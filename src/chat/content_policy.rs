@@ -10,7 +10,8 @@
 //! This module names the two sides of that choice:
 //! * [`ContentPolicy`] — whether a provider's endpoint refuses such material
 //!   ([`provider_content_policy`]);
-//! * [`SENSITIVE_TAG`] — the reserved tag that marks a note (or persona) as carrying it
+//! * the tags that mark a note (or persona) as carrying it — [`SENSITIVE_TAG`] plus the
+//!   known-sensitive [`SENSITIVE_TAGS`] and [`SENSITIVE_TAG_PREFIXES`]
 //!   ([`tags_are_sensitive`]).
 //!
 //! The composer uses them to leave a sensitive note out of the prompt when the session's
@@ -24,6 +25,23 @@
 /// safety classifier refuses (legitimate security / exploitation work). Case-insensitive.
 /// A session on a [`ContentPolicy::Restricted`] provider does not get it in its prompt.
 pub const SENSITIVE_TAG: &str = "provider-sensitive";
+
+/// Tags that mark exploitation / security-research material even without the explicit
+/// [`SENSITIVE_TAG`] marker. Requiring a human to add `provider-sensitive` by hand let the
+/// material leak: one untagged `exploit` note in the system prompt turns every turn of a
+/// restricted session into a refusal, even a bare "salut". These are the tags such work
+/// already carries, so the filter catches it without a second manual pass.
+pub const SENSITIVE_TAGS: &[&str] = &[
+    "exploit",
+    "kernel-exploit",
+    "security-research",
+    // The codename of the local device-exploitation work (CVE-2026-43499).
+    "ghostlock",
+];
+
+/// Tag prefixes that mark such material: a CVE identifier (`cve-2026-43499`) names an
+/// exploitation target by construction.
+pub const SENSITIVE_TAG_PREFIXES: &[&str] = &["cve-"];
 
 /// Whether a provider's endpoint refuses provider-sensitive material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -59,9 +77,23 @@ pub fn provider_content_policy(provider_id: &str) -> ContentPolicy {
 }
 
 /// Whether a note's (or persona's) tags mark it as carrying provider-sensitive material.
+///
+/// A tag marks it explicitly ([`SENSITIVE_TAG`]), by name ([`SENSITIVE_TAGS`]), or by
+/// prefix ([`SENSITIVE_TAG_PREFIXES`] — a CVE identifier). Case-insensitive, trimmed.
+/// Unrelated engineering tags (`futex`, `slub`, `exploit-prevention`) stay visible to a
+/// restricted provider.
 pub fn tags_are_sensitive(tags: &[String]) -> bool {
-    tags.iter()
-        .any(|t| t.trim().eq_ignore_ascii_case(SENSITIVE_TAG))
+    tags.iter().any(|raw| {
+        let tag = raw.trim();
+        tag.eq_ignore_ascii_case(SENSITIVE_TAG)
+            || SENSITIVE_TAGS
+                .iter()
+                .any(|known| tag.eq_ignore_ascii_case(known))
+            || SENSITIVE_TAG_PREFIXES.iter().any(|prefix| {
+                tag.len() >= prefix.len()
+                    && tag.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+            })
+    })
 }
 
 #[cfg(test)]
@@ -94,5 +126,37 @@ mod tests {
         ]));
         assert!(!tags_are_sensitive(&["sensitive".to_string()]));
         assert!(!tags_are_sensitive(&[]));
+    }
+
+    #[test]
+    fn exploitation_tags_are_sensitive_without_the_explicit_marker() {
+        assert!(tags_are_sensitive(&["exploit".to_string()]));
+        assert!(tags_are_sensitive(&["EXPLOIT".to_string()]));
+        assert!(tags_are_sensitive(&["kernel-exploit".to_string()]));
+        assert!(tags_are_sensitive(&["security-research".to_string()]));
+        assert!(tags_are_sensitive(&["ghostlock".to_string()]));
+        assert!(tags_are_sensitive(&[
+            "cve-2026-43499".to_string(),
+            "futex".to_string()
+        ]));
+    }
+
+    #[test]
+    fn a_cve_identifier_is_sensitive_by_its_prefix() {
+        assert!(tags_are_sensitive(&["cve-2026-43499".to_string()]));
+        assert!(tags_are_sensitive(&["CVE-2026-43499".to_string()]));
+        assert!(tags_are_sensitive(&["cve-".to_string()]));
+    }
+
+    #[test]
+    fn unrelated_engineering_tags_stay_visible_to_a_restricted_provider() {
+        // The extension must not sweep ordinary kernel notes into the sensitive set:
+        // `futex` alone is a subsystem, not an exploitation marker, and a defensive note
+        // tagged `exploit-prevention` must still reach Claude Code.
+        assert!(!tags_are_sensitive(&["futex".to_string()]));
+        assert!(!tags_are_sensitive(&["slub".to_string()]));
+        assert!(!tags_are_sensitive(&["kernelsnitch".to_string()]));
+        assert!(!tags_are_sensitive(&["gotcha".to_string()]));
+        assert!(!tags_are_sensitive(&["exploit-prevention".to_string()]));
     }
 }
