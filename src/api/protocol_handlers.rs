@@ -4,8 +4,8 @@ use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams};
 use crate::events::EventEmitter;
 use crate::protocol::{
-    self, Protocol, ProtocolCategory, ProtocolRun, ProtocolState, ProtocolTransition, RunStatus,
-    TransitionResult,
+    self, validate_protocol_structure, Protocol, ProtocolCategory, ProtocolRun, ProtocolState,
+    ProtocolTransition, RunStatus, TransitionResult, ValidatableState, ValidatableTransition,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -235,6 +235,35 @@ pub struct ProtocolDetail {
     pub protocol: Protocol,
     pub states: Vec<ProtocolState>,
     pub transitions: Vec<ProtocolTransition>,
+}
+
+/// Query parameters for validating stored protocols
+#[derive(Debug, Deserialize, Default)]
+pub struct ValidateProtocolsQuery {
+    /// Optional: restrict validation to a single project
+    pub project_id: Option<Uuid>,
+}
+
+/// A protocol validation result
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProtocolValidationResult {
+    pub protocol_id: Uuid,
+    pub protocol_name: String,
+    pub project_id: Uuid,
+    pub violations: Vec<crate::protocol::ProtocolViolation>,
+}
+
+/// Response for protocol validation
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ValidateProtocolsResponse {
+    /// Total number of protocols validated
+    pub total_validated: usize,
+    /// Number of protocols with violations
+    pub invalid_count: usize,
+    /// Number of protocols that passed validation
+    pub valid_count: usize,
+    /// Details for protocols with violations (empty if all valid)
+    pub invalid_protocols: Vec<ProtocolValidationResult>,
 }
 
 // ============================================================================
@@ -1697,90 +1726,35 @@ pub async fn compose_protocol(
         }
     }
 
-    // ── PYSR-4: Structural validation ───────────────────────────────────
-
-    // 1. Check for duplicate transitions (same from_state + trigger = non-deterministic)
-    {
-        let mut seen: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
-        for t in &body.transitions {
-            let key = (t.from_state.as_str(), t.trigger.as_str());
-            if !seen.insert(key) {
-                return Err(AppError::BadRequest(format!(
-                    "duplicate transition: from '{}' with trigger '{}' appears multiple times (non-deterministic)",
-                    t.from_state, t.trigger
-                )));
-            }
-        }
-    }
-
-    // 2. Parse state types to check for terminal and start states
-    let parsed_types: Vec<(&str, crate::protocol::StateType)> = body
+    // ── PYSR-4: Structural validation (via protocol::validate) ────────────
+    // Convert request body to validatable types
+    let validatable_states: Vec<ValidatableState<'_>> = body
         .states
         .iter()
-        .map(|s| {
-            let st = s
+        .map(|s| ValidatableState {
+            name: s.name.as_str(),
+            state_type: s
                 .state_type
                 .as_ref()
                 .and_then(|t| t.parse().ok())
-                .unwrap_or_default();
-            (s.name.as_str(), st)
+                .unwrap_or_default(),
         })
         .collect();
 
-    // 3. Check that at least one terminal state exists
-    let has_terminal = parsed_types
+    let validatable_transitions: Vec<ValidatableTransition<'_>> = body
+        .transitions
         .iter()
-        .any(|(_, st)| *st == crate::protocol::StateType::Terminal);
-    if !has_terminal {
-        return Err(AppError::BadRequest(
-            "protocol must have at least one terminal state".to_string(),
-        ));
-    }
+        .map(|t| ValidatableTransition {
+            from_state: t.from_state.as_str(),
+            to_state: t.to_state.as_str(),
+            trigger: t.trigger.as_str(),
+        })
+        .collect();
 
-    // 4. Check that all states are reachable from start
-    {
-        let start_name = parsed_types
-            .iter()
-            .find(|(_, st)| *st == crate::protocol::StateType::Start)
-            .map(|(name, _)| *name)
-            .or_else(|| body.states.first().map(|s| s.name.as_str()));
-
-        if let Some(start) = start_name {
-            // Build adjacency: from_state -> [to_states]
-            let mut adj: std::collections::HashMap<&str, Vec<&str>> =
-                std::collections::HashMap::new();
-            for t in &body.transitions {
-                adj.entry(t.from_state.as_str())
-                    .or_default()
-                    .push(t.to_state.as_str());
-            }
-
-            // BFS from start
-            let mut reachable: std::collections::HashSet<&str> = std::collections::HashSet::new();
-            let mut queue = std::collections::VecDeque::new();
-            queue.push_back(start);
-            reachable.insert(start);
-
-            while let Some(current) = queue.pop_front() {
-                if let Some(neighbors) = adj.get(current) {
-                    for &next in neighbors {
-                        if reachable.insert(next) {
-                            queue.push_back(next);
-                        }
-                    }
-                }
-            }
-
-            // Check all states are reachable
-            for name in &state_names {
-                if !reachable.contains(*name) {
-                    return Err(AppError::BadRequest(format!(
-                        "state '{}' is unreachable from the start state",
-                        name
-                    )));
-                }
-            }
-        }
+    // Run structural validation — returns first violation as error for backward compat
+    let violations = validate_protocol_structure(&validatable_states, &validatable_transitions);
+    if let Some(violation) = violations.first() {
+        return Err(AppError::BadRequest(violation.to_string()));
     }
 
     let category = match &body.category {
@@ -2087,6 +2061,124 @@ pub async fn simulate_activation(
         would_activate,
         explanation: affinity.explanation,
         context_used: context,
+    }))
+}
+
+/// Validate all stored protocols for structural integrity.
+///
+/// GET /api/protocols/validate?project_id=...
+///
+/// Validates all protocols (or just those in the specified project) against
+/// the structural rules:
+/// - No duplicate transitions (same from_state + trigger)
+/// - At least one terminal state
+/// - All states reachable from start
+///
+/// Returns a summary with counts and details for any invalid protocols.
+/// This is a read-only admin operation — it does not modify any protocols.
+pub async fn validate_all_protocols(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<ValidateProtocolsQuery>,
+) -> Result<Json<ValidateProtocolsResponse>, AppError> {
+    use crate::protocol::{ProtocolViolation, ValidatableState, ValidatableTransition};
+
+    let neo4j = state.orchestrator.neo4j();
+
+    // Collect all protocols to validate
+    let protocols_to_validate: Vec<(Uuid, String, Uuid)> =
+        if let Some(project_id) = query.project_id {
+            // Single project
+            let (protocols, _) = neo4j
+                .list_protocols(project_id, None, 1000, 0)
+                .await
+                .map_err(AppError::Internal)?;
+            protocols
+                .into_iter()
+                .map(|p| (p.id, p.name, p.project_id))
+                .collect()
+        } else {
+            // All projects
+            let projects = neo4j.list_projects().await.map_err(AppError::Internal)?;
+            let mut all_protocols = Vec::new();
+            for project in projects {
+                let (protocols, _) = neo4j
+                    .list_protocols(project.id, None, 1000, 0)
+                    .await
+                    .map_err(AppError::Internal)?;
+                for p in protocols {
+                    all_protocols.push((p.id, p.name, p.project_id));
+                }
+            }
+            all_protocols
+        };
+
+    let total_validated = protocols_to_validate.len();
+    let mut invalid_protocols = Vec::new();
+
+    for (protocol_id, protocol_name, project_id) in protocols_to_validate {
+        // Load states and transitions
+        let states = neo4j
+            .get_protocol_states(protocol_id)
+            .await
+            .map_err(AppError::Internal)?;
+        let transitions = neo4j
+            .get_protocol_transitions(protocol_id)
+            .await
+            .map_err(AppError::Internal)?;
+
+        // Convert to validatable types
+        let validatable_states: Vec<ValidatableState<'_>> = states
+            .iter()
+            .map(|s| ValidatableState {
+                name: s.name.as_str(),
+                state_type: s.state_type,
+            })
+            .collect();
+
+        let validatable_transitions: Vec<ValidatableTransition<'_>> = transitions
+            .iter()
+            .map(|t| {
+                // For stored protocols, transitions use UUIDs — we need to map to names
+                let from_name = states
+                    .iter()
+                    .find(|s| s.id == t.from_state)
+                    .map(|s| s.name.as_str())
+                    .unwrap_or("?");
+                let to_name = states
+                    .iter()
+                    .find(|s| s.id == t.to_state)
+                    .map(|s| s.name.as_str())
+                    .unwrap_or("?");
+                ValidatableTransition {
+                    from_state: from_name,
+                    to_state: to_name,
+                    trigger: t.trigger.as_str(),
+                }
+            })
+            .collect();
+
+        // Run validation
+        let violations: Vec<ProtocolViolation> =
+            validate_protocol_structure(&validatable_states, &validatable_transitions);
+
+        if !violations.is_empty() {
+            invalid_protocols.push(ProtocolValidationResult {
+                protocol_id,
+                protocol_name,
+                project_id,
+                violations,
+            });
+        }
+    }
+
+    let invalid_count = invalid_protocols.len();
+    let valid_count = total_validated - invalid_count;
+
+    Ok(Json(ValidateProtocolsResponse {
+        total_validated,
+        invalid_count,
+        valid_count,
+        invalid_protocols,
     }))
 }
 
@@ -2920,6 +3012,242 @@ mod tests {
         assert!(
             body.to_string().contains("duplicate"),
             "error should mention 'duplicate': {body}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // validate_all_protocols (PYSR-4 criterion 4)
+    // ----------------------------------------------------------------
+
+    /// Stored protocol with unreachable state appears in validation report.
+    /// PYSR-4 criterion 4: validate stored protocols.
+    #[tokio::test]
+    async fn validate_all_reports_unreachable_state() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::protocol::{Protocol, ProtocolState, ProtocolTransition};
+
+        let graph = std::sync::Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+        let mut project = test_project();
+        project.id = project_id;
+        graph.projects.write().await.insert(project_id, project);
+
+        // Create state IDs first (needed for Protocol::new)
+        let start_id = Uuid::new_v4();
+        let done_id = Uuid::new_v4();
+        let orphan_id = Uuid::new_v4();
+
+        // Create a protocol with an unreachable state directly in the store
+        let mut protocol = Protocol::new(project_id, "invalid-proto", start_id);
+        protocol.description = "Protocol with unreachable state".to_string();
+        protocol.terminal_states = vec![done_id];
+        let protocol_id = protocol.id;
+        graph.protocols.write().await.insert(protocol_id, protocol);
+
+        // Add states: start, done (terminal), orphan (unreachable)
+        let start_state = ProtocolState {
+            id: start_id,
+            protocol_id,
+            name: "start".to_string(),
+            description: String::new(),
+            action: None,
+            state_type: StateType::Start,
+            sub_protocol_id: None,
+            completion_strategy: None,
+            on_failure_strategy: None,
+            generator_config: None,
+            prompt_fragment: None,
+            available_tools: None,
+            forbidden_actions: None,
+            state_timeout_secs: None,
+        };
+        let done_state = ProtocolState {
+            id: done_id,
+            protocol_id,
+            name: "done".to_string(),
+            state_type: StateType::Terminal,
+            ..start_state.clone()
+        };
+        let orphan_state = ProtocolState {
+            id: orphan_id,
+            protocol_id,
+            name: "orphan".to_string(),
+            state_type: StateType::Intermediate,
+            ..start_state.clone()
+        };
+
+        {
+            let mut states = graph.protocol_states.write().await;
+            states.insert(start_id, start_state);
+            states.insert(done_id, done_state);
+            states.insert(orphan_id, orphan_state);
+        }
+
+        // Add transition: start → done (orphan is unreachable)
+        let transition = ProtocolTransition {
+            id: Uuid::new_v4(),
+            protocol_id,
+            from_state: start_id,
+            to_state: done_id,
+            trigger: "finish".to_string(),
+            guard: None,
+        };
+        graph
+            .protocol_transitions
+            .write()
+            .await
+            .insert(transition.id, transition);
+
+        let app = crate::api::list_routes_tests::router_over(graph.clone()).await;
+
+        // Call validate endpoint
+        let (status, body) = send(
+            &app,
+            "GET",
+            &format!("/api/protocols/validate?project_id={}", project_id),
+            serde_json::json!({}),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "validate should succeed: {body}"
+        );
+
+        let response: ValidateProtocolsResponse =
+            serde_json::from_value(body.clone()).expect("should parse response");
+
+        assert_eq!(response.total_validated, 1, "should validate 1 protocol");
+        assert_eq!(response.invalid_count, 1, "should find 1 invalid protocol");
+        assert_eq!(response.valid_count, 0, "should find 0 valid protocols");
+        assert_eq!(response.invalid_protocols.len(), 1);
+
+        let invalid = &response.invalid_protocols[0];
+        assert_eq!(invalid.protocol_name, "invalid-proto");
+        assert!(
+            invalid
+                .violations
+                .iter()
+                .any(|v| matches!(v, crate::protocol::ProtocolViolation::UnreachableState { state } if state == "orphan")),
+            "should report 'orphan' as unreachable: {:?}",
+            invalid.violations
+        );
+    }
+
+    /// Valid stored protocol does NOT appear in validation report.
+    #[tokio::test]
+    async fn validate_all_valid_protocol_not_in_report() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::protocol::{Protocol, ProtocolState, ProtocolTransition};
+
+        let graph = std::sync::Arc::new(MockGraphStore::new());
+        let project_id = Uuid::new_v4();
+        let mut project = test_project();
+        project.id = project_id;
+        graph.projects.write().await.insert(project_id, project);
+
+        // Create state IDs first (needed for Protocol::new)
+        let start_id = Uuid::new_v4();
+        let work_id = Uuid::new_v4();
+        let done_id = Uuid::new_v4();
+
+        // Create a valid protocol
+        let mut protocol = Protocol::new(project_id, "valid-proto", start_id);
+        protocol.description = "Valid protocol".to_string();
+        protocol.terminal_states = vec![done_id];
+        let protocol_id = protocol.id;
+        graph.protocols.write().await.insert(protocol_id, protocol);
+
+        // Add states: start → work → done (all reachable, has terminal)
+
+        let start_state = ProtocolState {
+            id: start_id,
+            protocol_id,
+            name: "start".to_string(),
+            description: String::new(),
+            action: None,
+            state_type: StateType::Start,
+            sub_protocol_id: None,
+            completion_strategy: None,
+            on_failure_strategy: None,
+            generator_config: None,
+            prompt_fragment: None,
+            available_tools: None,
+            forbidden_actions: None,
+            state_timeout_secs: None,
+        };
+        let work_state = ProtocolState {
+            id: work_id,
+            protocol_id,
+            name: "work".to_string(),
+            state_type: StateType::Intermediate,
+            ..start_state.clone()
+        };
+        let done_state = ProtocolState {
+            id: done_id,
+            protocol_id,
+            name: "done".to_string(),
+            state_type: StateType::Terminal,
+            ..start_state.clone()
+        };
+
+        {
+            let mut states = graph.protocol_states.write().await;
+            states.insert(start_id, start_state);
+            states.insert(work_id, work_state);
+            states.insert(done_id, done_state);
+        }
+
+        // Add transitions: start → work → done
+        let t1 = ProtocolTransition {
+            id: Uuid::new_v4(),
+            protocol_id,
+            from_state: start_id,
+            to_state: work_id,
+            trigger: "begin".to_string(),
+            guard: None,
+        };
+        let t2 = ProtocolTransition {
+            id: Uuid::new_v4(),
+            protocol_id,
+            from_state: work_id,
+            to_state: done_id,
+            trigger: "finish".to_string(),
+            guard: None,
+        };
+        {
+            let mut transitions = graph.protocol_transitions.write().await;
+            transitions.insert(t1.id, t1);
+            transitions.insert(t2.id, t2);
+        }
+
+        let app = crate::api::list_routes_tests::router_over(graph.clone()).await;
+
+        // Call validate endpoint
+        let (status, body) = send(
+            &app,
+            "GET",
+            &format!("/api/protocols/validate?project_id={}", project_id),
+            serde_json::json!({}),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "validate should succeed: {body}"
+        );
+
+        let response: ValidateProtocolsResponse =
+            serde_json::from_value(body.clone()).expect("should parse response");
+
+        assert_eq!(response.total_validated, 1, "should validate 1 protocol");
+        assert_eq!(response.invalid_count, 0, "should find 0 invalid protocols");
+        assert_eq!(response.valid_count, 1, "should find 1 valid protocol");
+        assert!(
+            response.invalid_protocols.is_empty(),
+            "valid protocol should not appear in invalid list"
         );
     }
 }
