@@ -13314,6 +13314,25 @@ mod openclaw_delegation {
         );
     }
 
+    /// A delegation carries a token and a spend cap (PYSR-3); an ACP agent refuses to open a
+    /// session with any limit (`unsupported("limits")`). Routed there by Auto, the delegation
+    /// must open anyway, without the caps it cannot hold (mono-harness rule).
+    #[tokio::test]
+    async fn a_session_with_caps_opens_on_an_acp_agent_that_cannot_enforce_them() {
+        let agent = Agent::new("bridge", "acp-bridge", Some(false));
+        agent.mode("ignoring");
+        let graph = Arc::new(MockGraphStore::new());
+        let manager = agent.manager(&graph, "iso4-acp").await;
+        let mut capped = request(Some("iso4-acp"), Some("proj"), "default");
+        capped.max_tokens = Some(1_000_000);
+        capped.max_cost_usd = Some(50.0);
+        let created = manager
+            .create_session(&capped)
+            .await
+            .unwrap_or_else(|e| panic!("a capped session must open on ACP: {e:#}"));
+        answered(&manager, &created.session_id).await;
+    }
+
     /// A native instance (`local`, `fake_openai`) and an ACP agent (`fake_acp`) on one manager.
     async fn native_and_acp(agent: &Agent) -> (ChatManager, Arc<MockGraphStore>, FakeOpenAi) {
         let fake = FakeOpenAi::start(script());

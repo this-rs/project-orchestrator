@@ -17289,6 +17289,23 @@ impl ChatManager {
         let remote_cwd = self.remote_cwd_of(provider_id).await?;
         let per_session_mcp = Self::carries_per_session_mcp(provider.as_ref(), model, None);
         let sid = session_id.to_string();
+        // A cap the engine cannot enforce would make it refuse to open (a delegation routed to
+        // DeepSeek without a price, to Codex or to ACP): it is left out, and said.
+        let (max_tokens, max_cost_usd, dropped) = super::provider::policy::enforceable_limits(
+            provider.kind(),
+            provider.capabilities(Some(model)).cost,
+            request.max_tokens,
+            request.max_cost_usd,
+        );
+        if !dropped.is_empty() {
+            warn!(
+                session_id = %sid,
+                provider_id,
+                model,
+                ?dropped,
+                "this engine cannot enforce these caps: the session opens without them"
+            );
+        }
         // A run (an executor) on a remote machine that does not allow `Trust` runs under `ask`
         // instead (a pilot asking for it is refused in authorize_provider_use). Every other
         // provider keeps the mode it was asked: it behaves like Claude Code (decision of
@@ -17344,8 +17361,8 @@ impl ChatManager {
                     user_claims: request.user_claims.as_ref(),
                     session_id: &sid,
                     third_party: provider_id != super::provider::resolver::CLAUDE_CODE,
-                    max_tokens: request.max_tokens,
-                    max_cost_usd: request.max_cost_usd,
+                    max_tokens,
+                    max_cost_usd,
                     kind: provider.kind(),
                     remote_cwd: remote_cwd.as_deref(),
                     per_session_mcp,
