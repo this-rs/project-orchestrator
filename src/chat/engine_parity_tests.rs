@@ -4817,6 +4817,16 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
              model: {unduly:?} (closed list: images without vision; an unknown context window)"
         );
     }
+    // ISO2: cells that EXPECTED declares (NotMeasured, or a declared Gap) but that this
+    // engine's scenario does not exercise must still appear in the measured matrix —
+    // `audit` reports an absent cell as "not measured at all". Fill ONLY the cells the
+    // scenario left unset, so a measured cell is never set twice (`Measures::set` panics).
+    let cc_engine = match path {
+        ProviderPath::Legacy => Engine::ClaudeCode,
+        ProviderPath::Agent => Engine::ClaudeCodeAgent,
+    };
+    fill_missing_declared(&mut cc, cc_engine);
+    fill_missing_declared(&mut na, Engine::Native);
     (cc, na)
 }
 
@@ -5027,6 +5037,31 @@ fn declared_only(engine: Engine) -> Measures {
         }
     }
     m
+}
+
+/// Fills, from [`EXPECTED`], the cells the scenario did not exercise on `engine`: a
+/// `NotMeasured` declaration becomes `NotMeasured`, a declared `Gap` becomes `Declared`.
+/// Only MISSING cells are touched — a cell the scenario already measured is left as is,
+/// so this never trips `Measures`'s "measured twice" guard.
+fn fill_missing_declared(m: &mut Measures, engine: Engine) {
+    for (function, _) in FUNCTIONS {
+        if m.get(function).is_some() {
+            continue;
+        }
+        match expected(engine, function) {
+            Some(Expect::NotMeasured { .. }) => m.set(
+                function,
+                Verdict::NotMeasured,
+                "not_measured (declared in EXPECTED)",
+            ),
+            Some(Expect::Gap { cause, .. }) => m.set(
+                function,
+                Verdict::Declared(cause),
+                "declared in EXPECTED, scenario did not run it",
+            ),
+            None => {}
+        }
+    }
 }
 
 /// Mini-run that measures `provider_switch.relay` on ACP by opening a native session then
