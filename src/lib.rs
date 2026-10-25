@@ -1874,6 +1874,13 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         .with_vault(vault.clone())
         // A default chat goes to Claude Code only when its CLI is on this machine (B2).
         .detecting_claude_cli();
+        // Hybrid knowledge retrieval: the same embedder the note and plan managers
+        // already use feeds the dense channel of the chat's knowledge injection, so
+        // a question with no keyword in common with a note still reaches it. Without
+        // a configured provider this is skipped and retrieval stays BM25-only.
+        if let Some(provider) = orchestrator.embedding_provider() {
+            cm = cm.with_embeddings(provider.clone());
+        }
         // Pass config.yaml path so permission changes can be persisted to disk
         if let Some(ref yaml_path) = config.config_yaml_path {
             cm = cm.with_config_yaml_path(yaml_path.clone());
