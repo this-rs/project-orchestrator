@@ -29,6 +29,8 @@ impl Neo4jClient {
                 affected_files: $affected_files,
                 estimated_complexity: $estimated_complexity,
                 frustration_score: 0.0,
+                due_date: $due_date,
+                estimated_minutes: $estimated_minutes,
                 created_at: datetime($created_at),
                 updated_at: datetime($updated_at)
             })
@@ -47,6 +49,16 @@ impl Neo4jClient {
         .param(
             "estimated_complexity",
             task.estimated_complexity.map(|c| c as i64).unwrap_or(0),
+        )
+        .param(
+            "due_date",
+            task.due_date
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_default(),
+        )
+        .param(
+            "estimated_minutes",
+            task.estimated_minutes.map(|m| m as i64).unwrap_or(0),
         )
         .param("created_at", now.clone())
         .param("updated_at", now);
@@ -153,6 +165,16 @@ impl Neo4jClient {
                 .map(|v| v as u32),
             actual_complexity: node
                 .get::<i64>("actual_complexity")
+                .ok()
+                .filter(|&v| v > 0)
+                .map(|v| v as u32),
+            due_date: node
+                .get::<String>("due_date")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()),
+            estimated_minutes: node
+                .get::<i64>("estimated_minutes")
                 .ok()
                 .filter(|&v| v > 0)
                 .map(|v| v as u32),
@@ -613,6 +635,12 @@ impl Neo4jClient {
         if updates.estimated_complexity.is_some() {
             set_clauses.push("t.estimated_complexity = $estimated_complexity");
         }
+        if updates.due_date.is_some() {
+            set_clauses.push("t.due_date = $due_date");
+        }
+        if updates.estimated_minutes.is_some() {
+            set_clauses.push("t.estimated_minutes = $estimated_minutes");
+        }
         if updates.assigned_to.is_some() {
             set_clauses.push("t.assigned_to = $assigned_to");
         }
@@ -653,6 +681,12 @@ impl Neo4jClient {
         }
         if let Some(complexity) = updates.estimated_complexity {
             q = q.param("estimated_complexity", complexity as i64);
+        }
+        if let Some(due) = updates.due_date {
+            q = q.param("due_date", due.format("%Y-%m-%d").to_string());
+        }
+        if let Some(minutes) = updates.estimated_minutes {
+            q = q.param("estimated_minutes", minutes as i64);
         }
         if let Some(ref assigned) = updates.assigned_to {
             q = q.param("assigned_to", assigned.clone());

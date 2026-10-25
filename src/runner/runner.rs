@@ -3414,6 +3414,8 @@ impl PlanRunner {
                         acceptance_criteria: vec![],
                         affected_files: vec![],
                         estimated_complexity: None,
+                        due_date: None,
+                        estimated_minutes: None,
                         actual_complexity: None,
                         created_at: chrono::Utc::now(),
                         updated_at: None,

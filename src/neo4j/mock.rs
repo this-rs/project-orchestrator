@@ -4533,6 +4533,12 @@ impl GraphStore for MockGraphStore {
             if let Some(complexity) = updates.estimated_complexity {
                 t.estimated_complexity = Some(complexity);
             }
+            if let Some(due) = updates.due_date {
+                t.due_date = Some(due);
+            }
+            if let Some(minutes) = updates.estimated_minutes {
+                t.estimated_minutes = Some(minutes);
+            }
             t.updated_at = Some(Utc::now());
         }
         Ok(())

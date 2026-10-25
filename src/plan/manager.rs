@@ -183,7 +183,7 @@ impl PlanManager {
 
     /// Add a task to a plan
     pub async fn add_task(&self, plan_id: Uuid, req: CreateTaskRequest) -> Result<TaskNode> {
-        let task = TaskNode::new_full(
+        let mut task = TaskNode::new_full(
             req.title,
             req.description,
             req.priority,
@@ -192,6 +192,8 @@ impl PlanManager {
             req.affected_files.unwrap_or_default(),
             req.estimated_complexity,
         );
+        task.due_date = req.due_date;
+        task.estimated_minutes = req.estimated_minutes;
 
         self.neo4j.create_task(plan_id, &task).await?;
 
@@ -963,6 +965,8 @@ mod tests {
             depends_on: None,
             steps: None,
             estimated_complexity: Some(4),
+            due_date: Some(chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap()),
+            estimated_minutes: Some(90),
         };
 
         let task = pm.add_task(plan.id, task_req).await.unwrap();
@@ -974,6 +978,11 @@ mod tests {
         assert_eq!(task.acceptance_criteria, vec!["Tests pass"]);
         assert_eq!(task.affected_files, vec!["src/api/routes.rs"]);
         assert_eq!(task.estimated_complexity, Some(4));
+        assert_eq!(
+            task.due_date,
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap())
+        );
+        assert_eq!(task.estimated_minutes, Some(90));
 
         // Verify task appears in plan details
         let details = pm.get_plan_details(plan.id).await.unwrap().unwrap();
@@ -1021,6 +1030,8 @@ mod tests {
                 },
             ]),
             estimated_complexity: None,
+            due_date: None,
+            estimated_minutes: None,
         };
 
         let task = pm.add_task(plan.id, task_req).await.unwrap();
@@ -1080,6 +1091,8 @@ mod tests {
                     depends_on: None,
                     steps: None,
                     estimated_complexity: None,
+                    due_date: None,
+                    estimated_minutes: None,
                 },
             )
             .await
@@ -1099,6 +1112,8 @@ mod tests {
                     depends_on: Some(vec![task_a.id]),
                     steps: None,
                     estimated_complexity: None,
+                    due_date: None,
+                    estimated_minutes: None,
                 },
             )
             .await
@@ -1152,6 +1167,8 @@ mod tests {
                         verification: None,
                     }]),
                     estimated_complexity: Some(3),
+                    due_date: None,
+                    estimated_minutes: None,
                 },
             )
             .await
@@ -1222,6 +1239,8 @@ mod tests {
                     depends_on: None,
                     steps: None,
                     estimated_complexity: None,
+                    due_date: None,
+                    estimated_minutes: None,
                 },
             )
             .await
@@ -1287,6 +1306,8 @@ mod tests {
                         verification: None,
                     }]),
                     estimated_complexity: None,
+                    due_date: None,
+                    estimated_minutes: None,
                 },
             )
             .await
@@ -1340,6 +1361,8 @@ mod tests {
                     depends_on: None,
                     steps: None,
                     estimated_complexity: None,
+                    due_date: None,
+                    estimated_minutes: None,
                 },
             )
             .await
@@ -1359,6 +1382,8 @@ mod tests {
                     depends_on: Some(vec![task_a.id]),
                     steps: None,
                     estimated_complexity: None,
+                    due_date: None,
+                    estimated_minutes: None,
                 },
             )
             .await
@@ -1405,6 +1430,8 @@ mod tests {
                     depends_on: None,
                     steps: None,
                     estimated_complexity: None,
+                    due_date: None,
+                    estimated_minutes: None,
                 },
             )
             .await
@@ -1424,6 +1451,8 @@ mod tests {
                     depends_on: Some(vec![task_a.id]),
                     steps: None,
                     estimated_complexity: None,
+                    due_date: None,
+                    estimated_minutes: None,
                 },
             )
             .await
@@ -1484,6 +1513,8 @@ mod tests {
                     depends_on: None,
                     steps: None,
                     estimated_complexity: None,
+                    due_date: None,
+                    estimated_minutes: None,
                 },
             )
             .await
@@ -1559,6 +1590,8 @@ mod tests {
                     depends_on: None,
                     steps: None,
                     estimated_complexity: None,
+                    due_date: None,
+                    estimated_minutes: None,
                 },
             )
             .await
@@ -1638,6 +1671,8 @@ mod tests {
                     depends_on: None,
                     steps: None,
                     estimated_complexity: None,
+                    due_date: None,
+                    estimated_minutes: None,
                 },
             )
             .await
@@ -1718,6 +1753,8 @@ mod tests {
                     depends_on: None,
                     steps: None,
                     estimated_complexity: None,
+                    due_date: None,
+                    estimated_minutes: None,
                 },
             )
             .await
@@ -1813,6 +1850,8 @@ mod tests {
                         verification: None,
                     }]),
                     estimated_complexity: None,
+                    due_date: None,
+                    estimated_minutes: None,
                 },
             )
             .await
@@ -1831,6 +1870,8 @@ mod tests {
                     depends_on: Some(vec![task1.id]),
                     steps: None,
                     estimated_complexity: None,
+                    due_date: None,
+                    estimated_minutes: None,
                 },
             )
             .await

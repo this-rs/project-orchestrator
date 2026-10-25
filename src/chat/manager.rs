@@ -3234,6 +3234,53 @@ pub(crate) fn is_auto_model(model: &str) -> bool {
     model.trim().eq_ignore_ascii_case("auto")
 }
 
+/// Whether an opening is decided by PO because the SERVER default is `auto`.
+///
+/// `chat.default_model: auto` is the operator's standing choice of Auto: a pilot
+/// conversation that names nothing (no provider, no model, no pool, no mode, no alias, no
+/// run) must then be routed by PO like one the user put in Auto from the menu — NOT left to
+/// the declared rules, which (with no primary configured) open Claude Code with the `auto`
+/// sentinel, i.e. the CLI's own account default, outside the person's Auto list and never
+/// re-decided (measured 25/10/2026: settings `executors_only` + stage `auto` + default
+/// `auto` → opening decision `applied: false`, session model `auto`, CLI on Opus 4.6).
+///
+/// A model named `auto` counts as nothing named: it is the sentinel, never a model. An
+/// executor (spawned, delegated, runner) or an opening PO already routes (`route_auto`) is
+/// not concerned: its routing is decided by its parent or by the settings' executor mode.
+pub(crate) fn opens_on_server_default_auto(default_model: &str, request: &ChatRequest) -> bool {
+    is_auto_model(default_model)
+        && request.routing_mode.is_none()
+        && request.routing_pool.is_none()
+        && request.provider.is_none()
+        && request
+            .model
+            .as_deref()
+            .is_none_or(|m| m.trim().is_empty() || is_auto_model(m))
+        && request.task_alias.is_none()
+        && request.persona_alias.is_none()
+        && request.run_provider.is_none()
+        && request.spawned_by.is_none()
+        && request.runner_context.is_none()
+        && !request.route_auto
+}
+
+/// The opening request as the router and the session record read it when
+/// [`opens_on_server_default_auto`]: the conversation is in Auto (`routing_mode: full`, so the
+/// opening decision is taken at the `auto` stage in `full`, the person's Auto list applies,
+/// the record says `full` and the per-turn router starts in Auto) and the `auto` sentinel is
+/// not a named model. `None` when the request already says what it wants.
+pub(crate) fn routed_by_server_default(
+    default_model: &str,
+    request: &ChatRequest,
+) -> Option<ChatRequest> {
+    opens_on_server_default_auto(default_model, request).then(|| {
+        let mut routed = request.clone();
+        routed.routing_mode = Some(super::provider::cognitive::ConversationRoutingMode::Full);
+        routed.model = None;
+        routed
+    })
+}
+
 /// Opens (or resumes) a session with `spec` through `open`. A provider that learned,
 /// between the reading of its capabilities and this opening, that it takes no MCP
 /// server per session (two first sessions opened at once on an ACP agent that refuses
@@ -7333,6 +7380,11 @@ impl ChatManager {
         session_id: Uuid,
         opened_on: &mut Option<String>,
     ) -> Result<CreateSessionResponse> {
+        // `chat.default_model: auto` and nothing named: the conversation is PO's to route,
+        // as if the user had put it in Auto (see `routed_by_server_default`). Read once here,
+        // so the decision, the record (`routing_mode`) and the per-turn router agree.
+        let routed = routed_by_server_default(&self.config.default_model, request);
+        let request = routed.as_ref().unwrap_or(request);
         // Who the session belongs to, settled before anything is opened: a refusal (no owner
         // can be named for a delegated session) leaves nothing behind.
         let owner = match self.session_owner(request.user_claims.as_ref()).await? {
@@ -20607,6 +20659,128 @@ mod tests {
         assert!(!is_auto_model("claude-opus-4-8"));
         assert!(!is_auto_model("automatic"));
         assert!(!is_auto_model(""));
+    }
+
+    #[test]
+    fn a_server_default_of_auto_puts_a_bare_pilot_opening_in_auto() {
+        use super::super::provider::cognitive::ConversationRoutingMode;
+        let bare = ChatRequest {
+            message: "hello".into(),
+            cwd: "/tmp/project".into(),
+            ..Default::default()
+        };
+        assert!(opens_on_server_default_auto("auto", &bare));
+        let routed = routed_by_server_default("auto", &bare).expect("routed by PO");
+        assert_eq!(routed.routing_mode, Some(ConversationRoutingMode::Full));
+        assert_eq!(routed.model, None);
+        assert_eq!(routed.message, "hello");
+
+        // The sentinel named as the model is nothing named: it is dropped, not pinned.
+        let sentinel = ChatRequest {
+            model: Some(" Auto ".into()),
+            ..bare.clone()
+        };
+        assert!(opens_on_server_default_auto("auto", &sentinel));
+        assert_eq!(
+            routed_by_server_default("auto", &sentinel).map(|r| r.model),
+            Some(None)
+        );
+        // Case and spaces in the config value do not matter either.
+        assert!(opens_on_server_default_auto(" AUTO ", &bare));
+    }
+
+    #[test]
+    fn a_concrete_server_default_or_a_named_opening_is_left_to_the_declared_rules() {
+        use super::super::provider::cognitive::ConversationRoutingMode;
+        let bare = ChatRequest {
+            message: "hello".into(),
+            cwd: "/tmp/project".into(),
+            ..Default::default()
+        };
+        // A concrete default: nothing changes, whatever the request.
+        assert!(!opens_on_server_default_auto("claude-sonnet-5-5", &bare));
+        assert!(routed_by_server_default("claude-sonnet-5-5", &bare).is_none());
+        assert!(!opens_on_server_default_auto("", &bare));
+
+        // Every way of naming an engine, a mode or a pool keeps the request as it is.
+        let named: Vec<(&str, ChatRequest)> = vec![
+            (
+                "provider",
+                ChatRequest {
+                    provider: Some("deepseek".into()),
+                    ..bare.clone()
+                },
+            ),
+            (
+                "model",
+                ChatRequest {
+                    model: Some("claude-haiku-5-5".into()),
+                    ..bare.clone()
+                },
+            ),
+            (
+                "routing_mode",
+                ChatRequest {
+                    routing_mode: Some(ConversationRoutingMode::Primary),
+                    ..bare.clone()
+                },
+            ),
+            (
+                "routing_pool",
+                ChatRequest {
+                    routing_pool: Some(vec![super::super::types::RoutingPoolEntry {
+                        provider: "claude-code".into(),
+                        model: "claude-haiku-5-5".into(),
+                    }]),
+                    ..bare.clone()
+                },
+            ),
+            (
+                "task_alias",
+                ChatRequest {
+                    task_alias: Some("fast".into()),
+                    ..bare.clone()
+                },
+            ),
+            (
+                "persona_alias",
+                ChatRequest {
+                    persona_alias: Some("deep".into()),
+                    ..bare.clone()
+                },
+            ),
+            (
+                "run_provider",
+                ChatRequest {
+                    run_provider: Some("deepseek".into()),
+                    ..bare.clone()
+                },
+            ),
+            (
+                "spawned_by",
+                ChatRequest {
+                    spawned_by: Some("conversation:parent".into()),
+                    ..bare.clone()
+                },
+            ),
+            (
+                "route_auto",
+                ChatRequest {
+                    route_auto: true,
+                    ..bare.clone()
+                },
+            ),
+        ];
+        for (what, request) in named {
+            assert!(
+                !opens_on_server_default_auto("auto", &request),
+                "{what} names what the opening wants: the server default decides nothing"
+            );
+            assert!(
+                routed_by_server_default("auto", &request).is_none(),
+                "{what}"
+            );
+        }
     }
 
     #[tokio::test]

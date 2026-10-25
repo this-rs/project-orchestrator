@@ -12567,6 +12567,38 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
     }
+
+    /// PATCH /api/tasks/{id} accepts and persists the RFC 2.0 Task-fields
+    /// slice (`due_date`, `estimated_minutes`).
+    #[tokio::test]
+    async fn update_task_persists_due_date_and_estimated_minutes() {
+        use crate::neo4j::GraphStore;
+
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let plan_id = Uuid::new_v4();
+        let task = crate::neo4j::models::TaskNode::new("Seed task".to_string());
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let (app, _bus) = test_app_parts(graph.clone()).await;
+
+        let resp = app
+            .clone()
+            .oneshot(auth_patch_json(
+                &format!("/api/tasks/{task_id}"),
+                serde_json::json!({ "due_date": "2026-01-15", "estimated_minutes": 45 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let stored = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.due_date,
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap())
+        );
+        assert_eq!(stored.estimated_minutes, Some(45));
+    }
 }
 
 #[cfg(test)]

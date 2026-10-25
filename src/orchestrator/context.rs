@@ -1224,6 +1224,8 @@ mod tests {
             acceptance_criteria: vec!["Tests pass".to_string()],
             affected_files: vec!["src/main.rs".to_string()],
             estimated_complexity: Some(3),
+            due_date: None,
+            estimated_minutes: None,
             actual_complexity: None,
             created_at: chrono::Utc::now(),
             updated_at: None,
