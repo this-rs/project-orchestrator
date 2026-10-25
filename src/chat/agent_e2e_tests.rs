@@ -3063,6 +3063,8 @@ mod turn_routing {
                     healthy: Some(true),
                     allowed_for_project: true,
                     sandboxed: false,
+                    quota_exhausted: None,
+                    quota_utilization: None,
                 })
                 .collect()
         }
@@ -4756,6 +4758,8 @@ mod provider_switch {
                     healthy: Some(true),
                     allowed_for_project: *allowed,
                     sandboxed: false,
+                    quota_exhausted: None,
+                    quota_utilization: None,
                 })
                 .collect()
             }

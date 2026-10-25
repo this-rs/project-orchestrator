@@ -2454,6 +2454,8 @@ mod provider_move_tests {
             healthy: Some(true),
             allowed_for_project: allowed,
             sandboxed: false,
+            quota_exhausted: None,
+            quota_utilization: None,
         }
     }
 
@@ -3523,6 +3525,8 @@ mod image_routing_tests {
             healthy: Some(true),
             allowed_for_project: true,
             sandboxed: false,
+            quota_exhausted: None,
+            quota_utilization: None,
         }
     }
 
@@ -4267,6 +4271,8 @@ mod segment_tests {
             healthy: Some(true),
             allowed_for_project: true,
             sandboxed: false,
+            quota_exhausted: None,
+            quota_utilization: None,
         }
     }
 

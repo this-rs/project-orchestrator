@@ -21,6 +21,7 @@ pub mod nexus_tools;
 pub mod oneshot;
 pub mod outage;
 pub mod policy;
+pub mod quota;
 pub mod resolver;
 pub mod settings;
 pub mod store;

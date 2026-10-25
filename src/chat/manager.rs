@@ -2507,7 +2507,11 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
                             Some(stop_reason),
                             &outcome.subtype,
                             outcome.is_error,
-                            outcome.error_code.is_some(),
+                            // A refusal of the account is not the model failing (QUOTA).
+                            super::provider::cognitive::decision::provider_fault(
+                                outcome.error_code.as_deref(),
+                                outcome.quota_refusal,
+                            ),
                         );
                         if let (Some(reward), Some(arm)) = (reward, decision.served_arm()) {
                             let observation = super::provider::cognitive::store::ArmObservation {
@@ -4263,7 +4267,7 @@ impl ChatManager {
         message: &str,
     ) -> bool {
         if let Some(routing) = self.cognitive_routing.as_ref() {
-            routing.mark_out_of_credit(failed_provider, std::time::Instant::now());
+            routing.mark_out_of_credit(failed_provider);
         }
         let Some(pick) = self.next_fallback_pick(session_id, failed_provider).await else {
             return false;
@@ -4316,11 +4320,10 @@ impl ChatManager {
         use super::provider::cognitive::decision::Pick;
         let uuid = Uuid::parse_str(session_id).ok()?;
         let node = self.graph.get_chat_session(uuid).await.ok().flatten()?;
-        let now = std::time::Instant::now();
         let out_of_credit = |provider: &str| {
             self.cognitive_routing
                 .as_ref()
-                .is_some_and(|routing| routing.out_of_credit(provider, now))
+                .is_some_and(|routing| routing.out_of_credit(provider))
         };
         // An explicit routing pool: fall back within it only, in the user's order. A
         // pool of one (a pin) offers nothing, and it never falls through to the
@@ -4390,6 +4393,9 @@ impl ChatManager {
         mut self,
         routing: super::provider::cognitive::decider::CognitiveRouting,
     ) -> Self {
+        // The sessions this manager opens report the limits their provider states to the same
+        // registry the router reads (QUOTA).
+        self.agent_runtime.set_quota(Arc::clone(&routing.quota));
         self.cognitive_routing = Some(routing);
         self
     }
@@ -8942,7 +8948,7 @@ impl ChatManager {
             provider = %provider_id,
             "legacy turn ended out of credit; excluding the provider instance for a cooldown"
         );
-        routing.mark_out_of_credit(&provider_id, Instant::now());
+        routing.mark_out_of_credit(&provider_id);
     }
 
     /// The conversation's persisted segmentation, or `None` when there is nothing to
@@ -15915,14 +15921,9 @@ impl ChatManager {
             .await
             .into_iter()
             .collect();
-        let healthy_of = |id: &str| {
-            if routing.out_of_credit(id, Instant::now()) {
-                return false;
-            }
-            match measured.get(id) {
-                Some(ok) => *ok,
-                None => routing.health.get(id, Instant::now()).unwrap_or(false),
-            }
+        let healthy_of = |id: &str| match measured.get(id) {
+            Some(ok) => *ok,
+            None => routing.health.get(id, Instant::now()).unwrap_or(false),
         };
         // The catalogs of the healthy instances, all at once and each bounded: a
         // sequential wait here added `ROUTING_CATALOG_TIMEOUT` per instance (review
@@ -16062,6 +16063,9 @@ impl ChatManager {
                 ));
             }
         }
+        // QUOTA: an account that refuses until a known instant is not unhealthy, it is exhausted, and
+        // the filter says so with the instant it is back (a reject reason of its own).
+        super::provider::cognitive::candidates::apply_quota(&mut pool, &routing.quota);
         pool
     }
 
@@ -17201,6 +17205,45 @@ impl ChatManager {
 
     /// Opens a session on the provider-neutral engine and sends the first
     /// message. The `ChatSession` node is already persisted by `create_session`.
+    /// Whether the person named the provider of this request (a pin, or a strict conversation),
+    /// as opposed to the router choosing it (Auto, mixed pools) or a delegated child.
+    fn provider_is_explicit(request: &ChatRequest) -> bool {
+        use super::provider::cognitive::ConversationRoutingMode as Mode;
+        if request.spawned_by.is_some() {
+            return false;
+        }
+        match request.routing_mode {
+            Some(Mode::Primary) => true,
+            Some(Mode::Mixed | Mode::Full) => false,
+            None => request.provider.is_some(),
+        }
+    }
+
+    /// Refuses an opening on an explicitly chosen provider whose quota is used up.
+    fn refuse_explicit_provider_if_exhausted(
+        &self,
+        provider_id: &str,
+        explicit: bool,
+    ) -> Result<()> {
+        if !explicit {
+            return Ok(());
+        }
+        let Some(held) = self
+            .cognitive_routing
+            .as_ref()
+            .and_then(|routing| routing.quota.exhausted(provider_id))
+        else {
+            return Ok(());
+        };
+        Err(super::provider::errors::on_provider(
+            provider_id,
+            anyhow::Error::new(nexus_claude::agent::ProviderError::RateLimited {
+                retry_after_ms: None,
+                resets_at_ms: Some(held.resets_at_ms),
+            }),
+        ))
+    }
+
     async fn open_agent_session(&self, o: AgentOpen<'_>) -> Result<CreateSessionResponse> {
         let AgentOpen {
             request,
@@ -17214,6 +17257,13 @@ impl ChatManager {
             relay,
             access,
         } = o;
+        // QUOTA: a provider the person chose is never swapped for another one behind their back.
+        // When its quota is used up the opening says so, with the instant it serves again, and
+        // lets them decide (wait, pick another provider, resume at the reset).
+        self.refuse_explicit_provider_if_exhausted(
+            provider_id,
+            Self::provider_is_explicit(request),
+        )?;
         let provider = self.provider_for(provider_id).await?;
         let remote_cwd = self.remote_cwd_of(provider_id).await?;
         let per_session_mcp = Self::carries_per_session_mcp(provider.as_ref(), model, None);
@@ -17340,7 +17390,7 @@ impl ChatManager {
                 Err(error) => {
                     if super::provider::cognitive::decider::is_out_of_credit(&error) {
                         if let Some(routing) = self.cognitive_routing.as_ref() {
-                            routing.mark_out_of_credit(provider_id, std::time::Instant::now());
+                            routing.mark_out_of_credit(provider_id);
                         }
                     }
                     return Err(anyhow::Error::new(error));
@@ -18280,7 +18330,7 @@ impl ChatManager {
             Err(error) => {
                 if super::provider::cognitive::decider::is_out_of_credit(&error) {
                     if let Some(routing) = self.cognitive_routing.as_ref() {
-                        routing.mark_out_of_credit(&provider_id, std::time::Instant::now());
+                        routing.mark_out_of_credit(&provider_id);
                     }
                 }
                 return Err(anyhow::Error::new(error));
@@ -28452,6 +28502,109 @@ mod tests {
         );
     }
 
+    /// QUOTA, explicit choice: a provider the person named, whose quota is used up, is never
+    /// replaced behind their back. The opening is refused with the instant it serves again (a
+    /// typed `rate_limited` carrying `resets_at_ms`), and nothing else is tried. A router's
+    /// choice, a mixed pool and a delegated child are not "explicit": the router already left the
+    /// exhausted instance out, and a child falls back on its parent's engine.
+    #[tokio::test]
+    async fn an_explicit_provider_whose_quota_is_used_up_is_refused_with_its_reset_not_swapped() {
+        use crate::chat::provider::cognitive::decider::CognitiveRouting;
+        use crate::chat::provider::cognitive::store::InMemoryRoutingStore;
+        use crate::chat::provider::cognitive::ConversationRoutingMode as Mode;
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let state = mock_app_state();
+        let routing = CognitiveRouting::new(Arc::new(InMemoryRoutingStore::new()));
+        let reset = routing.quota.now_ms() + 3 * 86_400_000;
+        routing
+            .quota
+            .mark_rate_limited("deepseek", Some(reset), None);
+        let manager = ChatManager::new_without_memory(graph, state.meili, test_config())
+            .with_cognitive_routing(routing);
+
+        let named = ChatRequest {
+            provider: Some("deepseek".into()),
+            ..ChatRequest::default()
+        };
+        assert!(ChatManager::provider_is_explicit(&named));
+        let refusal = manager
+            .refuse_explicit_provider_if_exhausted("deepseek", true)
+            .expect_err("refused");
+        let failure = crate::chat::provider::errors::classify_open_error(&refusal, None)
+            .expect("a typed failure");
+        assert_eq!(failure.status, 429);
+        assert_eq!(failure.code, "rate_limited");
+        assert_eq!(failure.resets_at_ms, Some(reset));
+        assert_eq!(failure.provider_id.as_deref(), Some("deepseek"));
+        assert!(failure.message.contains("serves again at"));
+        // Another provider is unaffected.
+        assert!(manager
+            .refuse_explicit_provider_if_exhausted("glm", true)
+            .is_ok());
+        // Not explicit: the router's pool filter already handled it.
+        for request in [
+            ChatRequest {
+                provider: Some("deepseek".into()),
+                routing_mode: Some(Mode::Full),
+                ..ChatRequest::default()
+            },
+            ChatRequest {
+                provider: Some("deepseek".into()),
+                spawned_by: Some("parent".into()),
+                ..ChatRequest::default()
+            },
+            ChatRequest::default(),
+        ] {
+            assert!(!ChatManager::provider_is_explicit(&request), "{request:?}");
+        }
+        assert!(ChatManager::provider_is_explicit(&ChatRequest {
+            routing_mode: Some(Mode::Primary),
+            ..ChatRequest::default()
+        }));
+    }
+
+    /// QUOTA: the fallback after a failure reads the same registry as the pool filter: an
+    /// instance exhausted until its reset (a dated 429 here) is not a target, the next one of the
+    /// pool is; at the reset it is a target again.
+    #[tokio::test]
+    async fn the_fallback_after_a_failure_skips_an_instance_whose_quota_is_used_up() {
+        use crate::chat::provider::cognitive::decider::CognitiveRouting;
+        use crate::chat::provider::cognitive::store::InMemoryRoutingStore;
+        use crate::chat::provider::limits::ManualClock;
+        use crate::chat::provider::quota::QuotaRegistry;
+        use crate::chat::types::RoutingPoolEntry;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let clock = Arc::new(ManualClock::at("2026-10-21T10:00:00Z"));
+        let quota = Arc::new(QuotaRegistry::new().with_clock(clock.clone()));
+        let routing =
+            CognitiveRouting::new(Arc::new(InMemoryRoutingStore::new())).with_quota(quota.clone());
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(dyn_graph, state.meili, test_config())
+            .with_cognitive_routing(routing);
+        let entry = |provider: &str| RoutingPoolEntry {
+            provider: provider.into(),
+            model: "m".into(),
+        };
+        let mut session = test_chat_session(None);
+        session.provider_id = Some("a".into());
+        session.routing_pool =
+            Some(serde_json::to_string(&vec![entry("a"), entry("b"), entry("c")]).unwrap());
+        graph.create_chat_session(&session).await.unwrap();
+        let sid = session.id.to_string();
+
+        quota.mark_rate_limited("b", Some(quota.now_ms() + 3_600_000), None);
+        let pick = manager.next_fallback_pick(&sid, "a").await.expect("c");
+        assert_eq!(pick.provider_id, "c", "b refuses for an hour");
+
+        clock.advance(std::time::Duration::from_secs(3_601));
+        let pick = manager.next_fallback_pick(&sid, "a").await.expect("b");
+        assert_eq!(
+            pick.provider_id, "b",
+            "back at its reset, nobody did anything"
+        );
+    }
+
     /// The failed provider is abandoned (marked out of credit) even when the pool
     /// holds no other provider: the fallback then returns `false`, never loops.
     #[tokio::test]
@@ -28474,7 +28627,7 @@ mod tests {
         assert!(!moved, "no other provider to fall back to");
         let routing = manager.cognitive_routing.as_ref().unwrap();
         assert!(
-            routing.out_of_credit("a", std::time::Instant::now()),
+            routing.out_of_credit("a"),
             "the failed provider is abandoned (out of credit)"
         );
         assert_eq!(
@@ -34434,7 +34587,7 @@ mod tests {
         )
         .await;
         assert!(
-            routing.out_of_credit("deepseek", Instant::now()),
+            routing.out_of_credit("deepseek"),
             "the provider instance is out of credit after a 402"
         );
 
@@ -34450,7 +34603,7 @@ mod tests {
         )
         .await;
         assert!(
-            !routing.out_of_credit("elsewhere", Instant::now()),
+            !routing.out_of_credit("elsewhere"),
             "a non-credit error does not mark the instance"
         );
     }
@@ -37117,6 +37270,8 @@ mod image_turn_services_tests {
                     healthy: Some(true),
                     allowed_for_project: true,
                     sandboxed: false,
+                    quota_exhausted: None,
+                    quota_utilization: None,
                 })
                 .collect()
         }

@@ -996,6 +996,9 @@ fn extract_payload(message: &Message) -> Option<(String, String, Option<String>)
             user_text(m),
             parent_tool_use_id.clone(),
         )),
+        // The account's limits (QUOTA) are read by the agent engine; the historical one shows
+        // no background output for a status the CLI repeats at every turn.
+        Message::System { subtype, .. } if subtype == "rate_limit_event" => None,
         Message::System { subtype, data } => Some((
             format!("system:{subtype}"),
             serde_json::to_string_pretty(data).unwrap_or_default(),

@@ -75,6 +75,25 @@ pub(crate) fn mask_agent_event_with(
     }
 }
 
+/// Epoch milliseconds now.
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// A rate limit that names its reset, further away than a turn retry may wait
+/// ([`MAX_RETRY_DELAY_MS`]): an exhausted quota, not a burst. Running the turn again would only
+/// meet the same refusal, so it is said to the person (with the instant it serves again) instead.
+fn waits_for_a_reset(error: &ProviderError, now_ms: u64) -> bool {
+    matches!(
+        error,
+        ProviderError::RateLimited { resets_at_ms: Some(at), .. }
+            if *at > now_ms.saturating_add(MAX_RETRY_DELAY_MS)
+    )
+}
+
 /// The failure that ends a turn and is worth trying again: a retryable
 /// `done.error` of an error turn, or a retryable terminal `error`.
 fn retryable_failure(event: &AgentEvent) -> Option<ProviderError> {
@@ -92,7 +111,7 @@ fn retryable_failure(event: &AgentEvent) -> Option<ProviderError> {
             ..
         }
         | AgentEvent::Error { error }
-            if error.retryable() =>
+            if error.retryable() && !waits_for_a_reset(error, wall_clock_ms()) =>
         {
             Some(error.clone())
         }
@@ -123,11 +142,26 @@ fn mid_generation_retryable(event: &AgentEvent) -> Option<ProviderError> {
             if matches!(
                 error,
                 ProviderError::RateLimited { .. } | ProviderError::Timeout { .. }
-            ) =>
+            ) && !waits_for_a_reset(error, wall_clock_ms()) =>
         {
             Some(error.clone())
         }
         _ => None,
+    }
+}
+
+/// Whether the event ends a turn on a refusal of the ACCOUNT: a rate limit, or no credit left.
+/// The model did not fail; the instance is out for a while (QUOTA).
+fn is_quota_refusal(event: &AgentEvent) -> bool {
+    match event {
+        AgentEvent::Done {
+            error: Some(error), ..
+        }
+        | AgentEvent::Error { error } => {
+            matches!(error, ProviderError::RateLimited { .. })
+                || super::provider::cognitive::decider::is_out_of_credit(error)
+        }
+        _ => false,
     }
 }
 
@@ -524,6 +558,10 @@ pub struct TurnOutcome {
     /// The typed provider error that caused a failure, as its stable code (ERR-1);
     /// `None` for a clean stop or an error without a typed provider cause.
     pub error_code: Option<String>,
+    /// The turn ended on a refusal of the ACCOUNT (a rate limit, an exhausted quota, no credit):
+    /// the instance is out for a while, which says nothing of how well the model works. The
+    /// bandit is not fed it as a failure of the arm (`decision::turn_reward`).
+    pub quota_refusal: bool,
 }
 
 /// What the host asks of the session after a turn: events to emit, then system
@@ -748,6 +786,9 @@ pub struct AgentSessionHandle {
     /// Whether an oversized tool result is spilled out of the transcript
     /// (`super::spill`): the budget and preview sizes this session keeps.
     spill: SpillConfig,
+    /// Where what the provider says about its account's limits goes (QUOTA): the registry the
+    /// router and the send path read. `None`: nothing is kept.
+    quota: Option<Arc<super::provider::quota::QuotaRegistry>>,
     /// When the session last did something (an event, a message): what the idle
     /// cleanup reads (`ChatManager::start_cleanup_task`).
     last_activity: std::sync::Mutex<Instant>,
@@ -1061,6 +1102,34 @@ impl AgentSessionHandle {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_policies(outage, hold);
+    }
+
+    /// What the provider says about the limits of its account, and the refusals that date them
+    /// (QUOTA), go to the registry as they arrive: the router excludes the instance until its
+    /// reset, and the send path says so. Never an effect on the turn itself.
+    fn observe_quota(&self, event: &AgentEvent) {
+        let Some(quota) = &self.quota else { return };
+        let refusal = match event {
+            AgentEvent::Quota { quota: snapshot } => {
+                quota.observe(&self.provider_id, snapshot);
+                return;
+            }
+            AgentEvent::Done {
+                error: Some(error), ..
+            }
+            | AgentEvent::Error { error } => error,
+            _ => return,
+        };
+        match refusal {
+            ProviderError::RateLimited {
+                retry_after_ms,
+                resets_at_ms,
+            } => quota.mark_rate_limited(&self.provider_id, *resets_at_ms, *retry_after_ms),
+            error if super::provider::cognitive::decider::is_out_of_credit(error) => {
+                quota.mark_out_of_credit(&self.provider_id);
+            }
+            _ => {}
+        }
     }
 
     /// Feeds one final failed call of this session to the outage detector and emits
@@ -1714,6 +1783,8 @@ impl AgentSessionHandle {
                 // Terminal-ness is read on the original: a withheld terminal event
                 // still ends the turn.
                 let terminal = event.is_terminal();
+                self.observe_quota(&event);
+                outcome.quota_refusal |= is_quota_refusal(&event);
                 exited |= process_exited(&event);
                 // The provider may have just named its session: stored before the
                 // terminal event goes out, so a client that saw the turn end can
@@ -2597,6 +2668,8 @@ pub struct AgentRuntime {
     /// How an oversized tool result is spilled out of the transcript
     /// (`super::spill`), copied onto every session this runtime adopts.
     spill: SpillConfig,
+    /// The quota registry handed to every session this runtime adopts (QUOTA).
+    quota: std::sync::RwLock<Option<Arc<super::provider::quota::QuotaRegistry>>>,
 }
 
 impl AgentRuntime {
@@ -2607,7 +2680,14 @@ impl AgentRuntime {
             graph,
             read_only_mcp_tools: Vec::new(),
             spill: SpillConfig::from_env(),
+            quota: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Sessions adopted from now on report the limits their provider states (and the refusals
+    /// that name a reset) to `registry`.
+    pub fn set_quota(&self, registry: Arc<super::provider::quota::QuotaRegistry>) {
+        *self.quota.write().unwrap_or_else(|e| e.into_inner()) = Some(registry);
     }
 
     /// This runtime, its sessions declaring these third-party MCP tools read-only (exact
@@ -2819,6 +2899,7 @@ impl AgentRuntime {
             retry: std::sync::RwLock::new(RetryConfig::default()),
             outage: std::sync::Mutex::new(TurnHold::new(provider_id)),
             spill: self.spill,
+            quota: self.quota.read().unwrap_or_else(|e| e.into_inner()).clone(),
             last_activity: std::sync::Mutex::new(Instant::now()),
             registry: Arc::downgrade(&self.sessions),
         });
@@ -2900,6 +2981,9 @@ impl AgentRuntime {
 pub(crate) async fn emit_out_of_band(handle: &AgentSessionHandle, events: Vec<AgentEvent>) {
     if events.is_empty() {
         return;
+    }
+    for event in &events {
+        handle.observe_quota(event);
     }
     let events: Vec<AgentEvent> = events.into_iter().map(mask_agent_event).collect();
     if let Some(services) = &handle.services {
@@ -3377,6 +3461,49 @@ mod mask_tests {
             matches!(&chat[0], crate::chat::types::ChatEvent::Error { message, .. }
             if message == crate::chat::manager::MASKING_FAILED_MESSAGE)
         );
+    }
+
+    /// QUOTA: a rate limit that names a reset far beyond what a retry waits is an exhausted quota,
+    /// not a burst: the turn is not run again into the same refusal, the person is told when the
+    /// provider serves again. A near reset, or none, keeps the old retry.
+    #[test]
+    fn a_rate_limit_with_a_far_reset_is_not_retried_and_a_near_one_is() {
+        let now = 1_792_500_000_000_u64;
+        let at = |resets: Option<u64>| ProviderError::RateLimited {
+            retry_after_ms: None,
+            resets_at_ms: resets,
+        };
+        assert!(waits_for_a_reset(&at(Some(now + 3 * 86_400_000)), now));
+        assert!(waits_for_a_reset(
+            &at(Some(now + MAX_RETRY_DELAY_MS + 1)),
+            now
+        ));
+        assert!(!waits_for_a_reset(&at(Some(now + MAX_RETRY_DELAY_MS)), now));
+        assert!(!waits_for_a_reset(&at(None), now));
+        assert!(!waits_for_a_reset(&ProviderError::Overloaded, now));
+        // The rule reaches the stream: a far reset makes the terminal error not retryable.
+        let far = AgentEvent::Error {
+            error: at(Some(wall_clock_ms() + 3 * 86_400_000)),
+        };
+        assert!(retryable_failure(&far).is_none());
+        let burst = AgentEvent::Error { error: at(None) };
+        assert!(retryable_failure(&burst).is_some());
+    }
+
+    #[test]
+    fn a_rate_limit_and_no_credit_are_refusals_of_the_account_and_nothing_else_is() {
+        let done = |error: ProviderError| AgentEvent::Error { error };
+        assert!(is_quota_refusal(&done(ProviderError::RateLimited {
+            retry_after_ms: None,
+            resets_at_ms: Some(1),
+        })));
+        assert!(is_quota_refusal(&done(ProviderError::InvalidRequest {
+            detail: "HTTP 402: insufficient credits".into()
+        })));
+        assert!(!is_quota_refusal(&done(ProviderError::Overloaded)));
+        assert!(!is_quota_refusal(&done(ProviderError::InvalidRequest {
+            detail: "HTTP 400: bad".into()
+        })));
     }
 
     #[test]
@@ -6237,6 +6364,115 @@ mod answered_tests {
             assistant, "Hello world",
             "the prefix stays and the turn resumes"
         );
+    }
+
+    /// A session whose runtime reports quota to `registry` (QUOTA), instance id `local`.
+    async fn session_with_quota(
+        registry: Arc<crate::chat::provider::quota::QuotaRegistry>,
+        retries: u32,
+    ) -> (FakeProvider, Arc<AgentSessionHandle>, Arc<Host>) {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        runtime.set_quota(registry);
+        let provider = FakeProvider::new();
+        let host = Arc::new(Host::default());
+        let handle = runtime
+            .adopt(
+                "not-a-uuid",
+                "local",
+                provider.session(),
+                1,
+                "claude_code",
+                serde_json::json!({}),
+                Some(host.clone() as Arc<dyn TurnServices>),
+            )
+            .await;
+        handle.configure_retry(RetryConfig {
+            max_attempts: retries,
+            initial_delay_ms: 5,
+            backoff_multiplier: 1.0,
+        });
+        (provider, handle, host)
+    }
+
+    /// QUOTA: what the provider says about the limits of its account (Claude Code's
+    /// `rate_limit_event`, mapped by nexus to `AgentEvent::Quota`) reaches the registry the router
+    /// reads, in the middle of a turn that goes on and ends normally; a `rejected` one holds the
+    /// instance out until its reset.
+    #[tokio::test]
+    async fn a_quota_event_of_the_provider_reaches_the_registry_and_the_turn_goes_on() {
+        use crate::chat::provider::limits::ManualClock;
+        use nexus_claude::agent::{QuotaSnapshot, QuotaStatus, QuotaWindow};
+        let clock = Arc::new(ManualClock::at("2026-10-21T10:00:00Z"));
+        let registry =
+            Arc::new(crate::chat::provider::quota::QuotaRegistry::new().with_clock(clock));
+        let (provider, handle, host) = session_with_quota(registry.clone(), 0).await;
+        let reset = 1_792_836_000_000_u64; // 2026-10-24T10:00:00Z
+        play_events(
+            &provider,
+            &handle,
+            vec![vec![
+                AgentEvent::Quota {
+                    quota: QuotaSnapshot::live(vec![QuotaWindow {
+                        kind: "seven_day".into(),
+                        utilization: Some(1.0),
+                        resets_at_ms: Some(reset),
+                        status: QuotaStatus::Exhausted,
+                    }]),
+                },
+                text("still answered"),
+                done(false, None),
+            ]],
+        )
+        .await;
+        assert_eq!(host.seen(), [true], "the turn went on and was answered");
+        let held = registry
+            .exhausted("local")
+            .expect("the instance is held out");
+        assert_eq!(held.resets_at_ms, reset);
+        assert_eq!(held.window.as_deref(), Some("seven_day"));
+    }
+
+    /// QUOTA: a rate limit that names a reset three days away is not run again (it would meet the
+    /// same refusal), is said to the person with the instant it serves again, and marks the
+    /// instance — but it is not the model failing: the turn's ending feeds no failure to the arm.
+    #[tokio::test]
+    async fn a_rate_limit_with_a_far_reset_ends_the_turn_says_when_and_marks_the_instance() {
+        let registry = Arc::new(crate::chat::provider::quota::QuotaRegistry::new());
+        let (provider, handle, host) = session_with_quota(registry.clone(), 3).await;
+        let reset = wall_clock_ms() + 3 * 86_400_000;
+        let seen = play_events(
+            &provider,
+            &handle,
+            vec![vec![done(
+                true,
+                Some(ProviderError::RateLimited {
+                    retry_after_ms: None,
+                    resets_at_ms: Some(reset),
+                }),
+            )]],
+        )
+        .await;
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap().len(),
+            1,
+            "three retries were allowed, none is useful against a quota used up"
+        );
+        assert_eq!(host.seen(), [false]);
+        assert_eq!(registry.exhausted("local").unwrap().resets_at_ms, reset);
+        let message = seen
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::Result {
+                    is_error: true,
+                    error_message,
+                    ..
+                } => error_message.clone(),
+                _ => None,
+            })
+            .expect("the failure is said on the wire");
+        assert!(message.contains("serves again at"), "{message}");
+        assert!(message.contains("nothing is switched for you"), "{message}");
     }
 
     /// A2/D1: partial text then a non-retryable failure keeps the old behaviour —

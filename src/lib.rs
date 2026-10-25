@@ -1776,8 +1776,21 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         event_bus.clone() as Arc<dyn events::EventEmitter>,
         orchestrator.neo4j_arc(),
     );
+    // What the providers say about their accounts' limits, and the refusals that date them
+    // (QUOTA): one registry for the router, the sessions and the API, persisted in the graph so a
+    // restart does not forget that an account is out until Saturday.
+    let quota_registry = Arc::new(chat::provider::quota::QuotaRegistry::new().with_store(
+        Arc::new(chat::provider::quota::GraphQuotaStore::new(
+            orchestrator.neo4j_arc(),
+        )),
+    ));
+    match quota_registry.load().await {
+        Ok(count) => tracing::info!(count, "provider quotas loaded"),
+        Err(error) => tracing::warn!(%error, "provider quotas could not be loaded; starting empty"),
+    }
     let cognitive_routing =
         chat::provider::cognitive::decider::CognitiveRouting::new(cognitive_store.clone())
+            .with_quota(quota_registry.clone())
             .with_claude_code_catalog(model_catalog.clone())
             // Episodic memory: the conversation segments and boundaries outlive the
             // process. The store is lazy (no schema migration at startup); the field

@@ -24,6 +24,7 @@ use super::handlers::{AppError, OrchestratorState};
 use crate::auth::jwt::Claims;
 use crate::chat::provider::endpoint_guard::{validate_endpoint, EndpointPolicy};
 use crate::chat::provider::listing::{HealthEntry, ModelEntry, ProviderEntry, RemoteEntry};
+use crate::chat::provider::quota::QUOTA_PREFIX;
 use crate::chat::provider::resolver::CLAUDE_CODE;
 use crate::chat::provider::settings::{
     self as st, ConsentRecord, InstanceDraft, InstancePatch, InstanceRecord, ModelAlias,
@@ -698,14 +699,34 @@ pub async fn delete_provider(
 }
 
 /// Remove an instance on either surface: `true` when something was removed.
+///
+/// The instance's QUOTA goes with it (QUOTA). An id can be created again, and a quota that
+/// outlived its instance would hold the NEW one out until a reset nobody can explain — so both
+/// the stored document and, when the router runs, the live entry are dropped. The stored key is
+/// removed whether or not the chat router is up: the registry reloads it at startup otherwise.
 async fn instance_delete(state: &OrchestratorState, id: &str) -> Result<bool, AppError> {
     if id == CLAUDE_CODE {
         return Err(map_settings_error(SettingsError::Builtin));
     }
-    graph(state)
+    let removed = graph(state)
         .delete_llm_setting(GLOBAL, &format!("{INSTANCE_PREFIX}{id}"))
         .await
-        .map_err(AppError::Internal)
+        .map_err(AppError::Internal)?;
+    if removed {
+        if let Some(routing) = state
+            .chat_manager
+            .as_ref()
+            .and_then(|manager| manager.cognitive_routing())
+        {
+            routing.quota.clear(id);
+        }
+        // Idempotent, and the one that matters after a restart.
+        graph(state)
+            .delete_llm_setting(GLOBAL, &format!("{QUOTA_PREFIX}{id}"))
+            .await
+            .map_err(AppError::Internal)?;
+    }
+    Ok(removed)
 }
 
 /// GET /api/chat/providers/{id}/status — health of one instance.
@@ -1560,6 +1581,80 @@ mod agent_surface_tests {
     /// A person's session token.
     fn person() -> String {
         crate::test_helpers::test_bearer_token()
+    }
+
+    /// QUOTA: deleting an instance takes its quota with it. An id can be created again, and a
+    /// quota that outlived its instance would hold the NEW one out until a reset nobody can
+    /// explain. The stored document is what matters: the registry reloads it at startup.
+    #[tokio::test]
+    async fn deleting_an_instance_forgets_its_quota_so_a_new_one_starts_clean() {
+        use crate::chat::provider::quota::QUOTA_PREFIX;
+        use crate::neo4j::GraphStore;
+
+        let (app, graph) = app().await;
+        let id = "deepseek-spent";
+        let instance_key = format!("{INSTANCE_PREFIX}{id}");
+        let quota_key = format!("{QUOTA_PREFIX}{id}");
+        // An instance, and an account of it reported as used up until some instant.
+        graph
+            .put_llm_setting(GLOBAL, &instance_key, "{}")
+            .await
+            .unwrap();
+        graph
+            .put_llm_setting(
+                GLOBAL,
+                &quota_key,
+                r#"{"windows":[],"source":"live","observed_at_ms":1792500000000,
+                    "exhaustion":{"resets_at_ms":1792900000000,"reset_known":true,
+                    "cause":"rate_limited"}}"#,
+            )
+            .await
+            .unwrap();
+
+        let gone = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/chat/providers/{id}"))
+                    .header("authorization", person())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), axum::http::StatusCode::NO_CONTENT);
+
+        assert!(
+            graph
+                .get_llm_setting(GLOBAL, &instance_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "the instance itself is gone"
+        );
+        assert!(
+            graph
+                .get_llm_setting(GLOBAL, &quota_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "its quota is gone too, or a new instance of the same id inherits it"
+        );
+
+        // The same id created again starts with nothing known about its account.
+        graph
+            .put_llm_setting(GLOBAL, &instance_key, "{}")
+            .await
+            .unwrap();
+        assert!(
+            graph
+                .get_llm_setting(GLOBAL, &quota_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "no quota is resurrected with the id"
+        );
     }
 
     /// A chat session's token, its permission ceiling signed into it (B21).

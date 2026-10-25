@@ -22,6 +22,7 @@ use super::profile_handlers;
 use super::project_handlers;
 use super::protocol_handlers;
 use super::provider_handlers;
+use super::quota_handlers;
 use super::reason_handlers;
 use super::refs_handlers;
 use super::registry_handlers;
@@ -2148,6 +2149,19 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/chat/providers/{id}/limits",
             get(provider_handlers::provider_limits),
+        )
+        // QUOTA: until when an account refuses, and the windows the provider reports. The PUT is a
+        // person's entry for a provider that exposes nothing (human only, like every mutation
+        // under /api/chat/providers).
+        .route(
+            "/api/chat/provider-quotas",
+            get(quota_handlers::list_quotas),
+        )
+        .route(
+            "/api/chat/providers/{id}/quota",
+            get(quota_handlers::get_quota)
+                .put(quota_handlers::put_quota)
+                .delete(quota_handlers::delete_quota),
         )
         .route(
             "/api/chat/providers/{id}/models",

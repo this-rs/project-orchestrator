@@ -47,6 +47,22 @@ pub struct ModelFacts {
     pub allowed_for_project: bool,
     /// The tools run inside a sandbox.
     pub sandboxed: bool,
+    /// The account refuses until this instant: the provider's own report, a refusal that named
+    /// its reset, or a person's entry (QUOTA). Not health: an exhausted account answers, and says
+    /// no. `None` when nothing is known, or once the reset has passed.
+    pub quota_exhausted: Option<QuotaExhaustion>,
+    /// How full this instance's fullest window is (`0.0..=1.0`), when a report says so (QUOTA).
+    /// Only a soft preference in the scorer: `None` is "nobody measured", never "empty".
+    pub quota_utilization: Option<f64>,
+}
+
+/// Until when an account refuses (`QuotaRegistry::exhausted`, as the filter reads it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaExhaustion {
+    /// The instant it serves again (epoch ms).
+    pub resets_at_ms: u64,
+    /// The window that is full, when one is named (`seven_day`).
+    pub window: Option<String>,
 }
 
 impl ModelFacts {
@@ -71,6 +87,8 @@ impl ModelFacts {
             healthy,
             allowed_for_project,
             sandboxed: caps.sandbox != SandboxLevel::None,
+            quota_exhausted: None,
+            quota_utilization: None,
         }
     }
 
@@ -97,6 +115,15 @@ pub enum RejectReason {
     Remote,
     /// The project did not consent to this instance's origin.
     NotAllowed,
+    /// The account refuses until `resets_at_ms` (its quota is used up, QUOTA): not a health
+    /// failure, the instance is back by itself at that instant.
+    QuotaExhausted {
+        /// The instant it serves again (epoch ms).
+        resets_at_ms: u64,
+        /// The window that is full, when one is named.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<String>,
+    },
     /// The instance is unhealthy right now.
     Unhealthy,
     /// The request needs tools and the model cannot call them.
@@ -133,6 +160,7 @@ impl RejectReason {
         match self {
             Self::Remote => "remote",
             Self::NotAllowed => "not_allowed",
+            Self::QuotaExhausted { .. } => "quota_exhausted",
             Self::Unhealthy => "unhealthy",
             Self::NoTools => "no_tools",
             Self::ContextTooSmall { .. } => "context_too_small",
@@ -229,6 +257,21 @@ pub fn claude_code_facts(
         .collect()
 }
 
+/// Marks every pair of `pool` whose instance refuses right now, at the registry's clock (QUOTA).
+/// Called each time a pool is built: an instance whose reset has passed is simply not marked
+/// any more, and is eligible again without anyone doing anything.
+pub fn apply_quota(pool: &mut [ModelFacts], quota: &crate::chat::provider::quota::QuotaRegistry) {
+    for facts in pool {
+        facts.quota_exhausted = quota
+            .exhausted(&facts.provider_id)
+            .map(|held| QuotaExhaustion {
+                resets_at_ms: held.resets_at_ms,
+                window: held.window,
+            });
+        facts.quota_utilization = quota.pressure(&facts.provider_id);
+    }
+}
+
 /// A pair that was not eligible, and why.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rejected {
@@ -264,6 +307,13 @@ fn check(signature: &TaskSignature, facts: &ModelFacts) -> Option<RejectReason> 
     }
     if !facts.allowed_for_project {
         return Some(RejectReason::NotAllowed);
+    }
+    // Before health: an exhausted account is healthy, and the reason must say when it is back.
+    if let Some(quota) = &facts.quota_exhausted {
+        return Some(RejectReason::QuotaExhausted {
+            resets_at_ms: quota.resets_at_ms,
+            window: quota.window.clone(),
+        });
     }
     if facts.healthy == Some(false) {
         return Some(RejectReason::Unhealthy);
@@ -408,6 +458,8 @@ mod tests {
             healthy: Some(true),
             allowed_for_project: true,
             sandboxed: false,
+            quota_exhausted: None,
+            quota_utilization: None,
         }
     }
 
