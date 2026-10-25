@@ -279,10 +279,83 @@ pub fn wire_tool_policy(policy: &ToolPolicy) -> serde_json::Value {
     serde_json::to_value(policy).unwrap_or(serde_json::Value::Null)
 }
 
+/// The spend and token caps an engine can enforce, out of the ones asked: what it cannot enforce
+/// is not handed to it, since every engine refuses to OPEN a session with a cap it cannot hold
+/// (Codex and ACP refuse any limit, `unsupported("limits")`; the native harness refuses a spend
+/// cap for a model without a price, `unsupported("cost")`). A delegation carries both caps
+/// (PYSR-3) and must still open on such an engine (mono-harness rule): it stays bounded by its
+/// own delay. Returns `(max_tokens, max_cost_usd, dropped)`, `dropped` naming the caps left out.
+pub fn enforceable_limits(
+    kind: nexus_claude::agent::ProviderKind,
+    cost: nexus_claude::agent::CostBasis,
+    max_tokens: Option<u64>,
+    max_cost_usd: Option<f64>,
+) -> (Option<u64>, Option<f64>, Vec<&'static str>) {
+    use nexus_claude::agent::{CostBasis, ProviderKind};
+    let mut dropped = Vec::new();
+    let no_limits = matches!(kind, ProviderKind::Codex | ProviderKind::Acp);
+    let max_tokens = match max_tokens {
+        Some(_) if no_limits => {
+            dropped.push("max_tokens");
+            None
+        }
+        other => other,
+    };
+    let max_cost_usd = match max_cost_usd {
+        Some(_) if no_limits || cost == CostBasis::Unknown => {
+            dropped.push("max_cost_usd");
+            None
+        }
+        other => other,
+    };
+    (max_tokens, max_cost_usd, dropped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nexus_claude::agent::{PolicyDecision, ToolCategory};
+
+    #[test]
+    fn an_engine_is_only_given_the_caps_it_can_enforce() {
+        use nexus_claude::agent::{CostBasis, ProviderKind};
+        // A priced native model and Claude Code keep both caps.
+        assert_eq!(
+            enforceable_limits(ProviderKind::Native, CostBasis::Priced, Some(9), Some(50.0)),
+            (Some(9), Some(50.0), vec![])
+        );
+        assert_eq!(
+            enforceable_limits(
+                ProviderKind::ClaudeCode,
+                CostBasis::Reported,
+                None,
+                Some(50.0)
+            ),
+            (None, Some(50.0), vec![])
+        );
+        // A native model without a price keeps the token cap, not the spend cap.
+        assert_eq!(
+            enforceable_limits(
+                ProviderKind::Native,
+                CostBasis::Unknown,
+                Some(9),
+                Some(50.0)
+            ),
+            (Some(9), None, vec!["max_cost_usd"])
+        );
+        // Codex and ACP take no limit at all.
+        for kind in [ProviderKind::Codex, ProviderKind::Acp] {
+            assert_eq!(
+                enforceable_limits(kind, CostBasis::Subscription, Some(9), Some(50.0)),
+                (None, None, vec!["max_tokens", "max_cost_usd"])
+            );
+        }
+        // Nothing asked, nothing dropped.
+        assert_eq!(
+            enforceable_limits(ProviderKind::Acp, CostBasis::Unknown, None, None),
+            (None, None, vec![])
+        );
+    }
 
     const TABLE: [(&str, PolicyMode, &str); 11] = [
         ("default", PolicyMode::Ask, "default"),
