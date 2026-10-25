@@ -739,6 +739,7 @@ Manage tasks. Actions: list, create, get, update, delete, get_next, add_dependen
 | get_prompt | `plan_id` (req), `task_id` (req) | Generate implementation prompt |
 | build_prompt | `plan_id` (req), `task_id` (req), `custom_sections` (array of strings) | Build implementation prompt with custom sections appended |
 | enrich | `task_id` (req) | Enrich task with auto-generated context (affected files, code references) |
+
 ## day_plan
 Manage the user's day plan. Actions: read, add, remove, reorder, move_to_tomorrow
 
@@ -3055,8 +3056,8 @@ mod tests {
     fn test_tool_groups_cover_all_mega_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 32,
-            "TOOL_GROUPS must cover exactly 32 unique mega-tools (got {}). \
+            count, 33,
+            "TOOL_GROUPS must cover exactly 33 unique mega-tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
