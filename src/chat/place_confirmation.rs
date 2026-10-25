@@ -342,6 +342,18 @@ impl<T: Clone> PlacementBook<T> {
         Ok(pending.remove(&id).expect("checked live"))
     }
 
+    /// The pending placements of one owner, not expired. Used by the listing endpoint so a page
+    /// reload can re-show the « exécute dans X » cards.
+    pub fn list_for_owner(&self, owner: &str, now: DateTime<Utc>) -> Vec<Pending<T>> {
+        let mut pending = self.lock();
+        pending.retain(|_, p| p.expires_at > now);
+        pending
+            .values()
+            .filter(|p| p.owner == owner)
+            .cloned()
+            .collect()
+    }
+
     /// The person says no: the placement is dropped.
     pub fn reject(
         &self,
@@ -602,5 +614,51 @@ mod tests {
             book.confirm_for_owner(id, SUB, "/work/x", Utc::now()),
             Err(PlacementError::NoPersonInFront(_))
         ));
+    }
+
+    #[test]
+    fn list_for_owner_returns_only_that_persons_pending_placements() {
+        let book: PlacementBook<()> = PlacementBook::new();
+        let now = Utc::now();
+        let other = "33333333-3333-3333-3333-333333333333";
+        // Two placements for SUB, one for `other`.
+        book.request(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            SUB.into(),
+            Requester::Person { sub: SUB.into() },
+            place("/a"),
+            (),
+            now,
+        )
+        .unwrap();
+        book.request(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            SUB.into(),
+            Requester::Person { sub: SUB.into() },
+            place("/b"),
+            (),
+            now,
+        )
+        .unwrap();
+        book.request(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            other.into(),
+            Requester::Person { sub: other.into() },
+            place("/c"),
+            (),
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(book.list_for_owner(SUB, now).len(), 2);
+        assert_eq!(book.list_for_owner(other, now).len(), 1);
+        assert_eq!(book.list_for_owner("nobody", now).len(), 0);
+
+        // Expired placements are pruned.
+        let later = now + PENDING_TTL + chrono::Duration::seconds(1);
+        assert!(book.list_for_owner(SUB, later).is_empty());
     }
 }

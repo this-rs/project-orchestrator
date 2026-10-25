@@ -18,7 +18,7 @@
 use std::sync::LazyLock;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -92,6 +92,10 @@ pub struct ExecutionPlaceView {
     pub owner: String,
     /// `session:<uuid>` or `person:<sub>`.
     pub requested_by: String,
+    /// The task the delegation belongs to.
+    pub task_id: Uuid,
+    /// The plan the delegation belongs to.
+    pub plan_id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
 }
@@ -108,6 +112,8 @@ impl ExecutionPlaceView {
             branch: meta.place.branch.clone(),
             owner: meta.owner.clone(),
             requested_by: meta.requested_by.clone(),
+            task_id: meta.task_id,
+            plan_id: meta.plan_id,
             expires_at,
         }
     }
@@ -536,6 +542,50 @@ pub async fn reject_execution_place(
     })))
 }
 
+/// Query parameters for `GET /api/execution-places`.
+#[derive(Debug, Deserialize)]
+pub struct ListExecutionPlacesQuery {
+    pub status: Option<String>,
+}
+
+/// GET /api/execution-places?status=pending — the pending placements for the calling person.
+///
+/// Reserved to a person signed in with their own token: an agent token gets 403. Returns only the
+/// placements whose `owner` matches the caller's `sub`, never anyone else's. The `place_confirmation`
+/// book is the single source; no second store is introduced.
+pub async fn list_pending_execution_places(
+    State(state): State<OrchestratorState>,
+    claims: Option<axum::Extension<Claims>>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<ListExecutionPlacesQuery>,
+) -> Result<Json<Vec<ExecutionPlaceView>>, AppError> {
+    match query.status.as_deref() {
+        Some("pending") => {}
+        Some(other) => {
+            return Err(AppError::BadRequest(format!(
+                "unsupported status filter: {other:?} (only \"pending\" is available)"
+            )));
+        }
+        None => {
+            return Err(AppError::BadRequest(
+                "missing required query parameter: status (expected \"pending\")".to_string(),
+            ));
+        }
+    }
+    let person = answering_person(&state, claims.as_ref().map(|c| &c.0), &headers)?;
+    let sub = match person {
+        Some(c) => &c.sub,
+        // No authentication configured: no identity, no placements to show.
+        None => return Ok(Json(vec![])),
+    };
+    let views: Vec<ExecutionPlaceView> = PLACEMENTS
+        .list_for_owner(sub, Utc::now())
+        .into_iter()
+        .map(|p| ExecutionPlaceView::of(&PlacementMeta::of_pending(&p), Some(p.expires_at)))
+        .collect();
+    Ok(Json(views))
+}
+
 /// GET /api/execution-places/{id} — a pending placement.
 pub async fn get_execution_place(
     Path(placement_id): Path<Uuid>,
@@ -922,6 +972,120 @@ mod tests {
             ]
         );
         assert!(PLACEMENTS.get(id, Utc::now()).is_none());
+    }
+
+    // ── GET /api/execution-places?status=pending ──────────────────────────────
+
+    fn query_pending() -> ListExecutionPlacesQuery {
+        ListExecutionPlacesQuery {
+            status: Some("pending".to_string()),
+        }
+    }
+
+    async fn list_for(
+        f: &Fixture,
+        claims: Claims,
+        query: ListExecutionPlacesQuery,
+    ) -> Result<Json<Vec<ExecutionPlaceView>>, AppError> {
+        list_pending_execution_places(
+            State(f.state.clone()),
+            Some(axum::Extension(claims)),
+            axum::http::HeaderMap::new(),
+            Query(query),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn list_pending_shows_only_the_callers_placements() {
+        // Use a unique owner so leaked placements from other tests (which share the
+        // static `PLACEMENTS` under coverage's single-process mode) don't interfere.
+        const LIST_OWNER: &str = "list-owner-11111111-1111-1111-1111-111111111111";
+        let f = fixture(Some(LIST_OWNER), None).await;
+        let pending = ask(&f).await.unwrap();
+        let id = pending.execution_place.placement_id;
+
+        // The owner sees their own placement.
+        let views = list_for(
+            &f,
+            Claims::person(LIST_OWNER, "p@example.org", "P"),
+            query_pending(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(views.0.len(), 1);
+        assert_eq!(views.0[0].placement_id, id);
+        assert_eq!(views.0[0].owner, LIST_OWNER);
+        assert!(views.0[0].expires_at.is_some());
+
+        // Another person sees nothing.
+        let views = list_for(
+            &f,
+            Claims::person("other-user", "o@example.org", "O"),
+            query_pending(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            views.0.is_empty(),
+            "another person must not see the owner's placements"
+        );
+
+        PLACEMENTS.discard(id);
+    }
+
+    #[tokio::test]
+    async fn list_pending_rejects_an_agent_token() {
+        let f = fixture(Some(OWNER), None).await;
+        let pending = ask(&f).await.unwrap();
+        let id = pending.execution_place.placement_id;
+
+        let mut agent = Claims::person(OWNER, "p@example.org", "P");
+        agent.token_type = Some(crate::auth::jwt::TOKEN_TYPE_AGENT_SESSION.to_string());
+        match list_for(&f, agent, query_pending()).await {
+            Err(AppError::Forbidden(m)) => {
+                assert!(m.contains("not_a_person"), "{m}");
+            }
+            other => panic!("an agent token must get 403, got {other:?}"),
+        }
+
+        PLACEMENTS.discard(id);
+    }
+
+    #[tokio::test]
+    async fn list_pending_requires_status_pending() {
+        let f = fixture(Some(OWNER), None).await;
+        let person = Claims::person(OWNER, "p@example.org", "P");
+
+        // Missing status → 400.
+        match list_for(
+            &f,
+            person.clone(),
+            ListExecutionPlacesQuery { status: None },
+        )
+        .await
+        {
+            Err(AppError::BadRequest(m)) => {
+                assert!(m.contains("status"), "{m}");
+            }
+            other => panic!("expected 400, got {other:?}"),
+        }
+
+        // Unknown status → 400.
+        match list_for(
+            &f,
+            person,
+            ListExecutionPlacesQuery {
+                status: Some("completed".to_string()),
+            },
+        )
+        .await
+        {
+            Err(AppError::BadRequest(m)) => {
+                assert!(m.contains("unsupported"), "{m}");
+            }
+            other => panic!("expected 400, got {other:?}"),
+        }
     }
 
     #[test]

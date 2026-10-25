@@ -22,7 +22,6 @@
 %%   temporaire) ; le chemin d'échec (launch_failed) est testé de bout en bout sur MockGraphStore ;
 %%   les placements en attente vivent en mémoire (perdus au redémarrage : il faut redemander) ;
 %%   un worktree laissé par un arrêt brutal du serveur n'est pas balayé au démarrage ;
-%%   aucune interface ne montre encore la question (événement CRUD execution_place_confirmation_required émis) ;
 %%   la Cypher n'a pas été exécutée contre un Neo4j réel.
 %% ---
 %% LEGENDE
@@ -56,6 +55,7 @@ flowchart TD
     GONE["✅ git worktree remove (sans --force) + branch -D ; journal removed<br/>test : a_clean_worktree_is_removed_with_its_branch, pushed_commits_do_not_keep_the_worktree"]
     REJ["✅ POST …/reject → journal rejected<br/>test : the_person_may_say_no"]
     READ["🟠 GET /api/tasks/{task}/execution-places — le journal, du plus ancien au plus récent"]
+    LIST["✅ GET /api/execution-places?status=pending — placements en attente de la personne appelante<br/>personne seulement (jeton agent → 403) ; filtre owner = claims.sub côté serveur ;<br/>status=pending requis ; lit le PlacementBook en mémoire (un seul store, place_confirmation)<br/>test : list_pending_shows_only_the_callers_placements, list_pending_rejects_an_agent_token, list_pending_requires_status_pending"]
 
     REQ --> WHO
     WHO -- personne --> NOP
@@ -71,3 +71,4 @@ flowchart TD
     REL -- travail en jeu --> KEPT
     REL -- rien à perdre --> GONE
     AUD -.-> READ
+    BOOK -.-> LIST
