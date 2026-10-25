@@ -1643,8 +1643,8 @@ mod tests {
         let tools = all_tools();
         assert_eq!(
             tools.len(),
-            32,
-            "Expected 32 mega-tools, got {}",
+            33,
+            "Expected 33 mega-tools, got {}",
             tools.len()
         );
     }
