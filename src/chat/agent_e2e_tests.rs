@@ -13596,6 +13596,8 @@ mod codex_switch {
         script: std::path::PathBuf,
         /// Root passed to `with_codex_home`: each instance home is `<root>/<instance-id>`.
         home_root: std::path::PathBuf,
+        /// Path where `fake_codex` records every incoming request (FAKE_CODEX_RECORD).
+        record: std::path::PathBuf,
     }
 
     impl FakeCodex {
@@ -13637,14 +13639,16 @@ mod codex_switch {
             let instance_home = home_root.join("iso4-codex");
             std::fs::create_dir_all(&instance_home).unwrap();
             std::fs::write(instance_home.join("auth.json"), b"{}").unwrap();
+            let record = dir.path().join("fake-codex-record.jsonl");
             let fake = fake_bin("fake_codex");
             let script = dir.path().join("fake-codex-wrapper.sh");
             std::fs::write(
                 &script,
                 format!(
-                    "#!/bin/sh\nFAKE_CODEX_TRANSCRIPT='{}' FAKE_CODEX_MAX_RUNTIME_MS=120000 \
-                     exec '{}' \"$@\"\n",
+                    "#!/bin/sh\nFAKE_CODEX_TRANSCRIPT='{}' FAKE_CODEX_RECORD='{}' \
+                     FAKE_CODEX_MAX_RUNTIME_MS=120000 exec '{}' \"$@\"\n",
                     transcript.display(),
+                    record.display(),
                     fake.display(),
                 ),
             )
@@ -13658,6 +13662,7 @@ mod codex_switch {
                 _dir: dir,
                 script,
                 home_root,
+                record,
             }
         }
 
@@ -13668,6 +13673,15 @@ mod codex_switch {
         /// Root for `with_codex_home`: each instance's home is `<root>/<instance-id>`.
         fn home_root(&self) -> &std::path::Path {
             &self.home_root
+        }
+
+        /// Every request recorded by `fake_codex` (FAKE_CODEX_RECORD).
+        fn recorded(&self) -> Vec<Value> {
+            std::fs::read_to_string(&self.record)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .collect()
         }
     }
 
@@ -13781,6 +13795,14 @@ mod codex_switch {
         })
         .await;
         assert!(said.is_some(), "Codex answered after the switch");
+        // ISO4: verify that fake_codex received the relayed native history.
+        assert!(
+            fake_codex
+                .recorded()
+                .iter()
+                .any(|e| e["kind"] == "in" && e["params"].to_string().contains("<conversation_relay")),
+            "fake_codex received the relayed native history in the switch request"
+        );
     }
 
     /// ISO4 — Codex → native: the thread keeps its id and the native side receives the

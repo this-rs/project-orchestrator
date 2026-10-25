@@ -53,6 +53,7 @@ use super::agent_e2e_tests::{
 };
 use super::agent_runtime::ProviderSource;
 use super::config::{ChatConfig, ProviderPath};
+use super::provider::settings::{process_origin, AcpCommand, InstanceRecord};
 use super::manager::ChatManager;
 use super::types::ChatEvent;
 use crate::documents::store::DocumentStore;
@@ -139,6 +140,11 @@ enum Verdict {
     Ok,
     Gap(Cause),
     NotMeasured,
+    /// The function is declared as a gap in [`EXPECTED`] but the parity scenario was
+    /// NOT run on this engine (no transcript-based fake exists yet). Distinct from
+    /// [`Verdict::Gap`] (measured) and [`Verdict::NotMeasured`] (fundamentally impossible
+    /// to exercise). Rendered as `declared (cause, task)` in the matrix.
+    Declared(Cause),
 }
 
 /// What [`EXPECTED`] says of a cell that is not `ok`.
@@ -337,7 +343,7 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
     (Engine::Codex, "background_tasks", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_NO_BG }),
     (Engine::Codex, "cancel_task", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: CODEX_NO_BG }),
     (Engine::Codex, "images", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "Codex v1 n'accepte pas les blocs image (A12)" }),
-    (Engine::Codex, "anthropic_messages", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "Codex utilise son propre moteur LLM, pas l'API Anthropic Messages" }),
+    (Engine::Codex, "anthropic_messages", Expect::NotMeasured { why: "Codex utilise son propre moteur LLM (API Codex v1), pas l'API Anthropic Messages ; concept sans objet sur ce moteur" }),
     (Engine::Codex, "ask_user_question", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "requestUserInput est expérimental en v1 ; le backend le synthétise mais ne peut pas l'interroger via Codex" }),
     // ── Codex — not_measured (transcript-based fake_codex needs per-function JSONL) ──
     (Engine::Codex, "compaction", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
@@ -375,8 +381,9 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
     (Engine::Acp, "hooks.subagent_stop", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
     (Engine::Acp, "hooks.notification", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: ACP_HOOKS }),
     (Engine::Acp, "nexus_tools", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "ACP utilise son propre environnement d'outils ; nexus-tools n'est pas joint à une session ACP" }),
-    (Engine::Acp, "anthropic_messages", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "ACP utilise son propre modèle LLM, pas l'API Anthropic Messages" }),
-    (Engine::Acp, "ask_user_question", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "ACP n'a pas de mécanisme natif de question utilisateur ; le backend le synthétise (§5)" }),
+    (Engine::Acp, "anthropic_messages", Expect::NotMeasured { why: "ACP utilise son propre moteur LLM (protocole ACP), pas l'API Anthropic Messages ; concept sans objet sur ce moteur" }),
+    (Engine::Acp, "ask_user_question", Expect::NotMeasured { why: "le backend synthétise la question via le harnais natif ; non exercé dans le scénario de parité (transcripts ACP non adaptés, ISO4)" }),
+    (Engine::Acp, "enrichment", Expect::NotMeasured { why: "ACP injecte le contexte PO via le bloc system du premier session/prompt ; la vérification parity cherche PLAN_TITLE dans les requêtes OpenAI qui n'existent pas pour ACP ; non exercé dans ce scénario (ISO4)" }),
     (Engine::Acp, "compaction.manual", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "/compact n'est pas transmis à un agent ACP : la compaction manuelle n'a pas de canal côté harnais" }),
     // ── ACP — ok (verified by separate tests, #924) ──────────────────────
     // `provider_switch.relay`: verified by `a_conversation_moves_from_*_to_acp_*` (#924).
@@ -571,6 +578,24 @@ fn audit(run: &Run<'_>, expected: &dyn Fn(Engine, &str) -> Option<Expect>) -> Ve
                     "{} / {function}: not measured, and not declared so",
                     engine.label()
                 )),
+                (Verdict::Declared(cause), Some(Expect::Gap { cause: declared, .. })) => {
+                    if cause != declared {
+                        problems.push(format!(
+                            "{} / {function}: declared cause {} but EXPECTED says {} — update EXPECTED",
+                            engine.label(),
+                            cause.label(),
+                            declared.label()
+                        ));
+                    }
+                }
+                (Verdict::Declared(_), None) => problems.push(format!(
+                    "{} / {function}: declared but EXPECTED says ok — use Verdict::Ok or add to EXPECTED",
+                    engine.label()
+                )),
+                (Verdict::Declared(_), Some(Expect::NotMeasured { .. })) => problems.push(format!(
+                    "{} / {function}: declared gap but EXPECTED says not_measured — use Verdict::NotMeasured",
+                    engine.label()
+                )),
             }
         }
     }
@@ -585,6 +610,10 @@ fn cell(engine: Engine, function: &str, m: &Measures) -> String {
         }
         (Some(Verdict::Gap(cause)), _) => format!("gap ({}, NON DÉCLARÉ)", cause.label()),
         (Some(Verdict::NotMeasured), _) => "not_measured".to_string(),
+        (Some(Verdict::Declared(_)), Some(Expect::Gap { cause, task, .. })) => {
+            format!("declared ({}, {task})", cause.label())
+        }
+        (Some(Verdict::Declared(cause)), _) => format!("declared ({}, ?)", cause.label()),
         (None, _) => "?".to_string(),
     }
 }
@@ -619,9 +648,11 @@ fn render(run: &Run<'_>) -> String {
          replay de transcripts JSONL ; verdicts par fonction déclarés dans `EXPECTED` (ISO4).\n\n\
          `ok` : mesuré et conforme. `gap (cause, tâche)` : mesuré absent, cause `harnais` \
          (le backend ou le harnais nexus ne le fait pas) ou `modèle` (le modèle ne le peut pas), \
-         fermé par la tâche PO nommée (plan 5ad54c48 « Parité totale », ou e87abcc2 « Claude Code devient optionnel » pour une tâche M…). `not_measured` : les faux binaires ne \
-         permettent pas de l'exercer sur ce moteur (raison ci-dessous). Un écart non déclaré, \
-         ou un écart déclaré qui disparaît, fait échouer le test.\n\n",
+         fermé par la tâche PO nommée (plan 5ad54c48 « Parité totale », ou e87abcc2 « Claude Code devient optionnel » pour une tâche M…). `declared (cause, tâche)` : écart déclaré \
+         dans EXPECTED mais le scénario n'a PAS tourné sur ce moteur (pas de transcript dédié) ; \
+         distinct de `gap` (mesuré) et de `not_measured` (impossible à exercer). `not_measured` : \
+         les faux binaires ne permettent pas de l'exercer sur ce moteur (raison ci-dessous). Un \
+         écart non déclaré, ou un écart déclaré qui disparaît, fait échouer le test.\n\n",
     );
     let labels: Vec<&str> = run.iter().map(|(engine, _)| engine.label()).collect();
     out.push_str(&format!(
@@ -2939,10 +2970,14 @@ fn the_same_scenario_on_both_engines_gives_the_parity_matrix() {
                 .block_on(async {
                     let (cc, na) = run_naming_the_column(ProviderPath::Legacy).await;
                     let (cca, _) = run_naming_the_column(ProviderPath::Agent).await;
-                    // New harnesses: all functions declared not_measured (YARDSTICK).
-                    let codex = as_declared(Engine::Codex);
+                    // Codex: provider_switch.relay measured via mini native→Codex run;
+                    // all other functions declared (transcript per function not yet written, ISO4).
+                    let codex = run_codex_column().await;
+                    // opencode: no fake_opencode, fully declared not_measured (YARDSTICK).
                     let opencode = as_declared(Engine::OpenCode);
-                    let acp = as_declared(Engine::Acp);
+                    // ACP: provider_switch.relay measured via mini native→ACP run;
+                    // all other functions declared or not_measured per EXPECTED (ISO4).
+                    let acp = run_acp_column().await;
                     gate(&[
                         (Engine::ClaudeCode, &cc),
                         (Engine::ClaudeCodeAgent, &cca),
@@ -4922,6 +4957,7 @@ async fn anthropic_turn(stage: &Stage, manager: &Arc<ChatManager>, cwd: &str) ->
 // ============================================================================
 
 /// A complete measure: every function `ok`, but the declared cells as declared.
+/// Used by unit tests (tautological by design: mirrors EXPECTED exactly).
 fn as_declared(engine: Engine) -> Measures {
     let mut m = Measures::default();
     for (function, _) in FUNCTIONS {
@@ -4932,6 +4968,410 @@ fn as_declared(engine: Engine) -> Measures {
         };
         m.set(function, verdict, "synthetic");
     }
+    m
+}
+
+/// Base measures for an engine where only a SUBSET of functions are actually run.
+/// Gap entries from EXPECTED become `Declared(cause)`, not_measured stay `NotMeasured`.
+/// Functions where EXPECTED returns `None` (expected ok) are NOT set here: the caller
+/// must set them via the actual mini-run measurement.
+fn declared_only(engine: Engine) -> Measures {
+    let mut m = Measures::default();
+    for (function, _) in FUNCTIONS {
+        match expected(engine, function) {
+            None => {} // caller sets this via real measurement
+            Some(Expect::Gap { cause, .. }) => m.set(
+                function,
+                Verdict::Declared(cause),
+                "declared in EXPECTED, scenario not run on this engine",
+            ),
+            Some(Expect::NotMeasured { .. }) => m.set(
+                function,
+                Verdict::NotMeasured,
+                "not_measured (declared in EXPECTED)",
+            ),
+        }
+    }
+    m
+}
+
+/// Mini-run that measures `provider_switch.relay` on ACP by opening a native session then
+/// switching to fake_acp, and fills the rest via [`declared_only`].
+async fn run_acp_column() -> Measures {
+    use std::collections::BTreeMap;
+    let dir = tempfile::TempDir::new().unwrap();
+    let d = dir.path();
+
+    // ACP transcript — "ignoring" mode: initialize → session/new → session/prompt → reply.
+    let transcript_lines = concat!(
+        "{\"op\":\"expect\",\"method\":\"initialize\",\"reply\":{\"protocolVersion\":1,",
+        "\"agentCapabilities\":{\"loadSession\":true,\"promptCapabilities\":{\"image\":true,",
+        "\"audio\":false,\"embeddedContext\":true},\"mcpCapabilities\":{\"http\":false,",
+        "\"sse\":false}},\"agentInfo\":{\"name\":\"openclaw-acp\",\"version\":\"2026.9.9\"},",
+        "\"authMethods\":[]}}\n",
+        "{\"op\":\"expect\",\"method\":\"session/new\",\"reply\":{\"sessionId\":\"oc-1\"}}\n",
+        "{\"op\":\"expect\",\"method\":\"session/prompt\",\"defer\":\"p\"}\n",
+        "{\"op\":\"notify\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"oc-1\",",
+        "\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",",
+        "\"text\":\"hello from openclaw\"}}}}\n",
+        "{\"op\":\"reply\",\"to\":\"p\",\"result\":{\"stopReason\":\"end_turn\"}}\n",
+    );
+    let transcript = d.join("acp-relay.jsonl");
+    std::fs::write(&transcript, transcript_lines).unwrap();
+
+    let record_path = d.join("acp-relay-record.jsonl");
+    let script = d.join("fake-acp-relay.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nFAKE_ACP_TRANSCRIPT='{}' FAKE_ACP_RECORD='{}' \
+             FAKE_ACP_MAX_RUNTIME_MS=60000 exec '{}' \"$@\"\n",
+            transcript.display(),
+            record_path.display(),
+            fake_bin("fake_acp").display(),
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let acp_homes = d.join("acp-homes");
+    std::fs::create_dir_all(&acp_homes).unwrap();
+
+    // Minimal native (FakeOpenAi) script: probe + one turn.
+    let native_script = json!([
+        sse_route("Call the ping tool now", vec![
+            delta(json!({"tool_calls": [{"index": 0, "id": "rp1",
+                "function": {"name": "ping", "arguments": "{}"}}]})),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+            json!("[DONE]"),
+        ]),
+        json!({"method": "GET", "path": "/v1/models", "status": 200,
+               "body": {"object": "list", "data": [{"id": "m", "context_length": 32000}]}}),
+        sse_route("hi there", vec![
+            delta(json!({"content": "hello from native"})),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 10,
+                "completion_tokens": 3, "total_tokens": 13}}),
+            json!("[DONE]"),
+        ]),
+    ]);
+    let fake = FakeOpenAi::start(native_script);
+
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "relay-mini", "local", &fake.origin()).await;
+
+    let acp_origin = process_origin("acp", Some("acp-bridge"));
+    store_instance(
+        &graph,
+        &InstanceRecord {
+            id: "parity-acp".into(),
+            kind: "acp".into(),
+            preset: Some("acp-bridge".into()),
+            label: "Parity ACP relay".into(),
+            base_url: String::new(),
+            origin: acp_origin.clone(),
+            default_model: Some("openclaw".into()),
+            cost_source: "unknown".into(),
+            credential_ref: "none".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    consent(&graph, "relay-mini", "parity-acp", &acp_origin).await;
+
+    let state = mock_app_state();
+    let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+    let manager = ChatManager::new_without_memory(
+        dyn_graph,
+        state.meili,
+        ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: None,
+            jwt_secret: Some("parity-secret-parity-secret-parity".to_string()),
+            ..Default::default()
+        },
+    )
+    .with_acp_commands({
+        let mut cmds = BTreeMap::new();
+        cmds.insert(
+            "acp-bridge".to_string(),
+            AcpCommand {
+                argv: vec![
+                    script.display().to_string(),
+                    "acp".into(),
+                    "--token-file".into(),
+                    "/dev/null".into(),
+                ],
+                per_session_mcp: Some(false),
+            },
+        );
+        cmds
+    })
+    .with_acp_homes(&acp_homes);
+
+    // Open native session, wait for first turn to complete.
+    let created = manager
+        .create_session(&request(Some("local"), Some("relay-mini"), "default"))
+        .await
+        .unwrap_or_else(|e| panic!("run_acp_column: native create_session failed: {e:#}"));
+    let sid = created.session_id;
+    let mut rx = manager.subscribe(&sid).await.unwrap();
+    loop {
+        match tokio::time::timeout(
+            Duration::from_secs(20),
+            rx.recv(),
+        )
+        .await
+        {
+            Ok(Ok(ChatEvent::Result { .. })) => break,
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) | Err(_) => panic!("run_acp_column: timed out waiting for native Result"),
+        }
+    }
+
+    // Switch to ACP.
+    manager
+        .switch_session_provider(&sid, "parity-acp", None, "relay check", None)
+        .await
+        .unwrap_or_else(|e| panic!("run_acp_column: switch to ACP failed: {e:#}"));
+
+    // Re-subscribe after the switch: the ACP session may use a fresh broadcast sender.
+    let mut rx = manager.subscribe(&sid).await.unwrap();
+
+    // Wait for ACP answer.
+    loop {
+        match tokio::time::timeout(
+            Duration::from_secs(20),
+            rx.recv(),
+        )
+        .await
+        {
+            Ok(Ok(ChatEvent::Result { .. })) => break,
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) | Err(_) => panic!("run_acp_column: timed out waiting for ACP Result"),
+        }
+    }
+
+    // Verify relay.
+    let recorded: Vec<Value> = std::fs::read_to_string(&record_path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .collect();
+    let relay_ok = recorded
+        .iter()
+        .any(|e| e["kind"] == "in" && e["params"].to_string().contains("<conversation_relay"));
+
+    let mut m = declared_only(Engine::Acp);
+    m.set(
+        "provider_switch.relay",
+        if relay_ok {
+            Verdict::Ok
+        } else {
+            Verdict::Gap(Cause::Harness)
+        },
+        format!(
+            "ACP enregistré {} requêtes ; relay présent dans params = {}",
+            recorded.len(),
+            relay_ok
+        ),
+    );
+    m
+}
+
+/// Mini-run that measures `provider_switch.relay` on Codex by opening a native session then
+/// switching to fake_codex, and fills the rest via [`declared_only`].
+async fn run_codex_column() -> Measures {
+    let dir = tempfile::TempDir::new().unwrap();
+    let d = dir.path();
+
+    // Codex transcript (one session: initialize → thread/start → turn/start → text → turn/completed).
+    let transcript = d.join("codex-relay.jsonl");
+    std::fs::write(
+        &transcript,
+        concat!(
+            "{\"op\":\"expect\",\"method\":\"initialize\",\"reply\":{\"userAgent\":\"fake_codex/0.130.0\",",
+            "\"codexHome\":\"/fake/codex-home\",\"platformFamily\":\"unix\",\"platformOs\":\"macos\"}}\n",
+            "{\"op\":\"expect_notification\",\"method\":\"initialized\"}\n",
+            "{\"op\":\"expect\",\"method\":\"thread/start\",\"reply\":{\"thread\":{\"id\":\"thr_r1\",",
+            "\"preview\":\"\",\"modelProvider\":\"openai\",\"createdAt\":1730910000},\"model\":\"gpt-fake\"}}\n",
+            "{\"op\":\"notify\",\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"thr_r1\",",
+            "\"preview\":\"\",\"modelProvider\":\"openai\",\"createdAt\":1730910000}}}\n",
+            "{\"op\":\"expect\",\"method\":\"turn/start\",\"reply\":{\"turn\":{\"id\":\"turn_r1\",",
+            "\"status\":\"inProgress\",\"items\":[],\"error\":null}}}\n",
+            "{\"op\":\"notify\",\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_r1\",",
+            "\"turn\":{\"id\":\"turn_r1\",\"status\":\"inProgress\",\"items\":[],\"error\":null}}}\n",
+            "{\"op\":\"notify\",\"method\":\"item/started\",\"params\":{\"threadId\":\"thr_r1\",",
+            "\"turnId\":\"turn_r1\",\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_r1\",\"text\":\"\"}}}\n",
+            "{\"op\":\"notify\",\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thr_r1\",",
+            "\"turnId\":\"turn_r1\",\"itemId\":\"msg_r1\",\"delta\":\"Hello from codex (relay)\"}}\n",
+            "{\"op\":\"notify\",\"method\":\"item/completed\",\"params\":{\"threadId\":\"thr_r1\",",
+            "\"turnId\":\"turn_r1\",\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_r1\",",
+            "\"text\":\"Hello from codex (relay)\"}}}\n",
+            "{\"op\":\"notify\",\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"thr_r1\",",
+            "\"turnId\":\"turn_r1\",\"tokenUsage\":{\"total\":{\"totalTokens\":50,\"inputTokens\":40,",
+            "\"cachedInputTokens\":0,\"outputTokens\":10,\"reasoningOutputTokens\":0},",
+            "\"last\":{\"totalTokens\":50,\"inputTokens\":40,\"cachedInputTokens\":0,",
+            "\"outputTokens\":10,\"reasoningOutputTokens\":0},\"modelContextWindow\":272000}}}\n",
+            "{\"op\":\"notify\",\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_r1\",",
+            "\"turn\":{\"id\":\"turn_r1\",\"status\":\"completed\",\"items\":[],\"error\":null}}}\n",
+        ),
+    )
+    .unwrap();
+
+    let record_path = d.join("codex-relay-record.jsonl");
+    let home_root = d.join("codex-homes");
+    let instance_home = home_root.join("parity-codex");
+    std::fs::create_dir_all(&instance_home).unwrap();
+    std::fs::write(instance_home.join("auth.json"), b"{}").unwrap();
+
+    let script = d.join("fake-codex-relay.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nFAKE_CODEX_TRANSCRIPT='{}' FAKE_CODEX_RECORD='{}' \
+             FAKE_CODEX_MAX_RUNTIME_MS=60000 exec '{}' \"$@\"\n",
+            transcript.display(),
+            record_path.display(),
+            fake_bin("fake_codex").display(),
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Minimal native (FakeOpenAi) script: probe + one turn.
+    let native_script = json!([
+        sse_route("Call the ping tool now", vec![
+            delta(json!({"tool_calls": [{"index": 0, "id": "cp1",
+                "function": {"name": "ping", "arguments": "{}"}}]})),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+            json!("[DONE]"),
+        ]),
+        json!({"method": "GET", "path": "/v1/models", "status": 200,
+               "body": {"object": "list", "data": [{"id": "m", "context_length": 32000}]}}),
+        sse_route("hi there", vec![
+            delta(json!({"content": "hello from native (codex relay)"})),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 10,
+                "completion_tokens": 5, "total_tokens": 15}}),
+            json!("[DONE]"),
+        ]),
+    ]);
+    let fake = FakeOpenAi::start(native_script);
+
+    let graph = Arc::new(MockGraphStore::new());
+    store_instance(&graph, &instance(&fake, "none")).await;
+    consent(&graph, "relay-codex", "local", &fake.origin()).await;
+
+    let codex_origin = process_origin("codex", None);
+    store_instance(
+        &graph,
+        &InstanceRecord {
+            id: "parity-codex".into(),
+            kind: "codex".into(),
+            label: "Parity Codex relay".into(),
+            origin: codex_origin.clone(),
+            default_model: Some("gpt-fake".into()),
+            cost_source: "unknown".into(),
+            credential_ref: "none".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    consent(&graph, "relay-codex", "parity-codex", &codex_origin).await;
+
+    let state = mock_app_state();
+    let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+    let manager = ChatManager::new_without_memory(
+        dyn_graph,
+        state.meili,
+        ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: fake_bin("fake_mcp"),
+            nexus_tools_path: None,
+            jwt_secret: Some("parity-secret-parity-secret-parity".to_string()),
+            ..Default::default()
+        },
+    )
+    .with_codex_program(&script)
+    .with_codex_home(&home_root);
+
+    // Open native session, wait for first turn to complete.
+    let created = manager
+        .create_session(&request(Some("local"), Some("relay-codex"), "default"))
+        .await
+        .unwrap_or_else(|e| panic!("run_codex_column: native create_session failed: {e:#}"));
+    let sid = created.session_id;
+    let mut rx = manager.subscribe(&sid).await.unwrap();
+    loop {
+        match tokio::time::timeout(
+            Duration::from_secs(20),
+            rx.recv(),
+        )
+        .await
+        {
+            Ok(Ok(ChatEvent::Result { .. })) => break,
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) | Err(_) => panic!("run_codex_column: timed out waiting for native Result"),
+        }
+    }
+
+    // Switch to Codex.
+    manager
+        .switch_session_provider(&sid, "parity-codex", None, "relay check", None)
+        .await
+        .unwrap_or_else(|e| panic!("run_codex_column: switch to Codex failed: {e:#}"));
+
+    // Re-subscribe after the switch: the Codex session may use a fresh broadcast sender.
+    let mut rx = manager.subscribe(&sid).await.unwrap();
+
+    // Wait for Codex answer.
+    loop {
+        match tokio::time::timeout(
+            Duration::from_secs(20),
+            rx.recv(),
+        )
+        .await
+        {
+            Ok(Ok(ChatEvent::Result { .. })) => break,
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) | Err(_) => panic!("run_codex_column: timed out waiting for Codex Result"),
+        }
+    }
+
+    // Verify relay.
+    let recorded: Vec<Value> = std::fs::read_to_string(&record_path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .collect();
+    let relay_ok = recorded
+        .iter()
+        .any(|e| e["kind"] == "in" && e["params"].to_string().contains("<conversation_relay"));
+
+    let mut m = declared_only(Engine::Codex);
+    m.set(
+        "provider_switch.relay",
+        if relay_ok {
+            Verdict::Ok
+        } else {
+            Verdict::Gap(Cause::Harness)
+        },
+        format!(
+            "Codex enregistré {} requêtes ; relay présent dans params = {}",
+            recorded.len(),
+            relay_ok
+        ),
+    );
     m
 }
 
