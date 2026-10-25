@@ -10426,7 +10426,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["method"], "GET");
-        assert_eq!(result["path"], "/api/day-plan?date=2026-10-25");
+        assert_eq!(result["path"], "/api/day-plan");
+        assert_eq!(result["query"], "date=2026-10-25");
     }
 
     #[tokio::test]
@@ -10450,7 +10451,7 @@ mod tests {
         assert_eq!(result["method"], "POST");
         let path = result["path"].as_str().unwrap();
         assert!(path.contains("/api/day-plan/tasks/"));
-        assert!(path.contains("?date="));
+        assert!(result["query"].as_str().unwrap().starts_with("date="));
     }
     #[tokio::test]
     async fn test_http_get_skill_health() {
