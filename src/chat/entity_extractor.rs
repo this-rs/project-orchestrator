@@ -69,6 +69,8 @@ pub enum ExtractionSource {
     Backtick,
     /// Matched a code keyword pattern (e.g. `fn build_prompt`, `struct FileNode`)
     CodePattern,
+    /// Matched a qualified Rust path written inline (e.g. `crate::chat::manager`)
+    QualifiedPath,
 }
 
 /// A validated entity — confirmed to exist in the Neo4j knowledge graph.
@@ -185,6 +187,13 @@ pub fn extract_entities(text: &str) -> Vec<ExtractedEntity> {
 
     // Strategy 3: Code keyword patterns (fn, struct, trait, enum, impl)
     for entity in extract_code_patterns(text) {
+        if seen.insert((entity.entity_type.clone(), entity.identifier.clone())) {
+            entities.push(entity);
+        }
+    }
+
+    // Strategy 4: Qualified Rust paths written inline (e.g. `crate::chat::manager`)
+    for entity in extract_qualified_paths(text) {
         if seen.insert((entity.entity_type.clone(), entity.identifier.clone())) {
             entities.push(entity);
         }
@@ -308,10 +317,14 @@ fn extract_backtick_identifiers(text: &str) -> Vec<ExtractedEntity> {
 
             // If it looks like a file path, classify it as File
             if is_file_path(trimmed) {
-                let normalized = trimmed.strip_prefix("./").unwrap_or(trimmed);
+                // Normalize to the same canonical form as the shared file-path
+                // extractor (backslashes → slashes, `./` and Windows drive prefix
+                // stripped, absolute paths reduced to `src/`/`tests/`).
+                let normalized = crate::utils::file_path_extractor::normalize_path(trimmed)
+                    .unwrap_or_else(|| trimmed.to_string());
                 results.push(ExtractedEntity {
                     entity_type: EntityType::File,
-                    identifier: normalized.to_string(),
+                    identifier: normalized,
                     source: ExtractionSource::Backtick,
                 });
                 continue;
@@ -391,6 +404,87 @@ fn extract_code_patterns(text: &str) -> Vec<ExtractedEntity> {
 
                 search_from = abs_pos + keyword.len();
             }
+        }
+    }
+
+    results
+}
+
+/// Strategy 4: Extract qualified Rust paths written inline in plain text.
+///
+/// Matches patterns like `crate::chat::manager::send_message` or
+/// `std::collections::HashMap` that appear WITHOUT backticks (backtick-wrapped
+/// paths are handled by `extract_backtick_identifiers`; when both match, the
+/// deduplication in `extract_entities` keeps a single entity).
+///
+/// Precision: only accepts tokens where every `::`-separated segment is a valid
+/// identifier, and rejects URLs, empty segments and non-identifier characters.
+/// Ordinary words (no `::`) are never matched.
+fn extract_qualified_paths(text: &str) -> Vec<ExtractedEntity> {
+    let mut results = Vec::new();
+
+    for line in text.lines() {
+        // Tokenize on whitespace and punctuation that can delimit a qualified path.
+        for word in line.split(|c: char| {
+            c.is_whitespace()
+                || c == ','
+                || c == ';'
+                || c == '('
+                || c == ')'
+                || c == '['
+                || c == ']'
+                || c == '"'
+                || c == '\''
+                || c == '`'
+                || c == '='
+                || c == '<'
+                || c == '>'
+        }) {
+            let token = word.trim_matches(|c: char| {
+                c == '`'
+                    || c == '\''
+                    || c == '"'
+                    || c == '('
+                    || c == ')'
+                    || c == '['
+                    || c == ']'
+                    || c == ','
+                    || c == ';'
+                    || c == '.'
+                    || c == '<'
+                    || c == '>'
+            });
+
+            // Only qualified paths (at least one `::`) are of interest.
+            if !token.contains("::") {
+                continue;
+            }
+
+            // Sanity bounds.
+            if token.len() < 3 || token.len() > 200 {
+                continue;
+            }
+
+            // Reject URLs and protocol-like tokens.
+            if token.starts_with("http://")
+                || token.starts_with("https://")
+                || token.starts_with("ftp://")
+                || token.starts_with("//")
+            {
+                continue;
+            }
+
+            // Every segment must be a valid identifier (rejects `foo::`, `::foo`,
+            // `foo.bar`, digit-leading segments).
+            if !is_valid_identifier(token) {
+                continue;
+            }
+
+            results.push(ExtractedEntity {
+                entity_type: EntityType::Symbol,
+                identifier: token.to_string(),
+                source: ExtractionSource::QualifiedPath,
+            });
         }
     }
 
@@ -715,6 +809,82 @@ mod tests {
                 .iter()
                 .any(|e| e.identifier == "crate::chat::manager::send_message"),
             "Should extract qualified paths, got: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_extract_qualified_path_inline_no_backticks() {
+        let text = "Modifie crate::chat::manager::send_message pour ajouter un log";
+        let entities = extract_entities(text);
+        assert!(
+            entities.iter().any(|e| {
+                e.identifier == "crate::chat::manager::send_message"
+                    && e.entity_type == EntityType::Symbol
+                    && e.source == ExtractionSource::QualifiedPath
+            }),
+            "Should extract an un-backticked qualified path, got: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_extract_qualified_path_std_inline() {
+        let text = "On utilise std::collections::HashMap ici";
+        let entities = extract_entities(text);
+        assert!(
+            entities
+                .iter()
+                .any(|e| e.identifier == "std::collections::HashMap"),
+            "Should extract std qualified path, got: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_qualified_path_trailing_colon_not_extracted() {
+        let text = "Appelle crate::chat::manager::send_message:: pour voir";
+        let entities = extract_entities(text);
+        assert!(
+            !entities
+                .iter()
+                .any(|e| e.identifier == "crate::chat::manager::send_message::"),
+            "A trailing '::' must not be extracted, got: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_qualified_path_digit_segment_not_extracted() {
+        let text = "Le ratio est de 1::2 dans ce cas";
+        let entities = extract_entities(text);
+        assert!(
+            !entities.iter().any(|e| e.identifier.contains("::")),
+            "Digit-leading segments must not be extracted, got: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_qualified_path_url_not_extracted() {
+        let text = "Voir https://docs.rs/foo::bar pour la doc";
+        let entities = extract_entities(text);
+        assert!(
+            !entities.iter().any(|e| e.identifier == "foo::bar"),
+            "URLs must not yield qualified paths, got: {:?}",
+            entities
+        );
+    }
+
+    #[test]
+    fn test_backtick_windows_path_normalized() {
+        let text = "Regarde `src\\chat\\manager.rs` pour le bug";
+        let entities = extract_entities(text);
+        assert!(
+            entities.iter().any(|e| {
+                e.entity_type == EntityType::File && e.identifier == "src/chat/manager.rs"
+            }),
+            "Backtick Windows paths should normalize backslashes, got: {:?}",
             entities
         );
     }
