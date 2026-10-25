@@ -998,21 +998,24 @@ mod tests {
 
     #[tokio::test]
     async fn list_pending_shows_only_the_callers_placements() {
-        let f = fixture(Some(OWNER), None).await;
+        // Use a unique owner so leaked placements from other tests (which share the
+        // static `PLACEMENTS` under coverage's single-process mode) don't interfere.
+        const LIST_OWNER: &str = "list-owner-11111111-1111-1111-1111-111111111111";
+        let f = fixture(Some(LIST_OWNER), None).await;
         let pending = ask(&f).await.unwrap();
         let id = pending.execution_place.placement_id;
 
         // The owner sees their own placement.
         let views = list_for(
             &f,
-            Claims::person(OWNER, "p@example.org", "P"),
+            Claims::person(LIST_OWNER, "p@example.org", "P"),
             query_pending(),
         )
         .await
         .unwrap();
         assert_eq!(views.0.len(), 1);
         assert_eq!(views.0[0].placement_id, id);
-        assert_eq!(views.0[0].owner, OWNER);
+        assert_eq!(views.0[0].owner, LIST_OWNER);
         assert!(views.0[0].expires_at.is_some());
 
         // Another person sees nothing.
