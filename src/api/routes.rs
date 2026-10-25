@@ -839,6 +839,10 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         // T5: a delegated task in an ephemeral worktree waits for a person to confirm its place.
         .route(
+            "/api/execution-places",
+            get(super::execution_place_handlers::list_pending_execution_places),
+        )
+        .route(
             "/api/execution-places/{placement_id}",
             get(super::execution_place_handlers::get_execution_place),
         )
