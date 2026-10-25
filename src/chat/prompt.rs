@@ -739,6 +739,17 @@ Manage tasks. Actions: list, create, get, update, delete, get_next, add_dependen
 | get_prompt | `plan_id` (req), `task_id` (req) | Generate implementation prompt |
 | build_prompt | `plan_id` (req), `task_id` (req), `custom_sections` (array of strings) | Build implementation prompt with custom sections appended |
 | enrich | `task_id` (req) | Enrich task with auto-generated context (affected files, code references) |
+## day_plan
+Manage the user's day plan. Actions: read, add, remove, reorder, move_to_tomorrow
+
+| Action | Key Parameters | Description |
+|--------|---------------|-------------|
+| read | `date` (optional, YYYY-MM-DD) | Read the ordered day plan (default today) |
+| add | `task_id` (req) | Append a task to today's plan |
+| remove | `task_id` (req) | Remove a task from today's plan |
+| reorder | `ids` (req, array) | Replace the whole order of the day |
+| move_to_tomorrow | `task_id` (req) | Remove from today, append to tomorrow |
+
 
 ## step
 Manage steps within tasks. Actions: list, create, update, get, delete, get_progress
@@ -1440,6 +1451,11 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
                 name: "step",
                 description: "Manage steps (list/create/update/get/delete/get_progress)",
             },
+            ToolRef {
+                name: "day_plan",
+                description: "Manage the user's day plan (read/add/remove/reorder/move_to_tomorrow)",
+            },
+
             ToolRef {
                 name: "lifecycle_hook",
                 description: "Manage lifecycle hooks (list/create/get/update/delete) — automatic actions triggered on entity status changes (cascade_children, create_note, emit_alert, start_protocol, mcp_call)",
