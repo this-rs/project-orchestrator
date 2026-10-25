@@ -317,19 +317,31 @@ impl TaskSignature {
         Some(match kind.trim().to_lowercase().as_str() {
             // A read-only investigation: what a sub-agent is asked for to spare the parent's
             // context, and Claude Code's guide lookup.
-            "explore" | "claude-code-guide" => TaskClass::Simple,
+            "explore" | "claude-code-guide" | "research" => TaskClass::Simple,
             // The general-purpose agent: a whole task handed over.
-            "general-purpose" => TaskClass::Complex,
+            "general-purpose" | "claude" | "fork" | "web-fetch" | "code-reviewer" => {
+                TaskClass::Complex
+            }
             // Designing an approach rather than carrying it out.
             "plan" => TaskClass::Creative,
             _ => return None,
         })
     }
 
+    /// Whether the given agent type needs tools. All current PO types do; a future
+    /// reasoning-only type could declare `false` here (ISO2).
+    fn subagent_needs_tools(kind: &str) -> bool {
+        match kind.trim().to_lowercase().as_str() {
+            "explore" | "claude-code-guide" | "general-purpose" | "plan" | "web-fetch"
+            | "claude" | "fork" | "research" | "code-reviewer" => true,
+            _ => true,
+        }
+    }
+
     /// A sub-agent of a native parent (the `Agent` tool): an executor whose class comes
     /// from the kind of agent the model named (`subagent_type`), or from a class it stated
-    /// outright; the prompt's length grows the complexity and the context need. A
-    /// sub-agent always calls tools and never carries images of its own.
+    /// outright; the prompt's length grows the complexity and the context need.
+    /// `needs_tools` reflects the type's declared capabilities (ISO2).
     pub fn from_subagent(
         subagent_type: Option<&str>,
         prompt: &str,
@@ -340,6 +352,7 @@ impl TaskSignature {
             .and_then(Self::subagent_class)
             .or_else(|| subagent_type.and_then(TaskClass::parse))
             .unwrap_or(TaskClass::Simple);
+        let needs_tools = subagent_type.is_none_or(Self::subagent_needs_tools);
         let length_bonus = (prompt.chars().count() / 800).min(2) as u8;
         let message_tokens = prompt.chars().count() as u64 / CHARS_PER_TOKEN;
         Self {
@@ -347,7 +360,7 @@ impl TaskSignature {
             class,
             complexity: clamp_complexity(class.base_complexity() + length_bonus),
             context_need_tokens: context_need(None, 0, message_tokens, &hints),
-            needs_tools: true,
+            needs_tools,
             needs_images: false,
             budget_remaining_usd: hints.budget_remaining_usd,
             attempt: 1,
@@ -655,5 +668,22 @@ mod tests {
         let sub = sig(Some("Explore"));
         assert_eq!(sub.role, Role::Executor);
         assert!(sub.needs_tools && !sub.needs_images);
+    }
+
+    /// ISO2: PO-defined agent types carry their class and the router uses it.
+    #[test]
+    fn po_subagent_types_carry_their_class() {
+        let hints = ContextHints::default();
+        let sig =
+            |kind: Option<&str>| TaskSignature::from_subagent(kind, "Do the work", None, hints);
+
+        // PO types.
+        assert_eq!(sig(Some("research")).class, TaskClass::Simple);
+        assert_eq!(sig(Some("code-reviewer")).class, TaskClass::Complex);
+        assert_eq!(sig(Some("fork")).class, TaskClass::Complex);
+
+        // PO types still need tools (they read files, run bash).
+        assert!(sig(Some("research")).needs_tools);
+        assert!(sig(Some("code-reviewer")).needs_tools);
     }
 }

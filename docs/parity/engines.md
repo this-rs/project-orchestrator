@@ -52,11 +52,13 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | ok | ok | declared (harnais, ISO4) | not_measured | not_measured |
 | `ask_user_question` | une question du modèle s'affiche (ask_user_question) et la réponse de l'utilisateur lui revient au tour suivant | ok | ok | ok | declared (harnais, ISO4) | not_measured | not_measured |
 | `subagents` | un sous-agent (Agent / Task) travaille et sa réponse revient en résultat ; sur le natif, une session enfant qui ne peut pas re-déléguer | ok | ok | ok | not_measured | not_measured | not_measured |
+| `subagents.background` | un sous-agent lancé en arrière-plan (run_in_background: true) rend la main au parent immédiatement ; sa fin est injectée comme task_notification au tour suivant | not_measured | not_measured | not_measured | not_measured | not_measured | not_measured |
+| `subagents.types` | subagent_type valide parmi les types déclarés ; un type inconnu est refusé avec la liste des types connus | not_measured | not_measured | ok | not_measured | not_measured | not_measured |
 | `system_init.degraded` | system_init n'annonce comme manquant qu'une limite du modèle (liste fermée) | ok | ok | ok | not_measured | not_measured | not_measured |
 | `session_limits` | sans réglage, aucune limite de durée par tour ni budget de session (ISO5) : le CLI ne reçoit pas --max-budget-usd, une session du moteur agent s'ouvre et reprend sans turn_timeout_ms ni max_tokens | ok | ok | ok | not_measured | not_measured | not_measured |
 | `anthropic_messages` | une instance `anthropic` (clé au coffre) : le harnais natif parle lui-même l'API Messages, et la requête reçue par le modèle porte les trois points cache_control — dernier outil, système, dernier tour (CTX5) | not_measured | not_measured | ok | not_measured | not_measured | not_measured |
 
-`ok` : Claude Code 36/39, Claude Code (moteur agent) 36/39, natif 39/39, Codex 1/39, opencode 0/39, ACP 1/39.
+`ok` : Claude Code 36/41, Claude Code (moteur agent) 36/41, natif 40/41, Codex 1/41, opencode 0/41, ACP 1/41.
 
 ## Écarts déclarés
 
@@ -91,10 +93,15 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 |---|---|---|
 | Claude Code | `tool_search` | les outils différés et ToolSearch sont internes au CLI Claude : la liste d'outils qu'il envoie au modèle n'est pas visible du harnais, et fake_claude rejoue un transcript |
 | Claude Code | `nexus_tools` | Read / Edit / Bash sont les outils internes du CLI Claude : fake_claude rejoue un transcript et n'exécute aucun outil |
+| Claude Code | `subagents.background` | fake_claude rejoue un transcript sans Agent(run_in_background) ; le miroir P18c le mesure séparément |
+| Claude Code | `subagents.types` | la validation des types est propre au natif (ISO2) ; sur Claude Code le CLI gère ses propres types d'agents |
 | Claude Code | `anthropic_messages` | le CLI Claude parle lui-même l'API Messages et pose ses propres points de cache : fake_claude rejoue un transcript, la requête au modèle n'est pas visible du harnais |
 | Claude Code (moteur agent) | `tool_search` | les outils différés et ToolSearch sont internes au CLI Claude : la liste d'outils qu'il envoie au modèle n'est pas visible du harnais, et fake_claude rejoue un transcript |
 | Claude Code (moteur agent) | `nexus_tools` | Read / Edit / Bash sont les outils internes du CLI Claude : fake_claude rejoue un transcript et n'exécute aucun outil |
+| Claude Code (moteur agent) | `subagents.background` | fake_claude rejoue un transcript sans Agent(run_in_background) ; le miroir P18c le mesure séparément |
+| Claude Code (moteur agent) | `subagents.types` | la validation des types est propre au natif (ISO2) ; sur Claude Code le CLI gère ses propres types d'agents |
 | Claude Code (moteur agent) | `anthropic_messages` | le CLI Claude parle lui-même l'API Messages et pose ses propres points de cache : fake_claude rejoue un transcript, la requête au modèle n'est pas visible du harnais |
+| natif | `subagents.background` | le scénario turn-based ne peut pas exercer inject_hint sans entrée script ; chemin testé par les tests unitaires ISO2 |
 | Codex | `compaction` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
 | Codex | `compaction.manual` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
 | Codex | `message_queue` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
@@ -118,6 +125,8 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | Codex | `refs` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
 | Codex | `session_record` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
 | Codex | `subagents` | collabToolCall (sous-agents Codex) NOT VERIFIED dans la suite nexus ; transcript nécessaire |
+| Codex | `subagents.background` | collabToolCall (sous-agents Codex) NOT VERIFIED dans la suite nexus ; transcript nécessaire |
+| Codex | `subagents.types` | collabToolCall (sous-agents Codex) NOT VERIFIED dans la suite nexus ; transcript nécessaire |
 | Codex | `system_init.degraded` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
 | Codex | `session_limits` | fake_codex (nexus src/bin/fake_codex.rs) rejoue des transcripts JSONL déterministes ; cette fonction exige un transcript dédié non encore écrit (ISO4) |
 | Codex | `anthropic_messages` | Codex utilise son propre moteur LLM (API Codex v1), pas l'API Anthropic Messages ; concept sans objet sur ce moteur |
@@ -157,6 +166,8 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | opencode | `cancel_task` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `ask_user_question` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `subagents` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
+| opencode | `subagents.background` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
+| opencode | `subagents.types` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `system_init.degraded` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `session_limits` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
 | opencode | `anthropic_messages` | fake_opencode n'existe pas dans le dépôt nexus ; le scénario ne peut pas être joué sans binaire faux déterministe (YARDSTICK, tâche 87eb345e) |
@@ -185,6 +196,8 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | ACP | `cancel_task` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
 | ACP | `ask_user_question` | le backend synthétise la question via le harnais natif ; non exercé dans le scénario de parité (transcripts ACP non adaptés, ISO4) |
 | ACP | `subagents` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `subagents.background` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
+| ACP | `subagents.types` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
 | ACP | `system_init.degraded` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
 | ACP | `session_limits` | fake_acp (nexus src/bin/fake_acp.rs) rejoue des transcripts JSONL ; le scénario de parité complet n'est pas encore adapté pour cette fonction (ISO4) |
 | ACP | `anthropic_messages` | ACP utilise son propre moteur LLM (protocole ACP), pas l'API Anthropic Messages ; concept sans objet sur ce moteur |

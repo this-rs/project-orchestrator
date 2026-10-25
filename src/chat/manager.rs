@@ -17349,7 +17349,7 @@ impl ChatManager {
             )
             .await;
         cleanup.registered(router);
-        let spec = self
+        let mut spec = self
             .build_agent_spec_with_access(
                 AgentSpecInput {
                     file_scope_lifted: request.file_scope_lifted,
@@ -17379,6 +17379,13 @@ impl ChatManager {
                 access,
             )
             .await?;
+        // ISO2: sub-agent type tool restrictions — the child cannot use tools
+        // the type definition denies.
+        for tool_name in &request.denied_tools {
+            spec.policy
+                .deny
+                .push(nexus_claude::agent::ToolPattern::tool(tool_name));
+        }
         cleanup.minted(&spec, self.config.jwt_secret.as_deref());
         let tool_policy = super::provider::policy::wire_tool_policy(&spec.policy);
         self.authorize_provider_use(ProviderUse {
@@ -24331,6 +24338,7 @@ mod tests {
             scaffolding_override: None,
             runner_context: None,
             routing_decision_id: None,
+            denied_tools: vec![],
         }
     }
 

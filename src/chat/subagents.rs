@@ -97,9 +97,75 @@ use nexus_claude::agent::{
 use uuid::Uuid;
 
 use super::manager::ChatManager;
+use super::provider::cognitive::signature::TaskClass;
 use super::provider::policy::SessionAccess;
 use super::session_pool::{WarmFacts, WarmKey};
 use super::types::{ChatEvent, ChatRequest, SpawnedBy};
+
+// ── Sub-agent type registry (ISO2) ──────────────────────────────────────────
+
+/// A known agent type: class for cognitive routing, tool restrictions for the child's
+/// session policy.  CC types carry no host-imposed restriction; PO types do.
+pub(crate) struct SubagentTypeDef {
+    /// The [`TaskClass`] the type implies for cognitive routing.
+    #[allow(dead_code)]
+    pub class: TaskClass,
+    /// Tool names the child is denied (applied as `spec.policy.deny`).  Empty = no restriction.
+    pub denied_tools: &'static [&'static str],
+}
+
+/// Resolves a `subagent_type` name to its definition, or `None` for unknown types.
+///
+/// CC types (explore, general-purpose, plan, claude-code-guide, fork, web-fetch) carry no
+/// tool restriction from the host.  PO types (research, code-reviewer) deny write tools.
+/// An unknown type gets `None` and the caller rejects the call.
+pub(crate) fn resolve_subagent_type(name: &str) -> Option<SubagentTypeDef> {
+    Some(match name.trim().to_lowercase().as_str() {
+        // ── CC types — no tool restriction from the host ─────────
+        "explore" | "claude-code-guide" => SubagentTypeDef {
+            class: TaskClass::Simple,
+            denied_tools: &[],
+        },
+        "general-purpose" | "claude" => SubagentTypeDef {
+            class: TaskClass::Complex,
+            denied_tools: &[],
+        },
+        "plan" => SubagentTypeDef {
+            class: TaskClass::Creative,
+            denied_tools: &[],
+        },
+        "fork" | "web-fetch" => SubagentTypeDef {
+            class: TaskClass::Complex,
+            denied_tools: &[],
+        },
+        // ── PO types — each with explicit tool restrictions ──────
+        "research" => SubagentTypeDef {
+            class: TaskClass::Simple,
+            denied_tools: &["Edit", "Write", "NotebookEdit"],
+        },
+        "code-reviewer" => SubagentTypeDef {
+            class: TaskClass::Complex,
+            denied_tools: &["Edit", "Write", "NotebookEdit"],
+        },
+        _ => return None,
+    })
+}
+
+/// Comma-separated list of known agent type names, for error messages.
+pub(crate) fn known_subagent_type_list() -> String {
+    [
+        "explore",
+        "claude-code-guide",
+        "general-purpose",
+        "claude",
+        "plan",
+        "fork",
+        "web-fetch",
+        "research",
+        "code-reviewer",
+    ]
+    .join(", ")
+}
 
 /// The hooks of a native session that may run sub-agents: its other hooks, plus the host of
 /// the `Agent` tool.
@@ -215,6 +281,10 @@ impl SessionHooks for SubagentHooks {
     }
 
     fn runs_subagents(&self) -> bool {
+        true
+    }
+
+    fn runs_background_subagents(&self) -> bool {
         true
     }
 
@@ -513,6 +583,19 @@ impl ChatManager {
             .await
             .map_err(|e| refused(e.to_string()))?
             .ok_or_else(|| refused("the parent session is unknown".to_owned()))?;
+        // ── Validate subagent_type and resolve tool restrictions (ISO2) ──────
+        let type_def = request.subagent_type.as_deref().map(resolve_subagent_type);
+        if let Some(None) = type_def {
+            // The model named a type not in the registry.
+            let kind = request.subagent_type.as_deref().unwrap_or("");
+            return Err(refused(format!(
+                "unknown subagent_type \"{kind}\": known types are [{}]",
+                known_subagent_type_list(),
+            )));
+        }
+        let denied_tools: Vec<String> = type_def.flatten().map_or_else(Vec::new, |td| {
+            td.denied_tools.iter().map(|s| (*s).to_owned()).collect()
+        });
         // Taken before the envelope counts the parent's children (A17); moved into
         // `open_wait_close`'s own task below and held there for the child's whole real
         // lifetime, NOT in this frame — a drop of this future (the parent's turn
@@ -593,6 +676,8 @@ impl ChatManager {
             route_auto: route_child,
             // Never wider than the parent (a read-only parent has no `Agent`; defence in depth).
             access: Some(parent.access),
+            // ISO2: tool restrictions from the agent type.
+            denied_tools,
             ..Default::default()
         };
         let default_mode = self.default_permission_mode().await;
@@ -624,6 +709,47 @@ impl ChatManager {
                     .await
             })
         };
+        // ── Background (ISO2) ──────────────────────────────────────────────
+        // The child runs in a detached task: its answer, or its failure, is
+        // injected into the parent's next turn as a `task_notification` hint.
+        if request.run_in_background {
+            let parent_id = parent_session_id.to_string();
+            let tool_call_id = request.tool_call_id.clone();
+            let mgr = Arc::clone(&self);
+            tokio::spawn(async move {
+                // Hold the sender so `cancelled` never fires: the child runs
+                // to completion, not bounded by the parent's turn.
+                let _keep = alive;
+                let result = opening
+                    .await
+                    .unwrap_or_else(|e| Err(format!("the sub-agent ended: {e}")));
+                let (status, summary) = match &result {
+                    Ok(answer) => ("completed", bounded(answer.clone())),
+                    Err(err) => ("failed", err.clone()),
+                };
+                let notification = format!(
+                    "<task-notification tool_use_id=\"{tool_call_id}\" \
+                     status=\"{status}\">\n{summary}\n</task-notification>",
+                );
+                if let Err(e) = mgr.inject_hint(&parent_id, &notification).await {
+                    tracing::warn!(
+                        parent = %parent_id,
+                        tool_use_id = %tool_call_id,
+                        error = %e,
+                        "could not inject background sub-agent completion",
+                    );
+                }
+            });
+            return Ok(format!(
+                "Async agent launched successfully (tool_use_id: {}): {}",
+                request.tool_call_id,
+                request
+                    .description
+                    .as_deref()
+                    .unwrap_or("background sub-agent"),
+            ));
+        }
+        // ── Foreground (unchanged) ─────────────────────────────────────────
         let _alive = alive;
         opening
             .await
@@ -2243,5 +2369,88 @@ mod tests {
             manager.read_back(&id, &mut Watch::default(), 2).await,
             Some(Ok("DEUXIEME-REPONSE".to_string()))
         );
+    }
+
+    // ── ISO2 — sub-agent type registry + background ─────────────────────
+
+    /// ISO2, step 1: an unknown subagent_type is refused with a named error that lists
+    /// the known types.  RED without the validation.
+    #[test]
+    fn unknown_subagent_type_is_refused() {
+        assert!(
+            resolve_subagent_type("nonexistent").is_none(),
+            "unknown type must resolve to None"
+        );
+        // The error message must contain the type name and the known list.
+        let list = known_subagent_type_list();
+        assert!(list.contains("explore"));
+        assert!(list.contains("research"));
+        assert!(list.contains("code-reviewer"));
+    }
+
+    /// ISO2, step 1: every known type (CC + PO) resolves.
+    #[test]
+    fn all_known_types_resolve() {
+        for name in [
+            "explore",
+            "claude-code-guide",
+            "general-purpose",
+            "plan",
+            "web-fetch",
+            "claude",
+            "fork",
+            "research",
+            "code-reviewer",
+        ] {
+            assert!(
+                resolve_subagent_type(name).is_some(),
+                "type '{name}' should resolve"
+            );
+        }
+        // Case-insensitive
+        assert!(resolve_subagent_type("EXPLORE").is_some());
+        assert!(resolve_subagent_type("Research").is_some());
+    }
+
+    /// ISO2, step 2: PO types that deny write tools populate denied_tools.
+    #[test]
+    fn po_types_carry_denied_tools() {
+        let research = resolve_subagent_type("research").unwrap();
+        assert!(
+            research.denied_tools.contains(&"Edit"),
+            "research must deny Edit"
+        );
+        assert!(
+            research.denied_tools.contains(&"Write"),
+            "research must deny Write"
+        );
+        assert!(
+            research.denied_tools.contains(&"NotebookEdit"),
+            "research must deny NotebookEdit"
+        );
+
+        let reviewer = resolve_subagent_type("code-reviewer").unwrap();
+        assert!(!reviewer.denied_tools.is_empty());
+
+        // CC types carry no denied_tools.
+        let explore = resolve_subagent_type("explore").unwrap();
+        assert!(
+            explore.denied_tools.is_empty(),
+            "CC types carry no host-imposed restrictions"
+        );
+    }
+
+    /// ISO2: the denied_tools from a PO type flow into the ChatRequest.
+    #[test]
+    fn denied_tools_populate_chat_request() {
+        let td = resolve_subagent_type("research").unwrap();
+        let denied: Vec<String> = td.denied_tools.iter().map(|s| (*s).to_owned()).collect();
+        assert!(denied.contains(&"Edit".to_owned()));
+        assert!(denied.contains(&"Write".to_owned()));
+
+        // A CC type produces an empty vec.
+        let td = resolve_subagent_type("explore").unwrap();
+        let denied: Vec<String> = td.denied_tools.iter().map(|s| (*s).to_owned()).collect();
+        assert!(denied.is_empty());
     }
 }

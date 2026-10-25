@@ -1777,6 +1777,7 @@ fn delegation_chat_request(
         scaffolding_override: None,
         runner_context: None, // TODO: populate for delegate_task
         routing_decision_id: None,
+        denied_tools: vec![],
     };
     if let Some(env) = envelope {
         env.apply(&mut request, default_mode)?;
