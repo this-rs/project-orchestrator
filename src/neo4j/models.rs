@@ -634,6 +634,10 @@ pub struct ChatGraphSession {
     pub message_count: i64,
     pub total_cost_usd: f64,
     pub created_at: String,
+    /// The session that spawned this one (`SPAWNED_BY`): a sub-conversation, drawn as a
+    /// link from the child to its parent instead of as an orphan dot.
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
 }
 
 /// A DISCUSSED edge for the graph visualization

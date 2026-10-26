@@ -500,6 +500,7 @@ impl NoteManager {
                     &project_id_str,
                 )
                 .with_delta(serde_json::json!({
+                    "label": note.graph_label(),
                     "note_type": note.note_type.to_string(),
                     "importance": note.importance.to_string(),
                 })),
@@ -3262,6 +3263,9 @@ mod tests {
         assert_eq!(node_event.project_id, pid.to_string());
         assert_eq!(node_event.delta["note_type"], "guideline");
         assert_eq!(node_event.delta["importance"], "high");
+        // The live node must look like the one a reload builds, or a note shows its
+        // identifier until the next full load renames it.
+        assert_eq!(node_event.delta["label"], note.graph_label());
     }
 
     #[tokio::test]
