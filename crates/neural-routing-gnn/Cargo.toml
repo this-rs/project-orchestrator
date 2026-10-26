@@ -25,7 +25,7 @@ chrono = { workspace = true }
 neo4rs = { workspace = true }
 
 # Caching — LRU for subgraph cache, moka for concurrent inference cache
-lru = "0.18"
+lru = "0.19"
 moka = { version = "0.12", features = ["sync"] }
 
 # ML — always compiled (build full, runtime-controlled)
