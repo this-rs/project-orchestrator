@@ -4174,6 +4174,42 @@ pub struct FabricProjectRequest {
 /// Orchestrates the full fabric analytics pipeline: extracts the multi-layer
 /// fabric graph (IMPORTS + CO_CHANGED + SYNAPSE) and computes PageRank,
 /// Louvain, and Betweenness scores on it.
+/// Emit the fabric `scores_updated` graph event. Extracted so it is unit-testable
+/// without a live Neo4j-backed handler (the handler needs Neo4j to reach this
+/// point, which is why the inline emit was uncovered there).
+pub(crate) fn emit_fabric_scores_updated(
+    bus: &HybridEmitter,
+    project_id: &str,
+    delta: serde_json::Value,
+) {
+    bus.emit_graph(
+        crate::events::GraphEvent::scores_updated(project_id.to_string()).with_delta(delta),
+    );
+}
+
+/// Emit the fabric `community_changed` graph event after a Louvain recompute
+/// (no partition on the wire — clients refetch and recolor). Testable helper.
+pub(crate) fn emit_fabric_communities_refreshed(
+    bus: &HybridEmitter,
+    project_id: &str,
+    community_count: usize,
+    modularity: f64,
+) {
+    bus.emit_graph(
+        crate::events::GraphEvent::community_changed(
+            "project",
+            community_count,
+            project_id.to_string(),
+        )
+        .with_delta(serde_json::json!({
+            "scope": "project",
+            "algorithm": "louvain",
+            "community_count": community_count,
+            "modularity": modularity,
+        })),
+    );
+}
+
 pub async fn update_fabric_scores(
     State(state): State<OrchestratorState>,
     Json(body): Json<FabricProjectRequest>,
@@ -4255,28 +4291,20 @@ pub async fn update_fabric_scores(
         .await
         .unwrap_or(0);
 
-    state.event_bus.emit_graph(
-        crate::events::GraphEvent::scores_updated(project_id.to_string()).with_delta(
-            serde_json::json!({
-                "nodes_scored": analytics.metrics.len(),
-                "duration_ms": computation_ms,
-            }),
-        ),
+    emit_fabric_scores_updated(
+        &state.event_bus,
+        &project_id.to_string(),
+        serde_json::json!({
+            "nodes_scored": analytics.metrics.len(),
+            "duration_ms": computation_ms,
+        }),
     );
-
     // Louvain communities were just recomputed: tell clients to recolor (no partition on the wire).
-    state.event_bus.emit_graph(
-        crate::events::GraphEvent::community_changed(
-            "project",
-            analytics.communities.len(),
-            project_id.to_string(),
-        )
-        .with_delta(serde_json::json!({
-            "scope": "project",
-            "algorithm": "louvain",
-            "community_count": analytics.communities.len(),
-            "modularity": analytics.modularity,
-        })),
+    emit_fabric_communities_refreshed(
+        &state.event_bus,
+        &project_id.to_string(),
+        analytics.communities.len(),
+        analytics.modularity,
     );
 
     Ok(Json(serde_json::json!({
@@ -4771,11 +4799,11 @@ pub async fn bootstrap_knowledge_fabric(
 
     let total_time_ms = start.elapsed().as_millis() as u64;
 
-    state
-        .event_bus
-        .emit_graph(crate::events::GraphEvent::scores_updated(
-            project_id.to_string(),
-        ));
+    emit_fabric_scores_updated(
+        &state.event_bus,
+        &project_id.to_string(),
+        serde_json::json!({ "duration_ms": total_time_ms }),
+    );
 
     Ok(Json(serde_json::json!({
         "steps_completed": completed,
@@ -13231,5 +13259,28 @@ mod retry_plan_task_tests {
                 .is_none()
         );
         assert_eq!(unrouted.persona_alias.as_deref(), Some("opus"));
+    }
+}
+
+#[cfg(test)]
+mod fabric_emit_tests {
+    use super::*;
+
+    #[test]
+    fn fabric_refresh_helpers_emit_the_expected_graph_events() {
+        let bus = HybridEmitter::new(Arc::new(crate::events::EventBus::default()));
+        let mut rx = bus.subscribe_graph();
+        emit_fabric_scores_updated(
+            &bus,
+            "p1",
+            serde_json::json!({ "nodes_scored": 5, "duration_ms": 12 }),
+        );
+        let scores = rx.try_recv().expect("a scores_updated event");
+        assert_eq!(format!("{:?}", scores.event_type), "ScoresUpdated");
+        assert_eq!(scores.delta["nodes_scored"], serde_json::json!(5));
+        emit_fabric_communities_refreshed(&bus, "p1", 3, 0.42);
+        let comm = rx.try_recv().expect("a community_changed event");
+        assert_eq!(format!("{:?}", comm.event_type), "CommunityChanged");
+        assert_eq!(comm.delta["community_count"], serde_json::json!(3));
     }
 }
