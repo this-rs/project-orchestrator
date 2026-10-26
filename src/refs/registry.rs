@@ -207,7 +207,7 @@ mod tests {
             .collect()
     }
 
-    const EVENTS_ALL: [EventsEntity; 32] = [
+    const EVENTS_ALL: [EventsEntity; 33] = [
         EventsEntity::Project,
         EventsEntity::Plan,
         EventsEntity::Task,
@@ -240,6 +240,9 @@ mod tests {
         EventsEntity::LifecycleHook,
         EventsEntity::Learning,
         EventsEntity::AttentionChanged,
+        // The orchestrator's own ingestion activity: a subject, not a unit of
+        // work — classified Excluded(INFRA) above, like Runner and Alert.
+        EventsEntity::Ingestion,
     ];
 
     const NOTES_ALL: [NotesEntity; 30] = [
