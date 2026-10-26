@@ -1,0 +1,106 @@
+%% name: po-event-ingestion
+%% covers: backend:src/events/ingestion.rs
+%% verified: c97f7d7e
+%% ---
+%% PROUVE : ce que l'activite d'ingestion EST — le flux qui rend observable le travail du PO
+%%   lui-meme (PR #981), tel que le code le fait au sha c97f7d7e.
+%%   Le sujet n'est pas le graphe mais l'orchestrateur au travail : il voyage donc sur la
+%%   taxonomie CRUD existante (entity_type "ingestion"), pas sur GraphEvent, et aucune frame
+%%   WebSocket nouvelle n'est introduite.
+%%   DEUX actions seulement : "progress" pendant le travail, "synced" une fois a la fin.
+%%   COALESCENCE (le point dur) : au plus un "progress" toutes les 250 ms DANS UNE MEME PHASE ;
+%%   un changement de phase emet TOUJOURS (un sync a un nombre fixe de phases, donc le flux reste
+%%   borne) ; le dernier emet toujours. Le total d'un sync est phases + ecoule/250 ms, JAMAIS
+%%   fonction du nombre de fichiers. Aucun node_created par fichier : 2 000 fichiers feraient
+%%   sauter des evenements utiles sur un bus tokio::broadcast, dont les abonnes lents perdent
+%%   des messages (le CRUD part un message WebSocket par evenement ; seul le graphe est loti).
+%%   UN FICHIER = UN SCINTILLEMENT : le sync d'un seul fichier (post-commit, watcher) emet un
+%%   unique "progress" phase=indexing, files_total=1, avec current_path, et PAS de "synced".
+%%   Un fichier inchange n'emet rien (retour anticipe sur le hash).
+%%   current_path n'est renseigne QUE pendant indexing : c'est la seule boucle reellement par
+%%   fichier ; pendant parsing/storing le compteur avance par phase.
+%%   is_first_sync est lu AVANT l'ecriture (le dernier appelant a deja bump last_synced) et
+%%   OMIS quand inconnu (sync hors projet), jamais devine.
+%% ---
+%% SOURCES LUES (backend@c97f7d7e) :
+%%   src/events/ingestion.rs — IngestionReporter (new/with_interval/enter_phase/enter_phase_at/
+%%                             tick/synced/emit), IngestionPhase, IngestionProgress,
+%%                             IngestionSynced, IngestionSummary, INGESTION_PROGRESS_INTERVAL
+%%   src/events/types.rs     — EntityType::Ingestion, EventEmitter::{emit_progress, emit_synced}
+%%   src/orchestrator/runner.rs — sync_directory_for_project_with_options (6 phases + finale),
+%%                             sync_file_for_project_with_options (1 evenement), is_first_sync
+%%   src/refs/registry.rs    — classify_events : Ingestion => Excluded(INFRA)
+%%   src/api/ws_handlers.rs  — forward CRUD immediat, filtre ?entity_types=
+%%   src/api/project_handlers.rs — Project/Synced (compteurs identiques, autre sujet)
+%%   Tests : src/events/ingestion.rs (5 tests unitaires), tests/realtime_contract.rs
+%%           (ingestion_progress_matches_the_contract)
+%% ---
+%% NON ETABLI :
+%%   le cablage dans runner.rs n'a PAS de test dedie : les 6 phases et les compteurs y sont
+%%   relus, pas exerces (un test de sync demanderait un store simule et un arbre de fichiers).
+%%   Le contrat est donc prouve cote reporter, pas cote pipeline.
+%%   Le filtre ?entity_types=ingestion n'est pas teste nommement.
+%% ---
+%% LEGENDE
+%%   ✅ verifie (le noeud dit par quel test)  🟠 ecrit, sans test  🔴 defaut constate  ⚪ amont
+
+flowchart TD
+    subgraph legend["Legende"]
+        direction LR
+        L1["✅ verifie : test nomme"]
+        L2["🟠 ecrit, sans test"]
+        L3["🔴 defaut constate"]
+        L4["⚪ amont / autre domaine"]
+    end
+
+    CALLER["⚪ Appelants<br/>POST /api/projects/{slug}/sync (project_handlers)<br/>sync incremental post-commit (api/handlers create_commit)<br/>watcher (orchestrator/watcher)"]
+
+    subgraph SYNC["sync_directory_for_project_with_options (orchestrator/runner.rs)"]
+        direction TB
+        P1["🟠 enter_phase Scanning<br/>files_total=0 (le scan n'a pas encore tourne)"]
+        P2["🟠 enter_phase Reading<br/>files_total=scanned_total"]
+        P3["🟠 enter_phase Parsing<br/>files_done=0, files_skipped=hash inchanges"]
+        P4["🟠 enter_phase Storing<br/>files_done=parse_count"]
+        P5["🟠 enter_phase Indexing puis tick() PAR FICHIER<br/>current_path renseigne ici seulement"]
+        P6["🟠 enter_phase Cleanup<br/>files_deleted"]
+        P7["✅ synced(...) — toujours emis<br/>phase=done + les 6 compteurs de Project/Synced"]
+        P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7
+    end
+
+    CALLER --> P1
+
+    REP["✅ IngestionReporter (events/ingestion.rs)<br/>un reporter par sync : throttle par projet et par run, aucun etat partage<br/>enter_phase/enter_phase_at = force l'emission ; tick = throttle 250 ms"]
+
+    SYNC -.->|"chaque phase"| REP
+
+    subgraph FILTRE["Couture de cadence"]
+        direction TB
+        C1["✅ changement de phase : emis<br/>test per_file_ticks_are_throttled_but_phase_changes_are_not"]
+        C2["✅ tick dans la meme phase < 250 ms : jete<br/>meme test : 100 ticks -> 1 seul evenement"]
+        C3["✅ dernier evenement : toujours emis<br/>test synced_is_always_emitted_and_mirrors_project_synced"]
+        C1 --> C2 --> C3
+    end
+
+    REP --> FILTRE
+
+    SINGLE["🟠 sync_file_for_project_with_options<br/>un seul fichier : 1 progress phase=indexing, files_total=1,<br/>files_done=1, current_path ; aucun synced<br/>fichier inchange : retour anticipe, rien emis"]
+
+    CALLER -.-> SINGLE
+    SINGLE -.-> REP
+
+    EMIT["✅ EventEmitter::emit_progress / emit_synced<br/>EntityType::Ingestion, project_id = uuid du projet<br/>test progress_event_carries_the_contract_shape"]
+
+    FILTRE --> EMIT
+
+    HYB["⚪ HybridEmitter -> events.crud (local + NATS si configure)<br/>les CRUD ne sont PAS lotis, contrairement au graphe"]
+
+    WS["⚪ /ws/events (api/ws_handlers)<br/>filtre ?entity_types=ingestion, ?project_id="]
+
+    EMIT --> HYB --> WS
+
+    PAS["🔴 Decides NON emis (et documentes comme tels)<br/>aucun node_created par fichier — pas d'inondation du broadcast<br/>aucun node_created de couche code : la couche code reste muette au sync"]
+
+    EMIT -.->|"ne fait pas"| PAS
+
+    REG["✅ refs/registry.rs : Ingestion => Excluded(INFRA)<br/>comme Runner et Alert (test de cardinalite : 33 variantes)"]
+    EMIT -.-> REG
