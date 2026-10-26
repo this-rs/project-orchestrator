@@ -1506,11 +1506,28 @@ pub(crate) async fn launch_delegation(
     let sid = session_id.clone();
     let task_title_clone = task_title.clone();
 
-    // Emit TaskStarted event via WebSocket for real-time tracking
+    // A delegation is a pair: `delegation_started` here, and
+    // `delegation_completed` / `delegation_failed` from
+    // `listen_delegation_result`. Without the first one a client only learns
+    // about a sub-agent once it has already answered — the parent→child link
+    // could never be animated. `provider` and `model` are deliberately absent:
+    // the router's pick is not resolved yet at this point, and guessing them
+    // would be worse than omitting them.
     let event_bus = state.event_bus.clone();
     let ev_task_id = task_id;
     let ev_plan_id = plan_id;
     let ev_session_id = session_id.clone();
+    event_bus.emit_updated(
+        crate::events::EntityType::Task,
+        &task_id.to_string(),
+        serde_json::json!({
+            "event": "delegation_started",
+            "child_session_id": session_id,
+            "parent_session_id": parent_session_id.map(|p| p.to_string()),
+            "plan_id": plan_id.to_string(),
+        }),
+        Some(plan_id.to_string()),
+    );
 
     let graph_for_place = graph.clone();
     tokio::spawn(async move {
@@ -3281,12 +3298,10 @@ pub async fn update_step(
             .update_step(step_id, &req)
             .await?;
     }
-    state.event_bus.emit_updated(
-        crate::events::EntityType::Step,
-        &step_id.to_string(),
-        serde_json::json!({}),
-        None,
-    );
+    // Both branches above already emit their own event: `update_step_status`
+    // emits `Step/StatusChanged`, `update_step` emits `Step/Updated`. The empty
+    // `Updated` this handler used to emit on top was a duplicate — two events
+    // for one PATCH (see src/plan/manager.rs).
     Ok(StatusCode::NO_CONTENT)
 }
 

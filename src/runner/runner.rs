@@ -2339,6 +2339,13 @@ impl PlanRunner {
                             "Marked step {} as in_progress at task {} launch",
                             first_step.id, task_id
                         );
+                        self.emit_step_status_changed(
+                            first_step.id,
+                            crate::neo4j::models::StepStatus::Pending,
+                            crate::neo4j::models::StepStatus::InProgress,
+                            task_id,
+                            Some(plan_id),
+                        );
                     }
                 }
             }
@@ -4859,6 +4866,41 @@ impl PlanRunner {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    /// Emit a `Step/StatusChanged` for a step the runner wrote itself.
+    ///
+    /// The runner writes step statuses straight to the store (it does not go
+    /// through `PlanManager`), so nothing used to be emitted: a run in progress
+    /// was invisible step by step. The event is built here rather than routed
+    /// through the manager to avoid re-reading a step we already hold.
+    fn emit_step_status_changed(
+        &self,
+        step_id: Uuid,
+        old_status: crate::neo4j::models::StepStatus,
+        new_status: crate::neo4j::models::StepStatus,
+        task_id: Uuid,
+        plan_id: Option<Uuid>,
+    ) {
+        let Some(ref emitter) = self.event_emitter else {
+            return;
+        };
+        let mut payload = serde_json::json!({
+            "old_status": old_status,
+            "new_status": new_status,
+            "task_id": task_id.to_string(),
+        });
+        if let Some(plan_id) = plan_id {
+            payload["plan_id"] = serde_json::json!(plan_id.to_string());
+        }
+        emitter.emit(
+            CrudEvent::new(
+                EntityType::Step,
+                CrudAction::StatusChanged,
+                step_id.to_string(),
+            )
+            .with_payload(payload),
+        );
+    }
+
     /// Finalize steps for a task on ALL exit paths (success, timeout, error, cancelled).
     ///
     /// - `Success`: pending/in_progress → completed
@@ -4943,6 +4985,8 @@ impl PlanRunner {
             );
         }
 
+        let plan_id = self.graph.get_task_plan_id(task_id).await.ok().flatten();
+
         for step in &remaining {
             let new_status = match outcome {
                 TaskResult::Success { .. } => crate::neo4j::models::StepStatus::Completed,
@@ -4969,8 +5013,21 @@ impl PlanRunner {
                 _ => {}
             }
 
-            if let Err(e) = self.graph.update_step_status(step.id, new_status).await {
-                warn!("finalize_steps: failed to update step {}: {}", step.id, e);
+            match self
+                .graph
+                .update_step_status(step.id, new_status.clone())
+                .await
+            {
+                Ok(()) => self.emit_step_status_changed(
+                    step.id,
+                    step.status.clone(),
+                    new_status,
+                    task_id,
+                    plan_id,
+                ),
+                Err(e) => {
+                    warn!("finalize_steps: failed to update step {}: {}", step.id, e);
+                }
             }
         }
 
