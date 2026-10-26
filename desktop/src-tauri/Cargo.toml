@@ -51,7 +51,7 @@ url = "2"
 anyhow = "1"
 
 # Embedding model management (setup wizard)
-fastembed = { version = "5.17", optional = true }
+fastembed = { version = "7.3", optional = true }
 tauri-plugin-opener = "2.5.4"
 tauri-plugin-dialog = "2"
 tauri-plugin-websocket = "2"
