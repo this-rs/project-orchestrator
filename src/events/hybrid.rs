@@ -129,6 +129,9 @@ impl HybridEmitter {
     pub fn emit_graph(&self, event: GraphEvent) {
         let event_type = format!("{:?}", event.event_type);
         let layer = format!("{:?}", event.layer);
+        if let Some(nats) = &self.nats {
+            nats.publish_graph_event(&event);
+        }
         match self.graph_sender.send(event) {
             Ok(n) => {
                 debug!(
@@ -225,6 +228,63 @@ impl HybridEmitter {
             warn!("NATS→local bridge: subscriber closed");
         });
     }
+    /// Start the NATS→local GRAPH bridge: subscribes to NATS graph events and
+    /// re-injects them into the local graph broadcast. Dedup by
+    /// `timestamp:event_type:node_id` prevents echoing locally-published events.
+    /// No-op if NATS is not configured.
+    pub fn start_graph_nats_bridge(&self) {
+        let Some(nats) = &self.nats else {
+            return;
+        };
+        let nats = nats.clone();
+        let graph_sender = self.graph_sender.clone();
+        tokio::spawn(async move {
+            let mut subscriber = match nats.subscribe_graph_events().await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    warn!("Failed to start NATS→local graph bridge: {}", e);
+                    return;
+                }
+            };
+            info!("NATS→local graph bridge started: events.graph → local broadcast");
+            const DEDUP: usize = 256;
+            let mut seen: std::collections::VecDeque<String> =
+                std::collections::VecDeque::with_capacity(DEDUP);
+            let mut seen_set: std::collections::HashSet<String> =
+                std::collections::HashSet::with_capacity(DEDUP);
+            use futures::StreamExt;
+            while let Some(msg) = subscriber.next().await {
+                match serde_json::from_slice::<GraphEvent>(&msg.payload) {
+                    Ok(event) => {
+                        let key = event
+                            .node_id
+                            .as_deref()
+                            .or(event.target_id.as_deref())
+                            .unwrap_or("");
+                        let fp = format!("{}:{:?}:{}", event.timestamp, event.event_type, key);
+                        if seen_set.contains(&fp) {
+                            continue;
+                        }
+                        seen_set.insert(fp.clone());
+                        seen.push_back(fp);
+                        if seen.len() > DEDUP {
+                            if let Some(old) = seen.pop_front() {
+                                seen_set.remove(&old);
+                            }
+                        }
+                        let _ = graph_sender.send(event);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "NATS→local graph bridge: failed to deserialize GraphEvent: {}",
+                            e
+                        );
+                    }
+                }
+            }
+            warn!("NATS→local graph bridge: subscriber closed");
+        });
+    }
 }
 
 impl EventEmitter for HybridEmitter {
@@ -248,6 +308,44 @@ impl EventEmitter for HybridEmitter {
 mod tests {
     use super::*;
     use crate::events::{CrudAction, EntityType};
+
+    #[tokio::test]
+    async fn graph_events_round_trip_on_nats() {
+        use futures::StreamExt;
+        let broker = crate::events::nats_broker_test::TestBroker::start().await;
+        let nats = NatsEmitter::new(broker.client().await, "events");
+        let mut sub = nats.subscribe_graph_events().await.unwrap();
+        nats.publish_graph_event(&GraphEvent::scores_updated("proj"));
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), sub.next())
+            .await
+            .expect("a graph event arrives")
+            .expect("a message");
+        let ev: GraphEvent = serde_json::from_slice(&msg.payload).unwrap();
+        assert_eq!(format!("{:?}", ev.event_type), "ScoresUpdated");
+    }
+
+    #[tokio::test]
+    async fn a_remote_graph_event_is_bridged_into_the_local_graph() {
+        let broker = crate::events::nats_broker_test::TestBroker::start().await;
+        let nats_a = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let hybrid_a = HybridEmitter::with_nats(Arc::new(EventBus::default()), nats_a);
+        hybrid_a.start_graph_nats_bridge();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let mut rx = hybrid_a.subscribe_graph();
+        let nats_b = NatsEmitter::new(broker.client().await, "events");
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                nats_b.publish_graph_event(&GraphEvent::scores_updated("proj-x"));
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                if let Ok(ev) = rx.try_recv() {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("the remote graph event is bridged in time");
+        assert_eq!(format!("{:?}", ev.event_type), "ScoresUpdated");
+    }
 
     #[test]
     fn test_local_only_emit() {

@@ -663,14 +663,20 @@ impl NoteManager {
             }
             self.emit(event);
 
-            // Graph event: knowledge node removed (synapses implicitly removed via DETACH DELETE)
+            // Graph event: knowledge node removed (synapses implicitly removed by
+            // DETACH DELETE). `NodeDeleted`, not `NodeUpdated`: an update makes a
+            // client redraw the node, so a removal reported that way left a
+            // ghost on screen — the node was never taken away.
             if let Some(pid) = project_id_str {
-                self.emit_graph_event(GraphEvent::node(
-                    GraphEventType::NodeUpdated,
-                    GraphLayer::Knowledge,
-                    id.to_string(),
-                    pid,
-                ));
+                self.emit_graph_event(
+                    GraphEvent::node(
+                        GraphEventType::NodeDeleted,
+                        GraphLayer::Knowledge,
+                        id.to_string(),
+                        pid,
+                    )
+                    .with_delta(serde_json::json!({"node_type": "note"})),
+                );
             }
         }
 
@@ -3259,7 +3265,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_note_emits_graph_node_updated() {
+    async fn test_delete_note_emits_graph_node_deleted() {
         let (mgr, pid, recorder) = create_note_manager_with_recorder().await;
         let req = make_create_request(pid, "Note to delete");
         let note = mgr.create_note(req, "agent-1").await.unwrap();
@@ -3273,8 +3279,8 @@ mod tests {
         let events = recorder.take_graph_events();
         let delete_event = events
             .iter()
-            .find(|e| e.event_type == GraphEventType::NodeUpdated)
-            .expect("delete_note should emit NodeUpdated graph event");
+            .find(|e| e.event_type == GraphEventType::NodeDeleted)
+            .expect("delete_note should emit NodeDeleted graph event");
 
         assert_eq!(delete_event.layer, GraphLayer::Knowledge);
         assert_eq!(
@@ -3282,6 +3288,15 @@ mod tests {
             Some(note.id.to_string().as_str())
         );
         assert_eq!(delete_event.project_id, pid.to_string());
+        assert_eq!(delete_event.delta["node_type"], "note");
+        // A removal must not also be reported as an update: a client redraws on
+        // update and would keep the node on screen.
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.event_type == GraphEventType::NodeUpdated),
+            "a deletion must not emit NodeUpdated"
+        );
     }
 
     #[tokio::test]

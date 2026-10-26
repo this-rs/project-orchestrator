@@ -47,6 +47,15 @@ diagrams:
       - "backend:src/api/ingress_handlers.rs"
       - "backend:src/ingress/**"
       - "backend:src/neo4j/ingress.rs"
+  - name: po-event-ingestion
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-event-ingestion.mmd
+    # Arbitrage : l'activite d'ingestion n'appartient ni a po-autonomic (cycle automatique du
+    # PO) ni a po-api (surface HTTP). C'est un sujet propre — « le PO au travail » — qui voyage
+    # sur la taxonomie CRUD, et un seul fichier le porte : le reporter et sa cadence.
+    covers:
+      - "backend:src/events/ingestion.rs"
   - name: po-chat-manager
     owner: theotime
     status: verified

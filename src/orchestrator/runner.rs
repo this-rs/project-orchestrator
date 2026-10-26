@@ -5,6 +5,7 @@ use crate::embeddings::FastEmbedProvider;
 use crate::embeddings::{EmbeddingProvider, HttpEmbeddingProvider};
 use crate::events::{
     CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter, HybridEmitter,
+    IngestionCounters, IngestionPhase, IngestionReporter, IngestionSummary,
 };
 use crate::graph::{
     AnalyticsConfig, AnalyticsDebouncer, AnalyticsEngine, CoChangeDebouncer, GraphAnalyticsEngine,
@@ -1731,13 +1732,47 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let project_slug = project_slug.map(|s| s.to_string());
         let mut result = SyncResult::default();
 
+        // ── Ingestion activity ─────────────────────────────────────
+        // One reporter per sync run, so the throttle is naturally per project
+        // and per run, with no shared state to lock. When the orchestrator was
+        // built without an emitter (CLI paths, some tests) every call is a
+        // no-op.
+        let mut ingestion = IngestionReporter::new(
+            self.event_emitter.clone(),
+            project_id,
+            project_slug.as_deref(),
+        );
+        let sync_started = std::time::Instant::now();
+        // Read before the sync writes anything: once the caller has bumped
+        // `last_synced`, the answer is "not first" for every subsequent sync.
+        let is_first_sync = match project_id {
+            Some(pid) => self
+                .state
+                .neo4j
+                .get_project(pid)
+                .await
+                .ok()
+                .flatten()
+                .map(|project| project.last_synced.is_none()),
+            None => None,
+        };
+
         // ── Phase 1: Scan ──────────────────────────────────────────
+        ingestion.enter_phase(IngestionPhase::Scanning, IngestionCounters::default());
         let entries = scan_files(dir_path);
+        let scanned_total = entries.len();
 
         // Track all scanned paths for stale-file cleanup
         let synced_paths: HashSet<String> = entries.iter().map(|e| e.path.clone()).collect();
 
         // ── Phase 2: Read ───────────────────────────────────────────
+        ingestion.enter_phase(
+            IngestionPhase::Reading,
+            IngestionCounters {
+                files_total: scanned_total,
+                ..Default::default()
+            },
+        );
         let file_contents = read_files(entries).await;
 
         // ── Hash check: skip unchanged files ───────────────────────
@@ -1755,6 +1790,14 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         }
 
         // ── Phase 3: Parse (with AST cache) ─────────────────────────
+        ingestion.enter_phase(
+            IngestionPhase::Parsing,
+            IngestionCounters {
+                files_total: scanned_total,
+                files_skipped: result.files_skipped,
+                ..Default::default()
+            },
+        );
         let mut cache_guard = self.ast_cache.lock().await;
         let parsed_files = parse_files_with_cache(to_parse, Some(&mut *cache_guard)).await;
         drop(cache_guard); // Release lock before Neo4j calls
@@ -1777,6 +1820,15 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         import_ctx.log_stats();
 
         // ── Store: Batch Neo4j (~10 queries total) ─────────────────
+        ingestion.enter_phase(
+            IngestionPhase::Storing,
+            IngestionCounters {
+                files_total: scanned_total,
+                files_done: parse_count,
+                files_skipped: result.files_skipped,
+                ..Default::default()
+            },
+        );
         match self
             .store_parsed_files_batch(&parsed_files, project_id, &mut import_ctx)
             .await
@@ -1792,11 +1844,31 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         // ── Index in MeiliSearch ───────────────────────────────────
         if let (Some(pid), Some(slug)) = (project_id, project_slug.as_deref()) {
-            for parsed in &parsed_files {
+            ingestion.enter_phase(
+                IngestionPhase::Indexing,
+                IngestionCounters {
+                    files_total: scanned_total,
+                    files_skipped: result.files_skipped,
+                    ..Default::default()
+                },
+            );
+            for (indexed, parsed) in parsed_files.iter().enumerate() {
                 let doc = CodeParser::to_code_document(parsed, &pid.to_string(), slug);
                 if let Err(e) = self.state.meili.index_code(&doc).await {
                     tracing::warn!("Failed to index {} in Meilisearch: {}", parsed.path, e);
                 }
+                // Throttled by the reporter: this is the only place where a
+                // real per-file path is available, so it is what feeds a
+                // client's "current file" display.
+                ingestion.tick(
+                    IngestionCounters {
+                        files_total: scanned_total,
+                        files_done: indexed + 1,
+                        files_skipped: result.files_skipped,
+                        ..Default::default()
+                    },
+                    Some(parsed.path.as_str()),
+                );
             }
         }
 
@@ -1821,6 +1893,15 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         );
 
         // ── Cleanup: remove stale files ────────────────────────────
+        ingestion.enter_phase(
+            IngestionPhase::Cleanup,
+            IngestionCounters {
+                files_total: scanned_total,
+                files_done: parse_count,
+                files_skipped: result.files_skipped,
+                files_deleted: result.files_deleted,
+            },
+        );
         // An empty scan (missing, unmounted or emptied root) is not proof that
         // every file was deleted: skip the purge so the project graph survives.
         if project_id.is_some() && synced_paths.is_empty() {
@@ -1856,6 +1937,39 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 Err(e) => {
                     tracing::warn!("Failed to clean up stale files: {}", e);
                 }
+            }
+        }
+
+        let duration_ms = sync_started.elapsed().as_millis() as u64;
+        ingestion.synced(IngestionSummary {
+            files_parsed: result.files_synced,
+            files_skipped: result.files_skipped,
+            files_deleted: result.files_deleted,
+            errors: result.errors,
+            duration_ms,
+            is_first_sync,
+        });
+        tracing::debug!(
+            emitted = ingestion.emitted(),
+            duration_ms,
+            "sync pipeline: ingestion activity reported"
+        );
+
+        // The code layer was just re-indexed: ONE batch event at the end lets a
+        // client refresh it without a per-file storm. Counters are what this run
+        // really has; the created/updated split and relation counts the contract
+        // names would need the sync to track them, which it does not yet.
+        if let Some(pid) = project_id {
+            if let Some(emitter) = self.event_emitter.as_ref() {
+                emitter.emit_graph(crate::events::GraphEvent::batch(
+                    crate::events::graph::GraphLayer::Code,
+                    serde_json::json!({
+                        "files_synced": result.files_synced,
+                        "files_deleted": result.files_deleted,
+                        "symbols_deleted": result.symbols_deleted,
+                    }),
+                    pid.to_string(),
+                ));
             }
         }
 
@@ -1925,6 +2039,23 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         // Verify notes attached to this file
         self.verify_notes_for_file(&path_str, &parsed, &content)
             .await?;
+
+        // One ingestion event per changed file: a commit-triggered resync or a
+        // watcher save is the orchestrator working too, at the finest grain a
+        // client can show. The early return above means an unchanged file emits
+        // nothing. Deliberately no `synced` terminator here — a one-file pass is
+        // a blip, not a run.
+        let mut ingestion =
+            IngestionReporter::new(self.event_emitter.clone(), project_id, project_slug);
+        ingestion.enter_phase_at(
+            IngestionPhase::Indexing,
+            IngestionCounters {
+                files_total: 1,
+                files_done: 1,
+                ..Default::default()
+            },
+            Some(path_str.as_str()),
+        );
 
         Ok(true)
     }
@@ -9773,6 +9904,71 @@ mod tests {
         assert_eq!(
             stats2.size, 13,
             "Cache should hold 10 + 3 entries (old + new hashes)"
+        );
+    }
+
+    /// The ingestion stream, end to end through a real sync.
+    ///
+    /// The contract: a phase is always reported, the run is closed by exactly
+    /// one `synced`, and the number of events is bounded by the number of phases
+    /// — never by the number of files. That last part is the whole reason the
+    /// stream is coalesced, so it is what this test pins.
+    #[tokio::test]
+    async fn a_sync_emits_one_coalesced_ingestion_stream() {
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..8 {
+            fs::write(
+                tmp.path().join(format!("f{i}.rs")),
+                format!("pub fn f{i}() -> u32 {{ {i} }}"),
+            )
+            .unwrap();
+        }
+
+        let (orch, mut rx) = orch_with_bus().await;
+
+        let result = orch
+            .sync_directory_for_project_with_options(tmp.path(), None, None, true)
+            .await
+            .unwrap();
+
+        let mut ingestion = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if event.entity_type == EventEntityType::Ingestion {
+                ingestion.push(event);
+            }
+        }
+
+        assert!(
+            !ingestion.is_empty(),
+            "a sync must report that it is working"
+        );
+        assert_eq!(
+            ingestion[0].payload["phase"], "scanning",
+            "the first thing a client hears is where the sync starts"
+        );
+        assert_eq!(ingestion[0].action, CrudAction::Progress);
+
+        let last = ingestion.last().unwrap();
+        assert_eq!(last.action, CrudAction::Synced, "exactly one terminator");
+        assert_eq!(last.payload["phase"], "done");
+        // Same counters as Project/Synced, so either event tells the same story.
+        assert_eq!(last.payload["files_parsed"], result.files_synced);
+        // The point of coalescing: 8 files, a handful of events.
+        assert!(
+            ingestion.len() <= 10,
+            "8 files produced {} ingestion events — the stream depends on file count, \
+             which is exactly what coalescing forbids",
+            ingestion.len()
+        );
+        assert_eq!(
+            ingestion
+                .iter()
+                .filter(|e| e.action == CrudAction::Synced)
+                .count(),
+            1,
+            "a sync has one terminator, not one per file"
         );
     }
 

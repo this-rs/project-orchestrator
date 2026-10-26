@@ -1,8 +1,10 @@
 //! WebSocket handlers for real-time event notifications
 //!
-//! Multiplexes two event streams into a single WebSocket connection:
+//! Multiplexes three event streams into a single WebSocket connection:
 //! - **CRUD events**: entity mutations (create/update/delete/link/unlink)
 //! - **Graph events**: graph visualization mutations (node/edge/reinforcement/activation)
+//! - **Chat events**: opt-in, one frame per session named in `?sessions=` — so
+//!   following N agents costs one socket and one ticket, not N
 //!
 //! Events from both local and remote sources (NATS) arrive via the local
 //! broadcast bus thanks to the NATS→local bridge in `HybridEmitter`.
@@ -11,6 +13,7 @@
 use super::handlers::OrchestratorState;
 use super::ws_auth::CookieAuthResult;
 use crate::auth::jwt::Claims;
+use crate::chat::types::ChatEvent;
 use crate::events::graph::GraphEvent;
 use crate::events::CrudEvent;
 use axum::{
@@ -24,6 +27,7 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::HashSet;
+use tokio::sync::broadcast;
 use tokio::time::{interval, Duration};
 use tracing::{debug, info, warn};
 
@@ -40,7 +44,21 @@ pub struct WsQuery {
     pub layers: Option<String>,
     /// One-time ticket for auth (fallback when cookies aren't sent on WS upgrade)
     pub ticket: Option<String>,
+    /// Comma-separated chat session IDs to multiplex onto this connection
+    /// (e.g. "uuid-a,uuid-b").
+    ///
+    /// Exists because the WS ticket is single-use: following N agents used to
+    /// mean N tickets and N sockets, each with its own reconnect and backoff.
+    /// Each multiplexed event is sent as `{"kind":"chat","session_id":…,"event":…}`,
+    /// immediately — no batching, the volume is low and latency matters.
+    ///
+    /// Bounded by [`MAX_MUX_SESSIONS`]: a longer list is refused with 400 rather
+    /// than silently truncated.
+    pub sessions: Option<String>,
 }
+
+/// Maximum number of chat sessions multiplexed on one `/ws/events` connection.
+pub const MAX_MUX_SESSIONS: usize = 64;
 
 /// WebSocket upgrade handler for `/ws/events`
 ///
@@ -69,6 +87,36 @@ pub async fn ws_events(
             .collect()
     });
 
+    // ── Requested chat sessions (optional) ─────────────────────────
+    // Refused, not truncated, when too long: a client that silently loses half
+    // its subscriptions would show half the agents and look broken.
+    let requested_sessions: Vec<String> = query
+        .sessions
+        .as_deref()
+        .map(|list| {
+            list.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if requested_sessions.len() > MAX_MUX_SESSIONS {
+        warn!(
+            requested = requested_sessions.len(),
+            max = MAX_MUX_SESSIONS,
+            "WS /ws/events: refusing a ?sessions= list that is too long"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "too many sessions in ?sessions= ({} requested, {} max)",
+                requested_sessions.len(),
+                MAX_MUX_SESSIONS
+            ),
+        )
+            .into_response();
+    }
+
     // Pre-upgrade auth: cookie first, then ticket fallback
     let has_cookie = headers.get(axum::http::header::COOKIE).is_some();
     let has_ticket = query.ticket.is_some();
@@ -88,9 +136,32 @@ pub async fn ws_events(
     )
     .await;
 
+    // Subscribe to the multiplexed chat sessions BEFORE the upgrade, for the
+    // same reason /ws/chat does: an event emitted between the upgrade and the
+    // client's first read would otherwise be lost. A session that is not live
+    // cannot be subscribed — it is skipped with a debug line rather than an
+    // error, because a client may name a session that has not started yet and
+    // will hear about it through `chat_session/created`.
     match auth_result {
         CookieAuthResult::Authenticated(claims) => {
-            info!(email = %claims.email, "WS /ws/events: authenticated, upgrading");
+            let mut chat_subs = Vec::with_capacity(requested_sessions.len());
+            if let Some(manager) = state.chat_manager.as_ref() {
+                for session_id in &requested_sessions {
+                    match manager.subscribe(session_id).await {
+                        Ok(rx) => chat_subs.push((session_id.clone(), rx)),
+                        Err(e) => debug!(
+                            session_id = %session_id,
+                            error = %e,
+                            "WS /ws/events: chat session not multiplexed (not live)"
+                        ),
+                    }
+                }
+            }
+            let multiplexed = chat_subs.len();
+            info!(
+                email = %claims.email,
+                multiplexed, "WS /ws/events: authenticated, upgrading"
+            );
             ws.on_upgrade(move |socket| {
                 handle_ws_preauthed(
                     socket,
@@ -98,6 +169,7 @@ pub async fn ws_events(
                     entity_filter,
                     project_filter,
                     layer_filter,
+                    chat_subs,
                     claims,
                 )
             })
@@ -179,6 +251,7 @@ async fn handle_ws_preauthed(
     entity_filter: Option<HashSet<String>>,
     project_filter: Option<String>,
     layer_filter: Option<HashSet<String>>,
+    chat_subs: Vec<(String, broadcast::Receiver<ChatEvent>)>,
     claims: Claims,
 ) {
     // Wait for client "ready" signal before sending auth_ok
@@ -189,9 +262,75 @@ async fn handle_ws_preauthed(
         entity_filter,
         project_filter,
         layer_filter,
+        chat_subs,
         claims,
     )
     .await;
+}
+
+/// Build the wire frame of a multiplexed chat event.
+///
+/// `{"kind":"chat","session_id":…,"event":…}` is a documented contract for
+/// external consumers: the `kind` discriminant is what tells this frame apart
+/// from a bare CRUD event on the same socket. Kept as a function so the shape
+/// can be tested without a socket.
+pub fn chat_frame(session_id: &str, event: &ChatEvent) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&serde_json::json!({
+        "kind": "chat",
+        "session_id": session_id,
+        "event": event,
+    }))
+}
+
+/// Poll the multiplexed chat subscriptions, round-robin, without blocking.
+///
+/// Mirrors `poll_chat_sessions` in `ws_run_handler`: `try_recv` on each
+/// subscription, and drop the ones whose broadcast channel is closed (the
+/// session ended) so a finished agent never keeps the loop spinning.
+fn poll_mux_sessions(
+    subs: &mut Vec<(String, broadcast::Receiver<ChatEvent>)>,
+) -> Option<(String, ChatEvent)> {
+    let mut i = 0;
+    while i < subs.len() {
+        match subs[i].1.try_recv() {
+            Ok(event) => return Some((subs[i].0.clone(), event)),
+            Err(broadcast::error::TryRecvError::Empty) => i += 1,
+            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                warn!(
+                    session_id = %subs[i].0,
+                    skipped = n,
+                    "WS /ws/events: multiplexed chat subscriber lagged"
+                );
+                i += 1;
+            }
+            Err(broadcast::error::TryRecvError::Closed) => {
+                debug!(
+                    session_id = %subs[i].0,
+                    "WS /ws/events: chat session ended, dropping it from the multiplex"
+                );
+                subs.remove(i);
+            }
+        }
+    }
+    None
+}
+
+/// Await the next multiplexed chat event, yielding when there is none.
+///
+/// With no subscription the future is simply pending, so `tokio::select!`
+/// disables the branch instead of busy-looping.
+async fn next_mux_chat_event(
+    subs: &mut Vec<(String, broadcast::Receiver<ChatEvent>)>,
+) -> Option<(String, ChatEvent)> {
+    if subs.is_empty() {
+        std::future::pending::<()>().await;
+        return None;
+    }
+    if let Some(pair) = poll_mux_sessions(subs) {
+        return Some(pair);
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    None
 }
 
 /// Maximum graph events in a single batch before flushing immediately
@@ -235,9 +374,12 @@ async fn flush_graph_batch(
 
 /// Main event loop for an authenticated WebSocket connection.
 ///
-/// Multiplexes two broadcast channels into a single WebSocket stream:
+/// Multiplexes three broadcast channels into a single WebSocket stream:
 /// - **CRUD events** from `event_bus.subscribe()` — sent immediately (low volume)
 /// - **Graph events** from `event_bus.subscribe_graph()` — batched to prevent flood
+/// - **Chat events** from the sessions named in `?sessions=` — sent immediately,
+///   one frame per event, because a tool call the user is waiting on must not
+///   wait behind a 100 ms batch window
 ///
 /// Graph event batching: events are collected into a buffer and flushed either:
 /// - When the buffer reaches `GRAPH_BATCH_MAX_SIZE` (10) events, OR
@@ -251,6 +393,7 @@ async fn handle_ws_loop(
     entity_filter: Option<HashSet<String>>,
     project_filter: Option<String>,
     layer_filter: Option<HashSet<String>>,
+    mut chat_subs: Vec<(String, broadcast::Receiver<ChatEvent>)>,
     claims: Claims,
 ) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
@@ -348,6 +491,21 @@ async fn handle_ws_loop(
                     break;
                 }
                 batch_timer_active = false;
+            }
+
+            // Forward a multiplexed chat event for one of the named sessions.
+            // Sent immediately: a `tool_use` the user is watching must not wait
+            // behind the graph batch window.
+            Some((session_id, chat_event)) = next_mux_chat_event(&mut chat_subs) => {
+                match chat_frame(&session_id, &chat_event) {
+                    Ok(frame) => {
+                        if ws_sender.send(Message::Text(frame.into())).await.is_err() {
+                            debug!(%session_id, "WebSocket send failed on a chat frame");
+                            break;
+                        }
+                    }
+                    Err(e) => warn!(%session_id, "Failed to serialize a chat frame: {}", e),
+                }
             }
 
             // Send periodic pings to detect dead clients
@@ -708,5 +866,77 @@ mod tests {
         assert_eq!(passed.len(), 2);
         assert_eq!(passed[0].layer, GraphLayer::Knowledge);
         assert_eq!(passed[1].layer, GraphLayer::Neural);
+    }
+
+    // ================================================================
+    // Multiplexed chat sessions (?sessions=)
+    // ================================================================
+
+    fn chat_text(content: &str) -> ChatEvent {
+        ChatEvent::AssistantText {
+            content: content.to_string(),
+            parent_tool_use_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_multiplexed_event_names_its_session() {
+        // The frame must say WHO spoke: with N sessions on one socket, an event
+        // without its session id would be unattributable.
+        let (tx_a, rx_a) = broadcast::channel(8);
+        let mut subs = vec![("session-a".to_string(), rx_a)];
+        tx_a.send(chat_text("hello")).unwrap();
+
+        let (session_id, event) = next_mux_chat_event(&mut subs).await.expect("an event");
+        assert_eq!(session_id, "session-a");
+        assert!(matches!(event, ChatEvent::AssistantText { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_finished_session_leaves_the_multiplex_without_killing_it() {
+        // One agent ending must not take the other nineteen down with it.
+        let (tx_a, rx_a) = broadcast::channel(8);
+        let (tx_b, rx_b) = broadcast::channel(8);
+        let mut subs = vec![
+            ("session-a".to_string(), rx_a),
+            ("session-b".to_string(), rx_b),
+        ];
+
+        drop(tx_b); // session b is over
+
+        // Polling once drains a (empty) and notices b's closed channel.
+        let _ = next_mux_chat_event(&mut subs).await;
+        assert_eq!(subs.len(), 1, "the closed session is dropped");
+        assert_eq!(subs[0].0, "session-a", "the live one stays");
+
+        // And a still fires afterwards.
+        tx_a.send(chat_text("still here")).unwrap();
+        let (session_id, _) = next_mux_chat_event(&mut subs).await.expect("an event");
+        assert_eq!(session_id, "session-a");
+    }
+
+    #[tokio::test]
+    async fn no_subscription_leaves_the_branch_pending() {
+        // With nothing to multiplex the future never resolves, so tokio::select!
+        // disables the branch instead of spinning on it.
+        let mut subs: Vec<(String, broadcast::Receiver<ChatEvent>)> = Vec::new();
+        let polled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            next_mux_chat_event(&mut subs),
+        )
+        .await;
+        assert!(
+            polled.is_err(),
+            "the branch must stay pending, not busy-loop"
+        );
+    }
+
+    #[test]
+    fn too_many_sessions_are_refused_rather_than_truncated() {
+        // A client that silently loses half its subscriptions shows half its
+        // agents and looks broken; the refusal is explicit.
+        let list: Vec<String> = (0..MAX_MUX_SESSIONS + 1).map(|i| format!("s{i}")).collect();
+        assert!(list.len() > MAX_MUX_SESSIONS);
+        assert_eq!(MAX_MUX_SESSIONS, 64);
     }
 }

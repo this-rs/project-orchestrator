@@ -44,6 +44,13 @@ pub enum GraphEventType {
     NodeCreated,
     /// A node's attributes changed (energy, staleness, status, etc.)
     NodeUpdated,
+    /// A node was removed from the graph (note deleted, file dropped by a sync).
+    ///
+    /// Distinct from [`NodeUpdated`](Self::NodeUpdated) on purpose: a client
+    /// that receives an update redraws the node, so a deletion sent as an
+    /// update leaves the node lit forever. Deletions used to be reported that
+    /// way.
+    NodeDeleted,
     /// A new edge was created (synapse, LINKED_TO, CO_CHANGED, etc.)
     EdgeCreated,
     /// An edge was removed (synapse pruned, note unlinked, etc.)

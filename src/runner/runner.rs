@@ -2339,6 +2339,13 @@ impl PlanRunner {
                             "Marked step {} as in_progress at task {} launch",
                             first_step.id, task_id
                         );
+                        self.emit_step_status_changed(
+                            first_step.id,
+                            crate::neo4j::models::StepStatus::Pending,
+                            crate::neo4j::models::StepStatus::InProgress,
+                            task_id,
+                            Some(plan_id),
+                        );
                     }
                 }
             }
@@ -4859,6 +4866,41 @@ impl PlanRunner {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    /// Emit a `Step/StatusChanged` for a step the runner wrote itself.
+    ///
+    /// The runner writes step statuses straight to the store (it does not go
+    /// through `PlanManager`), so nothing used to be emitted: a run in progress
+    /// was invisible step by step. The event is built here rather than routed
+    /// through the manager to avoid re-reading a step we already hold.
+    fn emit_step_status_changed(
+        &self,
+        step_id: Uuid,
+        old_status: crate::neo4j::models::StepStatus,
+        new_status: crate::neo4j::models::StepStatus,
+        task_id: Uuid,
+        plan_id: Option<Uuid>,
+    ) {
+        let Some(ref emitter) = self.event_emitter else {
+            return;
+        };
+        let mut payload = serde_json::json!({
+            "old_status": old_status,
+            "new_status": new_status,
+            "task_id": task_id.to_string(),
+        });
+        if let Some(plan_id) = plan_id {
+            payload["plan_id"] = serde_json::json!(plan_id.to_string());
+        }
+        emitter.emit(
+            CrudEvent::new(
+                EntityType::Step,
+                CrudAction::StatusChanged,
+                step_id.to_string(),
+            )
+            .with_payload(payload),
+        );
+    }
+
     /// Finalize steps for a task on ALL exit paths (success, timeout, error, cancelled).
     ///
     /// - `Success`: pending/in_progress → completed
@@ -4943,6 +4985,8 @@ impl PlanRunner {
             );
         }
 
+        let plan_id = self.graph.get_task_plan_id(task_id).await.ok().flatten();
+
         for step in &remaining {
             let new_status = match outcome {
                 TaskResult::Success { .. } => crate::neo4j::models::StepStatus::Completed,
@@ -4969,8 +5013,21 @@ impl PlanRunner {
                 _ => {}
             }
 
-            if let Err(e) = self.graph.update_step_status(step.id, new_status).await {
-                warn!("finalize_steps: failed to update step {}: {}", step.id, e);
+            match self
+                .graph
+                .update_step_status(step.id, new_status.clone())
+                .await
+            {
+                Ok(()) => self.emit_step_status_changed(
+                    step.id,
+                    step.status.clone(),
+                    new_status,
+                    task_id,
+                    plan_id,
+                ),
+                Err(e) => {
+                    warn!("finalize_steps: failed to update step {}: {}", step.id, e);
+                }
             }
         }
 
@@ -12238,5 +12295,50 @@ mod tests {
         );
 
         reset_globals().await;
+    }
+
+    /// The runner writes step statuses straight to the store, so this helper is
+    /// the ONLY thing that tells a client a step was crossed. It must carry both
+    /// sides of the transition plus the ids that let a dashboard pulse the right
+    /// plan node — an event with only the new status cannot drive an animation.
+    #[tokio::test]
+    async fn emit_step_status_changed_carries_the_transition_and_its_parents() {
+        use crate::events::{EventBus, HybridEmitter};
+
+        let hybrid = Arc::new(HybridEmitter::new(Arc::new(EventBus::default())));
+        let mut rx = hybrid.subscribe();
+        let mut runner = test_plan_runner();
+        runner.event_emitter = Some(hybrid);
+
+        let step_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let plan_id = Uuid::new_v4();
+        runner.emit_step_status_changed(
+            step_id,
+            crate::neo4j::models::StepStatus::Pending,
+            crate::neo4j::models::StepStatus::Completed,
+            task_id,
+            Some(plan_id),
+        );
+
+        let event = rx.try_recv().expect("one step event");
+        assert_eq!(event.entity_type, EntityType::Step);
+        assert_eq!(event.action, CrudAction::StatusChanged);
+        assert_eq!(event.entity_id, step_id.to_string());
+        assert_eq!(event.payload["old_status"], "pending");
+        assert_eq!(event.payload["new_status"], "completed");
+        assert_eq!(event.payload["task_id"], task_id.to_string());
+        assert_eq!(event.payload["plan_id"], plan_id.to_string());
+        // A parentless step still reports its transition; the field is omitted
+        // rather than invented.
+        runner.emit_step_status_changed(
+            step_id,
+            crate::neo4j::models::StepStatus::Pending,
+            crate::neo4j::models::StepStatus::Skipped,
+            task_id,
+            None,
+        );
+        let second = rx.try_recv().expect("a second step event");
+        assert!(second.payload.get("plan_id").is_none());
     }
 }

@@ -293,13 +293,43 @@ impl PlanManager {
     }
 
     /// Update step status
+    ///
+    /// Emits `StatusChanged` (not `Updated`): a client animating "a step was
+    /// crossed" needs to tell a status transition apart from a description
+    /// edit, and needs both sides of the transition.
     pub async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> Result<()> {
+        // Read the previous status *before* writing: a transition that carries
+        // only the new value cannot drive an animation.
+        let previous_status = self
+            .neo4j
+            .get_step(step_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|step| step.status);
         self.neo4j
             .update_step_status(step_id, status.clone())
             .await?;
+        let mut payload = serde_json::json!({
+            "old_status": previous_status,
+            "new_status": status,
+        });
+        // The parent ids let the dashboard pulse the right plan node. Both
+        // lookups are best-effort: a step without a parent is still a valid
+        // transition and must not fail the write.
+        if let Ok(Some(task_id)) = self.neo4j.get_step_parent_task_id(step_id).await {
+            payload["task_id"] = serde_json::json!(task_id.to_string());
+            if let Ok(Some(plan_id)) = self.neo4j.get_task_plan_id(task_id).await {
+                payload["plan_id"] = serde_json::json!(plan_id.to_string());
+            }
+        }
         self.emit(
-            CrudEvent::new(EntityType::Step, CrudAction::Updated, step_id.to_string())
-                .with_payload(serde_json::json!({"status": status})),
+            CrudEvent::new(
+                EntityType::Step,
+                CrudAction::StatusChanged,
+                step_id.to_string(),
+            )
+            .with_payload(payload),
         );
         Ok(())
     }

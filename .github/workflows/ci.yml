@@ -735,7 +735,9 @@ jobs:
       # (1) Unit tests, whole workspace (member crates carry their own suites).
       # `test_large_index_performance` is a wall-clock assertion that does not
       # hold under llvm-cov instrumentation — skipped here, still run by the
-      # Unit Tests job. See docs/COVERAGE.md.
+      # Unit Tests job. See docs/COVERAGE.md. `the_same_scenario_on_both_engines_
+      # gives_the_parity_matrix` (multi-engine scenario, Codex column stalls ~90s
+      # under instrumentation — documented FLAKY-PARITE) is skipped here too.
       - name: Build the nexus fake servers used by the agent e2e tests
         uses: ./.github/actions/nexus-fakes
 
@@ -754,7 +756,8 @@ jobs:
         run: |
           cargo llvm-cov --no-report --no-fail-fast \
             --workspace --exclude project-orchestrator-desktop --lib \
-            -- --skip test_large_index_performance
+            -- --skip test_large_index_performance \
+               --skip the_same_scenario_on_both_engines_gives_the_parity_matrix
 
       # (2) Parser tests — no service needed.
       - name: Collect coverage — parser tests
