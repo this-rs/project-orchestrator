@@ -769,6 +769,37 @@ pub async fn delete_session(
     }
 }
 
+/// POST /api/chat/sessions/{id}/close — Close a live session WITHOUT deleting it.
+///
+/// Interrupts the running turn, disconnects the CLI and removes the session from
+/// the live map (freeing its envelope slot), but keeps the node and its
+/// transcript: a later message resumes it. Distinct from DELETE, which removes
+/// the node. This is the explicit closure a delegated session needs when its
+/// provider process died and no turn is left to end it (ZOMBIE-CLI).
+pub async fn close_session(
+    State(state): State<OrchestratorState>,
+    Path(session_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let Some(chat_manager) = state.chat_manager.as_ref() else {
+        // Without a live manager nothing is running; there is nothing to close.
+        return Ok(Json(serde_json::json!({
+            "closed": false,
+            "reason": "no live chat manager",
+        })));
+    };
+    chat_manager
+        .close_session(&session_id.to_string())
+        .await
+        .map_err(AppError::Internal)?;
+    // The node survives but its live state changed: tell the UI to refresh.
+    state.event_bus.emit(CrudEvent::new(
+        EntityType::ChatSession,
+        CrudAction::Updated,
+        session_id.to_string(),
+    ));
+    Ok(Json(serde_json::json!({ "closed": true })))
+}
+
 // ============================================================================
 // Cancel running tools (T3 of plan 28e9afe3)
 // ============================================================================
@@ -4289,6 +4320,60 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ====================================================================
+    // POST /api/chat/sessions/{id}/close — close (non-destructive)
+    // ====================================================================
+
+    /// A server with no live chat manager has nothing running to close: the
+    /// endpoint answers, it never fails.
+    #[tokio::test]
+    async fn close_on_a_server_without_a_chat_manager_says_nothing_is_running() {
+        let app = test_app().await;
+        let sid = Uuid::new_v4();
+
+        let (status, body) = call(
+            &app,
+            auth_post(&format!("/api/chat/sessions/{sid}/close"), "{}"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["closed"], false);
+        assert_eq!(body["reason"], "no live chat manager");
+    }
+
+    /// Closing a live session frees its envelope slot but keeps its node: a later
+    /// message resumes it (the explicit closure a delegated zombie needs).
+    #[tokio::test]
+    async fn close_frees_a_live_session_but_keeps_its_node() {
+        let h = action_harness(None).await;
+        let sid = seed_session(&h).await;
+        test_support::insert_live_session_without_cli(&h.manager, &sid.to_string()).await;
+        assert_eq!(
+            h.manager.active_session_count().await,
+            1,
+            "the session is live"
+        );
+
+        let (status, body) = call(
+            &h.app,
+            auth_post(&format!("/api/chat/sessions/{sid}/close"), "{}"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["closed"], true);
+        assert_eq!(
+            h.manager.active_session_count().await,
+            0,
+            "its slot is freed"
+        );
+        assert!(
+            h.graph.get_chat_session(sid).await.unwrap().is_some(),
+            "the node and its transcript survive: a later message resumes it"
+        );
     }
 
     // ====================================================================

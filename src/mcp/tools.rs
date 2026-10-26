@@ -218,6 +218,7 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "get_chat_session" => Some(("chat", "get_session")),
         "get_session_children" => Some(("chat", "get_children")),
         "delete_chat_session" => Some(("chat", "delete_session")),
+        "close_chat_session" => Some(("chat", "close_session")),
         "chat_send_message" => Some(("chat", "send_message")),
         "list_chat_messages" => Some(("chat", "list_messages")),
         "get_session_tree" => Some(("chat", "get_session_tree")),
@@ -957,7 +958,7 @@ fn chat_tool() -> ToolDefinition {
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list_sessions", "get_session", "get_children", "delete_session", "send_message", "list_messages", "add_discussed", "get_session_entities", "get_session_tree", "get_run_sessions", "associate_with", "team_message", "team_status", "list_anchors", "add_anchor", "update_anchor", "remove_anchor", "list_anchored_sessions"],
+                    "enum": ["list_sessions", "get_session", "get_children", "delete_session", "close_session", "send_message", "list_messages", "add_discussed", "get_session_entities", "get_session_tree", "get_run_sessions", "associate_with", "team_message", "team_status", "list_anchors", "add_anchor", "update_anchor", "remove_anchor", "list_anchored_sessions"],
                     "description": "Operation to perform"
                 },
                 "session_id": {"type": "string", "description": "Session UUID. For send_message: resume this existing session instead of creating a new one (omit to start a new conversation)"},

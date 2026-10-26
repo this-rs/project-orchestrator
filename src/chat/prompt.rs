@@ -974,6 +974,7 @@ Manage chat sessions.
 | get_session | `session_id` (req) | Get session details |
 | get_children | `session_id` (req) | Get child sessions |
 | delete_session | `session_id` (req) | Delete session |
+| close_session | `session_id` (req) | Close a live session without deleting it (frees its slot; a later message resumes it) |
 | send_message | `message` (req), `cwd`, `project_slug`, `model`, `permission_mode`, `workspace_slug`, `add_dirs` | Send message to orchestrator |
 | list_messages | `session_id` (req), `limit`, `offset` | List messages in session |
 | add_discussed | `session_id` (req), `entities` (req: [{entity_type, entity_id}]) | Mark entities as discussed |
