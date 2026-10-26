@@ -404,6 +404,7 @@ pub(crate) const MEGA_TOOL_ACTIONS: &[(&str, &str, &str)] = &[
     ("chat", "get_session", "get_chat_session"),
     ("chat", "get_children", "get_session_children"),
     ("chat", "delete_session", "delete_chat_session"),
+    ("chat", "close_session", "close_chat_session"),
     ("chat", "send_message", "chat_send_message"),
     ("chat", "list_messages", "list_chat_messages"),
     ("chat", "add_discussed", "add_discussed"),
@@ -4305,6 +4306,14 @@ impl ToolHandler {
             "delete_chat_session" => {
                 let id = extract_id(args, "session_id")?;
                 let result = http.delete(&format!("/api/chat/sessions/{}", id)).await?;
+                Ok(Some(result))
+            }
+
+            "close_chat_session" => {
+                let id = extract_id(args, "session_id")?;
+                let result = http
+                    .post(&format!("/api/chat/sessions/{}/close", id), &json!({}))
+                    .await?;
                 Ok(Some(result))
             }
 
@@ -9929,6 +9938,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["method"], "GET");
+        assert!(result["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/api/chat/sessions/"));
+    }
+
+    #[tokio::test]
+    async fn test_http_close_chat_session() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle("close_chat_session", Some(json!({"session_id": UUID1})))
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
         assert!(result["path"]
             .as_str()
             .unwrap()

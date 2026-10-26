@@ -769,6 +769,37 @@ pub async fn delete_session(
     }
 }
 
+/// POST /api/chat/sessions/{id}/close — Close a live session WITHOUT deleting it.
+///
+/// Interrupts the running turn, disconnects the CLI and removes the session from
+/// the live map (freeing its envelope slot), but keeps the node and its
+/// transcript: a later message resumes it. Distinct from DELETE, which removes
+/// the node. This is the explicit closure a delegated session needs when its
+/// provider process died and no turn is left to end it (ZOMBIE-CLI).
+pub async fn close_session(
+    State(state): State<OrchestratorState>,
+    Path(session_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let Some(chat_manager) = state.chat_manager.as_ref() else {
+        // Without a live manager nothing is running; there is nothing to close.
+        return Ok(Json(serde_json::json!({
+            "closed": false,
+            "reason": "no live chat manager",
+        })));
+    };
+    chat_manager
+        .close_session(&session_id.to_string())
+        .await
+        .map_err(AppError::Internal)?;
+    // The node survives but its live state changed: tell the UI to refresh.
+    state.event_bus.emit(CrudEvent::new(
+        EntityType::ChatSession,
+        CrudAction::Updated,
+        session_id.to_string(),
+    ));
+    Ok(Json(serde_json::json!({ "closed": true })))
+}
+
 // ============================================================================
 // Cancel running tools (T3 of plan 28e9afe3)
 // ============================================================================

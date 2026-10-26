@@ -2006,6 +2006,12 @@ fn protected_routes() -> Router<OrchestratorState> {
                 .patch(chat_handlers::update_session)
                 .delete(chat_handlers::delete_session),
         )
+        // Close (non-destructive) a live session: ends its turn and frees its
+        // envelope slot without removing the node (ZOMBIE-CLI explicit closure).
+        .route(
+            "/api/chat/sessions/{id}/close",
+            post(chat_handlers::close_session),
+        )
         .route(
             "/api/chat/sessions/{id}/messages",
             get(chat_handlers::list_messages).post(chat_handlers::send_session_message),
