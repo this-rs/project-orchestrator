@@ -910,6 +910,13 @@ const PLAN_TITLE: &str = "Port the enrichment";
 const TASK_TITLE: &str = "Measure the parity";
 const WAIT: Duration = Duration::from_secs(20);
 
+/// Deadline for a plain engine Result on a native/ACP/Codex column. Wider than
+/// `WAIT` for the same reason as `INTERRUPT_TURN_END_WAIT`: a coverage-
+/// instrumented binary is several times slower, and a 20 s deadline flakes
+/// under `cargo llvm-cov` (the Code Coverage job) even though it passes in the
+/// plain Unit Tests job.
+const ENGINE_RESULT_WAIT: Duration = Duration::from_secs(90);
+
 /// The end of a turn AFTER an interruption gets its own, wider deadline than
 /// `WAIT`. The interruption travels three hops (the other instance publishing
 /// over NATS, the CLI's `interrupt` control_request, the CLI closing the
@@ -5197,7 +5204,7 @@ async fn run_acp_column() -> Measures {
     let sid = created.session_id;
     let mut rx = manager.subscribe(&sid).await.unwrap();
     loop {
-        match tokio::time::timeout(Duration::from_secs(20), rx.recv()).await {
+        match tokio::time::timeout(ENGINE_RESULT_WAIT, rx.recv()).await {
             Ok(Ok(ChatEvent::Result { .. })) => break,
             Ok(Ok(_)) => continue,
             Ok(Err(_)) | Err(_) => panic!("run_acp_column: timed out waiting for native Result"),
@@ -5215,7 +5222,7 @@ async fn run_acp_column() -> Measures {
 
     // Wait for ACP answer.
     loop {
-        match tokio::time::timeout(Duration::from_secs(20), rx.recv()).await {
+        match tokio::time::timeout(ENGINE_RESULT_WAIT, rx.recv()).await {
             Ok(Ok(ChatEvent::Result { .. })) => break,
             Ok(Ok(_)) => continue,
             Ok(Err(_)) | Err(_) => panic!("run_acp_column: timed out waiting for ACP Result"),
@@ -5384,7 +5391,7 @@ async fn run_codex_column() -> Measures {
     let sid = created.session_id;
     let mut rx = manager.subscribe(&sid).await.unwrap();
     loop {
-        match tokio::time::timeout(Duration::from_secs(20), rx.recv()).await {
+        match tokio::time::timeout(ENGINE_RESULT_WAIT, rx.recv()).await {
             Ok(Ok(ChatEvent::Result { .. })) => break,
             Ok(Ok(_)) => continue,
             Ok(Err(_)) | Err(_) => panic!("run_codex_column: timed out waiting for native Result"),
@@ -5402,7 +5409,7 @@ async fn run_codex_column() -> Measures {
 
     // Wait for Codex answer.
     loop {
-        match tokio::time::timeout(Duration::from_secs(20), rx.recv()).await {
+        match tokio::time::timeout(ENGINE_RESULT_WAIT, rx.recv()).await {
             Ok(Ok(ChatEvent::Result { .. })) => break,
             Ok(Ok(_)) => continue,
             Ok(Err(_)) | Err(_) => panic!("run_codex_column: timed out waiting for Codex Result"),
