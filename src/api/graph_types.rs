@@ -965,10 +965,32 @@ pub async fn build_project_graph_data(
                     "message_count": session.message_count,
                     "total_cost_usd": session.total_cost_usd,
                     "created_at": session.created_at,
+                    "parent_session_id": session.parent_session_id,
+                    "sub_conversation": session.parent_session_id.is_some(),
                 })),
             });
             node_ids.insert(session.id.clone());
             chat_node_count += 1;
+        }
+
+        // A sub-conversation is drawn as a link, not as an orphan dot: `SPAWNED_BY` from the
+        // child to its parent. The relation already exists between the two nodes; the graph
+        // only had to carry it.
+        for session in &sessions {
+            let Some(parent) = session.parent_session_id.as_deref() else {
+                continue;
+            };
+            if !node_ids.contains(parent) {
+                continue;
+            }
+            all_edges.push(GraphEdge {
+                source: session.id.clone(),
+                target: parent.to_string(),
+                edge_type: "SPAWNED_BY".to_string(),
+                layer: "chat".to_string(),
+                attributes: Some(serde_json::json!({ "origin": "sub_conversation" })),
+            });
+            chat_edge_count += 1;
         }
 
         for disc in &discussed {

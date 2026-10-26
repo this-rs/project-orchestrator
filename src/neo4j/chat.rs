@@ -1896,7 +1896,8 @@ impl Neo4jClient {
                     cs.model AS model,
                     cs.message_count AS message_count,
                     cs.total_cost_usd AS total_cost_usd,
-                    toString(cs.created_at) AS created_at
+                    toString(cs.created_at) AS created_at,
+                    [(cs)-[:SPAWNED_BY]->(p:ChatSession) | p.id][0] AS parent_id
              ORDER BY cs.updated_at DESC
              LIMIT $lim",
         )
@@ -1918,12 +1919,62 @@ impl Neo4jClient {
                 message_count: row.get::<i64>("message_count").unwrap_or(0),
                 total_cost_usd: row.get::<f64>("total_cost_usd").unwrap_or(0.0),
                 created_at: row.get::<String>("created_at").unwrap_or_default(),
+                parent_session_id: row.get::<Option<String>>("parent_id").ok().flatten(),
             });
         }
 
         if sessions.is_empty() {
             return Ok((sessions, vec![]));
         }
+
+        // Query 1b: close the family. A sub-conversation belongs to the conversation even
+        // when it discussed nothing itself (a delegated agent that only ran commands), and
+        // a parent may have been scrolled out of the LIMIT. Without this the SPAWNED_BY link
+        // had no second end to attach to, so sub-conversations never showed on the graph.
+        let lineage_query = query(
+            "UNWIND $ids AS sid
+             MATCH (cs:ChatSession {id: sid})
+             OPTIONAL MATCH (cs)-[:SPAWNED_BY*1..8]->(up:ChatSession)
+             OPTIONAL MATCH (down:ChatSession)-[:SPAWNED_BY*1..8]->(cs)
+             WITH collect(DISTINCT cs) + collect(DISTINCT up) + collect(DISTINCT down) AS family
+             UNWIND family AS s
+             WITH DISTINCT s
+             RETURN s.id AS id,
+                    coalesce(s.title, 'Sans titre') AS title,
+                    s.model AS model,
+                    coalesce(s.message_count, 0) AS message_count,
+                    coalesce(s.total_cost_usd, 0.0) AS total_cost_usd,
+                    toString(s.created_at) AS created_at,
+                    [(s)-[:SPAWNED_BY]->(p:ChatSession) | p.id][0] AS parent_id
+             LIMIT $cap",
+        )
+        .param("ids", session_ids.clone())
+        // The family of a seed is small (a session and its children); the cap only guards
+        // against a pathological chain.
+        .param("cap", (limit.saturating_mul(3)).max(limit) as i64);
+
+        let mut result = self.graph.execute(lineage_query).await?;
+        let mut seen: std::collections::HashSet<String> =
+            sessions.iter().map(|s| s.id.clone()).collect();
+        while let Some(row) = result.next().await? {
+            let id: String = row.get("id")?;
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            sessions.push(ChatGraphSession {
+                id,
+                title: row
+                    .get::<String>("title")
+                    .unwrap_or_else(|_| "Untitled".to_string()),
+                model: row.get::<Option<String>>("model").ok().flatten(),
+                message_count: row.get::<i64>("message_count").unwrap_or(0),
+                total_cost_usd: row.get::<f64>("total_cost_usd").unwrap_or(0.0),
+                created_at: row.get::<String>("created_at").unwrap_or_default(),
+                parent_session_id: row.get::<Option<String>>("parent_id").ok().flatten(),
+            });
+        }
+        // Their own DISCUSSED edges are wanted too: a sub-conversation reads files.
+        session_ids = sessions.iter().map(|s| s.id.clone()).collect();
 
         // Query 2: DISCUSSED edges for those sessions, top 10 per session by mention_count
         let discussed_query = query(
