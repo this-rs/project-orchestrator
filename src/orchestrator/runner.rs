@@ -1955,6 +1955,24 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             "sync pipeline: ingestion activity reported"
         );
 
+        // The code layer was just re-indexed: ONE batch event at the end lets a
+        // client refresh it without a per-file storm. Counters are what this run
+        // really has; the created/updated split and relation counts the contract
+        // names would need the sync to track them, which it does not yet.
+        if let Some(pid) = project_id {
+            if let Some(emitter) = self.event_emitter.as_ref() {
+                emitter.emit_graph(crate::events::GraphEvent::batch(
+                    crate::events::graph::GraphLayer::Code,
+                    serde_json::json!({
+                        "files_synced": result.files_synced,
+                        "files_deleted": result.files_deleted,
+                        "symbols_deleted": result.symbols_deleted,
+                    }),
+                    pid.to_string(),
+                ));
+            }
+        }
+
         Ok(result)
     }
 

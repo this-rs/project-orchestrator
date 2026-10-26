@@ -4255,11 +4255,14 @@ pub async fn update_fabric_scores(
         .await
         .unwrap_or(0);
 
-    state
-        .event_bus
-        .emit_graph(crate::events::GraphEvent::scores_updated(
-            project_id.to_string(),
-        ));
+    state.event_bus.emit_graph(
+        crate::events::GraphEvent::scores_updated(project_id.to_string()).with_delta(
+            serde_json::json!({
+                "nodes_scored": analytics.metrics.len(),
+                "duration_ms": computation_ms,
+            }),
+        ),
+    );
 
     // Louvain communities were just recomputed: tell clients to recolor (no partition on the wire).
     state.event_bus.emit_graph(
