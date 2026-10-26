@@ -392,16 +392,23 @@ impl StatusInjectionStage {
             tree.node_count,
         );
 
-        // Collect suggested actions
+        // Collect suggested actions. The parameters travel with the action: an
+        // action without them (`decision(get)` with no decision_id) cannot be
+        // executed, which defeats the point of suggesting it.
         let actions = tree.suggested_actions();
         if !actions.is_empty() {
             content.push_str("**Suggested actions:**\n");
             for (i, action) in actions.iter().take(5).enumerate() {
+                let params = render_action_params(&action.params);
+                let call = if params.is_empty() {
+                    format!("{}({})", action.tool, action.action)
+                } else {
+                    format!("{}({}, {})", action.tool, action.action, params)
+                };
                 content.push_str(&format!(
-                    "{}. `{}({})` — confidence: {:.0}%\n",
+                    "{}. `{}` — confidence: {:.0}%\n",
                     i + 1,
-                    action.tool,
-                    action.action,
+                    call,
                     action.confidence * 100.0,
                 ));
             }
@@ -412,6 +419,22 @@ impl StatusInjectionStage {
 }
 
 /// Truncate a string to a maximum length, adding "…" if truncated.
+/// Render an action's parameters inline so the suggestion is executable.
+/// `{"decision_id": "abc"}` → `decision_id: abc`; empty or non-object → `""`.
+fn render_action_params(params: &serde_json::Value) -> String {
+    match params {
+        serde_json::Value::Object(map) if !map.is_empty() => map
+            .iter()
+            .map(|(k, v)| match v {
+                serde_json::Value::String(s) => format!("{k}: {s}"),
+                other => format!("{k}: {other}"),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => String::new(),
+    }
+}
+
 fn truncate(s: &str, max_len: usize) -> &str {
     if s.len() <= max_len {
         s
@@ -1361,7 +1384,10 @@ mod tests {
         let rendered = StatusInjectionStage::render_reasoning_tree(&tree);
         assert!(rendered.contains("Confidence:"));
         assert!(rendered.contains("Suggested actions:"));
-        assert!(rendered.contains("code(get_file_symbols)"));
+        assert!(
+            rendered.contains("code(get_file_symbols, file_path: src/main.rs)"),
+            "the action's parameters must travel with it so it is executable: {rendered}"
+        );
     }
 
     #[test]

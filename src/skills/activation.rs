@@ -746,9 +746,13 @@ pub fn assemble_context_with_confidence(
     confidence: Option<f64>,
     pre_sorted: bool,
 ) -> (String, usize) {
+    // `confidence` is the matched trigger's own strength (a training-time
+    // property of the trigger), not a per-turn relevance. Naming it
+    // "trigger match" says what it is; "confidence" read as a certainty about
+    // the current turn, which it never was.
     let header = match confidence {
         Some(conf) => format!(
-            "## \u{1f9e0} Skill \"{}\" (confidence {}%)\n",
+            "## \u{1f9e0} Skill \"{}\" (trigger match {}%)\n",
             skill_name,
             (conf * 100.0).round() as u32
         ),
@@ -2169,7 +2173,7 @@ mod tests {
             false,
         );
         assert!(
-            context.starts_with("## \u{1f9e0} Skill \"Neo4j Perf\" (confidence 85%)"),
+            context.starts_with("## \u{1f9e0} Skill \"Neo4j Perf\" (trigger match 85%)"),
             "Expected confidence header, got: {}",
             context.lines().next().unwrap_or("")
         );
@@ -2211,7 +2215,7 @@ mod tests {
         let (context, _) =
             assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(0.666), false);
         assert!(
-            context.contains("confidence 67%"),
+            context.contains("trigger match 67%"),
             "Expected confidence 67%, got: {}",
             context.lines().next().unwrap_or("")
         );
@@ -2220,7 +2224,7 @@ mod tests {
         let (context, _) =
             assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(1.0), false);
         assert!(
-            context.contains("confidence 100%"),
+            context.contains("trigger match 100%"),
             "Expected confidence 100%, got: {}",
             context.lines().next().unwrap_or("")
         );
@@ -2229,7 +2233,7 @@ mod tests {
         let (context, _) =
             assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(0.0), false);
         assert!(
-            context.contains("confidence 0%"),
+            context.contains("trigger match 0%"),
             "Expected confidence 0%, got: {}",
             context.lines().next().unwrap_or("")
         );
