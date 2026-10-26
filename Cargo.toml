@@ -221,7 +221,7 @@ neural-routing-runtime = { path = "crates/neural-routing-runtime" }
 neural-routing-gnn = { path = "crates/neural-routing-gnn" }
 
 # Local embeddings via ONNX Runtime (default provider — zero external dependency)
-fastembed = { version = "5.17", optional = true }
+fastembed = { version = "7.3", optional = true }
 
 # Dimensionality reduction (UMAP projection for embedding visualization)
 rag-umap = "0.0"
