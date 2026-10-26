@@ -560,9 +560,9 @@ pub type TrustNotice =
 /// question (the gate that asks and the answer path that records). Never read from what the
 /// model says about what it wants — a model does not formulate its own request for access.
 ///
-/// Empty for a call that names no destination: a search, whose engines come from the server's
-/// configuration, or a call without a usable `url`. Such a refusal stays the flat one it was: a
-/// person asked about it could decide nothing about THIS call.
+/// Empty for a call that names no destination: a call without a usable `url`, or a search, whose
+/// engines come from the server's configuration — a search is not left unanswered for that
+/// ([`search_destinations`]: the question is then about the engines themselves).
 ///
 /// nexus-tools upgrades `http://` to `https://` before it connects and the gate judges both
 /// forms, so both are returned: a consent that covered only one of them would ask again for the
@@ -587,12 +587,79 @@ pub fn destinations_of(name: &str, canonical: Option<&str>, input: &Value) -> Ve
     }
 }
 
-/// The origin a consent question about this call is about: the endpoint nexus-tools really
+/// The origins a consent question about this call is about: the endpoint nexus-tools really
 /// connects to ([`destinations_of`], `https://`), which is also the subject the harness remembers
 /// a `session` answer against (`tool\u{0}subject`). `None`: the call names no destination.
 pub fn consent_subject(name: &str, canonical: Option<&str>, input: &Value) -> Option<String> {
     let first = destinations_of(name, canonical, input).into_iter().next()?;
     Some(reached(&first))
+}
+
+/// The origins a SEARCH would reach: every engine of the session, as nexus-tools reaches them
+/// (`https://`), deduplicated.
+///
+/// A search names no destination of its own — its engines come from the server's configuration —
+/// so [`destinations_of`] is empty for it and, without this, its refusal stayed a flat
+/// `tool_origin_not_allowed` a person could never answer. But there IS something to decide: this
+/// project, this search engine. And something to decide about every engine at once, because
+/// nexus-tools tries them in order and falls back to the next, so any of them may be reached.
+/// That is why the question names them all and an `always` answer records them all: a consent
+/// covering only the first would be asked again the moment the second engine answered.
+///
+/// Asserted by the harness, never by the model: the list is the one the session was launched
+/// with (`ToolAccessHooks::search_origins`, the gate's own), read back per session
+/// ([`remember_search_origins`]).
+pub fn search_destinations(search_origins: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(search_origins.len());
+    for origin in search_origins {
+        let origin = reached(origin);
+        if !out.contains(&origin) {
+            out.push(origin);
+        }
+    }
+    out
+}
+
+/// The search origins of the sessions alive in this process, by session id: what the gate checks
+/// and what a question about a search is about, kept where both can read it (the gate lives in
+/// the hooks, the question is decorated in the runtime).
+///
+/// Written when a session attaches its `nexus-tools` ([`remember_search_origins`]), forgotten
+/// when it closes ([`forget_search_origins`]). A session with no entry has no engine: a search it
+/// attempted was refused before any engine ran.
+static SESSION_SEARCH_ORIGINS: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashMap<String, Vec<String>>>,
+> = std::sync::OnceLock::new();
+
+fn session_search_origins_registry(
+) -> &'static std::sync::RwLock<std::collections::HashMap<String, Vec<String>>> {
+    SESSION_SEARCH_ORIGINS.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Records the engines this session was launched with.
+pub fn remember_search_origins(session_id: &str, search_origins: &[String]) {
+    session_search_origins_registry()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(session_id.to_string(), search_origins.to_vec());
+}
+
+/// The engines this session was launched with (`[]`: none, or a session that closed).
+pub fn search_origins_of(session_id: &str) -> Vec<String> {
+    session_search_origins_registry()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(session_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Forgets them when the session closes.
+pub fn forget_search_origins(session_id: &str) {
+    session_search_origins_registry()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(session_id);
 }
 
 /// Whether Rock'n roll opens the network of a session: the session's access is normal AND a
@@ -717,8 +784,9 @@ impl ToolAccessHooks {
     /// What the gate asks a person about `refusal`, or the refusal to keep (N23b).
     ///
     /// A question only when ALL of these hold: the refusal is a destination without the project's
-    /// consent, the call NAMES that destination ([`destinations_of`]: a search names none), and a
-    /// person is in front of the session. Everything else keeps the flat refusal of before.
+    /// consent, the call NAMES that destination ([`destinations_of`], or for a search the engines
+    /// of the session — [`search_destinations`]), and a person is in front of the session.
+    /// Everything else keeps the flat refusal of before.
     fn consent_question(&self, refusal: &ToolAccessError, named: &[String]) -> Option<HookVerdict> {
         let ToolAccessError::OriginNotConsented { origin } = refusal else {
             return None;
@@ -881,8 +949,16 @@ impl SessionHooks for ToolAccessHooks {
         // again with the ones already let through, and each is announced. The loop ends: it adds
         // a new origin at every turn or returns.
         // The destinations THIS call names, computed once, before any I/O: what a person may be
-        // asked about, and what an `always` answer will record (N23b).
-        let named = destinations_of(&call.name, call.canonical.as_deref(), &call.input);
+        // asked about, and what an `always` answer will record (N23b). A search names none of its
+        // own — what it reaches is the engines of the session, so its question is about those.
+        let named = {
+            let named = destinations_of(&call.name, call.canonical.as_deref(), &call.input);
+            if named.is_empty() && call.canonical.as_deref() == Some("WebSearch") {
+                search_destinations(&self.search_origins)
+            } else {
+                named
+            }
+        };
         let mut let_through = BTreeSet::new();
         loop {
             match check_call_with(
@@ -2138,7 +2214,8 @@ mod tests {
     #[tokio::test]
     async fn a_call_that_names_no_destination_stays_a_flat_refusal_even_for_a_person() {
         let graph = Arc::new(MockGraphStore::new());
-        // A search: its engines are the server's configuration, not a destination of THIS call.
+        // No engine attached at all: there is nothing to reach, so nothing to consent to, and the
+        // refusal is the flat `tool_search_not_allowed` of before.
         let search = call(
             "mcp__nexus__WebSearch",
             Some("WebSearch"),
@@ -2150,9 +2227,50 @@ mod tests {
             .await;
         assert!(
             matches!(verdict, HookVerdict::Deny { .. }),
-            "nothing to consent to about this call, so no question: {verdict:?}"
+            "no engine, so no question: {verdict:?}"
         );
         crate::auth::agent_tokens::revoke_session("n23b-search");
+    }
+
+    /// A search names no page of its own, but it does reach something: the engines of the
+    /// session. Their origins ARE the question, all of them (nexus-tools falls back from one to
+    /// the next), so a person can answer it in the chat instead of going to the settings page.
+    #[tokio::test]
+    async fn a_search_asks_about_the_engines_it_would_reach() {
+        let graph = Arc::new(MockGraphStore::new());
+        crate::auth::agent_tokens::register_tools("n23b-search-engines");
+        let gate = ToolAccessHooks::new(
+            None,
+            Arc::new(GraphConsents(graph.clone())),
+            "n23b-search-engines",
+            Some("proj".into()),
+            vec![
+                "https://html.duckduckgo.com".to_owned(),
+                "https://api.search.brave.com".to_owned(),
+            ],
+        )
+        .with_person_in_front(true);
+        let verdict = gate.before_tool(&web_search()).await;
+        let HookVerdict::RequireConsent { subject, reason } = verdict else {
+            panic!("a consent question was expected, got {verdict:?}");
+        };
+        // The subject is the one the refusal named — the first engine, as the gate tries them.
+        assert_eq!(subject, "https://html.duckduckgo.com");
+        assert!(reason.starts_with("tool_origin_not_allowed:"), "{reason}");
+        // Every engine is what an `always` answer would record, and they are the engines really
+        // reached: `https://`, deduplicated.
+        assert_eq!(
+            search_destinations(&[
+                "http://html.duckduckgo.com".to_owned(),
+                "https://html.duckduckgo.com".to_owned(),
+                "https://api.search.brave.com".to_owned(),
+            ]),
+            vec![
+                "https://html.duckduckgo.com".to_owned(),
+                "https://api.search.brave.com".to_owned(),
+            ]
+        );
+        crate::auth::agent_tokens::revoke_session("n23b-search-engines");
     }
 
     #[tokio::test]

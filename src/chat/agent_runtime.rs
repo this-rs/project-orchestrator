@@ -807,6 +807,45 @@ impl AgentSessionHandle {
     /// decision emitted with the scope `session` and the grant: the user is not asked.
     /// Only requests the provider ASKED reach this point: its policy (read-only access,
     /// denies, trust) has already decided.
+    /// What a question about this call is about, as the HARNESS judges it (N23b): the origin the
+    /// answer will be kept against, and every destination it covers. `None`: this call names no
+    /// destination, so the question stays the ordinary one about the call.
+    ///
+    /// Two sources, the same on both sides of the question (the wire it decorates and the answer
+    /// it records):
+    ///
+    /// * a page — the `url` of a fetch or a browser navigation, `https://` as nexus-tools reaches
+    ///   it ([`nexus_tools::consent_subject`]);
+    /// * a SEARCH — which names no destination of its own: what it reaches is the engines the
+    ///   session was launched with, all of them, since nexus-tools falls back from one to the next
+    ///   ([`nexus_tools::search_destinations`]). Asking about a search is asking this project for
+    ///   its search engine, which is exactly what Settings → Network tools records.
+    ///
+    /// [`nexus_tools::consent_subject`]: super::provider::nexus_tools::consent_subject
+    /// [`nexus_tools::search_destinations`]: super::provider::nexus_tools::search_destinations
+    fn consent_about(
+        &self,
+        tool: &str,
+        canonical: Option<&str>,
+        input: &serde_json::Value,
+    ) -> Option<(String, Vec<String>)> {
+        if let Some(subject) = super::provider::nexus_tools::consent_subject(tool, canonical, input)
+        {
+            return Some((
+                subject,
+                super::provider::nexus_tools::destinations_of(tool, canonical, input),
+            ));
+        }
+        if canonical != Some("WebSearch") {
+            return None;
+        }
+        let engines = super::provider::nexus_tools::search_destinations(
+            &super::provider::nexus_tools::search_origins_of(&self.session_id),
+        );
+        let subject = engines.first()?.clone();
+        Some((subject, engines))
+    }
+
     pub async fn emit(&self, event: ChatEvent) {
         let timing = self.tool_clock.observe(&event, chrono::Utc::now());
         let covered = self.emit_one(event).await;
@@ -947,18 +986,15 @@ impl AgentSessionHandle {
                 input: input.clone(),
             };
             // A question about a DESTINATION (N23b, CONSENT-WIRE): its subject is named on the
-            // wire by the very functions the answer path records with
-            // (`deliver_permission_answer`), so what the person is shown is what PO keeps.
-            *consent =
-                super::provider::nexus_tools::consent_subject(tool, canonical.as_deref(), input)
-                    .map(|subject| super::types::ConsentSubject {
-                        subject,
-                        destinations: super::provider::nexus_tools::destinations_of(
-                            tool,
-                            canonical.as_deref(),
-                            input,
-                        ),
-                    });
+            // wire by the very function the answer path records with
+            // (`deliver_permission_answer`), so what the person is shown is what PO keeps. A
+            // search names no page of its own: its question is about the engines of the session.
+            *consent = self.consent_about(tool, canonical.as_deref(), input).map(
+                |(subject, destinations)| super::types::ConsentSubject {
+                    subject,
+                    destinations,
+                },
+            );
             // Whether this very question may be answered `always` (the client offers it then).
             // About a destination: the project's network consent, kept only by a session that
             // keeps lasting rules in a project (`keep_origin_consents`), on a provider that
@@ -2178,28 +2214,19 @@ impl AgentSessionHandle {
             .get(request_id)
             .cloned();
         // Is this ask about a DESTINATION (N23b)? The gate of the session
-        // (`nexus_tools::ToolAccessHooks`) raised a `HookVerdict::RequireConsent` about the page
+        // (`nexus_tools::ToolAccessHooks`) raised a `HookVerdict::RequireConsent` about what
         // this call would reach, and names the subject with the very function read here: the
         // answer is then about an ORIGIN, and its durable place is the project's network-tools
         // consent — the same document the settings route writes — never a lasting rule about a
-        // tool call, which the gate does not read.
-        let destinations: Vec<String> = asked
+        // tool call, which the gate does not read. A search names no page of its own: what it
+        // would reach is the engines of the session, and an `always` writes them all.
+        let (destination, destinations) = match asked
             .as_ref()
-            .map(|call| {
-                super::provider::nexus_tools::destinations_of(
-                    &call.tool,
-                    call.canonical.as_deref(),
-                    &call.input,
-                )
-            })
-            .unwrap_or_default();
-        let destination = asked.as_ref().and_then(|call| {
-            super::provider::nexus_tools::consent_subject(
-                &call.tool,
-                call.canonical.as_deref(),
-                &call.input,
-            )
-        });
+            .and_then(|call| self.consent_about(&call.tool, call.canonical.as_deref(), &call.input))
+        {
+            Some((subject, destinations)) => (Some(subject), destinations),
+            None => (None, Vec::new()),
+        };
         // `always` kept as a lasting rule (`false`: as a session grant, the shell having
         // possibly left the project's root; review of #714, A).
         let mut for_good = false;
@@ -2958,6 +2985,9 @@ impl AgentRuntime {
     }
 
     async fn close_inner(&self, session_id: &str, announce: bool) -> Result<()> {
+        // The engines this session was launched with are gone with it: a later question about a
+        // search must not name an origin nothing runs (`nexus_tools::remember_search_origins`).
+        super::provider::nexus_tools::forget_search_origins(session_id);
         let handle = self
             .sessions
             .write()
@@ -4432,6 +4462,84 @@ mod adopt_tests {
                 "{origin} was shown and must be kept"
             );
         }
+    }
+
+    /// A SEARCH names no page of its own: what it would reach is the engines the session was
+    /// launched with. A question about it is therefore about those origins — all of them, since
+    /// nexus-tools falls back from one engine to the next — and `always` writes every one of
+    /// them. Without this, a web search the project had not consented to stayed a flat refusal a
+    /// person could not answer from the chat at all.
+    #[tokio::test]
+    async fn a_search_asks_about_its_engines_and_an_always_answer_keeps_them_all() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(Arc::clone(&graph));
+        let provider = FakeProvider::new();
+        let root = tempfile::tempdir().unwrap();
+        let session = "consent-wire-search";
+        super::super::provider::nexus_tools::remember_search_origins(
+            session,
+            &[
+                "https://html.duckduckgo.com".to_string(),
+                "http://api.search.brave.com".to_string(),
+            ],
+        );
+        let handle = origin_handle(
+            &runtime,
+            &provider,
+            session,
+            Some(lasting_scope_of(root.path())),
+        )
+        .await;
+        let mut rx = handle.events_tx.subscribe();
+        handle
+            .emit(ChatEvent::PermissionRequest {
+                id: "s1".into(),
+                tool: "mcp__nexus__WebSearch".into(),
+                input: serde_json::json!({ "query": "cve" }),
+                parent_tool_use_id: None,
+                category: Some("web".into()),
+                canonical: Some("WebSearch".into()),
+                tool_use_id: None,
+                always: None,
+                consent: None,
+            })
+            .await;
+
+        let ChatEvent::PermissionRequest {
+            consent, always, ..
+        } = emitted_request(&mut rx, "s1").await
+        else {
+            unreachable!()
+        };
+        let consent = consent.expect("a search is a question about its engines");
+        assert_eq!(
+            consent.subject, "https://html.duckduckgo.com",
+            "the first engine the gate tries, upgraded as nexus-tools reaches it"
+        );
+        assert_eq!(
+            consent.destinations,
+            vec![
+                "https://html.duckduckgo.com".to_string(),
+                "https://api.search.brave.com".to_string(),
+            ],
+            "every engine of the session, deduplicated and secure"
+        );
+        assert_eq!(always, Some(true));
+
+        handle
+            .answer_permission_scoped("s1", true, PermissionAnswerScope::Always)
+            .await
+            .expect("the answer is delivered");
+        for origin in &consent.destinations {
+            let (scope, key) = consent_key(origin);
+            assert!(
+                graph.get_llm_setting(&scope, &key).await.unwrap().is_some(),
+                "an engine the person was shown must be kept: {origin}"
+            );
+        }
+        // A search that reaches no engine is not a question: nothing to consent to.
+        super::super::provider::nexus_tools::forget_search_origins(session);
+        assert!(super::super::provider::nexus_tools::search_origins_of(session).is_empty());
     }
 
     /// CONSENT-WIRE: an ordinary tool permission is serialized exactly as before — no `consent`
