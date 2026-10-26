@@ -4261,6 +4261,21 @@ pub async fn update_fabric_scores(
             project_id.to_string(),
         ));
 
+    // Louvain communities were just recomputed: tell clients to recolor (no partition on the wire).
+    state.event_bus.emit_graph(
+        crate::events::GraphEvent::community_changed(
+            "project",
+            analytics.communities.len(),
+            project_id.to_string(),
+        )
+        .with_delta(serde_json::json!({
+            "scope": "project",
+            "algorithm": "louvain",
+            "community_count": analytics.communities.len(),
+            "modularity": analytics.modularity,
+        })),
+    );
+
     Ok(Json(serde_json::json!({
         "nodes_updated": analytics.metrics.len(),
         "computation_ms": start.elapsed().as_millis() as u64,
