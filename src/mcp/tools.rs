@@ -810,6 +810,7 @@ fn note_tool() -> ToolDefinition {
                 "global_only": {"type": "boolean", "description": "Only notes without a project (list)"},
                 "min_staleness": {"type": "number", "description": "Min staleness 0-1 filter (list)"},
                 "max_staleness": {"type": "number", "description": "Max staleness 0-1 filter (list)"},
+                "min_similarity": {"type": "number", "description": "Minimum cosine similarity threshold (0.0-1.0) for search_semantic"},
                 "project_slug": {"type": "string", "description": "Project slug filter (search/search_semantic)"},
                 "workspace_slug": {"type": "string", "description": "Workspace slug filter (search_semantic)"},
                 "max_depth": {"type": "integer", "description": "Max graph traversal depth (get_context/get_context_knowledge/get_propagated/get_propagated_knowledge)"},
