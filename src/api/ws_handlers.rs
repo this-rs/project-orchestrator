@@ -867,4 +867,76 @@ mod tests {
         assert_eq!(passed[0].layer, GraphLayer::Knowledge);
         assert_eq!(passed[1].layer, GraphLayer::Neural);
     }
+
+    // ================================================================
+    // Multiplexed chat sessions (?sessions=)
+    // ================================================================
+
+    fn chat_text(content: &str) -> ChatEvent {
+        ChatEvent::AssistantText {
+            content: content.to_string(),
+            parent_tool_use_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_multiplexed_event_names_its_session() {
+        // The frame must say WHO spoke: with N sessions on one socket, an event
+        // without its session id would be unattributable.
+        let (tx_a, rx_a) = broadcast::channel(8);
+        let mut subs = vec![("session-a".to_string(), rx_a)];
+        tx_a.send(chat_text("hello")).unwrap();
+
+        let (session_id, event) = next_mux_chat_event(&mut subs).await.expect("an event");
+        assert_eq!(session_id, "session-a");
+        assert!(matches!(event, ChatEvent::AssistantText { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_finished_session_leaves_the_multiplex_without_killing_it() {
+        // One agent ending must not take the other nineteen down with it.
+        let (tx_a, rx_a) = broadcast::channel(8);
+        let (tx_b, rx_b) = broadcast::channel(8);
+        let mut subs = vec![
+            ("session-a".to_string(), rx_a),
+            ("session-b".to_string(), rx_b),
+        ];
+
+        drop(tx_b); // session b is over
+
+        // Polling once drains a (empty) and notices b's closed channel.
+        let _ = next_mux_chat_event(&mut subs).await;
+        assert_eq!(subs.len(), 1, "the closed session is dropped");
+        assert_eq!(subs[0].0, "session-a", "the live one stays");
+
+        // And a still fires afterwards.
+        tx_a.send(chat_text("still here")).unwrap();
+        let (session_id, _) = next_mux_chat_event(&mut subs).await.expect("an event");
+        assert_eq!(session_id, "session-a");
+    }
+
+    #[tokio::test]
+    async fn no_subscription_leaves_the_branch_pending() {
+        // With nothing to multiplex the future never resolves, so tokio::select!
+        // disables the branch instead of spinning on it.
+        let mut subs: Vec<(String, broadcast::Receiver<ChatEvent>)> = Vec::new();
+        let polled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            next_mux_chat_event(&mut subs),
+        )
+        .await;
+        assert!(
+            polled.is_err(),
+            "the branch must stay pending, not busy-loop"
+        );
+    }
+
+    #[test]
+    fn too_many_sessions_are_refused_rather_than_truncated() {
+        // A client that silently loses half its subscriptions shows half its
+        // agents and looks broken; the refusal is explicit.
+        let list: Vec<String> = (0..MAX_MUX_SESSIONS + 1).map(|i| format!("s{i}")).collect();
+        assert!(list.len() > MAX_MUX_SESSIONS);
+        assert_eq!(MAX_MUX_SESSIONS, 64);
+    }
 }

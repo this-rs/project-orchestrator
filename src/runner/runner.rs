@@ -12296,4 +12296,49 @@ mod tests {
 
         reset_globals().await;
     }
+
+    /// The runner writes step statuses straight to the store, so this helper is
+    /// the ONLY thing that tells a client a step was crossed. It must carry both
+    /// sides of the transition plus the ids that let a dashboard pulse the right
+    /// plan node — an event with only the new status cannot drive an animation.
+    #[tokio::test]
+    async fn emit_step_status_changed_carries_the_transition_and_its_parents() {
+        use crate::events::{EventBus, HybridEmitter};
+
+        let hybrid = Arc::new(HybridEmitter::new(Arc::new(EventBus::default())));
+        let mut rx = hybrid.subscribe();
+        let mut runner = test_plan_runner();
+        runner.event_emitter = Some(hybrid);
+
+        let step_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let plan_id = Uuid::new_v4();
+        runner.emit_step_status_changed(
+            step_id,
+            crate::neo4j::models::StepStatus::Pending,
+            crate::neo4j::models::StepStatus::Completed,
+            task_id,
+            Some(plan_id),
+        );
+
+        let event = rx.try_recv().expect("one step event");
+        assert_eq!(event.entity_type, EntityType::Step);
+        assert_eq!(event.action, CrudAction::StatusChanged);
+        assert_eq!(event.entity_id, step_id.to_string());
+        assert_eq!(event.payload["old_status"], "pending");
+        assert_eq!(event.payload["new_status"], "completed");
+        assert_eq!(event.payload["task_id"], task_id.to_string());
+        assert_eq!(event.payload["plan_id"], plan_id.to_string());
+        // A parentless step still reports its transition; the field is omitted
+        // rather than invented.
+        runner.emit_step_status_changed(
+            step_id,
+            crate::neo4j::models::StepStatus::Pending,
+            crate::neo4j::models::StepStatus::Skipped,
+            task_id,
+            None,
+        );
+        let second = rx.try_recv().expect("a second step event");
+        assert!(second.payload.get("plan_id").is_none());
+    }
 }

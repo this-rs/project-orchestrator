@@ -9889,6 +9889,71 @@ mod tests {
         );
     }
 
+    /// The ingestion stream, end to end through a real sync.
+    ///
+    /// The contract: a phase is always reported, the run is closed by exactly
+    /// one `synced`, and the number of events is bounded by the number of phases
+    /// — never by the number of files. That last part is the whole reason the
+    /// stream is coalesced, so it is what this test pins.
+    #[tokio::test]
+    async fn a_sync_emits_one_coalesced_ingestion_stream() {
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..8 {
+            fs::write(
+                tmp.path().join(format!("f{i}.rs")),
+                format!("pub fn f{i}() -> u32 {{ {i} }}"),
+            )
+            .unwrap();
+        }
+
+        let (orch, mut rx) = orch_with_bus().await;
+
+        let result = orch
+            .sync_directory_for_project_with_options(tmp.path(), None, None, true)
+            .await
+            .unwrap();
+
+        let mut ingestion = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if event.entity_type == EventEntityType::Ingestion {
+                ingestion.push(event);
+            }
+        }
+
+        assert!(
+            !ingestion.is_empty(),
+            "a sync must report that it is working"
+        );
+        assert_eq!(
+            ingestion[0].payload["phase"], "scanning",
+            "the first thing a client hears is where the sync starts"
+        );
+        assert_eq!(ingestion[0].action, CrudAction::Progress);
+
+        let last = ingestion.last().unwrap();
+        assert_eq!(last.action, CrudAction::Synced, "exactly one terminator");
+        assert_eq!(last.payload["phase"], "done");
+        // Same counters as Project/Synced, so either event tells the same story.
+        assert_eq!(last.payload["files_parsed"], result.files_synced);
+        // The point of coalescing: 8 files, a handful of events.
+        assert!(
+            ingestion.len() <= 10,
+            "8 files produced {} ingestion events — the stream depends on file count, \
+             which is exactly what coalescing forbids",
+            ingestion.len()
+        );
+        assert_eq!(
+            ingestion
+                .iter()
+                .filter(|e| e.action == CrudAction::Synced)
+                .count(),
+            1,
+            "a sync has one terminator, not one per file"
+        );
+    }
+
     #[test]
     fn test_rayon_pool_init_idempotent() {
         // Calling init_rayon_pool multiple times should not panic
