@@ -17054,6 +17054,13 @@ impl ChatManager {
                     }
                     attach_native_servers(&mut spec.mcp_servers, attachment.servers)?;
                     gate_temp_dir = attachment.temp_dir.clone();
+                    // The list the gate checks a SEARCH against, kept where the runtime can read
+                    // it: a search names no destination of its own, so a question about it is
+                    // about these engines (N23b, CONSENT-WIRE).
+                    super::provider::nexus_tools::remember_search_origins(
+                        session_id,
+                        &attachment.search_origins,
+                    );
                     gate = Some(attachment.search_origins);
                 }
                 None => tracing::warn!(
