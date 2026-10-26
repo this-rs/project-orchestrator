@@ -309,6 +309,44 @@ mod tests {
     use super::*;
     use crate::events::{CrudAction, EntityType};
 
+    #[tokio::test]
+    async fn graph_events_round_trip_on_nats() {
+        use futures::StreamExt;
+        let broker = crate::events::nats_broker_test::TestBroker::start().await;
+        let nats = NatsEmitter::new(broker.client().await, "events");
+        let mut sub = nats.subscribe_graph_events().await.unwrap();
+        nats.publish_graph_event(&GraphEvent::scores_updated("proj"));
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), sub.next())
+            .await
+            .expect("a graph event arrives")
+            .expect("a message");
+        let ev: GraphEvent = serde_json::from_slice(&msg.payload).unwrap();
+        assert_eq!(format!("{:?}", ev.event_type), "ScoresUpdated");
+    }
+
+    #[tokio::test]
+    async fn a_remote_graph_event_is_bridged_into_the_local_graph() {
+        let broker = crate::events::nats_broker_test::TestBroker::start().await;
+        let nats_a = Arc::new(NatsEmitter::new(broker.client().await, "events"));
+        let hybrid_a = HybridEmitter::with_nats(Arc::new(EventBus::default()), nats_a);
+        hybrid_a.start_graph_nats_bridge();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let mut rx = hybrid_a.subscribe_graph();
+        let nats_b = NatsEmitter::new(broker.client().await, "events");
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                nats_b.publish_graph_event(&GraphEvent::scores_updated("proj-x"));
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                if let Ok(ev) = rx.try_recv() {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("the remote graph event is bridged in time");
+        assert_eq!(format!("{:?}", ev.event_type), "ScoresUpdated");
+    }
+
     #[test]
     fn test_local_only_emit() {
         let bus = Arc::new(EventBus::default());
