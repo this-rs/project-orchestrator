@@ -123,6 +123,11 @@ impl NatsEmitter {
         format!("{}.crud", self.subject_prefix)
     }
 
+    /// Build the graph events subject (e.g. "events.graph").
+    fn graph_subject(&self) -> String {
+        format!("{}.graph", self.subject_prefix)
+    }
+
     // ========================================================================
     // Chat event pub/sub
     // ========================================================================
@@ -569,6 +574,37 @@ impl NatsEmitter {
             anyhow::anyhow!("Failed to subscribe to NATS CRUD events {}: {}", subject, e)
         })?;
         debug!(subject = %subject, "Subscribed to NATS CRUD events");
+        Ok(subscriber)
+    }
+
+    /// Publish a graph event to NATS (fire-and-forget, like CRUD `emit`).
+    pub fn publish_graph_event(&self, event: &crate::events::GraphEvent) {
+        let client = self.client.clone();
+        let subject = self.graph_subject();
+        let event = event.clone();
+        tokio::spawn(async move {
+            match serde_json::to_vec(&event) {
+                Ok(payload) => {
+                    if let Err(e) = client.publish(subject.clone(), payload.into()).await {
+                        warn!(subject = %subject, "Failed to publish graph event: {}", e);
+                    }
+                }
+                Err(e) => warn!("Failed to serialize graph event: {}", e),
+            }
+        });
+    }
+
+    /// Subscribe to NATS graph events (e.g. "events.graph").
+    pub async fn subscribe_graph_events(&self) -> anyhow::Result<async_nats::Subscriber> {
+        let subject = self.graph_subject();
+        let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to subscribe to NATS graph events {}: {}",
+                subject,
+                e
+            )
+        })?;
+        debug!(subject = %subject, "Subscribed to NATS graph events");
         Ok(subscriber)
     }
 }

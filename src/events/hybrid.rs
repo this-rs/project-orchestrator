@@ -129,6 +129,9 @@ impl HybridEmitter {
     pub fn emit_graph(&self, event: GraphEvent) {
         let event_type = format!("{:?}", event.event_type);
         let layer = format!("{:?}", event.layer);
+        if let Some(nats) = &self.nats {
+            nats.publish_graph_event(&event);
+        }
         match self.graph_sender.send(event) {
             Ok(n) => {
                 debug!(
@@ -223,6 +226,63 @@ impl HybridEmitter {
             }
 
             warn!("NATS→local bridge: subscriber closed");
+        });
+    }
+    /// Start the NATS→local GRAPH bridge: subscribes to NATS graph events and
+    /// re-injects them into the local graph broadcast. Dedup by
+    /// `timestamp:event_type:node_id` prevents echoing locally-published events.
+    /// No-op if NATS is not configured.
+    pub fn start_graph_nats_bridge(&self) {
+        let Some(nats) = &self.nats else {
+            return;
+        };
+        let nats = nats.clone();
+        let graph_sender = self.graph_sender.clone();
+        tokio::spawn(async move {
+            let mut subscriber = match nats.subscribe_graph_events().await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    warn!("Failed to start NATS→local graph bridge: {}", e);
+                    return;
+                }
+            };
+            info!("NATS→local graph bridge started: events.graph → local broadcast");
+            const DEDUP: usize = 256;
+            let mut seen: std::collections::VecDeque<String> =
+                std::collections::VecDeque::with_capacity(DEDUP);
+            let mut seen_set: std::collections::HashSet<String> =
+                std::collections::HashSet::with_capacity(DEDUP);
+            use futures::StreamExt;
+            while let Some(msg) = subscriber.next().await {
+                match serde_json::from_slice::<GraphEvent>(&msg.payload) {
+                    Ok(event) => {
+                        let key = event
+                            .node_id
+                            .as_deref()
+                            .or(event.target_id.as_deref())
+                            .unwrap_or("");
+                        let fp = format!("{}:{:?}:{}", event.timestamp, event.event_type, key);
+                        if seen_set.contains(&fp) {
+                            continue;
+                        }
+                        seen_set.insert(fp.clone());
+                        seen.push_back(fp);
+                        if seen.len() > DEDUP {
+                            if let Some(old) = seen.pop_front() {
+                                seen_set.remove(&old);
+                            }
+                        }
+                        let _ = graph_sender.send(event);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "NATS→local graph bridge: failed to deserialize GraphEvent: {}",
+                            e
+                        );
+                    }
+                }
+            }
+            warn!("NATS→local graph bridge: subscriber closed");
         });
     }
 }

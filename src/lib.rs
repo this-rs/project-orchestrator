@@ -1501,6 +1501,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // them into the local broadcast bus. This makes the local bus the single
     // source of truth — WS handlers only need to listen to the local bus.
     event_bus.start_nats_bridge();
+    // Same for graph events (events.graph): cross-instance graph mutations.
+    event_bus.start_graph_nats_bridge();
 
     // Extract neural_router, trajectory_collector, trajectory_store, trajectory_store_neo4j,
     // and mcp_registry before state is moved into Orchestrator
