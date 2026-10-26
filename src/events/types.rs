@@ -83,6 +83,14 @@ pub enum EntityType {
     /// minimal (ids + `workspace_slug` + `reasons`), NEVER the text of a command
     /// or question: consumers refetch `/api/attention`.
     AttentionChanged,
+    /// Activity of the ingestion pipeline itself (scan, parse, store, index):
+    /// `Progress` while a sync runs, `Synced` once at the end.
+    ///
+    /// Not an entity in the graph — a subject for the orchestrator's own work,
+    /// so that a client can show "the orchestrator is indexing" instead of
+    /// waiting for the single `Project/Synced` that used to be the only signal.
+    /// Emitters: `orchestrator/runner.rs` via `crate::events::IngestionReporter`.
+    Ingestion,
 }
 
 /// The CRUD action performed on an entity.
@@ -497,7 +505,7 @@ mod tests {
     #[test]
     fn test_entity_type_has_30_variants() {
         // Ensure we don't accidentally add/remove variants
-        let all: [EntityType; 32] = [
+        let all: [EntityType; 33] = [
             EntityType::Project,
             EntityType::Plan,
             EntityType::Task,
@@ -530,8 +538,9 @@ mod tests {
             EntityType::LifecycleHook,
             EntityType::Learning,
             EntityType::AttentionChanged,
+            EntityType::Ingestion,
         ];
-        assert_eq!(all.len(), 32);
+        assert_eq!(all.len(), 33);
     }
 
     // ================================================================

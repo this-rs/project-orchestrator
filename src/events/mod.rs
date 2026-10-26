@@ -75,6 +75,7 @@ pub mod builtin_triggers;
 mod bus;
 pub mod graph;
 mod hybrid;
+pub mod ingestion;
 pub mod nats;
 #[cfg(test)]
 pub(crate) mod nats_broker_test;
@@ -88,6 +89,10 @@ mod types;
 pub use bus::EventBus;
 pub use graph::{ActivationTarget, GraphEvent, GraphEventType, GraphLayer};
 pub use hybrid::HybridEmitter;
+pub use ingestion::{
+    IngestionCounters, IngestionPhase, IngestionProgress, IngestionReporter, IngestionSummary,
+    IngestionSynced, INGESTION_PROGRESS_INTERVAL,
+};
 pub use nats::{
     connect_nats, ChatRpcRequest, ChatRpcResponse, NatsEmitter, RelayFailure, StreamingSnapshot,
 };

@@ -144,7 +144,8 @@ pub fn classify_events(e: &EventsEntity) -> Classification {
         | EventsEntity::Trigger
         | EventsEntity::LifecycleHook
         | EventsEntity::Learning
-        | EventsEntity::AttentionChanged => Excluded(INFRA),
+        | EventsEntity::AttentionChanged
+        | EventsEntity::Ingestion => Excluded(INFRA),
     }
 }
 
