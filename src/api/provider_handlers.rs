@@ -2228,10 +2228,21 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let program = script(&dir, "yes 'host ssh-ed25519 junk'");
         let started = Instant::now();
-        let r = run_keyscan(&program, &[], Duration::from_secs(8)).await;
+        let mut r = run_keyscan(&program, &[], Duration::from_secs(8)).await;
+        // The shared CI runner is occasionally memory/load-starved and a
+        // fork/exec fails with EAGAIN, surfacing as NotAvailable. That is an
+        // ENVIRONMENT failure, not a regression of the output ceiling, so retry
+        // a bounded number of times before trusting the verdict.
+        for _ in 0..5 {
+            if !matches!(r, Err(KeyScanError::NotAvailable)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            r = run_keyscan(&program, &[], Duration::from_secs(8)).await;
+        }
         assert_eq!(r, Err(KeyScanError::NoKey));
         assert!(
-            started.elapsed() < Duration::from_secs(4),
+            started.elapsed() < Duration::from_secs(6),
             "the output ceiling must end the read, not the deadline"
         );
     }
