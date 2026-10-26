@@ -352,6 +352,7 @@ pub(crate) const ACTION_CLASSES: &[(&str, &[&str], &[&str])] = &[
         ],
         &[
             "delete_session",
+            "close_session",
             "send_message",
             "add_discussed",
             "associate_with",
