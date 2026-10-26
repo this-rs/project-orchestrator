@@ -1330,6 +1330,7 @@ pub async fn cancel_backfill_synapses(
 #[derive(Debug, Deserialize)]
 pub struct SemanticSearchQuery {
     pub query: String,
+    pub project_id: Option<Uuid>,
     pub project_slug: Option<String>,
     pub workspace_slug: Option<String>,
     pub limit: Option<usize>,
@@ -1350,7 +1351,12 @@ pub async fn search_notes_semantic(
     State(state): State<OrchestratorState>,
     Query(query): Query<SemanticSearchQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let project_id = if let Some(ref slug) = query.project_slug {
+    // An explicit project_id wins over the slug shortcut. Without either, the
+    // search stays global on purpose: the breadth across projects is a feature,
+    // not an accident to fence off.
+    let project_id = if let Some(pid) = query.project_id {
+        Some(pid)
+    } else if let Some(ref slug) = query.project_slug {
         let project = state
             .orchestrator
             .neo4j()

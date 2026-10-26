@@ -2839,6 +2839,9 @@ impl ToolHandler {
                     resolve_intent_profile(&query_str, explicit_profile, explicit_intent);
 
                 let mut query = vec![("query".to_string(), query_str)];
+                if let Some(v) = args.get("project_id").and_then(|v| v.as_str()) {
+                    query.push(("project_id".to_string(), v.to_string()));
+                }
                 if let Some(v) = args.get("project_slug").and_then(|v| v.as_str()) {
                     query.push(("project_slug".to_string(), v.to_string()));
                 }
@@ -2853,6 +2856,9 @@ impl ToolHandler {
                 }
                 if let Some(ref profile) = resolved_profile {
                     query.push(("profile".to_string(), profile.clone()));
+                }
+                if let Some(v) = args.get("min_similarity").and_then(|v| v.as_f64()) {
+                    query.push(("min_similarity".to_string(), v.to_string()));
                 }
                 let result = http
                     .get_with_query("/api/notes/search-semantic", &query)
@@ -7380,6 +7386,53 @@ mod tests {
             .unwrap();
         assert_eq!(result["method"], "GET");
         assert_eq!(result["path"], "/api/notes/search-semantic");
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_note_search_semantic_forwards_project_id() {
+        let (handler, _) = make_http_handler().await;
+        let pid = "550e8400-e29b-41d4-a716-446655440000";
+        let result = handler
+            .handle(
+                "note",
+                Some(json!({
+                    "action": "search_semantic",
+                    "query": "how to",
+                    "project_id": pid,
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/notes/search-semantic");
+        let query = result["query"].as_str().unwrap_or("");
+        assert!(
+            query.contains(&format!("project_id={pid}")),
+            "project_id must travel to the HTTP layer, got query: {query}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mega_tool_note_search_semantic_forwards_min_similarity() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "note",
+                Some(json!({
+                    "action": "search_semantic",
+                    "query": "how to",
+                    "min_similarity": 0.7,
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "GET");
+        assert_eq!(result["path"], "/api/notes/search-semantic");
+        let query = result["query"].as_str().unwrap_or("");
+        assert!(
+            query.contains("min_similarity=0.7"),
+            "min_similarity must travel to the HTTP layer, got query: {query}"
+        );
     }
 
     // -- Error paths -------------------------------------------------------
