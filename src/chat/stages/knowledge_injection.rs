@@ -66,6 +66,7 @@ use crate::neo4j::traits::GraphStore;
 use crate::neurons::intent::{IntentDetector, QueryIntentMode};
 use crate::notes::models::EntityType as NoteEntityType;
 use crate::sharing::consent_gate::ConsentReader;
+use crate::utils::reciprocal_rank_fusion;
 
 // ============================================================================
 // Configuration
@@ -242,53 +243,6 @@ pub struct KnowledgeInjectionStage {
 struct DenseHits {
     notes: Vec<(crate::notes::Note, f64)>,
     decisions: Vec<(crate::neo4j::models::DecisionNode, f64)>,
-}
-
-/// Reciprocal Rank Fusion constant.
-///
-/// Cormack, Clarke & Büttcher (2009) use 60 and report that the result is
-/// insensitive to it: it only damps how much the very first ranks dominate.
-const RRF_K: f64 = 60.0;
-
-/// Fuse ranked candidate lists by Reciprocal Rank Fusion.
-///
-/// Each channel contributes `1 / (RRF_K + rank)` (rank starting at 1) for every
-/// candidate it lists, and a candidate's score is the sum over the channels that
-/// list it. Summing ranks rather than scores is what makes this work here: BM25
-/// scores are unbounded and differ per query, cosine lives in [−1, 1], and no
-/// affine map between them is meaningful — ranks are comparable by construction.
-/// A candidate both channels rank highly therefore beats one only a single
-/// channel likes, which is the case worth promoting.
-///
-/// The result is rescaled so the best fused candidate scores `anchor`, keeping
-/// the head of the list on the scale the other sources use (an entity note is
-/// 0.8, a workspace guideline 0.6, a referenced note 1.0) — consensus changes
-/// the *order*, not the currency.
-///
-/// Returns `(id, score)` sorted by descending score, ties broken by id so the
-/// order is deterministic (a `HashMap` iteration is not).
-fn reciprocal_rank_fusion(channels: &[&[String]], anchor: f64) -> Vec<(String, f64)> {
-    let mut fused: HashMap<&str, f64> = HashMap::new();
-    for channel in channels {
-        for (index, id) in channel.iter().enumerate() {
-            let contribution = 1.0 / (RRF_K + (index as f64) + 1.0);
-            *fused.entry(id.as_str()).or_insert(0.0) += contribution;
-        }
-    }
-    let peak = fused.values().copied().fold(0.0_f64, f64::max);
-    if peak <= 0.0 {
-        return Vec::new();
-    }
-    let mut out: Vec<(String, f64)> = fused
-        .into_iter()
-        .map(|(id, score)| (id.to_string(), score * anchor / peak))
-        .collect();
-    out.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    out
 }
 
 /// Time constant (days) of the recency factor: at equal relevance, fresher

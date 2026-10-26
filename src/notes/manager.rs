@@ -10,7 +10,9 @@ use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType, EventE
 use crate::meilisearch::indexes::NoteDocument;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::GraphStore;
+use crate::utils::reciprocal_rank_fusion;
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -1063,8 +1065,9 @@ impl NoteManager {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to embed search query: {}", e))?;
 
-        // Perform vector similarity search via Neo4j HNSW index
-        let results = self
+        // Channel 1 — dense cosine over the note embeddings, scoped by
+        // project_id / workspace_slug in the Cypher and floored by min_similarity.
+        let dense = self
             .neo4j
             .vector_search_notes(
                 &query_embedding,
@@ -1075,27 +1078,26 @@ impl NoteManager {
             )
             .await?;
 
-        // Convert to NoteSearchHit with scar penalty applied.
-        // Notes with high scar_intensity (past invalidations) get de-prioritized.
-        // Max penalty = 50% score reduction at scar_intensity=1.0.
-        let mut hits: Vec<NoteSearchHit> = results
+        // Channel 2 — lexical BM25. It is fetched unscoped, then confined to the
+        // *same* scope as the dense channel: fusing an unscoped lexical list
+        // would reintroduce the cross-project leak that project_id closes.
+        // A Meilisearch hiccup must not sink the dense answer, hence
+        // `unwrap_or_default` (degrade to dense-only).
+        let lexical: Vec<NoteSearchHit> = self
+            .search_notes(
+                query,
+                &NoteFilters {
+                    limit: Some(limit as i64),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_or_default()
             .into_iter()
-            .map(|(note, score)| {
-                let scar_penalty = 1.0 - note.scar_intensity.clamp(0.0, 1.0) * 0.5;
-                NoteSearchHit {
-                    score: score * scar_penalty,
-                    note,
-                    highlights: None,
-                }
-            })
+            .filter(|hit| note_in_scope(hit.note.project_id, project_id, workspace_slug.is_some()))
             .collect();
-        // Re-sort by penalized score (descending)
-        hits.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        Ok(hits)
+
+        Ok(fuse_dense_and_lexical(dense, lexical, limit))
     }
 
     // ========================================================================
@@ -2156,10 +2158,154 @@ pub struct SynapseBackfillProgress {
     pub energy_initialized: usize,
 }
 
+/// Whether a note returned by the (unscoped) lexical channel may join a search
+/// that the dense channel scoped.
+///
+/// The rule mirrors the dense Cypher exactly:
+/// - project scope: the note must belong to that very project;
+/// - workspace scope: membership cannot be checked here (the BM25 filter only
+///   knows a project slug), so the lexical channel is *skipped* rather than
+///   risk leaking a foreign note;
+/// - no scope: everything is in scope (the deliberate breadth across projects).
+fn note_in_scope(
+    note_project_id: Option<Uuid>,
+    scope_project_id: Option<Uuid>,
+    workspace_scoped: bool,
+) -> bool {
+    match (scope_project_id, workspace_scoped) {
+        (Some(pid), _) => note_project_id == Some(pid),
+        (None, true) => false,
+        (None, false) => true,
+    }
+}
+
+/// Fuse the dense and lexical channels of a note search by Reciprocal Rank
+/// Fusion, then map ids back to notes and re-apply the scar penalty.
+///
+/// Fusion on ranks (not scores) is what lets a flat dense answer be re-ordered
+/// by a discriminative lexical one - cosine on closely clustered embeddings
+/// barely separates anything, while BM25 ranking one candidate first is a
+/// strong, calibratable signal. When only one channel answered, its own order
+/// and scores are kept (dense: cosine; lexical: BM25), so callers still get a
+/// sensible list before any embedding backfill.
+fn fuse_dense_and_lexical(
+    dense: Vec<(Note, f64)>,
+    lexical: Vec<NoteSearchHit>,
+    limit: usize,
+) -> Vec<NoteSearchHit> {
+    let mut dense = dense;
+    dense.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // id -> note, from whichever channel has it (dense wins on overlap).
+    let mut notes: HashMap<String, Note> = HashMap::new();
+    for (note, _) in &dense {
+        notes.insert(note.id.to_string(), note.clone());
+    }
+    for hit in &lexical {
+        notes
+            .entry(hit.note.id.to_string())
+            .or_insert_with(|| hit.note.clone());
+    }
+
+    let dense_ids: Vec<String> = dense.iter().map(|(n, _)| n.id.to_string()).collect();
+    let lexical_ids: Vec<String> = lexical.iter().map(|h| h.note.id.to_string()).collect();
+    // Keep the fused head on the cosine scale the caller already reads.
+    let anchor = dense.first().map(|(_, s)| *s).unwrap_or(0.0);
+
+    let ranked: Vec<(String, f64)> = match (dense_ids.is_empty(), lexical_ids.is_empty()) {
+        (false, false) => reciprocal_rank_fusion(&[&dense_ids, &lexical_ids], anchor),
+        (false, true) => dense.iter().map(|(n, s)| (n.id.to_string(), *s)).collect(),
+        (true, false) => lexical
+            .iter()
+            .map(|h| (h.note.id.to_string(), h.score))
+            .collect(),
+        (true, true) => Vec::new(),
+    };
+
+    let mut out: Vec<NoteSearchHit> = ranked
+        .into_iter()
+        .filter_map(|(id, score)| {
+            notes.remove(&id).map(|note| {
+                let scar_penalty = 1.0 - note.scar_intensity.clamp(0.0, 1.0) * 0.5;
+                NoteSearchHit {
+                    note,
+                    score: score * scar_penalty,
+                    highlights: None,
+                }
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out.truncate(limit);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_helpers::*;
+
+    // -- Hybrid ranking: dense ∪ lexical, fused by RRF ----------------------
+
+    #[test]
+    fn lexical_channel_is_confined_to_the_dense_scope() {
+        let me = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert!(
+            note_in_scope(Some(me), Some(me), false),
+            "same project kept"
+        );
+        assert!(
+            !note_in_scope(Some(other), Some(me), false),
+            "foreign project dropped"
+        );
+        assert!(
+            !note_in_scope(None, Some(me), false),
+            "global note dropped under a project scope"
+        );
+        assert!(
+            note_in_scope(Some(me), None, false),
+            "no scope keeps everything"
+        );
+        assert!(
+            !note_in_scope(Some(me), None, true),
+            "workspace scope skips lexical (membership cannot be verified here)"
+        );
+    }
+
+    #[test]
+    fn a_lexical_consensus_promotes_past_a_flat_dense_tail() {
+        let pid = Uuid::new_v4();
+        let dense_top = test_note(pid, NoteType::Gotcha, "dense lead, no lexical match");
+        let consensus = test_note(pid, NoteType::Gotcha, "matched by both channels");
+        let dense = vec![(dense_top.clone(), 0.9272), (consensus.clone(), 0.9245)];
+        let lexical = vec![NoteSearchHit {
+            note: consensus.clone(),
+            score: 12.0,
+            highlights: None,
+        }];
+        let out = fuse_dense_and_lexical(dense, lexical, 10);
+        assert_eq!(out.len(), 2, "both notes survive");
+        assert_eq!(
+            out[0].note.id, consensus.id,
+            "the note both channels rank wins over a flat dense-only lead"
+        );
+    }
+
+    #[test]
+    fn dense_order_is_kept_when_the_lexical_channel_is_empty() {
+        let pid = Uuid::new_v4();
+        let high = test_note(pid, NoteType::Gotcha, "high cosine");
+        let low = test_note(pid, NoteType::Gotcha, "low cosine");
+        let dense = vec![(low.clone(), 0.80), (high.clone(), 0.90)];
+        let out = fuse_dense_and_lexical(dense, Vec::new(), 10);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].note.id, high.id, "higher cosine stays first");
+    }
 
     /// Helper: build a NoteManager backed by mock stores, with a pre-seeded project.
     /// Returns (NoteManager, project_id).
