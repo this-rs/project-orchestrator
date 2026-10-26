@@ -10,6 +10,16 @@ use anyhow::{Context, Result};
 use neo4rs::query;
 use uuid::Uuid;
 
+/// The `project_id` Cypher parameter of a note write.
+///
+/// `None` must reach the database as a NULL, never as an empty string: an empty
+/// string is a third state the read path decodes back to `None`, yet every
+/// predicate that tests `IS NULL` misses it. 3 319 notes were stranded that way
+/// until this write was fixed. One spelling only.
+fn note_project_param(project_id: Option<Uuid>) -> Option<String> {
+    project_id.map(|id| id.to_string())
+}
+
 /// Note properties a client may sort on. Anything else falls back to
 /// `created_at` (the field name is spliced into the Cypher, so it must come
 /// from this whitelist, never straight from the request).
@@ -179,10 +189,7 @@ impl Neo4jClient {
             "#,
         )
         .param("id", note.id.to_string())
-        .param(
-            "project_id",
-            note.project_id.map(|id| id.to_string()).unwrap_or_default(),
-        )
+        .param("project_id", note_project_param(note.project_id))
         .param("note_type", note.note_type.to_string())
         .param("status", note.status.to_string())
         .param("importance", note.importance.to_string())
@@ -2284,6 +2291,7 @@ impl Neo4jClient {
                 AND (
                     n.project_id IN [(w:Workspace {slug: $ws_slug})<-[:BELONGS_TO_WORKSPACE]-(proj:Project) | proj.id]
                     OR n.project_id IS NULL
+                    OR n.project_id = ''
                 )
                 RETURN n, score
                 ORDER BY score DESC
@@ -2971,7 +2979,7 @@ impl Neo4jClient {
         let cypher = r#"
             UNWIND $items AS pair
             MATCH (a:Note {id: pair.a}), (b:Note {id: pair.b})
-            WHERE a.project_id IS NOT NULL AND a.project_id = b.project_id AND a.id <> b.id
+            WHERE a.project_id IS NOT NULL AND a.project_id <> '' AND a.project_id = b.project_id AND a.id <> b.id
             MERGE (a)-[s1:SYNAPSE]->(b)
               ON CREATE SET s1.weight = 0.5, s1.created_at = datetime(),
                 s1.last_reinforced_at = datetime(), s1.reinforcement_count = 1,
@@ -3038,7 +3046,7 @@ impl Neo4jClient {
                     // Never touch a synapse that crosses projects: both ends must
                     // share the project (a Decision has no project_id: it is not a
                     // cross-project signal by itself).
-                    WHERE n.project_id IS NULL OR m.project_id IS NULL OR n.project_id = m.project_id
+                    WHERE n.project_id IS NULL OR n.project_id = '' OR m.project_id IS NULL OR m.project_id = '' OR n.project_id = m.project_id
                     SET s.weight = s.weight - $amount
                     WITH collect(s) AS all_syn
                     WITH all_syn, [x IN all_syn WHERE x.weight < $threshold] AS weak
@@ -3994,5 +4002,25 @@ mod synapse_param_tests {
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(synapse_bind_params(&[(Uuid::new_v4(), 0.3), (Uuid::new_v4(), bad)]).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod project_param_tests {
+    //! The write side of a note's scope. `None` must stay `None`: an empty
+    //! string is a third state that reads back as `None` but that every
+    //! `IS NULL` predicate misses, which is how 3 319 notes ended up stranded.
+    use super::note_project_param;
+    use uuid::Uuid;
+
+    #[test]
+    fn a_global_note_writes_a_null_and_not_an_empty_string() {
+        assert_eq!(
+            note_project_param(None),
+            None,
+            "None must reach Cypher as a NULL, never as ''"
+        );
+        let id = Uuid::new_v4();
+        assert_eq!(note_project_param(Some(id)), Some(id.to_string()));
     }
 }

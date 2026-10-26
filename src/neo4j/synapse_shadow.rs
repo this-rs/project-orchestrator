@@ -158,7 +158,7 @@ impl Neo4jClient {
                 query(
                     r#"
                     MATCH (a:Note)-[s:SYNAPSE]->(b:Note)
-                    WHERE a.project_id IS NOT NULL AND a.project_id = b.project_id
+                    WHERE a.project_id IS NOT NULL AND a.project_id <> '' AND a.project_id = b.project_id
                       AND NOT a.project_id IN $disabled
                       AND ($default_enabled OR a.project_id IN $enabled)
                     WITH s, a.project_id IN $dormant AS frozen,
