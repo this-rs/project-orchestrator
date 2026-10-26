@@ -767,6 +767,25 @@ pub struct Note {
 }
 
 impl Note {
+    /// The label the knowledge graph shows for a note: its content, cut at 40 characters.
+    ///
+    /// ONE formula, used by the graph endpoint AND by the live `node_created` event.
+    /// Two copies drifted apart: a note created live kept its identifier as a label
+    /// until the next full reload renamed it (measured 26/10/2026, po-graph).
+    pub fn graph_label(&self) -> String {
+        if self.content.chars().count() > 40 {
+            let end = self
+                .content
+                .char_indices()
+                .nth(40)
+                .map(|(i, _)| i)
+                .unwrap_or(self.content.len());
+            format!("{}…", &self.content[..end])
+        } else {
+            self.content.clone()
+        }
+    }
+
     /// Create a new note with minimal fields
     pub fn new(
         project_id: Option<Uuid>,
@@ -1413,6 +1432,26 @@ mod tests {
             NoteScope::File("bar".into()).specificity()
                 < NoteScope::Function("baz".into()).specificity()
         );
+    }
+
+    #[test]
+    fn graph_label_cuts_at_forty_characters_without_breaking_utf8() {
+        let mut note = Note::new(
+            None,
+            NoteType::Guideline,
+            "court".to_string(),
+            "t".to_string(),
+        );
+        assert_eq!(note.graph_label(), "court", "short content is the label");
+
+        note.content = "a".repeat(40);
+        assert_eq!(note.graph_label(), "a".repeat(40), "exactly 40 is not cut");
+
+        note.content = "é".repeat(41); // 2 bytes per char: a byte cut would panic
+        assert_eq!(note.graph_label(), format!("{}…", "é".repeat(40)));
+
+        note.content = "x".repeat(41);
+        assert_eq!(note.graph_label(), format!("{}…", "x".repeat(40)));
     }
 
     #[test]

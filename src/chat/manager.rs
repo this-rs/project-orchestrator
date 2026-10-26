@@ -1723,6 +1723,29 @@ pub(crate) async fn enrichment_for_turn(
             }
         },
     };
+    // Bind the project the turn actually runs on, once, on the session node (P18).
+    // A session opened without a project resolved one from its working directory on
+    // every turn, but the node kept `project_slug = null`: the enrichment knew the
+    // project while `/api/agents/live` reported an agent "without a project", and a
+    // dashboard could not place it in its project. The write refuses a session that
+    // already has a slug, so an explicit project is never overwritten.
+    if node
+        .project_slug
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        if let Some(slug) = project_slug.as_deref().filter(|s| !s.trim().is_empty()) {
+            if let Err(e) = graph.bind_chat_session_project(uuid, slug).await {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "could not bind the resolved project on the session"
+                );
+            }
+        }
+    }
     if mode == AnchorContextMode::Shadow {
         spawn_posture_shadow(graph.clone(), uuid, node.clone());
         spawn_anchor_shadow(

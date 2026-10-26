@@ -545,21 +545,10 @@ pub async fn build_project_graph_data(
             if knowledge_node_count >= limit {
                 break;
             }
-            let label = if note.content.chars().count() > 40 {
-                let end = note
-                    .content
-                    .char_indices()
-                    .nth(40)
-                    .map(|(i, _)| i)
-                    .unwrap_or(note.content.len());
-                format!("{}…", &note.content[..end])
-            } else {
-                note.content.clone()
-            };
             all_nodes.push(GraphNode {
                 id: note.id.to_string(),
                 node_type: "note".to_string(),
-                label,
+                label: note.graph_label(),
                 layer: "knowledge".to_string(),
                 attributes: Some(serde_json::json!({
                     "note_type": format!("{:?}", note.note_type).to_lowercase(),

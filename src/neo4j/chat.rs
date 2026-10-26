@@ -386,6 +386,26 @@ impl Neo4jClient {
         }
     }
 
+    /// Binds the project a session actually works on, when the node carries none.
+    ///
+    /// A session opened without a `project_slug` resolves its project from its working
+    /// directory on every turn, but the node kept `project_slug = null` for ever: the
+    /// enrichment knew the project while `/api/agents/live` reported an agent without
+    /// one, and the dashboard could not place it in its project. Idempotent by
+    /// construction: the WHERE clause refuses any session that already has a slug, so
+    /// an explicit (or already bound) project is never overwritten.
+    pub async fn bind_chat_session_project(&self, id: Uuid, project_slug: &str) -> Result<bool> {
+        let cypher = "MATCH (s:ChatSession {id: $id}) \
+                      WHERE s.project_slug IS NULL OR trim(s.project_slug) = '' \
+                      SET s.project_slug = $slug, s.updated_at = datetime() \
+                      RETURN s";
+        let q = query(cypher)
+            .param("id", id.to_string())
+            .param("slug", project_slug.to_string());
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
     /// Update the permission_mode field on a chat session node
     pub async fn update_chat_session_permission_mode(&self, id: Uuid, mode: &str) -> Result<()> {
         let cypher = "MATCH (s:ChatSession {id: $id}) SET s.permission_mode = $mode, s.updated_at = datetime()";

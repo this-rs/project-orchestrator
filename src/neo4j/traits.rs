@@ -2188,6 +2188,12 @@ pub trait GraphStore: Send + Sync {
     /// Update the permission_mode field on a chat session node
     async fn update_chat_session_permission_mode(&self, id: Uuid, mode: &str) -> Result<()>;
 
+    /// Bind the project a session actually works on, when the node carries none.
+    ///
+    /// Returns `true` when it was written. Never overwrites an existing slug: the
+    /// explicit `project_slug` of a session, or one already bound before, wins.
+    async fn bind_chat_session_project(&self, id: Uuid, project_slug: &str) -> Result<bool>;
+
     /// Adds `delta_usd` to the spend of the CHILDREN of a session (sub-agents of the `Agent`
     /// tool, PYSR-3) and returns the new children total. Kept APART from `total_cost_usd`, which
     /// stays the session's OWN cost: the routing decision of the parent is closed on its own

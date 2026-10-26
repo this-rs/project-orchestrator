@@ -8503,6 +8503,23 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn bind_chat_session_project(&self, id: Uuid, project_slug: &str) -> Result<bool> {
+        let mut sessions = self.chat_sessions.write().await;
+        let Some(session) = sessions.get_mut(&id) else {
+            return Ok(false);
+        };
+        if session
+            .project_slug
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            return Ok(false);
+        }
+        session.project_slug = Some(project_slug.to_string());
+        session.updated_at = Utc::now();
+        Ok(true)
+    }
+
     async fn update_chat_session_file_scope_lifted(&self, id: Uuid, lifted: bool) -> Result<()> {
         let mut sessions = self.chat_sessions.write().await;
         if let Some(session) = sessions.get_mut(&id) {
@@ -18917,5 +18934,90 @@ mod session_tree_tests {
             2,
             "a and b once each"
         );
+    }
+}
+
+#[cfg(test)]
+mod bind_project_tests {
+    //! `bind_chat_session_project` (P18): the project a session actually works on is
+    //! written once on the node, and an explicit project is never overwritten. Before
+    //! it, a session opened without `project_slug` stayed anonymous in
+    //! `/api/agents/live` although every turn resolved its project from the cwd.
+    use super::*;
+    use crate::neo4j::traits::GraphStore;
+    use crate::test_helpers::test_chat_session;
+
+    async fn session(store: &MockGraphStore, slug: Option<&str>) -> Uuid {
+        let s = test_chat_session(slug);
+        let id = s.id;
+        store.create_chat_session(&s).await.unwrap();
+        id
+    }
+
+    async fn project_of(store: &MockGraphStore, id: Uuid) -> Option<String> {
+        store
+            .get_chat_session(id)
+            .await
+            .unwrap()
+            .expect("the session exists")
+            .project_slug
+    }
+
+    #[tokio::test]
+    async fn a_session_without_a_project_binds_the_resolved_one() {
+        let store = MockGraphStore::new();
+        let id = session(&store, None).await;
+
+        assert!(
+            store
+                .bind_chat_session_project(id, "po-graph")
+                .await
+                .unwrap(),
+            "the first bind writes"
+        );
+        assert_eq!(project_of(&store, id).await.as_deref(), Some("po-graph"));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_project_is_never_overwritten() {
+        let store = MockGraphStore::new();
+        let id = session(&store, Some("project-orchestrator-backend")).await;
+
+        assert!(
+            !store
+                .bind_chat_session_project(id, "po-graph")
+                .await
+                .unwrap(),
+            "binding refuses a session that already has a project"
+        );
+        assert_eq!(
+            project_of(&store, id).await.as_deref(),
+            Some("project-orchestrator-backend")
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_is_idempotent_and_an_empty_slug_counts_as_no_project() {
+        let store = MockGraphStore::new();
+        let id = session(&store, Some("  ")).await;
+
+        assert!(store
+            .bind_chat_session_project(id, "po-graph")
+            .await
+            .unwrap());
+        assert!(
+            !store.bind_chat_session_project(id, "other").await.unwrap(),
+            "a second bind writes nothing"
+        );
+        assert_eq!(project_of(&store, id).await.as_deref(), Some("po-graph"));
+    }
+
+    #[tokio::test]
+    async fn binding_an_unknown_session_writes_nothing_and_does_not_fail() {
+        let store = MockGraphStore::new();
+        assert!(!store
+            .bind_chat_session_project(Uuid::new_v4(), "po-graph")
+            .await
+            .unwrap());
     }
 }
