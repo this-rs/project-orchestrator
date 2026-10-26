@@ -4749,6 +4749,8 @@ pub async fn bootstrap_knowledge_fabric(
 
     let total_time_ms = start.elapsed().as_millis() as u64;
 
+    state.event_bus.emit_graph(crate::events::GraphEvent::scores_updated(project_id.to_string()));
+
     Ok(Json(serde_json::json!({
         "steps_completed": completed,
         "steps_failed": failed,
