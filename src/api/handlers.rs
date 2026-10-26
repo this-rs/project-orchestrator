@@ -4255,6 +4255,8 @@ pub async fn update_fabric_scores(
         .await
         .unwrap_or(0);
 
+    state.event_bus.emit_graph(crate::events::GraphEvent::scores_updated(project_id.to_string()));
+
     Ok(Json(serde_json::json!({
         "nodes_updated": analytics.metrics.len(),
         "computation_ms": start.elapsed().as_millis() as u64,
