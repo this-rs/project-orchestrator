@@ -555,7 +555,7 @@ fn trigger_ties_are_ordered_by_id_not_input_order() {
 // ============================================================================
 
 fn protocol(relevance: RelevanceVector) -> Protocol {
-    let mut p = Protocol::new(Uuid::new_v4(), "p", Uuid::new_v4());
+    let mut p = Protocol::new(Some(Uuid::new_v4()), "p", Uuid::new_v4());
     p.relevance_vector = Some(relevance);
     p
 }

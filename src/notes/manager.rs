@@ -3520,7 +3520,7 @@ mod tests {
         // Seed an rfc-lifecycle protocol with a start state
         let start_state_id = Uuid::new_v4();
         let mut protocol =
-            crate::protocol::Protocol::new(project_id, "rfc-lifecycle", start_state_id);
+            crate::protocol::Protocol::new(Some(project_id), "rfc-lifecycle", start_state_id);
         let protocol_id = protocol.id;
         protocol.terminal_states = vec![]; // no terminal states needed for this test
         state.neo4j.upsert_protocol(&protocol).await.unwrap();

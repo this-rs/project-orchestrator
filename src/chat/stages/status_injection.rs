@@ -694,7 +694,7 @@ mod tests {
 
         // Create protocol
         let start_id = Uuid::new_v4();
-        let mut proto = crate::protocol::Protocol::new(project_id, "code-review", start_id);
+        let mut proto = crate::protocol::Protocol::new(Some(project_id), "code-review", start_id);
 
         // Create states with prompt_fragment
         let state_analyze = crate::protocol::ProtocolState {
@@ -747,6 +747,7 @@ mod tests {
         let run = crate::protocol::ProtocolRun {
             id: Uuid::new_v4(),
             protocol_id: proto.id,
+            project_id: None,
             plan_id: None,
             task_id: None,
             parent_run_id: None,
@@ -816,7 +817,7 @@ mod tests {
         mock.create_project(&project).await.unwrap();
 
         let start_id = Uuid::new_v4();
-        let proto = crate::protocol::Protocol::new(project_id, "code-review", start_id);
+        let proto = crate::protocol::Protocol::new(Some(project_id), "code-review", start_id);
         mock.upsert_protocol(&proto).await.unwrap();
 
         let state = crate::protocol::ProtocolState::new(proto.id, "analyze");
@@ -839,7 +840,7 @@ mod tests {
         mock.create_project(&project).await.unwrap();
 
         // A protocol with a running run...
-        let mut busy = crate::protocol::Protocol::new(project_id, "busy", Uuid::new_v4());
+        let mut busy = crate::protocol::Protocol::new(Some(project_id), "busy", Uuid::new_v4());
         let busy_state = crate::protocol::ProtocolState::start(busy.id, "running");
         let busy_done = crate::protocol::ProtocolState::terminal(busy.id, "done");
         busy.entry_state = busy_state.id;
@@ -852,7 +853,7 @@ mod tests {
             .unwrap();
 
         // ... and one with none (its states are never read).
-        let mut quiet = crate::protocol::Protocol::new(project_id, "quiet", Uuid::new_v4());
+        let mut quiet = crate::protocol::Protocol::new(Some(project_id), "quiet", Uuid::new_v4());
         let quiet_state = crate::protocol::ProtocolState::start(quiet.id, "waiting");
         quiet.entry_state = quiet_state.id;
         mock.upsert_protocol(&quiet).await.unwrap();
@@ -1025,7 +1026,8 @@ mod tests {
         let project_id = project.id;
         mock.create_project(&project).await.unwrap();
 
-        let mut proto = crate::protocol::Protocol::new(project_id, "code-review", Uuid::new_v4());
+        let mut proto =
+            crate::protocol::Protocol::new(Some(project_id), "code-review", Uuid::new_v4());
         let mut state = crate::protocol::ProtocolState::start(proto.id, "analyze");
         state.prompt_fragment = Some("Read the diff before you review it.".to_string());
         state.forbidden_actions = Some(vec!["git push".to_string()]);
@@ -1079,7 +1081,7 @@ mod tests {
         let project_id = project.id;
         mock.create_project(&project).await.unwrap();
 
-        let mut proto = crate::protocol::Protocol::new(project_id, "deploy", Uuid::new_v4());
+        let mut proto = crate::protocol::Protocol::new(Some(project_id), "deploy", Uuid::new_v4());
         let state = crate::protocol::ProtocolState::start(proto.id, "uploading");
         proto.entry_state = state.id;
         mock.upsert_protocol(&proto).await.unwrap();
@@ -1435,6 +1437,7 @@ mod tests {
         crate::protocol::ProtocolRun {
             id: Uuid::new_v4(),
             protocol_id,
+            project_id: None,
             plan_id: None,
             task_id: None,
             parent_run_id: None,

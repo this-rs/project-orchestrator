@@ -349,7 +349,7 @@ mod tests {
     fn make_protocol() -> (Protocol, ProtocolState, ProtocolRun) {
         let project_id = Uuid::new_v4();
         let state = ProtocolState::new(Uuid::new_v4(), "test_state");
-        let protocol = Protocol::new(project_id, "test_protocol", state.id);
+        let protocol = Protocol::new(Some(project_id), "test_protocol", state.id);
         let run = ProtocolRun::new(protocol.id, state.id, "test_state");
         (protocol, state, run)
     }

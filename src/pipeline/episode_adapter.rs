@@ -610,7 +610,7 @@ mod tests {
         // Create a protocol with a start state
         let project_id = Uuid::new_v4();
         let start_state = ProtocolState::start(Uuid::nil(), "start");
-        let protocol = Protocol::new(project_id, "my-cool-protocol", start_state.id);
+        let protocol = Protocol::new(Some(project_id), "my-cool-protocol", start_state.id);
         store.upsert_protocol(&protocol).await.unwrap();
 
         // Create a run for that protocol

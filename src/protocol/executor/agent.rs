@@ -601,7 +601,10 @@ impl Executor for AgentExecutor {
 
         // Load transitions and project root for prompt building
         let transitions = store.get_protocol_transitions(run.protocol_id).await?;
-        let project = store.get_project(protocol.project_id).await?;
+        let project = match protocol.project_id {
+            Some(pid) => store.get_project(pid).await?,
+            None => None,
+        };
         let project_root = project.as_ref().and_then(|p| p.root_path_opt());
         let project_slug = project.as_ref().map(|p| p.slug.as_str());
 
@@ -776,7 +779,7 @@ mod tests {
         let protocol_id = uuid::Uuid::new_v4();
         let state_id = uuid::Uuid::new_v4();
 
-        let protocol = Protocol::new(uuid::Uuid::new_v4(), "Test Protocol", state_id);
+        let protocol = Protocol::new(Some(uuid::Uuid::new_v4()), "Test Protocol", state_id);
 
         let mut state = ProtocolState::new(protocol_id, "review");
         state.id = state_id;
@@ -815,7 +818,7 @@ mod tests {
     fn test_build_agent_prompt_no_action_no_description() {
         let protocol_id = uuid::Uuid::new_v4();
         let state_id = uuid::Uuid::new_v4();
-        let protocol = Protocol::new(uuid::Uuid::new_v4(), "Proto", state_id);
+        let protocol = Protocol::new(Some(uuid::Uuid::new_v4()), "Proto", state_id);
         let mut state = ProtocolState::new(protocol_id, "idle");
         state.id = state_id;
         state.description = String::new();
@@ -835,7 +838,7 @@ mod tests {
         use crate::protocol::StateVisit;
         let protocol_id = uuid::Uuid::new_v4();
         let state_id = uuid::Uuid::new_v4();
-        let protocol = Protocol::new(uuid::Uuid::new_v4(), "P", state_id);
+        let protocol = Protocol::new(Some(uuid::Uuid::new_v4()), "P", state_id);
         let mut state = ProtocolState::new(protocol_id, "s2");
         state.id = state_id;
         let mut run = ProtocolRun::new(protocol_id, state_id, "s2");
@@ -869,7 +872,7 @@ mod tests {
     fn test_build_agent_prompt_no_transitions() {
         let protocol_id = uuid::Uuid::new_v4();
         let state_id = uuid::Uuid::new_v4();
-        let protocol = Protocol::new(uuid::Uuid::new_v4(), "P", state_id);
+        let protocol = Protocol::new(Some(uuid::Uuid::new_v4()), "P", state_id);
         let mut state = ProtocolState::new(protocol_id, "final");
         state.id = state_id;
         let run = ProtocolRun::new(protocol_id, state_id, "final");
@@ -881,7 +884,7 @@ mod tests {
     fn test_build_agent_prompt_with_guards() {
         let protocol_id = uuid::Uuid::new_v4();
         let state_id = uuid::Uuid::new_v4();
-        let protocol = Protocol::new(uuid::Uuid::new_v4(), "P", state_id);
+        let protocol = Protocol::new(Some(uuid::Uuid::new_v4()), "P", state_id);
         let mut state = ProtocolState::new(protocol_id, "gate");
         state.id = state_id;
         let run = ProtocolRun::new(protocol_id, state_id, "gate");
@@ -900,7 +903,7 @@ mod tests {
     fn a_protocol_agent_session_takes_the_projects_default_through_the_resolver() {
         let state_id = uuid::Uuid::new_v4();
         let protocol_id = uuid::Uuid::new_v4();
-        let protocol = Protocol::new(uuid::Uuid::new_v4(), "Review", state_id);
+        let protocol = Protocol::new(Some(uuid::Uuid::new_v4()), "Review", state_id);
         let state = ProtocolState::new(protocol_id, "REVIEW");
         let run = ProtocolRun::new(protocol_id, state_id, "REVIEW");
 
@@ -935,7 +938,7 @@ mod tests {
     fn test_build_agent_prompt_no_project_root() {
         let protocol_id = uuid::Uuid::new_v4();
         let state_id = uuid::Uuid::new_v4();
-        let protocol = Protocol::new(uuid::Uuid::new_v4(), "P", state_id);
+        let protocol = Protocol::new(Some(uuid::Uuid::new_v4()), "P", state_id);
         let mut state = ProtocolState::new(protocol_id, "s");
         state.id = state_id;
         let run = ProtocolRun::new(protocol_id, state_id, "s");
@@ -1042,7 +1045,7 @@ mod tests {
 
         let protocol_id = uuid::Uuid::new_v4();
         let state_id = uuid::Uuid::new_v4();
-        let protocol = Protocol::new(uuid::Uuid::new_v4(), "Review", state_id);
+        let protocol = Protocol::new(Some(uuid::Uuid::new_v4()), "Review", state_id);
         let mut state = ProtocolState::new(protocol_id, "review");
         state.id = state_id;
         // Not an MCP-style action: the slow path (an LLM session), not the fast one.

@@ -878,7 +878,7 @@ mod tests {
 
         // Use a temporary id to build the protocol, then fix protocol_id on states
         let tmp_start = ProtocolState::start(Uuid::nil(), "start");
-        let protocol = Protocol::new(project_id, "test-proto", tmp_start.id);
+        let protocol = Protocol::new(Some(project_id), "test-proto", tmp_start.id);
         let protocol_id = protocol.id;
 
         let start_state = ProtocolState::start(protocol_id, "start");

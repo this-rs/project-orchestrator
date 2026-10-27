@@ -100,7 +100,7 @@ pub async fn seed_runner_protocols(
         let mut state_objects: Vec<ProtocolState> = Vec::new();
 
         let placeholder_entry = Uuid::new_v4();
-        let mut proto = Protocol::new(project_id, def.name, placeholder_entry);
+        let mut proto = Protocol::new(Some(project_id), def.name, placeholder_entry);
         proto.description = def.description.to_string();
         proto.protocol_category = crate::protocol::ProtocolCategory::Business;
         proto.relevance_vector = Some(def.relevance_vector.clone());
@@ -288,7 +288,7 @@ async fn create_protocol_from_def(
     let mut state_objects: Vec<ProtocolState> = Vec::new();
 
     let placeholder_entry = Uuid::new_v4();
-    let mut proto = Protocol::new(project_id, def.name, placeholder_entry);
+    let mut proto = Protocol::new(Some(project_id), def.name, placeholder_entry);
     proto.description = def.description.to_string();
     proto.protocol_category = crate::protocol::ProtocolCategory::Business;
     proto.relevance_vector = Some(def.relevance_vector.clone());

@@ -727,7 +727,7 @@ async fn import_protocols(
             id: protocol_id,
             name: portable.name.clone(),
             description: portable.description.clone(),
-            project_id: target_project_id,
+            project_id: Some(target_project_id),
             skill_id: Some(skill_id),
             entry_state,
             terminal_states: terminal_state_ids,
@@ -1234,7 +1234,7 @@ mod tests {
         let proto = &protocols[0];
         assert_eq!(proto.name, "code-review");
         assert_eq!(proto.description, "Automated code review workflow");
-        assert_eq!(proto.project_id, project_id);
+        assert_eq!(proto.project_id, Some(project_id));
         assert_eq!(proto.skill_id, Some(result.skill_id));
         assert_eq!(
             proto.protocol_category,
@@ -1400,7 +1400,7 @@ mod tests {
         let end_state_id = Uuid::new_v4();
 
         let proto = crate::protocol::Protocol::new_full(
-            source_project_id,
+            Some(source_project_id),
             "test-proto",
             "A test protocol",
             start_state_id,

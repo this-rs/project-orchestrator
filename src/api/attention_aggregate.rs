@@ -2024,9 +2024,9 @@ mod tests {
     async fn running_protocol_run_is_a_running_thread_unless_a_plan_thread_covers_it() {
         let w = World::new();
         let acme = w.lane("acme").await;
-        let proto = Protocol::new(Uuid::nil(), "p", Uuid::new_v4());
+        let proto = Protocol::new(Some(Uuid::nil()), "p", Uuid::new_v4());
         let mut proto = proto;
-        proto.project_id = acme.project;
+        proto.project_id = Some(acme.project);
         w.g.upsert_protocol(&proto).await.unwrap();
         let run = ProtocolRun::new(proto.id, proto.entry_state, "start");
         w.g.create_protocol_run(&run).await.unwrap();

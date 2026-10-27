@@ -861,7 +861,7 @@ mod tests {
         // Create a protocol in the store
         let state_id = uuid::Uuid::new_v4();
         let mut protocol =
-            crate::protocol::Protocol::new(project_id, "test-auto-protocol", state_id);
+            crate::protocol::Protocol::new(Some(project_id), "test-auto-protocol", state_id);
         protocol.protocol_category = crate::protocol::ProtocolCategory::System;
         graph.upsert_protocol(&protocol).await.unwrap();
 

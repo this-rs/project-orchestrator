@@ -576,7 +576,13 @@ async fn on_protocol_run_completed_collect_episode(event: CrudEvent, state: Arc<
             }
         };
         match neo4j.get_protocol(protocol_id).await {
-            Ok(Some(proto)) => proto.project_id,
+            Ok(Some(proto)) => match proto.project_id {
+                Some(pid) => pid,
+                None => {
+                    debug!(run_id = %run_id, "on_protocol_run_completed: transverse protocol, no project to react on");
+                    return;
+                }
+            },
             Ok(None) => {
                 debug!(run_id = %run_id, protocol_id = %protocol_id, "on_protocol_run_completed: protocol not found");
                 return;

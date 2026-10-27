@@ -1056,7 +1056,7 @@ mod tests {
         state_names: &[&str],
     ) -> Uuid {
         let entry_state = Uuid::new_v4();
-        let proto = Protocol::new(project_id, protocol_name, entry_state);
+        let proto = Protocol::new(Some(project_id), protocol_name, entry_state);
         let protocol_id = proto.id;
         mock.protocols.write().await.insert(protocol_id, proto);
 

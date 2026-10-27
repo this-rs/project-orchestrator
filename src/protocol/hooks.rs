@@ -744,7 +744,7 @@ mod tests {
         let done_state = ProtocolState::terminal(protocol_id, "Done");
 
         let mut protocol = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "Test Event Protocol",
             "Protocol for event-trigger testing",
             start_state.id,
@@ -1019,7 +1019,7 @@ mod tests {
         let done_state = ProtocolState::terminal(protocol_id, "Done");
 
         let mut protocol = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "Test Scheduled Protocol",
             "Protocol for scheduler testing",
             start_state.id,
@@ -1502,7 +1502,7 @@ mod tests {
         let done_state = ProtocolState::terminal(protocol_id, "Done");
 
         let mut protocol = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "inference",
             "Code intelligence inference protocol",
             start_state.id,
