@@ -18982,7 +18982,10 @@ pub(crate) fn process_alive(pid: Option<u32>) -> Option<bool> {
         // exists and that we may signal it.
         let rc = unsafe { libc::kill(pid, 0) };
         if rc == 0 {
-            return Some(true);
+            // A process that has exited but not been reaped still answers kill(0):
+            // it is a zombie (`<defunct>`), not a running process. Counting it alive
+            // kept a dead CLI's background task and its child slot forever.
+            return Some(!is_zombie(pid));
         }
         // EPERM: the process exists but belongs to someone else.
         Some(std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
@@ -18991,6 +18994,35 @@ pub(crate) fn process_alive(pid: Option<u32>) -> Option<bool> {
     {
         let _ = pid;
         None
+    }
+}
+
+/// Is `pid` a zombie: exited, its status not yet collected by its parent?
+#[cfg(unix)]
+fn is_zombie(pid: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // `/proc/<pid>/stat` is `pid (comm) S ...`; the state follows the last `)`.
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit(')')
+                    .next()
+                    .map(|rest| rest.trim_start().starts_with('Z'))
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .map(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .trim_start()
+                    .starts_with('Z')
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -19153,6 +19185,16 @@ mod idle_expiry_tests {
             let pid = child.id();
             child.wait().expect("wait for `true`");
             assert_eq!(process_alive(Some(pid)), Some(false));
+
+            // A child that has exited but NOT been reaped is a zombie: it is dead, and
+            // the probe must say so (kill(0) alone still succeeds on it).
+            let mut zombie = std::process::Command::new("true")
+                .spawn()
+                .expect("spawn `true`");
+            let zombie_pid = zombie.id();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert_eq!(process_alive(Some(zombie_pid)), Some(false));
+            zombie.wait().expect("reap the zombie");
         }
     }
 
