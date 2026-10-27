@@ -34,7 +34,7 @@ const PROPS_PROJECTION: &str = "{\
 /// Owning project id of node `m`, as the project filter reads it. A node carries
 /// `project_id` itself, is a Project, or hangs under a Plan of a Project (Plan,
 /// Task, Step). Anything else has no known owner (`null`): the filter refuses it.
-/// A global note is stored with `project_id = ''`: no owner either (`null`, as
+/// A global note is stored with a NULL `project_id`: no owner either (`null`, as
 /// the in-memory walk says), not an owner named `""` (T3-ter). Run against a
 /// real Neo4j by `tests/harness_neo4j.rs` (`anchor_scope`).
 const OWNER_CYPHER: &str = "coalesce(CASE WHEN m.project_id <> '' THEN m.project_id END, \
