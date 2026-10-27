@@ -1409,6 +1409,37 @@ impl Neo4jClient {
         Ok(artefacts)
     }
 
+    /// Re-scope a protocol: `None` makes it transverse, `Some(pid)` attaches it.
+    ///
+    /// Same contract as [`Self::rescope_skill`]: the edge moves, it is never
+    /// duplicated, and the property follows in the same statement.
+    pub async fn rescope_protocol(
+        &self,
+        protocol_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (p:Protocol {id: $id})
+            OPTIONAL MATCH (p)-[old:BELONGS_TO]->(:Project)
+            DELETE old
+            WITH p
+            OPTIONAL MATCH (proj:Project {id: $project_id})
+            FOREACH (_ IN CASE WHEN proj IS NULL THEN [] ELSE [1] END |
+                CREATE (p)-[:BELONGS_TO]->(proj)
+            )
+            SET p.project_id = $project_id
+            RETURN p.id AS id
+            "#,
+        )
+        .param("id", protocol_id.to_string())
+        .param("project_id", project_id.map(|p| p.to_string()));
+
+        let mut result = self.graph.execute(q).await?;
+        result.next().await?;
+        Ok(())
+    }
+
     /// Find the most recently started active (running) protocol run for a project.
     ///
     /// Traverses: ProtocolRun -[:INSTANCE_OF]-> Protocol {project_id}.

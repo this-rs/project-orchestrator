@@ -139,6 +139,10 @@ pub struct UpdateProtocolBody {
     pub trigger_mode: Option<String>,
     pub trigger_config: Option<crate::protocol::TriggerConfig>,
     pub relevance_vector: Option<crate::protocol::routing::RelevanceVector>,
+    /// Re-scope this protocol. Absent: leave it alone. `null`: make it
+    /// transverse. A uuid: attach it to that project.
+    #[serde(default, deserialize_with = "crate::api::double_option")]
+    pub project_id: Option<Option<Uuid>>,
 }
 
 /// Request body for adding a state
@@ -742,6 +746,18 @@ pub async fn update_protocol(
         .upsert_protocol(&protocol)
         .await
         .map_err(AppError::Internal)?;
+
+    // Re-scope: absent leaves the scope alone, `null` makes it transverse, a
+    // uuid attaches it. Same contract as the skill update.
+    if let Some(scope) = body.project_id {
+        state
+            .orchestrator
+            .neo4j()
+            .rescope_protocol(protocol.id, scope)
+            .await
+            .map_err(AppError::Internal)?;
+        protocol.project_id = scope;
+    }
 
     // Emit event for protocol update
     state.event_bus.emit_updated(
@@ -2722,6 +2738,7 @@ mod tests {
     async fn test_handler_update_protocol_ok() {
         let (state, _project_id, proto_id) = make_state_with_protocol().await;
         let body = UpdateProtocolBody {
+            project_id: None,
             name: Some("renamed-proto".to_string()),
             description: Some("updated".to_string()),
             protocol_category: None,

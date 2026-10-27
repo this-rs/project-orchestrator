@@ -11785,6 +11785,32 @@ impl GraphStore for MockGraphStore {
         Ok(existed)
     }
 
+    async fn rescope_skill(&self, skill_id: Uuid, project_id: Option<Uuid>) -> anyhow::Result<()> {
+        let mut skills = self.skills.write().await;
+        match skills.values_mut().find(|s| s.id == skill_id) {
+            Some(skill) => {
+                skill.project_id = project_id;
+                Ok(())
+            }
+            None => anyhow::bail!("skill {} not found", skill_id),
+        }
+    }
+
+    async fn rescope_protocol(
+        &self,
+        protocol_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<()> {
+        let mut protocols = self.protocols.write().await;
+        match protocols.values_mut().find(|p| p.id == protocol_id) {
+            Some(protocol) => {
+                protocol.project_id = project_id;
+                Ok(())
+            }
+            None => anyhow::bail!("protocol {} not found", protocol_id),
+        }
+    }
+
     async fn list_skills(
         &self,
         project_id: Option<Uuid>,
@@ -19116,5 +19142,53 @@ mod transverse_skill_tests {
         let live = store.get_live_skills_for_project(pid).await.unwrap();
         assert_eq!(live.len(), 1, "detection must not see transverse skills");
         assert_eq!(live[0].name, "local");
+    }
+}
+
+#[cfg(test)]
+mod rescope_tests {
+    //! Re-scoping is the operation T3 depends on: it must move a node between
+    //! the transverse level and a project without recreating it (and therefore
+    //! without losing its members, states, transitions or runs).
+    use super::*;
+    use crate::skills::{SkillNode, SkillStatus};
+    use crate::test_helpers::test_project;
+
+    #[tokio::test]
+    async fn rescoping_moves_the_scope_and_null_makes_it_transverse() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        let pid = project.id;
+        store.create_project(&project).await.unwrap();
+
+        let mut skill = SkillNode::new(Some(pid), "rescoped");
+        skill.status = SkillStatus::Active;
+        let id = skill.id;
+        store.create_skill(&skill).await.unwrap();
+
+        // attached -> transverse
+        store.rescope_skill(id, None).await.unwrap();
+        let (library, _) = store.list_skills(None, None, 10, 0).await.unwrap();
+        assert!(
+            library.iter().any(|s| s.id == id),
+            "null must make the skill transverse"
+        );
+
+        // transverse -> attached elsewhere
+        let elsewhere = Uuid::new_v4();
+        store.rescope_skill(id, Some(elsewhere)).await.unwrap();
+        let (from_project, _) = store
+            .list_skills(Some(elsewhere), None, 10, 0)
+            .await
+            .unwrap();
+        assert!(
+            from_project.iter().any(|s| s.id == id),
+            "a uuid must attach the skill to that project"
+        );
+        let (library, _) = store.list_skills(None, None, 10, 0).await.unwrap();
+        assert!(
+            !library.iter().any(|s| s.id == id),
+            "it must have left the transverse library"
+        );
     }
 }
