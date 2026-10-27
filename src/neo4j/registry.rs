@@ -42,7 +42,10 @@ impl super::client::Neo4jClient {
         .param("trust_score", published.trust_score)
         .param("trust_components_json", trust_components_json)
         .param("trust_level", published.trust_level.to_string())
-        .param("source_project_id", published.source_project_id.to_string())
+        .param(
+            "source_project_id",
+            published.source_project_id.map(|id| id.to_string()),
+        )
         .param("source_project_name", published.source_project_name.clone())
         .param("published_by", published.published_by.clone())
         .param("published_at", published.published_at.to_rfc3339())
@@ -255,7 +258,7 @@ fn parse_published_skill_node(node: &Node) -> Result<PublishedSkill> {
         trust_score,
         trust_components,
         trust_level,
-        source_project_id,
+        source_project_id: Some(source_project_id),
         source_project_name,
         published_by,
         published_at,

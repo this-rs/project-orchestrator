@@ -738,7 +738,7 @@ mod tests {
     use super::*;
 
     fn make_skill(status: SkillStatus, energy: f64, cohesion: f64) -> SkillNode {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Test Skill");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Test Skill");
         skill.status = status;
         skill.energy = energy;
         skill.cohesion = cohesion;
@@ -837,7 +837,7 @@ mod tests {
     #[test]
     fn test_evaluate_promotion_boundary_values() {
         // Exactly at thresholds — should pass
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Boundary");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Boundary");
         skill.status = SkillStatus::Emerging;
         skill.energy = 0.3;
         skill.cohesion = 0.4;
@@ -850,7 +850,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_promotion_just_below_thresholds() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Just Below");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Just Below");
         skill.status = SkillStatus::Emerging;
         skill.energy = 0.299;
         skill.cohesion = 0.4;
@@ -1045,7 +1045,7 @@ mod tests {
 
     async fn mock_store_with_skill(skill: SkillNode) -> Arc<MockGraphStore> {
         let store = MockGraphStore::new();
-        let project_id = skill.project_id;
+        let project_id = skill.project_id.expect("the test skill has a project");
         let mut p = crate::test_helpers::test_project();
         p.id = project_id;
         store.projects.write().await.insert(p.id, p);
@@ -1056,7 +1056,7 @@ mod tests {
     #[tokio::test]
     async fn test_demote_skill_active_to_dormant() {
         let project_id = Uuid::new_v4();
-        let mut skill = SkillNode::new(project_id, "Active Skill");
+        let mut skill = SkillNode::new(Some(project_id), "Active Skill");
         skill.status = SkillStatus::Active;
         skill.energy = 0.05;
         let skill_id = skill.id;
@@ -1071,7 +1071,7 @@ mod tests {
     #[tokio::test]
     async fn test_demote_skill_wrong_status_fails() {
         let project_id = Uuid::new_v4();
-        let mut skill = SkillNode::new(project_id, "Emerging Skill");
+        let mut skill = SkillNode::new(Some(project_id), "Emerging Skill");
         skill.status = SkillStatus::Emerging;
         let skill_id = skill.id;
         let store = mock_store_with_skill(skill).await;
@@ -1092,7 +1092,7 @@ mod tests {
     #[tokio::test]
     async fn test_archive_skill_dormant_to_archived() {
         let project_id = Uuid::new_v4();
-        let mut skill = SkillNode::new(project_id, "Dormant Skill");
+        let mut skill = SkillNode::new(Some(project_id), "Dormant Skill");
         skill.status = SkillStatus::Dormant;
         let skill_id = skill.id;
         let store = mock_store_with_skill(skill).await;
@@ -1106,7 +1106,7 @@ mod tests {
     #[tokio::test]
     async fn test_archive_skill_wrong_status_fails() {
         let project_id = Uuid::new_v4();
-        let mut skill = SkillNode::new(project_id, "Active Skill");
+        let mut skill = SkillNode::new(Some(project_id), "Active Skill");
         skill.status = SkillStatus::Active;
         let skill_id = skill.id;
         let store = mock_store_with_skill(skill).await;
@@ -1119,7 +1119,7 @@ mod tests {
     #[tokio::test]
     async fn test_archive_imported_skill_success() {
         let project_id = Uuid::new_v4();
-        let mut skill = SkillNode::new(project_id, "Imported Skill");
+        let mut skill = SkillNode::new(Some(project_id), "Imported Skill");
         skill.status = SkillStatus::Imported;
         skill.imported_at = Some(Utc::now() - chrono::Duration::days(30));
         let skill_id = skill.id;
@@ -1136,7 +1136,7 @@ mod tests {
     #[tokio::test]
     async fn test_archive_imported_skill_wrong_status_fails() {
         let project_id = Uuid::new_v4();
-        let mut skill = SkillNode::new(project_id, "Active Skill");
+        let mut skill = SkillNode::new(Some(project_id), "Active Skill");
         skill.status = SkillStatus::Active;
         let skill_id = skill.id;
         let store = mock_store_with_skill(skill).await;
@@ -1152,7 +1152,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_imported_skill_success() {
         let project_id = Uuid::new_v4();
-        let mut skill = SkillNode::new(project_id, "Imported Skill");
+        let mut skill = SkillNode::new(Some(project_id), "Imported Skill");
         skill.status = SkillStatus::Imported;
         skill.activation_count = 5;
         let skill_id = skill.id;
@@ -1170,7 +1170,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_imported_skill_wrong_status_fails() {
         let project_id = Uuid::new_v4();
-        let mut skill = SkillNode::new(project_id, "Dormant Skill");
+        let mut skill = SkillNode::new(Some(project_id), "Dormant Skill");
         skill.status = SkillStatus::Dormant;
         let skill_id = skill.id;
         let store = mock_store_with_skill(skill).await;
@@ -1186,7 +1186,7 @@ mod tests {
     #[tokio::test]
     async fn test_reactivate_skill_dormant_to_emerging() {
         let project_id = Uuid::new_v4();
-        let mut skill = SkillNode::new(project_id, "Dormant Skill");
+        let mut skill = SkillNode::new(Some(project_id), "Dormant Skill");
         skill.status = SkillStatus::Dormant;
         skill.activation_count = 10;
         let skill_id = skill.id;
@@ -1203,7 +1203,7 @@ mod tests {
     #[tokio::test]
     async fn test_reactivate_skill_wrong_status_fails() {
         let project_id = Uuid::new_v4();
-        let mut skill = SkillNode::new(project_id, "Active Skill");
+        let mut skill = SkillNode::new(Some(project_id), "Active Skill");
         skill.status = SkillStatus::Active;
         let skill_id = skill.id;
         let store = mock_store_with_skill(skill).await;
@@ -1216,7 +1216,7 @@ mod tests {
     #[tokio::test]
     async fn test_promote_skill_emerging_to_active() {
         let project_id = Uuid::new_v4();
-        let mut skill = SkillNode::new(project_id, "Emerging Skill");
+        let mut skill = SkillNode::new(Some(project_id), "Emerging Skill");
         skill.status = SkillStatus::Emerging;
         skill.energy = 0.5;
         skill.cohesion = 0.6;
@@ -1236,7 +1236,7 @@ mod tests {
     #[tokio::test]
     async fn test_promote_skill_wrong_status_fails() {
         let project_id = Uuid::new_v4();
-        let mut skill = SkillNode::new(project_id, "Active Skill");
+        let mut skill = SkillNode::new(Some(project_id), "Active Skill");
         skill.status = SkillStatus::Active;
         let skill_id = skill.id;
         let store = mock_store_with_skill(skill).await;
@@ -1276,7 +1276,7 @@ mod tests {
         p.id = project_id;
         store.projects.write().await.insert(p.id, p);
 
-        let mut skill = SkillNode::new(project_id, "Should Demote");
+        let mut skill = SkillNode::new(Some(project_id), "Should Demote");
         skill.status = SkillStatus::Active;
         skill.energy = 0.05;
         skill.cohesion = 0.15;
@@ -1301,7 +1301,7 @@ mod tests {
         p.id = project_id;
         store.projects.write().await.insert(p.id, p);
 
-        let mut skill = SkillNode::new(project_id, "Should Archive");
+        let mut skill = SkillNode::new(Some(project_id), "Should Archive");
         skill.status = SkillStatus::Dormant;
         skill.energy = 0.01;
         skill.last_activated = Some(Utc::now() - chrono::Duration::days(100));

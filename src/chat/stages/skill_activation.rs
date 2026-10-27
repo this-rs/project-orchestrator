@@ -461,7 +461,7 @@ mod tests {
         let store = crate::neo4j::mock::MockGraphStore::new();
         let project = crate::test_helpers::test_project_named("Mine");
         store.create_project(&project).await.unwrap();
-        let skill = SkillNode::new(project.id, "S");
+        let skill = SkillNode::new(Some(project.id), "S");
         store.create_skill(&skill).await.unwrap();
         let mut ids = Vec::new();
         for owner in [Some(project.id), Some(Uuid::new_v4()), None] {
@@ -496,7 +496,7 @@ mod tests {
         let store = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let project = crate::test_helpers::test_project_named("Live");
         store.create_project(&project).await.unwrap();
-        let mut skill = SkillNode::new(project.id, "Live Skill");
+        let mut skill = SkillNode::new(Some(project.id), "Live Skill");
         skill.context_template = Some(
             "# Live Skill\n## Gotchas\n- use the OLD way\n## Activated Notes\n\n{{activated_notes}}\n## Relevant Decisions\n\n{{relevant_decisions}}".into(),
         );
@@ -536,7 +536,7 @@ mod tests {
         );
 
         // Without current members: name + description, still no template.
-        let mut bare = SkillNode::new(project.id, "Bare");
+        let mut bare = SkillNode::new(Some(project.id), "Bare");
         bare.description = "what it covers".into();
         bare.context_template = Some("{{activated_notes}}".into());
         store.create_skill(&bare).await.unwrap();

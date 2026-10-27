@@ -53,12 +53,15 @@ pub async fn export_skill(
         .context("Failed to load skill members")?;
 
     // 2b. Load project root_path for path sanitization
-    let project_root = graph_store
-        .get_project(skill.project_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|p| p.root_path);
+    let project_root = match skill.project_id {
+        Some(pid) => graph_store
+            .get_project(pid)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| p.root_path),
+        None => None,
+    };
 
     // 3. Convert to portable format
     let portable_notes: Vec<PortableNote> = notes
@@ -123,10 +126,11 @@ pub async fn export_skill(
 
     // Find protocols linked to this skill via skill_id
     let project_id = skill.project_id;
-    let (all_protocols, _) = graph_store
-        .list_protocols(project_id, None, 100, 0)
-        .await
-        .unwrap_or_default();
+    let (all_protocols, _) = match project_id {
+        Some(pid) => graph_store.list_protocols(pid, None, 100, 0).await,
+        None => Ok((Vec::new(), 0)),
+    }
+    .unwrap_or_default();
 
     for proto in &all_protocols {
         if proto.skill_id != Some(skill_id) {
@@ -239,9 +243,13 @@ pub async fn export_skill(
             .unwrap_or_default();
         for run in &runs {
             if seen_run_ids.insert(run.id) {
-                match crate::episodes::collector::collect_episode(graph_store, run.id, project_id)
-                    .await
-                {
+                let collected = match project_id {
+                    Some(pid) => {
+                        crate::episodes::collector::collect_episode(graph_store, run.id, pid).await
+                    }
+                    None => Ok(None),
+                };
+                match collected {
                     Ok(Some(ep)) => portable_episodes.push(ep.to_portable()),
                     Ok(None) => {}
                     Err(e) => {
@@ -345,7 +353,7 @@ mod tests {
 
         // Create a skill with members
         let project_id = Uuid::new_v4();
-        let mut skill = crate::skills::SkillNode::new(project_id, "Test Skill");
+        let mut skill = crate::skills::SkillNode::new(Some(project_id), "Test Skill");
         skill.trigger_patterns = vec![
             crate::skills::SkillTrigger::regex("test|mock", 0.7),
             crate::skills::SkillTrigger::file_glob("src/test/**", 0.8),
@@ -433,7 +441,7 @@ mod tests {
         let store = MockGraphStore::new();
 
         let project_id = Uuid::new_v4();
-        let mut skill = crate::skills::SkillNode::new(project_id, "Valid Skill");
+        let mut skill = crate::skills::SkillNode::new(Some(project_id), "Valid Skill");
         skill.trigger_patterns = vec![crate::skills::SkillTrigger::regex("test", 0.7)];
         let skill_id = skill.id;
         store.create_skill(&skill).await.unwrap();
@@ -452,7 +460,7 @@ mod tests {
         let store = MockGraphStore::new();
 
         let project_id = Uuid::new_v4();
-        let skill = crate::skills::SkillNode::new(project_id, "Small Skill");
+        let skill = crate::skills::SkillNode::new(Some(project_id), "Small Skill");
         let skill_id = skill.id;
         store.create_skill(&skill).await.unwrap();
 

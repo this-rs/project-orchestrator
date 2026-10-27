@@ -152,7 +152,7 @@ impl Classifier for Skills {
         let file = case.input.get("file").and_then(Value::as_str);
         let mut best: Option<(f64, String)> = None;
         for spec in specs {
-            let mut node = SkillNode::new(Uuid::nil(), spec.name.clone());
+            let mut node = SkillNode::new(Some(Uuid::nil()), spec.name.clone());
             node.trigger_patterns = spec
                 .triggers
                 .into_iter()

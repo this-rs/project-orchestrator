@@ -244,8 +244,9 @@ impl SkillTrigger {
 pub struct SkillNode {
     /// Unique identifier
     pub id: Uuid,
-    /// Project this skill belongs to
-    pub project_id: Uuid,
+    /// Owning project. `None` means the skill is transverse: it belongs to the
+    /// instance, not to a project, and is visible from every project.
+    pub project_id: Option<Uuid>,
     /// Human-readable name (auto-generated from tags or LLM-enriched)
     pub name: String,
     /// Description of the skill's domain of expertise
@@ -324,7 +325,7 @@ fn default_version() -> i64 {
 
 impl SkillNode {
     /// Create a new Emerging skill with minimal fields.
-    pub fn new(project_id: Uuid, name: impl Into<String>) -> Self {
+    pub fn new(project_id: Option<Uuid>, name: impl Into<String>) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
@@ -354,7 +355,7 @@ impl SkillNode {
 
     /// Create a new skill with full configuration.
     pub fn new_full(
-        project_id: Uuid,
+        project_id: Option<Uuid>,
         name: impl Into<String>,
         description: impl Into<String>,
         energy: f64,
@@ -423,8 +424,8 @@ pub struct ActivatedSkillContext {
 /// Request to create a new skill manually
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSkillRequest {
-    /// Project this skill belongs to
-    pub project_id: Uuid,
+    /// Owning project. `None` creates a transverse skill (instance level).
+    pub project_id: Option<Uuid>,
     /// Human-readable name
     pub name: String,
     /// Description of the skill's domain
@@ -853,9 +854,9 @@ mod tests {
     #[test]
     fn test_skill_node_new() {
         let project_id = Uuid::new_v4();
-        let skill = SkillNode::new(project_id, "Neo4j Performance");
+        let skill = SkillNode::new(Some(project_id), "Neo4j Performance");
 
-        assert_eq!(skill.project_id, project_id);
+        assert_eq!(skill.project_id, Some(project_id));
         assert_eq!(skill.name, "Neo4j Performance");
         assert_eq!(skill.status, SkillStatus::Emerging);
         assert!(skill.description.is_empty());
@@ -872,7 +873,7 @@ mod tests {
     fn test_skill_node_new_full() {
         let project_id = Uuid::new_v4();
         let skill = SkillNode::new_full(
-            project_id,
+            Some(project_id),
             "API Auth",
             "Authentication and authorization patterns",
             0.75,
@@ -892,7 +893,7 @@ mod tests {
 
     #[test]
     fn test_skill_node_energy_clamping() {
-        let skill = SkillNode::new_full(Uuid::new_v4(), "test", "desc", 1.5, -0.3, vec![]);
+        let skill = SkillNode::new_full(Some(Uuid::new_v4()), "test", "desc", 1.5, -0.3, vec![]);
         assert!((skill.energy - 1.0).abs() < f64::EPSILON);
         assert!((skill.cohesion - 0.0).abs() < f64::EPSILON);
     }
@@ -900,7 +901,7 @@ mod tests {
     #[test]
     fn test_skill_node_matchable() {
         let project_id = Uuid::new_v4();
-        let mut skill = SkillNode::new(project_id, "test");
+        let mut skill = SkillNode::new(Some(project_id), "test");
 
         // Emerging → matchable
         skill.status = SkillStatus::Emerging;
@@ -927,7 +928,7 @@ mod tests {
 
     #[test]
     fn test_skill_node_imported() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "test");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "test");
         assert!(!skill.is_imported());
 
         skill.imported_at = Some(Utc::now());
@@ -936,7 +937,7 @@ mod tests {
 
     #[test]
     fn test_skill_node_reliable_triggers() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "test");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "test");
 
         let good = SkillTrigger {
             quality_score: Some(0.8),
@@ -960,7 +961,7 @@ mod tests {
     fn test_skill_node_serde_roundtrip() {
         let project_id = Uuid::new_v4();
         let mut skill = SkillNode::new_full(
-            project_id,
+            Some(project_id),
             "Neo4j Performance",
             "Optimization patterns for Neo4j queries",
             0.72,
@@ -982,7 +983,7 @@ mod tests {
         let deserialized: SkillNode = serde_json::from_str(&json).unwrap();
 
         assert_eq!(deserialized.id, skill.id);
-        assert_eq!(deserialized.project_id, project_id);
+        assert_eq!(deserialized.project_id, Some(project_id));
         assert_eq!(deserialized.name, "Neo4j Performance");
         assert_eq!(deserialized.status, SkillStatus::Emerging);
         assert!((deserialized.energy - 0.72).abs() < f64::EPSILON);
@@ -996,7 +997,7 @@ mod tests {
     #[test]
     fn test_skill_summary_from_node() {
         let skill = SkillNode::new_full(
-            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
             "Test Skill",
             "Description",
             0.7,

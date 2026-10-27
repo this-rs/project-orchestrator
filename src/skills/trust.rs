@@ -192,7 +192,7 @@ mod tests {
     use uuid::Uuid;
 
     fn make_skill(energy: f64, cohesion: f64, activation_count: i64, hit_rate: f64) -> SkillNode {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Test Skill");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Test Skill");
         skill.energy = energy;
         skill.cohesion = cohesion;
         skill.activation_count = activation_count;

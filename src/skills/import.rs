@@ -303,7 +303,9 @@ async fn find_skill_by_name(
     project_id: Uuid,
     name: &str,
 ) -> Result<Option<SkillNode>> {
-    let (skills, _) = graph_store.list_skills(project_id, None, 200, 0).await?;
+    let (skills, _) = graph_store
+        .list_skills(Some(project_id), None, 200, 0)
+        .await?;
     let normalized_name = name.trim().to_lowercase();
     Ok(skills
         .into_iter()
@@ -388,7 +390,7 @@ fn create_imported_skill(package: &SkillPackage, project_id: Uuid) -> SkillNode 
     let now = Utc::now();
     SkillNode {
         id: Uuid::new_v4(),
-        project_id,
+        project_id: Some(project_id),
         name: package.skill.name.clone(),
         description: package.skill.description.clone(),
         status: SkillStatus::Imported,
@@ -902,7 +904,7 @@ mod tests {
         assert_eq!(skill.status, SkillStatus::Imported);
         assert!(skill.imported_at.is_some());
         assert!(!skill.is_validated);
-        assert_eq!(skill.project_id, project_id);
+        assert_eq!(skill.project_id, Some(project_id));
     }
 
     #[tokio::test]
@@ -942,7 +944,7 @@ mod tests {
         let project_id = Uuid::new_v4();
 
         // Create an existing skill with the same name
-        let existing = SkillNode::new(project_id, "Neo4j Performance");
+        let existing = SkillNode::new(Some(project_id), "Neo4j Performance");
         store.create_skill(&existing).await.unwrap();
 
         // Try to import — should fail with Skip strategy
@@ -958,7 +960,7 @@ mod tests {
         let project_id = Uuid::new_v4();
 
         // Create an existing skill with the same name
-        let existing = SkillNode::new(project_id, "Neo4j Performance");
+        let existing = SkillNode::new(Some(project_id), "Neo4j Performance");
         let existing_id = existing.id;
         store.create_skill(&existing).await.unwrap();
 
@@ -984,7 +986,7 @@ mod tests {
         let project_id = Uuid::new_v4();
 
         // Create an existing skill
-        let existing = SkillNode::new(project_id, "Neo4j Performance");
+        let existing = SkillNode::new(Some(project_id), "Neo4j Performance");
         let old_id = existing.id;
         store.create_skill(&existing).await.unwrap();
 
@@ -1347,7 +1349,7 @@ mod tests {
         store.create_project(&target_project).await.unwrap();
 
         // Create a skill with a protocol in the source project
-        let mut skill = SkillNode::new(source_project_id, "Round Trip Skill");
+        let mut skill = SkillNode::new(Some(source_project_id), "Round Trip Skill");
         skill.description = "Test round-trip".to_string();
         skill.tags = vec!["test".to_string()];
         skill.activation_count = 5;

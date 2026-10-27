@@ -347,7 +347,7 @@ mod tests {
     fn make_test_skill(name: &str, triggers: Vec<(TriggerType, &str)>) -> SkillNode {
         use crate::skills::models::SkillTrigger;
 
-        let mut skill = SkillNode::new(Uuid::new_v4(), name);
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), name);
         skill.trigger_patterns = triggers
             .into_iter()
             .map(|(tt, val)| match tt {

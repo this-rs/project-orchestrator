@@ -1585,7 +1585,7 @@ mod tests {
     use std::sync::Arc;
 
     fn make_test_skill(project_id: Uuid) -> SkillNode {
-        SkillNode::new(project_id, "test-skill")
+        SkillNode::new(Some(project_id), "test-skill")
     }
 
     fn make_test_note(project_id: Uuid, id: Uuid) -> crate::notes::Note {

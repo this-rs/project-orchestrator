@@ -353,7 +353,7 @@ pub async fn session_context(
 
     // Fetch active skills (limit 5, sorted by energy desc)
     let active_skills = match neo4j
-        .list_skills(project_id, Some(SkillStatus::Active), 5, 0)
+        .list_skills(Some(project_id), Some(SkillStatus::Active), 5, 0)
         .await
     {
         Ok((skills, _)) => skills

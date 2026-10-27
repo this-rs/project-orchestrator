@@ -259,7 +259,7 @@ mod tests {
         context_template: &str,
     ) -> Uuid {
         let skill_id = Uuid::new_v4();
-        let mut skill = SkillNode::new(project_id, name);
+        let mut skill = SkillNode::new(Some(project_id), name);
         skill.id = skill_id;
         skill.status = SkillStatus::Active;
         skill.energy = 0.9;

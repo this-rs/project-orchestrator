@@ -953,7 +953,7 @@ mod tests {
         let (store, project_id) = setup_store_with_project().await;
 
         // Create an active skill with low energy and old activation
-        let mut skill = SkillNode::new(project_id, "Active Low Energy");
+        let mut skill = SkillNode::new(Some(project_id), "Active Low Energy");
         skill.status = SkillStatus::Active;
         skill.energy = 0.05;
         skill.cohesion = 0.15;
@@ -1564,7 +1564,7 @@ mod tests {
         store.create_project(&project).await.unwrap();
 
         // Create a skill with an absolute FileGlob trigger
-        let mut skill = SkillNode::new(pid, "Test Skill");
+        let mut skill = SkillNode::new(Some(pid), "Test Skill");
         skill.trigger_patterns = vec![
             crate::skills::models::SkillTrigger::file_glob("/home/user/myproject/src/**/*.rs", 0.8),
             crate::skills::models::SkillTrigger::regex("test.*pattern", 0.7),
@@ -1597,7 +1597,7 @@ mod tests {
         store.create_project(&project).await.unwrap();
 
         // Create a skill with only relative triggers
-        let mut skill = SkillNode::new(pid, "Relative Skill");
+        let mut skill = SkillNode::new(Some(pid), "Relative Skill");
         skill.trigger_patterns = vec![crate::skills::models::SkillTrigger::file_glob(
             "src/**/*.rs",
             0.8,
@@ -1975,7 +1975,7 @@ mod tests {
 
         // Create some skills so adaptive lifecycle config is computed
         for i in 0..3 {
-            let mut skill = SkillNode::new(project_id, format!("Skill {}", i));
+            let mut skill = SkillNode::new(Some(project_id), format!("Skill {}", i));
             skill.status = SkillStatus::Active;
             skill.energy = 0.5;
             skill.cohesion = 0.5;
@@ -2001,7 +2001,7 @@ mod tests {
         let (store, project_id) = setup_store_with_project().await;
 
         // Create existing skills with members
-        let mut skill = SkillNode::new(project_id, "Existing Skill");
+        let mut skill = SkillNode::new(Some(project_id), "Existing Skill");
         skill.status = SkillStatus::Active;
         let skill_id = skill.id;
         store.create_skill(&skill).await.unwrap();
@@ -2054,7 +2054,7 @@ mod tests {
         // Regression: evolution creates New skills with no trigger patterns,
         // so they could never be activated by the hook.
         let (store, project_id) = setup_store_with_project().await;
-        let mut skill = SkillNode::new(project_id, "Evolved Without Triggers");
+        let mut skill = SkillNode::new(Some(project_id), "Evolved Without Triggers");
         skill.status = SkillStatus::Emerging;
         assert!(skill.trigger_patterns.is_empty());
         let skill_id = skill.id;
@@ -2098,12 +2098,12 @@ mod tests {
         // re-created as a New skill on each pass.
         let (store, project_id) = setup_store_with_project().await;
         for i in 0..3 {
-            let mut archived = SkillNode::new(project_id, format!("Archived {i}"));
+            let mut archived = SkillNode::new(Some(project_id), format!("Archived {i}"));
             archived.status = SkillStatus::Archived;
             archived.energy = 0.5;
             store.create_skill(&archived).await.unwrap();
         }
-        let mut live = SkillNode::new(project_id, "Live");
+        let mut live = SkillNode::new(Some(project_id), "Live");
         live.status = SkillStatus::Emerging;
         live.energy = 0.0;
         store.create_skill(&live).await.unwrap();
@@ -2128,7 +2128,7 @@ mod tests {
         store.create_project(&project).await.unwrap();
 
         // Create a skill with absolute trigger
-        let mut skill = SkillNode::new(pid, "Cleanup Target");
+        let mut skill = SkillNode::new(Some(pid), "Cleanup Target");
         skill.trigger_patterns = vec![crate::skills::models::SkillTrigger::file_glob(
             "/home/user/proj/src/**",
             0.8,
