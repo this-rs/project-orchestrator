@@ -77,7 +77,7 @@ pub async fn route_lifecycle_protocol(
     };
 
     // 2. List lifecycle protocols for this project (plan-runner-*)
-    let (all_protocols, _) = graph.list_protocols(project_id, None, 100, 0).await?;
+    let (all_protocols, _) = graph.list_protocols(Some(project_id), None, 100, 0).await?;
     let runner_protocols: Vec<_> = all_protocols
         .into_iter()
         .filter(|p| p.name.starts_with(RUNNER_PROTOCOL_PREFIX))

@@ -389,7 +389,7 @@ mod real_graph {
         for project in &projects {
             // List protocols for this project (limit 1000 should be enough)
             let (protocols, _) = client
-                .list_protocols(project.id, None, 1000, 0)
+                .list_protocols(Some(project.id), None, 1000, 0)
                 .await
                 .expect("list_protocols");
 

@@ -3971,7 +3971,7 @@ impl GraphStore for Neo4jClient {
 
     async fn list_protocols(
         &self,
-        project_id: uuid::Uuid,
+        project_id: Option<uuid::Uuid>,
         category: Option<crate::protocol::ProtocolCategory>,
         limit: usize,
         offset: usize,

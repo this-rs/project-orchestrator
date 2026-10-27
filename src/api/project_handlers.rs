@@ -828,6 +828,21 @@ fn slugify(name: &str) -> String {
         .join("-")
 }
 
+/// The instance-level graph: what belongs to no project.
+///
+/// Composed from existing reads rather than a new query: a transverse note is a
+/// note, a transverse skill is a skill. `MEASURED_IN` is counted from the
+/// SYNAPSE links of each transverse skill's member notes to notes that belong to
+/// a project — "where has this competence served", not "where is it mentioned".
+pub async fn get_transverse_graph(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<crate::api::graph_types::TransverseGraph>, AppError> {
+    let graph = crate::api::graph_types::collect_transverse_graph(state.orchestrator.neo4j())
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(graph))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

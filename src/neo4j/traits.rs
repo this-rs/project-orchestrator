@@ -3710,7 +3710,7 @@ pub trait GraphStore: Send + Sync {
     /// Returns (protocols, total_count).
     async fn list_protocols(
         &self,
-        project_id: Uuid,
+        project_id: Option<Uuid>,
         category: Option<crate::protocol::ProtocolCategory>,
         limit: usize,
         offset: usize,

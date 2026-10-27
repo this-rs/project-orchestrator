@@ -12218,7 +12218,7 @@ impl GraphStore for MockGraphStore {
 
     async fn list_protocols(
         &self,
-        project_id: Uuid,
+        project_id: Option<Uuid>,
         category: Option<crate::protocol::ProtocolCategory>,
         limit: usize,
         offset: usize,
@@ -12227,8 +12227,13 @@ impl GraphStore for MockGraphStore {
         let mut filtered: Vec<_> = store
             .values()
             .filter(|p| {
-                p.project_id == Some(project_id)
-                    && category.as_ref().is_none_or(|c| p.protocol_category == *c)
+                // Same scope rule as skills: no project lists the transverse
+                // library alone, a project sees its own protocols and those.
+                let in_scope = match project_id {
+                    Some(pid) => p.project_id == Some(pid) || p.project_id.is_none(),
+                    None => p.project_id.is_none(),
+                };
+                in_scope && category.as_ref().is_none_or(|c| p.protocol_category == *c)
             })
             .cloned()
             .collect();

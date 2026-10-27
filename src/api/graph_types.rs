@@ -791,7 +791,7 @@ pub async fn build_project_graph_data(
         let mut behavioral_edge_count = 0usize;
 
         let (protocols, _) = neo4j
-            .list_protocols(project.id, None, limit, 0)
+            .list_protocols(Some(project.id), None, limit, 0)
             .await
             .unwrap_or_default();
 
@@ -1073,7 +1073,7 @@ pub async fn build_intelligence_summary(
         neo4j.count_co_change_pairs(pid, 1),
         neo4j.get_neural_metrics(pid),
         neo4j.list_skills(Some(pid), None, 1000, 0),
-        neo4j.list_protocols(pid, None, 10_000, 0),
+        neo4j.list_protocols(Some(pid), None, 10_000, 0),
         // Single aggregate replaces the per-protocol states/transitions N+1.
         neo4j.count_protocol_states_transitions(pid),
         neo4j.get_pm_graph_data(pid, 10_000),
@@ -1266,6 +1266,237 @@ pub async fn build_intelligence_summary(
         pm,
         chat,
     })
+}
+
+/// One project where a transverse competence has really been used.
+///
+/// `MEASURED_IN` answers "where has this competence served", not "where is it
+/// mentioned": it is counted from the SYNAPSE links of the skill's member notes
+/// to notes that belong to a project.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CarrierEdge {
+    pub skill_id: String,
+    pub project_id: String,
+    /// How many member notes of the skill reach that project.
+    pub notes: usize,
+    /// Mean synapse weight of those links, so a caller can rank carriers.
+    pub weight: f64,
+}
+
+/// The instance-level graph: what belongs to no project.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TransverseGraph {
+    pub nodes: Vec<GraphNode>,
+    pub carriers: Vec<CarrierEdge>,
+    pub total: usize,
+}
+
+/// Assemble the transverse layer.
+///
+/// Pure on purpose: the shape — real node types, every node marked
+/// `scope: "global"`, carriers carrying their count and weight — is the whole
+/// contract, and it is the only part that can be pinned without a database.
+///
+/// A transverse note, skill or protocol is **not** duplicated into the project
+/// graphs: it lives here, once, and the `MEASURED_IN` edges say where it has
+/// been used.
+/// Minimum member notes reaching a project for the link to be drawn.
+///
+/// Measured on the real instance: 18, 13, 10, 6, 4, 3, then singletons. Three
+/// keeps the six carriers two independent measurements agree on, and drops the
+/// noise. It is a display filter, not a claim: the count and weight travel with
+/// the edge so a caller can re-filter.
+pub const MEASURED_IN_MIN_NOTES: usize = 3;
+
+pub fn build_transverse_graph(
+    notes: &[crate::notes::Note],
+    skills: &[crate::skills::SkillNode],
+    protocols: &[crate::protocol::Protocol],
+    carriers: &[CarrierEdge],
+) -> TransverseGraph {
+    let mut nodes = Vec::with_capacity(notes.len() + skills.len() + protocols.len());
+
+    for note in notes {
+        nodes.push(GraphNode {
+            id: note.id.to_string(),
+            node_type: "note".to_string(),
+            label: note.graph_label(),
+            layer: "knowledge".to_string(),
+            attributes: Some(serde_json::json!({
+                "scope": "global",
+                "note_type": note.note_type.to_string(),
+            })),
+        });
+    }
+    for skill in skills {
+        nodes.push(GraphNode {
+            id: skill.id.to_string(),
+            node_type: "skill".to_string(),
+            label: skill.name.clone(),
+            layer: "skills".to_string(),
+            attributes: Some(serde_json::json!({
+                "scope": "global",
+                "status": format!("{:?}", skill.status).to_lowercase(),
+            })),
+        });
+    }
+    for protocol in protocols {
+        nodes.push(GraphNode {
+            id: protocol.id.to_string(),
+            node_type: "protocol".to_string(),
+            label: protocol.name.clone(),
+            layer: "pm".to_string(),
+            attributes: Some(serde_json::json!({ "scope": "global" })),
+        });
+    }
+
+    TransverseGraph {
+        total: nodes.len(),
+        nodes,
+        carriers: carriers.to_vec(),
+    }
+}
+
+/// Read and assemble the transverse layer.
+///
+/// Takes the store rather than the HTTP state so the composition — including
+/// the carrier loop — is testable against the in-memory store, and the handler
+/// stays three lines.
+pub async fn collect_transverse_graph(
+    store: &dyn crate::neo4j::traits::GraphStore,
+) -> anyhow::Result<TransverseGraph> {
+    let filters = crate::notes::NoteFilters {
+        status: Some(vec![crate::notes::NoteStatus::Active]),
+        global_only: Some(true),
+        limit: Some(5000),
+        ..Default::default()
+    };
+    let (notes, _) = store.list_notes(None, None, &filters).await?;
+    let (skills, _) = store.list_skills(None, None, 200, 0).await?;
+    let (protocols, _) = store.list_protocols(None, None, 200, 0).await?;
+
+    let mut carriers = Vec::new();
+    for skill in &skills {
+        let (members, _) = store.get_skill_members(skill.id).await?;
+        // Bounded on purpose: a skill can carry hundreds of members and this
+        // route answers in one request.
+        let mut per_project: std::collections::HashMap<uuid::Uuid, (usize, f64)> =
+            std::collections::HashMap::new();
+        for member in members.iter().take(50) {
+            for (neighbour, weight) in store.get_synapses(member.id).await? {
+                if let Some(note) = store.get_note(neighbour).await? {
+                    if let Some(pid) = note.project_id {
+                        let entry = per_project.entry(pid).or_insert((0, 0.0));
+                        entry.0 += 1;
+                        entry.1 += weight;
+                    }
+                }
+            }
+        }
+        for (pid, (count, sum)) in per_project {
+            if count >= MEASURED_IN_MIN_NOTES {
+                carriers.push(CarrierEdge {
+                    skill_id: skill.id.to_string(),
+                    project_id: pid.to_string(),
+                    notes: count,
+                    weight: sum / count as f64,
+                });
+            }
+        }
+    }
+
+    Ok(build_transverse_graph(
+        &notes, &skills, &protocols, &carriers,
+    ))
+}
+
+#[cfg(test)]
+mod transverse_graph_tests {
+    //! The transverse layer is the answer to "what belongs to no project, and
+    //! where has it been used". Both halves are pinned here: the shape (real
+    //! node types, every node marked global, carriers carrying their count) and
+    //! the selection (a project note must NOT leak into it).
+    use super::*;
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::GraphStore;
+    use crate::protocol::Protocol;
+    use crate::skills::{SkillNode, SkillStatus};
+    use crate::test_helpers::{test_note, test_project};
+
+    #[test]
+    fn the_shape_keeps_real_types_and_marks_everything_global() {
+        let note = test_note(
+            uuid::Uuid::new_v4(),
+            crate::notes::NoteType::Observation,
+            "une note",
+        );
+        let skill = SkillNode::new(None, "une compétence");
+        let protocol = Protocol::new(None, "un protocole", uuid::Uuid::new_v4());
+        let carriers = vec![CarrierEdge {
+            skill_id: skill.id.to_string(),
+            project_id: "p1".to_string(),
+            notes: 18,
+            weight: 0.47,
+        }];
+
+        let graph = build_transverse_graph(&[note], &[skill], &[protocol], &carriers);
+
+        assert_eq!(graph.total, 3);
+        assert!(graph.nodes.iter().all(|n| {
+            n.attributes
+                .as_ref()
+                .and_then(|a| a.get("scope"))
+                .and_then(|v| v.as_str())
+                == Some("global")
+        }));
+        assert!(graph.nodes.iter().any(|n| n.node_type == "skill"));
+        assert!(graph.nodes.iter().any(|n| n.node_type == "protocol"));
+        assert_eq!(graph.carriers.len(), 1);
+        assert_eq!(
+            graph.carriers[0].notes, 18,
+            "the count travels with the edge"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_what_belongs_to_no_project_is_listed() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        let pid = project.id;
+        store.create_project(&project).await.unwrap();
+
+        let mut transverse_note = test_note(pid, crate::notes::NoteType::Observation, "globale");
+        transverse_note.project_id = None;
+        store.create_note(&transverse_note).await.unwrap();
+
+        let mut local_note = test_note(pid, crate::notes::NoteType::Observation, "locale");
+        local_note.project_id = Some(pid);
+        store.create_note(&local_note).await.unwrap();
+
+        let mut skill = SkillNode::new(None, "compétence transverse");
+        skill.status = SkillStatus::Active;
+        store.create_skill(&skill).await.unwrap();
+
+        let graph = collect_transverse_graph(&store).await.unwrap();
+
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .filter(|n| n.layer == "knowledge")
+                .count(),
+            1,
+            "a note owned by a project must not leak into the transverse layer"
+        );
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|n| n.label == "compétence transverse"));
+        assert!(
+            graph.carriers.is_empty(),
+            "no synapse in the mock, so no carrier"
+        );
+    }
 }
 
 #[cfg(test)]

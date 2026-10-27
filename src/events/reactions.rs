@@ -980,7 +980,10 @@ async fn on_patterns_detected_evolve(event: CrudEvent, state: Arc<ServerState>) 
 
     tokio::spawn(async move {
         // Find all protocols for this project
-        let protocols = match neo4j_arc.list_protocols(project_id, None, 50, 0).await {
+        let protocols = match neo4j_arc
+            .list_protocols(Some(project_id), None, 50, 0)
+            .await
+        {
             Ok((protos, _)) => protos,
             Err(e) => {
                 warn!(

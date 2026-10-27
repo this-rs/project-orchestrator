@@ -347,7 +347,7 @@ impl KindResolver for ProtocolResolver {
         for project in projects_in_scope(self.graph.as_ref(), c).await? {
             let (found, _) = self
                 .graph
-                .list_protocols(project.id, None, SCAN_CAP, 0)
+                .list_protocols(Some(project.id), None, SCAN_CAP, 0)
                 .await?;
             for p in found {
                 if c.matches(&p.name, &p.description) {

@@ -518,7 +518,10 @@ impl NoteManager {
     /// the note is still created successfully.
     async fn auto_start_rfc_lifecycle(&self, note: &mut Note, project_id: Uuid) -> Result<()> {
         // Find the rfc-lifecycle protocol in this project
-        let (protocols, _) = self.neo4j.list_protocols(project_id, None, 100, 0).await?;
+        let (protocols, _) = self
+            .neo4j
+            .list_protocols(Some(project_id), None, 100, 0)
+            .await?;
         let protocol = protocols.iter().find(|p| p.name == "rfc-lifecycle");
 
         let protocol = match protocol {

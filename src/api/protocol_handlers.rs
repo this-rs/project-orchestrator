@@ -297,7 +297,7 @@ pub async fn list_protocols(
     let (protocols, total) = state
         .orchestrator
         .neo4j()
-        .list_protocols(query.project_id, category_filter, limit, offset)
+        .list_protocols(Some(query.project_id), category_filter, limit, offset)
         .await
         .map_err(AppError::Internal)?;
 
@@ -323,7 +323,7 @@ pub async fn route_protocols(
     let (protocols, _) = state
         .orchestrator
         .neo4j()
-        .list_protocols(query.project_id, None, 200, 0)
+        .list_protocols(Some(query.project_id), None, 200, 0)
         .await
         .map_err(AppError::Internal)?;
 
@@ -2105,7 +2105,7 @@ pub async fn validate_all_protocols(
         if let Some(project_id) = query.project_id {
             // Single project
             let (protocols, _) = neo4j
-                .list_protocols(project_id, None, 1000, 0)
+                .list_protocols(Some(project_id), None, 1000, 0)
                 .await
                 .map_err(AppError::Internal)?;
             protocols
@@ -2118,7 +2118,7 @@ pub async fn validate_all_protocols(
             let mut all_protocols = Vec::new();
             for project in projects {
                 let (protocols, _) = neo4j
-                    .list_protocols(project.id, None, 1000, 0)
+                    .list_protocols(Some(project.id), None, 1000, 0)
                     .await
                     .map_err(AppError::Internal)?;
                 for p in protocols {

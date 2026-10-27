@@ -281,7 +281,7 @@ impl Neo4jClient {
     /// List protocols for a project with optional category filter and pagination.
     pub async fn list_protocols(
         &self,
-        project_id: Uuid,
+        project_id: Option<Uuid>,
         category: Option<ProtocolCategory>,
         limit: usize,
         offset: usize,
@@ -289,17 +289,24 @@ impl Neo4jClient {
         // Count query
         let count_cypher = if category.is_some() {
             r#"
-            MATCH (proto:Protocol {project_id: $project_id, protocol_category: $category})
+            MATCH (proto:Protocol {protocol_category: $category})
+            WHERE (proto.project_id = $project_id
+               OR ($project_id IS NOT NULL AND proto.project_id IS NULL)
+               OR ($project_id IS NULL AND proto.project_id IS NULL))
             RETURN count(proto) AS total
             "#
         } else {
             r#"
-            MATCH (proto:Protocol {project_id: $project_id})
+            MATCH (proto:Protocol)
+            WHERE (proto.project_id = $project_id
+               OR ($project_id IS NOT NULL AND proto.project_id IS NULL)
+               OR ($project_id IS NULL AND proto.project_id IS NULL))
             RETURN count(proto) AS total
             "#
         };
 
-        let mut count_q = query(count_cypher).param("project_id", project_id.to_string());
+        let mut count_q =
+            query(count_cypher).param("project_id", project_id.map(|id| id.to_string()));
         if let Some(ref cat) = category {
             count_q = count_q.param("category", cat.to_string());
         }
@@ -318,14 +325,20 @@ impl Neo4jClient {
         // List query
         let list_cypher = if category.is_some() {
             r#"
-            MATCH (proto:Protocol {project_id: $project_id, protocol_category: $category})
+            MATCH (proto:Protocol {protocol_category: $category})
+            WHERE (proto.project_id = $project_id
+               OR ($project_id IS NOT NULL AND proto.project_id IS NULL)
+               OR ($project_id IS NULL AND proto.project_id IS NULL))
             RETURN proto
             ORDER BY proto.updated_at DESC
             SKIP $offset LIMIT $limit
             "#
         } else {
             r#"
-            MATCH (proto:Protocol {project_id: $project_id})
+            MATCH (proto:Protocol)
+            WHERE (proto.project_id = $project_id
+               OR ($project_id IS NOT NULL AND proto.project_id IS NULL)
+               OR ($project_id IS NULL AND proto.project_id IS NULL))
             RETURN proto
             ORDER BY proto.updated_at DESC
             SKIP $offset LIMIT $limit
@@ -333,7 +346,7 @@ impl Neo4jClient {
         };
 
         let mut list_q = query(list_cypher)
-            .param("project_id", project_id.to_string())
+            .param("project_id", project_id.map(|id| id.to_string()))
             .param("offset", offset as i64)
             .param("limit", limit as i64);
         if let Some(ref cat) = category {
@@ -519,7 +532,10 @@ impl Neo4jClient {
     pub async fn count_protocol_states_transitions(&self, project_id: Uuid) -> Result<(i64, i64)> {
         let q = query(
             r#"
-            MATCH (proto:Protocol {project_id: $project_id})
+            MATCH (proto:Protocol)
+            WHERE (proto.project_id = $project_id
+               OR ($project_id IS NOT NULL AND proto.project_id IS NULL)
+               OR ($project_id IS NULL AND proto.project_id IS NULL))
             WITH collect(proto.id) AS pids
             OPTIONAL MATCH (s:ProtocolState) WHERE s.protocol_id IN pids
             WITH pids, count(s) AS states

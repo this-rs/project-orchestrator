@@ -310,7 +310,7 @@ pub mod conformance {
         let proto = Protocol::new(Some(p.id), "merge protocol", Uuid::new_v4());
         store.upsert_protocol(&proto).await.unwrap();
         store.upsert_protocol(&proto).await.unwrap();
-        let (_, total) = store.list_protocols(p.id, None, 10, 0).await.unwrap();
+        let (_, total) = store.list_protocols(Some(p.id), None, 10, 0).await.unwrap();
         assert_eq!(total, 1, "one protocol after two upserts");
 
         assert!(store.delete_protocol(proto.id).await.unwrap());

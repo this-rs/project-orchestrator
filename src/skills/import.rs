@@ -1227,7 +1227,7 @@ mod tests {
 
         // Verify protocol exists in the store
         let (protocols, count) = store
-            .list_protocols(project_id, None, 100, 0)
+            .list_protocols(Some(project_id), None, 100, 0)
             .await
             .unwrap();
         assert_eq!(count, 1);
@@ -1294,7 +1294,7 @@ mod tests {
 
         // No protocols should exist
         let (protocols, count) = store
-            .list_protocols(project_id, None, 100, 0)
+            .list_protocols(Some(project_id), None, 100, 0)
             .await
             .unwrap();
         assert_eq!(count, 0);
@@ -1492,7 +1492,7 @@ mod tests {
 
         // Verify imported protocol
         let (imported_protos, _) = store
-            .list_protocols(target_project_id, None, 100, 0)
+            .list_protocols(Some(target_project_id), None, 100, 0)
             .await
             .unwrap();
         assert_eq!(imported_protos.len(), 1);
@@ -1592,7 +1592,7 @@ mod tests {
         assert_eq!(result.protocols_imported, 2);
 
         let (protos, count) = store
-            .list_protocols(project_id, None, 100, 0)
+            .list_protocols(Some(project_id), None, 100, 0)
             .await
             .unwrap();
         assert_eq!(count, 2);
