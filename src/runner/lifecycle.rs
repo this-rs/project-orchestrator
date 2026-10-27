@@ -254,7 +254,7 @@ mod tests {
         let init_state = ProtocolState::start(protocol_id, "init");
         let executing_state = ProtocolState::new(protocol_id, "executing");
 
-        let mut protocol = Protocol::new(project_id, "plan-runner-full", init_state.id);
+        let mut protocol = Protocol::new(Some(project_id), "plan-runner-full", init_state.id);
         protocol.id = protocol_id;
         protocol.terminal_states = vec![];
 
@@ -292,7 +292,7 @@ mod tests {
         let protocol_id = Uuid::new_v4();
         let init_state = ProtocolState::start(protocol_id, "init");
 
-        let mut protocol = Protocol::new(project_id, "code-review-protocol", init_state.id);
+        let mut protocol = Protocol::new(Some(project_id), "code-review-protocol", init_state.id);
         protocol.id = protocol_id;
 
         mock.upsert_protocol(&protocol).await.unwrap();
@@ -348,7 +348,8 @@ mod tests {
         let protocol_id = Uuid::new_v4();
         let init_state = ProtocolState::start(protocol_id, "init");
 
-        let mut protocol = Protocol::new(project_id, "plan-runner-low-affinity", init_state.id);
+        let mut protocol =
+            Protocol::new(Some(project_id), "plan-runner-low-affinity", init_state.id);
         protocol.id = protocol_id;
         protocol.relevance_vector = Some(RelevanceVector {
             phase: 0.0,     // context has 0.5 → distance 0.5
@@ -383,7 +384,7 @@ mod tests {
         let protocol_id = Uuid::new_v4();
         let init_state = ProtocolState::start(protocol_id, "init");
 
-        let mut protocol = Protocol::new(project_id, "plan-runner-full", init_state.id);
+        let mut protocol = Protocol::new(Some(project_id), "plan-runner-full", init_state.id);
         protocol.id = protocol_id;
         protocol.terminal_states = vec![];
 
@@ -416,7 +417,7 @@ mod tests {
         let init_a = ProtocolState::start(proto_a_id, "init");
         let exec_a = ProtocolState::new(proto_a_id, "executing");
 
-        let mut proto_a = Protocol::new(project_id, "plan-runner-full", init_a.id);
+        let mut proto_a = Protocol::new(Some(project_id), "plan-runner-full", init_a.id);
         proto_a.id = proto_a_id;
         proto_a.terminal_states = vec![];
         // Context: phase=0.5, structure~0.39, domain=0.5, resource=1.0, lifecycle=0.0
@@ -439,7 +440,7 @@ mod tests {
         let init_b = ProtocolState::start(proto_b_id, "init");
         let exec_b = ProtocolState::new(proto_b_id, "executing");
 
-        let mut proto_b = Protocol::new(project_id, "plan-runner-light", init_b.id);
+        let mut proto_b = Protocol::new(Some(project_id), "plan-runner-light", init_b.id);
         proto_b.id = proto_b_id;
         proto_b.terminal_states = vec![];
         proto_b.relevance_vector = Some(RelevanceVector {
@@ -477,7 +478,7 @@ mod tests {
         let init_state = ProtocolState::start(protocol_id, "init");
         let executing_state = ProtocolState::new(protocol_id, "executing");
 
-        let mut protocol = Protocol::new(project_id, "plan-runner-full", init_state.id);
+        let mut protocol = Protocol::new(Some(project_id), "plan-runner-full", init_state.id);
         protocol.id = protocol_id;
         protocol.terminal_states = vec![];
 
@@ -516,7 +517,7 @@ mod tests {
         let init_state = ProtocolState::start(protocol_id, "init");
         let executing_state = ProtocolState::new(protocol_id, "executing");
 
-        let mut protocol = Protocol::new(project_id, "plan-runner-light", init_state.id);
+        let mut protocol = Protocol::new(Some(project_id), "plan-runner-light", init_state.id);
         protocol.id = protocol_id;
         protocol.terminal_states = vec![];
 
@@ -551,7 +552,7 @@ mod tests {
         let init_state = ProtocolState::start(protocol_id, "init");
         let executing_state = ProtocolState::new(protocol_id, "executing");
 
-        let mut protocol = Protocol::new(project_id, "plan-runner-reviewed", init_state.id);
+        let mut protocol = Protocol::new(Some(project_id), "plan-runner-reviewed", init_state.id);
         protocol.id = protocol_id;
         protocol.terminal_states = vec![];
 
@@ -591,7 +592,7 @@ mod tests {
         // Create a non-runner protocol (should be filtered out)
         let non_runner_id = Uuid::new_v4();
         let nr_init = ProtocolState::start(non_runner_id, "init");
-        let mut non_runner = Protocol::new(project_id, "code-review-protocol", nr_init.id);
+        let mut non_runner = Protocol::new(Some(project_id), "code-review-protocol", nr_init.id);
         non_runner.id = non_runner_id;
         mock.upsert_protocol(&non_runner).await.unwrap();
         mock.upsert_protocol_state(&nr_init).await.unwrap();
@@ -600,7 +601,7 @@ mod tests {
         let runner_id = Uuid::new_v4();
         let r_init = ProtocolState::start(runner_id, "init");
         let r_exec = ProtocolState::new(runner_id, "executing");
-        let mut runner = Protocol::new(project_id, "plan-runner-full", r_init.id);
+        let mut runner = Protocol::new(Some(project_id), "plan-runner-full", r_init.id);
         runner.id = runner_id;
         runner.terminal_states = vec![];
         mock.upsert_protocol(&runner).await.unwrap();

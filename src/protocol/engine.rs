@@ -606,7 +606,7 @@ mod tests {
         let done_state = ProtocolState::terminal(protocol_id, "Done");
 
         let protocol = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "Test Protocol",
             "A simple test protocol",
             start_state.id,
@@ -958,7 +958,7 @@ mod tests {
         let child_start = ProtocolState::start(child_id, "ChildStart");
         let child_done = ProtocolState::terminal(child_id, "ChildDone");
         let mut child_proto = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "Child Protocol",
             "A child sub-protocol",
             child_start.id,
@@ -981,7 +981,7 @@ mod tests {
         let p_done = ProtocolState::terminal(parent_id, "Done");
 
         let mut parent_proto = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "Parent Protocol",
             "A parent with macro-state",
             p_start.id,
@@ -1160,7 +1160,7 @@ mod tests {
         let c2_start = ProtocolState::start(child2_id, "C2Start");
         let c2_done = ProtocolState::terminal(child2_id, "C2Done");
         let mut child2_proto = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "Child Protocol 2",
             "Second child sub-protocol",
             c2_start.id,
@@ -1252,7 +1252,7 @@ mod tests {
         let p_done = ProtocolState::terminal(parent_id, "Done");
 
         let mut parent_proto = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "AnyComplete Parent",
             "Parent with AnyComplete strategy",
             p_start.id,
@@ -1285,7 +1285,7 @@ mod tests {
         let c2_start = ProtocolState::start(child2_id, "C2Start");
         let c2_done = ProtocolState::terminal(child2_id, "C2Done");
         let mut child2_proto = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "Child Protocol 2",
             "Second child",
             c2_start.id,
@@ -1347,7 +1347,7 @@ mod tests {
         let p_done = ProtocolState::terminal(parent_id, "Done");
 
         let mut parent_proto = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "Manual Parent",
             "Parent with Manual strategy",
             p_start.id,
@@ -1444,7 +1444,7 @@ mod tests {
         let p_done = ProtocolState::terminal(parent_id, "Done");
 
         let mut parent_proto = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "Skip Parent",
             "Parent with Skip failure strategy",
             p_start.id,
@@ -1509,7 +1509,7 @@ mod tests {
         let p_done = ProtocolState::terminal(parent_id, "Done");
 
         let mut parent_proto = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "Retry Parent",
             "Parent with Retry failure strategy",
             p_start.id,

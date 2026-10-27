@@ -72,8 +72,8 @@ async fn ext() -> Ext {
     g.create_release(&ra).await.unwrap();
     g.create_release(&rb).await.unwrap();
 
-    let pa = crate::protocol::Protocol::new(w.a, "Protocole de revue", Uuid::new_v4());
-    let pb = crate::protocol::Protocol::new(w.b, "Protocole de facturation", Uuid::new_v4());
+    let pa = crate::protocol::Protocol::new(Some(w.a), "Protocole de revue", Uuid::new_v4());
+    let pb = crate::protocol::Protocol::new(Some(w.b), "Protocole de facturation", Uuid::new_v4());
     g.upsert_protocol(&pa).await.unwrap();
     g.upsert_protocol(&pb).await.unwrap();
 

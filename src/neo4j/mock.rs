@@ -12153,10 +12153,18 @@ impl GraphStore for MockGraphStore {
     async fn upsert_protocol(&self, protocol: &crate::protocol::Protocol) -> anyhow::Result<()> {
         // Validate project exists
         let projects = self.projects.read().await;
-        if !projects.is_empty() && !projects.contains_key(&protocol.project_id) {
+        // A transverse protocol has no project, by design: nothing to validate.
+        if !projects.is_empty()
+            && protocol
+                .project_id
+                .is_some_and(|pid| !projects.contains_key(&pid))
+        {
             anyhow::bail!(
                 "Project not found: {}. Cannot create protocol in non-existent project.",
-                protocol.project_id
+                protocol
+                    .project_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default()
             );
         }
         drop(projects);
@@ -12182,7 +12190,7 @@ impl GraphStore for MockGraphStore {
         let mut filtered: Vec<_> = store
             .values()
             .filter(|p| {
-                p.project_id == project_id
+                p.project_id == Some(project_id)
                     && category.as_ref().is_none_or(|c| p.protocol_category == *c)
             })
             .cloned()
@@ -12241,7 +12249,7 @@ impl GraphStore for MockGraphStore {
     ) -> anyhow::Result<Option<Uuid>> {
         let store = self.protocols.read().await;
         for proto in store.values() {
-            if proto.name == name && proto.project_id == project_id {
+            if proto.name == name && proto.project_id == Some(project_id) {
                 return Ok(Some(proto.id));
             }
         }
@@ -12372,7 +12380,7 @@ impl GraphStore for MockGraphStore {
             .filter(|r| match scope {
                 Some(ref s) => protocols
                     .get(&r.protocol_id)
-                    .is_some_and(|p| s.contains(&p.project_id)),
+                    .is_some_and(|p| p.project_id.is_some_and(|pid| s.contains(&pid))),
                 None => true,
             })
             .cloned()

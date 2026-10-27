@@ -668,7 +668,7 @@ mod tests {
         let start = ProtocolState::start(protocol_id, "Start");
         let done = ProtocolState::terminal(protocol_id, "Done");
         let mut protocol = Protocol::new_full(
-            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
             "triggered",
             "started by an EventTrigger",
             start.id,

@@ -249,7 +249,7 @@ pub struct ValidateProtocolsQuery {
 pub struct ProtocolValidationResult {
     pub protocol_id: Uuid,
     pub protocol_name: String,
-    pub project_id: Uuid,
+    pub project_id: Option<Uuid>,
     pub violations: Vec<crate::protocol::ProtocolViolation>,
 }
 
@@ -495,7 +495,7 @@ pub async fn create_protocol(
 
     // Create protocol — placeholder entry_state, will be updated if inline states are provided
     let placeholder_entry = Uuid::new_v4();
-    let mut protocol = Protocol::new(body.project_id, &body.name, placeholder_entry);
+    let mut protocol = Protocol::new(Some(body.project_id), &body.name, placeholder_entry);
     protocol.description = body.description.unwrap_or_default();
     protocol.skill_id = body.skill_id;
     protocol.protocol_category = category;
@@ -629,7 +629,7 @@ pub async fn create_protocol(
             "states_count": created_states.len(),
             "transitions_count": created_transitions.len(),
         }),
-        Some(protocol.project_id.to_string()),
+        protocol.project_id.map(|id| id.to_string()),
     );
 
     Ok((
@@ -751,7 +751,7 @@ pub async fn update_protocol(
             "name": protocol.name,
             "project_id": protocol.project_id,
         }),
-        Some(protocol.project_id.to_string()),
+        protocol.project_id.map(|id| id.to_string()),
     );
 
     Ok(Json(protocol))
@@ -1101,7 +1101,7 @@ pub async fn link_to_skill(
         &protocol_id.to_string(),
         crate::events::EntityType::Skill,
         &body.skill_id.to_string(),
-        Some(protocol.project_id.to_string()),
+        protocol.project_id.map(|id| id.to_string()),
     );
 
     Ok(Json(protocol))
@@ -1815,7 +1815,7 @@ pub async fn compose_protocol(
 
     // ── 2. Create Protocol ──────────────────────────────────────────
     let placeholder_entry = Uuid::new_v4();
-    let mut proto = Protocol::new(body.project_id, &body.name, placeholder_entry);
+    let mut proto = Protocol::new(Some(body.project_id), &body.name, placeholder_entry);
     proto.description = body.description.unwrap_or_default();
     proto.protocol_category = category;
     proto.skill_id = Some(skill_id);
@@ -1939,7 +1939,7 @@ pub async fn compose_protocol(
             "notes_linked": notes_linked,
             "composed": true,
         }),
-        Some(proto.project_id.to_string()),
+        proto.project_id.map(|id| id.to_string()),
     );
 
     Ok((
@@ -2085,7 +2085,7 @@ pub async fn validate_all_protocols(
     let neo4j = state.orchestrator.neo4j();
 
     // Collect all protocols to validate
-    let protocols_to_validate: Vec<(Uuid, String, Uuid)> =
+    let protocols_to_validate: Vec<(Uuid, String, Option<Uuid>)> =
         if let Some(project_id) = query.project_id {
             // Single project
             let (protocols, _) = neo4j
@@ -2403,7 +2403,7 @@ mod tests {
         let start_id = Uuid::new_v4();
         let mid_id = Uuid::new_v4();
         let end_id = Uuid::new_v4();
-        let proto = crate::protocol::Protocol::new(project_id, "existing-proto", start_id);
+        let proto = crate::protocol::Protocol::new(Some(project_id), "existing-proto", start_id);
         let proto_id = proto.id;
         mock.protocols.write().await.insert(proto_id, proto);
 
@@ -2845,7 +2845,7 @@ mod tests {
     async fn update_protocol_refuses_an_unknown_schedule_and_keeps_the_stored_one() {
         let graph = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let project_id = Uuid::new_v4();
-        let mut p = Protocol::new(project_id, "nightly", Uuid::new_v4());
+        let mut p = Protocol::new(Some(project_id), "nightly", Uuid::new_v4());
         p.trigger_config = Some(crate::protocol::TriggerConfig {
             schedule: Some("daily".to_string()),
             ..Default::default()
@@ -3038,7 +3038,7 @@ mod tests {
         let orphan_id = Uuid::new_v4();
 
         // Create a protocol with an unreachable state directly in the store
-        let mut protocol = Protocol::new(project_id, "invalid-proto", start_id);
+        let mut protocol = Protocol::new(Some(project_id), "invalid-proto", start_id);
         protocol.description = "Protocol with unreachable state".to_string();
         protocol.terminal_states = vec![done_id];
         let protocol_id = protocol.id;
@@ -3153,7 +3153,7 @@ mod tests {
         let done_id = Uuid::new_v4();
 
         // Create a valid protocol
-        let mut protocol = Protocol::new(project_id, "valid-proto", start_id);
+        let mut protocol = Protocol::new(Some(project_id), "valid-proto", start_id);
         protocol.description = "Valid protocol".to_string();
         protocol.terminal_states = vec![done_id];
         let protocol_id = protocol.id;

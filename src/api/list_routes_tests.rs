@@ -64,12 +64,12 @@ async fn seed_workspace(g: &MockGraphStore, slug: &str) -> (Uuid, Uuid, Uuid, Uu
     g.create_decision(task.id, &accepted).await.unwrap();
 
     // protocol with one running and one completed run
-    let proto = Protocol::new(project.id, format!("proto-{slug}"), Uuid::new_v4());
+    let proto = Protocol::new(Some(project.id), format!("proto-{slug}"), Uuid::new_v4());
     g.upsert_protocol(&proto).await.unwrap();
     let running = ProtocolRun::new(proto.id, proto.entry_state, "start");
     g.create_protocol_run(&running).await.unwrap();
     // (the store allows one running run per protocol: use a second protocol)
-    let proto2 = Protocol::new(project.id, format!("proto2-{slug}"), Uuid::new_v4());
+    let proto2 = Protocol::new(Some(project.id), format!("proto2-{slug}"), Uuid::new_v4());
     g.upsert_protocol(&proto2).await.unwrap();
     let mut done = ProtocolRun::new(proto2.id, proto2.entry_state, "start");
     done.status = RunStatus::Completed;

@@ -315,7 +315,7 @@ pub fn protocol(graph: Arc<dyn GraphStore>) -> Box<dyn KindResolver> {
 
 impl ProtocolResolver {
     async fn meta(&self, p: &Protocol, memo: &mut Memo) -> anyhow::Result<RefMeta> {
-        let (project, workspace) = scope_of(self.graph.as_ref(), memo, Some(p.project_id)).await?;
+        let (project, workspace) = scope_of(self.graph.as_ref(), memo, p.project_id).await?;
         Ok(RefMeta {
             kind: RefKind::Protocol,
             id: p.id.into(),

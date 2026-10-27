@@ -289,7 +289,7 @@ async fn find_or_create_rfc_lifecycle(
 
     // -- Create protocol node --
     let protocol = Protocol::new_full(
-        project_id,
+        Some(project_id),
         "rfc-lifecycle",
         "RFC lifecycle FSM — auto-bootstrapped. 9 states, 16 transitions.",
         s_draft.id,

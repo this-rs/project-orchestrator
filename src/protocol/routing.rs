@@ -689,7 +689,7 @@ mod tests {
         let project_id = uuid::Uuid::new_v4();
 
         // Protocol A: perfect match
-        let mut proto_a = Protocol::new(project_id, "Wave Execution", uuid::Uuid::new_v4());
+        let mut proto_a = Protocol::new(Some(project_id), "Wave Execution", uuid::Uuid::new_v4());
         proto_a.relevance_vector = Some(RelevanceVector {
             phase: 0.5,
             structure: 0.8,
@@ -699,7 +699,7 @@ mod tests {
         });
 
         // Protocol B: partial match
-        let mut proto_b = Protocol::new(project_id, "Code Review", uuid::Uuid::new_v4());
+        let mut proto_b = Protocol::new(Some(project_id), "Code Review", uuid::Uuid::new_v4());
         proto_b.relevance_vector = Some(RelevanceVector {
             phase: 0.75,
             structure: 0.3,
@@ -709,7 +709,7 @@ mod tests {
         });
 
         // Protocol C: no relevance vector (defaults to neutral)
-        let proto_c = Protocol::new(project_id, "Generic", uuid::Uuid::new_v4());
+        let proto_c = Protocol::new(Some(project_id), "Generic", uuid::Uuid::new_v4());
 
         let weights = DimensionWeights::default();
         let response = rank_protocols(

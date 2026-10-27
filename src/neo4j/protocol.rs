@@ -30,7 +30,13 @@ impl Neo4jClient {
             id: node.get::<String>("id")?.parse()?,
             name: node.get("name")?,
             description: node.get("description").unwrap_or_default(),
-            project_id: node.get::<String>("project_id")?.parse()?,
+            project_id: node.get::<String>("project_id").ok().and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    s.parse().ok()
+                }
+            }),
             skill_id: node
                 .get::<String>("skill_id")
                 .ok()
@@ -192,7 +198,7 @@ impl Neo4jClient {
             "#,
         )
         .param("id", protocol.id.to_string())
-        .param("project_id", protocol.project_id.to_string())
+        .param("project_id", protocol.project_id.map(|id| id.to_string()))
         .param("name", protocol.name.clone())
         .param("description", protocol.description.clone())
         .param(
@@ -671,6 +677,13 @@ impl Neo4jClient {
         Ok(ProtocolRun {
             id: node.get::<String>("id")?.parse()?,
             protocol_id: node.get::<String>("protocol_id")?.parse()?,
+            project_id: node.get::<String>("project_id").ok().and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    s.parse().ok()
+                }
+            }),
             plan_id: node
                 .get::<String>("plan_id")
                 .ok()
@@ -733,6 +746,7 @@ impl Neo4jClient {
             CREATE (r:ProtocolRun {
                 id: $id,
                 protocol_id: $protocol_id,
+                project_id: $project_id,
                 plan_id: $plan_id,
                 task_id: $task_id,
                 parent_run_id: $parent_run_id,
@@ -753,6 +767,7 @@ impl Neo4jClient {
         )
         .param("id", run.id.to_string())
         .param("protocol_id", run.protocol_id.to_string())
+        .param("project_id", run.project_id.map(|u| u.to_string()))
         .param(
             "plan_id",
             run.plan_id.map(|u| u.to_string()).unwrap_or_default(),
@@ -1401,7 +1416,9 @@ impl Neo4jClient {
     pub async fn find_active_run_for_project(&self, project_id: Uuid) -> Result<Option<Uuid>> {
         let q = query(
             r#"
-            MATCH (r:ProtocolRun {status: 'running'})-[:INSTANCE_OF]->(p:Protocol {project_id: $project_id})
+            MATCH (r:ProtocolRun {status: 'running'})-[:INSTANCE_OF]->(p:Protocol)
+            WHERE r.project_id = $project_id
+               OR (r.project_id IS NULL AND p.project_id = $project_id)
             RETURN r.id AS run_id
             ORDER BY r.started_at DESC
             LIMIT 1
@@ -1448,7 +1465,9 @@ impl Neo4jClient {
     ) -> Result<Vec<ProtocolRun>> {
         let q = query(
             r#"
-            MATCH (r:ProtocolRun {status: 'completed'})-[:INSTANCE_OF]->(p:Protocol {project_id: $project_id})
+            MATCH (r:ProtocolRun {status: 'completed'})-[:INSTANCE_OF]->(p:Protocol)
+            WHERE r.project_id = $project_id
+               OR (r.project_id IS NULL AND p.project_id = $project_id)
             RETURN r
             ORDER BY r.completed_at DESC
             LIMIT $limit
@@ -1480,7 +1499,8 @@ impl Neo4jClient {
             &r#"
             MATCH (r:ProtocolRun {status: 'completed'})
             MATCH (p:Protocol {id: r.protocol_id})
-            WHERE p.project_id = $project_id
+            WHERE (r.project_id = $project_id
+                   OR (r.project_id IS NULL AND p.project_id = $project_id))
               AND r.completed_at IS NOT NULL
 
             // Find notes created during the run window

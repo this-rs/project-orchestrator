@@ -307,7 +307,7 @@ pub mod conformance {
         let blockers = store.get_task_blockers(t1.id).await.unwrap();
         assert_eq!(ids(&blockers, |t| t.id), vec![t2.id]);
 
-        let proto = Protocol::new(p.id, "merge protocol", Uuid::new_v4());
+        let proto = Protocol::new(Some(p.id), "merge protocol", Uuid::new_v4());
         store.upsert_protocol(&proto).await.unwrap();
         store.upsert_protocol(&proto).await.unwrap();
         let (_, total) = store.list_protocols(p.id, None, 10, 0).await.unwrap();
@@ -330,7 +330,7 @@ pub mod conformance {
     pub async fn check_cas_protocol_run(store: &dyn GraphStore) {
         let p = a_project("cas");
         store.create_project(&p).await.unwrap();
-        let proto = Protocol::new(p.id, "cas protocol", Uuid::new_v4());
+        let proto = Protocol::new(Some(p.id), "cas protocol", Uuid::new_v4());
         store.upsert_protocol(&proto).await.unwrap();
 
         let root = a_run(&proto, None, at(0));
@@ -390,7 +390,7 @@ pub mod conformance {
     pub async fn check_concurrent_create_protocol_run(store: &dyn GraphStore) {
         let p = a_project("cas-race");
         store.create_project(&p).await.unwrap();
-        let racing = Protocol::new(p.id, "cas race", Uuid::new_v4());
+        let racing = Protocol::new(Some(p.id), "cas race", Uuid::new_v4());
         store.upsert_protocol(&racing).await.unwrap();
         let runs: Vec<ProtocolRun> = (0..8).map(|i| a_run(&racing, None, at(10 + i))).collect();
         let outcomes = join_all(runs.iter().map(|r| store.create_protocol_run(r))).await;
@@ -1240,7 +1240,7 @@ pub mod conformance {
             "an absent confirmer reads as empty"
         );
 
-        let proto = Protocol::new(p.id, "null protocol", Uuid::new_v4());
+        let proto = Protocol::new(Some(p.id), "null protocol", Uuid::new_v4());
         store.upsert_protocol(&proto).await.unwrap();
         let run = a_run(&proto, None, created);
         store.create_protocol_run(&run).await.unwrap();
@@ -1270,7 +1270,7 @@ pub mod conformance {
     pub async fn check_traversal_run_tree(store: &dyn GraphStore) {
         let p = a_project("traversal");
         store.create_project(&p).await.unwrap();
-        let proto = Protocol::new(p.id, "traversal protocol", Uuid::new_v4());
+        let proto = Protocol::new(Some(p.id), "traversal protocol", Uuid::new_v4());
         store.upsert_protocol(&proto).await.unwrap();
 
         let root = a_run(&proto, None, at(0));

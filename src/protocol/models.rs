@@ -377,8 +377,9 @@ pub struct Protocol {
     /// Description of the protocol's purpose and behavior
     #[serde(default)]
     pub description: String,
-    /// Project this protocol belongs to
-    pub project_id: Uuid,
+    /// Owning project. `None` means the protocol is transverse: it belongs to
+    /// the instance and is usable from every project.
+    pub project_id: Option<Uuid>,
     /// Optional link to a Neural Skill (for context injection)
     pub skill_id: Option<Uuid>,
     /// ID of the entry state (must be a StateType::Start state)
@@ -406,7 +407,7 @@ pub struct Protocol {
 
 impl Protocol {
     /// Create a new Business protocol with minimal fields.
-    pub fn new(project_id: Uuid, name: impl Into<String>, entry_state: Uuid) -> Self {
+    pub fn new(project_id: Option<Uuid>, name: impl Into<String>, entry_state: Uuid) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
@@ -428,7 +429,7 @@ impl Protocol {
 
     /// Create a new protocol with full configuration.
     pub fn new_full(
-        project_id: Uuid,
+        project_id: Option<Uuid>,
         name: impl Into<String>,
         description: impl Into<String>,
         entry_state: Uuid,
@@ -720,6 +721,11 @@ pub struct ProtocolRun {
     pub id: Uuid,
     /// The protocol being executed
     pub protocol_id: Uuid,
+    /// The project this run was started in. `None` when the run has no project
+    /// context. A transverse protocol can run from any project, so a run cannot
+    /// inherit its project from the protocol — it carries its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
     /// Optional plan context (e.g., wave-execution runs against a plan)
     pub plan_id: Option<Uuid>,
     /// Optional task context
@@ -774,6 +780,7 @@ impl ProtocolRun {
         Self {
             id: Uuid::new_v4(),
             protocol_id,
+            project_id: None,
             plan_id: None,
             task_id: None,
             current_state: entry_state_id,
@@ -1051,8 +1058,8 @@ pub struct FireTransitionRequest {
 /// Request to create a new protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateProtocolRequest {
-    /// Project this protocol belongs to
-    pub project_id: Uuid,
+    /// Owning project. `None` creates a transverse protocol (instance level).
+    pub project_id: Option<Uuid>,
     /// Human-readable name
     pub name: String,
     /// Description of the protocol's purpose
@@ -1222,9 +1229,9 @@ mod tests {
     fn test_protocol_new() {
         let project_id = Uuid::new_v4();
         let entry_state = Uuid::new_v4();
-        let protocol = Protocol::new(project_id, "Code Review", entry_state);
+        let protocol = Protocol::new(Some(project_id), "Code Review", entry_state);
 
-        assert_eq!(protocol.project_id, project_id);
+        assert_eq!(protocol.project_id, Some(project_id));
         assert_eq!(protocol.name, "Code Review");
         assert_eq!(protocol.entry_state, entry_state);
         assert_eq!(protocol.protocol_category, ProtocolCategory::Business);
@@ -1243,7 +1250,7 @@ mod tests {
         let term2 = Uuid::new_v4();
 
         let protocol = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "Deployment",
             "Automated deployment protocol",
             entry_state,
@@ -1259,7 +1266,7 @@ mod tests {
 
     #[test]
     fn test_protocol_has_skill() {
-        let mut protocol = Protocol::new(Uuid::new_v4(), "test", Uuid::new_v4());
+        let mut protocol = Protocol::new(Some(Uuid::new_v4()), "test", Uuid::new_v4());
         assert!(!protocol.has_skill());
 
         protocol.skill_id = Some(Uuid::new_v4());
@@ -1271,7 +1278,7 @@ mod tests {
         let project_id = Uuid::new_v4();
         let entry_state = Uuid::new_v4();
         let mut protocol = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "Bug Triage",
             "Automated bug triage workflow",
             entry_state,
@@ -1284,7 +1291,7 @@ mod tests {
         let deserialized: Protocol = serde_json::from_str(&json).unwrap();
 
         assert_eq!(deserialized.id, protocol.id);
-        assert_eq!(deserialized.project_id, project_id);
+        assert_eq!(deserialized.project_id, Some(project_id));
         assert_eq!(deserialized.name, "Bug Triage");
         assert_eq!(deserialized.protocol_category, ProtocolCategory::Business);
         assert_eq!(deserialized.skill_id, protocol.skill_id);

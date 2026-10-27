@@ -110,7 +110,7 @@ mod tests {
 
         // Build protocol
         let mut protocol = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "auto-maintenance",
             "Auto-maintenance protocol for knowledge graph health",
             health_check.id,
@@ -191,7 +191,7 @@ mod tests {
         let done = ProtocolState::terminal(protocol_id, "done");
 
         let mut protocol = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "simple-protocol",
             "A simple test protocol",
             start.id,
@@ -743,7 +743,7 @@ mod tests {
         let done = ProtocolState::terminal(protocol_id, "done");
 
         let mut protocol = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "needs-human",
             "Protocol that needs human input at one point",
             start.id,

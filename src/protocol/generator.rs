@@ -183,7 +183,7 @@ mod tests {
         let done = ProtocolState::terminal(protocol_id, "Done");
 
         let mut protocol = Protocol::new_full(
-            project_id,
+            Some(project_id),
             "Generator Protocol",
             "Test generator",
             start.id,

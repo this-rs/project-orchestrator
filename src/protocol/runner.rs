@@ -160,7 +160,7 @@ pub async fn run_protocol(
             "executing",
             None,
             None,
-            protocol.project_id,
+            run.project_id,
         );
 
         // Determine timeout
@@ -283,7 +283,7 @@ pub async fn run_protocol(
                     run_id,
                     &transition_result.current_state_name,
                     transition_result.status,
-                    protocol.project_id,
+                    run.project_id,
                 );
             }
             Err(e) => {
@@ -340,7 +340,7 @@ fn emit_progress_event(
     sub_action: &str,
     processed: Option<u64>,
     total: Option<u64>,
-    project_id: Uuid,
+    project_id: Option<Uuid>,
 ) {
     let mut payload = serde_json::json!({
         "current_state": state_name,
@@ -359,7 +359,7 @@ fn emit_progress_event(
         related: None,
         payload,
         timestamp: chrono::Utc::now().to_rfc3339(),
-        project_id: Some(project_id.to_string()),
+        project_id: project_id.map(|id| id.to_string()),
     });
 }
 
@@ -369,7 +369,7 @@ fn emit_transition_event(
     run_id: Uuid,
     state_name: &str,
     status: RunStatus,
-    project_id: Uuid,
+    project_id: Option<Uuid>,
 ) {
     let action = match status {
         RunStatus::Completed => CrudAction::StatusChanged,
@@ -388,7 +388,7 @@ fn emit_transition_event(
             "status": status.to_string(),
         }),
         timestamp: chrono::Utc::now().to_rfc3339(),
-        project_id: Some(project_id.to_string()),
+        project_id: project_id.map(|id| id.to_string()),
     });
 }
 
@@ -419,7 +419,7 @@ mod tests {
             "executing",
             None,
             None,
-            project_id,
+            Some(project_id),
         );
     }
 
@@ -437,7 +437,7 @@ mod tests {
             "processing",
             Some(5),
             Some(10),
-            project_id,
+            Some(project_id),
         );
     }
 
@@ -450,7 +450,7 @@ mod tests {
         let project_id = Uuid::new_v4();
 
         // Completed status should map to StatusChanged action
-        emit_transition_event(&bus, run_id, "done", RunStatus::Completed, project_id);
+        emit_transition_event(&bus, run_id, "done", RunStatus::Completed, Some(project_id));
     }
 
     #[test]
@@ -460,7 +460,13 @@ mod tests {
         let project_id = Uuid::new_v4();
 
         // Running status should map to Updated action
-        emit_transition_event(&bus, run_id, "processing", RunStatus::Running, project_id);
+        emit_transition_event(
+            &bus,
+            run_id,
+            "processing",
+            RunStatus::Running,
+            Some(project_id),
+        );
     }
 
     // ── fail_run_with_error tests ──
@@ -486,7 +492,7 @@ mod tests {
         store.create_project(&project).await.unwrap();
 
         let state_id = Uuid::new_v4();
-        let mut protocol = Protocol::new(project_id, "test-protocol", state_id);
+        let mut protocol = Protocol::new(Some(project_id), "test-protocol", state_id);
         protocol.protocol_category = ProtocolCategory::System;
         store.upsert_protocol(&protocol).await.unwrap();
 
