@@ -1296,6 +1296,10 @@ fn protected_routes() -> Router<OrchestratorState> {
                 .patch(note_handlers::update_note)
                 .delete(note_handlers::delete_note),
         )
+        .route(
+            "/api/notes/{note_id}/scope",
+            axum::routing::post(note_handlers::rescope_note),
+        )
         // Notes search
         .route("/api/notes/search", get(note_handlers::search_notes))
         .route(

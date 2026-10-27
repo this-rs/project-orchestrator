@@ -318,6 +318,31 @@ impl Neo4jClient {
     }
 
     /// Delete a note
+    /// Move a note between the global level and a project, updating BOTH
+    /// representations. See `GraphStore::rescope_note` for why both matter.
+    pub async fn rescope_note(&self, note_id: Uuid, project_id: Option<Uuid>) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (n:Note {id: $id})
+            OPTIONAL MATCH (:Project)-[old:HAS_NOTE]->(n)
+            DELETE old
+            WITH n
+            OPTIONAL MATCH (p:Project {id: $project_id})
+            FOREACH (_ IN CASE WHEN p IS NULL THEN [] ELSE [1] END |
+                MERGE (p)-[:HAS_NOTE]->(n)
+            )
+            SET n.project_id = $project_id
+            RETURN n.id AS id
+            "#,
+        )
+        .param("id", note_id.to_string())
+        .param("project_id", project_id.map(|p| p.to_string()));
+
+        let mut result = self.graph.execute(q).await?;
+        result.next().await?;
+        Ok(())
+    }
+
     pub async fn delete_note(&self, id: Uuid) -> Result<bool> {
         let q = query(
             r#"

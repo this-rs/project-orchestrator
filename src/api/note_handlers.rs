@@ -1718,6 +1718,37 @@ pub struct ApplyFeedbackRfcBody {
 // Tests
 // ============================================================================
 
+/// Body of `POST /api/notes/{note_id}/scope`.
+#[derive(Debug, Deserialize)]
+pub struct RescopeNoteBody {
+    /// `null` (or omitted) makes the note global; a uuid gives it that project.
+    pub project_id: Option<Uuid>,
+}
+
+/// Move a note between the global level and a project.
+///
+/// Writes both representations of a note's project — the property every read
+/// filters on, and the `HAS_NOTE` edge `project.delete` follows. Doing only one
+/// of them produces a note that looks attached but that the old project reclaims
+/// on deletion, silently.
+pub async fn rescope_note(
+    State(state): State<OrchestratorState>,
+    Path(note_id): Path<Uuid>,
+    Json(body): Json<RescopeNoteBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state
+        .orchestrator
+        .neo4j()
+        .rescope_note(note_id, body.project_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "note_id": note_id,
+        "project_id": body.project_id,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::api::handlers::ServerState;
@@ -1815,6 +1846,51 @@ mod tests {
     }
 
     /// Parse response body as JSON
+    /// A note's project lives in two places: the property every read filters on,
+    /// and the `HAS_NOTE` edge `project.delete` follows. This endpoint moves
+    /// both, so a note taken from a project is not reclaimed by it later.
+    #[tokio::test]
+    async fn rescoping_a_note_moves_it_between_the_global_level_and_a_project() {
+        let project_id = uuid::Uuid::new_v4();
+        let (app, notes) = test_app_with_notes(&[None]).await;
+        let note_id = notes[0];
+
+        let resp = app
+            .clone()
+            .oneshot(auth_post(
+                &format!("/api/notes/{}/scope", note_id),
+                serde_json::json!({ "project_id": project_id }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "attach failed: {}",
+            resp.status()
+        );
+        assert_eq!(
+            body_json(resp).await["project_id"],
+            serde_json::json!(project_id)
+        );
+
+        let resp = app
+            .oneshot(auth_post(
+                &format!("/api/notes/{}/scope", note_id),
+                serde_json::json!({ "project_id": null }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "detach failed: {}",
+            resp.status()
+        );
+        assert!(
+            body_json(resp).await["project_id"].is_null(),
+            "null must make the note global again"
+        );
+    }
+
     async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await

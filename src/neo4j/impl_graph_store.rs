@@ -2006,6 +2006,10 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
+    async fn rescope_note(&self, note_id: Uuid, project_id: Option<Uuid>) -> anyhow::Result<()> {
+        self.rescope_note(note_id, project_id).await
+    }
+
     async fn delete_note(&self, id: Uuid) -> anyhow::Result<bool> {
         self.delete_note(id).await
     }
