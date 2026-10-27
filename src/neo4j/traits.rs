@@ -3135,6 +3135,42 @@ pub trait GraphStore: Send + Sync {
     /// Match skills by evaluating trigger patterns against an input string.
     /// Returns matching skills with their confidence scores, sorted descending.
     /// Only matches Active/Emerging skills with reliable triggers.
+    /// Rank the competences that answer `query`, transverse library included.
+    ///
+    /// Default implementation, composed from two methods every store already
+    /// has — `list_skills` for the candidates, `match_skills_by_trigger` for the
+    /// trigger channel — and fused by [`crate::skills::activation::rank_skills`].
+    ///
+    /// Deliberately not implemented per store: the ordering is the whole
+    /// contract, so there is exactly one implementation, and the in-memory mock
+    /// exercises the very code the Neo4j path runs.
+    ///
+    /// `project_id` follows the listing convention: `None` ranks the transverse
+    /// library alone, `Some(pid)` ranks that project's competences **and** the
+    /// transverse ones.
+    async fn search_skills(
+        &self,
+        project_id: Option<Uuid>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::skills::activation::SkillMatch>> {
+        let (candidates, _) = self
+            .list_skills(
+                project_id,
+                Some(crate::skills::models::SkillStatus::Active),
+                500,
+                0,
+            )
+            .await?;
+        let triggered = self.match_skills_by_trigger(project_id, query).await?;
+        Ok(crate::skills::activation::rank_skills(
+            &candidates,
+            &triggered,
+            &std::collections::HashMap::new(),
+            limit,
+        ))
+    }
+
     async fn match_skills_by_trigger(
         &self,
         project_id: Option<Uuid>,

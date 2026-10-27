@@ -445,6 +445,7 @@ pub(crate) const ACTION_CLASSES: &[(&str, &[&str], &[&str])] = &[
         "skill",
         &[
             "list",
+            "search",
             "get",
             "get_members",
             "get_health",
@@ -699,6 +700,7 @@ const READ_ONLY_POST_ROUTES: &[(&str, &str, &str)] = &[
     ),
     ("/api/code/find-bridges", "code", "find_bridges"),
     ("/api/reason", "reasoning", "reason"),
+    ("/api/skills/search", "skill", "search"),
     ("/api/skills/*/activate", "skill", "activate"),
     ("/api/personas/*/activate", "persona", "activate"),
     (

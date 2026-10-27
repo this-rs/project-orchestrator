@@ -1424,6 +1424,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(skill_handlers::list_skills).post(skill_handlers::create_skill),
         )
         .route(
+            "/api/skills/search",
+            axum::routing::post(skill_handlers::search_skills),
+        )
+        .route(
             "/api/skills/{skill_id}",
             get(skill_handlers::get_skill)
                 .put(skill_handlers::update_skill)

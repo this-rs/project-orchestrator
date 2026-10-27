@@ -299,6 +299,7 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
 
         // Skill
         "list_skills" => Some(("skill", "list")),
+        "search_skills" => Some(("skill", "search")),
         "create_skill" => Some(("skill", "create")),
         "get_skill" => Some(("skill", "get")),
         "update_skill" => Some(("skill", "update")),
@@ -1227,7 +1228,7 @@ fn skill_tool() -> ToolDefinition {
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "delete", "get_members", "add_member", "remove_member", "activate", "export", "import", "get_health", "split", "merge"],
+                    "enum": ["list", "search", "create", "get", "update", "delete", "get_members", "add_member", "remove_member", "activate", "export", "import", "get_health", "split", "merge"],
                     "description": "Operation to perform"
                 },
                 "skill_id": {"type": "string", "description": "Skill UUID (get/update/delete/get_members/add_member/remove_member/activate/export)"},
