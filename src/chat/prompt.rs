@@ -1119,6 +1119,7 @@ Manage neural skills (emergent knowledge clusters).
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
 | list | `project_id` (req), `limit`, `offset` | List skills |
+| search | `query` (req), `project_id`, `limit` | Rank the skills that answer a query (project + transverse) |
 | create | `project_id` (req), `name` (req), `description`, `tags`, `trigger_patterns`, `context_template` | Create skill |
 | get | `skill_id` (req) | Get skill by UUID |
 | update | `skill_id` (req), `name`, `description`, `status` (emerging/active/dormant/archived/imported), `tags`, `trigger_patterns`, `context_template`, `energy` (0-1), `cohesion` (0-1) | Update skill |

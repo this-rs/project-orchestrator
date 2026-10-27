@@ -1715,6 +1715,170 @@ pub async fn reconstruct_knowledge_links(
 // Tests
 // ============================================================================
 
+// ---------------------------------------------------------------------------
+// Classement pour `skill search`
+// ---------------------------------------------------------------------------
+
+/// One ranked competence, with the channels that produced its score.
+///
+/// The per-channel values are exposed so a caller (or a log) can explain *why*
+/// a competence came first, instead of showing an opaque number.
+#[derive(Debug, Clone)]
+pub struct SkillMatch {
+    pub skill: SkillNode,
+    /// Fused score.
+    pub score: f64,
+    /// Trigger channel alone.
+    pub trigger_score: f64,
+    /// Semantic channel alone: `0.0` when the caller supplied no embedding.
+    pub semantic_score: f64,
+}
+
+/// Weights of the fused score. They sum to 1.0 so `score` stays comparable
+/// between calls; changing one is a deliberate act, hence named constants.
+const W_TRIGGER: f64 = 0.45;
+const W_SEMANTIC: f64 = 0.30;
+const W_ENERGY: f64 = 0.10;
+const W_COHESION: f64 = 0.05;
+const W_HIT_RATE: f64 = 0.10;
+
+/// Fuse the channels into one ordering.
+///
+/// `triggered` is the trigger channel (`match_skills_by_trigger`). `semantic` is
+/// the cosine similarity per skill id, passed rather than fetched: the store
+/// layer has no embedding provider today, and a hard dependency there would make
+/// the whole ranking untestable.
+///
+/// A competence that no channel scores is **still returned**. The ordering is the
+/// answer, not a filter: silently dropping a competence that nothing matched
+/// would make it look non-existent, which is the failure mode this whole feature
+/// exists to remove.
+pub fn rank_skills(
+    candidates: &[SkillNode],
+    triggered: &[(SkillNode, f64)],
+    semantic: &std::collections::HashMap<Uuid, f64>,
+    limit: usize,
+) -> Vec<SkillMatch> {
+    let trigger_of: std::collections::HashMap<Uuid, f64> = triggered
+        .iter()
+        .map(|(skill, score)| (skill.id, *score))
+        .collect();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut ranked = Vec::new();
+    for skill in candidates
+        .iter()
+        .chain(triggered.iter().map(|(skill, _)| skill))
+    {
+        if !seen.insert(skill.id) {
+            continue;
+        }
+        let trigger_score = trigger_of.get(&skill.id).copied().unwrap_or(0.0);
+        let semantic_score = semantic.get(&skill.id).copied().unwrap_or(0.0);
+        let score = W_TRIGGER * trigger_score.clamp(0.0, 1.0)
+            + W_SEMANTIC * semantic_score.clamp(0.0, 1.0)
+            + W_ENERGY * skill.energy.clamp(0.0, 1.0)
+            + W_COHESION * skill.cohesion.clamp(0.0, 1.0)
+            + W_HIT_RATE * skill.hit_rate.clamp(0.0, 1.0);
+        ranked.push(SkillMatch {
+            skill: skill.clone(),
+            score,
+            trigger_score,
+            semantic_score,
+        });
+    }
+
+    // Score first, then name, then id: two competences that tie must not swap
+    // places depending on how the collection was built.
+    ranked.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.skill.name.cmp(&b.skill.name))
+            .then_with(|| a.skill.id.cmp(&b.skill.id))
+    });
+    ranked.truncate(limit);
+    ranked
+}
+
+#[cfg(test)]
+mod rank_tests {
+    use super::*;
+    use crate::skills::{SkillNode, SkillStatus};
+
+    fn skill(name: &str, project_id: Option<Uuid>) -> SkillNode {
+        let mut skill = SkillNode::new(project_id, name);
+        skill.status = SkillStatus::Active;
+        skill.energy = 0.0;
+        skill.cohesion = 0.0;
+        skill.hit_rate = 0.0;
+        skill
+    }
+
+    #[test]
+    fn the_trigger_channel_outranks_a_cold_competence() {
+        let cold = skill("cold", None);
+        let hit = skill("hit", None);
+        let triggered = vec![(hit.clone(), 0.9)];
+        let ranked = rank_skills(
+            &[cold, hit],
+            &triggered,
+            &std::collections::HashMap::new(),
+            10,
+        );
+        assert_eq!(ranked[0].skill.name, "hit");
+        assert!(ranked[0].score > ranked[1].score);
+        assert_eq!(ranked[1].trigger_score, 0.0);
+    }
+
+    #[test]
+    fn a_semantic_signal_can_overtake_a_weaker_trigger() {
+        let weak = skill("weak-trigger", None);
+        let strong = skill("strong-semantic", None);
+        let triggered = vec![(weak.clone(), 0.2)];
+        let mut semantic = std::collections::HashMap::new();
+        semantic.insert(strong.id, 1.0);
+        let ranked = rank_skills(&[weak, strong], &triggered, &semantic, 10);
+        assert_eq!(ranked[0].skill.name, "strong-semantic");
+    }
+
+    #[test]
+    fn a_competence_no_channel_scores_is_still_returned() {
+        // Dropping it would make it look non-existent — the failure this
+        // feature exists to remove.
+        let unmatched = skill("unmatched", None);
+        let ranked = rank_skills(&[unmatched], &[], &std::collections::HashMap::new(), 10);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].score, 0.0);
+    }
+
+    #[test]
+    fn a_triggered_competence_absent_from_the_candidates_is_ranked() {
+        let only_triggered = skill("transverse", None);
+        let ranked = rank_skills(
+            &[],
+            &[(only_triggered, 0.5)],
+            &std::collections::HashMap::new(),
+            10,
+        );
+        assert_eq!(ranked.len(), 1, "the transverse library must not be lost");
+    }
+
+    #[test]
+    fn ties_are_broken_by_name_then_id_not_by_insertion_order() {
+        let a = skill("alpha", None);
+        let b = skill("beta", None);
+        let ranked = rank_skills(&[b, a], &[], &std::collections::HashMap::new(), 10);
+        assert_eq!(ranked[0].skill.name, "alpha");
+    }
+
+    #[test]
+    fn the_limit_truncates_without_reordering() {
+        let skills: Vec<_> = (0..5).map(|i| skill(&format!("s{i}"), None)).collect();
+        let ranked = rank_skills(&skills, &[], &std::collections::HashMap::new(), 2);
+        assert_eq!(ranked.len(), 2);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

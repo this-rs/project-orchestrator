@@ -1079,6 +1079,59 @@ pub async fn merge_skills(
 // Tests
 // ============================================================================
 
+/// Body of `POST /api/skills/search`.
+#[derive(Debug, Deserialize)]
+pub struct SearchSkillsBody {
+    /// Omit it to rank the transverse library alone; pass a project to rank that
+    /// project's competences and the transverse ones together.
+    pub project_id: Option<Uuid>,
+    /// Free-form query: the text an agent would have typed.
+    pub query: String,
+    pub limit: Option<usize>,
+}
+
+/// Rank the competences that answer a free-form query.
+///
+/// This is the entry point an agent uses when it does not know which competence
+/// applies — `list` answers "what is there", this answers "what applies". The
+/// per-channel scores travel with each result so the ordering can be explained
+/// rather than trusted.
+pub async fn search_skills(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<SearchSkillsBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let query = body.query.trim();
+    if query.is_empty() {
+        return Err(AppError::BadRequest("query must not be empty".into()));
+    }
+    let limit = body.limit.unwrap_or(10).clamp(1, 50);
+
+    let matches = state
+        .orchestrator
+        .neo4j()
+        .search_skills(body.project_id, query, limit)
+        .await
+        .map_err(AppError::Internal)?;
+
+    let items: Vec<serde_json::Value> = matches
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "skill": m.skill,
+                "score": m.score,
+                "trigger_score": m.trigger_score,
+                "semantic_score": m.semantic_score,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "query": query,
+        "total": items.len(),
+        "items": items,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1419,6 +1472,62 @@ mod tests {
             serde_json::json!(project_id),
             "an absent project_id must not change the scope"
         );
+    }
+
+    /// `search` is the entry point when the competence is not known by name.
+    /// An unmatched competence must still be listed: the ranking is the answer,
+    /// not a filter.
+    #[tokio::test]
+    async fn search_ranks_the_skills_and_keeps_the_unmatched_ones() {
+        let (app, project_id) = test_app_with_project().await;
+        for name in ["alpha", "beta"] {
+            let created = app
+                .clone()
+                .oneshot(auth_post_json(
+                    "/api/skills",
+                    serde_json::json!({
+                        "project_id": project_id,
+                        "name": name,
+                        "description": "searchable"
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert!(created.status().is_success(), "creating {name} failed");
+        }
+
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/skills/search",
+                serde_json::json!({ "project_id": project_id, "query": "nothing matches this" }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "search failed: {:?}",
+            resp.status()
+        );
+        let body = body_json(resp).await;
+        assert_eq!(body["query"], "nothing matches this");
+        assert_eq!(
+            body["total"], 2,
+            "a competence no channel matched must still be listed"
+        );
+        assert_eq!(body["items"][0]["skill"]["name"], "alpha");
+    }
+
+    #[tokio::test]
+    async fn search_refuses_an_empty_query() {
+        let (app, _project_id) = test_app_with_project().await;
+        let resp = app
+            .oneshot(auth_post_json(
+                "/api/skills/search",
+                serde_json::json!({ "query": "   " }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::BAD_REQUEST);
     }
 
     #[tokio::test]

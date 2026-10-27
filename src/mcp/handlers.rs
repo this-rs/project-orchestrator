@@ -489,6 +489,7 @@ pub(crate) const MEGA_TOOL_ACTIONS: &[(&str, &str, &str)] = &[
 
     // Skill
     ("skill", "list", "list_skills"),
+    ("skill", "search", "search_skills"),
     ("skill", "create", "create_skill"),
     ("skill", "get", "get_skill"),
     ("skill", "update", "update_skill"),
@@ -5211,6 +5212,11 @@ impl ToolHandler {
                     query.push(("offset".to_string(), o.to_string()));
                 }
                 let result = http.get_with_query("/api/skills", &query).await?;
+                Ok(Some(result))
+            }
+
+            "search_skills" => {
+                let result = http.post("/api/skills/search", args).await?;
                 Ok(Some(result))
             }
 
