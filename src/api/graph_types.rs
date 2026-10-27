@@ -534,6 +534,10 @@ pub async fn build_project_graph_data(
         // Get all project notes (active only)
         let note_filters = crate::notes::NoteFilters {
             status: Some(vec![crate::notes::NoteStatus::Active]),
+            // Without this, `list_notes` falls back to 50 and every project's
+            // knowledge layer is silently truncated to 50 notes — the outer
+            // `knowledge_node_count >= limit` guard never gets a chance.
+            limit: Some(limit as i64),
             ..Default::default()
         };
         let (notes, _) = neo4j
@@ -1262,4 +1266,42 @@ pub async fn build_intelligence_summary(
         pm,
         chat,
     })
+}
+
+#[cfg(test)]
+mod knowledge_layer_tests {
+    //! The knowledge layer used to stop at 50 notes whatever `limit` said:
+    //! `NoteFilters::limit` was left empty, so `list_notes` applied its own
+    //! default and the caller's limit never applied. A project with 60 notes
+    //! showed 50 and said nothing.
+    use super::*;
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::test_helpers::{test_note, test_project};
+
+    #[tokio::test]
+    async fn the_knowledge_layer_is_not_silently_capped_at_fifty() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        let pid = project.id;
+        store.create_project(&project).await.unwrap();
+        for i in 0..60 {
+            let note = test_note(
+                pid,
+                crate::notes::NoteType::Observation,
+                &format!("note {i}"),
+            );
+            store.create_note(&note).await.unwrap();
+        }
+
+        let (nodes, _edges, _communities, _stats) =
+            build_project_graph_data(&store, &project, &["knowledge".to_string()], 5000, None)
+                .await
+                .expect("the graph must build");
+
+        let knowledge = nodes.iter().filter(|n| n.layer == "knowledge").count();
+        assert_eq!(
+            knowledge, 60,
+            "the knowledge layer must serve every note under the limit, not 50"
+        );
+    }
 }
