@@ -1608,6 +1608,15 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<Option<Note>>;
 
     /// Delete a note
+    /// Re-scope a note: `None` makes it global, `Some(pid)` gives it that project.
+    ///
+    /// A note's project is stored TWICE — the `project_id` property, which every
+    /// read filters on, and the `(p)-[:HAS_NOTE]->(n)` edge, which
+    /// `project.delete` follows to archive "its" notes. Writing only one of them
+    /// leaves a note that looks attached but that the old project reclaims on
+    /// deletion, silently. Both move here, in one statement.
+    async fn rescope_note(&self, note_id: Uuid, project_id: Option<Uuid>) -> Result<()>;
+
     async fn delete_note(&self, id: Uuid) -> Result<bool>;
 
     /// List notes with filters and pagination

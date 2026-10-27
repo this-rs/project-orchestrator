@@ -6562,6 +6562,17 @@ impl GraphStore for MockGraphStore {
         }
     }
 
+    async fn rescope_note(&self, note_id: Uuid, project_id: Option<Uuid>) -> anyhow::Result<()> {
+        let mut notes = self.notes.write().await;
+        match notes.get_mut(&note_id) {
+            Some(note) => {
+                note.project_id = project_id;
+                Ok(())
+            }
+            None => anyhow::bail!("note {} not found", note_id),
+        }
+    }
+
     async fn delete_note(&self, id: Uuid) -> Result<bool> {
         let removed = self.notes.write().await.remove(&id).is_some();
         self.note_anchors.write().await.remove(&id);
