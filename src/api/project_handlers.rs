@@ -730,7 +730,7 @@ pub async fn get_embeddings_projection(
 
     let (synapse_res, skills_res) = tokio::join!(
         neo4j.get_synapse_graph(pid, 0.0),
-        neo4j.list_skills(pid, None, 1000, 0),
+        neo4j.list_skills(Some(pid), None, 1000, 0),
     );
 
     // 7. Build synapses (filter to only include projected points)

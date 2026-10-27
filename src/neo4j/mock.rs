@@ -11749,14 +11749,16 @@ impl GraphStore for MockGraphStore {
 
     async fn create_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
         // Validate project exists (only if projects map is populated, for backward compatibility)
-        let projects = self.projects.read().await;
-        if !projects.is_empty() && !projects.contains_key(&skill.project_id) {
-            anyhow::bail!(
-                "Project not found: {}. Cannot create skill in non-existent project.",
-                skill.project_id
-            );
+        // A transverse skill has no project, by design: nothing to validate.
+        if let Some(pid) = skill.project_id {
+            let projects = self.projects.read().await;
+            if !projects.is_empty() && !projects.contains_key(&pid) {
+                anyhow::bail!(
+                    "Project not found: {}. Cannot create skill in non-existent project.",
+                    pid
+                );
+            }
         }
-        drop(projects);
         self.skills.write().await.insert(skill.id, skill.clone());
         Ok(())
     }
@@ -11785,7 +11787,7 @@ impl GraphStore for MockGraphStore {
 
     async fn list_skills(
         &self,
-        project_id: Uuid,
+        project_id: Option<Uuid>,
         status: Option<crate::skills::SkillStatus>,
         limit: usize,
         offset: usize,
@@ -11793,7 +11795,10 @@ impl GraphStore for MockGraphStore {
         let store = self.skills.read().await;
         let mut filtered: Vec<_> = store
             .values()
-            .filter(|s| s.project_id == project_id)
+            .filter(|s| match project_id {
+                Some(pid) => s.project_id == Some(pid) || s.project_id.is_none(),
+                None => s.project_id.is_none(),
+            })
             .filter(|s| status.is_none_or(|st| s.status == st))
             .cloned()
             .collect();
@@ -11918,7 +11923,7 @@ impl GraphStore for MockGraphStore {
         let store = self.skills.read().await;
         Ok(store
             .values()
-            .filter(|s| s.project_id == project_id)
+            .filter(|s| s.project_id == Some(project_id))
             .cloned()
             .collect())
     }
@@ -11973,14 +11978,18 @@ impl GraphStore for MockGraphStore {
 
     async fn match_skills_by_trigger(
         &self,
-        project_id: Uuid,
+        project_id: Option<Uuid>,
         input: &str,
     ) -> anyhow::Result<Vec<(crate::skills::SkillNode, f64)>> {
         let store = self.skills.read().await;
         let candidates: Vec<_> = store
             .values()
             .filter(|s| {
-                s.project_id == project_id
+                let in_scope = match project_id {
+                    Some(pid) => s.project_id == Some(pid) || s.project_id.is_none(),
+                    None => s.project_id.is_none(),
+                };
+                in_scope
                     && matches!(
                         s.status,
                         crate::skills::SkillStatus::Active | crate::skills::SkillStatus::Emerging
@@ -19019,5 +19028,85 @@ mod bind_project_tests {
             .bind_chat_session_project(Uuid::new_v4(), "po-graph")
             .await
             .unwrap());
+    }
+}
+
+#[cfg(test)]
+mod transverse_skill_tests {
+    //! A skill with no project is transverse: it belongs to the instance and is
+    //! visible from every project. The rule lives in three places — the Neo4j
+    //! query, this in-memory store, and the trigger matcher — so it is pinned
+    //! here instead of only in a query string.
+    use super::*;
+    use crate::skills::{SkillNode, SkillStatus};
+    use crate::test_helpers::test_project;
+
+    async fn store_with_a_project() -> (MockGraphStore, Uuid) {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        let pid = project.id;
+        store.create_project(&project).await.unwrap();
+        (store, pid)
+    }
+
+    fn active(project_id: Option<Uuid>, name: &str) -> SkillNode {
+        let mut skill = SkillNode::new(project_id, name);
+        skill.status = SkillStatus::Active;
+        skill
+    }
+
+    #[tokio::test]
+    async fn a_transverse_skill_is_visible_from_every_project() {
+        let (store, pid) = store_with_a_project().await;
+        store
+            .create_skill(&active(Some(pid), "local"))
+            .await
+            .unwrap();
+        store
+            .create_skill(&active(None, "everywhere"))
+            .await
+            .unwrap();
+
+        // From the project it belongs to: both.
+        let (found, total) = store.list_skills(Some(pid), None, 10, 0).await.unwrap();
+        assert_eq!(
+            total, 2,
+            "a project sees its own skills and the transverse ones"
+        );
+        assert!(found.iter().any(|s| s.name == "local"));
+        assert!(found.iter().any(|s| s.name == "everywhere"));
+
+        // From a project it was never written for: the transverse one only.
+        let elsewhere = Uuid::new_v4();
+        let (found, total) = store
+            .list_skills(Some(elsewhere), None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "another project must see the transverse skill");
+        assert_eq!(found[0].name, "everywhere");
+
+        // No project asked: the transverse library, and nothing else.
+        let (found, total) = store.list_skills(None, None, 10, 0).await.unwrap();
+        assert_eq!(total, 1, "without a project, only the library is listed");
+        assert_eq!(found[0].name, "everywhere");
+    }
+
+    #[tokio::test]
+    async fn the_detection_reads_stay_project_scoped() {
+        // `get_live_skills_for_project` feeds skill detection: seeing a
+        // transverse skill there would make it look "new" on every pass.
+        let (store, pid) = store_with_a_project().await;
+        store
+            .create_skill(&active(Some(pid), "local"))
+            .await
+            .unwrap();
+        store
+            .create_skill(&active(None, "everywhere"))
+            .await
+            .unwrap();
+
+        let live = store.get_live_skills_for_project(pid).await.unwrap();
+        assert_eq!(live.len(), 1, "detection must not see transverse skills");
+        assert_eq!(live[0].name, "local");
     }
 }

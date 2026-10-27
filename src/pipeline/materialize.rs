@@ -253,7 +253,7 @@ async fn create_skill_from_recommendation(
     rec: &SkillRecommendation,
     available_note_ids: &[Uuid],
 ) -> Result<Option<Uuid>> {
-    let mut skill = SkillNode::new(project_id, &rec.name);
+    let mut skill = SkillNode::new(Some(project_id), &rec.name);
     skill.description = rec.description.clone();
     skill.energy = 0.5; // Start with moderate energy
     skill.tags = {

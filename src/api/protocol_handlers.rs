@@ -1782,7 +1782,7 @@ pub async fn compose_protocol(
     let skill_id = Uuid::new_v4();
     let skill = crate::skills::SkillNode {
         id: skill_id,
-        project_id: body.project_id,
+        project_id: Some(body.project_id),
         name: format!("Skill: {}", body.name),
         description: body
             .description

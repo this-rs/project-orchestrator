@@ -2998,7 +2998,7 @@ pub trait GraphStore: Send + Sync {
     /// Returns (skills, total_count).
     async fn list_skills(
         &self,
-        project_id: Uuid,
+        project_id: Option<Uuid>,
         status: Option<SkillStatus>,
         limit: usize,
         offset: usize,
@@ -3127,7 +3127,7 @@ pub trait GraphStore: Send + Sync {
     /// Only matches Active/Emerging skills with reliable triggers.
     async fn match_skills_by_trigger(
         &self,
-        project_id: Uuid,
+        project_id: Option<Uuid>,
         input: &str,
     ) -> Result<Vec<(SkillNode, f64)>>;
 

@@ -343,7 +343,7 @@ mod tests {
 
     fn make_imported_skill(days_ago: i64, activations: i64) -> SkillNode {
         let now = Utc::now();
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Test Import Skill");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Test Import Skill");
         skill.status = SkillStatus::Imported;
         skill.imported_at = Some(now - Duration::days(days_ago));
         skill.activation_count = activations;
@@ -353,7 +353,7 @@ mod tests {
     }
 
     fn make_active_skill(energy: f64, activations: i64) -> SkillNode {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Active Skill");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Active Skill");
         skill.status = SkillStatus::Active;
         skill.energy = energy;
         skill.activation_count = activations;
@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_dormant_should_archive() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Dormant Skill");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Dormant Skill");
         skill.status = SkillStatus::Dormant;
         let health = compute_health(&skill, Utc::now());
 
@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn test_archived_should_archive() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Archived Skill");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Archived Skill");
         skill.status = SkillStatus::Archived;
         let health = compute_health(&skill, Utc::now());
 
@@ -467,7 +467,7 @@ mod tests {
     #[test]
     fn test_should_accelerate_archive() {
         // Not imported → false
-        let native = SkillNode::new(Uuid::new_v4(), "Native");
+        let native = SkillNode::new(Some(Uuid::new_v4()), "Native");
         assert!(!should_accelerate_archive(&native, Utc::now()));
 
         // Imported, within probation → false
@@ -486,7 +486,7 @@ mod tests {
     #[test]
     fn test_qualifies_for_validation() {
         // Not imported → false
-        let native = SkillNode::new(Uuid::new_v4(), "Native");
+        let native = SkillNode::new(Some(Uuid::new_v4()), "Native");
         assert!(!qualifies_for_validation(&native));
 
         // Imported, not enough activations → false

@@ -70,7 +70,7 @@ pub async fn publish_skill(
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Skill {} not found", body.skill_id)))?;
 
-    if skill.project_id != body.project_id {
+    if skill.project_id != Some(body.project_id) {
         return Err(AppError::BadRequest(format!(
             "Skill {} does not belong to project {}",
             body.skill_id, body.project_id

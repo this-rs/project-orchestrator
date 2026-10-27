@@ -3753,7 +3753,7 @@ impl GraphStore for Neo4jClient {
 
     async fn list_skills(
         &self,
-        project_id: uuid::Uuid,
+        project_id: Option<uuid::Uuid>,
         status: Option<crate::skills::SkillStatus>,
         limit: usize,
         offset: usize,
@@ -3873,7 +3873,7 @@ impl GraphStore for Neo4jClient {
 
     async fn match_skills_by_trigger(
         &self,
-        project_id: uuid::Uuid,
+        project_id: Option<uuid::Uuid>,
         input: &str,
     ) -> anyhow::Result<Vec<(crate::skills::SkillNode, f64)>> {
         self.match_skills_by_trigger(project_id, input).await

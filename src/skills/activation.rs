@@ -1825,7 +1825,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_skill_match_regex_hit() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Neo4j");
         skill.trigger_patterns = vec![SkillTrigger::regex("neo4j|cypher|UNWIND", 0.6)];
 
         let confidence = evaluate_skill_match(&skill, Some("neo4j_client"), None);
@@ -1834,7 +1834,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_skill_match_regex_miss() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Neo4j");
         skill.trigger_patterns = vec![SkillTrigger::regex("neo4j|cypher", 0.6)];
 
         let confidence = evaluate_skill_match(&skill, Some("api_handler"), None);
@@ -1843,7 +1843,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_skill_match_file_glob_hit() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Neo4j");
         skill.trigger_patterns = vec![SkillTrigger::file_glob("src/neo4j/**", 0.8)];
 
         let confidence = evaluate_skill_match(&skill, None, Some("src/neo4j/client.rs"));
@@ -1859,7 +1859,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_skill_match_file_glob_with_pattern_fallback() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Neo4j");
         skill.trigger_patterns = vec![SkillTrigger::file_glob("src/neo4j/**", 0.8)];
 
         // file_context is None, but pattern is a file path (from Read tool)
@@ -1875,7 +1875,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_skill_match_multiple_triggers_best_wins() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Neo4j");
         skill.trigger_patterns = vec![
             SkillTrigger::regex("neo4j|cypher", 0.6),
             SkillTrigger::file_glob("src/api/**", 0.8), // won't match
@@ -1888,7 +1888,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_skill_match_no_pattern_no_file() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Neo4j");
         skill.trigger_patterns = vec![SkillTrigger::regex("neo4j", 0.6)];
 
         let confidence = evaluate_skill_match(&skill, None, None);
@@ -1897,7 +1897,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_skill_match_unreliable_trigger_skipped() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Neo4j");
         let mut trigger = SkillTrigger::regex(".*", 0.5); // matches everything
         trigger.quality_score = Some(0.1); // but unreliable
         skill.trigger_patterns = vec![trigger];
@@ -1908,7 +1908,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_skill_match_semantic_skipped() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Neo4j");
         skill.trigger_patterns = vec![SkillTrigger::semantic("[0.1, 0.2]", 0.7)];
 
         let confidence = evaluate_skill_match(&skill, Some("neo4j"), None);
@@ -1917,7 +1917,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_skill_match_dormant_not_matchable() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Neo4j");
         skill.status = crate::skills::models::SkillStatus::Dormant;
         skill.trigger_patterns = vec![SkillTrigger::regex("neo4j", 0.5)];
 
@@ -1945,10 +1945,10 @@ mod tests {
     fn test_specific_glob_beats_generic() {
         // Two skills with SAME base confidence (0.8), but different glob depths.
         // The specific skill should score higher than the generic one.
-        let mut generic_skill = SkillNode::new(Uuid::new_v4(), "Broad");
+        let mut generic_skill = SkillNode::new(Some(Uuid::new_v4()), "Broad");
         generic_skill.trigger_patterns = vec![SkillTrigger::file_glob("src/**", 0.8)];
 
-        let mut specific_skill = SkillNode::new(Uuid::new_v4(), "Specific");
+        let mut specific_skill = SkillNode::new(Some(Uuid::new_v4()), "Specific");
         specific_skill.trigger_patterns =
             vec![SkillTrigger::file_glob("src/skills/activation/**", 0.8)];
 
@@ -2917,7 +2917,7 @@ mod tests {
         store.create_project(&project).await.unwrap();
 
         // Create skill
-        let mut skill = SkillNode::new(project_id, skill_name);
+        let mut skill = SkillNode::new(Some(project_id), skill_name);
         skill.status = SkillStatus::Active;
         skill.trigger_patterns = triggers;
         skill.energy = 0.8;

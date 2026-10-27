@@ -6049,7 +6049,8 @@ mod parity {
             |m| m,
         )
         .await;
-        let mut skill = crate::skills::models::SkillNode::new(r.project.id, "Widget Porting B14");
+        let mut skill =
+            crate::skills::models::SkillNode::new(Some(r.project.id), "Widget Porting B14");
         skill.status = crate::skills::models::SkillStatus::Active;
         skill.energy = 0.9;
         skill.trigger_patterns = vec![crate::skills::models::SkillTrigger {

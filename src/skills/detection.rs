@@ -236,7 +236,7 @@ pub fn cluster_to_skill(
     all_tags.sort();
     all_tags.dedup();
 
-    let mut skill = crate::skills::SkillNode::new(project_id, name);
+    let mut skill = crate::skills::SkillNode::new(Some(project_id), name);
     skill.energy = energy.clamp(0.0, 1.0);
     skill.cohesion = candidate.cohesion.clamp(0.0, 1.0);
     skill.note_count = note_count;
@@ -1856,7 +1856,7 @@ mod tests {
         let project_id = Uuid::new_v4();
 
         // Create an existing skill
-        let mut existing_skill = crate::skills::SkillNode::new(project_id, "existing-skill");
+        let mut existing_skill = crate::skills::SkillNode::new(Some(project_id), "existing-skill");
         existing_skill.energy = 0.5;
         existing_skill.cohesion = 0.6;
         let existing_id = existing_skill.id;

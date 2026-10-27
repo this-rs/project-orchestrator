@@ -717,7 +717,7 @@ pub async fn build_project_graph_data(
         let mut skills_edge_count = 0usize;
 
         let (skills, _) = neo4j
-            .list_skills(project.id, None, limit, 0)
+            .list_skills(Some(project.id), None, limit, 0)
             .await
             .unwrap_or_default();
 
@@ -1068,7 +1068,7 @@ pub async fn build_intelligence_summary(
         // Count co-change pairs instead of pulling up to 100k rows to .len().
         neo4j.count_co_change_pairs(pid, 1),
         neo4j.get_neural_metrics(pid),
-        neo4j.list_skills(pid, None, 1000, 0),
+        neo4j.list_skills(Some(pid), None, 1000, 0),
         neo4j.list_protocols(pid, None, 10_000, 0),
         // Single aggregate replaces the per-protocol states/transitions N+1.
         neo4j.count_protocol_states_transitions(pid),

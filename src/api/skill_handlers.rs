@@ -152,8 +152,10 @@ fn validate_input_limits(
 pub struct SkillsListQuery {
     #[serde(flatten)]
     pub pagination: PaginationParams,
-    /// Required: filter skills by project
-    pub project_id: Uuid,
+    /// Optional: omit it to list the transverse library, which is visible from
+    /// every project. With a project, the answer is that project's skills AND
+    /// the transverse ones.
+    pub project_id: Option<Uuid>,
     /// Optional: filter by status (emerging, active, dormant, archived, imported)
     pub status: Option<String>,
 }
@@ -282,7 +284,7 @@ pub async fn create_skill(
         validate_trigger_patterns(triggers).map_err(AppError::BadRequest)?;
     }
 
-    let mut skill = SkillNode::new(body.project_id, body.name);
+    let mut skill = SkillNode::new(Some(body.project_id), body.name);
     if let Some(desc) = body.description {
         skill.description = desc;
     }
@@ -302,14 +304,16 @@ pub async fn create_skill(
         .map_err(AppError::Internal)?;
 
     // Invalidate hook activation cache for this project
-    skill_cache().invalidate_project(&skill.project_id).await;
+    if let Some(pid) = skill.project_id {
+        skill_cache().invalidate_project(&pid).await;
+    }
 
     // Emit created event
     state.event_bus.emit_created(
         crate::events::EntityType::Skill,
         &skill.id.to_string(),
         serde_json::json!({"name": &skill.name, "project_id": skill.project_id}),
-        Some(skill.project_id.to_string()),
+        skill.project_id.map(|id| id.to_string()),
     );
 
     Ok((StatusCode::CREATED, Json(skill)))
@@ -412,7 +416,9 @@ pub async fn update_skill(
         .map_err(AppError::Internal)?;
 
     // Invalidate hook activation cache for this project
-    skill_cache().invalidate_project(&skill.project_id).await;
+    if let Some(pid) = skill.project_id {
+        skill_cache().invalidate_project(&pid).await;
+    }
 
     // Emit status_changed if status transitioned, otherwise updated
     let new_status = format!("{}", skill.status);
@@ -422,14 +428,14 @@ pub async fn update_skill(
             &skill.id.to_string(),
             &old_status,
             &new_status,
-            Some(skill.project_id.to_string()),
+            skill.project_id.map(|id| id.to_string()),
         );
     } else {
         state.event_bus.emit_updated(
             crate::events::EntityType::Skill,
             &skill.id.to_string(),
             serde_json::json!({"name": &skill.name, "project_id": skill.project_id}),
-            Some(skill.project_id.to_string()),
+            skill.project_id.map(|id| id.to_string()),
         );
     }
 
@@ -460,9 +466,14 @@ pub async fn delete_skill(
 
     if deleted {
         // Invalidate hook activation cache for this project
-        let project_id_str = skill.as_ref().map(|s| s.project_id.to_string());
+        let project_id_str = skill
+            .as_ref()
+            .and_then(|s| s.project_id)
+            .map(|id| id.to_string());
         if let Some(ref skill) = skill {
-            skill_cache().invalidate_project(&skill.project_id).await;
+            if let Some(pid) = skill.project_id {
+                skill_cache().invalidate_project(&pid).await;
+            }
         }
 
         // Emit deleted event
@@ -530,7 +541,9 @@ pub async fn add_skill_member(
         .map_err(AppError::Internal)?;
 
     // Invalidate cache — membership change may affect trigger evaluation
-    skill_cache().invalidate_project(&skill.project_id).await;
+    if let Some(pid) = skill.project_id {
+        skill_cache().invalidate_project(&pid).await;
+    }
 
     // Emit linked event
     let related_entity_type = match body.entity_type.as_str() {
@@ -543,7 +556,7 @@ pub async fn add_skill_member(
         &skill_id.to_string(),
         related_entity_type,
         &body.entity_id.to_string(),
-        Some(skill.project_id.to_string()),
+        skill.project_id.map(|id| id.to_string()),
     );
 
     Ok(StatusCode::CREATED)
@@ -579,9 +592,14 @@ pub async fn remove_skill_member(
 
     if removed {
         // Invalidate cache — membership change may affect trigger evaluation
-        let project_id_str = skill.as_ref().map(|s| s.project_id.to_string());
+        let project_id_str = skill
+            .as_ref()
+            .and_then(|s| s.project_id)
+            .map(|id| id.to_string());
         if let Some(ref skill) = skill {
-            skill_cache().invalidate_project(&skill.project_id).await;
+            if let Some(pid) = skill.project_id {
+                skill_cache().invalidate_project(&pid).await;
+            }
         }
 
         // Emit unlinked event
@@ -745,7 +763,11 @@ pub async fn get_skill_health(
     // Enrich with project-level percentile context.
     // Loads all skills for the project so we can rank this skill among its peers.
     // Falls back gracefully (percentiles stay None) on any error.
-    if let Ok(peers) = neo4j.get_live_skills_for_project(skill.project_id).await {
+    let peers = match skill.project_id {
+        Some(pid) => neo4j.get_live_skills_for_project(pid).await.ok(),
+        None => None,
+    };
+    if let Some(peers) = peers {
         crate::skills::validation::enrich_with_project_context(&mut health, &peers);
     }
 
@@ -837,13 +859,20 @@ pub async fn split_skill(
     } else {
         // Auto-detect sub-clusters via SYNAPSE graph
         let config = crate::skills::detection::SkillDetectionConfig::default();
-        let edges = graph
-            .get_synapse_graph(skill.project_id, config.min_synapse_weight)
-            .await
-            .map_err(AppError::Internal)?;
+        let edges = match skill.project_id {
+            Some(pid) => graph
+                .get_synapse_graph(pid, config.min_synapse_weight)
+                .await
+                .map_err(AppError::Internal)?,
+            // A transverse skill has no project synapse graph to cluster.
+            None => Default::default(),
+        };
         let detection = crate::skills::detection::detect_skill_candidates(
             &edges,
-            &skill.project_id.to_string(),
+            &skill
+                .project_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "transverse".into()),
             &config,
         );
         // Find candidates overlapping with this skill
@@ -878,12 +907,17 @@ pub async fn split_skill(
         notes_map.insert(note.id.to_string(), note.clone());
     }
 
-    let result = execute_evolution(graph, &evolution, &notes_map, skill.project_id)
+    let evolution_project = skill.project_id.ok_or_else(|| {
+        AppError::BadRequest("a transverse skill has no project to evolve within".into())
+    })?;
+    let result = execute_evolution(graph, &evolution, &notes_map, evolution_project)
         .await
         .map_err(AppError::Internal)?;
 
     // Invalidate hook cache
-    skill_cache().invalidate_project(&skill.project_id).await;
+    if let Some(pid) = skill.project_id {
+        skill_cache().invalidate_project(&pid).await;
+    }
 
     let new_ids: Vec<Uuid> = result
         .split
@@ -902,7 +936,7 @@ pub async fn split_skill(
             "sub_cluster_count": candidates.len(),
             "project_id": skill.project_id,
         }),
-        Some(skill.project_id.to_string()),
+        skill.project_id.map(|id| id.to_string()),
     );
 
     Ok(Json(serde_json::json!({
@@ -949,8 +983,8 @@ pub async fn merge_skills(
 
         // Ensure all skills belong to the same project
         match project_id {
-            None => project_id = Some(skill.project_id),
-            Some(pid) if pid != skill.project_id => {
+            None => project_id = skill.project_id,
+            Some(pid) if Some(pid) != skill.project_id => {
                 return Err(AppError::BadRequest(
                     "Cannot merge skills from different projects".into(),
                 ));
@@ -1352,7 +1386,7 @@ mod tests {
         let app_state = mock_app_state();
         let project = test_project();
         app_state.neo4j.create_project(&project).await.unwrap();
-        let skill = SkillNode::new(project.id, "My Skill");
+        let skill = SkillNode::new(Some(project.id), "My Skill");
         let skill_id = skill.id;
         app_state.neo4j.create_skill(&skill).await.unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
@@ -1416,7 +1450,7 @@ mod tests {
         let app_state = mock_app_state();
         let project = test_project();
         app_state.neo4j.create_project(&project).await.unwrap();
-        let skill = SkillNode::new(project.id, "To Delete");
+        let skill = SkillNode::new(Some(project.id), "To Delete");
         let skill_id = skill.id;
         app_state.neo4j.create_skill(&skill).await.unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
@@ -1467,7 +1501,7 @@ mod tests {
         let app_state = mock_app_state();
         let project = test_project();
         app_state.neo4j.create_project(&project).await.unwrap();
-        let skill = SkillNode::new(project.id, "Skill With No Members");
+        let skill = SkillNode::new(Some(project.id), "Skill With No Members");
         let skill_id = skill.id;
         app_state.neo4j.create_skill(&skill).await.unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
@@ -1521,7 +1555,7 @@ mod tests {
         let app_state = mock_app_state();
         let project = test_project();
         app_state.neo4j.create_project(&project).await.unwrap();
-        let skill = SkillNode::new(project.id, "Original Name");
+        let skill = SkillNode::new(Some(project.id), "Original Name");
         let skill_id = skill.id;
         app_state.neo4j.create_skill(&skill).await.unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
@@ -1580,7 +1614,7 @@ mod tests {
         let app_state = mock_app_state();
         let project = test_project();
         app_state.neo4j.create_project(&project).await.unwrap();
-        let skill = SkillNode::new(project.id, "Health Check");
+        let skill = SkillNode::new(Some(project.id), "Health Check");
         let skill_id = skill.id;
         app_state.neo4j.create_skill(&skill).await.unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());

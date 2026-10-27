@@ -388,7 +388,7 @@ fn profile_rank_never_drops_when_a_tag_is_added() {
 const UNANCHORED: &[&str] = &["cache", "pourquoi|why", "bug", "impact", "cach\\w+", "fail"];
 
 fn skill_with(patterns: &[&str]) -> SkillNode {
-    let mut skill = SkillNode::new(Uuid::new_v4(), "skill");
+    let mut skill = SkillNode::new(Some(Uuid::new_v4()), "skill");
     skill.trigger_patterns = patterns
         .iter()
         .map(|p| SkillTrigger::regex(*p, 0.8))

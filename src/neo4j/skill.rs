@@ -44,7 +44,7 @@ impl Neo4jClient {
 
         Ok(SkillNode {
             id: node.get::<String>("id")?.parse()?,
-            project_id: node.get::<String>("project_id")?.parse()?,
+            project_id: scope_project_id(node)?,
             name: node.get("name")?,
             description: node.get("description").unwrap_or_default(),
             status: node
@@ -119,7 +119,7 @@ impl Neo4jClient {
 
         let q = query(
             r#"
-            MATCH (p:Project {id: $project_id})
+            OPTIONAL MATCH (p:Project {id: $project_id})
             CREATE (s:Skill {
                 id: $id,
                 project_id: $project_id,
@@ -144,12 +144,14 @@ impl Neo4jClient {
                 created_at: datetime($created_at),
                 updated_at: datetime($updated_at)
             })
-            CREATE (s)-[:BELONGS_TO]->(p)
+            FOREACH (_ IN CASE WHEN p IS NULL THEN [] ELSE [1] END |
+                CREATE (s)-[:BELONGS_TO]->(p)
+            )
             RETURN s.id AS created_id
             "#,
         )
         .param("id", skill.id.to_string())
-        .param("project_id", skill.project_id.to_string())
+        .param("project_id", skill.project_id.map(|id| id.to_string()))
         .param("name", skill.name.clone())
         .param("description", skill.description.clone())
         .param("status", skill.status.to_string())
@@ -203,10 +205,15 @@ impl Neo4jClient {
             .await
             .context("Failed to create Skill node")?;
 
-        if result.next().await?.is_none() {
+        // `OPTIONAL MATCH` yields a row even without a project: this branch only
+        // fires when a project WAS asked for and does not exist.
+        if skill.project_id.is_some() && result.next().await?.is_none() {
             anyhow::bail!(
                 "Cannot create skill: project {} does not exist",
-                skill.project_id
+                skill
+                    .project_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default()
             );
         }
 
@@ -362,7 +369,7 @@ impl Neo4jClient {
     /// List skills for a project with optional status filter and pagination.
     pub async fn list_skills(
         &self,
-        project_id: Uuid,
+        project_id: Option<Uuid>,
         status: Option<SkillStatus>,
         limit: usize,
         offset: usize,
@@ -372,12 +379,14 @@ impl Neo4jClient {
 
         // Count query
         let count_cypher = r#"
-            MATCH (s:Skill {project_id: $project_id})
+            MATCH (s:Skill)
             WHERE ($status IS NULL OR s.status = $status)
+              AND ($project_id IS NULL OR s.project_id = $project_id OR s.project_id IS NULL)
+              AND ($project_id IS NOT NULL OR s.project_id IS NULL)
             RETURN count(s) AS total
             "#;
         let count_q = query(count_cypher)
-            .param("project_id", project_id.to_string())
+            .param("project_id", project_id.map(|id| id.to_string()))
             .param(
                 "status",
                 status_str
@@ -398,15 +407,17 @@ impl Neo4jClient {
 
         // Data query
         let data_cypher = r#"
-            MATCH (s:Skill {project_id: $project_id})
+            MATCH (s:Skill)
             WHERE ($status IS NULL OR s.status = $status)
+              AND ($project_id IS NULL OR s.project_id = $project_id OR s.project_id IS NULL)
+              AND ($project_id IS NOT NULL OR s.project_id IS NULL)
             RETURN s
             ORDER BY s.energy DESC, s.name ASC
             SKIP $offset
             LIMIT $limit
             "#;
         let data_q = query(data_cypher)
-            .param("project_id", project_id.to_string())
+            .param("project_id", project_id.map(|id| id.to_string()))
             .param(
                 "status",
                 status_str
@@ -933,19 +944,21 @@ impl Neo4jClient {
     /// are skipped. Returns matches sorted by confidence descending.
     pub async fn match_skills_by_trigger(
         &self,
-        project_id: Uuid,
+        project_id: Option<Uuid>,
         input: &str,
     ) -> Result<Vec<(SkillNode, f64)>> {
         // Get all matchable skills for the project
         let q = query(
             r#"
-            MATCH (s:Skill {project_id: $project_id})
+            MATCH (s:Skill)
             WHERE s.status IN ['active', 'emerging']
+              AND ($project_id IS NULL OR s.project_id = $project_id OR s.project_id IS NULL)
+              AND ($project_id IS NOT NULL OR s.project_id IS NULL)
             RETURN s
             LIMIT 500
             "#,
         )
-        .param("project_id", project_id.to_string());
+        .param("project_id", project_id.map(|id| id.to_string()));
 
         let mut result = self.graph.execute(q).await?;
         let mut candidates = Vec::new();
@@ -1090,6 +1103,27 @@ impl Neo4jClient {
         }
 
         Ok(edges)
+    }
+}
+
+/// The owning project of a node, read as a scope: `None` means transverse.
+///
+/// A node without the property, or with an explicit NULL, has no owning project
+/// and belongs to the instance. The legacy empty string is accepted but
+/// reported loudly: it is a third state that reads like "no project" while every
+/// `IS NULL` predicate misses it — the defect the note write path had (#984).
+/// No Skill carries it today; a warning keeps a reappearance visible.
+pub(crate) fn scope_project_id(node: &neo4rs::Node) -> anyhow::Result<Option<Uuid>> {
+    match node.get::<String>("project_id") {
+        Err(_) => Ok(None),
+        Ok(s) if s.is_empty() => {
+            tracing::warn!(
+                node_id = node.get::<String>("id").unwrap_or_default(),
+                "empty project_id on a scoped node: read as transverse, migrate the row"
+            );
+            Ok(None)
+        }
+        Ok(s) => Ok(Some(s.parse()?)),
     }
 }
 

@@ -123,7 +123,7 @@ impl LearningMetrics {
         let total_episodes = episodes.len();
         let (skills, _) = graph
             .list_skills(
-                project_id,
+                Some(project_id),
                 Some(crate::skills::models::SkillStatus::Emerging),
                 500,
                 0,

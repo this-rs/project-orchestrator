@@ -1178,7 +1178,7 @@ pub async fn import_persona(
     // 4. Re-link skills by name
     let mut skills_linked = 0;
     let (all_skills, _) = neo4j
-        .list_skills(body.project_id, None, 1000, 0)
+        .list_skills(Some(body.project_id), None, 1000, 0)
         .await
         .unwrap_or_default();
 

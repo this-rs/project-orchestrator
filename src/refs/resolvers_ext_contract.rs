@@ -83,8 +83,8 @@ async fn ext() -> Ext {
     for p in [&persona_a, &persona_b, &persona_global] {
         g.create_persona(p).await.unwrap();
     }
-    let skill_a = SkillNode::new(w.a, "Skill refs");
-    let skill_b = SkillNode::new(w.b, "Skill facturation");
+    let skill_a = SkillNode::new(Some(w.a), "Skill refs");
+    let skill_b = SkillNode::new(Some(w.b), "Skill facturation");
     g.create_skill(&skill_a).await.unwrap();
     g.create_skill(&skill_b).await.unwrap();
 

@@ -373,7 +373,7 @@ pub fn skill(graph: Arc<dyn GraphStore>) -> Box<dyn KindResolver> {
 
 impl SkillResolver {
     async fn meta(&self, s: &SkillNode, memo: &mut Memo) -> anyhow::Result<RefMeta> {
-        let (project, workspace) = scope_of(self.graph.as_ref(), memo, Some(s.project_id)).await?;
+        let (project, workspace) = scope_of(self.graph.as_ref(), memo, s.project_id).await?;
         Ok(RefMeta {
             kind: RefKind::Skill,
             id: s.id.into(),
@@ -405,7 +405,7 @@ impl KindResolver for SkillResolver {
         for project in projects_in_scope(self.graph.as_ref(), c).await? {
             let (found, _) = self
                 .graph
-                .list_skills(project.id, None, SCAN_CAP, 0)
+                .list_skills(Some(project.id), None, SCAN_CAP, 0)
                 .await?;
             for s in found {
                 if c.matches(&s.name, &s.description) {

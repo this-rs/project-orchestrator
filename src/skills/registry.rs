@@ -43,7 +43,7 @@ pub struct PublishedSkill {
     /// Trust level category
     pub trust_level: crate::skills::trust::TrustLevel,
     /// ID of the source project that published this skill
-    pub source_project_id: Uuid,
+    pub source_project_id: Option<Uuid>,
     /// Name of the source project
     pub source_project_name: String,
     /// Who published this skill
@@ -322,7 +322,7 @@ mod tests {
     use crate::skills::package::*;
 
     fn make_test_skill() -> SkillNode {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Test Skill");
+        let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Test Skill");
         skill.energy = 0.8;
         skill.cohesion = 0.75;
         skill.activation_count = 50;
