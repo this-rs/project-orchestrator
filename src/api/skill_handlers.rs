@@ -186,6 +186,10 @@ pub struct UpdateSkillBody {
     pub context_template: Option<String>,
     pub energy: Option<f64>,
     pub cohesion: Option<f64>,
+    /// Re-scope this skill. Absent: leave it alone. `null`: make it transverse.
+    /// A uuid: attach it to that project.
+    #[serde(default, deserialize_with = "crate::api::double_option")]
+    pub project_id: Option<Option<Uuid>>,
 }
 
 /// Request body for adding a member to a skill
@@ -414,6 +418,18 @@ pub async fn update_skill(
         .update_skill(&skill)
         .await
         .map_err(AppError::Internal)?;
+
+    // Re-scope: absent leaves the scope alone, `null` makes it transverse, a
+    // uuid attaches it. The edge moves in the same statement as the property.
+    if let Some(scope) = body.project_id {
+        state
+            .orchestrator
+            .neo4j()
+            .rescope_skill(skill.id, scope)
+            .await
+            .map_err(AppError::Internal)?;
+        skill.project_id = scope;
+    }
 
     // Invalidate hook activation cache for this project
     if let Some(pid) = skill.project_id {

@@ -1059,6 +1059,34 @@ impl Neo4jClient {
     // Skill Detection — Graph Extraction
     // ========================================================================
 
+    /// Re-scope a skill: `None` makes it transverse, `Some(pid)` attaches it.
+    ///
+    /// Moves the `BELONGS_TO` edge — never adds a second one — and writes
+    /// `project_id` in the same statement, so a node never claims a project it
+    /// is not attached to.
+    pub async fn rescope_skill(&self, skill_id: Uuid, project_id: Option<Uuid>) -> Result<()> {
+        let q = query(
+            r#"
+            MATCH (s:Skill {id: $id})
+            OPTIONAL MATCH (s)-[old:BELONGS_TO]->(:Project)
+            DELETE old
+            WITH s
+            OPTIONAL MATCH (p:Project {id: $project_id})
+            FOREACH (_ IN CASE WHEN p IS NULL THEN [] ELSE [1] END |
+                CREATE (s)-[:BELONGS_TO]->(p)
+            )
+            SET s.project_id = $project_id
+            RETURN s.id AS id
+            "#,
+        )
+        .param("id", skill_id.to_string())
+        .param("project_id", project_id.map(|p| p.to_string()));
+
+        let mut result = self.graph.execute(q).await?;
+        result.next().await?;
+        Ok(())
+    }
+
     /// Extract the SYNAPSE graph for a project.
     ///
     /// Returns all SYNAPSE edges between notes belonging to the given project,

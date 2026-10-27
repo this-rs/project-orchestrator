@@ -3751,6 +3751,18 @@ impl GraphStore for Neo4jClient {
         self.delete_skill(id).await
     }
 
+    async fn rescope_skill(&self, skill_id: Uuid, project_id: Option<Uuid>) -> anyhow::Result<()> {
+        self.rescope_skill(skill_id, project_id).await
+    }
+
+    async fn rescope_protocol(
+        &self,
+        protocol_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<()> {
+        self.rescope_protocol(protocol_id, project_id).await
+    }
+
     async fn list_skills(
         &self,
         project_id: Option<uuid::Uuid>,

@@ -58,3 +58,17 @@ pub mod embedded_frontend;
 
 pub use query::*;
 pub use routes::create_router;
+
+/// Distinguishes "field absent" from "field set to null".
+///
+/// `Option<T>` alone conflates the two: `{}` and `{"project_id": null}` both
+/// give `None`. Re-scoping needs them apart — absent means "leave the scope
+/// alone", null means "make it transverse". Declared as `Option<Option<T>>`
+/// with `#[serde(default, deserialize_with = "double_option")]`.
+pub fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
+}

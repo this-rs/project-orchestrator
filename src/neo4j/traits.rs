@@ -2990,6 +2990,16 @@ pub trait GraphStore: Send + Sync {
     /// Update a skill node (replaces all mutable fields).
     async fn update_skill(&self, skill: &SkillNode) -> Result<()>;
 
+    /// Re-scope a skill: `None` makes it transverse, `Some(pid)` attaches it.
+    ///
+    /// Moves the `BELONGS_TO` edge (never adds a second one) and writes
+    /// `project_id` in the same transaction, so a node is never left claiming a
+    /// project it is not attached to.
+    async fn rescope_skill(&self, skill_id: Uuid, project_id: Option<Uuid>) -> Result<()>;
+
+    /// Re-scope a protocol: `None` makes it transverse, `Some(pid)` attaches it.
+    async fn rescope_protocol(&self, protocol_id: Uuid, project_id: Option<Uuid>) -> Result<()>;
+
     /// Delete a skill and all its relationships (CONTAINS, COVERS, BELONGS_TO).
     /// Returns true if the skill existed and was deleted.
     async fn delete_skill(&self, id: Uuid) -> Result<bool>;
