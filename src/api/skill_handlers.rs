@@ -1346,6 +1346,81 @@ mod tests {
         (create_router(state), project_id)
     }
 
+    /// `project_id: null` must make the skill transverse — the tri-state exists
+    /// precisely so a rename cannot silently re-parent it, and so a scope change
+    /// can happen without recreating the node (and losing its members).
+    #[tokio::test]
+    async fn a_null_project_id_makes_the_skill_transverse() {
+        let (app, project_id) = test_app_with_project().await;
+        let created = app
+            .clone()
+            .oneshot(auth_post_json(
+                "/api/skills",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "name": "Rescoped Skill",
+                    "description": "starts attached to a project"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            created.status().is_success(),
+            "creating a skill must succeed: {}",
+            created.status()
+        );
+        let id = body_json(created).await["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .oneshot(auth_put_json(
+                &format!("/api/skills/{}", id),
+                serde_json::json!({ "project_id": null }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        assert_eq!(
+            body_json(resp).await["project_id"],
+            serde_json::Value::Null,
+            "null must make the skill transverse"
+        );
+    }
+
+    /// An update that does not mention the scope must leave it alone.
+    #[tokio::test]
+    async fn an_absent_project_id_leaves_the_skill_where_it_was() {
+        let (app, project_id) = test_app_with_project().await;
+        let created = app
+            .clone()
+            .oneshot(auth_post_json(
+                "/api/skills",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "name": "Stable Skill",
+                    "description": "must not move"
+                }),
+            ))
+            .await
+            .unwrap();
+        let id = body_json(created).await["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .oneshot(auth_put_json(
+                &format!("/api/skills/{}", id),
+                serde_json::json!({ "name": "renamed" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let updated = body_json(resp).await;
+        assert_eq!(updated["name"], "renamed");
+        assert_eq!(
+            updated["project_id"],
+            serde_json::json!(project_id),
+            "an absent project_id must not change the scope"
+        );
+    }
+
     #[tokio::test]
     async fn test_list_skills_empty() {
         let (app, project_id) = test_app_with_project().await;

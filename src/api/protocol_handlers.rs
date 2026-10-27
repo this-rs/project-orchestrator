@@ -2734,6 +2734,49 @@ mod tests {
         assert_eq!(after.len(), 2);
     }
 
+    /// Same tri-state on the protocol side: `null` makes it transverse,
+    /// absent leaves it attached. Both share `double_option`.
+    #[tokio::test]
+    async fn a_null_project_id_makes_the_protocol_transverse() {
+        let (state, _project_id, proto_id) = make_state_with_protocol().await;
+        let body = UpdateProtocolBody {
+            project_id: Some(None),
+            name: None,
+            description: None,
+            protocol_category: None,
+            trigger_mode: None,
+            trigger_config: None,
+            relevance_vector: None,
+        };
+        let res = update_protocol(State(state), Path(proto_id), Json(body)).await;
+        let protocol = res.expect("update_protocol failed").0;
+        assert!(
+            protocol.project_id.is_none(),
+            "null must make the protocol transverse"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absent_project_id_leaves_the_protocol_attached() {
+        let (state, project_id, proto_id) = make_state_with_protocol().await;
+        let body = UpdateProtocolBody {
+            project_id: None,
+            name: Some("renamed-proto".to_string()),
+            description: None,
+            protocol_category: None,
+            trigger_mode: None,
+            trigger_config: None,
+            relevance_vector: None,
+        };
+        let res = update_protocol(State(state), Path(proto_id), Json(body)).await;
+        let protocol = res.expect("update_protocol failed").0;
+        assert_eq!(
+            protocol.project_id,
+            Some(project_id),
+            "an absent project_id must not detach the protocol"
+        );
+    }
+
     #[tokio::test]
     async fn test_handler_update_protocol_ok() {
         let (state, _project_id, proto_id) = make_state_with_protocol().await;
