@@ -1404,6 +1404,10 @@ fn protected_routes() -> Router<OrchestratorState> {
         )
         // Ego-graph around any entity (entity pages, agents)
         .route(
+            "/api/graph/transverse",
+            get(project_handlers::get_transverse_graph),
+        )
+        .route(
             "/api/graph/neighborhood",
             get(graph_handlers::get_neighborhood),
         )

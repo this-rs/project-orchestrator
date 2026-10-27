@@ -245,7 +245,7 @@ async fn find_or_create_rfc_lifecycle(
 ) -> Result<Protocol, AppError> {
     // 1. Try to find existing protocol
     let (protocols, _) = neo4j
-        .list_protocols(project_id, None, 200, 0)
+        .list_protocols(Some(project_id), None, 200, 0)
         .await
         .map_err(AppError::Internal)?;
 
@@ -1833,7 +1833,7 @@ mod tests {
         // Should have no protocols initially
         let (protocols, _) = app_state
             .neo4j
-            .list_protocols(project_id, None, 100, 0)
+            .list_protocols(Some(project_id), None, 100, 0)
             .await
             .unwrap();
         assert_eq!(protocols.len(), 0);
@@ -1903,7 +1903,7 @@ mod tests {
         // Should still have exactly 1 protocol
         let (protocols, _) = app_state
             .neo4j
-            .list_protocols(project_id, None, 100, 0)
+            .list_protocols(Some(project_id), None, 100, 0)
             .await
             .unwrap();
         assert_eq!(protocols.len(), 1);

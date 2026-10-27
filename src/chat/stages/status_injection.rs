@@ -136,7 +136,10 @@ impl GraphProtocolProvider {
 impl ProtocolStatusProvider for GraphProtocolProvider {
     async fn get_active_runs(&self, project_id: Uuid) -> Result<Vec<ProtocolRunStatus>> {
         // 1. Get all protocols for this project
-        let (protocols, _) = self.graph.list_protocols(project_id, None, 100, 0).await?;
+        let (protocols, _) = self
+            .graph
+            .list_protocols(Some(project_id), None, 100, 0)
+            .await?;
 
         if protocols.is_empty() {
             return Ok(Vec::new());

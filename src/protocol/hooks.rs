@@ -120,7 +120,7 @@ async fn trigger_protocols_for_event(
     emitter: Option<Arc<dyn EventEmitter>>,
 ) -> anyhow::Result<()> {
     // List all protocols for the project (reasonable upper bound — few protocols per project)
-    let (protocols, _) = store.list_protocols(project_id, None, 100, 0).await?;
+    let (protocols, _) = store.list_protocols(Some(project_id), None, 100, 0).await?;
 
     let now = chrono::Utc::now();
     let mut triggered_count = 0u32;
@@ -229,7 +229,7 @@ async fn all_protocols(
     let mut all = Vec::new();
     loop {
         let (page, _) = store
-            .list_protocols(project_id, None, RECOVERY_PAGE_SIZE, all.len())
+            .list_protocols(Some(project_id), None, RECOVERY_PAGE_SIZE, all.len())
             .await?;
         let n = page.len();
         all.extend(page);
@@ -450,7 +450,7 @@ pub async fn timeout_stale_runs(store: &dyn GraphStore) -> anyhow::Result<u32> {
     let mut total_timed_out = 0u32;
 
     for project in &projects {
-        let (protocols, _) = store.list_protocols(project.id, None, 100, 0).await?;
+        let (protocols, _) = store.list_protocols(Some(project.id), None, 100, 0).await?;
 
         for protocol in &protocols {
             let (running_runs, _) = store
@@ -615,7 +615,7 @@ async fn run_scheduled_protocols(
 
     for project in &projects {
         // List all protocols for this project
-        let (protocols, _) = store.list_protocols(project.id, None, 100, 0).await?;
+        let (protocols, _) = store.list_protocols(Some(project.id), None, 100, 0).await?;
 
         for protocol in &protocols {
             // Check trigger_mode supports scheduling

@@ -127,7 +127,7 @@ pub async fn export_skill(
     // Find protocols linked to this skill via skill_id
     let project_id = skill.project_id;
     let (all_protocols, _) = match project_id {
-        Some(pid) => graph_store.list_protocols(pid, None, 100, 0).await,
+        Some(pid) => graph_store.list_protocols(Some(pid), None, 100, 0).await,
         None => Ok((Vec::new(), 0)),
     }
     .unwrap_or_default();
