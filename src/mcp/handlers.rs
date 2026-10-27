@@ -75,6 +75,49 @@ fn resolve_intent_profile(
 /// A string is only converted when the tool's published input schema declares
 /// that parameter as a non-string type; parameters declared as strings, or not
 /// declared at all, are left verbatim (so `"007"` or `"true"` survive as titles).
+/// Keys of a skill update, `project_id` included.
+pub(crate) const SKILL_UPDATE_KEYS: &[&str] = &[
+    "name",
+    "description",
+    "status",
+    "tags",
+    "trigger_patterns",
+    "context_template",
+    "energy",
+    "cohesion",
+    "project_id",
+];
+
+/// Keys of a protocol update, `project_id` included.
+pub(crate) const PROTOCOL_UPDATE_KEYS: &[&str] = &[
+    "name",
+    "description",
+    "protocol_category",
+    "trigger_mode",
+    "trigger_config",
+    "relevance_vector",
+    "project_id",
+];
+
+/// Copy the update keys the caller actually sent.
+///
+/// `project_id` is a **tri-state**: absent means "leave the scope alone", null
+/// means "make it transverse", a uuid means "attach it". The key is therefore
+/// copied when it is *present*, null included.
+///
+/// This used to be a whitelist rebuilt by hand inside each dispatch arm, and
+/// `project_id` was never in it: re-scoping a skill or a protocol was impossible
+/// through MCP, silently — the call succeeded and changed nothing.
+pub(crate) fn update_body(args: &Value, keys: &[&str]) -> serde_json::Map<String, Value> {
+    let mut body = serde_json::Map::new();
+    for key in keys {
+        if let Some(value) = args.get(*key) {
+            body.insert((*key).to_string(), value.clone());
+        }
+    }
+    body
+}
+
 fn unstringify_json_values(args: &mut Value, properties: Option<&Value>) {
     let (Some(obj), Some(props)) = (args.as_object_mut(), properties) else {
         return;
@@ -5233,31 +5276,7 @@ impl ToolHandler {
 
             "update_skill" => {
                 let skill_id = extract_id(args, "skill_id")?;
-                let mut body = serde_json::Map::new();
-                if let Some(v) = args.get("name") {
-                    body.insert("name".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("description") {
-                    body.insert("description".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("status") {
-                    body.insert("status".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("tags") {
-                    body.insert("tags".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("trigger_patterns") {
-                    body.insert("trigger_patterns".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("context_template") {
-                    body.insert("context_template".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("energy") {
-                    body.insert("energy".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("cohesion") {
-                    body.insert("cohesion".to_string(), v.clone());
-                }
+                let body = update_body(args, SKILL_UPDATE_KEYS);
                 let result = http
                     .put(&format!("/api/skills/{}", skill_id), &Value::Object(body))
                     .await?;
@@ -5833,25 +5852,7 @@ impl ToolHandler {
 
             "update_protocol" => {
                 let protocol_id = extract_id(args, "protocol_id")?;
-                let mut body = serde_json::Map::new();
-                if let Some(v) = args.get("name") {
-                    body.insert("name".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("description") {
-                    body.insert("description".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("protocol_category") {
-                    body.insert("protocol_category".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("trigger_mode") {
-                    body.insert("trigger_mode".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("trigger_config") {
-                    body.insert("trigger_config".to_string(), v.clone());
-                }
-                if let Some(v) = args.get("relevance_vector") {
-                    body.insert("relevance_vector".to_string(), v.clone());
-                }
+                let body = update_body(args, PROTOCOL_UPDATE_KEYS);
                 let result = http
                     .put(
                         &format!("/api/protocols/{}", protocol_id),
@@ -6566,6 +6567,54 @@ impl ToolHandler {
 
             // ── All tools migrated ──────────────────────────────────────
             _ => Ok(None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod update_body_tests {
+    //! `project_id` is a tri-state and the dispatch used to drop it entirely:
+    //! re-scoping a skill or a protocol through MCP succeeded and changed
+    //! nothing. These pin the three cases, because only one of them may erase
+    //! a scope.
+    use super::{update_body, PROTOCOL_UPDATE_KEYS, SKILL_UPDATE_KEYS};
+    use serde_json::json;
+
+    #[test]
+    fn an_absent_project_id_stays_absent() {
+        for keys in [SKILL_UPDATE_KEYS, PROTOCOL_UPDATE_KEYS] {
+            let body = update_body(&json!({ "name": "renamed" }), keys);
+            assert!(
+                !body.contains_key("project_id"),
+                "absent must not be forwarded: it means 'leave the scope alone'"
+            );
+            assert_eq!(body.get("name"), Some(&json!("renamed")));
+        }
+    }
+
+    #[test]
+    fn a_null_project_id_reaches_the_api_as_null() {
+        for keys in [SKILL_UPDATE_KEYS, PROTOCOL_UPDATE_KEYS] {
+            let body = update_body(&json!({ "project_id": null }), keys);
+            assert_eq!(
+                body.get("project_id"),
+                Some(&json!(null)),
+                "null means 'make it transverse' and must be forwarded"
+            );
+        }
+    }
+
+    #[test]
+    fn a_uuid_project_id_is_forwarded() {
+        for keys in [SKILL_UPDATE_KEYS, PROTOCOL_UPDATE_KEYS] {
+            let body = update_body(
+                &json!({ "project_id": "0e408038-0000-0000-0000-000000000000" }),
+                keys,
+            );
+            assert_eq!(
+                body.get("project_id"),
+                Some(&json!("0e408038-0000-0000-0000-000000000000"))
+            );
         }
     }
 }
@@ -13025,6 +13074,21 @@ mod schema_drift_tests {
             regex::Regex::new(r#"args\["([a-z_0-9]+)"\]"#).unwrap(),
         ];
         let for_list = regex::Regex::new(r"for \w+ in &?\[([^\]]*)\]").unwrap();
+        // An arm may read its keys through a shared list (`update_body(args, X)`)
+        // instead of spelling every `args.get("k")`. Follow the list to its
+        // `const X: &[&str] = &[...]` so the check keeps seeing those keys.
+        let update_body_re = regex::Regex::new(r"update_body\(args, ([A-Z_]+)\)").unwrap();
+        let const_re = regex::Regex::new(r"(?s)const ([A-Z_]+): &\[&str\] = &\[(.*?)\];").unwrap();
+        let mut const_keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for cap in const_re.captures_iter(src) {
+            const_keys.insert(
+                cap[1].to_string(),
+                name_re
+                    .captures_iter(&cap[2])
+                    .map(|c| c[1].to_string())
+                    .collect(),
+            );
+        }
 
         let mut arms: Vec<(Vec<String>, String)> = Vec::new();
         let mut continuing = false;
@@ -13067,6 +13131,11 @@ mod schema_drift_tests {
             for c in for_list.captures_iter(&body) {
                 for n in name_re.captures_iter(&c[1]) {
                     keys.insert(n[1].to_string());
+                }
+            }
+            for c in update_body_re.captures_iter(&body) {
+                if let Some(from_const) = const_keys.get(&c[1]) {
+                    keys.extend(from_const.iter().cloned());
                 }
             }
             keys.remove("action");
