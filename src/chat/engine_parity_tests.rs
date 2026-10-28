@@ -362,6 +362,10 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
     (Engine::Codex, "images", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "Codex v1 n'accepte pas les blocs image (A12)" }),
     (Engine::Codex, "anthropic_messages", Expect::NotMeasured { why: "Codex utilise son propre moteur LLM (API Codex v1), pas l'API Anthropic Messages ; concept sans objet sur ce moteur" }),
     (Engine::Codex, "ask_user_question", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "requestUserInput est expérimental en v1 ; le backend le synthétise mais ne peut pas l'interroger via Codex" }),
+    // The agent façade runs the nexus rev pinned in Cargo.toml, which still closes a question
+    // with an `allow` (measured: fermée par un refus = false). The fix is nexus#147; this gap
+    // closes when the pin is bumped to the release that contains it, and this entry goes with it.
+    (Engine::ClaudeCodeAgent, "ask_user_question", Expect::Gap { cause: Cause::Harness, task: "nexus#147 + bump du rev épinglé", why: "la façade lit le rev épinglé de nexus, qui clôt la question par un allow sans réponse ; le deny est dans nexus#147" }),
     // ── Codex — not_measured (transcript-based fake_codex needs per-function JSONL) ──
     (Engine::Codex, "compaction", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
     (Engine::Codex, "compaction.manual", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
@@ -3662,7 +3666,7 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     );
     w.settle(ends, &manager).await;
 
-    // A question to the user: shown, allowed by the engine, answered by a turn.
+    // A question to the user: shown, closed by a denial that ends the turn (§15.6), answered by a turn.
     let ends = w.turn_ends();
     manager.send_message(&sid, &kc.k("TURN-ASK")).await.unwrap();
     cc_sent += 1;
@@ -3672,7 +3676,9 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
                 if tool_call_id == "t-ask" && questions.to_string().contains("Which database?"))
         })
         .await;
-    let allowed = cli.wait_line(0, "req-ask", WAIT).await.unwrap_or_default();
+    let closing = cli.wait_line(0, "req-ask", WAIT).await.unwrap_or_default();
+    let closed_by_denial =
+        closing.contains("\"behavior\":\"deny\"") && closing.contains("posed to the user");
     w.settle(ends, &manager).await;
     let ends = w.turn_ends();
     // What the frontend sends for the answer (`input_response`): an inert user turn.
@@ -3688,13 +3694,12 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     cc.check(
         "ask_user_question",
         shown
-            && allowed.contains("\"behavior\":\"allow\"")
+            && closed_by_denial
             && answer_read
             && w.said(WAIT, "answered ask").await,
         Cause::Harness,
         format!(
-            "ask_user_question={shown}, autorisée={}, réponse lue au tour suivant={answer_read}",
-            allowed.contains("\"behavior\":\"allow\"")
+            "ask_user_question={shown}, fermée par un refus qui termine le tour={closed_by_denial}, réponse lue au tour suivant={answer_read}"
         ),
     );
     w.settle(ends, &manager).await;

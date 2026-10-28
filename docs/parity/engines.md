@@ -50,7 +50,7 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | `session_record` | le dossier de session porte message_count, total_cost_usd et un titre | ok | ok | ok | not_measured | not_measured | not_measured |
 | `background_tasks` | une tâche d'arrière-plan est suivie (active_tasks_update) | ok | ok | ok | declared (harnais, ISO4) | not_measured | not_measured |
 | `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | ok | ok | declared (harnais, ISO4) | not_measured | not_measured |
-| `ask_user_question` | une question du modèle s'affiche (ask_user_question) et la réponse de l'utilisateur lui revient au tour suivant | ok | ok | ok | declared (harnais, ISO4) | not_measured | not_measured |
+| `ask_user_question` | une question du modèle s'affiche (ask_user_question) et la réponse de l'utilisateur lui revient au tour suivant | ok | gap (harnais, nexus#147 + bump du rev épinglé) | ok | declared (harnais, ISO4) | not_measured | not_measured |
 | `subagents` | un sous-agent (Agent / Task) travaille et sa réponse revient en résultat ; sur le natif, une session enfant qui ne peut pas re-déléguer | ok | ok | ok | not_measured | not_measured | not_measured |
 | `subagents.background` | un sous-agent lancé en arrière-plan (run_in_background: true) rend la main au parent immédiatement ; sa fin est injectée comme task_notification au tour suivant | not_measured | not_measured | not_measured | not_measured | not_measured | not_measured |
 | `subagents.types` | subagent_type valide parmi les types déclarés ; un type inconnu est refusé avec la liste des types connus | not_measured | not_measured | ok | not_measured | not_measured | not_measured |
@@ -58,12 +58,13 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | `session_limits` | sans réglage, aucune limite de durée par tour ni budget de session (ISO5) : le CLI ne reçoit pas --max-budget-usd, une session du moteur agent s'ouvre et reprend sans turn_timeout_ms ni max_tokens | ok | ok | ok | not_measured | not_measured | not_measured |
 | `anthropic_messages` | une instance `anthropic` (clé au coffre) : le harnais natif parle lui-même l'API Messages, et la requête reçue par le modèle porte les trois points cache_control — dernier outil, système, dernier tour (CTX5) | not_measured | not_measured | ok | not_measured | not_measured | not_measured |
 
-`ok` : Claude Code 36/41, Claude Code (moteur agent) 36/41, natif 40/41, Codex 1/41, opencode 0/41, ACP 1/41.
+`ok` : Claude Code 36/41, Claude Code (moteur agent) 35/41, natif 40/41, Codex 1/41, opencode 0/41, ACP 1/41.
 
 ## Écarts déclarés
 
 | Moteur | Fonction | Cause | Tâche | Ce qui manque |
 |---|---|---|---|---|
+| Claude Code (moteur agent) | `ask_user_question` | harnais | nexus#147 + bump du rev épinglé | la façade lit le rev épinglé de nexus, qui clôt la question par un allow sans réponse ; le deny est dans nexus#147 |
 | Codex | `hooks.before_tool` | harnais | ISO4 | Codex v1 n'a pas d'exécutable relais pour les hooks (A40) ; `SessionSpec::hooks` est ignoré avec `provider_notice { hooks_not_supported }` |
 | Codex | `hooks.after_tool` | harnais | ISO4 | Codex v1 n'a pas d'exécutable relais pour les hooks (A40) ; `SessionSpec::hooks` est ignoré avec `provider_notice { hooks_not_supported }` |
 | Codex | `hooks.before_compaction` | harnais | ISO4 | Codex v1 n'a pas d'exécutable relais pour les hooks (A40) ; `SessionSpec::hooks` est ignoré avec `provider_notice { hooks_not_supported }` |
