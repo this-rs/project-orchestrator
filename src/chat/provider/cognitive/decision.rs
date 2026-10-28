@@ -199,6 +199,47 @@ pub fn provider_fault(error_code: Option<&str>, quota_refusal: bool) -> bool {
     error_code.is_some() && !quota_refusal
 }
 
+/// What to feed the bandit after a turn, decided in ONE place.
+///
+/// `None` means "feed nothing", and every reason is deliberate: an overridden
+/// decision (already fed by `close_routing_decision`), a decision without a served
+/// arm, an ending that says nothing about the arm (see [`turn_reward`]), and a
+/// failure that is the ACCOUNT's rather than the model's — a rate limit, an
+/// exhausted quota, no credit — which says the instance is out, not that the arm
+/// answers badly (see [`provider_fault`], QUOTA).
+///
+/// Extracted from the provider's `after_turn`: that wiring had no test, so a
+/// swapped argument or a forgotten guard would have stayed invisible until the
+/// posterior drifted.
+pub fn turn_settlement(
+    decision: &CognitiveDecision,
+    stop_reason: Option<&str>,
+    subtype: &str,
+    is_error: bool,
+    error_code: Option<&str>,
+    quota_refusal: bool,
+) -> Option<(super::store::ArmKey, super::store::ArmObservation)> {
+    if decision.outcome.as_ref().is_some_and(|o| o.overridden) {
+        return None;
+    }
+    let reward = turn_reward(
+        stop_reason,
+        subtype,
+        is_error,
+        provider_fault(error_code, quota_refusal),
+    )?;
+    let arm = decision.served_arm()?;
+    Some((
+        arm,
+        super::store::ArmObservation {
+            reward,
+            success_threshold: super::decider::TURN_REWARD_THRESHOLD,
+            cost_usd: None,
+            latency_ms: None,
+        },
+    ))
+}
+
 /// A request to decide.
 #[derive(Debug, Clone)]
 pub struct DecideRequest {
@@ -336,6 +377,74 @@ mod tests {
             outcome: None,
             used: None,
         }
+    }
+
+    /// The settlement decision, which had no test: a swapped argument or a
+    /// forgotten guard at the manager's call site would have stayed invisible
+    /// until the posterior drifted.
+    #[test]
+    fn a_concluded_success_feeds_one() {
+        let (_, observation) = turn_settlement(
+            &decision(),
+            Some("completed"),
+            "success",
+            false,
+            None,
+            false,
+        )
+        .expect("a concluded success must feed the arm");
+        assert_eq!(observation.reward, 1.0);
+    }
+
+    #[test]
+    fn a_provider_error_feeds_zero() {
+        let (_, observation) = turn_settlement(
+            &decision(),
+            Some("error"),
+            "error_during_execution",
+            true,
+            Some("server_error"),
+            false,
+        )
+        .expect("a provider fault is the arm's failure");
+        assert_eq!(observation.reward, 0.0);
+    }
+
+    #[test]
+    fn an_account_refusal_feeds_nothing() {
+        // 429, exhausted quota, no credit: the ACCOUNT is out, the arm is not to
+        // blame. Feeding a zero here would make the model pay for the bill.
+        assert!(turn_settlement(
+            &decision(),
+            Some("error"),
+            "error_during_execution",
+            true,
+            Some("rate_limit_error"),
+            true
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn an_overridden_decision_is_never_fed_again() {
+        let mut decided = decision();
+        decided.outcome = Some(DecisionOutcome {
+            overridden: true,
+            ..Default::default()
+        });
+        assert!(
+            turn_settlement(&decided, Some("completed"), "success", false, None, false).is_none(),
+            "an override is already fed by close_routing_decision"
+        );
+    }
+
+    #[test]
+    fn a_decision_without_a_served_arm_is_not_fed() {
+        let mut decided = decision();
+        decided.chosen = None;
+        assert!(
+            turn_settlement(&decided, Some("completed"), "success", false, None, false).is_none()
+        );
     }
 
     #[test]
