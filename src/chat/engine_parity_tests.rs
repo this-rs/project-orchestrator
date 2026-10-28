@@ -31,6 +31,11 @@
 //! Offline and deterministic. `NEXUS_FAKES_DIR` must hold `fake_claude`,
 //! `fake_openai`, `fake_mcp` and `nexus-tools` built at the nexus revision
 //! Cargo.toml pins (CI: `.github/actions/nexus-fakes`); a missing one FAILS.
+//!
+//! A STALE one is refused wherever it cannot report what is measured, instead of being
+//! read as a parity gap: a `fake_openai` that does not record request headers hides
+//! `anthropic-version`, and the cell then accused the harness on a `main` whose CI was
+//! green (28/10/2026, see [`anthropic_messages_verdict`]).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -49,7 +54,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use super::agent_e2e_tests::{
-    consent, delta, fake_bin, instance, request, sse_route, store_instance, FakeOpenAi,
+    consent, delta, fake_bin, fakes_dir, instance, request, sse_route, store_instance, FakeOpenAi,
 };
 use super::agent_runtime::ProviderSource;
 use super::config::{ChatConfig, ProviderPath};
@@ -337,8 +342,9 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
     (Engine::ClaudeCode, "anthropic_messages", Expect::NotMeasured { why: CLI_PROMPT_CACHE }),
     (Engine::ClaudeCodeAgent, "anthropic_messages", Expect::NotMeasured { why: CLI_PROMPT_CACHE }),
     // Native/anthropic_messages: ok with correct fakes (header_values["anthropic-version"] is
-    // captured by fake_openai ≥ pin 0587011). Old fakes (08/10) silently dropped that header,
-    // causing a false gap; no EXPECTED entry is needed here.
+    // captured by fake_openai ≥ pin 0587011). No EXPECTED entry: a fake too old to report the
+    // headers is REFUSED by `anthropic_messages_verdict` (it used to read as `gap (harnais)`,
+    // which accused a green `main` — measured 28/10/2026).
     // ISO2: subagents.background — the parity scenario is turn-based (fake_openai), so a
     // background sub-agent whose inject_hint triggers a new turn would need a matching
     // script entry; tested by dedicated unit tests (unknown_subagent_type_is_refused,
@@ -4967,9 +4973,41 @@ async fn anthropic_turn(stage: &Stage, manager: &Arc<ChatManager>, cwd: &str) ->
         .collect();
     w.settle(0, manager).await;
     let _ = manager.close_session(&sid).await;
+    match anthropic_messages_verdict(&posts, answered, ANTHROPIC_KEY) {
+        Ok(verdict) => verdict,
+        Err(why) => panic!(
+            "{why}\n  faux utilisé : {}\n  reconstruire NEXUS_FAKES_DIR à la révision nexus \
+             épinglée dans Cargo.toml (la CI le fait dans .github/actions/nexus-fakes)",
+            fakes_dir().display()
+        ),
+    }
+}
+
+/// The verdict of the `anthropic_messages` cell, from what `fake_openai` recorded.
+///
+/// `Err` means the measurement is IMPOSSIBLE, not that the harness is at fault. A
+/// `fake_openai` older than the nexus pin that records `header_values` reports
+/// `authorization_present`, `headers`, `body`, `method` and `path` — and nothing else
+/// (measured 28/10/2026 on the 17/10 build of `.target-nexus-fakes/debug`). Everything
+/// that depends on headers then goes blind: `anthropic-version` and the API key read as
+/// ABSENT while the harness sends both, and the cell is imputed to the HARNESS on a
+/// `main` whose CI is green. The caller refuses to conclude rather than lie.
+fn anthropic_messages_verdict(
+    posts: &[Value],
+    answered: bool,
+    key: &str,
+) -> Result<(bool, String), &'static str> {
     let Some(post) = posts.first() else {
-        return (false, "aucune requête POST /v1/messages".to_string());
+        return Ok((false, "aucune requête POST /v1/messages".to_string()));
     };
+    if post.get("header_values").is_none() {
+        return Err(
+            "fake_openai ne rapporte pas les en-têtes de la requête (`header_values` absent de \
+             son relevé) : ce faux précède la révision nexus qui les enregistre, donc \
+             anthropic-version et la clé se liraient ABSENTES alors que le harnais les envoie, \
+             et l'écart serait imputé au harnais à tort",
+        );
+    }
     let body = &post["body"];
     let last = body["messages"]
         .as_array()
@@ -4986,7 +5024,7 @@ async fn anthropic_turn(stage: &Stage, manager: &Arc<ChatManager>, cwd: &str) ->
     let points = cache_points(body);
     let version = post["header_values"]["anthropic-version"] == "2023-06-01";
     let key_sent = post["authorization_present"] == true || post["x_api_key_present"] == true;
-    let leaked = post.to_string().contains(ANTHROPIC_KEY);
+    let leaked = post.to_string().contains(key);
     let ok = posts.len() == 1
         && answered
         && tools > 0
@@ -4994,14 +5032,14 @@ async fn anthropic_turn(stage: &Stage, manager: &Arc<ChatManager>, cwd: &str) ->
         && version
         && key_sent
         && !leaked;
-    (
+    Ok((
         ok,
         format!(
             "requêtes /v1/messages={}, réponse={answered}, outils={tools}, points={points:?}, \
              anthropic-version={version}, clé envoyée={key_sent}, clé journalisée={leaked}",
             posts.len()
         ),
-    )
+    ))
 }
 
 // ============================================================================
@@ -5699,4 +5737,76 @@ async fn the_historical_loop_holds_a_turn_for_a_down_provider() {
         !errors.iter().any(|m| m.contains("502")),
         "the held turn was never closed on the refusal: {errors:?}"
     );
+}
+
+// ============================================================================
+// `anthropic_messages`: a fake that cannot report headers is not a parity gap
+// ============================================================================
+
+/// A `/v1/messages` record as `fake_openai` writes it once it records headers: the
+/// three `cache_control` points of CTX5, usable by both the old and the new shape.
+fn anthropic_post(header_values: Option<Value>, key_header: bool) -> Value {
+    let mut record = json!({
+        "method": "POST",
+        "path": "/v1/messages",
+        "headers": {"content-type": "application/json"},
+        "authorization_present": false,
+        "body": {
+            "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+            ]}],
+            "tools": [{"name": "t", "input_schema": {"type": "object"},
+                       "cache_control": {"type": "ephemeral"}}],
+        },
+    });
+    if let Some(headers) = header_values {
+        record["header_values"] = headers;
+    }
+    if key_header {
+        record["x_api_key_present"] = json!(true);
+    }
+    record
+}
+
+#[test]
+fn an_old_fake_is_unmeasurable_not_a_gap_of_the_harness() {
+    // The exact record of the 17/10 build: headers, body, method, path, key booleans,
+    // and NO `header_values`. It used to be read as `gap (harnais)` on a green `main`.
+    let old = anthropic_post(None, false);
+    assert!(old.get("header_values").is_none());
+    let err = anthropic_messages_verdict(&[old], true, ANTHROPIC_KEY)
+        .expect_err("a fake that drops the headers cannot measure the cell");
+    assert!(err.contains("header_values"), "{err}");
+    assert!(
+        err.contains("à tort"),
+        "the reason names the false accusation: {err}"
+    );
+}
+
+#[test]
+fn a_request_without_the_version_header_is_a_real_gap_of_the_harness() {
+    // The guard must not swallow a genuine gap: headers ARE reported, the version is not
+    // what the Messages API requires, so the cell is the harness's fault and says so.
+    let post = anthropic_post(Some(json!({"content-type": "application/json"})), true);
+    let (ok, seen) =
+        anthropic_messages_verdict(&[post], true, ANTHROPIC_KEY).expect("the headers are reported");
+    assert!(!ok, "a missing version header is a gap: {seen}");
+    assert!(seen.contains("anthropic-version=false"), "{seen}");
+}
+
+#[test]
+fn a_conforming_request_is_ok() {
+    let post = anthropic_post(Some(json!({"anthropic-version": "2023-06-01"})), true);
+    let (ok, seen) =
+        anthropic_messages_verdict(&[post], true, ANTHROPIC_KEY).expect("the headers are reported");
+    assert!(ok, "{seen}");
+}
+
+#[test]
+fn a_turn_that_never_reached_the_messages_api_is_a_gap() {
+    let (ok, seen) = anthropic_messages_verdict(&[], true, ANTHROPIC_KEY)
+        .expect("nothing to read headers from is not the same as a blind fake");
+    assert!(!ok);
+    assert!(seen.contains("aucune requête"), "{seen}");
 }
