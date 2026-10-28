@@ -2533,31 +2533,22 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
                 .copied();
             if let Some(decision_id) = decision_id {
                 if let Ok(Some(decision)) = store.decision(decision_id).await {
-                    if !decision.outcome.as_ref().is_some_and(|o| o.overridden) {
-                        let reward = super::provider::cognitive::decision::turn_reward(
+                    if let Some((arm, observation)) =
+                        super::provider::cognitive::decision::turn_settlement(
+                            &decision,
                             Some(stop_reason),
                             &outcome.subtype,
                             outcome.is_error,
                             // A refusal of the account is not the model failing (QUOTA).
-                            super::provider::cognitive::decision::provider_fault(
-                                outcome.error_code.as_deref(),
-                                outcome.quota_refusal,
-                            ),
-                        );
-                        if let (Some(reward), Some(arm)) = (reward, decision.served_arm()) {
-                            let observation = super::provider::cognitive::store::ArmObservation {
-                                reward,
-                                success_threshold:
-                                    super::provider::cognitive::decider::TURN_REWARD_THRESHOLD,
-                                cost_usd: None,
-                                latency_ms: None,
-                            };
-                            if let Err(error) = store.observe(&arm, &observation).await {
-                                warn!(
-                                    %session_id, %decision_id, %error,
-                                    "feeding the turn reward failed"
-                                );
-                            }
+                            outcome.error_code.as_deref(),
+                            outcome.quota_refusal,
+                        )
+                    {
+                        if let Err(error) = store.observe(&arm, &observation).await {
+                            warn!(
+                                %session_id, %decision_id, %error,
+                                "feeding the turn reward failed"
+                            );
                         }
                     }
                 }
