@@ -5,3 +5,9 @@
 
 tests/:  # tests d'intégration — les pilotes réels montent et vérifient les adaptateurs (passer par l'adaptateur serait circulaire)
 src/events/nats_broker_test.rs:  # test du broker — un client réel en boucle locale pour prouver l'échange, pas pour contourner l'adaptateur
+crates/neural-routing-core/:neo4rs  # domaine trajectoires — le magasin neuronal porte son propre pool et ses requêtes ; à extraire vers l'adaptateur (domaine trajectoires)
+crates/neural-routing-gnn/:neo4rs  # domaine trajectoires — l'échantillonneur GNN lit le graphe par le pilote ; même extraction que ci-dessus
+src/chat/manager.rs:meilisearch_sdk  # domaine chat — la recherche des messages construit un client direct ; à porter sur SearchStore
+src/chat/manager.rs:async_nats  # domaine chat — le relais d'annulation de session nomme le client de transport ; à porter sur SessionControl
+src/chat/cancel_relay.rs:async_nats  # domaine chat — le relais nomme le sujet et le client de transport ; même chantier
+src/api/ws_chat_handler.rs:async_nats  # domaine chat — l'abonnement de session expose le type d'abonnement du transport ; même chantier
