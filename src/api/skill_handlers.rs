@@ -1090,6 +1090,84 @@ pub struct SearchSkillsBody {
     pub limit: Option<usize>,
 }
 
+/// Fold note scores into per-skill affinity.
+///
+/// `hits` is `(note_id, raw score)`, `skills_of` maps each hit note to the skills
+/// that own it. A skill takes the **best** of its member notes, not their sum: a
+/// competence is as relevant as its most relevant note, and summing would favour
+/// verbose skills over precise ones.
+///
+/// Scores are normalised by the best hit so the channel is comparable with the
+/// trigger channel, whatever scale the note search uses.
+pub(crate) fn fold_affinity(
+    hits: &[(uuid::Uuid, f64)],
+    skills_of: &[(uuid::Uuid, Vec<uuid::Uuid>)],
+) -> std::collections::HashMap<uuid::Uuid, f64> {
+    let mut affinity: std::collections::HashMap<uuid::Uuid, f64> = std::collections::HashMap::new();
+    let max = hits.iter().map(|(_, score)| *score).fold(0.0_f64, f64::max);
+    if max <= 0.0 {
+        return affinity;
+    }
+    for (note_id, score) in hits {
+        let normalised = (score / max).clamp(0.0, 1.0);
+        for (hit_note, skills) in skills_of {
+            if hit_note != note_id {
+                continue;
+            }
+            for skill_id in skills {
+                let entry = affinity.entry(*skill_id).or_insert(0.0_f64);
+                if normalised > *entry {
+                    *entry = normalised;
+                }
+            }
+        }
+    }
+    affinity
+}
+
+/// How strongly the query matches each skill, through that skill's **member
+/// notes**.
+///
+/// Computed from the note search rather than from raw embeddings: the store layer
+/// has no embedding provider, and the note search already fuses dense and lexical.
+/// Scores are normalised to 0..1 so they are comparable with the trigger channel.
+///
+/// A failure here must never fail the request — no embedding provider simply means
+/// the other channels rank, which is what happened before this existed.
+async fn note_affinity(
+    state: &OrchestratorState,
+    project_id: Option<Uuid>,
+    query: &str,
+) -> std::collections::HashMap<Uuid, f64> {
+    let hits = match state
+        .orchestrator
+        .note_manager()
+        .semantic_search_notes(query, project_id, None, Some(20), None, None)
+        .await
+    {
+        Ok(hits) => hits,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+
+    let mut scores = Vec::with_capacity(hits.len());
+    let mut skills_of = Vec::with_capacity(hits.len());
+    for hit in &hits {
+        scores.push((hit.note.id, hit.score));
+        let skills = state
+            .orchestrator
+            .neo4j()
+            .get_skills_for_note(hit.note.id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|skill| skill.id)
+            .collect();
+        skills_of.push((hit.note.id, skills));
+    }
+
+    fold_affinity(&scores, &skills_of)
+}
+
 /// Rank the competences that answer a free-form query.
 ///
 /// This is the entry point an agent uses when it does not know which competence
@@ -1106,10 +1184,14 @@ pub async fn search_skills(
     }
     let limit = body.limit.unwrap_or(10).clamp(1, 50);
 
+    // The channel that makes the transverse library reachable: a competence whose
+    // name says nothing about the question still scores when its *notes* match.
+    let affinity = note_affinity(&state, body.project_id, query).await;
+
     let matches = state
         .orchestrator
         .neo4j()
-        .search_skills(body.project_id, query, limit)
+        .search_skills_with_affinity(body.project_id, query, limit, &affinity)
         .await
         .map_err(AppError::Internal)?;
 
@@ -1402,6 +1484,39 @@ mod tests {
     /// `project_id: null` must make the skill transverse — the tri-state exists
     /// precisely so a rename cannot silently re-parent it, and so a scope change
     /// can happen without recreating the node (and losing its members).
+    /// The affinity channel: a competence is as relevant as its most relevant
+    /// note, and the scale is normalised so it mixes with the trigger channel.
+    #[test]
+    fn affinity_takes_the_best_member_note_and_normalises() {
+        let (s1, s2, n1, n2) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        // n1 scores 10, n2 scores 5 → normalised 1.0 and 0.5.
+        let hits = vec![(n1, 10.0), (n2, 5.0)];
+        // s1 owns both notes: it keeps the best, not the sum.
+        let skills_of = vec![(n1, vec![s1]), (n2, vec![s1, s2])];
+
+        let affinity = fold_affinity(&hits, &skills_of);
+
+        assert_eq!(
+            affinity.get(&s1),
+            Some(&1.0),
+            "best member note wins, never the sum"
+        );
+        assert_eq!(affinity.get(&s2), Some(&0.5));
+    }
+
+    #[test]
+    fn affinity_is_empty_without_a_hit_or_without_a_skill() {
+        assert!(fold_affinity(&[], &[]).is_empty());
+        let n = uuid::Uuid::new_v4();
+        assert!(fold_affinity(&[(n, 0.0)], &[(n, vec![uuid::Uuid::new_v4()])]).is_empty());
+        assert!(fold_affinity(&[(n, 3.0)], &[]).is_empty());
+    }
+
     #[tokio::test]
     async fn a_null_project_id_makes_the_skill_transverse() {
         let (app, project_id) = test_app_with_project().await;
