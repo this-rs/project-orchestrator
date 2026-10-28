@@ -15276,6 +15276,11 @@ impl ChatManager {
     fn kill_subtree(root_pid: u32) -> Vec<u32> {
         #[cfg(unix)]
         {
+            // kill(0, _) signals the caller's OWN process group: a root pid of 0 (never a
+            // real CLI) would SIGINT the whole test run (ZOMBIE-CLI, Unit Tests on #1002).
+            if root_pid == 0 {
+                return Vec::new();
+            }
             let mut all_pids = vec![root_pid];
             all_pids.extend(Self::get_descendant_pids(root_pid));
 
@@ -29760,6 +29765,17 @@ mod tests {
     /// transport. `InteractiveClient::new` looks the CLI up on disk, so the
     /// tests built on it were skipped wherever it is not installed — CI
     /// included — and passed without running.
+    /// The pid of a process that has exited and been reaped: nothing answers to it. Never 0:
+    /// kill(0, _) signals the caller's own process group, which is the test run itself.
+    fn reaped_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived process");
+        let pid = child.id();
+        child.wait().expect("reap it");
+        pid
+    }
+
     fn create_dummy_client() -> InteractiveClient {
         let (transport, _handle) = nexus_claude::transport::mock::MockTransport::pair();
         InteractiveClient::from_transport(transport)
@@ -36208,7 +36224,7 @@ mod tests {
         // Patch child_pid to a known-dead pid (0 is never a real process).
         // We reconstruct the session with child_pid set directly.
         let (mut dead_session, msgs) = create_dummy_session(false, "", vec![]);
-        dead_session.child_pid = Some(0); // process_alive(Some(0)) == Some(false) on unix
+        dead_session.child_pid = Some(reaped_pid());
         dead_session
             .cli_background_tasks
             .store(1, Ordering::Relaxed);
@@ -36244,7 +36260,7 @@ mod tests {
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
 
         let (mut dead, _) = create_dummy_session(false, "", vec![]);
-        dead.child_pid = Some(0); // never a real process: process_alive(Some(0)) == Some(false)
+        dead.child_pid = Some(reaped_pid());
         let mut events = dead.events_tx.subscribe();
         let (live, _) = create_dummy_session(false, "", vec![]);
         let mut live = live;
