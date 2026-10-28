@@ -8933,16 +8933,28 @@ impl ChatManager {
         nats: &Option<Arc<crate::events::NatsEmitter>>,
         grace: Duration,
     ) {
-        let (tasks_arc, cli_reports_live_tasks) = {
+        let (tasks_arc, cli_reports_live_tasks, cli_background_tasks_arc, child_pid) = {
             let sessions = active_sessions.read().await;
             match sessions.get(session_id) {
                 Some(active) => (
                     active.active_background_tasks.clone(),
                     active.cli_background_tasks.load(Ordering::Relaxed) > 0,
+                    active.cli_background_tasks.clone(),
+                    active.child_pid,
                 ),
                 None => return,
             }
         };
+        // A dead CLI (zombie or reaped) cannot have live tasks; its last count is stale.
+        // Clear it here so the idle-death logic below can do its job without being
+        // falsely kept alive by a count that will never reach 0 (ZOMBIE-CLI).
+        let cli_reports_live_tasks =
+            if cli_reports_live_tasks && process_alive(child_pid) == Some(false) {
+                cli_background_tasks_arc.store(0, Ordering::Relaxed);
+                false
+            } else {
+                cli_reports_live_tasks
+            };
 
         let now_inst = std::time::Instant::now();
         let now_chrono = chrono::Utc::now();
@@ -13999,12 +14011,21 @@ impl ChatManager {
                 (
                     s.active_background_tasks.clone(),
                     s.cli_background_tasks.clone(),
+                    s.child_pid,
                 )
             })
         };
         match tasks {
-            Some((background, cli_background)) => {
-                !background.lock().await.is_empty() || cli_background.load(Ordering::Relaxed) > 0
+            Some((background, cli_background, child_pid)) => {
+                let cli_count = cli_background.load(Ordering::Relaxed);
+                // A dead CLI (zombie or reaped) cannot have live background tasks; its last
+                // reported count is stale. Clear it so the session frees its child slot
+                // instead of holding it until the idle-cleanup timeout (ZOMBIE-CLI).
+                if cli_count > 0 && process_alive(child_pid) == Some(false) {
+                    cli_background.store(0, Ordering::Relaxed);
+                    return !background.lock().await.is_empty();
+                }
+                !background.lock().await.is_empty() || cli_count > 0
             }
             None => false,
         }
@@ -36127,6 +36148,48 @@ mod tests {
         );
         // A session nobody knows is not working.
         assert!(!manager.is_session_working("s-nowhere").await);
+    }
+
+    /// A dead CLI (zombie process) whose `cli_background_tasks` was left > 0 must NOT
+    /// be counted as working — the stale counter is cleared so the child slot is freed
+    /// (ZOMBIE-CLI: `envelope_too_many_children` caused by a defunct `<defunct>` entry).
+    #[tokio::test]
+    async fn a_zombie_cli_is_not_counted_as_working() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        // Session whose cli_background_tasks = 1 but whose CLI process is dead (pid 0
+        // is never a real process on Unix; process_alive(Some(0)) == Some(false)).
+        let (zombie_cli, _) = create_dummy_session(false, "", vec![]);
+        zombie_cli.cli_background_tasks.store(1, Ordering::Relaxed);
+
+        // Patch child_pid to a known-dead pid (0 is never a real process).
+        // We reconstruct the session with child_pid set directly.
+        let (mut dead_session, msgs) = create_dummy_session(false, "", vec![]);
+        dead_session.child_pid = Some(0); // process_alive(Some(0)) == Some(false) on unix
+        dead_session
+            .cli_background_tasks
+            .store(1, Ordering::Relaxed);
+        let cli_bg_arc = dead_session.cli_background_tasks.clone();
+
+        {
+            let mut sessions = manager.active_sessions.write().await;
+            sessions.insert("s-zombie".into(), dead_session);
+        }
+
+        // On a dead CLI, is_session_working must return false.
+        assert!(
+            !manager.is_session_working("s-zombie").await,
+            "a zombie CLI with stale cli_background_tasks must not be counted as working"
+        );
+        // The stale counter must have been cleared.
+        assert_eq!(
+            cli_bg_arc.load(Ordering::Relaxed),
+            0,
+            "cli_background_tasks must be reset to 0 when the CLI process is dead"
+        );
+        // Suppress unused-variable warning.
+        drop(msgs);
     }
 
     /// The envelope's `LiveSessions` view is that same verdict: through the trait, a
