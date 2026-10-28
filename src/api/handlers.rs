@@ -7912,6 +7912,60 @@ impl From<anyhow::Error> for AppError {
 pub(crate) mod tests {
     use super::*;
 
+    // ================================================================
+    // GET /health — JSON contract (frontend keys + backend capabilities)
+    // ================================================================
+
+    /// The `/health` payload keeps its frontend-contract keys — in particular
+    /// `services.neo4j` — and reports the capabilities of the backend that was
+    /// actually built (not a hard-coded manifest).
+    #[tokio::test]
+    async fn health_keeps_frontend_keys_and_reports_backend_capabilities() {
+        use crate::neo4j::mock::MockGraphStore;
+
+        let router =
+            crate::test_helpers::router_with_auth(std::sync::Arc::new(MockGraphStore::new())).await;
+
+        let resp = router
+            .oneshot(
+                axum::http::Request::get("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let obj = json.as_object().expect("health payload is an object");
+
+        for key in ["status", "version", "services", "storage_capabilities"] {
+            assert!(obj.contains_key(key), "missing top-level key `{key}`");
+        }
+
+        // `services.neo4j` is a frontend contract: kept even though the backend
+        // is now selected through the storage factory.
+        let services = obj["services"]
+            .as_object()
+            .expect("`services` is an object");
+        for key in ["neo4j", "meilisearch", "nats"] {
+            assert!(services.contains_key(key), "missing services key `{key}`");
+        }
+
+        // The capabilities reported are the ones the built backend declares.
+        let caps = obj["storage_capabilities"]
+            .as_object()
+            .expect("`storage_capabilities` is an object");
+        assert!(!caps.is_empty(), "capabilities must not be empty");
+        assert!(
+            caps["vector_search"].as_bool().unwrap_or(false),
+            "mock backend declares vector_search"
+        );
+    }
+
     // ── delegate_task: the spawn envelope (decision A17) ───────────────────
 
     fn parent_envelope(ceiling: &str) -> crate::chat::envelope::ParentEnvelope {
