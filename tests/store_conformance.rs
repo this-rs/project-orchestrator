@@ -2023,14 +2023,6 @@ const EXPECTED_DIVERGENCES: &[Divergence] = &[
          lost whenever another project holds 3 × limit closer notes (A gets nothing for limit 2 behind ten notes of B); the mock filters first",
         true,
     ),
-    neo4j(
-        "check_ordering_is_deterministic_across_pages",
-        "list_notes orders by created_at alone (ORDER BY n.created_at DESC, src/neo4j/note.rs:403), so notes sharing a created_at \
-         are unordered and SKIP/LIMIT across them is not a partition: walking pages of 2 over seven notes written on three \
-         instants returned one note twice and never showed another in 4 of 4 runs on a fresh Neo4j 5.26.20 (2026-10-28), and one \
-         run drew different boundaries on its second walk; the mock pages a stable list",
-        true,
-    ),
 ];
 
 /// Runs one check against one backend, applying [`EXPECTED_DIVERGENCES`].

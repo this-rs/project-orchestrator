@@ -21,7 +21,9 @@ pub(crate) fn list_all_plan_runs_cypher(by_workspace: bool, by_status: bool) -> 
     if by_status {
         cypher.push_str("WHERE r.status = $status\n");
     }
-    cypher.push_str("RETURN r\nORDER BY r.started_at DESC\nSKIP $offset\nLIMIT $limit");
+    cypher.push_str(
+        "RETURN r\nORDER BY r.started_at DESC, r.run_id DESC\nSKIP $offset\nLIMIT $limit",
+    );
     cypher
 }
 

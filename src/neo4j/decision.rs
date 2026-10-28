@@ -873,7 +873,7 @@ impl Neo4jClient {
 
         let list_cypher = format!(
             "{} {} RETURN d, task_id, project_id \
-             ORDER BY d.decided_at DESC SKIP $offset LIMIT $limit",
+             ORDER BY d.decided_at DESC, d.id DESC SKIP $offset LIMIT $limit",
             head, scope
         );
         let list_q = bind(
