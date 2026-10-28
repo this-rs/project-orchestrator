@@ -330,7 +330,7 @@ impl Neo4jClient {
                OR ($project_id IS NOT NULL AND proto.project_id IS NULL)
                OR ($project_id IS NULL AND proto.project_id IS NULL))
             RETURN proto
-            ORDER BY proto.updated_at DESC
+            ORDER BY proto.updated_at DESC, proto.id DESC
             SKIP $offset LIMIT $limit
             "#
         } else {
@@ -340,7 +340,7 @@ impl Neo4jClient {
                OR ($project_id IS NOT NULL AND proto.project_id IS NULL)
                OR ($project_id IS NULL AND proto.project_id IS NULL))
             RETURN proto
-            ORDER BY proto.updated_at DESC
+            ORDER BY proto.updated_at DESC, proto.id DESC
             SKIP $offset LIMIT $limit
             "#
         };
@@ -1071,14 +1071,14 @@ impl Neo4jClient {
             r#"
             MATCH (r:ProtocolRun {protocol_id: $protocol_id, status: $status})
             RETURN r
-            ORDER BY r.started_at DESC
+            ORDER BY r.started_at DESC, r.id DESC
             SKIP $offset LIMIT $limit
             "#
         } else {
             r#"
             MATCH (r:ProtocolRun {protocol_id: $protocol_id})
             RETURN r
-            ORDER BY r.started_at DESC
+            ORDER BY r.started_at DESC, r.id DESC
             SKIP $offset LIMIT $limit
             "#
         };

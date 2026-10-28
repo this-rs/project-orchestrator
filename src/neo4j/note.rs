@@ -2399,7 +2399,7 @@ impl Neo4jClient {
             MATCH (n:Note)
             WHERE n.embedding IS NULL
             RETURN n
-            ORDER BY n.created_at ASC
+            ORDER BY n.created_at ASC, n.id ASC
             SKIP $offset
             LIMIT $limit
         "#;
