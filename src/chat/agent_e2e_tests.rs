@@ -16996,9 +16996,20 @@ mod zombie_cli_real_kill {
         );
 
         // The one CLI this session started: the child that did not exist before it.
+        // Other tests run in parallel and spawn their own `fake_claude` under this process: the
+        // new child is not enough. Ours is the one whose environment names OUR transcript
+        // (the tempdir path is unique to this test).
+        let marker = transcript.display().to_string();
         let cli: Vec<i32> = fake_claude_children()
             .into_iter()
             .filter(|p| !before.contains(p))
+            .filter(|p| {
+                Command::new("ps")
+                    .args(["eww", "-o", "command=", "-p", &p.to_string()])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).contains(&marker))
+                    .unwrap_or(false)
+            })
             .collect();
         assert_eq!(cli.len(), 1, "exactly one CLI for this session: {cli:?}");
         let pid = cli[0];
