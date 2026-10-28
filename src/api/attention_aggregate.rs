@@ -1070,6 +1070,10 @@ pub struct LiveAgent {
     pub idle_secs: i64,
     pub message_count: i64,
     pub total_cost_usd: Option<f64>,
+    /// Skills injected into this session so far (most recent first, at most 8).
+    pub skills: Vec<crate::chat::activation_registry::ActivatedRef>,
+    /// Personas injected into this session so far (most recent first, at most 8).
+    pub personas: Vec<crate::chat::activation_registry::ActivatedRef>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -1145,6 +1149,16 @@ pub async fn build_live_agents(
             idle_secs: (now - updated_at).num_seconds().max(0),
             message_count: node.as_ref().map_or(0, |n| n.message_count),
             total_cost_usd: node.as_ref().and_then(|n| n.total_cost_usd),
+            skills: snap
+                .activations
+                .get(id)
+                .map(|a| a.skills.clone())
+                .unwrap_or_default(),
+            personas: snap
+                .activations
+                .get(id)
+                .map(|a| a.personas.clone())
+                .unwrap_or_default(),
         });
     }
     // Waiting first, then streaming, then idle; inside a state the most
@@ -2090,6 +2104,58 @@ mod tests {
                 .insert((*req).to_string());
         }
         snap
+    }
+
+    #[tokio::test]
+    async fn live_agent_carries_the_skills_and_personas_it_was_given() {
+        use crate::chat::activation_registry::{ActivatedRef, SessionActivations};
+        let id = Uuid::new_v4();
+        let store = live_store(vec![]).await;
+        let mut snap = snapshot(&[id], &[], &[]);
+        snap.activations.insert(
+            id,
+            SessionActivations {
+                skills: vec![ActivatedRef {
+                    id: "sk1".into(),
+                    name: "Revue".into(),
+                }],
+                personas: vec![ActivatedRef {
+                    id: "pe1".into(),
+                    name: "Pentest".into(),
+                }],
+            },
+        );
+        let r = build_live_agents(&store, now(), &snap).await;
+        let a = r
+            .agents
+            .iter()
+            .find(|a| a.session_id == id.to_string())
+            .expect("listed");
+        assert_eq!(
+            a.skills.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(),
+            ["Revue"]
+        );
+        assert_eq!(
+            a.personas
+                .iter()
+                .map(|x| x.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Pentest"]
+        );
+    }
+
+    /// An agent with nothing recorded lists empty skills and personas, never an error.
+    #[tokio::test]
+    async fn live_agent_without_activations_has_empty_lists() {
+        let id = Uuid::new_v4();
+        let store = live_store(vec![]).await;
+        let r = build_live_agents(&store, now(), &snapshot(&[id], &[], &[])).await;
+        let a = r
+            .agents
+            .iter()
+            .find(|a| a.session_id == id.to_string())
+            .expect("listed");
+        assert!(a.skills.is_empty() && a.personas.is_empty());
     }
 
     #[tokio::test]
