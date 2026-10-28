@@ -423,6 +423,8 @@ impl Decider for CognitiveDecider {
                 &ArmObservation {
                     reward,
                     success_threshold: TURN_REWARD_THRESHOLD,
+                    decay: 1.0,
+
                     cost_usd: None,
                     latency_ms: None,
                 },
@@ -1313,6 +1315,7 @@ mod tests {
                         success_threshold: 0.5,
                         cost_usd: Some(0.05),
                         latency_ms: Some(1_000),
+                        decay: 1.0,
                     },
                 )
                 .await
@@ -1325,6 +1328,7 @@ mod tests {
                         success_threshold: 0.5,
                         cost_usd: Some(0.05),
                         latency_ms: Some(1_000),
+                        decay: 1.0,
                     },
                 )
                 .await
