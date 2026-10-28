@@ -1070,10 +1070,21 @@ pub struct LiveAgent {
     pub idle_secs: i64,
     pub message_count: i64,
     pub total_cost_usd: Option<f64>,
+    /// Background subprocesses the session is waiting on right now, as the
+    /// manager counts them: `(monitors, bash)`. A session can stream nothing for
+    /// minutes while one of these runs; `state` alone would call it idle.
+    pub background_tasks: BackgroundCounts,
     /// Skills injected into this session so far (most recent first, at most 8).
     pub skills: Vec<crate::chat::activation_registry::ActivatedRef>,
     /// Personas injected into this session so far (most recent first, at most 8).
     pub personas: Vec<crate::chat::activation_registry::ActivatedRef>,
+}
+
+/// How many background subprocesses a live session currently owns.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct BackgroundCounts {
+    pub monitors: usize,
+    pub bash: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -1149,6 +1160,11 @@ pub async fn build_live_agents(
             idle_secs: (now - updated_at).num_seconds().max(0),
             message_count: node.as_ref().map_or(0, |n| n.message_count),
             total_cost_usd: node.as_ref().and_then(|n| n.total_cost_usd),
+            background_tasks: snap
+                .background_tasks
+                .get(id)
+                .map(|&(monitors, bash)| BackgroundCounts { monitors, bash })
+                .unwrap_or_default(),
             skills: snap
                 .activations
                 .get(id)
@@ -2104,6 +2120,32 @@ mod tests {
                 .insert((*req).to_string());
         }
         snap
+    }
+
+    /// A session waiting on a background bash is not streaming, yet it works:
+    /// the view says so with the counts, instead of a bare « idle ».
+    #[tokio::test]
+    async fn live_agent_carries_its_background_task_counts() {
+        let id = Uuid::new_v4();
+        let store = live_store(vec![]).await;
+        let mut snap = snapshot(&[id], &[], &[]);
+        snap.background_tasks.insert(id, (1, 2));
+        let r = build_live_agents(&store, now(), &snap).await;
+        let a = r
+            .agents
+            .iter()
+            .find(|a| a.session_id == id.to_string())
+            .expect("listed");
+        assert_eq!(
+            a.background_tasks,
+            BackgroundCounts {
+                monitors: 1,
+                bash: 2
+            }
+        );
+        let quiet = Uuid::new_v4();
+        let r2 = build_live_agents(&store, now(), &snapshot(&[quiet], &[], &[])).await;
+        assert_eq!(r2.agents[0].background_tasks, BackgroundCounts::default());
     }
 
     #[tokio::test]
