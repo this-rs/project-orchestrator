@@ -28366,6 +28366,134 @@ mod tests {
         assert!(matches!(event, ChatEvent::SessionClosed { .. }));
     }
 
+    /// ZOMBIE-CLI-suite: after the provider of a parent's CHILD session dies, the same
+    /// delegation that was refused succeeds again — the refusal (`envelope_too_many_children`)
+    /// came from the dead child still counting as "working" (it reports a running background
+    /// task), and `close_sessions_of_dead_clis` frees the parent's slot by closing it with
+    /// `process_died`. The whole REAL delegation path is exercised
+    /// (`ChatManager::run_subagent`, the one `delegate_task` uses).
+    #[tokio::test]
+    async fn a_delegation_refused_by_a_dead_child_succeeds_again_after_the_watchdog_closes_it() {
+        use nexus_claude::agent::{
+            AgentEvent, BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ProviderError,
+            StopReason, SubagentRequest,
+        };
+        let (manager, _graph, fake) = agent_manager();
+        let manager = Arc::new(manager);
+        manager.enable_subagents();
+        manager
+            .set_max_live_children(1)
+            .await
+            .expect("cap in bounds")
+            .expect("cap stored");
+        let parent = manager
+            .create_session(&agent_request(""))
+            .await
+            .unwrap()
+            .session_id;
+        let parent_uuid = Uuid::parse_str(&parent).unwrap();
+
+        // A child of the parent, idle but "working": it reports a running background task.
+        let mut child_req = agent_request("");
+        child_req.spawned_by = Some(crate::chat::envelope::conversation_spawned_by(parent_uuid));
+        let child = manager.create_session(&child_req).await.unwrap().session_id;
+        fake.state.push_oob(AgentEvent::BackgroundTasks {
+            tasks: vec![BackgroundTask {
+                id: "nt-1".into(),
+                kind: BackgroundTaskKind::Shell,
+                description: "tail -F deploy.log".into(),
+                status: BackgroundTaskStatus::Running,
+                started_at_ms: None,
+                tool_call_id: Some("b1".into()),
+                parent: None,
+                pid: None,
+            }],
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !manager.is_session_working(&child).await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the child is working (its background task is running)");
+
+        // The live child fills the parent's only slot: the delegation is refused, typed.
+        let refused = manager
+            .clone()
+            .run_subagent(&parent, None, &SubagentRequest::new("toolu_1", "do it"))
+            .await;
+        let err = refused.expect_err("the live child blocks the delegation");
+        assert!(
+            err.contains("envelope_too_many_children"),
+            "typed refusal, got: {err}"
+        );
+
+        // The child's provider process dies out of any turn.
+        fake.state.push_oob(AgentEvent::Error {
+            error: ProviderError::ProcessExited { code: None },
+        });
+        let handle = manager.agent_runtime.get(&child).await.expect("registered");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !handle.provider_is_dead() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the out-of-band death reaches the handle");
+
+        // The watchdog closes the dead child, freeing the parent's slot.
+        let closed = manager.close_sessions_of_dead_clis().await;
+        assert_eq!(closed, vec![child.clone()], "the dead child is closed");
+
+        // The SAME delegation now succeeds, and the child it opens finishes normally.
+        let delegation = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            let parent = parent.clone();
+            async move {
+                manager
+                    .run_subagent(
+                        &parent,
+                        None,
+                        &SubagentRequest::new("toolu_2", "do it again"),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fake.state.turns_started.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the child's turn started");
+        fake.state.push(AgentEvent::Text {
+            text: "working".into(),
+            seq: None,
+            parent: None,
+        });
+        fake.state.push(AgentEvent::Done {
+            stop_reason: StopReason::Completed,
+            subtype: Some("success".into()),
+            is_error: false,
+            result_text: Some("done".into()),
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 5,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: Some("m".into()),
+            provider_session_id: Some("p-1".into()),
+            structured_output: None,
+            error: None,
+        });
+        fake.state.end_turn();
+        let answer = tokio::time::timeout(Duration::from_secs(10), delegation)
+            .await
+            .expect("the delegation completes")
+            .expect("no panic");
+        assert_eq!(answer, Ok("done".to_string()));
+    }
+
     #[tokio::test]
     async fn claude_code_stays_on_the_legacy_engine_when_the_operator_says_legacy() {
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
