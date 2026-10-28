@@ -52,7 +52,7 @@ pub use client::Neo4jClient;
 pub use document::{Document, DocumentChunk, DocumentChunkHit};
 pub use models::*;
 pub use segment::Neo4jSegmentStore;
-pub use traits::GraphStore;
+pub use traits::{GraphStore, StoreCapabilities};
 
 // The in-memory store. Unit tests get it through `cfg(test)`; the integration
 // test targets (tests/store_conformance.rs runs the same checks against it and

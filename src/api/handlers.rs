@@ -15,6 +15,7 @@ use crate::neo4j::models::{
     ReleaseStatus, StepNode, TaskNode, TaskStatus, TaskWithPlan,
 };
 use crate::neo4j::plan::{compute_file_conflicts, WaveComputationResult};
+use crate::neo4j::StoreCapabilities;
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::plan::models::*;
 use crate::AuthConfig;
@@ -218,6 +219,8 @@ pub struct HealthResponse {
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub services: Option<ServiceHealthStatus>,
+    /// Manifest of the storage engine capabilities (see `StoreCapabilities`).
+    pub storage_capabilities: StoreCapabilities,
 }
 
 /// Health check handler — verifies actual connectivity to Neo4j, Meilisearch, and NATS.
@@ -285,6 +288,7 @@ pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json
                 },
                 nats: nats_status.to_string(),
             }),
+            storage_capabilities: state.orchestrator.neo4j().capabilities(),
         }),
     )
 }
