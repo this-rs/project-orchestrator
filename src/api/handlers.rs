@@ -245,14 +245,11 @@ pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json
 
     // NATS: check connection state if configured, otherwise "disabled"
     let nats_status = match &state.nats_emitter {
-        Some(emitter) => {
-            let conn_state = emitter.client().connection_state();
-            if conn_state == async_nats::connection::State::Connected {
-                "connected"
-            } else {
-                "disconnected"
-            }
-        }
+        Some(emitter) => match emitter.transport_state() {
+            crate::events::TransportState::Connected => "connected",
+            crate::events::TransportState::Disconnected => "disconnected",
+            _ => "disabled",
+        },
         None => "disabled",
     };
 

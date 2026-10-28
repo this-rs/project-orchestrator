@@ -5,7 +5,7 @@
 //!
 //! Fire-and-forget publishing: errors are logged but never block the caller.
 
-use super::types::{CrudEvent, EventEmitter};
+use super::types::{CrudEvent, EventEmitter, TransportState};
 use crate::chat::types::ChatEvent;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -103,6 +103,14 @@ impl NatsEmitter {
     pub fn with_cancel_rpc_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.cancel_rpc_timeout = timeout;
         self
+    }
+
+    /// Whether the client is currently connected to the server.
+    pub fn transport_state(&self) -> TransportState {
+        match self.client.connection_state() {
+            async_nats::connection::State::Connected => TransportState::Connected,
+            _ => TransportState::Disconnected,
+        }
     }
 
     /// Get a reference to the underlying NATS client.

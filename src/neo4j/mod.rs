@@ -43,6 +43,7 @@ mod synapse_shadow;
 mod task;
 mod topology;
 pub mod traits;
+pub mod trajectory;
 mod trigger;
 mod user;
 mod workspace;

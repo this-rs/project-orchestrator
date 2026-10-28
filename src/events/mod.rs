@@ -102,4 +102,5 @@ pub use reactions::register_builtin_reactions;
 pub use reactor::{EventReactor, ReactorBuilder, ReactorCounters, ReactorStats};
 pub use trigger::EventTrigger;
 pub use trigger_routing::{RoutingContext, RoutingDecision, TriggerRouter};
+pub use types::TransportState;
 pub use types::{CrudAction, CrudEvent, EntityType, EventEmitter, RelatedEntity};

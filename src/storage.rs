@@ -79,31 +79,13 @@ impl StorageBackend {
         let search: Arc<dyn SearchStore> =
             Arc::new(MeiliClient::new(&config.meilisearch_url, &config.meilisearch_key).await?);
 
-        // Trajectory store — neural routing keeps its own connection pool.
-        let nr_graph = Arc::new(
-            neo4rs::Graph::new(
-                &config.neo4j_uri,
-                &config.neo4j_user,
-                &config.neo4j_password,
-            )
-            .await?,
-        );
-        let nr_store = Arc::new(neural_routing_runtime::Neo4jTrajectoryStore::new(nr_graph));
-
-        // The NN router answers with `CALL db.index.vector.queryNodes(
-        // 'trajectory_query_embedding_idx', …)`; a Neo4j VECTOR index is not
-        // implicit. This is the only place it is created: without it the call
-        // throws `There is no such vector schema index`, `NNRouter::route_internal`
-        // returns early, and the dashboard reads `hits: 0` while `total_queries`
-        // climbs — the state measured on 17/10/2026 (290 trajectories, no index).
-        // `IF NOT EXISTS` makes it idempotent and back-fills what is already stored.
-        if let Err(e) = nr_store.ensure_indexes().await {
-            tracing::warn!(
-                error = %e,
-                "neural-routing vector indexes not ensured — the NN router will miss on \
-                 every query (hits stays 0)"
-            );
-        }
+        // Trajectory store — the adapter owns its pool and its schema.
+        let nr_store = crate::neo4j::trajectory::open(
+            &config.neo4j_uri,
+            &config.neo4j_user,
+            &config.neo4j_password,
+        )
+        .await?;
 
         let capabilities = graph.capabilities();
 
