@@ -1,0 +1,7 @@
+# Frontière de stockage — exceptions (une ligne = `chemin:motif  # raison`).
+# `chemin` est un fichier, ou un préfixe de répertoire quand il finit par `/`.
+# `motif` est une sous-chaîne de la ligne citée ; vide = tout le fichier.
+# Cette liste ne fait que décroître : une exception inutilisée est signalée.
+
+tests/:  # tests d'intégration — les pilotes réels montent et vérifient les adaptateurs (passer par l'adaptateur serait circulaire)
+src/events/nats_broker_test.rs:  # test du broker — un client réel en boucle locale pour prouver l'échange, pas pour contourner l'adaptateur
