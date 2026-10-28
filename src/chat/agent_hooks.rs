@@ -2540,6 +2540,7 @@ mod provider_move_tests {
                 });
             }
             Ok(CognitiveDecision {
+                snapshot: None,
                 id: Uuid::new_v4(),
                 at: Utc::now(),
                 signature: request.signature.clone(),
@@ -4327,6 +4328,7 @@ mod segment_tests {
                 });
             }
             Ok(CognitiveDecision {
+                snapshot: None,
                 id: Uuid::new_v4(),
                 at: Utc::now(),
                 signature: request.signature.clone(),

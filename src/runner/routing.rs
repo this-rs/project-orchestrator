@@ -330,6 +330,7 @@ pub(crate) mod test_support {
             self.seen.lock().unwrap().push(request.clone());
             let explicit = request.slot == Slot::Explicit;
             let decision = CognitiveDecision {
+                snapshot: None,
                 id: Uuid::new_v4(),
                 at: chrono::Utc::now(),
                 signature: request.signature.clone(),

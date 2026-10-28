@@ -248,6 +248,7 @@ mod tests {
         age: i64,
     ) -> CognitiveDecision {
         CognitiveDecision {
+            snapshot: None,
             id: Uuid::new_v4(),
             at: chrono::Utc::now() - chrono::Duration::seconds(age),
             signature: TaskSignature {
