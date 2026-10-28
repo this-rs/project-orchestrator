@@ -136,6 +136,7 @@ diagrams:
     covers:
       - "backend:src/api/{ws_chat_handler,refs_ws_tests}.rs"
       - "backend:src/chat/wire_contract.rs"
+      - "backend:src/events/transport.rs"
   - name: po-p2p-transport
     owner: theotime
     status: planned
@@ -392,3 +393,4 @@ diagrams:
       - "backend:src/storage.rs"
       - "backend:src/neo4j/trajectory.rs"
       - "backend:docs/storage/**"
+      - "backend:src/neo4j/graph_sampler.rs"
