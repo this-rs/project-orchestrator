@@ -221,6 +221,130 @@ pub(crate) async fn caller_author(
         .await
 }
 
+// ============================================================================
+// Pinned notes: injected in every turn, whatever the message (knowledge_injection)
+// ============================================================================
+
+/// `?project=<slug>`: the project's pins; absent: the global pins (every session).
+#[derive(Debug, Deserialize)]
+pub struct PinnedNotesQuery {
+    pub project: Option<String>,
+}
+
+/// `PUT /api/knowledge/pinned-notes` body: the whole list, in order.
+#[derive(Debug, Deserialize)]
+pub struct PinnedNotesBody {
+    pub note_ids: Vec<Uuid>,
+}
+
+/// The pins of a scope.
+#[derive(Debug, Serialize)]
+pub struct PinnedNotesView {
+    /// `global` or `project:<slug>`.
+    pub scope: String,
+    pub note_ids: Vec<Uuid>,
+}
+
+/// `GET /api/knowledge/pinned-notes[?project=<slug>]` — the pinned notes of a scope.
+pub async fn get_pinned_notes(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<PinnedNotesQuery>,
+) -> Result<Json<PinnedNotesView>, AppError> {
+    let project = query.project.as_deref();
+    let note_ids = crate::chat::stages::knowledge_injection::load_pinned_notes(
+        state.orchestrator.neo4j(),
+        project,
+    )
+    .await
+    .map_err(AppError::Internal)?;
+    Ok(Json(PinnedNotesView {
+        scope: crate::chat::stages::knowledge_injection::pinned_notes_scope(project),
+        note_ids,
+    }))
+}
+
+/// `PUT /api/knowledge/pinned-notes[?project=<slug>]` — replaces the pins of a scope
+/// (an empty list removes them).
+///
+/// A pin reaches EVERY turn of every session of its scope: whoever pins writes into the
+/// prompts of all of them. So a person only — never an agent, whose note pinned by
+/// itself would be a standing injection (refused by the middleware too, see
+/// `is_human_only_mutation`) — and the GLOBAL pins, which reach other people's chats,
+/// the root account only. A project pin must be a note of that project or a global
+/// note; a global pin must be a global note. At most `MAX_PINNED_NOTES`, each existing.
+pub async fn put_pinned_notes(
+    State(state): State<OrchestratorState>,
+    axum::Extension(claims): axum::Extension<crate::auth::jwt::Claims>,
+    Query(query): Query<PinnedNotesQuery>,
+    Json(body): Json<PinnedNotesBody>,
+) -> Result<Json<PinnedNotesView>, AppError> {
+    use crate::chat::stages::knowledge_injection::{
+        pinned_notes_scope, store_pinned_notes, MAX_PINNED_NOTES,
+    };
+    let graph = state.orchestrator.neo4j();
+    let project = query.project.as_deref();
+    let project_id = match project {
+        Some(slug) => {
+            if state.auth_config.is_some() && !claims.is_human() {
+                return Err(AppError::Forbidden(
+                    "pinned_notes_human_only: only a signed-in person pins notes".into(),
+                ));
+            }
+            let p = graph
+                .get_project_by_slug(slug)
+                .await
+                .map_err(AppError::Internal)?
+                .ok_or_else(|| AppError::NotFound(format!("Project {slug} not found")))?;
+            Some(p.id)
+        }
+        None => {
+            super::provider_handlers::require_root(&state, &claims)?;
+            None
+        }
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let ids: Vec<Uuid> = body
+        .note_ids
+        .into_iter()
+        .filter(|id| seen.insert(*id))
+        .collect();
+    if ids.len() > MAX_PINNED_NOTES {
+        return Err(AppError::BadRequest(format!(
+            "pinned_notes_too_many: at most {MAX_PINNED_NOTES} notes"
+        )));
+    }
+    for id in &ids {
+        let note = graph
+            .get_note(*id)
+            .await
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::BadRequest(format!("pinned_note_unknown: {id}")))?;
+        let fits = match (note.project_id, project_id) {
+            (None, _) => true,
+            (Some(owner), Some(scope)) => owner == scope,
+            (Some(_), None) => false,
+        };
+        if !fits {
+            return Err(AppError::BadRequest(format!(
+                "pinned_note_out_of_scope: {id} belongs to another project{}",
+                if project.is_none() {
+                    " (a global pin must be a global note)"
+                } else {
+                    ""
+                }
+            )));
+        }
+    }
+    store_pinned_notes(graph, project, &ids)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(PinnedNotesView {
+        scope: pinned_notes_scope(project),
+        note_ids: ids,
+    }))
+}
+
 /// Create a new note
 pub async fn create_note(
     State(state): State<OrchestratorState>,
@@ -2051,6 +2175,109 @@ mod tests {
         )
         .await;
         assert_eq!(replaced["created_by"], other["created_by"]);
+    }
+
+    /// Pinning is a person's act: a project's pins are set by a signed-in person, checked
+    /// note by note; an agent is refused (it would inject itself into every turn); the
+    /// global pins, which reach everyone's chats, need the root account.
+    #[tokio::test]
+    async fn only_a_person_pins_notes_and_only_notes_of_the_scope() {
+        use crate::neo4j::traits::GraphStore;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let alpha = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&alpha).await.unwrap();
+        let beta = crate::test_helpers::test_project_named("beta");
+        graph.create_project(&beta).await.unwrap();
+        let mut ids = std::collections::HashMap::new();
+        for (name, project) in [
+            ("global", None),
+            ("alpha", Some(alpha.id)),
+            ("beta", Some(beta.id)),
+        ] {
+            let n = crate::notes::models::Note::new(
+                project,
+                crate::notes::models::NoteType::Guideline,
+                name.into(),
+                "t".into(),
+            );
+            graph.create_note(&n).await.unwrap();
+            ids.insert(name, n.id);
+        }
+        let mut session = crate::test_helpers::test_chat_session(Some("alpha"));
+        session.model = "claude-opus-5-5".into();
+        graph.create_chat_session(&session).await.unwrap();
+        let app = test_app_with_state(crate::test_helpers::mock_app_state_with_graph(
+            graph.clone(),
+        ))
+        .await;
+        let call =
+            |method: &'static str, uri: &'static str, bearer: String, body: serde_json::Value| {
+                let app = app.clone();
+                async move {
+                    let resp = app
+                        .oneshot(
+                            Request::builder()
+                                .method(method)
+                                .uri(uri)
+                                .header("authorization", bearer)
+                                .header("content-type", "application/json")
+                                .body(Body::from(body.to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let status = resp.status();
+                    (status, body_json(resp).await)
+                }
+            };
+        let uri = "/api/knowledge/pinned-notes?project=alpha";
+
+        let (status, view) = call(
+            "PUT",
+            uri,
+            test_bearer_token(),
+            serde_json::json!({"note_ids": [ids["alpha"], ids["global"], ids["alpha"]]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["scope"], "project:alpha");
+        let expected = serde_json::json!([ids["alpha"], ids["global"]]);
+        assert_eq!(view["note_ids"], expected, "deduplicated, in order");
+        let (status, read) = call("GET", uri, test_bearer_token(), serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(read["note_ids"], expected);
+
+        // An agent cannot pin, not even in its own project.
+        let (status, _) = call(
+            "PUT",
+            uri,
+            agent_bearer(session.id),
+            serde_json::json!({"note_ids": [ids["alpha"]]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // A note of another project, an unknown note, too many notes: refused, nothing changed.
+        for body in [
+            serde_json::json!({"note_ids": [ids["beta"]]}),
+            serde_json::json!({"note_ids": [uuid::Uuid::new_v4()]}),
+            serde_json::json!({"note_ids": (0..11).map(|_| uuid::Uuid::new_v4()).collect::<Vec<_>>()}),
+        ] {
+            let (status, err) = call("PUT", uri, test_bearer_token(), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        }
+        let (_, read) = call("GET", uri, test_bearer_token(), serde_json::json!(null)).await;
+        assert_eq!(read["note_ids"], expected);
+
+        // The global pins reach everyone's chats: a person who is not root is refused.
+        let (status, _) = call(
+            "PUT",
+            "/api/knowledge/pinned-notes",
+            test_bearer_token(),
+            serde_json::json!({"note_ids": [ids["global"]]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     /// The other writes an agent makes through the API name it too: an RFC, a decision,
