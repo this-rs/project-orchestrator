@@ -198,7 +198,7 @@ impl Neo4jClient {
             r#"
             MATCH (se:SharingEvent)
             RETURN se
-            ORDER BY se.timestamp DESC
+            ORDER BY se.timestamp DESC, se.id DESC
             SKIP $offset
             LIMIT $limit
             "#,

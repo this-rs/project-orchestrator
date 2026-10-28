@@ -39,40 +39,37 @@ Quand l'ordre importe, le code ajoute une clé secondaire (souvent `id` ou
 | Événements d'exécution | `ORDER BY e.at ASC, e.id ASC` | `src/neo4j/execution_place.rs:79` |
 | Jalons | `ORDER BY m.target_date ASC, m.created_at ASC` | `src/neo4j/milestone.rs:135` |
 
-### 1.2 Clauses **sans** critère de départage
+### 1.2 Clauses paginées départagées par l'identifiant
 
-Beaucoup de tris reposent sur une clé unique **non garantie unique**, donc l'ordre
-entre ex æquo est indéterminé. C'est sans gravité tant que la requête ne pagine
-pas ; ça l'est dès qu'elle pagine :
+Les listes paginées ci-dessous triaient sur une clé **non garantie unique** (`p.energy`
+est un float, `decided_at`/`created_at`/`started_at`/`at`/`timestamp` des
+horodatages non garantis uniques), donc l'ordre entre ex æquo était indéterminé
+et un parcours `SKIP`/`LIMIT` pouvait répéter une entité sur deux pages ou en
+sauter une. Chacune a reçu l'identifiant de l'entité en **dernière** position
+du `ORDER BY` — l'ordre principal ne change pas, l'ordre total est rétabli :
 
 | Requête paginée | Clause | Preuve |
 |---|---|---|
-| Liste des décisions | `ORDER BY d.decided_at DESC SKIP $offset LIMIT $limit` | `src/neo4j/decision.rs:876` |
-| Liste des exécutions de protocole | `ORDER BY r.started_at DESC SKIP $offset LIMIT $limit` | `src/neo4j/protocol.rs:1015` |
-| Liste des exécutions de plan | `ORDER BY r.started_at DESC SKIP $offset LIMIT $limit` | `src/neo4j/plan_run.rs:24` |
-| Liste des personas | `ORDER BY p.energy DESC SKIP $offset LIMIT $limit` | `src/neo4j/persona.rs:321` |
-| Backfill des décisions sans synapse | `ORDER BY d.decided_at SKIP $offset LIMIT $limit` | `src/neo4j/note.rs:2804` |
-| Backfill des notes sans synapse | `ORDER BY n.created_at SKIP $offset LIMIT $limit` | `src/neo4j/note.rs:3666` |
-| Journal de partage | `ORDER BY se.timestamp DESC SKIP $offset LIMIT $limit` | `src/neo4j/sharing.rs:201` |
-| Décisions de routage | `ORDER BY d.at DESC SKIP $offset LIMIT $limit` | `src/neo4j/routing.rs:220` |
+| Liste des décisions | `ORDER BY d.decided_at DESC, d.id DESC SKIP $offset LIMIT $limit` | `src/neo4j/decision.rs:876` |
+| Liste des exécutions de protocole | `ORDER BY r.started_at DESC, r.id DESC SKIP $offset LIMIT $limit` | `src/neo4j/protocol.rs:1015` |
+| Liste des exécutions de plan | `ORDER BY r.started_at DESC, r.run_id DESC SKIP $offset LIMIT $limit` | `src/neo4j/plan_run.rs:25` |
+| Liste des personas | `ORDER BY p.energy DESC, p.id DESC SKIP $offset LIMIT $limit` | `src/neo4j/persona.rs:321` |
+| Liste des notes | `ORDER BY n.{champ} {sens}, n.id {sens}` | `src/neo4j/note.rs:403` |
+| Backfill des décisions sans synapse | `ORDER BY d.decided_at, d.id SKIP $offset LIMIT $limit` | `src/neo4j/note.rs:2804` |
+| Backfill des notes sans synapse | `ORDER BY n.created_at, n.id SKIP $offset LIMIT $limit` | `src/neo4j/note.rs:3666` |
+| Journal de partage | `ORDER BY se.timestamp DESC, se.id DESC SKIP $offset LIMIT $limit` | `src/neo4j/sharing.rs:201` |
+| Décisions de routage | `ORDER BY d.at DESC, d.id DESC SKIP $offset LIMIT $limit` | `src/neo4j/routing.rs:220` |
 
-`p.energy` (float) et `d.decided_at` (horodatage non garanti unique) sont des
-clés où les ex æquo sont fréquents.
-
-**Conséquence pour un paginateur.** Avec `SKIP`/`LIMIT` sur un tri non
-déterminé, la même entité peut apparaître sur deux pages, ou être sautée, si
-l'ordre change entre deux appels. Le code d'aujourd'hui n'a pas de règle
-uniforme : certaines listes paginées ont un départage (`registry.rs:145`
-`ORDER BY ps.trust_score DESC, ps.published_at DESC`), d'autres non. Un
-adaptateur ne peut pas « choisir » un ordre : il doit reproduire l'ordre **et**
-son instabilité pour être conforme, ou bien le tri doit être rendu déterministe
-partout (voir « Ce qui reste indécis »).
+L'identifiant (`id`, `run_id` pour les exécutions de plan) est unique par
+entité : le tri devient total et déterministe, quelle que soit la clé primaire
+(`p.energy`, `d.decided_at`, `n.created_at`, …) qui continue de produire des
+ex æquo.
 
 ### 1.3 Le champ de tri est interpolé dans le texte Cypher
 
 Le champ et la direction sont **splicés** dans la requête par `format!` :
 
-- `ORDER BY n.{} {}` / `SKIP {}` / `LIMIT {}` — `src/neo4j/note.rs:403-405`.
+- `ORDER BY n.{} {}, n.id {}` / `SKIP {}` / `LIMIT {}` — `src/neo4j/note.rs:403-405`.
 
 Pour rester sûr, le champ vient d'une **liste blanche** et d'une fonction de
 repli, jamais de la requête brute :
@@ -100,7 +97,7 @@ La liste et le total sont **deux requêtes distinctes**. Le total n'a pas de
 // Count total
 MATCH (n:Note) {} RETURN count(n) AS total          ← src/neo4j/note.rs:383-388
 // Get notes
-MATCH (n:Note) {} RETURN n ORDER BY n.{} {} SKIP {} LIMIT {}   ← src/neo4j/note.rs:398-405
+MATCH (n:Note) {} RETURN n ORDER BY n.{} {}, n.id {} SKIP {} LIMIT {}   ← src/neo4j/note.rs:398-405
 ```
 
 Même motif ailleurs :
@@ -441,11 +438,10 @@ Points où le code ne tranche pas, constatés (pas des généralités) :
    chronologique » n'est tenue que par **certains** écrivains ; aucun test ne
    verrouille la largeur commune.
 
-2. **Tris paginés sans départage.** Huit listes paginées trient sur une clé non
-   unique sans clé secondaire (`decision.rs:876`, `protocol.rs:1015`,
-   `plan_run.rs:24`, `persona.rs:321`, `note.rs:2804`, `note.rs:3666`,
-   `sharing.rs:201`, `routing.rs:220`). Aucune décision n'est prise : faut-il
-   ajouter un `, id` partout, ou assumer l'ordre instable ?
+2. **Tris paginés départagés — résolu.** Les listes paginées qui triaient
+   sur une clé non unique sans clé secondaire ont reçu l'identifiant en
+   dernière position du `ORDER BY` (voir § 1.2) ; l'ordre est désormais total
+   et le paginage stable.
 
 3. **Deux conventions `NULL`/`''` opposées.** « chaîne vide = absent »
    (`environment.rs:10`, 78 sites de lecture) **vs** « `None` doit rester `NULL` »

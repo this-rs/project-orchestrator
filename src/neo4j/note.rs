@@ -400,11 +400,11 @@ impl Neo4jClient {
             MATCH (n:Note)
             {}
             RETURN n
-            ORDER BY n.{} {}
+            ORDER BY n.{} {}, n.id {}
             SKIP {}
             LIMIT {}
             "#,
-            where_clause, order_field, order_dir, offset, limit
+            where_clause, order_field, order_dir, order_dir, offset, limit
         );
 
         let mut result = self.graph.execute(wb.bind(query(&cypher))).await?;
@@ -2801,7 +2801,7 @@ impl Neo4jClient {
             MATCH (d:Decision)
             WHERE d.embedding IS NOT NULL AND NOT (d)-[:SYNAPSE]->()
             RETURN d
-            ORDER BY d.decided_at
+            ORDER BY d.decided_at, d.id
             SKIP $offset LIMIT $limit
             "#,
         )
@@ -3663,7 +3663,7 @@ impl Neo4jClient {
                 WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
                   AND n.status IN ['active', 'needs_review']
                 RETURN n
-                ORDER BY n.created_at
+                ORDER BY n.created_at, n.id
                 SKIP $offset LIMIT $limit
                 "#,
             )
@@ -3677,7 +3677,7 @@ impl Neo4jClient {
                 WHERE n.embedding IS NOT NULL AND NOT (n)-[:SYNAPSE]->()
                   AND n.status IN ['active', 'needs_review']
                 RETURN n
-                ORDER BY n.created_at
+                ORDER BY n.created_at, n.id
                 SKIP $offset LIMIT $limit
                 "#,
             )
