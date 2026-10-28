@@ -1916,6 +1916,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             api::routing_handlers::set_routing_store(Some(store));
         }
         cm.start_cleanup_task();
+        cm.start_dead_cli_watchdog();
         tracing::info!("Chat manager initialized");
         boot.done("chat");
         Some(cm)

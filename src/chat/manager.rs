@@ -64,6 +64,9 @@ pub(crate) const ROUTING_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest wait for one instance's model catalog while building the Auto pool.
 /// The catalogs are fetched all at once, so this bounds the whole catalog phase.
 pub(crate) const ROUTING_CATALOG_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often the watchdog looks for a legacy session whose CLI process is gone (ZOMBIE-CLI).
+const DEAD_CLI_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 /// Upper bound of building the Auto pool, whatever the number of instances: the
 /// health checks run at once (`ROUTING_HEALTH_TIMEOUT`), then the catalogs at once
 /// (`ROUTING_CATALOG_TIMEOUT`), then the capability probes are waited for together
@@ -18707,17 +18710,65 @@ impl ChatManager {
     }
 
     async fn close_session_inner(&self, session_id: &str) -> Result<()> {
-        self.close_session_inner_with(session_id, true).await
+        self.close_session_inner_with(session_id, true, "closed")
+            .await
+    }
+
+    /// Closes the legacy sessions whose CLI process is gone, with the typed reason
+    /// `process_died` on their `session_closed`. Returns the ids closed.
+    ///
+    /// Why it matters (ZOMBIE-CLI): a killed CLI stays `<defunct>` until something waits
+    /// for it, and its session stays "live" with its child slot held. Closing the session
+    /// runs `disconnect()`, whose `child.wait()` reaps the zombie, and removes the session
+    /// from the live table, which frees the parent's slot and purges its background tasks.
+    pub(crate) async fn close_sessions_of_dead_clis(&self) -> Vec<String> {
+        let dead: Vec<String> = {
+            let sessions = self.active_sessions.read().await;
+            sessions
+                .iter()
+                .filter(|(_, s)| process_alive(s.child_pid) == Some(false))
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in &dead {
+            warn!(session_id = %id, "CLI process is gone: closing its session (process_died)");
+            if let Err(e) = self
+                .close_session_inner_with(id, true, "process_died")
+                .await
+            {
+                warn!(session_id = %id, error = %e, "closing a session of a dead CLI failed");
+            }
+        }
+        dead
+    }
+
+    /// Runs [`Self::close_sessions_of_dead_clis`] every few seconds, so a dead CLI frees its
+    /// slot within seconds rather than after the idle cleanup's half hour.
+    pub fn start_dead_cli_watchdog(self: &Arc<Self>) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(DEAD_CLI_WATCH_INTERVAL);
+            loop {
+                ticker.tick().await;
+                manager.close_sessions_of_dead_clis().await;
+            }
+        });
     }
 
     /// Tears the session down WITHOUT announcing `session_closed`: an in-place provider
     /// switch, whose same thread must see only `provider_switched`, never `session_closed`.
     /// Unlike [`Self::close_session`], it does not remove a neutral directory.
     async fn close_session_for_switch(&self, session_id: &str) -> Result<()> {
-        self.close_session_inner_with(session_id, false).await
+        self.close_session_inner_with(session_id, false, "closed")
+            .await
     }
 
-    async fn close_session_inner_with(&self, session_id: &str, announce: bool) -> Result<()> {
+    async fn close_session_inner_with(
+        &self,
+        session_id: &str,
+        announce: bool,
+        reason: &str,
+    ) -> Result<()> {
         if let Ok(uuid) = Uuid::parse_str(session_id) {
             self.anchor_cache.forget(uuid);
         }
@@ -18771,7 +18822,7 @@ impl ChatManager {
         if announce {
             let closed = ChatEvent::SessionClosed {
                 session_id: session_id.to_string(),
-                reason: Some("closed".to_string()),
+                reason: Some(reason.to_string()),
             };
             let _ = events_tx.send(closed.clone());
             if let Some(ref nats) = self.nats {
@@ -36181,6 +36232,73 @@ mod tests {
         );
         // Suppress unused-variable warning.
         drop(msgs);
+    }
+
+    /// ZOMBIE-CLI, the whole path: a session whose CLI process is dead is CLOSED, with the
+    /// typed reason `process_died` on its `session_closed`, and removed from the live table
+    /// (which frees its parent's child slot). A live CLI and a session without a known pid
+    /// are left alone.
+    #[tokio::test]
+    async fn a_session_whose_cli_died_is_closed_with_process_died() {
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+
+        let (mut dead, _) = create_dummy_session(false, "", vec![]);
+        dead.child_pid = Some(0); // never a real process: process_alive(Some(0)) == Some(false)
+        let mut events = dead.events_tx.subscribe();
+        let (live, _) = create_dummy_session(false, "", vec![]);
+        let mut live = live;
+        live.child_pid = Some(std::process::id()); // this test process: alive
+        let (unknown, _) = create_dummy_session(false, "", vec![]); // child_pid None
+
+        {
+            let mut sessions = manager.active_sessions.write().await;
+            sessions.insert("s-dead".into(), dead);
+            sessions.insert("s-live".into(), live);
+            sessions.insert("s-unknown".into(), unknown);
+        }
+
+        let closed = manager.close_sessions_of_dead_clis().await;
+        assert_eq!(
+            closed,
+            vec!["s-dead".to_string()],
+            "only the dead CLI is closed"
+        );
+
+        {
+            let sessions = manager.active_sessions.read().await;
+            assert!(
+                !sessions.contains_key("s-dead"),
+                "the dead session left the live table"
+            );
+            assert!(
+                sessions.contains_key("s-live"),
+                "a live CLI keeps its session"
+            );
+            assert!(sessions.contains_key("s-unknown"), "no pid, no verdict");
+        }
+        assert!(
+            !manager.is_session_active("s-dead").await,
+            "a closed session holds no envelope slot"
+        );
+
+        // The typed reason reaches the clients.
+        let reason = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match events.recv().await {
+                    Ok(ChatEvent::SessionClosed { session_id, reason })
+                        if session_id == "s-dead" =>
+                    {
+                        break reason;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break None,
+                }
+            }
+        })
+        .await
+        .expect("session_closed is emitted");
+        assert_eq!(reason.as_deref(), Some("process_died"));
     }
 
     /// The envelope's `LiveSessions` view is that same verdict: through the trait, a
