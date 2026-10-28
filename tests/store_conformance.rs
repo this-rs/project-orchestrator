@@ -10,7 +10,9 @@
 //! twelve subjects of P0.1 are fifteen checks: the CAS and the sorting each
 //! have their race (concurrent creation, paging across a tie) as a check of
 //! their own, so the deterministic part stays green on its own merit, and the
-//! vector ranking has a second check for the recall of the project filter.
+//! vector ranking has a second check for the recall of the project filter. Three
+//! more stand on their own: the type a number keeps, the instant a timestamp
+//! keeps, and the page boundaries a tie does not move.
 //!
 //! Neo4j is the reference: a check asserts what Neo4j does, including where that
 //! is lossy (an absent description reads back as `""`), and the mock converges
@@ -48,7 +50,8 @@ pub mod conformance {
     use futures::future::join_all;
     use project_orchestrator::ingress::{ExternalEvent, IngressOutcome};
     use project_orchestrator::neo4j::models::{
-        AlertNode, AlertSeverity, FileNode, PlanNode, PlanStatus, ProjectNode, TaskNode, TaskStatus,
+        AlertNode, AlertSeverity, FileNode, PlanNode, PlanStatus, ProjectNode, StepNode,
+        StepStatus, TaskNode, TaskStatus,
     };
     use project_orchestrator::neo4j::GraphStore;
     use project_orchestrator::notes::{Note, NoteFilters, NoteStatus, NoteType};
@@ -1535,6 +1538,338 @@ pub mod conformance {
         let sin = (1.0 - cos * cos).sqrt();
         q.iter().zip(u).map(|(a, b)| cos * a + sin * b).collect()
     }
+
+    // ------------------------------------------------------------------
+    // 13. Numbers keep their type.
+    // ------------------------------------------------------------------
+
+    /// A counter written as an integer reads back as an integer, a decimal as a
+    /// decimal, and a total the store counts itself counts what is there.
+    ///
+    /// Every read of these numbers in the storage layer is typed and falls back
+    /// in silence when the property does not come back as the expected type:
+    /// `get::<i64>("activation_count").unwrap_or(0)` answers 0 for a counter,
+    /// `get("staleness_score").unwrap_or(0.0)` answers 0.0 for a decimal,
+    /// `get("energy").unwrap_or(1.0)` answers 1.0, `get::<i64>("total_steps")
+    /// .unwrap_or(0)` answers 0 for a total, and `get::<i64>("priority").ok()`
+    /// quietly drops an integer it could not read. None of that raises an error,
+    /// so a number that changed type is visible here or nowhere.
+    pub async fn check_numeric_typing_preserved(store: &dyn GraphStore) {
+        let p = a_project("numbers");
+        store.create_project(&p).await.unwrap();
+
+        let mut note = a_note(Some(p.id), "a counted note");
+        note.activation_count = 7; // an integer counter
+        note.staleness_score = 0.375; // a decimal, exactly representable
+        note.energy = 0.625; // another one, with a fallback of its own (1.0)
+        store.create_note(&note).await.unwrap();
+
+        let plan = a_plan(p.id, "numbers plan", 7, at(0));
+        store.create_plan(&plan).await.unwrap();
+        let mut task = a_task(Some("counted"));
+        task.priority = Some(7);
+        task.estimated_minutes = Some(45);
+        store.create_task(plan.id, &task).await.unwrap();
+        // Three steps, two of them completed: totals the store computes itself.
+        for order in 0..3 {
+            let step = StepNode {
+                id: Uuid::new_v4(),
+                order,
+                description: format!("step {order}"),
+                status: if order < 2 {
+                    StepStatus::Completed
+                } else {
+                    StepStatus::Pending
+                },
+                verification: None,
+                created_at: at(i64::from(order)),
+                updated_at: None,
+                completed_at: None,
+                execution_context: None,
+                persona: None,
+            };
+            store.create_step(task.id, &step).await.unwrap();
+        }
+
+        // Every read first, the cleanup second, the assertions last: a failed
+        // assertion must not leave rows behind in a shared database.
+        let read_note = store
+            .get_note(note.id)
+            .await
+            .unwrap()
+            .expect("the note exists");
+        let read_task = store
+            .get_task(task.id)
+            .await
+            .unwrap()
+            .expect("the task exists");
+        let counted = store
+            .get_task_enrichment_counts(&[task.id.to_string()])
+            .await
+            .unwrap();
+        let progress = store.get_task_step_progress(task.id).await.unwrap();
+
+        assert!(store.delete_note(note.id).await.unwrap());
+        store.delete_project(p.id, &p.name).await.unwrap();
+
+        assert_eq!(
+            read_note.activation_count, 7,
+            "an integer counter stays an integer: written 7, read {} — a counter \
+             stored as a float reads back through \
+             get::<i64>(\"activation_count\").unwrap_or(0) as 0, with no error",
+            read_note.activation_count
+        );
+        assert_eq!(
+            read_note.staleness_score, 0.375,
+            "a decimal stays a decimal: written 0.375, read {} — a score stored \
+             as an integer reads back through unwrap_or(0.0) as 0.0",
+            read_note.staleness_score
+        );
+        assert_eq!(
+            read_note.energy, 0.625,
+            "and so does the second decimal of the same note: written 0.625, \
+             read {} (its fallback is 1.0, a wrong value that is not even zero)",
+            read_note.energy
+        );
+        let counts = counted
+            .get(&task.id.to_string())
+            .expect("the counted task is in the map");
+        assert_eq!(
+            (counts.step_count, counts.completed_step_count),
+            (3, 2),
+            "a total the store counts is 3 steps and 2 completed, read {} and {} \
+             — a count read through get::<i64>(\"total_steps\").unwrap_or(0) \
+             silently answers 0 when its type is not an integer",
+            counts.step_count,
+            counts.completed_step_count
+        );
+        assert_eq!(
+            progress,
+            (2, 3),
+            "the (completed, total) pair of the same steps is (2, 3), read {progress:?}"
+        );
+        assert_eq!(
+            (read_task.priority, read_task.estimated_minutes),
+            (Some(7), Some(45)),
+            "integers read back as integers: read ({:?}, {:?}) — an integer \
+             stored as a float is dropped by get::<i64>(..).ok(), without an error",
+            read_task.priority,
+            read_task.estimated_minutes
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 14. Timestamps: the instant, its rank, and a deadline.
+    // ------------------------------------------------------------------
+
+    /// A run's `started_at` is written as RFC 3339 text: it must read back as the
+    /// instant it was, to the nanosecond; three encodings of one second must rank
+    /// chronologically, which is not what the characters of a text sort say; and a
+    /// deadline computed by adding a duration to a stored instant must fall
+    /// between the stored instants that sit 250 ms on either side of it.
+    ///
+    /// The values are chosen so that a truncation to the whole second, a shift of
+    /// the offset, or a comparison of two different RFC 3339 encodings moves one
+    /// of them across the deadline. The trait only accepts instants, so the
+    /// offset is always the one the store writes; the axis that varies here is
+    /// the precision of the encoding.
+    pub async fn check_datetime_roundtrip_and_arithmetic(store: &dyn GraphStore) {
+        let p = a_project("datetime");
+        store.create_project(&p).await.unwrap();
+        let proto = Protocol::new(Some(p.id), "datetime protocol", Uuid::new_v4());
+        store.upsert_protocol(&proto).await.unwrap();
+
+        // One second, three encodings: no fraction, milliseconds, nanoseconds.
+        let second = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let root = a_run(&proto, None, second - Duration::hours(1));
+        let bare = a_run(&proto, Some(&root), second);
+        let millis = a_run(&proto, Some(&root), second + Duration::milliseconds(400));
+        let nanos = a_run(
+            &proto,
+            Some(&root),
+            second + Duration::milliseconds(900) + Duration::nanoseconds(999),
+        );
+        // A deadline computed from `bare` by adding a duration, straddled by
+        // 250 ms on both sides.
+        let deadline = second + Duration::seconds(30);
+        let just_before = a_run(&proto, Some(&root), deadline - Duration::milliseconds(250));
+        let just_after = a_run(&proto, Some(&root), deadline + Duration::milliseconds(250));
+        let runs = [&root, &bare, &millis, &nanos, &just_before, &just_after];
+        for r in runs {
+            store.create_protocol_run(r).await.unwrap();
+        }
+
+        let read = |id: Uuid| async move {
+            store
+                .get_protocol_run(id)
+                .await
+                .unwrap()
+                .expect("the run was created")
+        };
+        let stored_bare = read(bare.id).await;
+        let stored_millis = read(millis.id).await;
+        let stored_nanos = read(nanos.id).await;
+        let stored_before = read(just_before.id).await;
+        let stored_after = read(just_after.id).await;
+        let newest_first = store
+            .list_protocol_runs(proto.id, None, 10, 0)
+            .await
+            .unwrap()
+            .0;
+        let by_depth = store.get_run_tree(root.id).await.unwrap();
+
+        assert!(store.delete_protocol(proto.id).await.unwrap());
+        for r in runs {
+            store.delete_protocol_run(r.id).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.unwrap();
+
+        assert_eq!(
+            stored_bare.started_at, second,
+            "a run whose instant falls on a whole second reads back as that \
+             second, not as the moment of the read: {}",
+            stored_bare.started_at
+        );
+        assert_eq!(
+            stored_millis.started_at,
+            second + Duration::milliseconds(400),
+            "a millisecond fraction survives the text form: {}",
+            stored_millis.started_at
+        );
+        assert_eq!(
+            stored_nanos.started_at,
+            second + Duration::milliseconds(900) + Duration::nanoseconds(999),
+            "and so does a nanosecond one: {} — a store that keeps the second \
+             alone makes these three runs one and the same instant",
+            stored_nanos.started_at
+        );
+        assert_eq!(
+            ids(&by_depth, |r| r.id),
+            vec![
+                root.id,
+                bare.id,
+                millis.id,
+                nanos.id,
+                just_before.id,
+                just_after.id
+            ],
+            "the run tree ranks by the instant: in RFC 3339 text, \
+             \"...03:04:05+00:00\" precedes \"...03:04:05.400+00:00\" only because \
+             '+' sorts before '.', and a text sort of two encodings is a guess"
+        );
+        assert_eq!(
+            ids(&newest_first, |r| r.id),
+            vec![
+                just_after.id,
+                just_before.id,
+                nanos.id,
+                millis.id,
+                bare.id,
+                root.id
+            ],
+            "the listing is newest first by the instant, every instant distinct"
+        );
+        let from_store = stored_bare.started_at + Duration::seconds(30);
+        assert!(
+            stored_before.started_at < from_store,
+            "a stored instant 250 ms before the deadline computed from a stored \
+             instant is before it: {} vs {from_store}",
+            stored_before.started_at
+        );
+        assert!(
+            stored_after.started_at > from_store,
+            "and the one 250 ms after is after it: {} vs {from_store}",
+            stored_after.started_at
+        );
+        assert_eq!(
+            stored_after.started_at - stored_before.started_at,
+            Duration::milliseconds(500),
+            "the two straddlers are exactly 500 ms apart"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 15. Paging is deterministic across a tie.
+    // ------------------------------------------------------------------
+
+    /// Seven notes on three written instants, so the default `created_at DESC`
+    /// key has ties (three at t, two at t + 1 s, two at t + 2 s): three walks of
+    /// the same pages, and the whole list asked for at once, must agree on every
+    /// boundary — each note seen once, none skipped. The instants are given
+    /// explicitly and never come from `now()`, so the tie is the same tie on
+    /// every run of the suite.
+    pub async fn check_ordering_is_deterministic_across_pages(store: &dyn GraphStore) {
+        let p = a_project("paging-ties");
+        store.create_project(&p).await.unwrap();
+        let t = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let mut notes = Vec::new();
+        for (i, seconds) in [0i64, 0, 0, 1, 1, 2, 2].into_iter().enumerate() {
+            let mut n = a_note(Some(p.id), &format!("tied note {i}"));
+            n.created_at = t + Duration::seconds(seconds);
+            store.create_note(&n).await.unwrap();
+            notes.push(n);
+        }
+        let total_expected = notes.len();
+        let page = |limit: i64, offset: i64| async move {
+            let filters = NoteFilters {
+                limit: Some(limit),
+                offset: Some(offset),
+                ..Default::default()
+            };
+            let (page, total) = store.list_notes(Some(p.id), None, &filters).await.unwrap();
+            assert_eq!(total, total_expected, "the total ignores paging");
+            ids(&page, |n| n.id)
+        };
+
+        let mut walks: Vec<Vec<Uuid>> = Vec::new();
+        for _pass in 0..3 {
+            let mut walk: Vec<Uuid> = Vec::new();
+            let mut offset = 0;
+            loop {
+                let batch = page(2, offset).await;
+                if batch.is_empty() {
+                    break;
+                }
+                walk.extend(batch);
+                offset += 2;
+            }
+            walks.push(walk);
+        }
+        let whole = page(total_expected as i64, 0).await;
+
+        for n in &notes {
+            assert!(store.delete_note(n.id).await.unwrap());
+        }
+        store.delete_project(p.id, &p.name).await.unwrap();
+
+        let all: HashSet<Uuid> = notes.iter().map(|n| n.id).collect();
+        assert_eq!(
+            walks[0].len(),
+            total_expected,
+            "a walk of pages of 2 sees every note once: {:?}",
+            walks[0]
+        );
+        assert_eq!(
+            walks[0].iter().copied().collect::<HashSet<_>>(),
+            all,
+            "no note is skipped or seen twice across the pages: {:?}",
+            walks[0]
+        );
+        for (pass, walk) in walks.iter().enumerate().skip(1) {
+            assert_eq!(
+                walk, &walks[0],
+                "pass {pass} draws its page boundaries elsewhere than the first \
+                 walk, so a tie is broken differently on each query: {walk:?} vs {:?}",
+                walks[0]
+            );
+        }
+        assert_eq!(
+            &whole, &walks[0],
+            "the pages follow the order the whole list gives, page after page: \
+             whole {whole:?} vs paged {:?}",
+            walks[0]
+        );
+    }
 }
 
 // ======================================================================
@@ -1688,6 +2023,14 @@ const EXPECTED_DIVERGENCES: &[Divergence] = &[
          lost whenever another project holds 3 × limit closer notes (A gets nothing for limit 2 behind ten notes of B); the mock filters first",
         true,
     ),
+    neo4j(
+        "check_ordering_is_deterministic_across_pages",
+        "list_notes orders by created_at alone (ORDER BY n.created_at DESC, src/neo4j/note.rs:403), so notes sharing a created_at \
+         are unordered and SKIP/LIMIT across them is not a partition: walking pages of 2 over seven notes written on three \
+         instants returned one note twice and never showed another in 4 of 4 runs on a fresh Neo4j 5.26.20 (2026-10-28), and one \
+         run drew different boundaries on its second walk; the mock pages a stable list",
+        true,
+    ),
 ];
 
 /// Runs one check against one backend, applying [`EXPECTED_DIVERGENCES`].
@@ -1769,6 +2112,9 @@ macro_rules! all_checks {
                 check_traversal_run_tree,
                 check_vector_ranking_with_project_filter,
                 check_vector_project_filter_recall,
+                check_numeric_typing_preserved,
+                check_datetime_roundtrip_and_arithmetic,
+                check_ordering_is_deterministic_across_pages,
             ]
         );
     };
