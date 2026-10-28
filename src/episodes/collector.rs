@@ -150,12 +150,29 @@ pub fn session_episode_id(session_id: Uuid) -> Uuid {
     Uuid::new_v5(&SESSION_EPISODE_NAMESPACE, session_id.as_bytes())
 }
 
-/// Whether a session's `spawned_by` places it inside a run (any `run_id`): a plan
-/// runner, a pipeline, a gate retry, a trigger with a run, a protocol state agent.
-fn is_part_of_a_run(spawned_by: Option<&str>) -> bool {
-    spawned_by
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-        .is_some_and(|v| v.get("run_id").is_some_and(|r| !r.is_null()))
+/// Whether the session works inside a run that has an episode of its own, which a
+/// session episode would count twice: a protocol state agent (`protocol_runner`: its
+/// run IS a protocol run), or a session of a plan run (runner, pipeline, gate, trigger)
+/// whose plan run carries a lifecycle protocol run (the run episode is collected from
+/// it). A plan run without one leaves no run episode: its sessions keep theirs.
+async fn run_has_its_own_episode(neo4j: &dyn GraphStore, spawned_by: Option<&str>) -> Result<bool> {
+    let Some(v) = spawned_by.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()) else {
+        return Ok(false);
+    };
+    let Some(run_id) = v
+        .get("run_id")
+        .and_then(|r| r.as_str())
+        .and_then(|r| Uuid::parse_str(r).ok())
+    else {
+        return Ok(false);
+    };
+    if v.get("type").and_then(|t| t.as_str()) == Some("protocol_runner") {
+        return Ok(true);
+    }
+    Ok(neo4j
+        .get_plan_run(run_id)
+        .await?
+        .is_some_and(|run| run.lifecycle_run_id.is_some()))
 }
 
 /// Take the episode a chat session leaves at its close, `close_reason` being the
@@ -175,8 +192,8 @@ fn is_part_of_a_run(spawned_by: Option<&str>) -> bool {
 ///
 /// `Ok(None)` when there is nothing to keep: no such session, a session that never
 /// received a message, one with no project (an episode belongs to a project), or one
-/// that is part of a run (its `spawned_by` names a `run_id`: the run has its own
-/// episode, and counting the work twice would skew what is learned from it).
+/// that works inside a run with an episode of its own ([`run_has_its_own_episode`]:
+/// counting the work twice would skew what is learned from it).
 ///
 /// Known limits: `preview` is the first message cut to ~200 characters; a session
 /// whose process died without a close (removed from the live table, never closed)
@@ -200,7 +217,7 @@ pub async fn collect_session_episode(
     let Some(slug) = session.project_slug.as_deref() else {
         return Ok(None);
     };
-    if is_part_of_a_run(session.spawned_by.as_deref()) {
+    if run_has_its_own_episode(neo4j, session.spawned_by.as_deref()).await? {
         return Ok(None);
     }
     let Some(project) = neo4j.get_project_by_slug(slug).await? else {
@@ -686,33 +703,72 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        // Part of a run (a plan runner, a protocol state agent): the run has the episode.
-        for spawned in [
-            format!(
-                r#"{{"type":"runner","run_id":"{}","task_id":"{}"}}"#,
-                Uuid::new_v4(),
-                Uuid::new_v4()
+        // No such session.
+        assert!(collect_session_episode(&store, Uuid::new_v4(), "closed")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// A session inside a run whose episode exists already leaves none (no double
+    /// count); a session of a plan run that leaves no run episode keeps its own.
+    #[tokio::test]
+    async fn a_session_is_counted_once_with_its_run() {
+        use crate::neo4j::GraphStore;
+        let with_lifecycle = Uuid::new_v4();
+        let without_lifecycle = Uuid::new_v4();
+        let cases = [
+            (
+                format!(
+                    r#"{{"type":"protocol_runner","run_id":"{}","state_name":"s"}}"#,
+                    Uuid::new_v4()
+                ),
+                false,
             ),
-            format!(
-                r#"{{"type":"protocol_runner","run_id":"{}","state_name":"s"}}"#,
-                Uuid::new_v4()
+            (
+                format!(
+                    r#"{{"type":"runner","run_id":"{with_lifecycle}","task_id":"{}"}}"#,
+                    Uuid::new_v4()
+                ),
+                false,
             ),
-        ] {
+            (
+                format!(
+                    r#"{{"type":"runner","run_id":"{without_lifecycle}","task_id":"{}"}}"#,
+                    Uuid::new_v4()
+                ),
+                true,
+            ),
+            (
+                format!(
+                    r#"{{"type":"runner","run_id":"{}","task_id":"{}"}}"#,
+                    Uuid::new_v4(),
+                    Uuid::new_v4()
+                ),
+                true,
+            ),
+        ];
+        for (spawned, kept) in cases {
             let (store, sid, _) = store_with_session(Some("alpha"), Some("run work")).await;
-            let mut node = crate::neo4j::GraphStore::get_chat_session(&store, sid)
-                .await
-                .unwrap()
-                .unwrap();
+            for (run_id, lifecycle) in [(with_lifecycle, true), (without_lifecycle, false)] {
+                let mut run =
+                    crate::runner::RunnerState::new(run_id, Uuid::new_v4(), 1, Default::default());
+                run.lifecycle_run_id = lifecycle.then(Uuid::new_v4);
+                store.create_plan_run(&run).await.unwrap();
+            }
+            let mut node = store.get_chat_session(sid).await.unwrap().unwrap();
             node.spawned_by = Some(spawned.clone());
             store.chat_sessions.write().await.insert(sid, node);
-            assert!(
-                collect_session_episode(&store, sid, "closed")
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "{spawned}"
-            );
+            let episode = collect_session_episode(&store, sid, "closed")
+                .await
+                .unwrap();
+            assert_eq!(episode.is_some(), kept, "{spawned}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_session_with_nothing_more_to_keep_leaves_no_episode() {
+        let (store, _, _) = store_with_session(Some("alpha"), Some("hello")).await;
         // No such session.
         assert!(collect_session_episode(&store, Uuid::new_v4(), "closed")
             .await

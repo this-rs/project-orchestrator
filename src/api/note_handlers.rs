@@ -285,7 +285,9 @@ pub async fn put_pinned_notes(
     let project = query.project.as_deref();
     let project_id = match project {
         Some(slug) => {
-            if state.auth_config.is_some() && !claims.is_human() {
+            // A person with their own session token: not an agent, an MCP token, a vault
+            // token or the server's account (`may_keep_lasting_approvals`, the same rule).
+            if state.auth_config.is_some() && !claims.may_keep_lasting_approvals() {
                 return Err(AppError::Forbidden(
                     "pinned_notes_human_only: only a signed-in person pins notes".into(),
                 ));

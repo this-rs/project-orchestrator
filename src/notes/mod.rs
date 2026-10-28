@@ -74,7 +74,6 @@ mod current_knowledge_tests {
     }
 }
 
-/// Who, among the agents, wrote something to the graph: see the module documentation.
 pub mod provenance {
     //! Stable agent provenance: who, among the agents, wrote something to the graph.
     //!
@@ -119,12 +118,12 @@ pub mod provenance {
     /// do not make another agent. `None` for an empty model or a name that is not a
     /// model ([`NOT_A_MODEL`]): no agent can be named, the caller keeps its fallback.
     pub fn agent_id(namespace: Uuid, model: &str) -> Option<Uuid> {
-        let model = model.trim();
+        let model = model.trim().to_ascii_lowercase();
         let model = model
             .strip_suffix("[1m]")
-            .unwrap_or(model)
+            .unwrap_or(&model)
             .trim_end()
-            .to_ascii_lowercase();
+            .to_string();
         if model.is_empty() || NOT_A_MODEL.contains(&model.as_str()) {
             return None;
         }
@@ -252,6 +251,10 @@ pub mod provenance {
             }
             assert_eq!(
                 agent_id(ns, "claude-opus-4-6[1m]"),
+                agent_id(ns, "claude-opus-4-6")
+            );
+            assert_eq!(
+                agent_id(ns, "Claude-Opus-4-6[1M]"),
                 agent_id(ns, "claude-opus-4-6")
             );
             assert!(agent_id(ns, "claude-opus-4-6").is_some());

@@ -765,9 +765,9 @@ impl Neo4jClient {
                     .run(query(cypher).param("id", id.to_string()))
                     .await?;
             }
-            // The episode its close left goes with it IN THE SAME STATEMENT: a close
-            // episode written concurrently either commits before (deleted here) or
-            // after (its MATCH finds no session, nothing is written) — never between.
+            // The episode its close left goes with it IN THE SAME STATEMENT. A close episode
+            // written concurrently commits after (its MATCH finds no session: nothing written)
+            // or before (deleted here, or by the sweep just below).
             let q = query(
                 "MATCH (s:ChatSession {id: $id}) \
                  OPTIONAL MATCH (e:SessionEpisode {session_id: $id}) \
@@ -775,6 +775,18 @@ impl Neo4jClient {
             )
             .param("id", id.to_string());
             self.graph.run(q).await?;
+            // A close episode whose write held the session's lock while the delete above
+            // waited lost its link to it (DETACH): it was committed BEFORE the delete, so
+            // it is here now, unlinked — and no write can make another one (no session).
+            self.graph
+                .run(
+                    query(
+                        "MATCH (e:SessionEpisode {session_id: $id}) \
+                         WHERE NOT (e)-[:EPISODE_OF]->() DETACH DELETE e",
+                    )
+                    .param("id", id.to_string()),
+                )
+                .await?;
             Ok(true)
         } else {
             Ok(false)

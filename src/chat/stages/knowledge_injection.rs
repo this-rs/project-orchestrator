@@ -252,7 +252,10 @@ pub const MAX_PINNED_NOTES: usize = 10;
 /// the turn goes on without them, and the ranked knowledge is not lost with them.
 const PINNED_NOTES_BUDGET: Duration = Duration::from_millis(500);
 
-/// The settings scope of the pins: `global` (every session) or `project:<slug>`.
+/// The settings scope of the pins: `global` (every session) or `project:<slug>`, the
+/// convention of the per-project consents. Keyed by slug like them: a renamed project
+/// leaves its pins behind, and a slug reused by a new project finds the old ones (the
+/// consent gate still applies to each note at every turn).
 pub fn pinned_notes_scope(project_slug: Option<&str>) -> String {
     match project_slug {
         Some(slug) => format!("project:{slug}"),
