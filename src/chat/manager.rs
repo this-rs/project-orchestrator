@@ -26,7 +26,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
 use nexus_claude::{
     build_hook_response_json, dispatch_hook_from_registry, is_hook_callback,
-    memory::{ContextInjector, ConversationMemoryManager, MemoryConfig},
+    memory::{
+        ContextInjector, ConversationMemoryManager, GetMessagesOptions, MemoryConfig,
+        MessageSearchOptions, MessageSort,
+    },
     ClaudeCodeOptions, ContentBlock, ContentValue, InteractiveClient, McpServerConfig, Message,
     StreamDelta, StreamEventData,
 };
@@ -5090,7 +5093,7 @@ impl ChatManager {
                                 match serde_json::to_vec(&snapshot) {
                                     Ok(payload) => {
                                         if let Err(e) =
-                                            nats.client().publish(reply_to, payload.into()).await
+                                            nats.publish(&reply_to, payload).await
                                         {
                                             warn!(
                                                 "Failed to reply with snapshot for session {}: {}",
@@ -5201,7 +5204,7 @@ impl ChatManager {
                                     error: Some(format!("Invalid request: {}", e)),
                                 };
                                 if let Ok(payload) = serde_json::to_vec(&resp) {
-                                    let _ = nats.client().publish(reply_to, payload.into()).await;
+                                    let _ = nats.publish(&reply_to, payload).await;
                                 }
                             }
                             continue;
@@ -5255,7 +5258,7 @@ impl ChatManager {
                         };
                         if let Some(reply_to) = msg.reply {
                             if let Ok(payload) = serde_json::to_vec(&resp) {
-                                let _ = nats.client().publish(reply_to, payload.into()).await;
+                                let _ = nats.publish(&reply_to, payload).await;
                             }
                         }
                         break;
@@ -5564,7 +5567,7 @@ impl ChatManager {
                 if let Some(reply_to) = msg.reply {
                     match serde_json::to_vec(&response) {
                         Ok(payload) => {
-                            if let Err(e) = nats.client().publish(reply_to, payload.into()).await {
+                            if let Err(e) = nats.publish(&reply_to, payload).await {
                                 warn!(
                                     "Failed to reply to NATS RPC for session {}: {}",
                                     session_id, e
@@ -13534,8 +13537,8 @@ impl ChatManager {
     /// Reads structured `ChatEventRecord` from Neo4j (the same data the WebSocket
     /// replay uses), so every event type is preserved — not just text.
     ///
-    /// Falls back to Meilisearch `nexus_messages` for pre-migration sessions that
-    /// have no ChatEvent nodes yet (text only, no tool_use).
+    /// Falls back to the message memory for sessions that have no ChatEvent
+    /// nodes yet (text only, no tool_use).
     pub async fn get_session_messages(
         &self,
         session_id: &str,
@@ -13574,40 +13577,42 @@ impl ChatManager {
             });
         }
 
-        // Fallback: pre-migration sessions — read from Meilisearch (text only)
+        // Fallback: sessions without persisted chat events — read from the message memory (text only)
         let session_node = self.graph.get_chat_session(uuid).await?.unwrap();
         if let Some(conversation_id) = session_node.conversation_id {
-            let meili_client = meilisearch_sdk::client::Client::new(
-                &self.config.meilisearch_url,
-                Some(&self.config.meilisearch_key),
-            )
-            .map_err(|e| anyhow!("Failed to create Meilisearch client: {}", e))?;
+            let injector = match self.context_injector.as_ref() {
+                Some(injector) => injector,
+                None => {
+                    return Ok(ChatEventPage {
+                        events: vec![],
+                        total_count: 0,
+                        has_more: false,
+                        offset: offset_val as usize,
+                        limit: limit_val as usize,
+                    });
+                }
+            };
 
-            let index = meili_client.index("nexus_messages");
-            let filter = legacy_messages_filter(&conversation_id);
+            let options = GetMessagesOptions::new()
+                .limit(limit_val as usize)
+                .offset(offset_val as usize)
+                .sort_by(MessageSort::CreatedAt)
+                .newest_first(false);
 
-            let results: meilisearch_sdk::search::SearchResults<
-                nexus_claude::memory::MessageDocument,
-            > = index
-                .search()
-                .with_query("")
-                .with_filter(&filter)
-                .with_sort(&["created_at:asc"])
-                .with_limit(limit_val as usize)
-                .with_offset(offset_val as usize)
-                .execute()
+            let paginated = injector
+                .provider()
+                .get_conversation_messages(&conversation_id, Some(options))
                 .await
                 .map_err(|e| anyhow!("Meilisearch query failed: {}", e))?;
 
-            let meili_total = results.estimated_total_hits.unwrap_or(0);
+            let meili_total = paginated.total_count;
 
             // Convert MessageDocument → ChatEventRecord (text-only approximation)
-            let events: Vec<ChatEventRecord> = results
-                .hits
+            let events: Vec<ChatEventRecord> = paginated
+                .messages
                 .into_iter()
                 .enumerate()
-                .map(|(i, hit)| {
-                    let msg = hit.result;
+                .map(|(i, msg)| {
                     let event_type = if msg.role == "user" {
                         "user_message"
                     } else {
@@ -13839,48 +13844,41 @@ impl ChatManager {
         Ok(updated)
     }
 
-    /// Search messages across all sessions via Meilisearch full-text search.
+    /// Search messages across all sessions via full-text search.
     ///
-    /// Queries the `nexus_messages` index directly (bypassing the nexus SDK's
-    /// `retrieve_context` which applies token_budget / max_context_items limits
-    /// designed for LLM context injection, not UI search).
+    /// Uses the message memory raw search (bypassing the SDK's `retrieve_context`
+    /// which applies token_budget / max_context_items limits designed for LLM
+    /// context injection, not UI search).
     pub async fn search_messages(
         &self,
         query: &str,
         limit: usize,
         project_slug: Option<&str>,
     ) -> Result<Vec<MessageSearchResult>> {
-        use nexus_claude::memory::MessageDocument;
         use std::collections::HashMap as StdHashMap;
 
-        // Build a direct Meilisearch client from our config
-        let meili_client = meilisearch_sdk::client::Client::new(
-            &self.config.meilisearch_url,
-            Some(&self.config.meilisearch_key),
-        )
-        .map_err(|e| anyhow!("Failed to create Meilisearch client: {}", e))?;
+        let injector = match self.context_injector.as_ref() {
+            Some(injector) => injector,
+            None => return Ok(vec![]),
+        };
 
-        let index = meili_client.index("nexus_messages");
-
-        // Query Meilisearch directly — no token budget, no max_context_items
-        let search_results: meilisearch_sdk::search::SearchResults<MessageDocument> = index
-            .search()
-            .with_query(query)
-            .with_limit(limit * 5) // Fetch extra to allow grouping by session
-            .with_show_ranking_score(true)
-            .execute()
+        // Query the memory provider directly — no token budget, no max_context_items
+        let options = MessageSearchOptions::new().limit(limit * 5); // Fetch extra to allow grouping by session
+        let hits: Vec<nexus_claude::memory::MessageSearchHit> = injector
+            .provider()
+            .search_messages(query, &options)
             .await
             .map_err(|e| anyhow!("Meilisearch search failed: {}", e))?;
 
-        if search_results.hits.is_empty() {
+        if hits.is_empty() {
             return Ok(vec![]);
         }
 
         // Group results by conversation_id
         let mut by_conversation: StdHashMap<String, Vec<MessageSearchHit>> = StdHashMap::new();
-        for hit in &search_results.hits {
-            let doc = &hit.result;
-            let score = hit.ranking_score.unwrap_or(0.0);
+        for hit in &hits {
+            let doc = &hit.document;
+            let score = hit.ranking_score;
             let search_hit = MessageSearchHit {
                 message_id: doc.id.clone(),
                 role: doc.role.clone(),
@@ -18033,7 +18031,7 @@ impl ChatManager {
                     return;
                 };
                 let closed = handle.closed.clone();
-                Self::serve_agent_cancels(sub, closed, move |msg: async_nats::Message| {
+                Self::serve_agent_cancels(sub, closed, move |msg: crate::events::transport::Message| {
                     let (nats, handle) = (nats.clone(), Arc::clone(&handle));
                     tokio::spawn(async move {
                         let kind = super::cancel_relay::CancelKind::Tools;
@@ -18067,26 +18065,30 @@ impl ChatManager {
                     return;
                 };
                 let closed = handle.closed.clone();
-                Self::serve_agent_cancels(sub, closed, move |msg: async_nats::Message| {
-                    let Some(reply_to) = msg.reply else { return };
-                    let task_id = super::cancel_relay::task_id_of(&msg.payload);
-                    let (nats, handle) = (nats.clone(), Arc::clone(&handle));
-                    tokio::spawn(async move {
-                        let kind = super::cancel_relay::CancelKind::Task;
-                        super::cancel_relay::answer(
-                            &nats,
-                            reply_to,
-                            super::cancel_relay::asker_v2(&msg.payload),
-                            kind,
-                            Self::unless_agent_closed(
-                                &handle.closed,
+                Self::serve_agent_cancels(
+                    sub,
+                    closed,
+                    move |msg: crate::events::transport::Message| {
+                        let Some(reply_to) = msg.reply else { return };
+                        let task_id = super::cancel_relay::task_id_of(&msg.payload);
+                        let (nats, handle) = (nats.clone(), Arc::clone(&handle));
+                        tokio::spawn(async move {
+                            let kind = super::cancel_relay::CancelKind::Task;
+                            super::cancel_relay::answer(
+                                &nats,
+                                reply_to,
+                                super::cancel_relay::asker_v2(&msg.payload),
                                 kind,
-                                handle.cancel_task(&task_id),
-                            ),
-                        )
-                        .await;
-                    });
-                })
+                                Self::unless_agent_closed(
+                                    &handle.closed,
+                                    kind,
+                                    handle.cancel_task(&task_id),
+                                ),
+                            )
+                            .await;
+                        });
+                    },
+                )
                 .await;
             });
         }
@@ -18109,7 +18111,7 @@ impl ChatManager {
                                 events: handle.streaming_events.lock().await.clone(),
                             };
                             if let Ok(payload) = serde_json::to_vec(&snapshot) {
-                                let _ = nats.client().publish(reply_to, payload.into()).await;
+                                let _ = nats.publish(&reply_to, payload).await;
                             }
                         }
                     }
@@ -18134,7 +18136,7 @@ impl ChatManager {
                             },
                         };
                         if let (Some(reply_to), Ok(payload)) = (msg.reply, serde_json::to_vec(&response)) {
-                            let _ = nats.client().publish(reply_to, payload.into()).await;
+                            let _ = nats.publish(&reply_to, payload).await;
                         }
                     }
                 }
@@ -19621,13 +19623,6 @@ mod runner_spawn_tests {
     }
 }
 
-/// Meilisearch filter selecting one conversation in `nexus_messages`.
-/// `conversation_id` is stored data (not trusted): it is quoted/escaped so a
-/// value containing `"` cannot widen the filter.
-pub(crate) fn legacy_messages_filter(conversation_id: &str) -> String {
-    crate::meilisearch::client::meili_filter_eq("conversation_id", conversation_id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -19659,16 +19654,6 @@ mod tests {
         assert_eq!(
             provider_kind_name(&nexus_claude::agent::ProviderKind::ClaudeCode),
             "claude_code"
-        );
-    }
-
-    #[test]
-    fn legacy_messages_filter_escapes_the_conversation_id() {
-        assert_eq!(legacy_messages_filter("abc"), "conversation_id = \"abc\"");
-        let evil = legacy_messages_filter("x\" OR conversation_id != \"y");
-        assert_eq!(
-            evil,
-            "conversation_id = \"x\\\" OR conversation_id != \\\"y\""
         );
     }
 

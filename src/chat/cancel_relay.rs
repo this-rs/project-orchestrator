@@ -45,7 +45,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::provider::errors::OpenFailure;
-use crate::events::{NatsEmitter, RelayFailure};
+use crate::events::{NatsEmitter, RelayFailure, Subject};
 
 /// How long one cancel may take, on the owner and locally, before it is reported
 /// as `owner_timeout` (shorter than the asker's 10 s, so a slow provider is
@@ -318,7 +318,7 @@ pub async fn bounded<T>(kind: CancelKind, work: impl Future<Output = Result<T>>)
 /// the listeners, so one slow cancel never holds the next one.
 pub async fn answer<T, F>(
     nats: &NatsEmitter,
-    reply_to: async_nats::Subject,
+    reply_to: Subject,
     asker_v2: bool,
     kind: CancelKind,
     work: F,
@@ -338,7 +338,7 @@ pub async fn answer<T, F>(
 /// Publishes one answer on its reply subject (nothing when the asker cannot read it).
 pub async fn publish<T: Serialize>(
     nats: &NatsEmitter,
-    reply_to: async_nats::Subject,
+    reply_to: Subject,
     asker_v2: bool,
     reply: &CancelReply<T>,
 ) {
@@ -346,8 +346,8 @@ pub async fn publish<T: Serialize>(
         return;
     };
     if let Ok(payload) = serde_json::to_vec(&body) {
-        let _ = nats.client().publish(reply_to, payload.into()).await;
-        let _ = nats.client().flush().await;
+        let _ = nats.publish(&reply_to, payload).await;
+        let _ = nats.flush().await;
     }
 }
 
