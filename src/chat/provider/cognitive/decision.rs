@@ -234,6 +234,8 @@ pub fn turn_settlement(
         super::store::ArmObservation {
             reward,
             success_threshold: super::decider::TURN_REWARD_THRESHOLD,
+            decay: 1.0,
+
             cost_usd: None,
             latency_ms: None,
         },

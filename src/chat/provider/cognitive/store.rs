@@ -104,6 +104,16 @@ pub struct ArmObservation {
     /// Legacy: the reward is now fractional (`alpha += reward`); this threshold
     /// is no longer consulted and is kept only for call-site compatibility.
     pub success_threshold: f64,
+    /// Forgetting factor applied before the counts move (PYSR-5).
+    ///
+    /// `1.0` — the default everywhere — keeps every observation, which is the
+    /// historical behaviour. Below that, `alpha ← γ·alpha + r` gives an
+    /// effective memory of about `1/(1−γ)` observations, so an arm whose quality
+    /// drops is demoted instead of keeping a decade of good history.
+    ///
+    /// It travels in the observation rather than in the store so the Cypher path
+    /// honours it too. Measured before activated: nothing sets it below 1.0 yet.
+    pub decay: f64,
     /// Marginal USD, `None` when unknown.
     pub cost_usd: Option<f64>,
     /// Duration in milliseconds.
@@ -146,15 +156,36 @@ pub trait RoutingArmStore: Send + Sync {
     async fn set_outcome(&self, id: Uuid, outcome: DecisionOutcome) -> anyhow::Result<bool>;
 }
 
+/// Forgetting factor for a window of `n` observations.
+///
+/// `alpha ← γ·alpha + r` gives an effective memory of about `1/(1−γ)`
+/// observations, so a window of `n` means `γ = 1 − 1/n`. Pure, so the number
+/// is testable; `n = 1` gives 0 (keep the last observation only) and is clamped
+/// away by the caller, not here.
+pub fn decay_for_window(n: usize) -> f64 {
+    if n == 0 {
+        return 1.0;
+    }
+    1.0 - 1.0 / n as f64
+}
+
 /// In-memory store, for tests and for a run without a graph.
-#[derive(Default)]
 pub struct InMemoryRoutingStore {
     arms: Mutex<HashMap<ArmKey, ArmStats>>,
     decisions: Mutex<Vec<CognitiveDecision>>,
 }
 
+impl Default for InMemoryRoutingStore {
+    fn default() -> Self {
+        Self {
+            arms: Mutex::new(HashMap::new()),
+            decisions: Mutex::new(Vec::new()),
+        }
+    }
+}
+
 impl InMemoryRoutingStore {
-    /// An empty store.
+    /// An empty store, remembering every observation.
     pub fn new() -> Self {
         Self::default()
     }
@@ -193,8 +224,12 @@ impl RoutingArmStore for InMemoryRoutingStore {
         // observation. This is an approximation: the posterior variance is no
         // longer calibrated like an integer count (see the n_eff caveat).
         let reward = observation.reward.clamp(0.0, 1.0);
-        arm.alpha += reward;
-        arm.beta += 1.0 - reward;
+        // PYSR-5: with a forgetting factor below 1, the old counts fade on each
+        // update, so an arm whose quality drops is demoted instead of keeping a
+        // decade of good history.
+        let decay = observation.decay.clamp(0.0, 1.0);
+        arm.alpha = arm.alpha * decay + reward;
+        arm.beta = arm.beta * decay + (1.0 - reward);
         arm.n += 1;
         if let Some(cost) = observation.cost_usd {
             arm.cost_sum_usd += cost;
@@ -254,6 +289,87 @@ impl RoutingArmStore for InMemoryRoutingStore {
     }
 }
 
+/// PYSR-5: the forgetting factor. Off by default — every caller passes 1.0, so
+/// the cumulative Beta is unchanged — and measurable when a replay journal exists.
+#[cfg(test)]
+mod forgetting_tests {
+    use super::*;
+
+    fn key() -> ArmKey {
+        ArmKey::new("code", "deepseek", "v4")
+    }
+
+    fn observation(reward: f64, decay: f64) -> ArmObservation {
+        ArmObservation {
+            reward,
+            success_threshold: 0.5,
+            cost_usd: None,
+            latency_ms: None,
+            decay,
+        }
+    }
+
+    #[test]
+    fn a_window_of_n_observations_forgets_at_one_over_n() {
+        assert_eq!(decay_for_window(0), 1.0, "no window: keep everything");
+        assert_eq!(decay_for_window(1), 0.0, "a window of one: the last only");
+        assert!((decay_for_window(10) - 0.9).abs() < 1e-12);
+        assert!((decay_for_window(100) - 0.99).abs() < 1e-12);
+        // Bigger window, slower forgetting.
+        assert!(decay_for_window(50) > decay_for_window(10));
+    }
+
+    #[tokio::test]
+    async fn the_default_decay_keeps_the_cumulative_beta_exactly() {
+        let store = InMemoryRoutingStore::new();
+        for _ in 0..3 {
+            store.observe(&key(), &observation(1.0, 1.0)).await.unwrap();
+        }
+        let arm = store.arm(&key()).await.unwrap().expect("arm exists");
+        assert_eq!(arm.alpha, 4.0, "prior 1 + three successes");
+        assert_eq!(arm.beta, 1.0, "no failure added");
+        assert_eq!(arm.n, 3, "n still counts observations");
+    }
+
+    #[tokio::test]
+    async fn a_decay_below_one_fades_the_old_counts() {
+        let store = InMemoryRoutingStore::new();
+        store.observe(&key(), &observation(1.0, 1.0)).await.unwrap();
+        store.observe(&key(), &observation(1.0, 0.5)).await.unwrap();
+        let arm = store.arm(&key()).await.unwrap().expect("arm exists");
+        // (1 + 1) * 0.5 + 1 = 2.0 ; beta (1 + 0) * 0.5 + 0 = 0.5
+        assert!((arm.alpha - 2.0).abs() < 1e-12);
+        assert!((arm.beta - 0.5).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn a_decaying_arm_is_demoted_faster_than_a_cumulative_one() {
+        // The whole point of PYSR-5: an arm that stops answering well must lose
+        // its rank, instead of keeping a decade of good history.
+        let cumulative = InMemoryRoutingStore::new();
+        let decaying = InMemoryRoutingStore::new();
+        for _ in 0..3 {
+            cumulative
+                .observe(&key(), &observation(0.0, 1.0))
+                .await
+                .unwrap();
+            decaying
+                .observe(&key(), &observation(0.0, 0.5))
+                .await
+                .unwrap();
+        }
+        let c = cumulative.arm(&key()).await.unwrap().expect("arm");
+        let d = decaying.arm(&key()).await.unwrap().expect("arm");
+        let mean = |a: &ArmStats| a.alpha / (a.alpha + a.beta);
+        assert!(
+            mean(&d) < mean(&c),
+            "with forgetting the posterior must fall further: {} vs {}",
+            mean(&d),
+            mean(&c)
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +410,7 @@ mod tests {
             success_threshold: 0.5,
             cost_usd: cost,
             latency_ms: Some(1_000),
+            decay: 1.0,
         }
     }
 

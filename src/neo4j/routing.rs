@@ -106,7 +106,7 @@ impl Neo4jClient {
             "MERGE (a:RoutingArm {{class: $class, provider_id: $provider_id, model: $model}}) \
              ON CREATE SET a.alpha = 1.0, a.beta = 1.0, a.n = 0, a.cost_sum_usd = 0.0, \
                  a.cost_n = 0, a.latency_sum_ms = 0, a.latency_n = 0 \
-             SET a.alpha = a.alpha + $d_alpha, a.beta = a.beta + $d_beta, a.n = a.n + 1, \
+             SET a.alpha = a.alpha * $decay + $d_alpha, a.beta = a.beta * $decay + $d_beta, a.n = a.n + 1, \
                  a.cost_sum_usd = a.cost_sum_usd + $cost, a.cost_n = a.cost_n + $cost_n, \
                  a.latency_sum_ms = a.latency_sum_ms + $latency, \
                  a.latency_n = a.latency_n + $latency_n, a.updated_at = $updated_at \
@@ -115,6 +115,7 @@ impl Neo4jClient {
         .param("class", key.class.clone())
         .param("provider_id", key.provider_id.clone())
         .param("model", key.model.clone())
+        .param("decay", observation.decay.clamp(0.0, 1.0))
         .param("d_alpha", reward)
         .param("d_beta", 1.0 - reward)
         .param("cost", observation.cost_usd.unwrap_or(0.0))
@@ -359,6 +360,7 @@ mod tests {
             success_threshold: 0.5,
             cost_usd: cost,
             latency_ms: Some(500),
+            decay: 1.0,
         };
         store.observe(&key, &obs(1.0, Some(0.2))).await.unwrap();
         let arm = store.observe(&key, &obs(0.0, None)).await.unwrap();

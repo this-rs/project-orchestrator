@@ -176,6 +176,7 @@ async fn teach(store: &Neo4jRoutingStore, class: &str, winner: (&str, &str)) {
                         success_threshold: 0.5,
                         cost_usd: None,
                         latency_ms: None,
+                        decay: 1.0,
                     },
                 )
                 .await
@@ -202,6 +203,7 @@ async fn teach_counts(
                     success_threshold: 0.5,
                     cost_usd: None,
                     latency_ms: None,
+                    decay: 1.0,
                 },
             )
             .await

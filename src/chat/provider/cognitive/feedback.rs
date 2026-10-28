@@ -305,6 +305,8 @@ pub async fn close_decision_with(
                 &ArmObservation {
                     reward,
                     success_threshold: SUCCESS_THRESHOLD,
+                    decay: 1.0,
+
                     cost_usd: outcome.cost_usd,
                     latency_ms: outcome.duration_ms,
                 },
