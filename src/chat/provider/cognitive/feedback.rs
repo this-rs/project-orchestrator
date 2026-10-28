@@ -295,6 +295,8 @@ pub async fn close_decision_with(
                 input_tokens: outcome.input_tokens,
                 output_tokens: outcome.output_tokens,
                 overridden,
+                attempts: Some(outcome.attempts),
+                verification_passed: outcome.verification_passed,
             },
         )
         .await?;
