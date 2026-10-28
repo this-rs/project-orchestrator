@@ -362,10 +362,6 @@ const EXPECTED: &[(Engine, &str, Expect)] = &[
     (Engine::Codex, "images", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "Codex v1 n'accepte pas les blocs image (A12)" }),
     (Engine::Codex, "anthropic_messages", Expect::NotMeasured { why: "Codex utilise son propre moteur LLM (API Codex v1), pas l'API Anthropic Messages ; concept sans objet sur ce moteur" }),
     (Engine::Codex, "ask_user_question", Expect::Gap { cause: Cause::Harness, task: "ISO4", why: "requestUserInput est expérimental en v1 ; le backend le synthétise mais ne peut pas l'interroger via Codex" }),
-    // The agent façade runs the nexus rev pinned in Cargo.toml, which still closes a question
-    // with an `allow` (measured: fermée par un refus = false). The fix is nexus#147; this gap
-    // closes when the pin is bumped to the release that contains it, and this entry goes with it.
-    (Engine::ClaudeCodeAgent, "ask_user_question", Expect::Gap { cause: Cause::Harness, task: "nexus#147 + bump du rev épinglé", why: "la façade lit le rev épinglé de nexus, qui clôt la question par un allow sans réponse ; le deny est dans nexus#147" }),
     // ── Codex — not_measured (transcript-based fake_codex needs per-function JSONL) ──
     (Engine::Codex, "compaction", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
     (Engine::Codex, "compaction.manual", Expect::NotMeasured { why: CODEX_TRANSCRIPT }),
