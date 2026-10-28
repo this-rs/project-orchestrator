@@ -202,13 +202,14 @@ pub async fn list_project_notes(
     )))
 }
 
-/// The `created_by` of a note written through the API: the agent of the calling chat
-/// session when there is one (`crate::notes::provenance`), `api` otherwise — a person, a
+/// The author of a write made through the API: the agent of the calling chat session
+/// when there is one (`crate::notes::provenance`), `fallback` otherwise — a person, a
 /// script, or a caller that cannot be placed. Never refuses the write.
-async fn note_author(
+pub(crate) async fn caller_author(
     state: &OrchestratorState,
     claims: Option<&crate::auth::jwt::Claims>,
     headers: &axum::http::HeaderMap,
+    fallback: &str,
 ) -> String {
     use crate::chat::envelope::{identify_caller, session_header, SpawnCaller};
     let caller = identify_caller(claims, session_header(headers), state.auth_config.is_some());
@@ -216,7 +217,8 @@ async fn note_author(
         Ok(SpawnCaller::Agent { session_id, .. }) => Some(session_id),
         Ok(SpawnCaller::Human) | Err(_) => None,
     };
-    crate::notes::provenance::author_of(state.orchestrator.neo4j(), session.as_deref(), "api").await
+    crate::notes::provenance::author_of(state.orchestrator.neo4j(), session.as_deref(), fallback)
+        .await
 }
 
 /// Create a new note
@@ -246,7 +248,7 @@ pub async fn create_note(
         .note_manager()
         .create_note(
             request,
-            &note_author(&state, claims.as_ref().map(|c| &c.0), &headers).await,
+            &caller_author(&state, claims.as_ref().map(|c| &c.0), &headers, "api").await,
         )
         .await?;
 
@@ -535,12 +537,16 @@ pub async fn unlink_note_from_entity(
 pub async fn confirm_note(
     State(state): State<OrchestratorState>,
     claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    headers: axum::http::HeaderMap,
     Path(note_id): Path<Uuid>,
 ) -> Result<Json<Note>, AppError> {
     let note = state
         .orchestrator
         .note_manager()
-        .confirm_note(note_id, "api")
+        .confirm_note(
+            note_id,
+            &caller_author(&state, claims.as_ref().map(|c| &c.0), &headers, "api").await,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Note {} not found", note_id)))?;
 
@@ -574,12 +580,18 @@ pub struct InvalidateNoteBody {
 pub async fn invalidate_note(
     State(state): State<OrchestratorState>,
     Path(note_id): Path<Uuid>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<InvalidateNoteBody>,
 ) -> Result<Json<Note>, AppError> {
     let note = state
         .orchestrator
         .note_manager()
-        .invalidate_note(note_id, &body.reason, "api")
+        .invalidate_note(
+            note_id,
+            &body.reason,
+            &caller_author(&state, claims.as_ref().map(|c| &c.0), &headers, "api").await,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Note {} not found", note_id)))?;
 
@@ -613,7 +625,7 @@ pub async fn supersede_note(
         .supersede_note(
             old_note_id,
             request,
-            &note_author(&state, claims.as_ref().map(|c| &c.0), &headers).await,
+            &caller_author(&state, claims.as_ref().map(|c| &c.0), &headers, "api").await,
         )
         .await?;
 
@@ -2039,6 +2051,109 @@ mod tests {
         )
         .await;
         assert_eq!(replaced["created_by"], other["created_by"]);
+    }
+
+    /// The other writes an agent makes through the API name it too: an RFC, a decision,
+    /// a confirmation and an invalidation. A person keeps the author each had before.
+    #[tokio::test]
+    async fn rfcs_decisions_confirmations_and_invalidations_name_the_agent() {
+        use crate::neo4j::traits::GraphStore;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let mut session = crate::test_helpers::test_chat_session(None);
+        session.model = "claude-opus-5-5".into();
+        graph.create_chat_session(&session).await.unwrap();
+        let plan = crate::test_helpers::test_plan();
+        graph.create_plan(&plan).await.unwrap();
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan.id, &task).await.unwrap();
+        let agent = crate::notes::provenance::actor(
+            crate::notes::provenance::agent_id_of_session(graph.as_ref(), session.id)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let app = test_app_with_state(crate::test_helpers::mock_app_state_with_graph(
+            graph.clone(),
+        ))
+        .await;
+        let send = |uri: String, bearer: String, body: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("authorization", bearer)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                (status, body_json(resp).await)
+            }
+        };
+        let rfc_body = serde_json::json!({
+            "title": "An RFC",
+            "sections": [{"title": "Problem", "content": "p"}]
+        });
+        let decision_body = serde_json::json!({"description": "d", "rationale": "r"});
+
+        let (status, rfc) = send(
+            "/api/rfcs".into(),
+            agent_bearer(session.id),
+            rfc_body.clone(),
+        )
+        .await;
+        assert!(status.is_success(), "{rfc}");
+        assert_eq!(rfc["created_by"], agent.as_str(), "{rfc}");
+        let (_, rfc) = send("/api/rfcs".into(), test_bearer_token(), rfc_body).await;
+        assert_eq!(rfc["created_by"], "api");
+
+        let uri = format!("/api/tasks/{}/decisions", task.id);
+        let (status, decision) =
+            send(uri.clone(), agent_bearer(session.id), decision_body.clone()).await;
+        assert!(status.is_success(), "{decision}");
+        assert_eq!(decision["decided_by"], agent.as_str(), "{decision}");
+        let (_, decision) = send(uri, test_bearer_token(), decision_body).await;
+        assert_eq!(
+            decision["decided_by"], "agent",
+            "a person's decision as before"
+        );
+
+        let (_, note) = send(
+            "/api/notes".into(),
+            test_bearer_token(),
+            serde_json::json!({"note_type": "tip", "content": "t"}),
+        )
+        .await;
+        let id = note["id"].as_str().unwrap().to_string();
+        let (status, confirmed) = send(
+            format!("/api/notes/{id}/confirm"),
+            agent_bearer(session.id),
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(status.is_success(), "{confirmed}");
+        assert_eq!(
+            confirmed["last_confirmed_by"],
+            agent.as_str(),
+            "{confirmed}"
+        );
+        let (status, invalidated) = send(
+            format!("/api/notes/{id}/invalidate"),
+            agent_bearer(session.id),
+            serde_json::json!({"reason": "stale"}),
+        )
+        .await;
+        assert!(status.is_success(), "{invalidated}");
+        let changes = invalidated["changes"].to_string();
+        assert!(
+            changes.contains(&agent),
+            "the invalidation is the agent's: {changes}"
+        );
     }
 
     #[tokio::test]

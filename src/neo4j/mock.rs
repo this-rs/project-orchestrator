@@ -198,6 +198,9 @@ pub struct MockGraphStore {
     /// Makes `save_session_episode` fail (a session closes even when its episode cannot be
     /// written).
     pub fail_session_episode_writes: std::sync::atomic::AtomicBool,
+    /// Every call of `save_session_episode`, failed or not (a test waits on it, the write
+    /// being detached from the close).
+    pub session_episode_save_calls: std::sync::atomic::AtomicUsize,
     /// Session episodes, by the session they were taken from (one per session).
     pub session_episodes: RwLock<HashMap<Uuid, crate::episodes::models::Episode>>,
     /// The root of the agent ids, made on first use (`agent_identity_namespace`).
@@ -451,6 +454,7 @@ impl MockGraphStore {
             fail_mark_read: std::sync::atomic::AtomicBool::new(false),
             fail_harness_writes: std::sync::atomic::AtomicBool::new(false),
             fail_session_episode_writes: std::sync::atomic::AtomicBool::new(false),
+            session_episode_save_calls: std::sync::atomic::AtomicUsize::new(0),
             session_episodes: RwLock::new(HashMap::new()),
             agent_identity_root: std::sync::Mutex::new(None),
             fail_session_writes: std::sync::atomic::AtomicBool::new(false),
@@ -8759,6 +8763,8 @@ impl GraphStore for MockGraphStore {
         &self,
         episode: &crate::episodes::models::Episode,
     ) -> Result<bool> {
+        self.session_episode_save_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self
             .fail_session_episode_writes
             .load(std::sync::atomic::Ordering::SeqCst)

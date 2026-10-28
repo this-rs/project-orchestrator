@@ -760,15 +760,20 @@ impl Neo4jClient {
             for cypher in [
                 "MATCH (a:Anchor {session_id: $id}) DELETE a",
                 "MATCH (e:AnchorEvent {session_id: $id}) DELETE e",
-                // The episode its close left is part of the session too.
-                "MATCH (e:SessionEpisode {session_id: $id}) DETACH DELETE e",
             ] {
                 self.graph
                     .run(query(cypher).param("id", id.to_string()))
                     .await?;
             }
-            let q = query("MATCH (s:ChatSession {id: $id}) DETACH DELETE s")
-                .param("id", id.to_string());
+            // The episode its close left goes with it IN THE SAME STATEMENT: a close
+            // episode written concurrently either commits before (deleted here) or
+            // after (its MATCH finds no session, nothing is written) — never between.
+            let q = query(
+                "MATCH (s:ChatSession {id: $id}) \
+                 OPTIONAL MATCH (e:SessionEpisode {session_id: $id}) \
+                 DETACH DELETE e, s",
+            )
+            .param("id", id.to_string());
             self.graph.run(q).await?;
             Ok(true)
         } else {
@@ -808,6 +813,14 @@ impl Neo4jClient {
     /// the `agent_identity_root_key` constraint makes unique: a concurrent first call
     /// matches the node the other created, and reads its namespace.
     pub async fn agent_identity_namespace(&self) -> Result<Uuid> {
+        // Cached once read: the root never changes after it is made.
+        self.agent_identity_root
+            .get_or_try_init(|| self.merge_agent_identity_root())
+            .await
+            .copied()
+    }
+
+    async fn merge_agent_identity_root(&self) -> Result<Uuid> {
         let mut result = self
             .graph
             .execute(
@@ -838,7 +851,7 @@ impl Neo4jClient {
             .graph
             .execute(
                 query(
-                    "MATCH (e:SessionEpisode {project_id: $pid}) \
+                    "MATCH (e:SessionEpisode {project_id: $pid})-[:EPISODE_OF]->(:ChatSession) \
                      RETURN e.payload AS payload ORDER BY e.collected_at DESC LIMIT $limit",
                 )
                 .param("pid", project_id.to_string())

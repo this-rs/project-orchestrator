@@ -48,6 +48,18 @@ pub struct ListEpisodesQuery {
     pub source: Option<String>,
 }
 
+/// When an episode ended: a session's at its close (`collected_at`, written then), a
+/// run's at its completion (start + duration), else when it started.
+pub fn ended_at(e: &crate::episodes::Episode) -> chrono::DateTime<chrono::Utc> {
+    if e.session.is_some() {
+        return e.collected_at;
+    }
+    match e.process.duration_ms {
+        Some(ms) => e.stimulus.timestamp + chrono::Duration::milliseconds(ms),
+        None => e.stimulus.timestamp,
+    }
+}
+
 /// The episodes `GET /api/episodes` lists (its `source` parameter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EpisodeSource {
@@ -159,8 +171,9 @@ pub async fn list_episodes(
         episodes.extend(sessions);
     }
     if source == EpisodeSource::All {
-        // Both kinds, most recent first by when they started.
-        episodes.sort_by(|a, b| b.stimulus.timestamp.cmp(&a.stimulus.timestamp));
+        // Both kinds, most recent END first: the key each source was cut on (runs by
+        // completion, sessions by close), so the merge keeps the true latest `limit`.
+        episodes.sort_by_key(|e| std::cmp::Reverse(ended_at(e)));
         episodes.truncate(limit);
     }
 
@@ -504,6 +517,30 @@ mod tests {
         let resp = CollectEpisodeResponse { episode: None };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json["episode"].is_null());
+    }
+
+    /// `source=all` merges on the key each source was cut on: a session that started
+    /// first but closed last is the most recent; a run counts from its completion.
+    #[test]
+    fn episodes_are_merged_by_when_they_ended() {
+        use crate::episodes::collector::tests_support::episode_at;
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(10);
+        // A session opened at t0, closed at t0+9h.
+        let long_session = episode_at(t0, None, Some(t0 + chrono::Duration::hours(9)));
+        // A session opened at t0+1h, closed at t0+2h.
+        let short_session = episode_at(
+            t0 + chrono::Duration::hours(1),
+            None,
+            Some(t0 + chrono::Duration::hours(2)),
+        );
+        // A run started at t0+3h that lasted 1h.
+        let run = episode_at(t0 + chrono::Duration::hours(3), Some(3_600_000), None);
+        let mut all = [short_session.clone(), run.clone(), long_session.clone()];
+        all.sort_by_key(|e| std::cmp::Reverse(ended_at(e)));
+        assert_eq!(
+            all.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![long_session.id, run.id, short_session.id]
+        );
     }
 
     #[test]

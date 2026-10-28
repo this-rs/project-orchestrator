@@ -141,6 +141,23 @@ pub async fn collect_episode(
     Ok(Some(episode))
 }
 
+/// Namespace of [`session_episode_id`]. Fixed: the id of a session's episode must
+/// not depend on the instance, only on the session.
+const SESSION_EPISODE_NAMESPACE: Uuid = Uuid::from_u128(0x5e55_1015_e915_0de0_a11c_e0f5_e551_0000);
+
+/// The id of the episode of session `session_id`: the same at every close.
+pub fn session_episode_id(session_id: Uuid) -> Uuid {
+    Uuid::new_v5(&SESSION_EPISODE_NAMESPACE, session_id.as_bytes())
+}
+
+/// Whether a session's `spawned_by` places it inside a run (any `run_id`): a plan
+/// runner, a pipeline, a gate retry, a trigger with a run, a protocol state agent.
+fn is_part_of_a_run(spawned_by: Option<&str>) -> bool {
+    spawned_by
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .is_some_and(|v| v.get("run_id").is_some_and(|r| !r.is_null()))
+}
+
 /// Take the episode a chat session leaves at its close, `close_reason` being the
 /// reason announced on its `session_closed`.
 ///
@@ -148,13 +165,22 @@ pub async fn collect_episode(
 /// - **Stimulus**: its first user message (the node's `preview`), at its creation.
 ///   `UserRequest`, or `Manual` for a session another agent or a runner spawned.
 /// - **Process**: no FSM state; its active span (`created_at` → last update).
-/// - **Outcome**: empty — nothing links what a session wrote back to it yet; an
-///   episode does not invent it.
+/// - **Outcome**: no artefact list — nothing links what a session wrote back to it yet,
+///   and an episode does not invent it. How it ended is `session.close_reason`.
 /// - **Validation**: none.
-/// - **Session**: id, messages exchanged, close reason, cost.
+/// - **Session**: id, messages exchanged, close reason, cost, agent.
+///
+/// Its id is derived from the session ([`session_episode_id`]): a later close of the
+/// same session (after a resume) replaces the episode under the SAME id.
 ///
 /// `Ok(None)` when there is nothing to keep: no such session, a session that never
-/// received a message, or one with no project (an episode belongs to a project).
+/// received a message, one with no project (an episode belongs to a project), or one
+/// that is part of a run (its `spawned_by` names a `run_id`: the run has its own
+/// episode, and counting the work twice would skew what is learned from it).
+///
+/// Known limits: `preview` is the first message cut to ~200 characters; a session
+/// whose process died without a close (removed from the live table, never closed)
+/// leaves no episode until it is resumed and closed.
 pub async fn collect_session_episode(
     neo4j: &dyn GraphStore,
     session_id: Uuid,
@@ -174,6 +200,9 @@ pub async fn collect_session_episode(
     let Some(slug) = session.project_slug.as_deref() else {
         return Ok(None);
     };
+    if is_part_of_a_run(session.spawned_by.as_deref()) {
+        return Ok(None);
+    }
     let Some(project) = neo4j.get_project_by_slug(slug).await? else {
         return Ok(None);
     };
@@ -213,7 +242,7 @@ pub async fn collect_session_episode(
     };
 
     Ok(Some(Episode {
-        id: Uuid::new_v4(),
+        id: session_episode_id(session_id),
         project_id: project.id,
         stimulus,
         process,
@@ -657,6 +686,33 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        // Part of a run (a plan runner, a protocol state agent): the run has the episode.
+        for spawned in [
+            format!(
+                r#"{{"type":"runner","run_id":"{}","task_id":"{}"}}"#,
+                Uuid::new_v4(),
+                Uuid::new_v4()
+            ),
+            format!(
+                r#"{{"type":"protocol_runner","run_id":"{}","state_name":"s"}}"#,
+                Uuid::new_v4()
+            ),
+        ] {
+            let (store, sid, _) = store_with_session(Some("alpha"), Some("run work")).await;
+            let mut node = crate::neo4j::GraphStore::get_chat_session(&store, sid)
+                .await
+                .unwrap()
+                .unwrap();
+            node.spawned_by = Some(spawned.clone());
+            store.chat_sessions.write().await.insert(sid, node);
+            assert!(
+                collect_session_episode(&store, sid, "closed")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{spawned}"
+            );
+        }
         // No such session.
         assert!(collect_session_episode(&store, Uuid::new_v4(), "closed")
             .await
@@ -683,6 +739,11 @@ mod tests {
         let listed = store.list_session_episodes(project_id, 10).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, second.id);
+        assert_eq!(
+            first.id, second.id,
+            "the same id at every close of a session"
+        );
+        assert_eq!(first.id, session_episode_id(sid));
         assert_eq!(
             listed[0].session.as_ref().unwrap().close_reason,
             "process_died"
@@ -713,5 +774,61 @@ mod tests {
         value.as_object_mut().unwrap().remove("session");
         let back: Episode = serde_json::from_value(value).unwrap();
         assert!(back.session.is_none());
+    }
+}
+
+/// Episode builders for tests of other modules.
+#[cfg(test)]
+pub mod tests_support {
+    use super::*;
+    use chrono::{DateTime, Utc};
+
+    /// An episode that started at `start`. With `closed_at`, a session episode closed
+    /// then; otherwise a run episode lasting `duration_ms`.
+    pub fn episode_at(
+        start: DateTime<Utc>,
+        duration_ms: Option<i64>,
+        closed_at: Option<DateTime<Utc>>,
+    ) -> Episode {
+        Episode {
+            id: Uuid::new_v4(),
+            project_id: Uuid::nil(),
+            stimulus: Stimulus {
+                request: "r".into(),
+                trigger: StimulusTrigger::Manual,
+                timestamp: start,
+                context_hash: None,
+            },
+            process: Process {
+                reasoning_tree_id: None,
+                states_visited: Vec::new(),
+                state_visits: Vec::new(),
+                duration_ms: closed_at
+                    .map(|c| (c - start).num_milliseconds())
+                    .or(duration_ms),
+            },
+            outcome: Outcome {
+                note_ids: Vec::new(),
+                decision_ids: Vec::new(),
+                commit_shas: Vec::new(),
+                files_modified: 0,
+            },
+            validation: Validation {
+                feedback_type: FeedbackType::None,
+                score: None,
+                evidence_count: 0,
+            },
+            lesson: None,
+            collected_at: closed_at.unwrap_or_else(Utc::now),
+            source_run_id: closed_at.is_none().then(Uuid::new_v4),
+            session: closed_at.map(|_| SessionTrace {
+                session_id: Uuid::new_v4(),
+                message_count: 1,
+                close_reason: "closed".into(),
+                total_cost_usd: None,
+                agent_id: None,
+            }),
+            embedding: None,
+        }
     }
 }

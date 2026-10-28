@@ -92,6 +92,12 @@ pub mod provenance {
     //! Written as `agent:<uuid>` where an actor string already lives (`created_by`), so
     //! the values written before (`api`, `system-inference`, `skill-evolution`, ...) stay
     //! as they are and read as before: [`parse_actor`] says `None` for them.
+    //!
+    //! Limits, on purpose: the identity is the model, not the person or persona behind
+    //! it (every Opus is one agent); a write takes the session's model AT THAT MOMENT, so
+    //! a conversation that switches provider writes under two agents; ids mean nothing on
+    //! another instance; with authentication disabled the calling session is a header,
+    //! a hint and not a proof (`envelope::identify_caller`).
 
     use anyhow::Result;
     use uuid::Uuid;
@@ -101,11 +107,25 @@ pub mod provenance {
     /// Prefix of an agent actor in a `created_by`.
     pub const AGENT_ACTOR_PREFIX: &str = "agent:";
 
-    /// The agent id of `model` under the store's `namespace`. Case and surrounding
-    /// spaces of the model name do not make another agent. `None` for an empty model.
+    /// Model names that do not name a model: a routing mode or a tier the provider
+    /// resolves (`auto`, `default`, ...) and the family aliases of Claude Code. A write
+    /// stamped with one of them would merge unrelated models into one "agent".
+    const NOT_A_MODEL: &[&str] = &[
+        "auto", "default", "fast", "deep", "utility", "best", "opus", "sonnet", "haiku", "opusplan",
+    ];
+
+    /// The agent id of `model` under the store's `namespace`. Case, surrounding spaces
+    /// and the context-window suffix (`[1m]`, as `agent_hooks::same_model` reads it)
+    /// do not make another agent. `None` for an empty model or a name that is not a
+    /// model ([`NOT_A_MODEL`]): no agent can be named, the caller keeps its fallback.
     pub fn agent_id(namespace: Uuid, model: &str) -> Option<Uuid> {
-        let model = model.trim().to_ascii_lowercase();
-        if model.is_empty() {
+        let model = model.trim();
+        let model = model
+            .strip_suffix("[1m]")
+            .unwrap_or(model)
+            .trim_end()
+            .to_ascii_lowercase();
+        if model.is_empty() || NOT_A_MODEL.contains(&model.as_str()) {
             return None;
         }
         Some(Uuid::new_v5(&namespace, model.as_bytes()))
@@ -222,6 +242,19 @@ pub mod provenance {
                 parse_actor(&author),
                 agent_id_of_session(&graph, sid).await.unwrap()
             );
+        }
+
+        #[test]
+        fn a_routing_mode_or_an_alias_names_no_agent_and_the_window_suffix_is_not_a_model() {
+            let ns = Uuid::new_v4();
+            for not_a_model in ["auto", "Default", " opus ", "sonnet", "haiku", "fast", ""] {
+                assert_eq!(agent_id(ns, not_a_model), None, "{not_a_model:?}");
+            }
+            assert_eq!(
+                agent_id(ns, "claude-opus-4-6[1m]"),
+                agent_id(ns, "claude-opus-4-6")
+            );
+            assert!(agent_id(ns, "claude-opus-4-6").is_some());
         }
 
         #[test]

@@ -68,9 +68,9 @@ pub(crate) const ROUTING_CATALOG_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often the watchdog looks for a legacy session whose CLI process is gone (ZOMBIE-CLI).
 const DEAD_CLI_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// How long a close may spend storing the episode the session leaves (`record_close_episode`):
-/// one read and one write of the graph. Past it, the close goes on without the episode.
-const CLOSE_EPISODE_BUDGET: Duration = Duration::from_secs(3);
+/// How long the detached write of the episode a closed session leaves may take
+/// (`record_close_episode`: a few graph round trips). Past it, it is given up and logged.
+const CLOSE_EPISODE_BUDGET: Duration = Duration::from_secs(10);
 
 /// Upper bound of building the Auto pool, whatever the number of instances: the
 /// health checks run at once (`ROUTING_HEALTH_TIMEOUT`), then the catalogs at once
@@ -18777,9 +18777,9 @@ impl ChatManager {
     /// Stores the episode a closed session leaves (`episodes::collector::collect_session_episode`).
     ///
     /// Called on an ANNOUNCED close only — never on an in-place switch, whose thread goes on.
-    /// Best effort and bounded: a graph that fails or hangs is logged and the close goes on;
-    /// an episode must never be the reason a session stays open.
-    async fn record_close_episode(&self, session_id: &str, reason: &str) {
+    /// Best effort, bounded and detached: a graph that fails or hangs is logged, and the
+    /// close neither waits for it nor fails because of it.
+    fn record_close_episode(&self, session_id: &str, reason: &str) {
         let Ok(id) = Uuid::parse_str(session_id) else {
             return;
         };
@@ -18793,15 +18793,19 @@ impl ChatManager {
                 None => Ok(false),
             }
         };
-        match tokio::time::timeout(CLOSE_EPISODE_BUDGET, work).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                warn!(session_id = %session_id, error = %e, "the session's close episode was not stored")
+        // Detached: the close never waits on the graph for its episode (a cascade or a
+        // deletion closes many sessions in a row). The write cannot outlive a deletion:
+        // it is one statement that MATCHes the session, and a deletion removes the session
+        // and its episode in one statement.
+        tokio::spawn(async move {
+            match tokio::time::timeout(CLOSE_EPISODE_BUDGET, work).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    warn!(session_id = %id, error = %e, "the session's close episode was not stored")
+                }
+                Err(_) => warn!(session_id = %id, "storing the session's close episode timed out"),
             }
-            Err(_) => {
-                warn!(session_id = %session_id, "storing the session's close episode timed out")
-            }
-        }
+        });
     }
 
     /// Tears the session down WITHOUT announcing `session_closed`: an in-place provider
@@ -18836,7 +18840,7 @@ impl ChatManager {
                 self.agent_runtime
                     .close_with_reason(session_id, reason)
                     .await?;
-                self.record_close_episode(session_id, reason).await;
+                self.record_close_episode(session_id, reason);
             } else {
                 self.agent_runtime.close_for_switch(session_id).await?;
             }
@@ -18925,7 +18929,7 @@ impl ChatManager {
         // After the disconnect: the node holds the session as it ended. A quiet close (an
         // in-place switch) is not an end, and leaves no episode.
         if announce {
-            self.record_close_episode(session_id, reason).await;
+            self.record_close_episode(session_id, reason);
         }
 
         Ok(())

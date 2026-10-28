@@ -177,6 +177,22 @@ pub(super) async fn store_instance(graph: &MockGraphStore, record: &InstanceReco
         .unwrap();
 }
 
+/// Waits until `save_session_episode` was called `n` times: the episode of a close is
+/// written by a detached task (`ChatManager::record_close_episode`).
+pub(super) async fn wait_for_session_episode_saves(graph: &MockGraphStore, n: usize) {
+    for _ in 0..200 {
+        if graph
+            .session_episode_save_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= n
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the close episode was never written ({n} write(s) expected)");
+}
+
 pub(super) async fn consent(graph: &MockGraphStore, slug: &str, id: &str, origin: &str) {
     // The consent names the credential reference the instance has NOW.
     let credential_ref = graph
@@ -4091,14 +4107,24 @@ mod provider_switch {
                 .any(|e| e.event_type == "assistant_text" && e.data.contains("the answer"))
         })
         .await;
-        assert!(
-            w.graph.session_episodes.read().await.is_empty(),
-            "a switch is not an end: no episode"
-        );
-
         w.manager.close_session(&sid).await.unwrap();
+        // Detached write: wait for it, then count EVERY write — a switch that wrote one
+        // would show as a second call (the stable id would hide it in the store).
+        super::wait_for_session_episode_saves(&w.graph, 1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            w.graph
+                .session_episode_save_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a switch is not an end: the close is the only write"
+        );
         let episodes = w.graph.list_session_episodes(project.id, 10).await.unwrap();
         assert_eq!(episodes.len(), 1, "exactly one episode: {episodes:?}");
+        assert_eq!(
+            episodes[0].id,
+            crate::episodes::collector::session_episode_id(id)
+        );
         let episode = &episodes[0];
         let trace = episode.session.as_ref().expect("a session episode");
         assert_eq!(trace.session_id, id);
@@ -4128,6 +4154,8 @@ mod provider_switch {
             !w.manager.is_session_active(&sid).await,
             "closed all the same"
         );
+        // The write was attempted (detached), failed, and left nothing.
+        super::wait_for_session_episode_saves(&w.graph, 1).await;
         assert!(w.graph.session_episodes.read().await.is_empty());
     }
 
@@ -9007,6 +9035,7 @@ mod legacy_session_record {
         record_until(&graph, &sid, |n| n.total_cost_usd == Some(0.01)).await;
 
         manager.close_session(&sid).await.unwrap();
+        super::wait_for_session_episode_saves(&graph, 1).await;
         let episodes = graph.list_session_episodes(project.id, 10).await.unwrap();
         assert_eq!(episodes.len(), 1, "{episodes:?}");
         let trace = episodes[0].session.as_ref().unwrap();

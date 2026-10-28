@@ -85,6 +85,9 @@ pub struct Neo4jClient {
     /// Value: (coupling_score, cached_at).
     /// Entries expire after `COUPLING_CACHE_TTL` (5 minutes).
     pub(crate) coupling_cache: RwLock<HashMap<(Uuid, Uuid), (f64, Instant)>>,
+    /// The agent identity root, once read (`agent_identity_namespace`): it never changes
+    /// after its creation, so one round trip per process.
+    pub(crate) agent_identity_root: tokio::sync::OnceCell<Uuid>,
 }
 
 /// Convert PascalCase to snake_case (e.g., "InProgress" -> "in_progress")
@@ -349,6 +352,7 @@ impl Neo4jClient {
         let client = Self {
             graph: Arc::new(graph),
             coupling_cache: RwLock::new(HashMap::new()),
+            agent_identity_root: tokio::sync::OnceCell::new(),
         };
 
         // Initialize schema
