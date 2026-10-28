@@ -1122,6 +1122,7 @@ fn episode_tool() -> ToolDefinition {
                 "run_id": {"type": "string", "description": "ProtocolRun UUID to collect episode from (collect/anonymize)"},
                 "project_id": {"type": "string", "description": "Project UUID (collect/list/anonymize/export_artifact)"},
                 "limit": {"type": "integer", "description": "Max episodes to return (list, default 20)"},
+                "source": {"type": "string", "enum": ["run", "session", "all"], "description": "Which episodes to list: from protocol runs (default), from closed chat sessions, or both (list)"},
                 "max_episodes": {"type": "integer", "description": "Max episodes in artifact (export_artifact, default 50)"},
                 "include_structure": {"type": "boolean", "description": "Include structural edges in artifact (export_artifact, default true)"}
             })),

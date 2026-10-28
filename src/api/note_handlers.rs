@@ -202,9 +202,28 @@ pub async fn list_project_notes(
     )))
 }
 
+/// The `created_by` of a note written through the API: the agent of the calling chat
+/// session when there is one (`crate::notes::provenance`), `api` otherwise — a person, a
+/// script, or a caller that cannot be placed. Never refuses the write.
+async fn note_author(
+    state: &OrchestratorState,
+    claims: Option<&crate::auth::jwt::Claims>,
+    headers: &axum::http::HeaderMap,
+) -> String {
+    use crate::chat::envelope::{identify_caller, session_header, SpawnCaller};
+    let caller = identify_caller(claims, session_header(headers), state.auth_config.is_some());
+    let session = match caller {
+        Ok(SpawnCaller::Agent { session_id, .. }) => Some(session_id),
+        Ok(SpawnCaller::Human) | Err(_) => None,
+    };
+    crate::notes::provenance::author_of(state.orchestrator.neo4j(), session.as_deref(), "api").await
+}
+
 /// Create a new note
 pub async fn create_note(
     State(state): State<OrchestratorState>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CreateNoteBody>,
 ) -> Result<(StatusCode, Json<Note>), AppError> {
     let explicit_run_id = body.run_id;
@@ -225,7 +244,10 @@ pub async fn create_note(
     let note = state
         .orchestrator
         .note_manager()
-        .create_note(request, "api")
+        .create_note(
+            request,
+            &note_author(&state, claims.as_ref().map(|c| &c.0), &headers).await,
+        )
         .await?;
 
     // Resolve run_id: explicit > auto-detect from active run
@@ -568,6 +590,8 @@ pub async fn invalidate_note(
 pub async fn supersede_note(
     State(state): State<OrchestratorState>,
     Path(old_note_id): Path<Uuid>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CreateNoteBody>,
 ) -> Result<(StatusCode, Json<Note>), AppError> {
     let request = CreateNoteRequest {
@@ -586,7 +610,11 @@ pub async fn supersede_note(
     let new_note = state
         .orchestrator
         .note_manager()
-        .supersede_note(old_note_id, request, "api")
+        .supersede_note(
+            old_note_id,
+            request,
+            &note_author(&state, claims.as_ref().map(|c| &c.0), &headers).await,
+        )
         .await?;
 
     Ok((StatusCode::CREATED, Json(new_note)))
@@ -1916,6 +1944,102 @@ mod tests {
     // ====================================================================
     // POST /api/notes + GET /api/notes/{id} — create and get
     // ====================================================================
+
+    /// A bound, live agent token for `session`.
+    fn agent_bearer(session: uuid::Uuid) -> String {
+        let claims = crate::auth::jwt::Claims::service_account("agent");
+        let binding = crate::auth::jwt::AgentSessionBinding {
+            session_id: session.to_string(),
+            ceiling: None,
+            tool_profile: None,
+            third_party: false,
+        };
+        let (token, jti) = crate::auth::jwt::generate_session_token(
+            &claims,
+            Some(&binding),
+            &crate::test_helpers::test_auth_config().jwt_secret,
+            3600,
+        )
+        .unwrap();
+        crate::auth::agent_tokens::register(&jti, Some(&session.to_string()));
+        format!("Bearer {token}")
+    }
+
+    /// Provenance: a note a chat session writes names the agent behind it — the same
+    /// agent for two sessions of one model, another for another model — and a note a
+    /// person writes keeps `api`, as every note did before. Superseding stamps it too.
+    #[tokio::test]
+    async fn a_note_written_by_a_chat_session_names_its_agent() {
+        use crate::neo4j::traits::GraphStore;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let mut sessions = Vec::new();
+        for model in ["claude-opus-5-5", "claude-opus-5-5", "deepseek-v4"] {
+            let mut s = crate::test_helpers::test_chat_session(None);
+            s.model = model.into();
+            graph.create_chat_session(&s).await.unwrap();
+            sessions.push(s.id);
+        }
+        let app = test_app_with_state(crate::test_helpers::mock_app_state_with_graph(
+            graph.clone(),
+        ))
+        .await;
+        let write = |uri: String, bearer: String| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("authorization", bearer)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({"note_type": "tip", "content": "a tip"})
+                                    .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::CREATED);
+                body_json(resp).await
+            }
+        };
+
+        let first = write("/api/notes".into(), agent_bearer(sessions[0])).await;
+        let second = write("/api/notes".into(), agent_bearer(sessions[1])).await;
+        let other = write("/api/notes".into(), agent_bearer(sessions[2])).await;
+        let person = write("/api/notes".into(), test_bearer_token()).await;
+
+        let expected = crate::notes::provenance::actor(
+            crate::notes::provenance::agent_id_of_session(graph.as_ref(), sessions[0])
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(first["created_by"], expected.as_str());
+        assert_eq!(
+            second["created_by"], first["created_by"],
+            "one model, one agent"
+        );
+        assert_ne!(
+            other["created_by"], first["created_by"],
+            "another model, another agent"
+        );
+        assert!(other["created_by"].as_str().unwrap().starts_with("agent:"));
+        assert_eq!(
+            person["created_by"], "api",
+            "a person's note keeps its author"
+        );
+
+        let old = first["id"].as_str().unwrap();
+        let replaced = write(
+            format!("/api/notes/{old}/supersede"),
+            agent_bearer(sessions[2]),
+        )
+        .await;
+        assert_eq!(replaced["created_by"], other["created_by"]);
+    }
 
     #[tokio::test]
     async fn test_create_and_get_note() {

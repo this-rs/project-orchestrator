@@ -17,5 +17,5 @@ pub mod models;
 
 pub use models::{
     Episode, Lesson, Outcome, PortableEpisode, PortableLesson, PortableOutcome, PortableProcess,
-    PortableStimulus, PortableValidation, Process, Stimulus, Validation,
+    PortableStimulus, PortableValidation, Process, SessionTrace, Stimulus, Validation,
 };

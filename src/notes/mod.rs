@@ -73,3 +73,171 @@ mod current_knowledge_tests {
         );
     }
 }
+
+/// Who, among the agents, wrote something to the graph: see the module documentation.
+pub mod provenance {
+    //! Stable agent provenance: who, among the agents, wrote something to the graph.
+    //!
+    //! A write made by a chat session used to read `created_by: "api"`, like a script's:
+    //! two sessions of the same agent could not be told apart from anything else, nor
+    //! recognised as the same agent. An agent's identity is its MODEL, the same in every
+    //! session whatever the context: two sessions of one model are the same agent, two
+    //! models are two agents. It is decoupled from projects (a model writes in many).
+    //!
+    //! The id is `uuid v5(root, model)`, the root a UUID the graph creates ONCE and keeps
+    //! ([`crate::neo4j::GraphStore::agent_identity_namespace`]): stable across sessions
+    //! and restarts, private to this store (another instance's agents are other agents),
+    //! and computed, never stored per write.
+    //!
+    //! Written as `agent:<uuid>` where an actor string already lives (`created_by`), so
+    //! the values written before (`api`, `system-inference`, `skill-evolution`, ...) stay
+    //! as they are and read as before: [`parse_actor`] says `None` for them.
+
+    use anyhow::Result;
+    use uuid::Uuid;
+
+    use crate::neo4j::GraphStore;
+
+    /// Prefix of an agent actor in a `created_by`.
+    pub const AGENT_ACTOR_PREFIX: &str = "agent:";
+
+    /// The agent id of `model` under the store's `namespace`. Case and surrounding
+    /// spaces of the model name do not make another agent. `None` for an empty model.
+    pub fn agent_id(namespace: Uuid, model: &str) -> Option<Uuid> {
+        let model = model.trim().to_ascii_lowercase();
+        if model.is_empty() {
+            return None;
+        }
+        Some(Uuid::new_v5(&namespace, model.as_bytes()))
+    }
+
+    /// The `created_by` of a write made by the agent `id`.
+    pub fn actor(id: Uuid) -> String {
+        format!("{AGENT_ACTOR_PREFIX}{id}")
+    }
+
+    /// The agent behind a `created_by`, if an agent wrote it. Every other value (`api`,
+    /// `system/...`, a person) is `None`: it was not an agent, or not one we can name.
+    pub fn parse_actor(created_by: &str) -> Option<Uuid> {
+        created_by
+            .strip_prefix(AGENT_ACTOR_PREFIX)
+            .and_then(|id| Uuid::parse_str(id).ok())
+    }
+
+    /// The agent id of the chat session `session_id`: its current model, under this
+    /// store's root. `Ok(None)` for a session that does not exist or has no model.
+    pub async fn agent_id_of_session(
+        graph: &dyn GraphStore,
+        session_id: Uuid,
+    ) -> Result<Option<Uuid>> {
+        let Some(session) = graph.get_chat_session(session_id).await? else {
+            return Ok(None);
+        };
+        let namespace = graph.agent_identity_namespace().await?;
+        Ok(agent_id(namespace, &session.model))
+    }
+
+    /// The `created_by` a write must carry: the agent actor of the calling session when
+    /// one can be named, `fallback` otherwise. Never fails: provenance is not a reason to
+    /// refuse a write — a session or root that cannot be read is logged and the write
+    /// keeps the fallback it always had.
+    pub async fn author_of(
+        graph: &dyn GraphStore,
+        calling_session: Option<&str>,
+        fallback: &str,
+    ) -> String {
+        let Some(session) = calling_session.and_then(|s| Uuid::parse_str(s.trim()).ok()) else {
+            return fallback.to_string();
+        };
+        match agent_id_of_session(graph, session).await {
+            Ok(Some(id)) => actor(id),
+            Ok(None) => fallback.to_string(),
+            Err(e) => {
+                tracing::warn!(session_id = %session, error = %e, "the agent behind a write could not be named");
+                fallback.to_string()
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::neo4j::mock::MockGraphStore;
+
+        async fn session_of(graph: &MockGraphStore, model: &str) -> Uuid {
+            let mut s = crate::test_helpers::test_chat_session(Some("alpha"));
+            s.model = model.into();
+            let id = s.id;
+            graph.create_chat_session(&s).await.unwrap();
+            id
+        }
+
+        #[tokio::test]
+        async fn two_sessions_of_one_model_are_the_same_agent() {
+            let graph = MockGraphStore::new();
+            let a = session_of(&graph, "claude-opus-5-5").await;
+            let b = session_of(&graph, " Claude-Opus-5-5 ").await;
+            let other = session_of(&graph, "deepseek-v4").await;
+            let id_a = agent_id_of_session(&graph, a).await.unwrap().unwrap();
+            let id_b = agent_id_of_session(&graph, b).await.unwrap().unwrap();
+            let id_other = agent_id_of_session(&graph, other).await.unwrap().unwrap();
+            assert_eq!(id_a, id_b, "the same model in two sessions is one agent");
+            assert_ne!(id_a, id_other, "two models are two agents");
+            // Survives the session: computed again later, from the store, it is the same.
+            graph.delete_chat_session(a).await.unwrap();
+            let again = agent_id(
+                graph.agent_identity_namespace().await.unwrap(),
+                "claude-opus-5-5",
+            );
+            assert_eq!(again, Some(id_a));
+        }
+
+        #[tokio::test]
+        async fn the_root_is_created_once_and_kept() {
+            let graph = MockGraphStore::new();
+            let first = graph.agent_identity_namespace().await.unwrap();
+            let second = graph.agent_identity_namespace().await.unwrap();
+            assert_eq!(first, second);
+            // Another store, another root: its agents are other agents.
+            let elsewhere = MockGraphStore::new()
+                .agent_identity_namespace()
+                .await
+                .unwrap();
+            assert_ne!(first, elsewhere);
+        }
+
+        #[tokio::test]
+        async fn a_write_without_a_nameable_agent_keeps_its_old_author() {
+            let graph = MockGraphStore::new();
+            assert_eq!(author_of(&graph, None, "api").await, "api");
+            assert_eq!(author_of(&graph, Some("not-a-uuid"), "api").await, "api");
+            let unknown = Uuid::new_v4().to_string();
+            assert_eq!(author_of(&graph, Some(&unknown), "api").await, "api");
+            let no_model = session_of(&graph, "  ").await.to_string();
+            assert_eq!(author_of(&graph, Some(&no_model), "api").await, "api");
+
+            let sid = session_of(&graph, "claude-opus-5-5").await;
+            let author = author_of(&graph, Some(&sid.to_string()), "api").await;
+            assert_eq!(
+                parse_actor(&author),
+                agent_id_of_session(&graph, sid).await.unwrap()
+            );
+        }
+
+        #[test]
+        fn old_authors_still_read_and_are_not_agents() {
+            for old in [
+                "api",
+                "system-inference",
+                "skill-evolution",
+                "system/heartbeat",
+                "agent:",
+                "agent:nope",
+            ] {
+                assert_eq!(parse_actor(old), None, "{old}");
+            }
+            let id = Uuid::new_v4();
+            assert_eq!(parse_actor(&actor(id)), Some(id));
+        }
+    }
+}

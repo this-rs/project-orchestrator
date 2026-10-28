@@ -67,6 +67,11 @@ pub(crate) const ROUTING_CATALOG_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How often the watchdog looks for a legacy session whose CLI process is gone (ZOMBIE-CLI).
 const DEAD_CLI_WATCH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a close may spend storing the episode the session leaves (`record_close_episode`):
+/// one read and one write of the graph. Past it, the close goes on without the episode.
+const CLOSE_EPISODE_BUDGET: Duration = Duration::from_secs(3);
+
 /// Upper bound of building the Auto pool, whatever the number of instances: the
 /// health checks run at once (`ROUTING_HEALTH_TIMEOUT`), then the catalogs at once
 /// (`ROUTING_CATALOG_TIMEOUT`), then the capability probes are waited for together
@@ -18769,6 +18774,36 @@ impl ChatManager {
         });
     }
 
+    /// Stores the episode a closed session leaves (`episodes::collector::collect_session_episode`).
+    ///
+    /// Called on an ANNOUNCED close only — never on an in-place switch, whose thread goes on.
+    /// Best effort and bounded: a graph that fails or hangs is logged and the close goes on;
+    /// an episode must never be the reason a session stays open.
+    async fn record_close_episode(&self, session_id: &str, reason: &str) {
+        let Ok(id) = Uuid::parse_str(session_id) else {
+            return;
+        };
+        let graph = self.graph.clone();
+        let reason = reason.to_string();
+        let work = async move {
+            match crate::episodes::collector::collect_session_episode(graph.as_ref(), id, &reason)
+                .await?
+            {
+                Some(episode) => graph.save_session_episode(&episode).await,
+                None => Ok(false),
+            }
+        };
+        match tokio::time::timeout(CLOSE_EPISODE_BUDGET, work).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                warn!(session_id = %session_id, error = %e, "the session's close episode was not stored")
+            }
+            Err(_) => {
+                warn!(session_id = %session_id, "storing the session's close episode timed out")
+            }
+        }
+    }
+
     /// Tears the session down WITHOUT announcing `session_closed`: an in-place provider
     /// switch, whose same thread must see only `provider_switched`, never `session_closed`.
     /// Unlike [`Self::close_session`], it does not remove a neutral directory.
@@ -18801,6 +18836,7 @@ impl ChatManager {
                 self.agent_runtime
                     .close_with_reason(session_id, reason)
                     .await?;
+                self.record_close_episode(session_id, reason).await;
             } else {
                 self.agent_runtime.close_for_switch(session_id).await?;
             }
@@ -18884,6 +18920,12 @@ impl ChatManager {
                 );
                 drop(client);
             }
+        }
+
+        // After the disconnect: the node holds the session as it ended. A quiet close (an
+        // in-place switch) is not an end, and leaves no episode.
+        if announce {
+            self.record_close_episode(session_id, reason).await;
         }
 
         Ok(())

@@ -4071,6 +4071,66 @@ mod provider_switch {
         assert!(!w.manager.spawned_by_nothing(&moved.session_id).await);
     }
 
+    /// A close leaves exactly one episode; an in-place switch, which is not an end,
+    /// leaves none (`close_session_for_switch` does not announce).
+    #[tokio::test]
+    async fn a_closed_session_leaves_one_episode_and_a_switch_leaves_none() {
+        let w = world().await;
+        let project = crate::test_helpers::test_project_named("proj");
+        w.graph.create_project(&project).await.unwrap();
+        let sid = first_turn(&w).await;
+        let id = Uuid::parse_str(&sid).unwrap();
+
+        w.manager
+            .switch_session_provider(&sid, "local2", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+        stored_until(&w, &sid, |events| {
+            events
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains("the answer"))
+        })
+        .await;
+        assert!(
+            w.graph.session_episodes.read().await.is_empty(),
+            "a switch is not an end: no episode"
+        );
+
+        w.manager.close_session(&sid).await.unwrap();
+        let episodes = w.graph.list_session_episodes(project.id, 10).await.unwrap();
+        assert_eq!(episodes.len(), 1, "exactly one episode: {episodes:?}");
+        let episode = &episodes[0];
+        let trace = episode.session.as_ref().expect("a session episode");
+        assert_eq!(trace.session_id, id);
+        assert_eq!(trace.close_reason, "closed");
+        assert!(trace.message_count > 0, "{trace:?}");
+        assert!(
+            episode.stimulus.request.contains("hi there"),
+            "the first user message: {:?}",
+            episode.stimulus.request
+        );
+        assert_eq!(episode.source_run_id, None);
+    }
+
+    /// An episode that cannot be stored never keeps a session open.
+    #[tokio::test]
+    async fn a_session_closes_even_when_its_episode_cannot_be_stored() {
+        let w = world().await;
+        let project = crate::test_helpers::test_project_named("proj");
+        w.graph.create_project(&project).await.unwrap();
+        let sid = first_turn(&w).await;
+        w.graph
+            .fail_session_episode_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        w.manager.close_session(&sid).await.unwrap();
+        assert!(
+            !w.manager.is_session_active(&sid).await,
+            "closed all the same"
+        );
+        assert!(w.graph.session_episodes.read().await.is_empty());
+    }
+
     #[tokio::test]
     async fn a_conversation_moves_to_another_provider_with_its_history_relayed() {
         let w = world().await;
@@ -8923,6 +8983,37 @@ mod legacy_session_record {
         assert_eq!(node.message_count, 3, "after the third turn: {node:?}");
         assert_eq!(node.cli_session_id.as_deref(), Some("fake-cli-session"));
         manager.close_session(&sid).await.unwrap();
+    }
+
+    /// The legacy engine closes on its own path (`close_session_inner_with` past the agent
+    /// runtime): it leaves its episode too, read once the CLI is disconnected.
+    #[tokio::test]
+    async fn a_closed_legacy_session_leaves_its_episode() {
+        let mut transcript = turn("answer one", 0.01).to_vec();
+        transcript.push(json!({"op": "wait_eof", "optional": true, "timeout_ms": 110000}));
+        let (dir, graph, manager) = legacy(&transcript).await;
+        let project = crate::test_helpers::test_project_named("proj");
+        graph.create_project(&project).await.unwrap();
+
+        let mut req = request(None, Some("proj"), "default");
+        req.message = "legacy first words".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager
+            .create_session(&req)
+            .await
+            .unwrap_or_else(|e| panic!("open failed: {e:#}"))
+            .session_id;
+        assert!(!manager.agent_runtime.owns(&sid).await, "the legacy engine");
+        record_until(&graph, &sid, |n| n.total_cost_usd == Some(0.01)).await;
+
+        manager.close_session(&sid).await.unwrap();
+        let episodes = graph.list_session_episodes(project.id, 10).await.unwrap();
+        assert_eq!(episodes.len(), 1, "{episodes:?}");
+        let trace = episodes[0].session.as_ref().unwrap();
+        assert_eq!(trace.session_id.to_string(), sid);
+        assert_eq!(trace.close_reason, "closed");
+        assert_eq!(trace.total_cost_usd, Some(0.01));
+        assert!(episodes[0].stimulus.request.contains("legacy first words"));
     }
 
     /// A turn whose wrap-up never returns, on the legacy engine with a real

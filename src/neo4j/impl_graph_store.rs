@@ -2704,6 +2704,25 @@ impl GraphStore for Neo4jClient {
         self.delete_chat_session(id).await
     }
 
+    async fn save_session_episode(
+        &self,
+        episode: &crate::episodes::models::Episode,
+    ) -> anyhow::Result<bool> {
+        self.save_session_episode(episode).await
+    }
+
+    async fn list_session_episodes(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::episodes::models::Episode>> {
+        self.list_session_episodes(project_id, limit).await
+    }
+
+    async fn agent_identity_namespace(&self) -> anyhow::Result<Uuid> {
+        self.agent_identity_namespace().await
+    }
+
     async fn apply_anchor_op(
         &self,
         session_id: Uuid,

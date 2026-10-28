@@ -4244,6 +4244,32 @@ pub trait GraphStore: Send + Sync {
     async fn get_works_on(&self, user_id: &str) -> Result<Vec<crate::profile::WorksOnRelation>>;
 
     // ========================================================================
+    // Session episodes (the episode a chat session leaves at its close)
+    // ========================================================================
+
+    /// Store the episode of a chat session, `episode.session` naming it. One per
+    /// session: a later close of the same session (after a resume) replaces it.
+    /// Written only while the session exists, in one statement, so a session deleted
+    /// meanwhile never gets an orphan episode. `Ok(false)`: the session is gone, or
+    /// the episode names no session.
+    async fn save_session_episode(
+        &self,
+        episode: &crate::episodes::models::Episode,
+    ) -> Result<bool>;
+
+    /// The session episodes of a project, most recent close first.
+    async fn list_session_episodes(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<crate::episodes::models::Episode>>;
+
+    /// The root the agent ids are derived from (`crate::notes::provenance`): created on the
+    /// first call, atomically, and the same on every call after — two first calls at
+    /// once still agree on one root.
+    async fn agent_identity_namespace(&self) -> Result<Uuid>;
+
+    // ========================================================================
     // Episode embedding search (ReflexEngine)
     // ========================================================================
 

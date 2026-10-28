@@ -760,6 +760,8 @@ impl Neo4jClient {
             for cypher in [
                 "MATCH (a:Anchor {session_id: $id}) DELETE a",
                 "MATCH (e:AnchorEvent {session_id: $id}) DELETE e",
+                // The episode its close left is part of the session too.
+                "MATCH (e:SessionEpisode {session_id: $id}) DETACH DELETE e",
             ] {
                 self.graph
                     .run(query(cypher).param("id", id.to_string()))
@@ -772,6 +774,86 @@ impl Neo4jClient {
         } else {
             Ok(false)
         }
+    }
+
+    /// See [`crate::neo4j::GraphStore::save_session_episode`]. The episode is kept whole
+    /// as JSON (`payload`); `session_id`, `project_id` and `collected_at` are copied out
+    /// for the uniqueness constraint and the listing.
+    pub async fn save_session_episode(
+        &self,
+        episode: &crate::episodes::models::Episode,
+    ) -> Result<bool> {
+        let Some(session) = episode.session.as_ref() else {
+            return Ok(false);
+        };
+        let payload = serde_json::to_string(episode)?;
+        // MATCH first: no session, no row, nothing written — in the same statement.
+        let q = query(
+            "MATCH (s:ChatSession {id: $sid}) \
+             MERGE (e:SessionEpisode {session_id: $sid}) \
+             SET e.id = $id, e.project_id = $pid, e.collected_at = $at, e.payload = $payload \
+             MERGE (e)-[:EPISODE_OF]->(s) \
+             RETURN e.id AS id",
+        )
+        .param("sid", session.session_id.to_string())
+        .param("id", episode.id.to_string())
+        .param("pid", episode.project_id.to_string())
+        .param("at", episode.collected_at.to_rfc3339())
+        .param("payload", payload);
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
+    /// See [`crate::neo4j::GraphStore::agent_identity_namespace`]. One MERGE on a key
+    /// the `agent_identity_root_key` constraint makes unique: a concurrent first call
+    /// matches the node the other created, and reads its namespace.
+    pub async fn agent_identity_namespace(&self) -> Result<Uuid> {
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MERGE (r:AgentIdentityRoot {key: 'root'}) \
+                     ON CREATE SET r.namespace = $ns, r.created_at = datetime() \
+                     RETURN r.namespace AS ns",
+                )
+                .param("ns", Uuid::new_v4().to_string()),
+            )
+            .await?;
+        let row = result
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("MERGE of the agent identity root returned no row"))?;
+        let ns: String = row.get("ns")?;
+        Ok(Uuid::parse_str(&ns)?)
+    }
+
+    /// See [`crate::neo4j::GraphStore::list_session_episodes`]. A payload that no longer
+    /// parses is skipped with a warning, not an error: one bad node must not hide the rest.
+    pub async fn list_session_episodes(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<crate::episodes::models::Episode>> {
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (e:SessionEpisode {project_id: $pid}) \
+                     RETURN e.payload AS payload ORDER BY e.collected_at DESC LIMIT $limit",
+                )
+                .param("pid", project_id.to_string())
+                .param("limit", limit as i64),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = result.next().await? {
+            let payload: String = row.get("payload")?;
+            match serde_json::from_str(&payload) {
+                Ok(episode) => out.push(episode),
+                Err(e) => tracing::warn!(error = %e, "unreadable SessionEpisode payload, skipped"),
+            }
+        }
+        Ok(out)
     }
 
     /// Get child sessions spawned by a parent session (identified by the SPAWNED_BY edge, else by parent_id in the spawned_by JSON).

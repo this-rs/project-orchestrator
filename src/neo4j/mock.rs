@@ -195,6 +195,13 @@ pub struct MockGraphStore {
     pub fail_mark_read: std::sync::atomic::AtomicBool,
     /// Makes `update_chat_session_harness` fail (the capability snapshot is not stored).
     pub fail_harness_writes: std::sync::atomic::AtomicBool,
+    /// Makes `save_session_episode` fail (a session closes even when its episode cannot be
+    /// written).
+    pub fail_session_episode_writes: std::sync::atomic::AtomicBool,
+    /// Session episodes, by the session they were taken from (one per session).
+    pub session_episodes: RwLock<HashMap<Uuid, crate::episodes::models::Episode>>,
+    /// The root of the agent ids, made on first use (`agent_identity_namespace`).
+    pub agent_identity_root: std::sync::Mutex<Option<Uuid>>,
     /// Makes every `create_chat_session` fail once set (a session written after it, such as
     /// the mirror of a sub-agent, is lost; the sessions already written are untouched).
     pub fail_session_writes: std::sync::atomic::AtomicBool,
@@ -443,6 +450,9 @@ impl MockGraphStore {
             plan_third_party_writes: RwLock::new(HashMap::new()),
             fail_mark_read: std::sync::atomic::AtomicBool::new(false),
             fail_harness_writes: std::sync::atomic::AtomicBool::new(false),
+            fail_session_episode_writes: std::sync::atomic::AtomicBool::new(false),
+            session_episodes: RwLock::new(HashMap::new()),
+            agent_identity_root: std::sync::Mutex::new(None),
             fail_session_writes: std::sync::atomic::AtomicBool::new(false),
             land_children_after_read: std::sync::Mutex::new(HashMap::new()),
             plan_tasks: RwLock::new(HashMap::new()),
@@ -8735,7 +8745,66 @@ impl GraphStore for MockGraphStore {
         anchors.events.retain(|e| e.session_id != id);
         anchors.versions.remove(&id);
         drop(anchors);
-        Ok(self.chat_sessions.write().await.remove(&id).is_some())
+        // Same lock order as `save_session_episode` (sessions, then episodes).
+        let mut sessions = self.chat_sessions.write().await;
+        let existed = sessions.remove(&id).is_some();
+        self.session_episodes.write().await.remove(&id);
+        Ok(existed)
+    }
+
+    // Session episodes — same rules as the Neo4j store: written only while the session
+    // exists, one per session.
+
+    async fn save_session_episode(
+        &self,
+        episode: &crate::episodes::models::Episode,
+    ) -> Result<bool> {
+        if self
+            .fail_session_episode_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("mock: session episode write failed");
+        }
+        let Some(session) = episode.session.as_ref() else {
+            return Ok(false);
+        };
+        // The session lock held across the write: a delete cannot slip in between.
+        let sessions = self.chat_sessions.read().await;
+        if !sessions.contains_key(&session.session_id) {
+            return Ok(false);
+        }
+        self.session_episodes
+            .write()
+            .await
+            .insert(session.session_id, episode.clone());
+        Ok(true)
+    }
+
+    async fn list_session_episodes(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<crate::episodes::models::Episode>> {
+        let mut out: Vec<_> = self
+            .session_episodes
+            .read()
+            .await
+            .values()
+            .filter(|e| e.project_id == project_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.collected_at.cmp(&a.collected_at));
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    async fn agent_identity_namespace(&self) -> Result<Uuid> {
+        // One lock for the read and the creation: the MERGE of the Neo4j store.
+        let mut root = self
+            .agent_identity_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(*root.get_or_insert_with(Uuid::new_v4))
     }
 
     // Chat anchors — same rules as the Neo4j store (both call `anchor::apply_op`).
