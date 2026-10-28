@@ -16891,3 +16891,172 @@ mod claude_code_recovery_at_boot {
         a.close_session(&sid).await.unwrap();
     }
 }
+
+/// ZOMBIE-CLI, for real: a real `fake_claude` process on the AGENT engine (the default) is
+/// SIGKILLed while the session is idle. Nothing here fakes the death: the provider's own
+/// stream reports it out of turn, and the manager's watchdog (started as in production)
+/// closes the session with `process_died`; the killed process must then be REAPED (no
+/// `<defunct>` left: `kill(pid, 0)` answers ESRCH), within 30 seconds.
+mod zombie_cli_real_kill {
+    use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
+
+    use super::claude_code_resume_token::FakeCli;
+    use super::*;
+    use crate::documents::store::DocumentStore;
+
+    /// The `fake_claude` children of this process right now (the CLI is spawned by us).
+    fn fake_claude_children() -> Vec<i32> {
+        let out = Command::new("pgrep")
+            .args(["-P", &std::process::id().to_string(), "-f", "fake_claude"])
+            .output()
+            .expect("pgrep");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<i32>().ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_real_cli_killed_while_idle_closes_its_session_and_is_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let stdin_out = dir.path().join("stdin.jsonl");
+        let lines = [
+            json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
+            json!({"op": "emit_json", "json": {
+                "type": "system", "subtype": "init", "session_id": "cli-kill",
+                "model": "fake-claude", "cwd": ".", "tools": ["Read"],
+                "permissionMode": "default", "apiKeySource": "none"}}),
+            json!({"op": "emit_json", "json": {
+                "type": "assistant", "message": {"id": "msg_kill", "type": "message",
+                "role": "assistant", "model": "fake-claude",
+                "content": [{"type": "text", "text": "ready"}], "stop_reason": "end_turn"}}}),
+            json!({"op": "emit_json", "json": {
+                "type": "result", "subtype": "success", "duration_ms": 1,
+                "duration_api_ms": 1, "is_error": false, "num_turns": 1,
+                "session_id": "cli-kill", "total_cost_usd": 0.0,
+                "usage": {"input_tokens": 1, "output_tokens": 1}, "result": "ready"}}),
+            // Stays alive, idle, until it is killed (or its stdin closes).
+            json!({"op": "wait_eof", "timeout_ms": 120000, "optional": true}),
+        ];
+        std::fs::write(
+            &transcript,
+            lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let mut config = ClaudeCodeConfig::default();
+        config.cli_path = Some(fake_bin("fake_claude"));
+        let provider = FakeCli {
+            inner: Arc::new(ClaudeCodeProvider::new(config)),
+            env: vec![
+                (
+                    "FAKE_CLAUDE_TRANSCRIPT".into(),
+                    transcript.display().to_string(),
+                ),
+                (
+                    "FAKE_CLAUDE_STDIN_OUT".into(),
+                    stdin_out.display().to_string(),
+                ),
+            ],
+        };
+        let graph = Arc::new(MockGraphStore::new());
+        let state = mock_app_state();
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let chat_config = super::super::config::ChatConfig {
+            provider_path: ProviderPath::Agent,
+            mcp_server_path: PathBuf::from("/nonexistent/mcp"),
+            max_sessions: 10,
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            ChatManager::new_without_memory(dyn_graph, state.meili, chat_config)
+                .with_provider_source(Arc::new(provider))
+                .with_document_store(DocumentStore::new(dir.path().join("blobs"))),
+        );
+
+        let before = fake_claude_children();
+        let mut req = request(None, None, "default");
+        req.message = "hello".into();
+        req.cwd = dir.path().display().to_string();
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        let uuid = Uuid::parse_str(&sid).unwrap();
+
+        // The turn answered: the CLI is now IDLE, waiting for its next message.
+        let mut answered = false;
+        for _ in 0..200 {
+            answered = graph
+                .get_chat_events(uuid, 0, 500)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.event_type == "result");
+            if answered {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(answered, "the first turn must be answered");
+        assert!(
+            manager.is_session_active(&sid).await,
+            "live before the kill"
+        );
+
+        // The one CLI this session started: the child that did not exist before it.
+        // Other tests run in parallel and spawn their own `fake_claude` under this process: the
+        // new child is not enough. Ours is the one whose environment names OUR transcript
+        // (the tempdir path is unique to this test).
+        let marker = transcript.display().to_string();
+        let cli: Vec<i32> = fake_claude_children()
+            .into_iter()
+            .filter(|p| !before.contains(p))
+            .filter(|p| {
+                Command::new("ps")
+                    .args(["eww", "-o", "command=", "-p", &p.to_string()])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).contains(&marker))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(cli.len(), 1, "exactly one CLI for this session: {cli:?}");
+        let pid = cli[0];
+
+        // Production timing: the same watchdog the server starts.
+        manager.start_dead_cli_watchdog();
+        let started = std::time::Instant::now();
+        // SAFETY: a plain signal to the child pid we just found, not a group.
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGKILL) },
+            0,
+            "SIGKILL delivered"
+        );
+
+        let deadline = started + Duration::from_secs(30);
+        while manager.is_session_active(&sid).await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session of a killed CLI must close within 30 s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let closed_in = started.elapsed();
+
+        // Reaped: a zombie would still answer kill(pid, 0); a reaped pid answers ESRCH.
+        let mut reaped = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                reaped = std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            reaped,
+            "the killed CLI ({pid}) must be reaped, not left <defunct>"
+        );
+        assert!(
+            !manager.is_session_working(&sid).await,
+            "a closed session holds no envelope slot"
+        );
+        eprintln!("ZOMBIE-CLI real kill: session closed in {closed_in:?}, pid {pid} reaped");
+    }
+}
