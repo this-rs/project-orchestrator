@@ -3662,7 +3662,7 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     );
     w.settle(ends, &manager).await;
 
-    // A question to the user: shown, allowed by the engine, answered by a turn.
+    // A question to the user: shown, closed by a denial that ends the turn (§15.6), answered by a turn.
     let ends = w.turn_ends();
     manager.send_message(&sid, &kc.k("TURN-ASK")).await.unwrap();
     cc_sent += 1;
@@ -3672,7 +3672,9 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
                 if tool_call_id == "t-ask" && questions.to_string().contains("Which database?"))
         })
         .await;
-    let allowed = cli.wait_line(0, "req-ask", WAIT).await.unwrap_or_default();
+    let closing = cli.wait_line(0, "req-ask", WAIT).await.unwrap_or_default();
+    let closed_by_denial =
+        closing.contains("\"behavior\":\"deny\"") && closing.contains("posed to the user");
     w.settle(ends, &manager).await;
     let ends = w.turn_ends();
     // What the frontend sends for the answer (`input_response`): an inert user turn.
@@ -3688,13 +3690,12 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     cc.check(
         "ask_user_question",
         shown
-            && allowed.contains("\"behavior\":\"allow\"")
+            && closed_by_denial
             && answer_read
             && w.said(WAIT, "answered ask").await,
         Cause::Harness,
         format!(
-            "ask_user_question={shown}, autorisée={}, réponse lue au tour suivant={answer_read}",
-            allowed.contains("\"behavior\":\"allow\"")
+            "ask_user_question={shown}, fermée par un refus qui termine le tour={closed_by_denial}, réponse lue au tour suivant={answer_read}"
         ),
     );
     w.settle(ends, &manager).await;

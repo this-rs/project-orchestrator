@@ -3679,7 +3679,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -5098,7 +5098,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 [[package]]
 name = "nexus-claude"
 version = "0.5.0"
-source = "git+https://github.com/this-rs/nexus.git?rev=3ed846361470db457f6e499084e2ac0b7bec8e2c#3ed846361470db457f6e499084e2ac0b7bec8e2c"
+source = "git+https://github.com/this-rs/nexus.git?rev=ed812f747adfaf489b643b669cae717ed6fa3df5#ed812f747adfaf489b643b669cae717ed6fa3df5"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -5126,7 +5126,7 @@ dependencies = [
 [[package]]
 name = "nexus-tools"
 version = "0.5.1"
-source = "git+https://github.com/this-rs/nexus.git?rev=3ed846361470db457f6e499084e2ac0b7bec8e2c#3ed846361470db457f6e499084e2ac0b7bec8e2c"
+source = "git+https://github.com/this-rs/nexus.git?rev=ed812f747adfaf489b643b669cae717ed6fa3df5#ed812f747adfaf489b643b669cae717ed6fa3df5"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
