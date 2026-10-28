@@ -53,6 +53,28 @@ pub struct DecisionAlternative {
     pub propensity: Option<f64>,
 }
 
+impl DecisionOutcome {
+    /// Recompute `reward()` from the journal alone.
+    ///
+    /// `None` when the node predates the fields this needs (`attempts`): saying
+    /// "unknown" is honest, inventing a default would fabricate a reward the
+    /// router never saw.
+    pub fn reward_recompute(&self, settings: &super::mode::RoutingSettings) -> Option<f64> {
+        let attempts = self.attempts?;
+        let outcome = super::feedback::Outcome {
+            success: self.success,
+            attempts,
+            cost_usd: self.cost_usd,
+            duration_ms: self.duration_ms,
+            verification_passed: self.verification_passed,
+            interrupted: false,
+            user_overrode_model: self.overridden,
+            ..Default::default()
+        };
+        Some(super::feedback::reward(&outcome, settings))
+    }
+}
+
 /// What happened afterwards, filled when the work closes.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DecisionOutcome {
@@ -70,6 +92,15 @@ pub struct DecisionOutcome {
     /// Output tokens of the work; `None` when unknown (never zero).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+    /// Attempts the turn took. `None` on nodes written before this existed.
+    ///
+    /// `reward()` needs it: without it the reward cannot be recomputed from the
+    /// journal alone, which is what makes an offline replay possible (PYSR-1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<u32>,
+    /// Whether the verification passed, when there was one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_passed: Option<bool>,
     /// The user switched the model by hand after the decision. May be set
     /// before the outcome is closed (`reward` is still `None` then).
     #[serde(default)]
@@ -348,6 +379,58 @@ pub trait Decider: Send + Sync {
         _provider_error: bool,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+}
+
+/// PYSR-1, hole 2: `reward()` needs the attempts and the verified flag, which
+/// were not in the journal — so an offline replay could not recompute the reward
+/// the router actually learned from.
+#[cfg(test)]
+mod recompute_tests {
+    use super::*;
+
+    fn settings() -> super::super::mode::RoutingSettings {
+        super::super::mode::RoutingSettings::default()
+    }
+
+    #[test]
+    fn the_reward_is_recomputable_from_the_journal_alone() {
+        let live = super::super::feedback::Outcome {
+            success: Some(true),
+            attempts: 1,
+            cost_usd: Some(0.02),
+            duration_ms: Some(1_200),
+            verification_passed: Some(true),
+            ..Default::default()
+        };
+        let expected = super::super::feedback::reward(&live, &settings());
+
+        let journal = DecisionOutcome {
+            success: live.success,
+            reward: Some(expected),
+            cost_usd: live.cost_usd,
+            duration_ms: live.duration_ms,
+            attempts: Some(live.attempts),
+            verification_passed: live.verification_passed,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            journal.reward_recompute(&settings()),
+            Some(expected),
+            "recomputing from the journal must give the value the router learned from"
+        );
+    }
+
+    #[test]
+    fn a_node_written_before_the_fields_is_not_recomputed() {
+        // Better "unknown" than a fabricated zero: a replay must not invent a
+        // reward the router never saw.
+        let legacy = DecisionOutcome {
+            success: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(legacy.reward_recompute(&settings()), None);
     }
 }
 
