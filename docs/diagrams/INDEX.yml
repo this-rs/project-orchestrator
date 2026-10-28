@@ -381,3 +381,14 @@ diagrams:
     file: docs/diagrams/po-bugs.mmd
     covers:
       - "backend:docs/BUGS.md"
+  - name: po-storage
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-storage.mmd
+    # La couche de stockage vue de l'exterieur : ce qui choisit un adaptateur et
+    # ce qui porte le pool d'un domaine. Les fichiers de src/neo4j/ restent
+    # couverts par leurs entrees existantes ; ces deux-la sont neufs.
+    covers:
+      - "backend:src/storage.rs"
+      - "backend:src/neo4j/trajectory.rs"
+      - "backend:docs/storage/**"

@@ -1,0 +1,40 @@
+%% name: po-storage
+%% covers: backend:src/storage.rs backend:src/neo4j/trajectory.rs backend:docs/storage/**
+%% verified: 1c5451eb
+%% ---
+%% PROUVE : ce que la couche de stockage PROMET au reste du backend.
+%%   Un seul point de composition choisit un adaptateur ; partout ailleurs le code ne
+%%   nomme que des traits. Chaque adaptateur DECLARE ses capacites, et /health les publie.
+%%   Le perimetre de la promesse est borne par un controle executable, pas par une note.
+%% ---
+%% SOURCES LUES :
+%%   src/storage.rs            — StorageBackend::from_config, select_backend, DEFAULT_BACKEND
+%%   src/neo4j/traits.rs       — trait GraphStore + StoreCapabilities (10 capacites)
+%%   src/neo4j/trajectory.rs   — pool dedie + amorcage de l'index vectoriel, dans l'adaptateur
+%%   src/api/handlers.rs       — /health publie storage_capabilities, garde le champ neo4j
+%%   src/events/types.rs       — TransportState : l'etat du transport vu de l'exterieur
+%%   xtask/src/storage_boundary.rs — le controle, ses modes et son fichier d'exceptions
+%% ---
+flowchart TD
+    subgraph composition["point de composition unique"]
+        CFG["Config<br/>storage.backend (defaut : adaptateur courant)"]
+        FAB["StorageBackend::from_config()<br/>src/storage.rs"]
+        CFG --> FAB
+    end
+
+    FAB --> G["Arc&lt;dyn GraphStore&gt;<br/>adaptateur graphe"]
+    FAB --> S["Arc&lt;dyn SearchStore&gt;<br/>adaptateur recherche"]
+    FAB --> T["Arc&lt;dyn TrajectoryStore&gt;<br/>adaptateur trajectoires"]
+
+    G --> CAPS["StoreCapabilities<br/>10 capacites declarees<br/>chacune justifiee dans le code"]
+    T --> IDX["index vectoriel du domaine<br/>cree par l'adaptateur"]
+
+    APP["managers, handlers, runner, CLI"] -. "ne nomment que des traits" .-> G
+    APP -.-> S
+    APP -.-> T
+
+    HEALTH["/health"] --> CAPS
+    HEALTH --> TS["TransportState<br/>Disabled / Connected / Disconnected / Unknown"]
+
+    CI["cargo xtask storage-boundary --strict"] -. "echoue si un pilote<br/>apparait hors adaptateur" .-> APP
+    EXC["storage-boundary-exceptions.txt<br/>base gelee, ne peut que decroitre"] --- CI
