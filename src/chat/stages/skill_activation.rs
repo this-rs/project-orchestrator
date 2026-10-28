@@ -257,6 +257,16 @@ impl ParallelEnrichmentStage for SkillActivationStage {
             skill_ids_to_boost.push(skill.id);
         }
 
+        crate::chat::activation_registry::record_skills(
+            input.session_id,
+            matches
+                .iter()
+                .map(|(s, _)| crate::chat::activation_registry::ActivatedRef {
+                    id: s.id.to_string(),
+                    name: s.name.clone(),
+                }),
+        );
+
         if !content_parts.is_empty() {
             output.add_section(
                 "Activated Skills",

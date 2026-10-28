@@ -315,6 +315,9 @@ pub struct LiveSessionSnapshot {
     /// while one of these runs, so this is what keeps a working session
     /// from looking dead.
     pub background_tasks: std::collections::HashMap<Uuid, (usize, usize)>,
+    /// Per live session, the skills and personas injected into it (see `activation_registry`).
+    pub activations:
+        std::collections::HashMap<Uuid, crate::chat::activation_registry::SessionActivations>,
 }
 
 /// Count the live `(monitors, bash)` among a session's tracked background
@@ -6164,6 +6167,14 @@ impl ChatManager {
         for id in self.mirrors.open_ids() {
             snap.live.insert(id);
             snap.streaming.insert(id);
+        }
+        // What each live session was given, and forget the sessions that ended.
+        crate::chat::activation_registry::retain_live(&snap.live);
+        for id in &snap.live {
+            let got = crate::chat::activation_registry::get(*id);
+            if !got.skills.is_empty() || !got.personas.is_empty() {
+                snap.activations.insert(*id, got);
+            }
         }
         for (id, pending) in inputs {
             let ids: std::collections::HashSet<String> =

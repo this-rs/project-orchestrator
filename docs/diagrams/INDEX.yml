@@ -91,6 +91,7 @@ diagrams:
       - "backend:src/chat/{agent_runtime,agent_hooks,cancel_relay,session_grants,lasting_rules,manual_compaction,spill,team}.rs"
       - "backend:src/chat/provider/{transcripts,hooks}.rs"
       - "backend:src/api/team_handlers.rs"
+      - "backend:src/chat/activation_registry.rs"
   - name: po-provider-settings
     owner: theotime
     status: verified
