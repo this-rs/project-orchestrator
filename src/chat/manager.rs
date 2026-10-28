@@ -9733,25 +9733,17 @@ impl ChatManager {
                                                     }
                                                 }
                                                 announce_control_event(&evt);
-                                                // AskUserQuestion: auto-allow the control request so the CLI
-                                                // waits for the tool_result (user's answer) instead of blocking.
+                                                // AskUserQuestion: close the control request with a denial that ends
+                                                // the turn; the user's answer comes as the next turn (§15.6). An
+                                                // `allow` without answers would make the CLI report "the user did not
+                                                // answer" and the model would go on without it.
                                                 // Do NOT store in pending_perm_inputs (it's not a permission).
-                                                if let ChatEvent::AskUserQuestion { ref id, ref input, .. } = evt {
+                                                if let ChatEvent::AskUserQuestion { ref id, .. } = evt {
                                                     if let Some(ref tx) = stdin_tx_for_auto_allow {
-                                                        let control_response = serde_json::json!({
-                                                            "type": "control_response",
-                                                            "response": {
-                                                                "subtype": "success",
-                                                                "request_id": id,
-                                                                "response": {
-                                                                    "behavior": "allow",
-                                                                    "updatedInput": input
-                                                                }
-                                                            }
-                                                        });
+                                                        let control_response = question_closing_response(id);
                                                         if let Ok(json) = serde_json::to_string(&control_response) {
                                                             let _ = tx.send(json).await;
-                                                            info!(request_id = %id, "Auto-allowed AskUserQuestion control request");
+                                                            info!(request_id = %id, "Closed AskUserQuestion control request (answer comes as the next turn)");
                                                         }
                                                     }
                                                 } else if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
@@ -9809,24 +9801,14 @@ impl ChatManager {
                                                         }
                                                     }
                                                     announce_control_event(&evt);
-                                                    // AskUserQuestion: auto-allow (same logic as above)
-                                                    if let ChatEvent::AskUserQuestion { ref id, ref input, .. } = evt {
+                                                    // AskUserQuestion: close it, as above (§15.6)
+                                                    if let ChatEvent::AskUserQuestion { ref id, .. } = evt {
                                                         if let Some(ref tx) = stdin_tx_for_auto_allow {
-                                                            let control_response = serde_json::json!({
-                                                                "type": "control_response",
-                                                                "response": {
-                                                                    "subtype": "success",
-                                                                    "request_id": id,
-                                                                    "response": {
-                                                                        "behavior": "allow",
-                                                                        "updatedInput": input
-                                                                    }
-                                                                }
-                                                            });
+                                                            let control_response = question_closing_response(id);
                                                             if let Ok(json) = serde_json::to_string(&control_response) {
                                                                 // try_send here because we're in a sync-ish drain loop
                                                                 let _ = tx.try_send(json);
-                                                                info!(request_id = %id, "Auto-allowed AskUserQuestion control request (drain)");
+                                                                info!(request_id = %id, "Closed AskUserQuestion control request (drain)");
                                                             }
                                                         }
                                                     } else if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
@@ -19497,6 +19479,23 @@ fn notify_attention_for_chat_event(
         AttentionSubject::Session(session_id.to_string()),
         reason,
     );
+}
+
+/// The control response that closes an `AskUserQuestion` request (§15.6): a denial with
+/// the question-posed message, so the turn ends and the user's answer comes as the next
+/// turn. Must match `nexus_claude`'s `QUESTION_POSED_MESSAGE` (the SDK's own copy).
+fn question_closing_response(request_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": {
+                "behavior": "deny",
+                "message": "The question was posed to the user. Their answer will arrive in their next message; do not guess it.",
+            }
+        }
+    })
 }
 
 /// without needing to spin up a full streaming session.
@@ -31870,6 +31869,24 @@ mod tests {
         {
             assert_eq!(id, "snake_id_002");
         }
+    }
+
+    // ── AskUserQuestion is closed by a denial that ends the turn (§15.6) ──
+
+    #[test]
+    fn a_question_is_closed_by_a_denial_never_by_an_allow() {
+        let response = question_closing_response("req-q");
+        assert_eq!(response["response"]["request_id"], "req-q");
+        assert_eq!(response["response"]["response"]["behavior"], "deny");
+        assert!(
+            response["response"]["response"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("posed to the user")),
+            "{response}"
+        );
+        assert!(response["response"]["response"]
+            .get("updatedInput")
+            .is_none());
     }
 
     // ── parse_permission_control_msg: AskUserQuestion tests ─────────────
