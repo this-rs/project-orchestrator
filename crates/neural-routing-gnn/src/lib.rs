@@ -29,10 +29,7 @@ pub use inference::{
 };
 pub use message_passing::{scatter_add, scatter_mean, MessagePassing};
 pub use rgcn::RGCN;
-pub use sampler::{
-    export_to_pyg, GraphSampler, GraphSamplerConfig, PyGData, RelationType, SamplerError, SubGraph,
-    SubGraphEdge, SubGraphNode,
-};
+pub use sampler::{export_to_pyg, PyGData, RelationType, SubGraph, SubGraphEdge, SubGraphNode};
 pub use training::{
     auc_roc, silhouette_score, spearman_correlation, BenchmarkReport, DataLoader, DataLoaderConfig,
     DataSplit, EpochMetrics, Split, TrainingConfig, TrainingResult,

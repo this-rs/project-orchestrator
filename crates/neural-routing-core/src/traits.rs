@@ -38,7 +38,7 @@ pub trait TrajectoryStore: Send + Sync {
     /// Store multiple trajectories in a single batch operation.
     ///
     /// Default implementation falls back to sequential `store_trajectory` calls.
-    /// `Neo4jTrajectoryStore` overrides this with UNWIND-based batch insert (≤3 queries).
+    /// The Neo4j adapter overrides this with UNWIND-based batch insert (≤3 queries).
     async fn store_trajectories_batch(&self, trajectories: &[Trajectory]) -> Result<usize> {
         let mut stored = 0;
         for trajectory in trajectories {
@@ -51,6 +51,26 @@ pub trait TrajectoryStore: Send + Sync {
     /// Link a trajectory to a protocol run via a DURING_RUN relation.
     /// Default implementation is a no-op (for stores that don't support graph relations).
     async fn link_trajectory_to_run(&self, _trajectory_id: &Uuid, _run_id: &Uuid) -> Result<()> {
+        Ok(())
+    }
+
+    /// Link a trajectory node's tool usages in a single batch.
+    ///
+    /// Default implementation is a no-op (for stores that don't persist tool-usage
+    /// relations). The Neo4j adapter overrides this with a single transaction.
+    async fn link_tool_usages_batch(&self, _node_id: &Uuid, _usages: &[ToolUsage]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Link a trajectory node's touched entities in a single batch.
+    ///
+    /// Default implementation is a no-op (for stores that don't persist entity-touch
+    /// relations). The Neo4j adapter overrides this with a single transaction.
+    async fn link_touched_entities_batch(
+        &self,
+        _node_id: &Uuid,
+        _entities: &[TouchedEntity],
+    ) -> Result<()> {
         Ok(())
     }
 }

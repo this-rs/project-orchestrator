@@ -216,6 +216,7 @@ rand = "0.10.0"
 dashmap = "6"
 
 # Neural routing — always compiled (build full), runtime-controlled via settings
+neural-routing-core = { path = "crates/neural-routing-core" }
 neural-routing-runtime = { path = "crates/neural-routing-runtime" }
 # Shared metrics (F1, AUC, ...) for the classifier evaluation bench (src/evaluation).
 neural-routing-gnn = { path = "crates/neural-routing-gnn" }

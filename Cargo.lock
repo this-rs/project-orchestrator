@@ -4467,15 +4467,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lru"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a9f71e3591c7ec44d3e563e87bf14ddc2bada8519dca046e5b0e560cd004e2d"
-dependencies = [
- "hashbrown 0.17.1",
-]
-
-[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4995,7 +4986,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
- "neo4rs",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -5014,9 +5004,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "chrono",
- "lru 0.19.0",
  "moka",
- "neo4rs",
  "neural-routing-core",
  "safetensors 0.8.0",
  "serde",
@@ -6456,11 +6444,12 @@ dependencies = [
  "indexmap 2.14.2",
  "jsonwebtoken 11.1.0",
  "libc",
- "lru 0.18.5",
+ "lru",
  "meilisearch-sdk",
  "mime_guess",
  "multibase",
  "neo4rs",
+ "neural-routing-core",
  "neural-routing-gnn",
  "neural-routing-runtime",
  "nexus-claude",

@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
+use super::trajectory_store::Neo4jTrajectoryStore;
 use anyhow::Result;
-use neural_routing_runtime::Neo4jTrajectoryStore;
 
 /// Opens the trajectory store on the configured server and makes sure the
 /// vector indexes it queries actually exist.

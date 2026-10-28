@@ -18,10 +18,11 @@ use neo4rs::{query, Graph};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::error::{NeuralRoutingError, Result};
-use crate::models::{Trajectory, TrajectoryNode};
-use crate::store::Neo4jTrajectoryStore;
-use crate::traits::TrajectoryStore;
+use neural_routing_core::error::{NeuralRoutingError, Result};
+use neural_routing_core::models::{Trajectory, TrajectoryNode};
+use neural_routing_core::traits::TrajectoryStore;
+
+use super::trajectory_store::Neo4jTrajectoryStore;
 
 /// Configuration for the historical migration job.
 #[derive(Debug, Clone)]

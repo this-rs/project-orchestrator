@@ -81,7 +81,7 @@ pub struct ServerState {
     pub trajectory_collector:
         std::sync::RwLock<Option<Arc<neural_routing_runtime::TrajectoryCollector>>>,
     /// Concrete Neo4j trajectory store — needed to create the collector at runtime.
-    pub trajectory_store_neo4j: Option<Arc<neural_routing_runtime::Neo4jTrajectoryStore>>,
+    pub trajectory_store_neo4j: Option<Arc<crate::neo4j::trajectory_store::Neo4jTrajectoryStore>>,
     /// Trajectory store — Neo4j CRUD + vector search for stored trajectories.
     pub trajectory_store: Option<Arc<dyn neural_routing_runtime::TrajectoryStore>>,
     /// EventReactor counters for the /api/reactor/status endpoint.

@@ -7,7 +7,6 @@ use crate::error::Result;
 use crate::mcts::{MctsConfig, MctsEngine};
 use crate::models::TrajectoryFilter;
 use crate::proxy_model::GdsHeuristicProxy;
-use crate::store::Neo4jTrajectoryStore;
 use crate::traits::TrajectoryStore;
 
 /// Configuration for the augmentation batch job.
@@ -63,7 +62,7 @@ pub struct AugmentationReport {
 /// This function uses `tokio::task::spawn_blocking` internally for MCTS
 /// computation-heavy work. The `max_threads` parameter on CpuGuard limits parallelism.
 pub async fn run_augmentation(
-    store: Arc<Neo4jTrajectoryStore>,
+    store: Arc<dyn TrajectoryStore>,
     config: &AugmentationConfig,
 ) -> Result<AugmentationReport> {
     let start = std::time::Instant::now();
@@ -72,7 +71,7 @@ pub async fn run_augmentation(
 
     // Count existing trajectories to enforce ratio limit
     let existing_count = store.count().await?;
-    let real_count = count_real_trajectories(&store).await?;
+    let real_count = count_real_trajectories(store.as_ref()).await?;
     let sim_count = existing_count.saturating_sub(real_count);
     let max_new_sims =
         ((real_count as f64 * config.max_sim_ratio) as usize).saturating_sub(sim_count);
@@ -206,7 +205,7 @@ pub async fn run_augmentation(
 }
 
 /// Count trajectories that are NOT simulated (real + migrated).
-async fn count_real_trajectories(store: &Neo4jTrajectoryStore) -> Result<usize> {
+async fn count_real_trajectories(store: &dyn TrajectoryStore) -> Result<usize> {
     // For now, use total count as approximation.
     // Once we have a source flag in the model, we can filter properly.
     // Real trajectories don't have "mcts-sim-" prefix in session_id.
