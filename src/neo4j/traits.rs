@@ -91,12 +91,12 @@ impl Default for StoreCapabilities {
 /// `execute`, `execute_with_params`, and private helpers) is represented here.
 #[async_trait]
 pub trait GraphStore: Send + Sync {
-    /// Manifest of what this store actually supports. The default is the
-    /// conservative [`StoreCapabilities::default`] (every flag `false`);
-    /// concrete adapters override it with values proven by their own code.
-    fn capabilities(&self) -> StoreCapabilities {
-        StoreCapabilities::default()
-    }
+    /// Manifest of what this store actually supports.
+    ///
+    /// Every adapter states it explicitly, with the values its own code proves;
+    /// there is deliberately no default, so a new adapter cannot inherit a
+    /// flattering manifest by accident.
+    fn capabilities(&self) -> StoreCapabilities;
 
     // ========================================================================
     // Project operations

@@ -596,6 +596,12 @@ mod tests {
     }
 
     #[test]
+    fn the_default_transport_state_is_unknown() {
+        let emitter = RecordingEmitter::new();
+        assert_eq!(emitter.transport_state(), TransportState::Unknown);
+    }
+
+    #[test]
     fn test_emit_created_default_method() {
         let emitter = RecordingEmitter::new();
         emitter.emit_created(
