@@ -18735,6 +18735,15 @@ impl ChatManager {
                 .map(|(id, _)| id.clone())
                 .collect()
         };
+        // The agent engine (the default): the provider said, out of a turn, that its process is
+        // gone. A turn in flight would have noticed and detached the handle by itself; an idle
+        // session never did, and held its child slot.
+        let mut dead = dead;
+        for handle in self.agent_runtime.handles().await {
+            if handle.provider_is_dead() && !dead.contains(&handle.session_id) {
+                dead.push(handle.session_id.clone());
+            }
+        }
         for id in &dead {
             warn!(session_id = %id, "CLI process is gone: closing its session (process_died)");
             if let Err(e) = self
@@ -18789,7 +18798,9 @@ impl ChatManager {
             // `session_closed` the runtime emits is published like every event. A quiet
             // close (an in-place switch) skips that announcement.
             if announce {
-                self.agent_runtime.close(session_id).await?;
+                self.agent_runtime
+                    .close_with_reason(session_id, reason)
+                    .await?;
             } else {
                 self.agent_runtime.close_for_switch(session_id).await?;
             }
@@ -28262,6 +28273,53 @@ mod tests {
         assert_eq!(tasks[0].id, "b1", "keyed by its tool_use");
         assert_eq!(tasks[0].pid, None, "the agent engine tracks no PID");
         manager.close_session(&sid).await.unwrap();
+    }
+
+    /// ZOMBIE-CLI on the agent engine (the default): an IDLE session whose provider process
+    /// dies says so out of any turn (`Error { ProcessExited }`). Nothing used to act on it: only
+    /// a turn in flight detached its handle, so the session stayed live and held its parent's
+    /// child slot. The watchdog now closes it, with the typed reason `process_died`. A healthy
+    /// sibling is left alone.
+    #[tokio::test]
+    async fn agent_path_an_idle_session_whose_provider_died_is_closed_with_process_died() {
+        use nexus_claude::agent::{AgentEvent, ProviderError};
+        let (manager, _graph, fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("go"))
+            .await
+            .unwrap()
+            .session_id;
+        assert!(manager.agent_runtime.owns(&sid).await, "the agent engine");
+        assert!(
+            manager.close_sessions_of_dead_clis().await.is_empty(),
+            "a healthy idle session is not closed"
+        );
+
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state.push_oob(AgentEvent::Error {
+            error: ProviderError::ProcessExited { code: None },
+        });
+        // The pump is asynchronous: wait for the handle to carry the verdict.
+        let handle = manager.agent_runtime.get(&sid).await.expect("registered");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !handle.provider_is_dead() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the out-of-band death reaches the handle");
+
+        let closed = manager.close_sessions_of_dead_clis().await;
+        assert_eq!(closed, vec![sid.clone()], "the dead session is closed");
+        assert!(
+            !manager.is_session_active(&sid).await,
+            "a closed session holds no envelope slot"
+        );
+        let event = next_matching(&mut rx, |e| {
+            matches!(e, ChatEvent::SessionClosed { reason: Some(r), .. } if r == "process_died")
+        })
+        .await;
+        assert!(matches!(event, ChatEvent::SessionClosed { .. }));
     }
 
     #[tokio::test]

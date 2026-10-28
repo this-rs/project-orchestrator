@@ -798,6 +798,11 @@ pub struct AgentSessionHandle {
     /// its provider process is gone: a dead handle must not keep answering (and
     /// re-failing) a session the manager will otherwise resume.
     registry: std::sync::Weak<RwLock<HashMap<String, Arc<AgentSessionHandle>>>>,
+    /// The provider said, OUT of any turn, that its process is gone (an idle CLI killed from
+    /// outside). Only a turn in flight used to notice a death, so an idle session whose CLI was
+    /// killed stayed live, holding its child slot (ZOMBIE-CLI, agent engine). The manager's
+    /// dead-CLI watchdog closes such a session with the reason `process_died`.
+    provider_dead: AtomicBool,
 }
 
 impl AgentSessionHandle {
@@ -1109,6 +1114,11 @@ impl AgentSessionHandle {
     /// session the manager will resume instead: once it is gone, the next message
     /// takes the resume path. Only this handle is removed — a newer handle that
     /// replaced it stays.
+    /// Whether the provider reported, out of a turn, that its process is gone.
+    pub(crate) fn provider_is_dead(&self) -> bool {
+        self.provider_dead.load(Ordering::SeqCst)
+    }
+
     async fn detach_after_process_exit(&self) {
         let Some(registry) = self.registry.upgrade() else {
             return;
@@ -2937,6 +2947,7 @@ impl AgentRuntime {
             quota: self.quota.read().unwrap_or_else(|e| e.into_inner()).clone(),
             last_activity: std::sync::Mutex::new(Instant::now()),
             registry: Arc::downgrade(&self.sessions),
+            provider_dead: AtomicBool::new(false),
         });
         let replaced = {
             let mut sessions = self.sessions.write().await;
@@ -2975,16 +2986,22 @@ impl AgentRuntime {
     /// Closes a session: tells the provider, announces `session_closed` (A45),
     /// forgets it.
     pub async fn close(&self, session_id: &str) -> Result<()> {
-        self.close_inner(session_id, true).await
+        self.close_inner(session_id, true, "closed").await
+    }
+
+    /// [`Self::close`] with the reason the clients are told (`process_died` for a provider whose
+    /// process is gone).
+    pub async fn close_with_reason(&self, session_id: &str, reason: &str) -> Result<()> {
+        self.close_inner(session_id, true, reason).await
     }
 
     /// [`Self::close`] without announcing `session_closed`: an in-place provider switch, whose
     /// same thread must see only `provider_switched`, never `session_closed`.
     pub async fn close_for_switch(&self, session_id: &str) -> Result<()> {
-        self.close_inner(session_id, false).await
+        self.close_inner(session_id, false, "closed").await
     }
 
-    async fn close_inner(&self, session_id: &str, announce: bool) -> Result<()> {
+    async fn close_inner(&self, session_id: &str, announce: bool, reason: &str) -> Result<()> {
         // The engines this session was launched with are gone with it: a later question about a
         // search must not name an origin nothing runs (`nexus_tools::remember_search_origins`).
         super::provider::nexus_tools::forget_search_origins(session_id);
@@ -3002,7 +3019,7 @@ impl AgentRuntime {
             handle
                 .emit(ChatEvent::SessionClosed {
                     session_id: session_id.to_string(),
-                    reason: Some("closed".to_string()),
+                    reason: Some(reason.to_string()),
                 })
                 .await;
         }
@@ -3022,6 +3039,9 @@ pub(crate) async fn emit_out_of_band(handle: &AgentSessionHandle, events: Vec<Ag
     }
     for event in &events {
         handle.observe_quota(event);
+    }
+    if events.iter().any(process_exited) {
+        handle.provider_dead.store(true, Ordering::SeqCst);
     }
     let events: Vec<AgentEvent> = events.into_iter().map(mask_agent_event).collect();
     if let Some(services) = &handle.services {
