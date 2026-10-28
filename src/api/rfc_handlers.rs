@@ -529,6 +529,8 @@ pub async fn get_rfc(
 /// POST /api/rfcs
 pub async fn create_rfc(
     State(state): State<OrchestratorState>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CreateRfcBody>,
 ) -> Result<(StatusCode, Json<RfcResponse>), AppError> {
     let content = rfc_content_json(&body.title, &body.sections);
@@ -557,7 +559,16 @@ pub async fn create_rfc(
     let note = state
         .orchestrator
         .note_manager()
-        .create_note(request, "api")
+        .create_note(
+            request,
+            &crate::api::note_handlers::caller_author(
+                &state,
+                claims.as_ref().map(|c| &c.0),
+                &headers,
+                "api",
+            )
+            .await,
+        )
         .await?;
 
     let rfc = note_to_rfc(&note);

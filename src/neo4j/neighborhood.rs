@@ -313,6 +313,7 @@ mod bench {
         let client = Neo4jClient {
             graph: std::sync::Arc::new(neo4rs::Graph::connect(config).await.unwrap()),
             coupling_cache: Default::default(),
+            agent_identity_root: Default::default(),
         };
         let centers = std::env::var("NEIGHBORHOOD_BENCH_CENTERS").unwrap_or_default();
         for c in centers.split(';').filter(|c| !c.is_empty()) {

@@ -43,6 +43,43 @@ pub struct ListEpisodesQuery {
     pub project_id: Uuid,
     /// Maximum number of episodes to return (default: 20).
     pub limit: Option<usize>,
+    /// Which episodes: `run` (from protocol runs, the default and the only kind before
+    /// session episodes existed), `session` (left by closed chat sessions) or `all`.
+    pub source: Option<String>,
+}
+
+/// When an episode ended: a session's at its close (`collected_at`, written then), a
+/// run's at its completion (start + duration), else when it started.
+pub fn ended_at(e: &crate::episodes::Episode) -> chrono::DateTime<chrono::Utc> {
+    if e.session.is_some() {
+        return e.collected_at;
+    }
+    match e.process.duration_ms {
+        Some(ms) => e.stimulus.timestamp + chrono::Duration::milliseconds(ms),
+        None => e.stimulus.timestamp,
+    }
+}
+
+/// The episodes `GET /api/episodes` lists (its `source` parameter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpisodeSource {
+    Run,
+    Session,
+    All,
+}
+
+impl EpisodeSource {
+    /// `None` (absent) is `Run`: a caller that never asked keeps what it always had.
+    pub fn parse(raw: Option<&str>) -> Result<Self, AppError> {
+        match raw {
+            None | Some("run") => Ok(Self::Run),
+            Some("session") => Ok(Self::Session),
+            Some("all") => Ok(Self::All),
+            Some(other) => Err(AppError::BadRequest(format!(
+                "unknown episode source `{other}`: expected run, session or all"
+            ))),
+        }
+    }
 }
 
 /// Response for `GET /api/episodes`.
@@ -117,10 +154,28 @@ pub async fn list_episodes(
     Query(query): Query<ListEpisodesQuery>,
 ) -> Result<Json<ListEpisodesResponse>, AppError> {
     let limit = query.limit.unwrap_or(20).min(100);
+    let source = EpisodeSource::parse(query.source.as_deref())?;
+    let graph = state.orchestrator.neo4j();
 
-    let episodes = collector::list_episodes(state.orchestrator.neo4j(), query.project_id, limit)
-        .await
-        .map_err(AppError::Internal)?;
+    let mut episodes = Vec::new();
+    if source != EpisodeSource::Session {
+        episodes = collector::list_episodes(graph, query.project_id, limit)
+            .await
+            .map_err(AppError::Internal)?;
+    }
+    if source != EpisodeSource::Run {
+        let sessions = graph
+            .list_session_episodes(query.project_id, limit)
+            .await
+            .map_err(AppError::Internal)?;
+        episodes.extend(sessions);
+    }
+    if source == EpisodeSource::All {
+        // Both kinds, most recent END first: the key each source was cut on (runs by
+        // completion, sessions by close), so the merge keeps the true latest `limit`.
+        episodes.sort_by_key(|e| std::cmp::Reverse(ended_at(e)));
+        episodes.truncate(limit);
+    }
 
     let count = episodes.len();
     Ok(Json(ListEpisodesResponse { episodes, count }))
@@ -288,7 +343,7 @@ pub async fn export_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn test_collect_episode_request_deserialization() {
@@ -462,5 +517,121 @@ mod tests {
         let resp = CollectEpisodeResponse { episode: None };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json["episode"].is_null());
+    }
+
+    /// `source=all` merges on the key each source was cut on: a session that started
+    /// first but closed last is the most recent; a run counts from its completion.
+    #[test]
+    fn episodes_are_merged_by_when_they_ended() {
+        use crate::episodes::collector::tests_support::episode_at;
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(10);
+        // A session opened at t0, closed at t0+9h.
+        let long_session = episode_at(t0, None, Some(t0 + chrono::Duration::hours(9)));
+        // A session opened at t0+1h, closed at t0+2h.
+        let short_session = episode_at(
+            t0 + chrono::Duration::hours(1),
+            None,
+            Some(t0 + chrono::Duration::hours(2)),
+        );
+        // A run started at t0+3h that lasted 1h.
+        let run = episode_at(t0 + chrono::Duration::hours(3), Some(3_600_000), None);
+        let mut all = [short_session.clone(), run.clone(), long_session.clone()];
+        all.sort_by_key(|e| std::cmp::Reverse(ended_at(e)));
+        assert_eq!(
+            all.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![long_session.id, run.id, short_session.id]
+        );
+    }
+
+    #[test]
+    fn an_absent_source_lists_run_episodes_as_before() {
+        assert_eq!(EpisodeSource::parse(None).unwrap(), EpisodeSource::Run);
+        assert_eq!(
+            EpisodeSource::parse(Some("run")).unwrap(),
+            EpisodeSource::Run
+        );
+        assert_eq!(
+            EpisodeSource::parse(Some("session")).unwrap(),
+            EpisodeSource::Session
+        );
+        assert_eq!(
+            EpisodeSource::parse(Some("all")).unwrap(),
+            EpisodeSource::All
+        );
+        assert!(matches!(
+            EpisodeSource::parse(Some("sessions")),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    /// Through the router: the episode a closed session left is listed with
+    /// `source=session` and `source=all`, never by default (run episodes only).
+    #[tokio::test]
+    async fn session_episodes_are_listed_only_when_asked_for() {
+        use crate::neo4j::GraphStore;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let graph = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&project).await.unwrap();
+        let mut session = crate::test_helpers::test_chat_session(Some("alpha"));
+        session.preview = Some("first message".into());
+        session.message_count = 2;
+        let sid = session.id;
+        graph.create_chat_session(&session).await.unwrap();
+        let episode = collector::collect_session_episode(graph.as_ref(), sid, "closed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(graph.save_session_episode(&episode).await.unwrap());
+        let app = crate::test_helpers::router_with_auth(graph.clone()).await;
+
+        let list = |source: Option<&str>| {
+            let mut uri = format!("/api/episodes?project_id={}", project.id);
+            if let Some(s) = source {
+                uri.push_str(&format!("&source={s}"));
+            }
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header("authorization", crate::test_helpers::test_bearer_token())
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+                )
+            }
+        };
+
+        let (status, body) = list(None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 0, "default stays run episodes only: {body}");
+
+        for source in ["session", "all"] {
+            let (status, body) = list(Some(source)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["count"], 1, "{source}: {body}");
+            assert_eq!(
+                body["episodes"][0]["session"]["session_id"],
+                sid.to_string()
+            );
+            assert_eq!(body["episodes"][0]["stimulus"]["request"], "first message");
+        }
+
+        let (status, _) = list(Some("bogus")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

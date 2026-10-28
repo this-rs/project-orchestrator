@@ -37,6 +37,8 @@ const EXPECTED_CONSTRAINTS: &[&str] = &[
     "component_id",
     "chat_session_id",
     "chat_event_id",
+    "session_episode_session",
+    "agent_identity_root_key",
     "milestone_id",
     "release_id",
     "environment_id",
@@ -83,6 +85,9 @@ pub struct Neo4jClient {
     /// Value: (coupling_score, cached_at).
     /// Entries expire after `COUPLING_CACHE_TTL` (5 minutes).
     pub(crate) coupling_cache: RwLock<HashMap<(Uuid, Uuid), (f64, Instant)>>,
+    /// The agent identity root, once read (`agent_identity_namespace`): it never changes
+    /// after its creation, so one round trip per process.
+    pub(crate) agent_identity_root: tokio::sync::OnceCell<Uuid>,
 }
 
 /// Convert PascalCase to snake_case (e.g., "InProgress" -> "in_progress")
@@ -347,6 +352,7 @@ impl Neo4jClient {
         let client = Self {
             graph: Arc::new(graph),
             coupling_cache: RwLock::new(HashMap::new()),
+            agent_identity_root: tokio::sync::OnceCell::new(),
         };
 
         // Initialize schema
@@ -434,6 +440,11 @@ impl Neo4jClient {
             "CREATE CONSTRAINT anchor_id IF NOT EXISTS FOR (a:Anchor) REQUIRE a.id IS UNIQUE",
             "CREATE CONSTRAINT anchor_session_target IF NOT EXISTS FOR (a:Anchor) REQUIRE (a.session_id, a.target_type, a.target_id) IS UNIQUE",
             "CREATE CONSTRAINT anchor_event_id IF NOT EXISTS FOR (e:AnchorEvent) REQUIRE e.id IS UNIQUE",
+            // The episode a chat session leaves at its close: one per session, the last
+            // close replacing the one before (`save_session_episode`).
+            "CREATE CONSTRAINT session_episode_session IF NOT EXISTS FOR (e:SessionEpisode) REQUIRE e.session_id IS UNIQUE",
+            // The root of the agent ids (`provenance`): one node, made once by an atomic MERGE.
+            "CREATE CONSTRAINT agent_identity_root_key IF NOT EXISTS FOR (r:AgentIdentityRoot) REQUIRE r.key IS UNIQUE",
             // Execution-place audit (T5): append-only, one node per event.
             "CREATE CONSTRAINT execution_place_event_id IF NOT EXISTS FOR (e:ExecutionPlaceEvent) REQUIRE e.id IS UNIQUE",
             "CREATE CONSTRAINT synapse_shadow_trace_id IF NOT EXISTS FOR (t:SynapseShadowTrace) REQUIRE t.id IS UNIQUE",
@@ -535,6 +546,7 @@ impl Neo4jClient {
             // Anchor indexes: reverse query "sessions anchored on X", and per-session reads/journal
             "CREATE INDEX anchor_target IF NOT EXISTS FOR (a:Anchor) ON (a.target_type, a.target_id)",
             "CREATE INDEX anchor_session IF NOT EXISTS FOR (a:Anchor) ON (a.session_id)",
+            "CREATE INDEX session_episode_project IF NOT EXISTS FOR (e:SessionEpisode) ON (e.project_id, e.collected_at)",
             "CREATE INDEX synapse_shadow_trace_session IF NOT EXISTS FOR (t:SynapseShadowTrace) ON (t.session_id)",
             "CREATE INDEX anchor_event_session IF NOT EXISTS FOR (e:AnchorEvent) ON (e.session_id)",
             "CREATE INDEX execution_place_event_task IF NOT EXISTS FOR (e:ExecutionPlaceEvent) ON (e.task_id)",
@@ -688,6 +700,14 @@ impl Neo4jClient {
             // embeddings — chunks are searched exactly the way notes are.
             r#"CREATE VECTOR INDEX document_chunk_embeddings IF NOT EXISTS
                FOR (c:DocumentChunk) ON (c.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}"#,
+            // The episode a session leaves at its close, recalled by the reflex stage
+            // from the embedding of its first message (`search_episodes_by_embedding`).
+            r#"CREATE VECTOR INDEX session_episode_embeddings IF NOT EXISTS
+               FOR (e:SessionEpisode) ON (e.embedding)
                OPTIONS {indexConfig: {
                    `vector.dimensions`: 768,
                    `vector.similarity_function`: 'cosine'

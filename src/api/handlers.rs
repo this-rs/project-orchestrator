@@ -2289,13 +2289,23 @@ pub async fn enrich_task(
 pub async fn add_decision(
     State(state): State<OrchestratorState>,
     Path(task_id): Path<Uuid>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<CreateDecisionRequest>,
 ) -> Result<Json<DecisionNode>, AppError> {
     let explicit_run_id = req.run_id;
+    // The agent of the calling session; `agent`, as before, for anyone else.
+    let author = crate::api::note_handlers::caller_author(
+        &state,
+        claims.as_ref().map(|c| &c.0),
+        &headers,
+        "agent",
+    )
+    .await;
     let decision = state
         .orchestrator
         .plan_manager()
-        .add_decision(task_id, req, "agent")
+        .add_decision(task_id, req, &author)
         .await
         .map_err(|e| {
             if e.to_string().contains("not found in Neo4j") {

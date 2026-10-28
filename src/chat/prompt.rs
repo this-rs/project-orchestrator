@@ -1317,12 +1317,12 @@ Manage living personas (adaptive knowledge agents scoped to code regions).
 | detect | `project_id` (req) | Auto-detect personas from code communities |
 
 ## episode
-Manage episodic memory (cognitive episodes from protocol runs).
+Manage episodic memory (cognitive episodes from protocol runs, and the episode each chat session leaves at its close).
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
 | collect | `project_id` (req), `run_id` (req) | Collect episode from completed ProtocolRun (stimulus + process + outcome) |
-| list | `project_id` (req), `limit` | List collected episodes |
+| list | `project_id` (req), `limit`, `source` (`run` default \| `session` \| `all`) | List episodes: from protocol runs, from closed chat sessions, or both |
 | anonymize | `project_id` (req), `run_id` (req) | Anonymize episode for safe export (strip secrets, paths) |
 | export_artifact | `project_id` (req), `max_episodes`, `include_structure` (bool) | Export episodes as portable artifact with optional structural edges |
 

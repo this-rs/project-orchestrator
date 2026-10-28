@@ -57,10 +57,36 @@ pub struct Episode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_run_id: Option<Uuid>,
 
+    /// The chat session that generated this episode, when it was taken at a session's
+    /// close rather than from a protocol run. Absent on every run episode, and on every
+    /// episode serialized before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionTrace>,
+
     /// Embedding vector for semantic similarity search (ReflexEngine).
     /// Computed from the stimulus request + lesson abstract_pattern during collection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
+}
+
+/// The chat session an episode was taken from, at its close.
+///
+/// What a session leaves that a protocol run does not: how much was exchanged and
+/// why it ended. Read from the session node at close time, never computed later.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionTrace {
+    /// The session closed.
+    pub session_id: Uuid,
+    /// Messages exchanged when it closed.
+    pub message_count: i64,
+    /// Why it closed (`closed`, `process_died`, ...), as announced on `session_closed`.
+    pub close_reason: String,
+    /// Its cost in USD when it closed, if the provider reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    /// The agent that ran it (`crate::notes::provenance`), from its model when it closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<Uuid>,
 }
 
 /// What triggered the episode.
@@ -469,6 +495,7 @@ mod tests {
             }),
             collected_at: Utc::now(),
             source_run_id: Some(Uuid::new_v4()),
+            session: None,
             embedding: None,
         }
     }

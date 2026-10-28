@@ -765,13 +765,177 @@ impl Neo4jClient {
                     .run(query(cypher).param("id", id.to_string()))
                     .await?;
             }
-            let q = query("MATCH (s:ChatSession {id: $id}) DETACH DELETE s")
-                .param("id", id.to_string());
+            // The episode its close left goes with it IN THE SAME STATEMENT. A close episode
+            // written concurrently commits after (its MATCH finds no session: nothing written)
+            // or before (deleted here, or by the sweep just below).
+            let q = query(
+                "MATCH (s:ChatSession {id: $id}) \
+                 OPTIONAL MATCH (e:SessionEpisode {session_id: $id}) \
+                 DETACH DELETE e, s",
+            )
+            .param("id", id.to_string());
             self.graph.run(q).await?;
+            // A close episode whose write held the session's lock while the delete above
+            // waited lost its link to it (DETACH): it was committed BEFORE the delete, so
+            // it is here now, unlinked — and no write can make another one (no session).
+            self.graph
+                .run(
+                    query(
+                        "MATCH (e:SessionEpisode {session_id: $id}) \
+                         WHERE NOT (e)-[:EPISODE_OF]->() DETACH DELETE e",
+                    )
+                    .param("id", id.to_string()),
+                )
+                .await?;
             Ok(true)
         } else {
             Ok(false)
         }
+    }
+
+    /// See [`crate::neo4j::GraphStore::save_session_episode`]. The episode is kept whole
+    /// as JSON (`payload`); `session_id`, `project_id` and `collected_at` are copied out
+    /// for the uniqueness constraint and the listing.
+    pub async fn save_session_episode(
+        &self,
+        episode: &crate::episodes::models::Episode,
+    ) -> Result<bool> {
+        let Some(session) = episode.session.as_ref() else {
+            return Ok(false);
+        };
+        // The vector lives in its own property (the `session_episode_embeddings` index
+        // reads it), not in the JSON: a 768-float payload would be read on every listing.
+        let mut without_vector = episode.clone();
+        let embedding = without_vector.embedding.take();
+        let payload = serde_json::to_string(&without_vector)?;
+        // MATCH first: no session, no row, nothing written — in the same statement.
+        let set_vector = if embedding.is_some() {
+            ", e.embedding = $embedding"
+        } else {
+            ""
+        };
+        let mut q = query(&format!(
+            "MATCH (s:ChatSession {{id: $sid}}) \
+             MERGE (e:SessionEpisode {{session_id: $sid}}) \
+             SET e.id = $id, e.project_id = $pid, e.collected_at = $at, e.payload = $payload{set_vector} \
+             MERGE (e)-[:EPISODE_OF]->(s) \
+             RETURN e.id AS id"
+        ))
+        .param("sid", session.session_id.to_string())
+        .param("id", episode.id.to_string())
+        .param("pid", episode.project_id.to_string())
+        .param("at", episode.collected_at.to_rfc3339())
+        .param("payload", payload);
+        if let Some(vector) = embedding {
+            q = q.param("embedding", vector);
+        }
+        let mut result = self.graph.execute(q).await?;
+        Ok(result.next().await?.is_some())
+    }
+
+    /// See [`crate::neo4j::GraphStore::search_episodes_by_embedding`]: the session
+    /// episodes of `project_id` closest to `embedding`, through the HNSW index
+    /// `session_episode_embeddings`. The index returns its `k` nearest over EVERY
+    /// project, so `k` is wider than `limit` and the project is filtered after. An
+    /// episode whose session is gone (no `EPISODE_OF`) is never a hit. A Neo4j
+    /// without vector indexes errs here, and the reflex that calls this logs and
+    /// recalls nothing.
+    pub async fn search_episodes_by_embedding(
+        &self,
+        project_id: Uuid,
+        embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(crate::episodes::models::Episode, f64)>> {
+        if embedding.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let k = (limit * 8).clamp(limit, 64) as i64;
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "CALL db.index.vector.queryNodes('session_episode_embeddings', $k, $embedding) \
+                     YIELD node AS e, score \
+                     WHERE e.project_id = $pid AND (e)-[:EPISODE_OF]->(:ChatSession) \
+                     RETURN e.payload AS payload, score \
+                     ORDER BY score DESC LIMIT $limit",
+                )
+                .param("k", k)
+                .param("embedding", embedding.to_vec())
+                .param("pid", project_id.to_string())
+                .param("limit", limit as i64),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = result.next().await? {
+            let payload: String = row.get("payload")?;
+            let score: f64 = row.get("score")?;
+            match serde_json::from_str(&payload) {
+                Ok(episode) => out.push((episode, score)),
+                Err(e) => tracing::warn!(error = %e, "unreadable SessionEpisode payload, skipped"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// See [`crate::neo4j::GraphStore::agent_identity_namespace`]. One MERGE on a key
+    /// the `agent_identity_root_key` constraint makes unique: a concurrent first call
+    /// matches the node the other created, and reads its namespace.
+    pub async fn agent_identity_namespace(&self) -> Result<Uuid> {
+        // Cached once read: the root never changes after it is made.
+        self.agent_identity_root
+            .get_or_try_init(|| self.merge_agent_identity_root())
+            .await
+            .copied()
+    }
+
+    async fn merge_agent_identity_root(&self) -> Result<Uuid> {
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MERGE (r:AgentIdentityRoot {key: 'root'}) \
+                     ON CREATE SET r.namespace = $ns, r.created_at = datetime() \
+                     RETURN r.namespace AS ns",
+                )
+                .param("ns", Uuid::new_v4().to_string()),
+            )
+            .await?;
+        let row = result
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("MERGE of the agent identity root returned no row"))?;
+        let ns: String = row.get("ns")?;
+        Ok(Uuid::parse_str(&ns)?)
+    }
+
+    /// See [`crate::neo4j::GraphStore::list_session_episodes`]. A payload that no longer
+    /// parses is skipped with a warning, not an error: one bad node must not hide the rest.
+    pub async fn list_session_episodes(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<crate::episodes::models::Episode>> {
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (e:SessionEpisode {project_id: $pid})-[:EPISODE_OF]->(:ChatSession) \
+                     RETURN e.payload AS payload ORDER BY e.collected_at DESC LIMIT $limit",
+                )
+                .param("pid", project_id.to_string())
+                .param("limit", limit as i64),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = result.next().await? {
+            let payload: String = row.get("payload")?;
+            match serde_json::from_str(&payload) {
+                Ok(episode) => out.push(episode),
+                Err(e) => tracing::warn!(error = %e, "unreadable SessionEpisode payload, skipped"),
+            }
+        }
+        Ok(out)
     }
 
     /// Get child sessions spawned by a parent session (identified by the SPAWNED_BY edge, else by parent_id in the spawned_by JSON).

@@ -357,6 +357,9 @@ const HUMAN_ONLY_MUTATION_PREFIXES: &[&str] = &[
     // the person's answer; an agent that could post it would open its own worktree (the handlers
     // refuse an agent token too).
     "/api/execution-places",
+    // A pinned note reaches every turn of every session of its scope: an agent that could
+    // pin would inject itself into all of them (knowledge_injection, pinned notes).
+    "/api/knowledge/pinned-notes",
 ];
 
 /// Per-project settings that decide where a project's content may go

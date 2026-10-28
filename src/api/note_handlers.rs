@@ -202,9 +202,156 @@ pub async fn list_project_notes(
     )))
 }
 
+/// The author of a write made through the API: the agent of the calling chat session
+/// when there is one (`crate::notes::provenance`), `fallback` otherwise — a person, a
+/// script, or a caller that cannot be placed. Never refuses the write.
+pub(crate) async fn caller_author(
+    state: &OrchestratorState,
+    claims: Option<&crate::auth::jwt::Claims>,
+    headers: &axum::http::HeaderMap,
+    fallback: &str,
+) -> String {
+    use crate::chat::envelope::{identify_caller, session_header, SpawnCaller};
+    let caller = identify_caller(claims, session_header(headers), state.auth_config.is_some());
+    let session = match caller {
+        Ok(SpawnCaller::Agent { session_id, .. }) => Some(session_id),
+        Ok(SpawnCaller::Human) | Err(_) => None,
+    };
+    crate::notes::provenance::author_of(state.orchestrator.neo4j(), session.as_deref(), fallback)
+        .await
+}
+
+// ============================================================================
+// Pinned notes: injected in every turn, whatever the message (knowledge_injection)
+// ============================================================================
+
+/// `?project=<slug>`: the project's pins; absent: the global pins (every session).
+#[derive(Debug, Deserialize)]
+pub struct PinnedNotesQuery {
+    pub project: Option<String>,
+}
+
+/// `PUT /api/knowledge/pinned-notes` body: the whole list, in order.
+#[derive(Debug, Deserialize)]
+pub struct PinnedNotesBody {
+    pub note_ids: Vec<Uuid>,
+}
+
+/// The pins of a scope.
+#[derive(Debug, Serialize)]
+pub struct PinnedNotesView {
+    /// `global` or `project:<slug>`.
+    pub scope: String,
+    pub note_ids: Vec<Uuid>,
+}
+
+/// `GET /api/knowledge/pinned-notes[?project=<slug>]` — the pinned notes of a scope.
+pub async fn get_pinned_notes(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<PinnedNotesQuery>,
+) -> Result<Json<PinnedNotesView>, AppError> {
+    let project = query.project.as_deref();
+    let note_ids = crate::chat::stages::knowledge_injection::load_pinned_notes(
+        state.orchestrator.neo4j(),
+        project,
+    )
+    .await
+    .map_err(AppError::Internal)?;
+    Ok(Json(PinnedNotesView {
+        scope: crate::chat::stages::knowledge_injection::pinned_notes_scope(project),
+        note_ids,
+    }))
+}
+
+/// `PUT /api/knowledge/pinned-notes[?project=<slug>]` — replaces the pins of a scope
+/// (an empty list removes them).
+///
+/// A pin reaches EVERY turn of every session of its scope: whoever pins writes into the
+/// prompts of all of them. So a person only — never an agent, whose note pinned by
+/// itself would be a standing injection (refused by the middleware too, see
+/// `is_human_only_mutation`) — and the GLOBAL pins, which reach other people's chats,
+/// the root account only. A project pin must be a note of that project or a global
+/// note; a global pin must be a global note. At most `MAX_PINNED_NOTES`, each existing.
+pub async fn put_pinned_notes(
+    State(state): State<OrchestratorState>,
+    axum::Extension(claims): axum::Extension<crate::auth::jwt::Claims>,
+    Query(query): Query<PinnedNotesQuery>,
+    Json(body): Json<PinnedNotesBody>,
+) -> Result<Json<PinnedNotesView>, AppError> {
+    use crate::chat::stages::knowledge_injection::{
+        pinned_notes_scope, store_pinned_notes, MAX_PINNED_NOTES,
+    };
+    let graph = state.orchestrator.neo4j();
+    let project = query.project.as_deref();
+    let project_id = match project {
+        Some(slug) => {
+            // A person with their own session token: not an agent, an MCP token, a vault
+            // token or the server's account (`may_keep_lasting_approvals`, the same rule).
+            if state.auth_config.is_some() && !claims.may_keep_lasting_approvals() {
+                return Err(AppError::Forbidden(
+                    "pinned_notes_human_only: only a signed-in person pins notes".into(),
+                ));
+            }
+            let p = graph
+                .get_project_by_slug(slug)
+                .await
+                .map_err(AppError::Internal)?
+                .ok_or_else(|| AppError::NotFound(format!("Project {slug} not found")))?;
+            Some(p.id)
+        }
+        None => {
+            super::provider_handlers::require_root(&state, &claims)?;
+            None
+        }
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let ids: Vec<Uuid> = body
+        .note_ids
+        .into_iter()
+        .filter(|id| seen.insert(*id))
+        .collect();
+    if ids.len() > MAX_PINNED_NOTES {
+        return Err(AppError::BadRequest(format!(
+            "pinned_notes_too_many: at most {MAX_PINNED_NOTES} notes"
+        )));
+    }
+    for id in &ids {
+        let note = graph
+            .get_note(*id)
+            .await
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::BadRequest(format!("pinned_note_unknown: {id}")))?;
+        let fits = match (note.project_id, project_id) {
+            (None, _) => true,
+            (Some(owner), Some(scope)) => owner == scope,
+            (Some(_), None) => false,
+        };
+        if !fits {
+            return Err(AppError::BadRequest(format!(
+                "pinned_note_out_of_scope: {id} belongs to another project{}",
+                if project.is_none() {
+                    " (a global pin must be a global note)"
+                } else {
+                    ""
+                }
+            )));
+        }
+    }
+    store_pinned_notes(graph, project, &ids)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(PinnedNotesView {
+        scope: pinned_notes_scope(project),
+        note_ids: ids,
+    }))
+}
+
 /// Create a new note
 pub async fn create_note(
     State(state): State<OrchestratorState>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CreateNoteBody>,
 ) -> Result<(StatusCode, Json<Note>), AppError> {
     let explicit_run_id = body.run_id;
@@ -225,7 +372,10 @@ pub async fn create_note(
     let note = state
         .orchestrator
         .note_manager()
-        .create_note(request, "api")
+        .create_note(
+            request,
+            &caller_author(&state, claims.as_ref().map(|c| &c.0), &headers, "api").await,
+        )
         .await?;
 
     // Resolve run_id: explicit > auto-detect from active run
@@ -513,12 +663,16 @@ pub async fn unlink_note_from_entity(
 pub async fn confirm_note(
     State(state): State<OrchestratorState>,
     claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    headers: axum::http::HeaderMap,
     Path(note_id): Path<Uuid>,
 ) -> Result<Json<Note>, AppError> {
     let note = state
         .orchestrator
         .note_manager()
-        .confirm_note(note_id, "api")
+        .confirm_note(
+            note_id,
+            &caller_author(&state, claims.as_ref().map(|c| &c.0), &headers, "api").await,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Note {} not found", note_id)))?;
 
@@ -552,12 +706,18 @@ pub struct InvalidateNoteBody {
 pub async fn invalidate_note(
     State(state): State<OrchestratorState>,
     Path(note_id): Path<Uuid>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<InvalidateNoteBody>,
 ) -> Result<Json<Note>, AppError> {
     let note = state
         .orchestrator
         .note_manager()
-        .invalidate_note(note_id, &body.reason, "api")
+        .invalidate_note(
+            note_id,
+            &body.reason,
+            &caller_author(&state, claims.as_ref().map(|c| &c.0), &headers, "api").await,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Note {} not found", note_id)))?;
 
@@ -568,6 +728,8 @@ pub async fn invalidate_note(
 pub async fn supersede_note(
     State(state): State<OrchestratorState>,
     Path(old_note_id): Path<Uuid>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CreateNoteBody>,
 ) -> Result<(StatusCode, Json<Note>), AppError> {
     let request = CreateNoteRequest {
@@ -586,7 +748,11 @@ pub async fn supersede_note(
     let new_note = state
         .orchestrator
         .note_manager()
-        .supersede_note(old_note_id, request, "api")
+        .supersede_note(
+            old_note_id,
+            request,
+            &caller_author(&state, claims.as_ref().map(|c| &c.0), &headers, "api").await,
+        )
         .await?;
 
     Ok((StatusCode::CREATED, Json(new_note)))
@@ -1916,6 +2082,308 @@ mod tests {
     // ====================================================================
     // POST /api/notes + GET /api/notes/{id} — create and get
     // ====================================================================
+
+    /// A bound, live agent token for `session`.
+    fn agent_bearer(session: uuid::Uuid) -> String {
+        let claims = crate::auth::jwt::Claims::service_account("agent");
+        let binding = crate::auth::jwt::AgentSessionBinding {
+            session_id: session.to_string(),
+            ceiling: None,
+            tool_profile: None,
+            third_party: false,
+        };
+        let (token, jti) = crate::auth::jwt::generate_session_token(
+            &claims,
+            Some(&binding),
+            &crate::test_helpers::test_auth_config().jwt_secret,
+            3600,
+        )
+        .unwrap();
+        crate::auth::agent_tokens::register(&jti, Some(&session.to_string()));
+        format!("Bearer {token}")
+    }
+
+    /// Provenance: a note a chat session writes names the agent behind it — the same
+    /// agent for two sessions of one model, another for another model — and a note a
+    /// person writes keeps `api`, as every note did before. Superseding stamps it too.
+    #[tokio::test]
+    async fn a_note_written_by_a_chat_session_names_its_agent() {
+        use crate::neo4j::traits::GraphStore;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let mut sessions = Vec::new();
+        for model in ["claude-opus-5-5", "claude-opus-5-5", "deepseek-v4"] {
+            let mut s = crate::test_helpers::test_chat_session(None);
+            s.model = model.into();
+            graph.create_chat_session(&s).await.unwrap();
+            sessions.push(s.id);
+        }
+        let app = test_app_with_state(crate::test_helpers::mock_app_state_with_graph(
+            graph.clone(),
+        ))
+        .await;
+        let write = |uri: String, bearer: String| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("authorization", bearer)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({"note_type": "tip", "content": "a tip"})
+                                    .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::CREATED);
+                body_json(resp).await
+            }
+        };
+
+        let first = write("/api/notes".into(), agent_bearer(sessions[0])).await;
+        let second = write("/api/notes".into(), agent_bearer(sessions[1])).await;
+        let other = write("/api/notes".into(), agent_bearer(sessions[2])).await;
+        let person = write("/api/notes".into(), test_bearer_token()).await;
+
+        let expected = crate::notes::provenance::actor(
+            crate::notes::provenance::agent_id_of_session(graph.as_ref(), sessions[0])
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(first["created_by"], expected.as_str());
+        assert_eq!(
+            second["created_by"], first["created_by"],
+            "one model, one agent"
+        );
+        assert_ne!(
+            other["created_by"], first["created_by"],
+            "another model, another agent"
+        );
+        assert!(other["created_by"].as_str().unwrap().starts_with("agent:"));
+        assert_eq!(
+            person["created_by"], "api",
+            "a person's note keeps its author"
+        );
+
+        let old = first["id"].as_str().unwrap();
+        let replaced = write(
+            format!("/api/notes/{old}/supersede"),
+            agent_bearer(sessions[2]),
+        )
+        .await;
+        assert_eq!(replaced["created_by"], other["created_by"]);
+    }
+
+    /// Pinning is a person's act: a project's pins are set by a signed-in person, checked
+    /// note by note; an agent is refused (it would inject itself into every turn); the
+    /// global pins, which reach everyone's chats, need the root account.
+    #[tokio::test]
+    async fn only_a_person_pins_notes_and_only_notes_of_the_scope() {
+        use crate::neo4j::traits::GraphStore;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let alpha = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&alpha).await.unwrap();
+        let beta = crate::test_helpers::test_project_named("beta");
+        graph.create_project(&beta).await.unwrap();
+        let mut ids = std::collections::HashMap::new();
+        for (name, project) in [
+            ("global", None),
+            ("alpha", Some(alpha.id)),
+            ("beta", Some(beta.id)),
+        ] {
+            let n = crate::notes::models::Note::new(
+                project,
+                crate::notes::models::NoteType::Guideline,
+                name.into(),
+                "t".into(),
+            );
+            graph.create_note(&n).await.unwrap();
+            ids.insert(name, n.id);
+        }
+        let mut session = crate::test_helpers::test_chat_session(Some("alpha"));
+        session.model = "claude-opus-5-5".into();
+        graph.create_chat_session(&session).await.unwrap();
+        let app = test_app_with_state(crate::test_helpers::mock_app_state_with_graph(
+            graph.clone(),
+        ))
+        .await;
+        let call =
+            |method: &'static str, uri: &'static str, bearer: String, body: serde_json::Value| {
+                let app = app.clone();
+                async move {
+                    let resp = app
+                        .oneshot(
+                            Request::builder()
+                                .method(method)
+                                .uri(uri)
+                                .header("authorization", bearer)
+                                .header("content-type", "application/json")
+                                .body(Body::from(body.to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let status = resp.status();
+                    (status, body_json(resp).await)
+                }
+            };
+        let uri = "/api/knowledge/pinned-notes?project=alpha";
+
+        let (status, view) = call(
+            "PUT",
+            uri,
+            test_bearer_token(),
+            serde_json::json!({"note_ids": [ids["alpha"], ids["global"], ids["alpha"]]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["scope"], "project:alpha");
+        let expected = serde_json::json!([ids["alpha"], ids["global"]]);
+        assert_eq!(view["note_ids"], expected, "deduplicated, in order");
+        let (status, read) = call("GET", uri, test_bearer_token(), serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(read["note_ids"], expected);
+
+        // An agent cannot pin, not even in its own project.
+        let (status, _) = call(
+            "PUT",
+            uri,
+            agent_bearer(session.id),
+            serde_json::json!({"note_ids": [ids["alpha"]]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // A note of another project, an unknown note, too many notes: refused, nothing changed.
+        for body in [
+            serde_json::json!({"note_ids": [ids["beta"]]}),
+            serde_json::json!({"note_ids": [uuid::Uuid::new_v4()]}),
+            serde_json::json!({"note_ids": (0..11).map(|_| uuid::Uuid::new_v4()).collect::<Vec<_>>()}),
+        ] {
+            let (status, err) = call("PUT", uri, test_bearer_token(), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        }
+        let (_, read) = call("GET", uri, test_bearer_token(), serde_json::json!(null)).await;
+        assert_eq!(read["note_ids"], expected);
+
+        // The global pins reach everyone's chats: a person who is not root is refused.
+        let (status, _) = call(
+            "PUT",
+            "/api/knowledge/pinned-notes",
+            test_bearer_token(),
+            serde_json::json!({"note_ids": [ids["global"]]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// The other writes an agent makes through the API name it too: an RFC, a decision,
+    /// a confirmation and an invalidation. A person keeps the author each had before.
+    #[tokio::test]
+    async fn rfcs_decisions_confirmations_and_invalidations_name_the_agent() {
+        use crate::neo4j::traits::GraphStore;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let mut session = crate::test_helpers::test_chat_session(None);
+        session.model = "claude-opus-5-5".into();
+        graph.create_chat_session(&session).await.unwrap();
+        let plan = crate::test_helpers::test_plan();
+        graph.create_plan(&plan).await.unwrap();
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan.id, &task).await.unwrap();
+        let agent = crate::notes::provenance::actor(
+            crate::notes::provenance::agent_id_of_session(graph.as_ref(), session.id)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let app = test_app_with_state(crate::test_helpers::mock_app_state_with_graph(
+            graph.clone(),
+        ))
+        .await;
+        let send = |uri: String, bearer: String, body: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("authorization", bearer)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                (status, body_json(resp).await)
+            }
+        };
+        let rfc_body = serde_json::json!({
+            "title": "An RFC",
+            "sections": [{"title": "Problem", "content": "p"}]
+        });
+        let decision_body = serde_json::json!({"description": "d", "rationale": "r"});
+
+        let (status, rfc) = send(
+            "/api/rfcs".into(),
+            agent_bearer(session.id),
+            rfc_body.clone(),
+        )
+        .await;
+        assert!(status.is_success(), "{rfc}");
+        assert_eq!(rfc["created_by"], agent.as_str(), "{rfc}");
+        let (_, rfc) = send("/api/rfcs".into(), test_bearer_token(), rfc_body).await;
+        assert_eq!(rfc["created_by"], "api");
+
+        let uri = format!("/api/tasks/{}/decisions", task.id);
+        let (status, decision) =
+            send(uri.clone(), agent_bearer(session.id), decision_body.clone()).await;
+        assert!(status.is_success(), "{decision}");
+        assert_eq!(decision["decided_by"], agent.as_str(), "{decision}");
+        let (_, decision) = send(uri, test_bearer_token(), decision_body).await;
+        assert_eq!(
+            decision["decided_by"], "agent",
+            "a person's decision as before"
+        );
+
+        let (_, note) = send(
+            "/api/notes".into(),
+            test_bearer_token(),
+            serde_json::json!({"note_type": "tip", "content": "t"}),
+        )
+        .await;
+        let id = note["id"].as_str().unwrap().to_string();
+        let (status, confirmed) = send(
+            format!("/api/notes/{id}/confirm"),
+            agent_bearer(session.id),
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(status.is_success(), "{confirmed}");
+        assert_eq!(
+            confirmed["last_confirmed_by"],
+            agent.as_str(),
+            "{confirmed}"
+        );
+        let (status, invalidated) = send(
+            format!("/api/notes/{id}/invalidate"),
+            agent_bearer(session.id),
+            serde_json::json!({"reason": "stale"}),
+        )
+        .await;
+        assert!(status.is_success(), "{invalidated}");
+        let changes = invalidated["changes"].to_string();
+        assert!(
+            changes.contains(&agent),
+            "the invalidation is the agent's: {changes}"
+        );
+    }
 
     #[tokio::test]
     async fn test_create_and_get_note() {

@@ -1290,6 +1290,11 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/notes",
             get(note_handlers::list_notes).post(note_handlers::create_note),
         )
+        // Notes injected in every turn (a person pins them: human-only mutation).
+        .route(
+            "/api/knowledge/pinned-notes",
+            get(note_handlers::get_pinned_notes).put(note_handlers::put_pinned_notes),
+        )
         .route(
             "/api/notes/{note_id}",
             get(note_handlers::get_note)
