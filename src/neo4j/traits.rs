@@ -3163,6 +3163,32 @@ pub trait GraphStore: Send + Sync {
         query: &str,
         limit: usize,
     ) -> Result<Vec<crate::skills::activation::SkillMatch>> {
+        self.search_skills_with_affinity(
+            project_id,
+            query,
+            limit,
+            &std::collections::HashMap::new(),
+        )
+        .await
+    }
+
+    /// Same ranking, with the note-affinity channel supplied by the caller.
+    ///
+    /// `affinity` maps a skill id to how strongly the query matched that skill's
+    /// **member notes** (max over the matching notes, normalised to 0..1). It is a
+    /// parameter rather than something read here because it needs the note search,
+    /// which lives above the store: the store has no embedding provider.
+    ///
+    /// The channel matters for the transverse library: a competence whose name
+    /// says nothing about the question ("UI/UX — design front" for "flake de test
+    /// frontend") still scores, because its *notes* match.
+    async fn search_skills_with_affinity(
+        &self,
+        project_id: Option<Uuid>,
+        query: &str,
+        limit: usize,
+        affinity: &std::collections::HashMap<Uuid, f64>,
+    ) -> Result<Vec<crate::skills::activation::SkillMatch>> {
         let (candidates, _) = self
             .list_skills(
                 project_id,
@@ -3175,7 +3201,7 @@ pub trait GraphStore: Send + Sync {
         Ok(crate::skills::activation::rank_skills(
             &candidates,
             &triggered,
-            &std::collections::HashMap::new(),
+            affinity,
             limit,
         ))
     }
