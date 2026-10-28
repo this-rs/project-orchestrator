@@ -22,7 +22,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use neural_routing_runtime::{Neo4jTrajectoryStore, Trajectory, TrajectoryNode, TrajectoryStore};
+use neural_routing_runtime::{Trajectory, TrajectoryNode, TrajectoryStore};
+use project_orchestrator::neo4j::trajectory_store::Neo4jTrajectoryStore;
 use uuid::Uuid;
 
 /// The startup path must create the vector index the router queries.
@@ -41,7 +42,7 @@ fn startup_creates_the_vector_index_the_nn_router_queries() {
 
     // Tie the two halves together: a rename of the index can never silently
     // disconnect the query from its creation.
-    let store = include_str!("../crates/neural-routing-core/src/store.rs");
+    let store = include_str!("../src/neo4j/trajectory_store.rs");
     assert!(
         store.contains("trajectory_query_embedding_idx"),
         "the index the router queries must be the one ensure_indexes creates"

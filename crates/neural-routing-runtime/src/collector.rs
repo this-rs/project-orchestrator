@@ -14,8 +14,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use neural_routing_core::{
-    DecisionVectorBuilder, Neo4jTrajectoryStore, ToolUsage, TouchedEntity, Trajectory,
-    TrajectoryNode, TrajectoryStore,
+    DecisionVectorBuilder, ToolUsage, TouchedEntity, Trajectory, TrajectoryNode, TrajectoryStore,
 };
 
 use crate::config::CollectionConfig;
@@ -134,7 +133,7 @@ impl TrajectoryCollector {
     ///
     /// Returns the collector handle and a JoinHandle for the background task.
     pub fn new(
-        store: Arc<Neo4jTrajectoryStore>,
+        store: Arc<dyn TrajectoryStore>,
         config: &CollectionConfig,
         vector_builder: Option<Arc<DecisionVectorBuilder>>,
     ) -> (Self, tokio::task::JoinHandle<()>) {
@@ -148,7 +147,7 @@ impl TrajectoryCollector {
 
     /// Create a collector with a custom reward computer.
     pub fn new_with_reward(
-        store: Arc<Neo4jTrajectoryStore>,
+        store: Arc<dyn TrajectoryStore>,
         config: &CollectionConfig,
         vector_builder: Option<Arc<DecisionVectorBuilder>>,
         reward_computer: SessionRewardComputer,
@@ -162,7 +161,7 @@ impl TrajectoryCollector {
     /// to `BufferEntry` and submitted to the `ContinualTrainer`. Training triggers
     /// when the replay buffer reaches `trigger_threshold`.
     pub fn new_full(
-        store: Arc<Neo4jTrajectoryStore>,
+        store: Arc<dyn TrajectoryStore>,
         config: &CollectionConfig,
         vector_builder: Option<Arc<DecisionVectorBuilder>>,
         reward_computer: SessionRewardComputer,
@@ -305,7 +304,7 @@ struct SessionBuffer {
 
 async fn run_collector_loop(
     mut rx: mpsc::Receiver<CollectorEvent>,
-    store: Arc<Neo4jTrajectoryStore>,
+    store: Arc<dyn TrajectoryStore>,
     _enabled: Arc<std::sync::atomic::AtomicBool>,
     vector_builder: Arc<DecisionVectorBuilder>,
     config: CollectorLoopConfig,
@@ -356,7 +355,7 @@ async fn run_collector_loop(
                             // Flush if we've accumulated enough
                             if pending_flush.len() >= buffer_size {
                                 let to_flush = std::mem::take(&mut pending_flush);
-                                flush_batch(&store, to_flush, &trainer).await;
+                                flush_batch(store.as_ref(), to_flush, &trainer).await;
                             }
                         }
                     }
@@ -381,7 +380,7 @@ async fn run_collector_loop(
                             // Flush if we've accumulated enough
                             if pending_flush.len() >= buffer_size {
                                 let to_flush = std::mem::take(&mut pending_flush);
-                                flush_batch(&store, to_flush, &trainer).await;
+                                flush_batch(store.as_ref(), to_flush, &trainer).await;
                             }
                         }
                     }
@@ -398,7 +397,7 @@ async fn run_collector_loop(
                         // Final flush
                         if !pending_flush.is_empty() {
                             let to_flush = std::mem::take(&mut pending_flush);
-                            flush_batch(&store, to_flush, &trainer).await;
+                            flush_batch(store.as_ref(), to_flush, &trainer).await;
                         }
 
                         tracing::info!("TrajectoryCollector shutdown complete");
@@ -435,7 +434,7 @@ async fn run_collector_loop(
                 // sessions that ended without reaching the batch threshold.
                 if !pending_flush.is_empty() {
                     let to_flush = std::mem::take(&mut pending_flush);
-                    flush_batch(&store, to_flush, &trainer).await;
+                    flush_batch(store.as_ref(), to_flush, &trainer).await;
                 }
             }
         }
@@ -651,7 +650,7 @@ fn build_trajectory(
 }
 
 async fn flush_batch(
-    store: &Neo4jTrajectoryStore,
+    store: &dyn TrajectoryStore,
     batch: Vec<PendingTrajectory>,
     trainer: &Option<Arc<ContinualTrainer>>,
 ) {

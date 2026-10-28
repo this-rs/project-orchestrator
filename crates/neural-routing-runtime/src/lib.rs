@@ -39,9 +39,9 @@ pub use reward::{SessionRewardComputer, SessionSignals};
 // Re-export core types so consumers only need neural-routing-runtime
 pub use neural_routing_core::{
     create_reward_strategy, error as routing_error, DecisionContext, DecisionVectorBuilder,
-    NNRoute, Neo4jTrajectoryStore, NodeFeatures, RewardConfig, RewardStrategy, Router, SessionMeta,
-    ToolUsage, TouchedEntity, Trajectory, TrajectoryFilter, TrajectoryNode, TrajectoryStats,
-    TrajectoryStore, SOURCE_EMBED_DIM, TOTAL_DIM,
+    NNRoute, NodeFeatures, RewardConfig, RewardStrategy, Router, SessionMeta, ToolUsage,
+    TouchedEntity, Trajectory, TrajectoryFilter, TrajectoryNode, TrajectoryStats, TrajectoryStore,
+    SOURCE_EMBED_DIM, TOTAL_DIM,
 };
 
 // Re-export NN types needed by handlers

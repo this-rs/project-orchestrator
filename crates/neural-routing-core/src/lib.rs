@@ -4,16 +4,14 @@
 //! - `Trajectory` / `TrajectoryNode` / `DecisionVector` — the core data model
 //! - `TrajectoryStore` trait — async CRUD + vector search abstraction
 //! - `RewardStrategy` trait — pluggable credit assignment strategies
-//! - `Neo4jTrajectoryStore` — concrete storage implementation
+//! - the Neo4j adapter — the concrete storage implementation, outside this crate
 
 pub mod augmentation;
 pub mod error;
 pub mod mcts;
-pub mod migration;
 pub mod models;
 pub mod proxy_model;
 pub mod reward;
-pub mod store;
 pub mod traits;
 pub mod validation;
 pub mod vector_builder;
@@ -21,11 +19,9 @@ pub mod vector_builder;
 pub use augmentation::{run_augmentation, AugmentationConfig, AugmentationReport};
 pub use error::NeuralRoutingError;
 pub use mcts::{MctsConfig, MctsEngine};
-pub use migration::{run_migration, MigrationConfig, MigrationReport};
 pub use models::*;
 pub use proxy_model::{GdsHeuristicProxy, ProxyModel};
 pub use reward::*;
-pub use store::Neo4jTrajectoryStore;
 pub use traits::*;
 pub use validation::*;
 pub use vector_builder::{
