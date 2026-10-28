@@ -4590,7 +4590,7 @@ mod tests {
         );
         // The conservative default advertises nothing at all.
         for key in EXPECTED_KEYS {
-            let v = serde_json::to_value(&default).expect("serialize")[key]
+            let v = serde_json::to_value(default).expect("serialize")[key]
                 .as_bool()
                 .expect("bool");
             assert!(!v, "default capability `{key}` must be false");
