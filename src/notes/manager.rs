@@ -1013,6 +1013,7 @@ impl NoteManager {
             // Get full note from Neo4j for complete data
             if let Ok(Some(note)) = self.neo4j.get_note(hit.document.id.parse()?).await {
                 results.push(NoteSearchHit {
+                    scope: NoteSearchHit::scope_of(&note),
                     note,
                     score: hit.score,
                     highlights: None,
@@ -2238,8 +2239,14 @@ fn fuse_dense_and_lexical(
             notes.remove(&id).map(|note| {
                 let scar_penalty = 1.0 - note.scar_intensity.clamp(0.0, 1.0) * 0.5;
                 NoteSearchHit {
+                    scope: NoteSearchHit::scope_of(&note),
+                    // Freshness last: it reorders near-ties, it does not change
+                    // what is relevant.
+                    score: crate::notes::models::apply_freshness(
+                        score * scar_penalty,
+                        note.staleness_score,
+                    ),
                     note,
-                    score: score * scar_penalty,
                     highlights: None,
                 }
             })
@@ -2294,6 +2301,7 @@ mod tests {
         let consensus = test_note(pid, NoteType::Gotcha, "matched by both channels");
         let dense = vec![(dense_top.clone(), 0.9272), (consensus.clone(), 0.9245)];
         let lexical = vec![NoteSearchHit {
+            scope: NoteSearchHit::scope_of(&consensus),
             note: consensus.clone(),
             score: 12.0,
             highlights: None,
