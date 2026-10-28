@@ -803,22 +803,79 @@ impl Neo4jClient {
         let Some(session) = episode.session.as_ref() else {
             return Ok(false);
         };
-        let payload = serde_json::to_string(episode)?;
+        // The vector lives in its own property (the `session_episode_embeddings` index
+        // reads it), not in the JSON: a 768-float payload would be read on every listing.
+        let mut without_vector = episode.clone();
+        let embedding = without_vector.embedding.take();
+        let payload = serde_json::to_string(&without_vector)?;
         // MATCH first: no session, no row, nothing written — in the same statement.
-        let q = query(
-            "MATCH (s:ChatSession {id: $sid}) \
-             MERGE (e:SessionEpisode {session_id: $sid}) \
-             SET e.id = $id, e.project_id = $pid, e.collected_at = $at, e.payload = $payload \
+        let set_vector = if embedding.is_some() {
+            ", e.embedding = $embedding"
+        } else {
+            ""
+        };
+        let mut q = query(&format!(
+            "MATCH (s:ChatSession {{id: $sid}}) \
+             MERGE (e:SessionEpisode {{session_id: $sid}}) \
+             SET e.id = $id, e.project_id = $pid, e.collected_at = $at, e.payload = $payload{set_vector} \
              MERGE (e)-[:EPISODE_OF]->(s) \
-             RETURN e.id AS id",
-        )
+             RETURN e.id AS id"
+        ))
         .param("sid", session.session_id.to_string())
         .param("id", episode.id.to_string())
         .param("pid", episode.project_id.to_string())
         .param("at", episode.collected_at.to_rfc3339())
         .param("payload", payload);
+        if let Some(vector) = embedding {
+            q = q.param("embedding", vector);
+        }
         let mut result = self.graph.execute(q).await?;
         Ok(result.next().await?.is_some())
+    }
+
+    /// See [`crate::neo4j::GraphStore::search_episodes_by_embedding`]: the session
+    /// episodes of `project_id` closest to `embedding`, through the HNSW index
+    /// `session_episode_embeddings`. The index returns its `k` nearest over EVERY
+    /// project, so `k` is wider than `limit` and the project is filtered after. An
+    /// episode whose session is gone (no `EPISODE_OF`) is never a hit. A Neo4j
+    /// without vector indexes errs here, and the reflex that calls this logs and
+    /// recalls nothing.
+    pub async fn search_episodes_by_embedding(
+        &self,
+        project_id: Uuid,
+        embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(crate::episodes::models::Episode, f64)>> {
+        if embedding.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let k = (limit * 8).clamp(limit, 64) as i64;
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "CALL db.index.vector.queryNodes('session_episode_embeddings', $k, $embedding) \
+                     YIELD node AS e, score \
+                     WHERE e.project_id = $pid AND (e)-[:EPISODE_OF]->(:ChatSession) \
+                     RETURN e.payload AS payload, score \
+                     ORDER BY score DESC LIMIT $limit",
+                )
+                .param("k", k)
+                .param("embedding", embedding.to_vec())
+                .param("pid", project_id.to_string())
+                .param("limit", limit as i64),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = result.next().await? {
+            let payload: String = row.get("payload")?;
+            let score: f64 = row.get("score")?;
+            match serde_json::from_str(&payload) {
+                Ok(episode) => out.push((episode, score)),
+                Err(e) => tracing::warn!(error = %e, "unreadable SessionEpisode payload, skipped"),
+            }
+        }
+        Ok(out)
     }
 
     /// See [`crate::neo4j::GraphStore::agent_identity_namespace`]. One MERGE on a key

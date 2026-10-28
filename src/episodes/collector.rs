@@ -820,6 +820,48 @@ mod tests {
             .is_empty());
     }
 
+    /// The recall of a closed session: by the vector of its first message, within its
+    /// project, never an episode without a vector, the closest first, `limit` kept.
+    #[tokio::test]
+    async fn a_closed_session_is_recalled_by_the_vector_of_its_first_message() {
+        use crate::neo4j::GraphStore;
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("alpha");
+        store.create_project(&project).await.unwrap();
+        let other = crate::test_helpers::test_project_named("beta");
+        store.create_project(&other).await.unwrap();
+        let mut saved = Vec::new();
+        for (slug, preview, vector) in [
+            ("alpha", "login page 500", Some(vec![1.0, 0.0, 0.0])),
+            ("alpha", "login timeout", Some(vec![0.9, 0.1, 0.0])),
+            ("alpha", "rotate api keys", Some(vec![0.0, 0.0, 1.0])),
+            ("alpha", "no vector at all", None),
+            ("beta", "login page 500", Some(vec![1.0, 0.0, 0.0])),
+        ] {
+            let mut session = crate::test_helpers::test_chat_session(Some(slug));
+            session.preview = Some(preview.into());
+            store.create_chat_session(&session).await.unwrap();
+            let mut episode = collect_session_episode(&store, session.id, "closed")
+                .await
+                .unwrap()
+                .unwrap();
+            episode.embedding = vector;
+            assert!(store.save_session_episode(&episode).await.unwrap());
+            saved.push(episode.id);
+        }
+        let hits = store
+            .search_episodes_by_embedding(project.id, &[1.0, 0.0, 0.0], 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|(e, _)| e.id).collect::<Vec<_>>(),
+            vec![saved[0], saved[1]],
+            "the closest first, the other project and the vectorless episode absent, limit kept"
+        );
+        assert!((hits[0].1 - 1.0).abs() < 1e-6);
+        assert!(hits[1].1 < 1.0 && hits[1].1 > 0.9);
+    }
+
     #[test]
     fn an_episode_serialized_before_sessions_existed_still_reads() {
         let mut value = serde_json::to_value(sample_episode()).unwrap();

@@ -617,25 +617,26 @@ impl KnowledgeInjectionStage {
                     }
                 }
             });
-            futures::future::join_all(lookups)
+            let mut candidates: Vec<ScoredNote> = futures::future::join_all(lookups)
                 .await
                 .into_iter()
                 .flatten()
-                .collect::<Vec<ScoredNote>>()
+                .collect();
+            candidates.retain(|n| !excluded.contains(&n.id));
+            if candidates.is_empty() {
+                return Vec::new();
+            }
+            // The currency, consent and policy checks read the graph too: under the
+            // same budget as the lookups, so a slow graph costs the pins, never the turn.
+            keep_current_notes(graph.as_ref(), reader, candidates, restricted).await
         };
-        let mut candidates = match timeout(PINNED_NOTES_BUDGET, read).await {
-            Ok(candidates) => candidates,
+        let kept = match timeout(PINNED_NOTES_BUDGET, read).await {
+            Ok(kept) => kept,
             Err(_) => {
                 warn!("[knowledge_injection] reading the pinned notes timed out");
                 return injected;
             }
         };
-        candidates.retain(|n| !excluded.contains(&n.id));
-        if candidates.is_empty() {
-            return injected;
-        }
-
-        let kept = keep_current_notes(self.graph.as_ref(), reader, candidates, restricted).await;
         if kept.is_empty() {
             return injected;
         }

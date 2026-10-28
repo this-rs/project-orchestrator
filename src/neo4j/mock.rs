@@ -8804,6 +8804,30 @@ impl GraphStore for MockGraphStore {
         Ok(out)
     }
 
+    /// Over the session episodes, as the Neo4j store does (cosine on the stored
+    /// embedding; an episode without one is never a hit).
+    async fn search_episodes_by_embedding(
+        &self,
+        project_id: Uuid,
+        embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(crate::episodes::models::Episode, f64)>> {
+        let mut hits: Vec<(crate::episodes::models::Episode, f64)> = self
+            .session_episodes
+            .read()
+            .await
+            .values()
+            .filter(|e| e.project_id == project_id)
+            .filter_map(|e| {
+                let stored = e.embedding.as_ref()?;
+                Some((e.clone(), cosine_similarity(stored, embedding)))
+            })
+            .collect();
+        hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
     async fn agent_identity_namespace(&self) -> Result<Uuid> {
         // One lock for the read and the creation: the MERGE of the Neo4j store.
         let mut root = self

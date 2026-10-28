@@ -4138,6 +4138,37 @@ mod provider_switch {
         assert_eq!(episode.source_run_id, None);
     }
 
+    /// With an embedding provider on the manager, the close episode carries the vector
+    /// the reflex stage recalls it by.
+    #[tokio::test]
+    async fn a_closed_session_leaves_its_vector_when_a_provider_is_wired() {
+        let World {
+            fake,
+            graph,
+            manager,
+        } = world().await;
+        let manager =
+            manager.with_embeddings(Arc::new(crate::embeddings::MockEmbeddingProvider::new(16)));
+        let w = World {
+            fake,
+            graph,
+            manager,
+        };
+        let project = crate::test_helpers::test_project_named("proj");
+        w.graph.create_project(&project).await.unwrap();
+        let sid = first_turn(&w).await;
+        w.manager.close_session(&sid).await.unwrap();
+        super::wait_for_session_episode_saves(&w.graph, 1).await;
+        let episodes = w.graph.list_session_episodes(project.id, 10).await.unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(
+            episodes[0].embedding.as_ref().map(Vec::len),
+            Some(16),
+            "{:?}",
+            episodes[0].session
+        );
+    }
+
     /// An episode that cannot be stored never keeps a session open.
     #[tokio::test]
     async fn a_session_closes_even_when_its_episode_cannot_be_stored() {

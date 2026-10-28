@@ -3677,10 +3677,16 @@ impl ChatManager {
         )));
         // Reflex stage: injects scar warnings, episode recall, co-change reminders
         // from the autonomous learning loop (T1→T2→T3 materialized knowledge).
-        // Controlled by ENRICHMENT_REFLEX env var (default: true).
-        pipeline.add_parallel_stage(Box::new(crate::reflex::stage::ReflexStage::new(
-            graph.clone(),
-        )));
+        // Controlled by ENRICHMENT_REFLEX env var (default: true). With an embedding
+        // provider it also recalls the closed sessions whose first message is close to
+        // this one (the session episodes); without one, scars and co-changes only.
+        let reflex_stage = crate::reflex::stage::ReflexStage::new(graph.clone());
+        let reflex_stage = if let Some(provider) = embeddings {
+            reflex_stage.with_embeddings(provider.clone())
+        } else {
+            reflex_stage
+        };
+        pipeline.add_parallel_stage(Box::new(reflex_stage));
         // MCP Federation stage: injects external tool availability into the prompt.
         // Only adds content when MCP servers are connected (0 overhead otherwise).
         if let Some(registry) = mcp_registry {
@@ -18784,14 +18790,28 @@ impl ChatManager {
             return;
         };
         let graph = self.graph.clone();
+        let embeddings = self.embeddings.clone();
         let reason = reason.to_string();
         let work = async move {
-            match crate::episodes::collector::collect_session_episode(graph.as_ref(), id, &reason)
-                .await?
-            {
-                Some(episode) => graph.save_session_episode(&episode).await,
-                None => Ok(false),
+            let Some(mut episode) =
+                crate::episodes::collector::collect_session_episode(graph.as_ref(), id, &reason)
+                    .await?
+            else {
+                return Ok(false);
+            };
+            // The vector the reflex stage recalls it by (`reflex::episode_recall`): the
+            // first message, which is short. No provider, or a provider that fails: the
+            // episode is kept, it is only not recallable by similarity.
+            if let Some(provider) = embeddings {
+                match provider.embed_text(&episode.stimulus.request).await {
+                    Ok(vector) if !vector.is_empty() => episode.embedding = Some(vector),
+                    Ok(_) => {}
+                    Err(e) => {
+                        debug!(session_id = %id, error = %e, "close episode left without embedding")
+                    }
+                }
             }
+            graph.save_session_episode(&episode).await
         };
         // Detached: the close never waits on the graph for its episode (a cascade or a
         // deletion closes many sessions in a row). The write cannot outlive a deletion:

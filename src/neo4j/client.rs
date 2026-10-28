@@ -704,6 +704,14 @@ impl Neo4jClient {
                    `vector.dimensions`: 768,
                    `vector.similarity_function`: 'cosine'
                }}"#,
+            // The episode a session leaves at its close, recalled by the reflex stage
+            // from the embedding of its first message (`search_episodes_by_embedding`).
+            r#"CREATE VECTOR INDEX session_episode_embeddings IF NOT EXISTS
+               FOR (e:SessionEpisode) ON (e.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}"#,
             // HNSW vector index for cosine similarity search on Decision embeddings
             r#"CREATE VECTOR INDEX decision_embedding IF NOT EXISTS
                FOR (d:Decision) ON (d.embedding)

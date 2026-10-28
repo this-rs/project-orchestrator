@@ -2723,6 +2723,16 @@ impl GraphStore for Neo4jClient {
         self.agent_identity_namespace().await
     }
 
+    async fn search_episodes_by_embedding(
+        &self,
+        project_id: Uuid,
+        embedding: &[f32],
+        limit: usize,
+    ) -> anyhow::Result<Vec<(crate::episodes::models::Episode, f64)>> {
+        self.search_episodes_by_embedding(project_id, embedding, limit)
+            .await
+    }
+
     async fn apply_anchor_op(
         &self,
         session_id: Uuid,
