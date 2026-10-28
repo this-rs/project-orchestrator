@@ -313,6 +313,7 @@ mod tests {
 
     fn decision() -> CognitiveDecision {
         CognitiveDecision {
+            snapshot: None,
             id: Uuid::new_v4(),
             at: Utc::now(),
             signature: TaskSignature::utility(TaskClass::UtilityCompaction, 9_000, Some("po")),

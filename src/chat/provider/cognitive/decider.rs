@@ -223,9 +223,15 @@ fn hysteresis_margin(
             }
         })
         .collect();
-    let confidence = confidence_from_scores(&utilities);
-    // Never narrower than the base margin; only wider when uncertain. Confidence
-    // 1 (clear winner) keeps the base, confidence 0 (indistinguishable) doubles it.
+    let ns: Vec<u64> = scored.iter().map(|s| s.n).collect();
+    hysteresis_margin_of(&ns, &utilities, current_index)
+}
+
+pub(crate) fn hysteresis_margin_of(n: &[u64], utilities: &[f64], current_index: usize) -> f64 {
+    if n[0] < HYSTERESIS_WARMUP || n[current_index] < HYSTERESIS_WARMUP {
+        return HYSTERESIS_MARGIN;
+    }
+    let confidence = confidence_from_scores(utilities);
     HYSTERESIS_MARGIN * (2.0 - confidence)
 }
 
@@ -259,6 +265,7 @@ fn decide_free(
         turn_index: request.turn_index,
         outcome: None,
         used: None,
+        snapshot: None,
     };
 
     let pool: Vec<ModelFacts> = request
@@ -323,6 +330,28 @@ fn decide_free(
             best.utility - now.utility
         }
     };
+    // Keep what decided the draw, before the hysteresis reorders it (PYSR-1).
+    decision.snapshot = Some(crate::chat::provider::cognitive::decision::DrawSnapshot {
+        settings: settings.clone(),
+        steady: request.steady,
+        current: request.current.clone(),
+        rows: scored
+            .iter()
+            .map(
+                |s| crate::chat::provider::cognitive::decision::SnapshotRow {
+                    pick: pick_of(&s.candidate),
+                    alpha: s.alpha,
+                    beta: s.beta,
+                    cost_norm: s.cost_norm,
+                    latency_norm: s.latency_norm,
+                    quota_norm: s.quota_norm,
+                    n: s.n,
+                    utility: s.utility,
+                    explored: s.explored,
+                },
+            )
+            .collect(),
+    });
     let mut kept = false;
     if !scored[0].explored {
         if let Some(current) = &request.current {
@@ -952,6 +981,81 @@ mod tests {
         let store = Arc::new(InMemoryRoutingStore::new());
         let decider = CognitiveDecider::new(store.clone());
         (decider.decide(request).await.unwrap(), store)
+    }
+
+    fn row(
+        pick: Pick,
+        utility: f64,
+        n: u64,
+    ) -> crate::chat::provider::cognitive::decision::SnapshotRow {
+        crate::chat::provider::cognitive::decision::SnapshotRow {
+            pick,
+            alpha: 3.0,
+            beta: 3.0,
+            cost_norm: 0.0,
+            latency_norm: 0.0,
+            quota_norm: 0.0,
+            n,
+            utility,
+            explored: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_steady_decision_replays_to_the_same_choice() {
+        let challenger = Pick::new("deepseek", "v4");
+        let incumbent = Pick::new("glm", "big");
+        let (mut decision, _) = decide(&request(
+            pilot(),
+            ProviderRoutingMode::Full,
+            LearningStage::Auto,
+        ))
+        .await;
+        decision.snapshot = Some(crate::chat::provider::cognitive::decision::DrawSnapshot {
+            settings: RoutingSettings::default(),
+            steady: true,
+            current: Some(incumbent.clone()),
+            rows: vec![row(challenger, 0.301, 6), row(incumbent.clone(), 0.300, 6)],
+        });
+        assert_eq!(
+            decision.replay().as_ref().map(|p| p.provider_id.as_str()),
+            Some("glm"),
+            "a hair behind is not enough to move"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_the_incumbent_the_replay_switches() {
+        let challenger = Pick::new("deepseek", "v4");
+        let incumbent = Pick::new("glm", "big");
+        let (mut decision, _) = decide(&request(
+            pilot(),
+            ProviderRoutingMode::Full,
+            LearningStage::Auto,
+        ))
+        .await;
+        decision.snapshot = Some(crate::chat::provider::cognitive::decision::DrawSnapshot {
+            settings: RoutingSettings::default(),
+            steady: true,
+            current: None,
+            rows: vec![row(challenger.clone(), 0.301, 6), row(incumbent, 0.300, 6)],
+        });
+        assert_eq!(
+            decision.replay().as_ref().map(|p| p.provider_id.as_str()),
+            Some("deepseek")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_decision_replays_to_its_own_choice() {
+        let req = request(pilot(), ProviderRoutingMode::Full, LearningStage::Auto);
+        let (decision, _store) = decide(&req).await;
+        assert!(decision.snapshot.is_some(), "the draw must be journaled");
+        assert_eq!(
+            decision.replay().map(|p| p.provider_id),
+            decision.chosen.map(|p| p.provider_id),
+            "replaying must reproduce the choice, not a neighbour"
+        );
     }
 
     /// QUOTA — the test that fails without the change: a pool {A, B} where A has a quota used up

@@ -425,6 +425,7 @@ mod tests {
 
     fn decision(class: TaskClass, chosen: &str, used: Option<&str>) -> CognitiveDecision {
         CognitiveDecision {
+            snapshot: None,
             id: Uuid::new_v4(),
             at: Utc::now(),
             signature: TaskSignature {

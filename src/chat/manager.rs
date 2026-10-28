@@ -36863,6 +36863,7 @@ mod auto_open_bounds_tests {
         use crate::chat::provider::cognitive::mode::LearningStage;
         use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
         CognitiveDecision {
+            snapshot: None,
             id: Uuid::new_v4(),
             at: chrono::Utc::now(),
             signature: TaskSignature::utility(TaskClass::UtilityCompaction, 9_000, None),

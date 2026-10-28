@@ -126,6 +126,8 @@ pub struct CognitiveDecision {
     /// ε-greedy propensity from the logged `p_top1` and `propensity`.
     #[serde(default)]
     pub exploration_epsilon: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<DrawSnapshot>,
     /// Confidence of the decision: `1 − H(p)/ln(k)` over the scored
     /// alternatives' scores. `None` when it was not scored. Persisted so the
     /// dashboard and the off-policy replay see the same number the scorer saw.
@@ -271,6 +273,28 @@ pub fn turn_settlement(
             latency_ms: None,
         },
     ))
+}
+
+/// One scored arm, exactly as the draw saw it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SnapshotRow {
+    pub pick: Pick,
+    pub alpha: f64,
+    pub beta: f64,
+    pub cost_norm: f64,
+    pub latency_norm: f64,
+    pub quota_norm: f64,
+    pub n: u64,
+    pub utility: f64,
+    pub explored: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DrawSnapshot {
+    pub settings: super::mode::RoutingSettings,
+    pub steady: bool,
+    pub current: Option<Pick>,
+    pub rows: Vec<SnapshotRow>,
 }
 
 /// A request to decide.
@@ -442,6 +466,7 @@ mod tests {
 
     fn decision() -> CognitiveDecision {
         CognitiveDecision {
+            snapshot: None,
             id: uuid::Uuid::new_v4(),
             at: chrono::Utc::now(),
             signature: TaskSignature::utility(TaskClass::UtilityCompaction, 9_000, None),
@@ -633,5 +658,61 @@ mod tests {
         // Without a served nor a chosen pair there is no arm to feed.
         d.chosen = None;
         assert_eq!(d.served_arm(), None);
+    }
+}
+
+impl CognitiveDecision {
+    /// Redo the choice from the journal alone.
+    pub fn replay(&self) -> Option<Pick> {
+        let snap = self.snapshot.as_ref()?;
+        if snap.rows.is_empty() {
+            return None;
+        }
+        let key = |p: &Pick| format!("{}/{}", p.provider_id, p.model);
+        let utilities: Vec<f64> = snap
+            .rows
+            .iter()
+            .map(|r| {
+                if snap.steady {
+                    super::decider::utility_of(
+                        r.alpha,
+                        r.beta,
+                        r.cost_norm,
+                        r.latency_norm,
+                        r.quota_norm,
+                        &snap.settings,
+                    )
+                } else {
+                    r.utility
+                }
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..snap.rows.len()).collect();
+        order.sort_by(|&a, &b| {
+            utilities[b]
+                .partial_cmp(&utilities[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| key(&snap.rows[a].pick).cmp(&key(&snap.rows[b].pick)))
+        });
+        let ns: Vec<u64> = order.iter().map(|&i| snap.rows[i].n).collect();
+        let us: Vec<f64> = order.iter().map(|&i| utilities[i]).collect();
+        let head = snap.rows[order[0]].pick.clone();
+        if snap.rows[order[0]].explored {
+            return Some(head);
+        }
+        let current = match snap.current.clone() {
+            Some(c) => c,
+            None => return Some(head),
+        };
+        let index = order.iter().position(|&i| snap.rows[i].pick == current)?;
+        if index == 0 {
+            return Some(head);
+        }
+        let margin = super::decider::hysteresis_margin_of(&ns, &us, index);
+        if us[0] - us[index] < margin {
+            Some(current)
+        } else {
+            Some(head)
+        }
     }
 }

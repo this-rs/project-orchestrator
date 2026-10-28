@@ -1959,6 +1959,7 @@ mod cognitive_routing {
                     .push(request.signature.clone());
             }
             Ok(CognitiveDecision {
+                snapshot: None,
                 id: Uuid::new_v4(),
                 at: Utc::now(),
                 signature: request.signature.clone(),
@@ -2043,6 +2044,7 @@ mod cognitive_routing {
         ) -> anyhow::Result<crate::chat::provider::cognitive::decision::CognitiveDecision> {
             use crate::chat::provider::cognitive::decision::CognitiveDecision;
             Ok(CognitiveDecision {
+                snapshot: None,
                 id: Uuid::new_v4(),
                 at: Utc::now(),
                 signature: request.signature.clone(),
@@ -3130,6 +3132,7 @@ mod turn_routing {
             let applied = request.settings.mode == ProviderRoutingMode::Full
                 && request.settings.stage == LearningStage::Auto;
             let decision = CognitiveDecision {
+                snapshot: None,
                 id: Uuid::new_v4(),
                 at: Utc::now(),
                 signature: request.signature.clone(),
@@ -4831,6 +4834,7 @@ mod provider_switch {
                     });
                 }
                 Ok(CognitiveDecision {
+                    snapshot: None,
                     id: Uuid::new_v4(),
                     at: Utc::now(),
                     signature: request.signature.clone(),
@@ -15080,6 +15084,7 @@ mod native_subagents {
                     crate::chat::provider::resolver::Role::Executor => Pick::new("deepseek", "d1"),
                 };
                 Ok(CognitiveDecision {
+                    snapshot: None,
                     id: Uuid::new_v4(),
                     at: Utc::now(),
                     signature: request.signature.clone(),
@@ -15243,6 +15248,7 @@ mod native_subagents {
                     crate::chat::provider::resolver::Role::Executor => Pick::new("other", "o1"),
                 };
                 Ok(CognitiveDecision {
+                    snapshot: None,
                     id: Uuid::new_v4(),
                     at: Utc::now(),
                     signature: request.signature.clone(),
