@@ -938,6 +938,26 @@ impl AgentSessionHandle {
             )
             .await;
         }
+        // The model IN FORCE is what the session node says: the sessions list and the model
+        // menu read it (SDA-2). A change reaches the backend as this event whoever made it: the
+        // user, the image router, or the `before_turn` hook of the per-turn router, which the
+        // harness applies INSIDE the provider without going through the manager — that last
+        // path persisted nothing and left the node on the opening value (`auto`, or the
+        // opening model). One write here covers all of them. `routing_mode` is a separate
+        // property: the Auto marker survives. A failed write is logged, not an error: the
+        // provider already runs the model, and the next change writes again.
+        if let ChatEvent::ModelChanged { model } = &event {
+            if let Some(uuid) = self.uuid {
+                if let Err(e) = self.graph.update_chat_session_model(uuid, model).await {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        %model,
+                        error = %e,
+                        "the active model could not be written on the session"
+                    );
+                }
+            }
+        }
         // What only the session owner knows rides on `system_init`.
         if let ChatEvent::SystemInit {
             provider,

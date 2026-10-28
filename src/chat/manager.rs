@@ -28235,6 +28235,50 @@ mod tests {
         );
     }
 
+    /// SDA-2: a model the PROVIDER switches by itself — the `before_turn` hook of the per-turn
+    /// router is applied inside the harness, without going through the manager — reaches the
+    /// backend only as `model_changed`. It must land on the session node, or the sessions list
+    /// and the model menu keep saying the model the session opened with. The Auto marker
+    /// (`routing_mode`) is a separate property and stays.
+    #[tokio::test]
+    async fn agent_path_a_model_switched_by_the_provider_is_written_on_the_session() {
+        use nexus_claude::agent::AgentEvent;
+        let (manager, graph, fake) = agent_manager();
+        let sid = manager
+            .create_session(&agent_request("go"))
+            .await
+            .unwrap()
+            .session_id;
+        let uuid = Uuid::parse_str(&sid).unwrap();
+        graph
+            .update_chat_session_routing(uuid, Some("full"), None, Some("po"))
+            .await
+            .unwrap();
+        let before = graph.get_chat_session(uuid).await.unwrap().unwrap();
+        assert_ne!(
+            before.model, "routed-model",
+            "the node does not already carry the model"
+        );
+
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state.push_oob(AgentEvent::ModelChanged {
+            model: "routed-model".into(),
+        });
+        next_matching(&mut rx, |e| matches!(e, ChatEvent::ModelChanged { .. })).await;
+
+        let node = graph.get_chat_session(uuid).await.unwrap().unwrap();
+        assert_eq!(
+            node.model, "routed-model",
+            "the model in force is written on the session"
+        );
+        assert_eq!(
+            node.routing_mode.as_deref(),
+            Some("full"),
+            "the Auto marker is untouched by a model change"
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+
     /// A typed `BackgroundTasks` snapshot scripted by the fake provider (out of
     /// turn) becomes an `ActiveTasksUpdate` WITHOUT any PID: the agent engine
     /// tracks no process — the pid, when there is one, belongs to the adapter.
