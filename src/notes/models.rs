@@ -1241,6 +1241,40 @@ pub struct NoteSearchHit {
     pub score: f64,
     /// Highlighted snippets from content
     pub highlights: Option<Vec<String>>,
+    /// Which level this hit comes from, derived at construction so a caller never
+    /// has to infer it from `note.project_id` — and so the two can never disagree.
+    pub scope: SearchScope,
+}
+
+/// Which level a hit belongs to: the instance, or one project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchScope {
+    /// The note belongs to no project: it is readable from everywhere.
+    Transverse,
+    /// The note belongs to a project.
+    Project,
+}
+
+impl NoteSearchHit {
+    /// The level a note lives at.
+    pub fn scope_of(note: &Note) -> SearchScope {
+        if note.project_id.is_none() {
+            SearchScope::Transverse
+        } else {
+            SearchScope::Project
+        }
+    }
+}
+
+/// Blend freshness into a relevance score.
+///
+/// `staleness` runs from 0 (fresh) to 1 (stale) and the penalty is bounded at
+/// 30 %: freshness reorders near-ties, it never resurrects an irrelevant note nor
+/// buries a relevant one. A score is never increased, so a stale note cannot
+/// overtake a fresher one with the same relevance.
+pub fn apply_freshness(score: f64, staleness: f64) -> f64 {
+    score * (1.0 - 0.3 * staleness.clamp(0.0, 1.0))
 }
 
 // ============================================================================
@@ -1265,6 +1299,62 @@ pub struct MigrationTarget {
     pub entity_type: EntityType,
     pub new_entity_id: String,
     pub similarity_score: f64,
+}
+
+#[cfg(test)]
+mod search_scope_tests {
+    //! Two things a caller must never have to infer: which level a hit comes
+    //! from, and how much freshness moved the ranking.
+    use super::*;
+
+    fn note_at(project_id: Option<Uuid>) -> Note {
+        Note::new(
+            project_id,
+            NoteType::Observation,
+            "contenu".to_string(),
+            "test".to_string(),
+        )
+    }
+
+    #[test]
+    fn a_note_with_no_project_is_transverse() {
+        assert_eq!(
+            NoteSearchHit::scope_of(&note_at(None)),
+            SearchScope::Transverse
+        );
+        assert_eq!(
+            NoteSearchHit::scope_of(&note_at(Some(Uuid::new_v4()))),
+            SearchScope::Project
+        );
+    }
+
+    #[test]
+    fn a_fresh_note_keeps_its_score() {
+        assert_eq!(apply_freshness(1.0, 0.0), 1.0);
+    }
+
+    #[test]
+    fn a_stale_note_loses_at_most_thirty_percent() {
+        assert!((apply_freshness(1.0, 1.0) - 0.7).abs() < 1e-12);
+        // Bounded: a staleness beyond 1 must not penalise further.
+        assert!((apply_freshness(1.0, 5.0) - 0.7).abs() < 1e-12);
+    }
+
+    #[test]
+    fn freshness_never_increases_a_score() {
+        for staleness in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            assert!(
+                apply_freshness(0.42, staleness) <= 0.42,
+                "freshness must never resurrect a note"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scope_serialises_as_a_word_not_a_number() {
+        let json = serde_json::to_string(&SearchScope::Transverse).unwrap();
+        assert_eq!(json, "\"transverse\"");
+    }
 }
 
 #[cfg(test)]
