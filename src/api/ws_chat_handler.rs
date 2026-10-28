@@ -377,7 +377,7 @@ async fn handle_ws_chat_loop(
     // cause every event to be received twice (local + NATS round-trip), producing
     // duplicated/interleaved text in the frontend.
     // NATS is only needed for remote instances that don't have the local broadcast.
-    let mut nats_chat_sub: Option<async_nats::Subscriber> = if event_rx.is_some() {
+    let mut nats_chat_sub: Option<crate::events::Subscriber> = if event_rx.is_some() {
         debug!(
             session_id = %session_id,
             "Local broadcast active — skipping NATS chat subscription (same instance)"
