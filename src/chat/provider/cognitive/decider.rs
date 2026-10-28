@@ -162,10 +162,34 @@ pub fn decide_with(
 
 /// The utility of a scored pair with its posterior MEAN in place of its Thompson draw.
 fn mean_utility(scored: &Scored, settings: &RoutingSettings) -> f64 {
-    scored.alpha / (scored.alpha + scored.beta)
-        - settings.cost_weight * scored.cost_norm
-        - settings.latency_weight * scored.latency_norm
-        - settings.quota_weight * scored.quota_norm
+    utility_of(
+        scored.alpha,
+        scored.beta,
+        scored.cost_norm,
+        scored.latency_norm,
+        scored.quota_norm,
+        settings,
+    )
+}
+
+/// The posterior mean utility, **from the numbers alone**.
+///
+/// One implementation, shared by the live path and any replay: a replay that
+/// recomputed utility its own way would drift from the router silently — the
+/// exact failure this journal exists to prevent (PYSR-1). Any future change to
+/// the formula therefore reaches both, or neither.
+pub fn utility_of(
+    alpha: f64,
+    beta: f64,
+    cost_norm: f64,
+    latency_norm: f64,
+    quota_norm: f64,
+    settings: &RoutingSettings,
+) -> f64 {
+    alpha / (alpha + beta)
+        - settings.cost_weight * cost_norm
+        - settings.latency_weight * latency_norm
+        - settings.quota_weight * quota_norm
 }
 
 /// The hysteresis margin: how much better than the pair in force a challenger
@@ -830,6 +854,38 @@ impl CognitiveRouting {
     /// Replaces the alias hints.
     pub fn set_hints(&self, hints: PriorHints) {
         *self.hints.write().unwrap_or_else(|e| e.into_inner()) = hints;
+    }
+}
+
+/// PYSR-1: the numeric core of the utility, pinned on its own so a replay can use
+/// it without rebuilding `ModelFacts` — and so any change to the formula is a
+/// deliberate act, visible here, rather than a silent drift between two copies.
+#[cfg(test)]
+mod utility_core_tests {
+    use super::*;
+
+    #[test]
+    fn the_utility_is_the_posterior_mean_minus_the_weighted_penalties() {
+        let settings = RoutingSettings {
+            cost_weight: 0.3,
+            latency_weight: 0.2,
+            quota_weight: 0.1,
+            ..Default::default()
+        };
+        // 3/(3+1) - 0.3·0.5 - 0.2·0.25 - 0.1·0.75 = 0.75 - 0.15 - 0.05 - 0.075
+        let utility = utility_of(3.0, 1.0, 0.5, 0.25, 0.75, &settings);
+        assert!((utility - 0.475).abs() < 1e-12, "got {utility}");
+    }
+
+    #[test]
+    fn a_zero_weight_setting_leaves_only_the_posterior_mean() {
+        let settings = RoutingSettings {
+            cost_weight: 0.0,
+            latency_weight: 0.0,
+            quota_weight: 0.0,
+            ..Default::default()
+        };
+        assert!((utility_of(1.0, 3.0, 9.0, 9.0, 9.0, &settings) - 0.25).abs() < 1e-12);
     }
 }
 
