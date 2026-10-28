@@ -5229,6 +5229,9 @@ impl ToolHandler {
                 if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
                     query.push(("limit".to_string(), l.to_string()));
                 }
+                if let Some(s) = args.get("source").and_then(|v| v.as_str()) {
+                    query.push(("source".to_string(), s.to_string()));
+                }
                 let result = http.get_with_query("/api/episodes", &query).await?;
                 Ok(Some(result))
             }

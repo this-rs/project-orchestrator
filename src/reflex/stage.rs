@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use tokio::time::{timeout, Duration};
 use tracing::debug;
 
 use super::{RefContext, ReflexEngine};
@@ -17,13 +18,52 @@ use crate::neo4j::traits::GraphStore;
 /// Enrichment stage that injects reflex suggestions (co-change, episode recall, scar warnings).
 pub struct ReflexStage {
     engine: ReflexEngine,
+    /// Embeds the message for the episode recall. Absent: no recall by similarity.
+    embeddings: Option<Arc<dyn crate::embeddings::EmbeddingProvider>>,
 }
+
+/// How much of the message is embedded for the recall: the same head the knowledge
+/// injection embeds for its dense channel.
+const EMBED_QUERY_CHARS: usize = 1000;
+/// The embed call is one network round trip; past this, the turn recalls nothing.
+const EMBED_BUDGET: Duration = Duration::from_millis(400);
 
 impl ReflexStage {
     /// Create a new reflex stage.
     pub fn new(graph: Arc<dyn GraphStore>) -> Self {
         Self {
             engine: ReflexEngine::new(graph),
+            embeddings: None,
+        }
+    }
+
+    /// Recall the closed sessions close to the message (`episode_recall`): one embed
+    /// call per turn, of the message's head. The knowledge injection already pays the
+    /// same call for its dense channel when a provider is wired, so this is at most
+    /// a second short call, not a new cost class.
+    pub fn with_embeddings(
+        mut self,
+        provider: Arc<dyn crate::embeddings::EmbeddingProvider>,
+    ) -> Self {
+        self.embeddings = Some(provider);
+        self
+    }
+
+    /// The message's vector, or `None` without a provider, on an error, or past the budget.
+    async fn embed(&self, message: &str) -> Option<Vec<f32>> {
+        let provider = self.embeddings.as_ref()?;
+        let head: String = message.chars().take(EMBED_QUERY_CHARS).collect();
+        match timeout(EMBED_BUDGET, provider.embed_text(&head)).await {
+            Ok(Ok(vector)) if !vector.is_empty() => Some(vector),
+            Ok(Ok(_)) => None,
+            Ok(Err(e)) => {
+                debug!(error = %e, "[reflex] message embedding failed; no episode recall this turn");
+                None
+            }
+            Err(_) => {
+                debug!("[reflex] message embedding timed out; no episode recall this turn");
+                None
+            }
         }
     }
 }
@@ -46,25 +86,22 @@ impl ParallelEnrichmentStage for ReflexStage {
         // in parallel mode (it was never set by anyone anyway — task description confirms).
         // We extract file paths directly from the message.
         let affected = extract_file_paths(&input.message);
+        // Only when something can use it: a message naming no file still recalls the
+        // sessions close to it; a stage without a provider embeds nothing.
+        let embedding = self.embed(&input.message).await;
 
         let ref_ctx = RefContext {
             affected_files: affected,
             task_title: None,
             step_description: None,
-            // Intentionally None: no embedding exists upstream. `EnrichmentInput`
-            // carries only the raw message (no vector), stages run in parallel so
-            // none can hand one to this stage, and `ReflexStage` owns only a
-            // `GraphStore` (no EmbeddingProvider). Wiring it would mean injecting a
-            // provider here and paying an embed call on every user message. Until
-            // then `fetch_episode_suggestions` skips episode recall by design
-            // (scar + co-change reflexes are unaffected).
-            embedding: None,
+            embedding,
             project_id,
         };
 
-        // Skip if no affected files
-        if ref_ctx.affected_files.is_empty() {
-            debug!("[reflex] No affected files detected, skipping");
+        // Nothing to look up: no file for the scar and co-change reflexes, no vector
+        // for the episode recall.
+        if ref_ctx.affected_files.is_empty() && ref_ctx.embedding.is_none() {
+            debug!("[reflex] No affected files and no embedding, skipping");
             return Ok(output);
         }
 
@@ -220,6 +257,70 @@ mod tests {
         let out = stage.execute(&input).await.unwrap();
         assert_eq!(out.sections.len(), 1, "scar note must produce a reflex");
         crate::chat::untrusted::assert_payload_contained(&out.sections[0].content, "PAYLOAD-XYZ");
+    }
+
+    /// A closed session whose first message is close to this one is recalled, even
+    /// when the message names no file; a message far from every past session recalls
+    /// nothing. Needs a provider: the one of the pipeline (`with_embeddings`).
+    #[tokio::test]
+    async fn a_past_session_close_to_the_message_is_recalled_without_any_file_named() {
+        use crate::embeddings::{EmbeddingProvider, MockEmbeddingProvider};
+        use crate::neo4j::mock::MockGraphStore;
+        let graph = Arc::new(MockGraphStore::new());
+        let project = crate::test_helpers::test_project_named("proj");
+        graph.create_project(&project).await.unwrap();
+        let provider = Arc::new(MockEmbeddingProvider::new(32));
+        let first_words = "the login page returns 500 after the deploy";
+        let mut session = crate::test_helpers::test_chat_session(Some("proj"));
+        session.preview = Some(first_words.into());
+        graph.create_chat_session(&session).await.unwrap();
+        let mut episode = crate::episodes::collector::collect_session_episode(
+            graph.as_ref(),
+            session.id,
+            "closed",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        episode.embedding = Some(provider.embed_text(first_words).await.unwrap());
+        assert!(graph.save_session_episode(&episode).await.unwrap());
+
+        let stage = ReflexStage::new(graph.clone()).with_embeddings(provider);
+        let input = |message: &str| EnrichmentInput {
+            message: message.to_string(),
+            session_id: uuid::Uuid::new_v4(),
+            project_slug: Some("proj".to_string()),
+            project_id: Some(project.id),
+            cwd: None,
+            protocol_run_id: None,
+            protocol_state: None,
+            excluded_note_ids: HashSet::new(),
+            restricted_content: false,
+            reasoning_path_tracker: None,
+        };
+
+        let out = stage.execute(&input(first_words)).await.unwrap();
+        assert_eq!(out.sections.len(), 1, "the past session is recalled");
+        assert!(
+            out.sections[0].content.contains("login page returns 500"),
+            "{}",
+            out.sections[0].content
+        );
+
+        let out = stage
+            .execute(&input("rotate every api key of the staging account"))
+            .await
+            .unwrap();
+        assert!(out.sections.is_empty(), "nothing close: nothing recalled");
+
+        // Without a provider, the same message recalls nothing (and names no file).
+        let bare = ReflexStage::new(graph.clone());
+        assert!(bare
+            .execute(&input(first_words))
+            .await
+            .unwrap()
+            .sections
+            .is_empty());
     }
 
     #[test]

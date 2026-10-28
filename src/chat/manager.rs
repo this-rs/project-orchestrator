@@ -67,6 +67,11 @@ pub(crate) const ROUTING_CATALOG_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How often the watchdog looks for a legacy session whose CLI process is gone (ZOMBIE-CLI).
 const DEAD_CLI_WATCH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long the detached write of the episode a closed session leaves may take
+/// (`record_close_episode`: a few graph round trips). Past it, it is given up and logged.
+const CLOSE_EPISODE_BUDGET: Duration = Duration::from_secs(10);
+
 /// Upper bound of building the Auto pool, whatever the number of instances: the
 /// health checks run at once (`ROUTING_HEALTH_TIMEOUT`), then the catalogs at once
 /// (`ROUTING_CATALOG_TIMEOUT`), then the capability probes are waited for together
@@ -310,6 +315,9 @@ pub struct LiveSessionSnapshot {
     /// while one of these runs, so this is what keeps a working session
     /// from looking dead.
     pub background_tasks: std::collections::HashMap<Uuid, (usize, usize)>,
+    /// Per live session, the skills and personas injected into it (see `activation_registry`).
+    pub activations:
+        std::collections::HashMap<Uuid, crate::chat::activation_registry::SessionActivations>,
 }
 
 /// Count the live `(monitors, bash)` among a session's tracked background
@@ -3672,10 +3680,16 @@ impl ChatManager {
         )));
         // Reflex stage: injects scar warnings, episode recall, co-change reminders
         // from the autonomous learning loop (T1→T2→T3 materialized knowledge).
-        // Controlled by ENRICHMENT_REFLEX env var (default: true).
-        pipeline.add_parallel_stage(Box::new(crate::reflex::stage::ReflexStage::new(
-            graph.clone(),
-        )));
+        // Controlled by ENRICHMENT_REFLEX env var (default: true). With an embedding
+        // provider it also recalls the closed sessions whose first message is close to
+        // this one (the session episodes); without one, scars and co-changes only.
+        let reflex_stage = crate::reflex::stage::ReflexStage::new(graph.clone());
+        let reflex_stage = if let Some(provider) = embeddings {
+            reflex_stage.with_embeddings(provider.clone())
+        } else {
+            reflex_stage
+        };
+        pipeline.add_parallel_stage(Box::new(reflex_stage));
         // MCP Federation stage: injects external tool availability into the prompt.
         // Only adds content when MCP servers are connected (0 overhead otherwise).
         if let Some(registry) = mcp_registry {
@@ -6153,6 +6167,14 @@ impl ChatManager {
         for id in self.mirrors.open_ids() {
             snap.live.insert(id);
             snap.streaming.insert(id);
+        }
+        // What each live session was given, and forget the sessions that ended.
+        crate::chat::activation_registry::retain_live(&snap.live);
+        for id in &snap.live {
+            let got = crate::chat::activation_registry::get(*id);
+            if !got.skills.is_empty() || !got.personas.is_empty() {
+                snap.activations.insert(*id, got);
+            }
         }
         for (id, pending) in inputs {
             let ids: std::collections::HashSet<String> =
@@ -18751,6 +18773,54 @@ impl ChatManager {
         });
     }
 
+    /// Stores the episode a closed session leaves (`episodes::collector::collect_session_episode`).
+    ///
+    /// Called on an ANNOUNCED close only — never on an in-place switch, whose thread goes on.
+    /// Best effort, bounded and detached: a graph that fails or hangs is logged, and the
+    /// close neither waits for it nor fails because of it.
+    fn record_close_episode(&self, session_id: &str, reason: &str) {
+        let Ok(id) = Uuid::parse_str(session_id) else {
+            return;
+        };
+        let graph = self.graph.clone();
+        let embeddings = self.embeddings.clone();
+        let reason = reason.to_string();
+        let work = async move {
+            let Some(mut episode) =
+                crate::episodes::collector::collect_session_episode(graph.as_ref(), id, &reason)
+                    .await?
+            else {
+                return Ok(false);
+            };
+            // The vector the reflex stage recalls it by (`reflex::episode_recall`): the
+            // first message, which is short. No provider, or a provider that fails: the
+            // episode is kept, it is only not recallable by similarity.
+            if let Some(provider) = embeddings {
+                match provider.embed_text(&episode.stimulus.request).await {
+                    Ok(vector) if !vector.is_empty() => episode.embedding = Some(vector),
+                    Ok(_) => {}
+                    Err(e) => {
+                        debug!(session_id = %id, error = %e, "close episode left without embedding")
+                    }
+                }
+            }
+            graph.save_session_episode(&episode).await
+        };
+        // Detached: the close never waits on the graph for its episode (a cascade or a
+        // deletion closes many sessions in a row). The write cannot outlive a deletion:
+        // it is one statement that MATCHes the session, and a deletion removes the session
+        // and its episode in one statement.
+        tokio::spawn(async move {
+            match tokio::time::timeout(CLOSE_EPISODE_BUDGET, work).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    warn!(session_id = %id, error = %e, "the session's close episode was not stored")
+                }
+                Err(_) => warn!(session_id = %id, "storing the session's close episode timed out"),
+            }
+        });
+    }
+
     /// Tears the session down WITHOUT announcing `session_closed`: an in-place provider
     /// switch, whose same thread must see only `provider_switched`, never `session_closed`.
     /// Unlike [`Self::close_session`], it does not remove a neutral directory.
@@ -18783,6 +18853,7 @@ impl ChatManager {
                 self.agent_runtime
                     .close_with_reason(session_id, reason)
                     .await?;
+                self.record_close_episode(session_id, reason);
             } else {
                 self.agent_runtime.close_for_switch(session_id).await?;
             }
@@ -18866,6 +18937,12 @@ impl ChatManager {
                 );
                 drop(client);
             }
+        }
+
+        // After the disconnect: the node holds the session as it ended. A quiet close (an
+        // in-place switch) is not an end, and leaves no episode.
+        if announce {
+            self.record_close_episode(session_id, reason);
         }
 
         Ok(())

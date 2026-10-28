@@ -130,6 +130,14 @@ impl ParallelEnrichmentStage for PersonaStage {
             )
         );
 
+        crate::chat::activation_registry::record_persona(
+            input.session_id,
+            crate::chat::activation_registry::ActivatedRef {
+                id: persona.id.to_string(),
+                name: persona.name.clone(),
+            },
+        );
+
         // Set hint so downstream stages know which persona is active
         output.set_hint("active_persona", persona.name.clone());
         output.set_hint("active_persona_id", persona.id.to_string());

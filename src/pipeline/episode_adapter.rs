@@ -441,6 +441,7 @@ mod tests {
             }),
             collected_at: now,
             source_run_id: Some(Uuid::new_v4()),
+            session: None,
             embedding: None,
         }
     }

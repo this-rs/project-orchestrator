@@ -11,6 +11,10 @@ use crate::neo4j::traits::GraphStore;
 
 /// Maximum episode recall suggestions to return.
 const MAX_EPISODES: usize = 2;
+/// Below this cosine similarity a past session is not "close": the nearest of a
+/// store is always returned by the index, so without a floor every turn would recall
+/// something. A floor chosen by reasoning, not measured on a real embedding model.
+const MIN_EPISODE_SIMILARITY: f64 = 0.6;
 
 /// Fetch episode recall suggestions for the given context.
 ///
@@ -38,6 +42,7 @@ pub async fn fetch_episode_suggestions(
         Ok(episodes) => {
             let suggestions: Vec<Suggestion> = episodes
                 .into_iter()
+                .filter(|(_, similarity)| *similarity >= MIN_EPISODE_SIMILARITY)
                 .map(|(episode, similarity)| Suggestion::EpisodeRecall {
                     episode_id: episode.id,
                     summary: truncate_str(&episode.stimulus.request, 120),

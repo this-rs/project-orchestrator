@@ -15,6 +15,7 @@ pub mod continuity;
 pub mod control_pump;
 pub(crate) mod drain;
 
+pub mod activation_registry;
 #[cfg(test)]
 mod agent_e2e_tests;
 pub(crate) mod agent_hooks;

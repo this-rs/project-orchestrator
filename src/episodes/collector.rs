@@ -134,10 +134,158 @@ pub async fn collect_episode(
         lesson: None, // Lessons are extracted later (optionally by LLM)
         collected_at: Utc::now(),
         source_run_id: Some(run_id),
+        session: None,
         embedding: None, // Computed later if embedding pipeline is available
     };
 
     Ok(Some(episode))
+}
+
+/// Namespace of [`session_episode_id`]. Fixed: the id of a session's episode must
+/// not depend on the instance, only on the session.
+const SESSION_EPISODE_NAMESPACE: Uuid = Uuid::from_u128(0x5e55_1015_e915_0de0_a11c_e0f5_e551_0000);
+
+/// The id of the episode of session `session_id`: the same at every close.
+pub fn session_episode_id(session_id: Uuid) -> Uuid {
+    Uuid::new_v5(&SESSION_EPISODE_NAMESPACE, session_id.as_bytes())
+}
+
+/// Whether the session works inside a run that has an episode of its own, which a
+/// session episode would count twice: a protocol state agent (`protocol_runner`: its
+/// run IS a protocol run), or a session of a plan run (runner, pipeline, gate, trigger)
+/// whose plan run carries a lifecycle protocol run (the run episode is collected from
+/// it). A plan run without one leaves no run episode: its sessions keep theirs.
+async fn run_has_its_own_episode(neo4j: &dyn GraphStore, spawned_by: Option<&str>) -> Result<bool> {
+    let Some(v) = spawned_by.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()) else {
+        return Ok(false);
+    };
+    let Some(run_id) = v
+        .get("run_id")
+        .and_then(|r| r.as_str())
+        .and_then(|r| Uuid::parse_str(r).ok())
+    else {
+        return Ok(false);
+    };
+    if v.get("type").and_then(|t| t.as_str()) == Some("protocol_runner") {
+        return Ok(true);
+    }
+    Ok(neo4j
+        .get_plan_run(run_id)
+        .await?
+        .is_some_and(|run| run.lifecycle_run_id.is_some()))
+}
+
+/// Take the episode a chat session leaves at its close, `close_reason` being the
+/// reason announced on its `session_closed`.
+///
+/// Read from the session node as it stands at the close:
+/// - **Stimulus**: its first user message (the node's `preview`), at its creation.
+///   `UserRequest`, or `Manual` for a session another agent or a runner spawned.
+/// - **Process**: no FSM state; its active span (`created_at` → last update).
+/// - **Outcome**: no artefact list — nothing links what a session wrote back to it yet,
+///   and an episode does not invent it. How it ended is `session.close_reason`.
+/// - **Validation**: none.
+/// - **Session**: id, messages exchanged, close reason, cost, agent.
+///
+/// Its id is derived from the session ([`session_episode_id`]): a later close of the
+/// same session (after a resume) replaces the episode under the SAME id.
+///
+/// `Ok(None)` when there is nothing to keep: no such session, a session that never
+/// received a message, one with no project (an episode belongs to a project), or one
+/// that works inside a run with an episode of its own ([`run_has_its_own_episode`]:
+/// counting the work twice would skew what is learned from it).
+///
+/// Known limits: `preview` is the first message cut to ~200 characters; a session
+/// whose process died without a close (removed from the live table, never closed)
+/// leaves no episode until it is resumed and closed.
+pub async fn collect_session_episode(
+    neo4j: &dyn GraphStore,
+    session_id: Uuid,
+    close_reason: &str,
+) -> Result<Option<Episode>> {
+    let Some(session) = neo4j.get_chat_session(session_id).await? else {
+        return Ok(None);
+    };
+    let request = session
+        .preview
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    let Some(slug) = session.project_slug.as_deref() else {
+        return Ok(None);
+    };
+    if run_has_its_own_episode(neo4j, session.spawned_by.as_deref()).await? {
+        return Ok(None);
+    }
+    let Some(project) = neo4j.get_project_by_slug(slug).await? else {
+        return Ok(None);
+    };
+
+    // The agent that ran it. Not naming it never costs the episode.
+    let agent_id = match neo4j.agent_identity_namespace().await {
+        Ok(ns) => crate::notes::provenance::agent_id(ns, &session.model),
+        Err(e) => {
+            tracing::warn!(session_id = %session_id, error = %e, "the agent of a closed session could not be named");
+            None
+        }
+    };
+
+    let spawned = session
+        .spawned_by
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    let stimulus = Stimulus {
+        request: request.to_string(),
+        trigger: if spawned {
+            StimulusTrigger::Manual
+        } else {
+            StimulusTrigger::UserRequest
+        },
+        timestamp: session.created_at,
+        context_hash: None,
+    };
+    let process = Process {
+        reasoning_tree_id: None,
+        states_visited: Vec::new(),
+        state_visits: Vec::new(),
+        duration_ms: Some(
+            (session.updated_at - session.created_at)
+                .num_milliseconds()
+                .max(0),
+        ),
+    };
+
+    Ok(Some(Episode {
+        id: session_episode_id(session_id),
+        project_id: project.id,
+        stimulus,
+        process,
+        outcome: Outcome {
+            note_ids: Vec::new(),
+            decision_ids: Vec::new(),
+            commit_shas: Vec::new(),
+            files_modified: 0,
+        },
+        validation: Validation {
+            feedback_type: FeedbackType::None,
+            score: None,
+            evidence_count: 0,
+        },
+        lesson: None,
+        collected_at: Utc::now(),
+        source_run_id: None,
+        session: Some(SessionTrace {
+            session_id,
+            message_count: session.message_count,
+            close_reason: close_reason.to_string(),
+            total_cost_usd: session.total_cost_usd,
+            agent_id,
+        }),
+        embedding: None,
+    }))
 }
 
 /// List all collectable episodes for a project.
@@ -262,6 +410,7 @@ mod tests {
             lesson: None,
             collected_at: Utc::now(),
             source_run_id: None,
+            session: None,
             embedding: None,
         }
     }
@@ -442,5 +591,342 @@ mod tests {
             sv.duration_ms.unwrap() >= 4000,
             "Duration should be ~5000ms"
         );
+    }
+
+    // ── session episodes ─────────────────────────────────────────────────
+
+    /// A store holding project `p` and a session of it that received `preview`.
+    async fn store_with_session(
+        project: Option<&str>,
+        preview: Option<&str>,
+    ) -> (crate::neo4j::mock::MockGraphStore, Uuid, Option<Uuid>) {
+        use crate::neo4j::GraphStore;
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let project_id = match project {
+            Some(slug) => {
+                let p = crate::test_helpers::test_project_named(slug);
+                store.create_project(&p).await.unwrap();
+                Some(p.id)
+            }
+            None => None,
+        };
+        let mut session = crate::test_helpers::test_chat_session(project);
+        session.preview = preview.map(String::from);
+        session.message_count = 4;
+        session.total_cost_usd = Some(0.25);
+        session.created_at = Utc::now() - chrono::Duration::seconds(90);
+        session.updated_at = session.created_at + chrono::Duration::seconds(60);
+        let session_id = session.id;
+        store.create_chat_session(&session).await.unwrap();
+        (store, session_id, project_id)
+    }
+
+    #[tokio::test]
+    async fn a_closed_session_gives_an_episode_of_its_first_message_and_its_end() {
+        use crate::neo4j::GraphStore;
+        let (store, sid, project_id) =
+            store_with_session(Some("alpha"), Some("  Fix the login bug  ")).await;
+        let episode = collect_session_episode(&store, sid, "process_died")
+            .await
+            .unwrap()
+            .expect("a session with a message and a project leaves an episode");
+
+        assert_eq!(Some(episode.project_id), project_id);
+        assert_eq!(episode.stimulus.request, "Fix the login bug");
+        assert_eq!(episode.stimulus.trigger, StimulusTrigger::UserRequest);
+        assert_eq!(episode.process.duration_ms, Some(60_000));
+        assert_eq!(episode.source_run_id, None);
+        assert_eq!(
+            episode.session,
+            Some(SessionTrace {
+                session_id: sid,
+                message_count: 4,
+                close_reason: "process_died".into(),
+                total_cost_usd: Some(0.25),
+                agent_id: crate::notes::provenance::agent_id(
+                    store.agent_identity_namespace().await.unwrap(),
+                    &crate::test_helpers::test_chat_session(None).model,
+                ),
+            })
+        );
+        assert!(
+            episode.session.as_ref().unwrap().agent_id.is_some(),
+            "the agent that ran it is named"
+        );
+        // Nothing links what the session wrote back to it: nothing is invented.
+        assert!(episode.outcome.note_ids.is_empty() && episode.outcome.decision_ids.is_empty());
+        assert_eq!(episode.validation.feedback_type, FeedbackType::None);
+    }
+
+    #[tokio::test]
+    async fn a_spawned_session_is_not_a_user_request() {
+        use crate::neo4j::GraphStore;
+        let (store, sid, _) = store_with_session(Some("alpha"), Some("delegated work")).await;
+        let mut node = store.get_chat_session(sid).await.unwrap().unwrap();
+        node.spawned_by = Some(r#"{"type":"runner"}"#.into());
+        store.chat_sessions.write().await.insert(sid, node);
+        let episode = collect_session_episode(&store, sid, "closed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(episode.stimulus.trigger, StimulusTrigger::Manual);
+    }
+
+    #[tokio::test]
+    async fn a_session_with_nothing_to_keep_leaves_no_episode() {
+        // Never received a message.
+        let (store, sid, _) = store_with_session(Some("alpha"), None).await;
+        assert!(collect_session_episode(&store, sid, "closed")
+            .await
+            .unwrap()
+            .is_none());
+        let (store, sid, _) = store_with_session(Some("alpha"), Some("   ")).await;
+        assert!(collect_session_episode(&store, sid, "closed")
+            .await
+            .unwrap()
+            .is_none());
+        // No project: an episode belongs to one.
+        let (store, sid, _) = store_with_session(None, Some("hello")).await;
+        assert!(collect_session_episode(&store, sid, "closed")
+            .await
+            .unwrap()
+            .is_none());
+        // A project slug that names no project.
+        let (store, _, _) = store_with_session(Some("alpha"), Some("hello")).await;
+        let mut orphan = crate::test_helpers::test_chat_session(Some("gone"));
+        orphan.preview = Some("hello".into());
+        let orphan_id = orphan.id;
+        crate::neo4j::GraphStore::create_chat_session(&store, &orphan)
+            .await
+            .unwrap();
+        assert!(collect_session_episode(&store, orphan_id, "closed")
+            .await
+            .unwrap()
+            .is_none());
+        // No such session.
+        assert!(collect_session_episode(&store, Uuid::new_v4(), "closed")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// A session inside a run whose episode exists already leaves none (no double
+    /// count); a session of a plan run that leaves no run episode keeps its own.
+    #[tokio::test]
+    async fn a_session_is_counted_once_with_its_run() {
+        use crate::neo4j::GraphStore;
+        let with_lifecycle = Uuid::new_v4();
+        let without_lifecycle = Uuid::new_v4();
+        let cases = [
+            (
+                format!(
+                    r#"{{"type":"protocol_runner","run_id":"{}","state_name":"s"}}"#,
+                    Uuid::new_v4()
+                ),
+                false,
+            ),
+            (
+                format!(
+                    r#"{{"type":"runner","run_id":"{with_lifecycle}","task_id":"{}"}}"#,
+                    Uuid::new_v4()
+                ),
+                false,
+            ),
+            (
+                format!(
+                    r#"{{"type":"runner","run_id":"{without_lifecycle}","task_id":"{}"}}"#,
+                    Uuid::new_v4()
+                ),
+                true,
+            ),
+            (
+                format!(
+                    r#"{{"type":"runner","run_id":"{}","task_id":"{}"}}"#,
+                    Uuid::new_v4(),
+                    Uuid::new_v4()
+                ),
+                true,
+            ),
+        ];
+        for (spawned, kept) in cases {
+            let (store, sid, _) = store_with_session(Some("alpha"), Some("run work")).await;
+            for (run_id, lifecycle) in [(with_lifecycle, true), (without_lifecycle, false)] {
+                let mut run =
+                    crate::runner::RunnerState::new(run_id, Uuid::new_v4(), 1, Default::default());
+                run.lifecycle_run_id = lifecycle.then(Uuid::new_v4);
+                store.create_plan_run(&run).await.unwrap();
+            }
+            let mut node = store.get_chat_session(sid).await.unwrap().unwrap();
+            node.spawned_by = Some(spawned.clone());
+            store.chat_sessions.write().await.insert(sid, node);
+            let episode = collect_session_episode(&store, sid, "closed")
+                .await
+                .unwrap();
+            assert_eq!(episode.is_some(), kept, "{spawned}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_with_nothing_more_to_keep_leaves_no_episode() {
+        let (store, _, _) = store_with_session(Some("alpha"), Some("hello")).await;
+        // No such session.
+        assert!(collect_session_episode(&store, Uuid::new_v4(), "closed")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_session_episode_is_stored_once_per_session_and_goes_with_the_session() {
+        use crate::neo4j::GraphStore;
+        let (store, sid, project_id) = store_with_session(Some("alpha"), Some("first")).await;
+        let project_id = project_id.unwrap();
+        let first = collect_session_episode(&store, sid, "closed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(store.save_session_episode(&first).await.unwrap());
+        // A second close (after a resume) replaces the first: one episode per session.
+        let second = collect_session_episode(&store, sid, "process_died")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(store.save_session_episode(&second).await.unwrap());
+        let listed = store.list_session_episodes(project_id, 10).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, second.id);
+        assert_eq!(
+            first.id, second.id,
+            "the same id at every close of a session"
+        );
+        assert_eq!(first.id, session_episode_id(sid));
+        assert_eq!(
+            listed[0].session.as_ref().unwrap().close_reason,
+            "process_died"
+        );
+
+        // Deleted with its session; and never written for a session that is gone.
+        assert!(store.delete_chat_session(sid).await.unwrap());
+        assert!(store
+            .list_session_episodes(project_id, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!store.save_session_episode(&second).await.unwrap());
+        assert!(store
+            .list_session_episodes(project_id, 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The recall of a closed session: by the vector of its first message, within its
+    /// project, never an episode without a vector, the closest first, `limit` kept.
+    #[tokio::test]
+    async fn a_closed_session_is_recalled_by_the_vector_of_its_first_message() {
+        use crate::neo4j::GraphStore;
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("alpha");
+        store.create_project(&project).await.unwrap();
+        let other = crate::test_helpers::test_project_named("beta");
+        store.create_project(&other).await.unwrap();
+        let mut saved = Vec::new();
+        for (slug, preview, vector) in [
+            ("alpha", "login page 500", Some(vec![1.0, 0.0, 0.0])),
+            ("alpha", "login timeout", Some(vec![0.9, 0.1, 0.0])),
+            ("alpha", "rotate api keys", Some(vec![0.0, 0.0, 1.0])),
+            ("alpha", "no vector at all", None),
+            ("beta", "login page 500", Some(vec![1.0, 0.0, 0.0])),
+        ] {
+            let mut session = crate::test_helpers::test_chat_session(Some(slug));
+            session.preview = Some(preview.into());
+            store.create_chat_session(&session).await.unwrap();
+            let mut episode = collect_session_episode(&store, session.id, "closed")
+                .await
+                .unwrap()
+                .unwrap();
+            episode.embedding = vector;
+            assert!(store.save_session_episode(&episode).await.unwrap());
+            saved.push(episode.id);
+        }
+        let hits = store
+            .search_episodes_by_embedding(project.id, &[1.0, 0.0, 0.0], 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|(e, _)| e.id).collect::<Vec<_>>(),
+            vec![saved[0], saved[1]],
+            "the closest first, the other project and the vectorless episode absent, limit kept"
+        );
+        assert!((hits[0].1 - 1.0).abs() < 1e-6);
+        assert!(hits[1].1 < 1.0 && hits[1].1 > 0.9);
+    }
+
+    #[test]
+    fn an_episode_serialized_before_sessions_existed_still_reads() {
+        let mut value = serde_json::to_value(sample_episode()).unwrap();
+        assert!(
+            value.get("session").is_none(),
+            "absent, not null, on a run episode"
+        );
+        value.as_object_mut().unwrap().remove("session");
+        let back: Episode = serde_json::from_value(value).unwrap();
+        assert!(back.session.is_none());
+    }
+}
+
+/// Episode builders for tests of other modules.
+#[cfg(test)]
+pub mod tests_support {
+    use super::*;
+    use chrono::{DateTime, Utc};
+
+    /// An episode that started at `start`. With `closed_at`, a session episode closed
+    /// then; otherwise a run episode lasting `duration_ms`.
+    pub fn episode_at(
+        start: DateTime<Utc>,
+        duration_ms: Option<i64>,
+        closed_at: Option<DateTime<Utc>>,
+    ) -> Episode {
+        Episode {
+            id: Uuid::new_v4(),
+            project_id: Uuid::nil(),
+            stimulus: Stimulus {
+                request: "r".into(),
+                trigger: StimulusTrigger::Manual,
+                timestamp: start,
+                context_hash: None,
+            },
+            process: Process {
+                reasoning_tree_id: None,
+                states_visited: Vec::new(),
+                state_visits: Vec::new(),
+                duration_ms: closed_at
+                    .map(|c| (c - start).num_milliseconds())
+                    .or(duration_ms),
+            },
+            outcome: Outcome {
+                note_ids: Vec::new(),
+                decision_ids: Vec::new(),
+                commit_shas: Vec::new(),
+                files_modified: 0,
+            },
+            validation: Validation {
+                feedback_type: FeedbackType::None,
+                score: None,
+                evidence_count: 0,
+            },
+            lesson: None,
+            collected_at: closed_at.unwrap_or_else(Utc::now),
+            source_run_id: closed_at.is_none().then(Uuid::new_v4),
+            session: closed_at.map(|_| SessionTrace {
+                session_id: Uuid::new_v4(),
+                message_count: 1,
+                close_reason: "closed".into(),
+                total_cost_usd: None,
+                agent_id: None,
+            }),
+            embedding: None,
+        }
     }
 }

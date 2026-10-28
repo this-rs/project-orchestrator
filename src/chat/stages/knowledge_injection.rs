@@ -9,6 +9,11 @@
 //! 2. **Hybrid decision retrieval** — same two channels over the decisions
 //! 3. **Propagated notes** (Neo4j graph traversal) — notes linked to files mentioned in the message
 //! 4. **Entity context notes** (Neo4j) — notes directly attached to detected entities
+//! 5. **Pinned notes** (Neo4j, by configured id) — foundation knowledge injected
+//!    whatever the question is: no ranking reaches a note nothing makes
+//!    relevant, which is exactly why it must not be ranked. Still guarded by
+//!    the freshness and consent checks, and rendered before the ranked notes so
+//!    the character budget cannot truncate it.
 //!
 //! Results are deduplicated by note_id/decision_id (keeping highest score)
 //! and truncated to a character budget (~3000 chars ≈ 750 tokens).
@@ -107,6 +112,16 @@ pub struct KnowledgeInjectionConfig {
     /// for no gain (the models truncate around 512 tokens anyway). The head of
     /// a message carries its subject.
     pub embed_query_chars: usize,
+    /// Note ids injected whatever the question is (default: empty).
+    ///
+    /// Foundation knowledge — a project's operating rules, an onboarding note —
+    /// is not an answer to the user's message, so neither BM25 nor the dense
+    /// channel ever reaches it. These ids are read in Neo4j and go through the
+    /// same guards as any other note (freshness, consent, provider policy): an
+    /// archived or superseded pin is dropped, never resurrected. Kept empty by
+    /// default, and never adjusted by [`scaffolding_config`]: a lower level
+    /// injects *less ranked context*, not less foundation.
+    pub pinned_notes: Vec<Uuid>,
 }
 
 impl Default for KnowledgeInjectionConfig {
@@ -122,6 +137,7 @@ impl Default for KnowledgeInjectionConfig {
             max_content_chars: 3000,
             dense_min_similarity: 0.80,
             embed_query_chars: 1000,
+            pinned_notes: Vec::new(),
         }
     }
 }
@@ -223,6 +239,61 @@ struct PredictedFile {
 // ============================================================================
 // Stage implementation
 // ============================================================================
+
+// ============================================================================
+// Pinned notes, as people set them
+// ============================================================================
+
+/// Key, in the settings store, of the list of notes a person pinned.
+pub const PINNED_NOTES_KEY: &str = "knowledge.pinned_notes";
+/// At most this many pinned notes reach a turn (configured, global, then project).
+pub const MAX_PINNED_NOTES: usize = 10;
+/// Budget of reading the pinned notes of a turn (the settings, then the notes): past it
+/// the turn goes on without them, and the ranked knowledge is not lost with them.
+const PINNED_NOTES_BUDGET: Duration = Duration::from_millis(500);
+
+/// The settings scope of the pins: `global` (every session) or `project:<slug>`, the
+/// convention of the per-project consents. Keyed by slug like them: a renamed project
+/// leaves its pins behind, and a slug reused by a new project finds the old ones (the
+/// consent gate still applies to each note at every turn).
+pub fn pinned_notes_scope(project_slug: Option<&str>) -> String {
+    match project_slug {
+        Some(slug) => format!("project:{slug}"),
+        None => crate::chat::provider::settings::GLOBAL.to_string(),
+    }
+}
+
+/// The notes pinned in a scope, in their order. Nothing stored: an empty list.
+pub async fn load_pinned_notes(
+    graph: &dyn GraphStore,
+    project_slug: Option<&str>,
+) -> Result<Vec<Uuid>> {
+    match graph
+        .get_llm_setting(&pinned_notes_scope(project_slug), PINNED_NOTES_KEY)
+        .await?
+    {
+        Some(raw) => Ok(serde_json::from_str(&raw)?),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Replaces the notes pinned in a scope. An empty list removes the setting. Who may
+/// call it is the route's business (a person only: a pin reaches every turn).
+pub async fn store_pinned_notes(
+    graph: &dyn GraphStore,
+    project_slug: Option<&str>,
+    ids: &[Uuid],
+) -> Result<()> {
+    let scope = pinned_notes_scope(project_slug);
+    if ids.is_empty() {
+        graph.delete_llm_setting(&scope, PINNED_NOTES_KEY).await?;
+    } else {
+        graph
+            .put_llm_setting(&scope, PINNED_NOTES_KEY, &serde_json::to_string(ids)?)
+            .await?;
+    }
+    Ok(())
+}
 
 /// Enrichment stage that auto-injects relevant knowledge from the graph and search index.
 pub struct KnowledgeInjectionStage {
@@ -470,6 +541,144 @@ impl KnowledgeInjectionStage {
                 None
             }
         }
+    }
+
+    /// Inject the pinned notes, whatever the question is.
+    ///
+    /// A pinned note is foundation knowledge (a project's operating rules, an
+    /// onboarding note). Neither search channel ever reaches it: no question
+    /// makes it relevant, which is exactly why it must be injected without
+    /// being ranked. It is not exempt from the guards, though — it goes through
+    /// [`keep_current_notes`] like any other candidate, so an archived,
+    /// superseded or stale pin is dropped rather than resurrected, the consent
+    /// gate applies, and a restricted provider withholds a sensitive one.
+    ///
+    /// Rendered in its own section, before the ranked notes, within half of the
+    /// knowledge budget (the ranked notes keep the rest). A pinned note may be global (no
+    /// owning project), so this runs before the project-scope guard: a
+    /// conversation without a project still receives its foundation.
+    ///
+    /// The pins are those of the configuration, then the GLOBAL ones and those of the
+    /// session's project as people set them ([`load_pinned_notes`]), deduplicated, at
+    /// most [`MAX_PINNED_NOTES`], minus the notes the message already references
+    /// (`excluded`). Read under [`PINNED_NOTES_BUDGET`]. Returns the ids injected, so
+    /// the ranked retrieval does not inject them a second time.
+    async fn inject_pinned(
+        &self,
+        output: &mut StageOutput,
+        reader: Option<Uuid>,
+        restricted: bool,
+        project: Option<&str>,
+        max_content_chars: usize,
+        excluded: &std::collections::HashSet<String>,
+    ) -> std::collections::HashSet<String> {
+        let mut injected = std::collections::HashSet::new();
+        let graph = self.graph.clone();
+        let configured = self.config.pinned_notes.clone();
+        let project_owned = project.map(str::to_string);
+        let read = async move {
+            let mut ids = configured;
+            // The global pins, then the project's (a session without a project: global only).
+            let mut scopes = vec![None];
+            if let Some(slug) = project_owned.as_deref() {
+                scopes.push(Some(slug));
+            }
+            for scope in scopes {
+                match load_pinned_notes(graph.as_ref(), scope).await {
+                    Ok(stored) => ids.extend(stored),
+                    Err(e) => {
+                        warn!(scope = ?scope, error = %e, "unreadable pinned notes, skipped")
+                    }
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            ids.retain(|id| seen.insert(*id));
+            ids.truncate(MAX_PINNED_NOTES);
+            let lookups = ids.into_iter().map(|id| {
+                let graph = graph.clone();
+                async move {
+                    match graph.get_note(id).await {
+                        Ok(Some(note)) => Some(ScoredNote {
+                            id: note.id.to_string(),
+                            note_type: format!("{:?}", note.note_type),
+                            importance: format!("{:?}", note.importance),
+                            content: note.content,
+                            score: 1.0, // Pinned = maximal relevance, by construction
+                            source: "pinned",
+                        }),
+                        Ok(None) => {
+                            debug!(note_id = %id, "Pinned note not found");
+                            None
+                        }
+                        Err(e) => {
+                            debug!(note_id = %id, error = %e, "Failed to read a pinned note");
+                            None
+                        }
+                    }
+                }
+            });
+            let mut candidates: Vec<ScoredNote> = futures::future::join_all(lookups)
+                .await
+                .into_iter()
+                .flatten()
+                .collect();
+            candidates.retain(|n| !excluded.contains(&n.id));
+            if candidates.is_empty() {
+                return Vec::new();
+            }
+            // The currency, consent and policy checks read the graph too: under the
+            // same budget as the lookups, so a slow graph costs the pins, never the turn.
+            keep_current_notes(graph.as_ref(), reader, candidates, restricted).await
+        };
+        let kept = match timeout(PINNED_NOTES_BUDGET, read).await {
+            Ok(kept) => kept,
+            Err(_) => {
+                warn!("[knowledge_injection] reading the pinned notes timed out");
+                return injected;
+            }
+        };
+        if kept.is_empty() {
+            return injected;
+        }
+
+        // Half the knowledge budget at most: the pins come first, they must not leave
+        // nothing to the ranked notes the message asked for.
+        let budget = max_content_chars / 2;
+        let mut group = String::new();
+        let mut chars_used = 0;
+        for note in &kept {
+            let entry = format!(
+                "- **[{}|{}]** {}\n",
+                note.note_type.to_lowercase(),
+                note.importance.to_lowercase(),
+                truncate_content(&note.content, 300),
+            );
+            if chars_used + entry.len() > budget {
+                break;
+            }
+            group.push_str(&entry);
+            chars_used += entry.len();
+            injected.insert(note.id.clone());
+        }
+        if group.is_empty() {
+            return injected;
+        }
+
+        let mut content = String::from("### Foundational Notes\n");
+        content.push_str(&untrusted_group("note", &group, project));
+        output.add_section(
+            "Foundational Notes",
+            content,
+            self.name(),
+            crate::chat::enrichment::EnrichmentSource::KnowledgeInjection,
+        );
+
+        debug!(
+            count = injected.len(),
+            "[knowledge_injection] Injected {} pinned note(s) without ranking",
+            injected.len()
+        );
+        injected
     }
 
     /// Run all knowledge queries in parallel with individual timeouts.
@@ -1377,16 +1586,34 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
     async fn execute(&self, input: &EnrichmentInput) -> Result<StageOutput> {
         let mut output = StageOutput::new(self.name());
 
-        // Need a project scope for knowledge search
-        let project_slug = match &input.project_slug {
-            Some(slug) => slug.clone(),
-            None => return Ok(output), // No project scope, skip
+        // Resolve the project scope first: the pinned notes below may be global
+        // notes (no owning project), so they must be injectable without one.
+        let requested_slug = input.project_slug.clone();
+        let project_id = match (&requested_slug, input.project_id) {
+            (Some(_), Some(id)) => Some(id),
+            (Some(slug), None) => self.resolve_project_id(slug).await,
+            (None, _) => None,
         };
 
-        let project_id = if let Some(id) = input.project_id {
-            Some(id)
-        } else {
-            self.resolve_project_id(&project_slug).await
+        // ── Pinned notes ─────────────────────────────────────────────────
+        // Foundation knowledge is not an answer to the user's message: the
+        // ranking never reaches it, so it is injected here — outside the
+        // project-scope guard — while still passing keep_current_notes.
+        let pinned = self
+            .inject_pinned(
+                &mut output,
+                project_id,
+                input.restricted_content,
+                requested_slug.as_deref(),
+                self.config.max_content_chars,
+                &input.excluded_note_ids,
+            )
+            .await;
+
+        // The ranked retrieval below needs a project scope.
+        let project_slug = match requested_slug {
+            Some(slug) => slug,
+            None => return Ok(output), // No project scope, skip the ranking
         };
 
         // ── Scaffolding-adaptive config ──────────────────────────────────
@@ -1479,6 +1706,11 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
                     removed
                 );
             }
+        }
+
+        // A pinned note is already in the prompt: not a second time among the ranked.
+        if !pinned.is_empty() {
+            notes.retain(|n| !pinned.contains(&n.id));
         }
 
         // ── Intent-aware reweighting ────────────────────────────────────
@@ -2663,6 +2895,117 @@ mod tests {
         );
     }
 
+    // ── Pinned notes: injected whatever the question is ────────────────
+    //
+    // A pinned note exists precisely because no question makes it relevant:
+    // the ranking can never reach it. These two tests hold that contract, and
+    // the second one holds its limit — a pin is not exempt from the freshness
+    // check, so an archived pin dies with the note instead of outliving it.
+
+    /// A stage whose only knowledge source is the pinned note list.
+    fn stage_with_pinned(
+        pinned: Vec<Uuid>,
+        graph: Arc<crate::neo4j::mock::MockGraphStore>,
+    ) -> KnowledgeInjectionStage {
+        use crate::meilisearch::mock::MockSearchStore;
+        KnowledgeInjectionStage {
+            graph: graph as Arc<dyn crate::neo4j::traits::GraphStore>,
+            search: Arc::new(MockSearchStore::new())
+                as Arc<dyn crate::meilisearch::traits::SearchStore>,
+            config: KnowledgeInjectionConfig {
+                pinned_notes: pinned,
+                ..KnowledgeInjectionConfig::default()
+            },
+            collector: None,
+            embeddings: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pinned_note_reaches_the_prompt_without_any_matching_query() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::notes::{Note, NoteType};
+
+        let graph = Arc::new(MockGraphStore::new());
+        // A global note: no owning project at all.
+        let note = Note::new(
+            None,
+            NoteType::Guideline,
+            "The foundation rule: measure before certifying.".to_string(),
+            "test-agent".to_string(),
+        );
+        let pinned_id = note.id;
+        graph.create_note(&note).await.unwrap();
+
+        let stage = stage_with_pinned(vec![pinned_id], graph);
+        let input = EnrichmentInput {
+            message: "a question that has nothing to do with the note".to_string(),
+            session_id: Uuid::new_v4(),
+            project_slug: None,
+            project_id: None,
+            cwd: None,
+            protocol_run_id: None,
+            protocol_state: None,
+            excluded_note_ids: Default::default(),
+            restricted_content: false,
+            reasoning_path_tracker: None,
+        };
+
+        let output = stage.execute(&input).await.unwrap();
+        let section = output
+            .sections
+            .iter()
+            .find(|s| s.title == "Foundational Notes")
+            .expect("a pinned note is injected with no project and no matching query");
+        assert!(
+            section.content.contains("measure before certifying"),
+            "the pinned note's content must be in the prompt, got: {}",
+            section.content
+        );
+    }
+
+    #[tokio::test]
+    async fn an_archived_pinned_note_is_not_injected() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::notes::{Note, NoteStatus, NoteType};
+
+        let graph = Arc::new(MockGraphStore::new());
+        let mut note = Note::new(
+            None,
+            NoteType::Guideline,
+            "An instruction the graph no longer stands behind.".to_string(),
+            "test-agent".to_string(),
+        );
+        note.status = NoteStatus::Archived;
+        let pinned_id = note.id;
+        graph.create_note(&note).await.unwrap();
+
+        let stage = stage_with_pinned(vec![pinned_id], graph);
+        let input = EnrichmentInput {
+            message: "hello".to_string(),
+            session_id: Uuid::new_v4(),
+            project_slug: None,
+            project_id: None,
+            cwd: None,
+            protocol_run_id: None,
+            protocol_state: None,
+            excluded_note_ids: Default::default(),
+            restricted_content: false,
+            reasoning_path_tracker: None,
+        };
+
+        let output = stage.execute(&input).await.unwrap();
+        assert!(
+            !output
+                .sections
+                .iter()
+                .any(|s| s.title == "Foundational Notes"),
+            "pinning must not resurrect an archived note"
+        );
+    }
+
     // ── Scaffolding integration tests ─────────────────────────────────
 
     /// Helper: create a KnowledgeInjectionStage with a pre-populated MockGraphStore
@@ -3286,5 +3629,161 @@ mod tests {
              and must not swallow the BM25 one"
         );
         assert!(decisions[0].description.contains("gather_resolver_symbols"));
+    }
+}
+
+/// The pins as people set them (`/api/knowledge/pinned-notes`), and what keeps a pin
+/// from being injected twice or where it has no business.
+#[cfg(test)]
+mod pinned_settings_tests {
+    use super::*;
+    use crate::chat::enrichment::ParallelEnrichmentStage;
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::notes::{Note, NoteType};
+
+    fn stage(graph: Arc<MockGraphStore>, configured: Vec<Uuid>) -> KnowledgeInjectionStage {
+        KnowledgeInjectionStage {
+            graph: graph as Arc<dyn GraphStore>,
+            search: Arc::new(crate::meilisearch::mock::MockSearchStore::new())
+                as Arc<dyn crate::meilisearch::traits::SearchStore>,
+            config: KnowledgeInjectionConfig {
+                pinned_notes: configured,
+                ..KnowledgeInjectionConfig::default()
+            },
+            collector: None,
+            embeddings: None,
+        }
+    }
+
+    fn input(message: &str, project: Option<(&str, Uuid)>) -> EnrichmentInput {
+        EnrichmentInput {
+            message: message.to_string(),
+            session_id: Uuid::new_v4(),
+            project_slug: project.map(|p| p.0.to_string()),
+            project_id: project.map(|p| p.1),
+            cwd: None,
+            protocol_run_id: None,
+            protocol_state: None,
+            excluded_note_ids: Default::default(),
+            restricted_content: false,
+            reasoning_path_tracker: None,
+        }
+    }
+
+    async fn note(graph: &MockGraphStore, project: Option<Uuid>, content: &str) -> Uuid {
+        let n = Note::new(project, NoteType::Guideline, content.into(), "t".into());
+        let id = n.id;
+        graph.create_note(&n).await.unwrap();
+        id
+    }
+
+    /// Every occurrence of `needle` across the sections of a turn.
+    fn count(output: &StageOutput, needle: &str) -> usize {
+        output
+            .sections
+            .iter()
+            .map(|s| s.content.matches(needle).count())
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn the_pins_people_set_reach_the_turns_of_their_scope() {
+        let graph = Arc::new(MockGraphStore::new());
+        let alpha = Uuid::new_v4();
+        let global = note(&graph, None, "GLOBAL-FOUNDATION").await;
+        let local = note(&graph, Some(alpha), "ALPHA-FOUNDATION").await;
+        store_pinned_notes(graph.as_ref(), None, &[global])
+            .await
+            .unwrap();
+        store_pinned_notes(graph.as_ref(), Some("alpha"), &[local])
+            .await
+            .unwrap();
+        assert_eq!(
+            load_pinned_notes(graph.as_ref(), Some("alpha"))
+                .await
+                .unwrap(),
+            vec![local]
+        );
+        let stage = stage(graph.clone(), Vec::new());
+
+        let in_alpha = stage
+            .execute(&input("unrelated", Some(("alpha", alpha))))
+            .await
+            .unwrap();
+        assert_eq!(count(&in_alpha, "GLOBAL-FOUNDATION"), 1);
+        assert_eq!(count(&in_alpha, "ALPHA-FOUNDATION"), 1);
+
+        let no_project = stage.execute(&input("unrelated", None)).await.unwrap();
+        assert_eq!(count(&no_project, "GLOBAL-FOUNDATION"), 1);
+        assert_eq!(
+            count(&no_project, "ALPHA-FOUNDATION"),
+            0,
+            "a project's pins stay in it"
+        );
+
+        // An empty list removes the pins.
+        store_pinned_notes(graph.as_ref(), None, &[]).await.unwrap();
+        let after = stage.execute(&input("unrelated", None)).await.unwrap();
+        assert_eq!(count(&after, "GLOBAL-FOUNDATION"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_pin_the_ranking_also_finds_is_injected_once() {
+        let graph = Arc::new(MockGraphStore::new());
+        let alpha = Uuid::new_v4();
+        let pinned = note(&graph, None, "ONCE-ONLY").await;
+        let stage = stage(graph.clone(), vec![pinned]);
+        // The message names the note: the ranked retrieval reaches it too.
+        let output = stage
+            .execute(&input(&format!("see {pinned}"), Some(("alpha", alpha))))
+            .await
+            .unwrap();
+        assert_eq!(count(&output, "ONCE-ONLY"), 1, "{:#?}", output.sections);
+    }
+
+    #[tokio::test]
+    async fn a_pin_the_message_already_carries_is_not_injected() {
+        let graph = Arc::new(MockGraphStore::new());
+        let pinned = note(&graph, None, "ALREADY-THERE").await;
+        let stage = stage(graph.clone(), vec![pinned]);
+        let mut turn = input("unrelated", None);
+        turn.excluded_note_ids.insert(pinned.to_string());
+        let output = stage.execute(&turn).await.unwrap();
+        assert_eq!(count(&output, "ALREADY-THERE"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_pin_its_owner_withholds_does_not_cross_into_another_project() {
+        let graph = Arc::new(MockGraphStore::new());
+        let (owner, reader) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut n = Note::new(
+            Some(owner),
+            NoteType::Guideline,
+            "OWNER-ONLY".into(),
+            "t".into(),
+        );
+        n.sharing_consent = crate::episodes::distill_models::SharingConsent::ExplicitDeny;
+        let id = n.id;
+        graph.create_note(&n).await.unwrap();
+        let stage = stage(graph.clone(), vec![id]);
+
+        let elsewhere = stage
+            .execute(&input("unrelated", Some(("beta", reader))))
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&elsewhere, "OWNER-ONLY"),
+            0,
+            "the consent gate holds for a pin"
+        );
+        let at_home = stage
+            .execute(&input("unrelated", Some(("alpha", owner))))
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&at_home, "OWNER-ONLY"),
+            1,
+            "and only that gate: at home it is there"
+        );
     }
 }
