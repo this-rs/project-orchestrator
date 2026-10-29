@@ -1423,7 +1423,6 @@ mod transverse_graph_tests {
     //! the selection (a project note must NOT leak into it).
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::traits::GraphStore;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
