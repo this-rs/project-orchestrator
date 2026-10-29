@@ -1,7 +1,7 @@
 //! Project Orchestrator - CLI Tool
 //!
 //! Command-line interface for interacting with the orchestrator.
-use crate::neo4j::traits::*;
+use project_orchestrator::neo4j::traits::*;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
