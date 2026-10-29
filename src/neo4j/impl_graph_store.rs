@@ -10,6 +10,7 @@ use uuid::Uuid;
 use super::client::Neo4jClient;
 use super::document::{Document, DocumentChunk, DocumentChunkHit};
 use super::models::*;
+#[allow(unused_imports)]
 use super::traits::*;
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
 use crate::notes::{
