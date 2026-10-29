@@ -507,12 +507,17 @@ pub async fn get_project_graph(
     let requested_layers = parse_layers(&params.layers);
     let limit = params.limit.unwrap_or(5000);
 
+    let live: Vec<_> = match state.chat_manager.as_ref() {
+        Some(cm) => cm.live_session_snapshot().await.live.into_iter().collect(),
+        None => Vec::new(),
+    };
     let (nodes, edges, communities, stats) = super::graph_types::build_project_graph_data(
         neo4j,
         &project,
         &requested_layers,
         limit,
         params.community,
+        &live,
     )
     .await?;
 

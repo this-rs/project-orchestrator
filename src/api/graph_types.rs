@@ -255,6 +255,7 @@ pub async fn build_project_graph_data(
     requested_layers: &[String],
     limit: usize,
     community_filter: Option<i64>,
+    live_sessions: &[Uuid],
 ) -> Result<
     (
         Vec<GraphNode>,
@@ -953,10 +954,40 @@ pub async fn build_project_graph_data(
         let mut chat_node_count = 0usize;
         let mut chat_edge_count = 0usize;
 
-        let (sessions, discussed) = neo4j
+        let (mut sessions, discussed) = neo4j
             .get_chat_graph_data(project.id, 20) // Hard limit: max 20 sessions
             .await
             .unwrap_or_default();
+
+        // The agents running right now always get their node, even when they are outside the
+        // 20 most recent DISCUSSED sessions or have discussed nothing yet. Without it the
+        // client cannot place a live agent on the graph, and its tools never show on its robot.
+        for live in live_sessions {
+            let id = live.to_string();
+            if sessions.iter().any(|s| s.id == id) {
+                continue;
+            }
+            let Ok(Some(node)) = neo4j.get_chat_session(*live).await else {
+                continue;
+            };
+            if node.project_slug.as_deref() != Some(project.slug.as_str()) {
+                continue;
+            }
+            let parent_session_id = node
+                .spawned_by
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .and_then(|v| v.get("parent_session_id")?.as_str().map(str::to_string));
+            sessions.push(crate::neo4j::models::ChatGraphSession {
+                id,
+                title: node.title.clone().unwrap_or_else(|| "Untitled".to_string()),
+                model: Some(node.model.clone()),
+                message_count: node.message_count,
+                total_cost_usd: node.total_cost_usd.unwrap_or(0.0),
+                created_at: node.created_at.to_rfc3339(),
+                parent_session_id,
+            });
+        }
 
         for session in &sessions {
             all_nodes.push(GraphNode {
@@ -1524,15 +1555,72 @@ mod knowledge_layer_tests {
             store.create_note(&note).await.unwrap();
         }
 
-        let (nodes, _edges, _communities, _stats) =
-            build_project_graph_data(&store, &project, &["knowledge".to_string()], 5000, None)
-                .await
-                .expect("the graph must build");
+        let (nodes, _edges, _communities, _stats) = build_project_graph_data(
+            &store,
+            &project,
+            &["knowledge".to_string()],
+            5000,
+            None,
+            &[],
+        )
+        .await
+        .expect("the graph must build");
 
         let knowledge = nodes.iter().filter(|n| n.layer == "knowledge").count();
         assert_eq!(
             knowledge, 60,
             "the knowledge layer must serve every note under the limit, not 50"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_agent_of_this_project_gets_its_node_without_discussion() {
+        use crate::test_helpers::test_chat_session;
+        let store = MockGraphStore::new();
+        let project = test_project();
+        store.create_project(&project).await.unwrap();
+        // Running now, in this project, and no DISCUSSED edge: the chat layer used to drop it.
+        let live = test_chat_session(Some(&project.slug));
+        store.create_chat_session(&live).await.unwrap();
+        // Running now, but in another project: must not leak into this graph.
+        let other = test_chat_session(Some("autre-projet"));
+        store.create_chat_session(&other).await.unwrap();
+
+        let chat_ids = |nodes: &[GraphNode]| -> Vec<String> {
+            nodes
+                .iter()
+                .filter(|n| n.layer == "chat")
+                .map(|n| n.id.clone())
+                .collect()
+        };
+
+        let (nodes, _, _, _) = build_project_graph_data(
+            &store,
+            &project,
+            &["chat".to_string()],
+            5000,
+            None,
+            &[live.id, other.id],
+        )
+        .await
+        .expect("the graph must build");
+        let ids = chat_ids(&nodes);
+        assert!(
+            ids.contains(&live.id.to_string()),
+            "the live agent needs its node"
+        );
+        assert!(
+            !ids.contains(&other.id.to_string()),
+            "another project must not leak in"
+        );
+
+        let (nodes, _, _, _) =
+            build_project_graph_data(&store, &project, &["chat".to_string()], 5000, None, &[])
+                .await
+                .expect("the graph must build");
+        assert!(
+            !chat_ids(&nodes).contains(&live.id.to_string()),
+            "without a live list the session is not invented"
         );
     }
 }
