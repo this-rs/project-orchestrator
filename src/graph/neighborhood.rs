@@ -19,6 +19,7 @@
 //!    candidate set: it applies `min_weight` and the layer filter, runs a BFS
 //!    from the centre, admits nodes hop by hop strongest-edge-first until
 //!    `limit`, and computes `truncated` and the stats.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
@@ -1204,6 +1205,7 @@ pub fn layer_counts(raw: &RawNeighborhood, depth: u32, min_weight: f64) -> BTree
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn node(id: &str, t: &str, w: f64) -> RawNode {

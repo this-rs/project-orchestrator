@@ -3,6 +3,7 @@
 //! Knowledge Notes capture contextual information from conversations:
 //! guidelines, gotchas, patterns, tips, and assertions that can be
 //! linked to code entities and automatically surfaced to agents.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
@@ -1307,6 +1308,7 @@ mod search_scope_tests {
     //! Two things a caller must never have to infer: which level a hit comes
     //! from, and how much freshness moved the ranking.
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn note_at(project_id: Option<Uuid>) -> Note {
@@ -1362,6 +1364,7 @@ mod search_scope_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

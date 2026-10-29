@@ -116,6 +116,7 @@
 //! Known limit: a client that joins an OPEN mirror reads its stored events, then follows it
 //! live; an event stored between the two is shown only after a reload (a normal session
 //! fills that gap from its streaming snapshot, a mirror has none).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, HashSet};
@@ -128,6 +129,7 @@ use uuid::Uuid;
 
 use super::types::{ChatEvent, SpawnedBy};
 use crate::neo4j::models::{ChatEventRecord, ChatSessionNode};
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 
@@ -1129,6 +1131,7 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

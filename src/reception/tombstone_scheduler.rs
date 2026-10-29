@@ -2,6 +2,7 @@
 //!
 //! Tracks which peers have acknowledged a tombstone and provides
 //! a list of pending tombstones that need re-broadcast.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
@@ -110,6 +111,7 @@ impl TombstoneScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[tokio::test]

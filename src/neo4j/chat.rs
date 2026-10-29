@@ -1,4 +1,5 @@
 //! Neo4j Chat Session and Event operations
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
@@ -3116,6 +3117,7 @@ impl Neo4jClient {
 #[cfg(test)]
 mod injection_tests {
     use super::chat_session_update_clauses;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

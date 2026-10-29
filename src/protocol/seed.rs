@@ -6,6 +6,7 @@
 //!
 //! Run via `admin(action: "seed_prompt_fragments")` or the REST endpoint
 //! `POST /api/admin/seed-prompt-fragments`.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use anyhow::{Context, Result};
@@ -696,6 +697,7 @@ No further action required until the next maintenance trigger.",
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

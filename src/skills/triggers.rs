@@ -5,6 +5,7 @@
 //! - **Regex**: From frequent tags and content keywords
 //! - **McpAction**: From MCP-related tags (auto-detected from `mcp-usage` tagged notes)
 //! - **Semantic**: From embedding centroid of member notes (if available)
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::notes::{EntityType, Note};
@@ -1062,6 +1063,7 @@ pub fn generate_all_triggers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::notes::{NoteAnchor, NoteImportance, NoteScope, NoteStatus, NoteType};
     use chrono::Utc;

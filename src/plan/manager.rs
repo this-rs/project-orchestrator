@@ -1,4 +1,5 @@
 //! Plan management operations
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::models::*;
@@ -766,6 +767,7 @@ impl PlanManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::test_helpers::*;
 

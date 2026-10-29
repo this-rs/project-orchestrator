@@ -8,6 +8,7 @@
 //! 4. **Anchor** — link replayed notes to local knowledge graph tags
 //!
 //! The [`receive_envelope`] function orchestrates the full pipeline.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod anchor;
@@ -98,6 +99,7 @@ mod tests {
         DistillationEnvelope, DistillationMeta, DistilledLesson, PortabilityLayer,
         SensitivityLevel, TrustProof,
     };
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};

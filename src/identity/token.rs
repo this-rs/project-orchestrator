@@ -3,6 +3,7 @@
 //! Uses PASETO v4.public (Ed25519 signatures) for authenticating P2P messages.
 //! Tokens carry claims: issuer (did:key), subject, issued_at, expiration, and
 //! custom claims for extensibility.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use anyhow::{anyhow, Result};
@@ -163,6 +164,7 @@ pub fn verify_token(token: &str, verifying_key: &VerifyingKey) -> Result<TokenCl
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use ed25519_dalek::SigningKey;
 

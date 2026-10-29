@@ -11,6 +11,7 @@
 //!
 //! Additionally, a directory index supports Java-style wildcard imports
 //! (e.g., `import com.example.*`) by mapping `(dir_suffix, extension)` to files.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
@@ -188,6 +189,7 @@ impl SuffixIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn sample_paths() -> Vec<String> {

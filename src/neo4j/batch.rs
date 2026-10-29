@@ -28,6 +28,7 @@
 //!     RETURN count(r) AS cnt
 //! "#).await?;
 //! ```
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use anyhow::{Context, Result};
@@ -261,6 +262,7 @@ pub fn bolt_map(pairs: &[(&str, neo4rs::BoltType)]) -> BoltMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

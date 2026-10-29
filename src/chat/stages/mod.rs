@@ -4,6 +4,7 @@
 //! registered in the pipeline at startup. All stages run concurrently via
 //! `futures::join_all` and return [`super::enrichment::StageOutput`] which
 //! the pipeline merges in registration order.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod biomimicry;

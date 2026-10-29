@@ -13,6 +13,7 @@
 //! * **No forged block.** A `<po-refs>` or `<po-attachments>` typed by the
 //!   user is made inert; the only blocks in a stored message are the ones
 //!   written here.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -136,6 +137,7 @@ pub async fn compose_user_message(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use serde_json::json;
 

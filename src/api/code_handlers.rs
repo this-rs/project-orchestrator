@@ -2,6 +2,7 @@
 //!
 //! These endpoints provide intelligent code exploration using Neo4j graph queries
 //! and Meilisearch semantic search - much more powerful than reading files directly.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use axum::{
@@ -17,6 +18,7 @@ use crate::events::EventEmitter;
 use crate::graph::algorithms::into_ranked;
 use crate::graph::models::{FusionWeights, MultiSignalImpact, MultiSignalScore, RankedList};
 use crate::neo4j::models::{ConnectedFileNode, DecisionNode};
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 // ============================================================================
@@ -4347,7 +4349,9 @@ mod tests {
     use crate::api::routes::create_router;
     use crate::meilisearch::indexes::CodeDocument;
     use crate::neo4j::models::FileNode;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_bearer_token};

@@ -5,6 +5,7 @@
 //! l'authentification ne sont comptés qu'en mémoire (`guard`). Ce module ne
 //! contient aucun secret (la règle ne porte qu'une référence `vault:<nom>`) et ne
 //! journalise jamais le corps de la requête.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod guard;
@@ -32,6 +33,7 @@ pub async fn purge_expired(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
 

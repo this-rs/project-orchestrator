@@ -13,6 +13,7 @@
 //!     -e NEO4J_AUTH=neo4j/testpassword neo4j:5
 //!   NEO4J_URI=bolt://localhost:17687 NEO4J_PASSWORD=testpassword \
 //!     cargo test --test neural_routing_sampler
+#[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
 
 use std::sync::Arc;

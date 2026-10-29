@@ -24,6 +24,7 @@
 //!   ▼
 //! Vec<DiscoveredTool>
 //! ```
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use anyhow::Result;
@@ -678,6 +679,7 @@ impl ToolIntrospector {
 mod tests {
     use super::*;
     use crate::embeddings::MockEmbeddingProvider;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use serde_json::json;
 

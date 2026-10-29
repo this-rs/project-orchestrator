@@ -9,6 +9,7 @@
 //! derivation and edge-case audit.
 //!
 //! Plan: `00f0ca9a-816f-4fcc-bc53-da88d595de34`, task R5.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use statrs::distribution::{ContinuousCDF, FisherSnedecor};
@@ -148,6 +149,7 @@ pub fn one_way_anova(groups: &[&[f64]]) -> Option<AnovaResult> {
 mod tests {
     use super::*;
     use crate::analytics::stats::golden_fixtures::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     // ─── Validation guards ───────────────────────────────────────────────────

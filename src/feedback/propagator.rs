@@ -4,6 +4,7 @@
 //! decay_synapses, apply_scars) to update the neural knowledge layer.
 //!
 //! All propagation goes through GraphStore — no raw Cypher here.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use crate::neo4j::traits::GraphStore;
 use crate::notes::models::{Note, NoteImportance, NoteType};
 
 use super::models::{ExplicitFeedback, FeedbackTarget, ImplicitSignal};
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 // ============================================================================
@@ -482,6 +484,7 @@ async fn handle_high_activation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[tokio::test]

@@ -7,6 +7,7 @@
 //! taken here yet; the signature, candidates, scorer and decision log come in
 //! later slices. Whatever the settings say, the resolver (`resolver.rs`) is
 //! unchanged until then.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod auto_models;
@@ -75,6 +76,7 @@ pub async fn load_routing(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[tokio::test]

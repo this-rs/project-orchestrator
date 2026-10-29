@@ -2,6 +2,7 @@
 //!
 //! When the composer generates a pipeline, the SkillInjector consults
 //! active skills and applies their modifications to the pipeline spec.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
@@ -633,6 +634,7 @@ impl Default for SkillInjector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::pipeline::composer::{compose_pipeline, PlanConstraint, PlanWave};
 

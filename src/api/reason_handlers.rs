@@ -5,6 +5,7 @@
 //! - `POST /api/reason/{tree_id}/feedback` — Provide feedback on a reasoning tree
 
 use crate::api::handlers::{AppError, OrchestratorState};
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::reasoning::models::ReasoningTreeConfig;
 use axum::{
@@ -392,6 +393,7 @@ pub async fn reason_feedback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use serde_json::json;
 

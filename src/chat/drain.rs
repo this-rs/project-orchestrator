@@ -4,6 +4,7 @@
 //! (from auto-continue, objective tracker, or concurrent user sends) are
 //! drained one at a time: each message is persisted, broadcast, then
 //! `stream_response` is called recursively to process it.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::manager::{ActiveSession, ChatManager};
@@ -388,6 +389,7 @@ fn pop_highest_priority(queue: &mut VecDeque<PendingMessage>) -> Option<PendingM
 mod tests {
     use super::*;
     use crate::chat::types::PendingMessage;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn user(content: &str) -> PendingMessage {
@@ -616,6 +618,7 @@ mod tests {
 #[cfg(test)]
 mod stop_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn q(items: Vec<PendingMessage>) -> VecDeque<PendingMessage> {

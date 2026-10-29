@@ -10,6 +10,7 @@
 //! Sync hooks keep the topology fresh for code that moves. This keeps it true for
 //! everything else, and costs nothing when nothing changed — the derivation is
 //! deterministic and writes through an upsert, so a no-change run is a no-op.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -130,7 +131,9 @@ mod tests {
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::WorkspaceNode;
     use crate::neo4j::traits::GraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use std::sync::Arc;
     use uuid::Uuid;

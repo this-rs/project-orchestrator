@@ -1,4 +1,5 @@
 //! Neo4j client and models for the knowledge graph
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub(crate) mod agent_execution;

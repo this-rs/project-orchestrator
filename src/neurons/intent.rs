@@ -3,6 +3,7 @@
 //! Detects query intent using lightweight heuristics (< 1ms, no LLM)
 //! to dynamically weight the spreading activation algorithm.
 //! Bilingual FR/EN support.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
@@ -125,6 +126,7 @@ impl IntentDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     // ── Debug queries (FR) ──────────────────────────────────────────

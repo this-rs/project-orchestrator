@@ -15,6 +15,7 @@
 //! GraphStore — so it runs with just the heartbeat's `graph` + `search`. The
 //! backfill self-gates (early-returns when every note already has synapses), so on
 //! a healthy graph this check costs almost nothing; on a depleted one it rebuilds.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::time::Duration;
@@ -96,6 +97,7 @@ impl HeartbeatCheck for SynapseReplenishCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

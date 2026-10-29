@@ -3,6 +3,7 @@
 //! Each plan run produces an ExecutionVector capturing 7 dimensions:
 //! trigger, timing, cost, quality, knowledge, drift, outcome.
 //! These vectors enable run-to-run comparison and predictive inference.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::runner::models::{PlanRunStatus, TriggerSource};
@@ -895,6 +896,7 @@ pub fn predict_run(vectors: &[ExecutionVector]) -> RunPrediction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn make_runner_state() -> crate::runner::RunnerState {

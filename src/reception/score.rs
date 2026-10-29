@@ -2,6 +2,7 @@
 //!
 //! Scores how relevant an incoming distilled lesson is to the local instance
 //! based on tag overlap, technology overlap, and source trust.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
@@ -111,6 +112,7 @@ mod tests {
         DistillationEnvelope, DistillationMeta, DistilledLesson, PortabilityLayer,
         SensitivityLevel, TrustProof,
     };
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use chrono::Utc;
     use std::collections::HashMap;

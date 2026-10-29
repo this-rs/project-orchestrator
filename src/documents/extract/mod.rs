@@ -19,6 +19,7 @@
 //! in the extracted text, so an alignment landing at byte 12 000 can be reported
 //! as "page 7" rather than as an offset nobody can act on. Formats without
 //! pagination leave it empty; that is information, not a gap.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod text;
@@ -274,6 +275,7 @@ impl Default for ExtractorRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

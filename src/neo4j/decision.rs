@@ -1,4 +1,5 @@
 //! Neo4j Decision operations
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
@@ -1013,6 +1014,7 @@ mod parent_existence_tests {
     use super::super::models::{DecisionNode, DecisionStatus};
     use super::super::traits::GraphStore;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use uuid::Uuid;
 
@@ -1089,6 +1091,7 @@ mod parent_existence_tests {
 #[cfg(test)]
 mod injection_tests {
     use super::safe_entity_label;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

@@ -2,6 +2,7 @@
 //!
 //! These types support the full distillation pipeline:
 //! collect -> abstract -> anonymize -> envelope -> package.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
@@ -375,6 +376,7 @@ pub struct DistillationEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

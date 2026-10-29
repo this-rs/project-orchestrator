@@ -7,6 +7,7 @@
 //! so a caller can snapshot them as JSON and read them back without loss; the
 //! trait is what the wiring depends on, and the in-memory implementation serves
 //! the tests of every caller until the graph-backed one is written.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
@@ -86,6 +87,7 @@ impl SegmentStore for InMemorySegmentStore {
 mod tests {
     use super::super::segment::{Dimension, Fingerprint, Observation, SegmentPolicy, Segmenter};
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn obs(turn: u32, prints: &[(Dimension, &[&str])]) -> Observation {

@@ -14,6 +14,7 @@
 //! * `none` — no credential.
 //!
 //! No value ever appears in an error: errors name the instance and what to do.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -107,6 +108,7 @@ impl CredentialResolver for VaultCredentialResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::vault::grants::{GrantScope, SecretSelector};
     use chrono::{Duration, Utc};

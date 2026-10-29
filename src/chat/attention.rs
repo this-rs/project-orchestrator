@@ -33,6 +33,7 @@
 //! read ([`AnalyticsStore::get_attention_events`]) does not even fetch it.
 //!
 //! [`AnalyticsStore::get_attention_events`]: crate::neo4j::traits::AnalyticsStore::get_attention_events
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, HashSet};
@@ -43,6 +44,7 @@ use uuid::Uuid;
 use crate::api::attention::{OrphanRequest, QuestionOption, RequestKind, WaitingRequest};
 use crate::chat::types::ChatEvent;
 use crate::neo4j::models::ChatEventRecord;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 /// Everything the derivation needs to know about one session, except its
@@ -369,6 +371,7 @@ fn question_text_and_options(questions: &serde_json::Value) -> (String, Vec<Ques
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use chrono::TimeZone;
     use serde_json::json;

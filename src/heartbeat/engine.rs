@@ -1,6 +1,7 @@
 //! HeartbeatEngine — scheduler that runs HeartbeatChecks at their configured intervals.
 //!
 //! Pattern follows ScheduleProvider: watch::channel shutdown, Arc<dyn GraphStore>, tracing logs.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -199,6 +200,7 @@ impl HeartbeatHandle {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use anyhow::Result;
     use async_trait::async_trait;

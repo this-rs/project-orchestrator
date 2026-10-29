@@ -5,6 +5,7 @@
 //! `SYNAPSE` edges between two notes of one project, and `SynapseShadowTrace`
 //! nodes. `SYNAPSE.weight` is read (as the starting value of a shadow weight)
 //! but never written; no edge is ever created or deleted.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use anyhow::{Context, Result};

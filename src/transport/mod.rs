@@ -1,4 +1,5 @@
 pub mod http;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 pub mod http_handlers;
 pub mod sync;

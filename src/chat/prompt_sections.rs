@@ -9,6 +9,7 @@
 //!
 //! Backward compatibility: at scaffolding level 0 without FSM, all 16 sections
 //! activate — producing output identical to the original monolith.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::fmt;
@@ -1978,6 +1979,7 @@ pub fn extract_tool_reference(tool_reference: &str, groups: &[ToolRefGroupId]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     /// The Claude Code needles are the sections' own text, and the `Agent` vocabulary
@@ -2176,6 +2178,7 @@ mod tests {
     /// `focal`, `lathe`, `capsule`, `repeat`, `torus` (frontend PRs #407/#408/#409).
     /// Re-copy it when the frontend's contract moves.
     mod iso_contract {
+        #[allow(unused_imports)]
         use crate::neo4j::traits::*;
         pub const SCENE_KEYS: &[&str] = &[
             "title",
@@ -2360,6 +2363,7 @@ mod tests {
     /// `assets`. A `scene3d` block may still carry a v1 payload (`version: "1"` — migration tier 2), which
     /// delegates to [`iso_scene_problems`]. The exact bounds are `scene3d_contract` (spec §3).
     mod scene3d_contract {
+        #[allow(unused_imports)]
         use crate::neo4j::traits::*;
         pub const V1_KEYS: &[&str] = &[
             "layout",

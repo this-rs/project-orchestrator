@@ -1,6 +1,7 @@
 //! API handlers for Analysis Profiles
 //!
 //! CRUD for analysis profiles that weight edge types for contextual analytics.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
@@ -179,6 +180,7 @@ pub async fn delete_analysis_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use serde_json::json;
 

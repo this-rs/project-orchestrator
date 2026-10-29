@@ -3,6 +3,7 @@
 //! CRUD for:
 //! - **Analysis profiles**: weight edge types for contextual analytics.
 //! - **User profiles**: adaptive behavioral profiles learned from implicit signals.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;

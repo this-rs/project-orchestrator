@@ -5,6 +5,7 @@
 //!
 //! Notes can be linked to code entities and automatically surfaced to agents
 //! based on relevance and graph propagation.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod coactivation;
@@ -51,6 +52,7 @@ pub use witness::{CodeRef, ExternalRef, Witness, WitnessKind, WitnessValidationE
 #[cfg(test)]
 mod current_knowledge_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]
@@ -184,6 +186,7 @@ pub mod provenance {
     mod tests {
         use super::*;
         use crate::neo4j::mock::MockGraphStore;
+        #[allow(unused_imports)]
         use crate::neo4j::traits::*;
 
         async fn session_of(graph: &MockGraphStore, model: &str) -> Uuid {

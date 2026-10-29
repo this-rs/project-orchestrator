@@ -1,4 +1,5 @@
 //! Meilisearch client for search operations
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::indexes::*;
@@ -640,6 +641,7 @@ impl MeiliClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

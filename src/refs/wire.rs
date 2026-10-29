@@ -1,5 +1,6 @@
 //! The bodies the frontend reads: search results, the `refs_resolved` event
 //! and the error body. Their JSON is pinned by `tests/fixtures/refs/*.json`.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
@@ -195,6 +196,7 @@ impl RefsErrorBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

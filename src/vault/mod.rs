@@ -16,6 +16,7 @@
 //! What it cannot do: stop an agent that holds a secret from sending it
 //! somewhere. A vault limits accidental exposure and bounds it in time and
 //! scope; it is not a sandbox.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod agent_cli;

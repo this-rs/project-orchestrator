@@ -52,6 +52,7 @@
 //! contaminated one, or a resume that the provider refuses all end the same way: a fresh
 //! session, exactly as before this module existed. A delegation never fails for want of a
 //! pool entry.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Mutex;
@@ -421,6 +422,7 @@ pub fn fingerprint<'a>(parts: impl IntoIterator<Item = Option<&'a str>>) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn key(provider: &str, model: &str) -> WarmKey {

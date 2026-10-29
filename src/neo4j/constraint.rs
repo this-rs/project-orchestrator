@@ -1,4 +1,5 @@
 //! Neo4j Constraint operations
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
@@ -228,6 +229,7 @@ mod parent_existence_tests {
     use super::super::models::{ConstraintNode, ConstraintType};
     use super::super::traits::GraphStore;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use uuid::Uuid;
 

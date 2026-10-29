@@ -16,6 +16,7 @@
 //! architecture of anything. See `manifest::classify_path_dependency` and the
 //! skip list in `manifest::read_project_manifests` for the filters that keep it
 //! honest.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::{BTreeMap, HashMap};
@@ -475,6 +476,7 @@ fn dedupe_edges(edges: &mut Vec<DerivedEdge>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use std::fs;
 

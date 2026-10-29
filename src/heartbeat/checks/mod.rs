@@ -3,6 +3,7 @@
 //! Each check runs at its own interval and operates on the shared GraphStore.
 //! Checks MUST NOT block the Axum server — they run in a separate tokio::spawn.
 //! Any check exceeding 5s is automatically skipped by the engine.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod architecture_drift;

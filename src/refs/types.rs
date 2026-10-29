@@ -1,4 +1,5 @@
 //! The wire shapes of a reference.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::fmt;
@@ -316,6 +317,7 @@ pub fn split_token(token: &str) -> Option<(char, RawRef)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn id() -> Uuid {

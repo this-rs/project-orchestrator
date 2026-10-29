@@ -35,6 +35,7 @@
 //! * The browser (Obscura, N23) is attached only if its executable is found AND an operator
 //!   authorised it for the project (`browser` document). Its stealth mode is never passed: this
 //!   module takes no argument for the browser.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,6 +61,7 @@ use sha2::Sha256;
 
 use super::endpoint_guard::{origin_of, validate_endpoint, EndpointPolicy};
 use super::settings::project_scope;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::vault::grants::Denied;
@@ -1718,6 +1720,7 @@ pub async fn attach(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::vault::grants::{GrantScope, SecretSelector};
     use chrono::Duration;

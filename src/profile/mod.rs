@@ -2,6 +2,7 @@
 //!
 //! The profile tracks aggregated behavioral metrics (never message content or code).
 //! Dimensions are updated via Exponential Moving Average (EMA) from implicit signals.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod aggregator;
@@ -128,6 +129,7 @@ pub struct WorksOnRelation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

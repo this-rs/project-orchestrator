@@ -11,6 +11,7 @@
 //! once a project has consented to its origin and credential reference. The
 //! security gate (A32) refuses to create one on a server running without
 //! authentication.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use axum::{
@@ -1561,6 +1562,7 @@ mod agent_surface_tests {
     //! The agent surface the MCP `provider` mega-tool calls: THE SAME answers as
     //! the person's settings routes (no second set of validations), plus the two
     //! grants an agent may not give itself.
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     use super::*;
@@ -2133,6 +2135,7 @@ mod agent_surface_tests {
 #[cfg(test)]
 mod listed_models_tests {
     use super::merge_listed_models;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn v(xs: &[&str]) -> Vec<String> {
@@ -2164,6 +2167,7 @@ mod listed_models_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};

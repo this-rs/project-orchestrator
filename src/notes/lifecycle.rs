@@ -2,6 +2,7 @@
 //!
 //! Handles automatic detection of note obsolescence during code sync,
 //! staleness calculation, and note status transitions.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::hashing::{hash_function_body, hash_function_signature, similarity_score};
@@ -903,6 +904,7 @@ pub struct AssertionVerificationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

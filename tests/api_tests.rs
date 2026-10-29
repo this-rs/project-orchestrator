@@ -2,6 +2,7 @@
 //!
 //! These tests require the full stack to be running.
 //! Run with: cargo test --test api_tests
+#[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
 
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};

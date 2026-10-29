@@ -1,4 +1,5 @@
 //! JSON-RPC 2.0 protocol types for MCP
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
@@ -254,6 +255,7 @@ impl ToolCallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

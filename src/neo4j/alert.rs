@@ -1,4 +1,5 @@
 //! Neo4j Alert operations (Heartbeat Engine)
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;

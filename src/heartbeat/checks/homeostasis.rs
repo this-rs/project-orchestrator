@@ -16,6 +16,7 @@
 //! we left off. When all notes are processed, the cursor resets.
 //!
 //! Creates alerts when corrective actions are taken.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
@@ -276,6 +277,7 @@ impl HeartbeatCheck for HomeostasisCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

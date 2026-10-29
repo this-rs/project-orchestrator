@@ -1,4 +1,5 @@
 //! Neo4j graph models representing code structure and plans
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::chat::provider::policy::SessionAccess;
@@ -3310,6 +3311,7 @@ pub struct McpToolNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     // ── FeatureGraphEntity enrichment ──
@@ -4243,6 +4245,7 @@ mod tests {
 #[cfg(test)]
 mod status_display_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     /// Regression: status Display must use snake_case (matching serde), not

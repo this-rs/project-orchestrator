@@ -2,6 +2,7 @@
 //! for candidates, keep what is in the requested scope **and** that the access
 //! policy lets this principal see, and shape the answer the golden fixture
 //! `tests/fixtures/refs/search_response.json` pins.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::VecDeque;
@@ -322,6 +323,7 @@ where
 mod tests {
     use super::*;
     use crate::neo4j::models::PlanNode;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
     use crate::refs::access::Disclosure;
@@ -829,6 +831,7 @@ mod tests {
 #[cfg(test)]
 mod fan_out_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::refs::resolvers::Candidates;
     use crate::refs::test_support::{user, world};
@@ -973,6 +976,7 @@ mod fan_out_tests {
 #[cfg(test)]
 mod pushdown_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::refs::test_support::{note_with, user, world};
 

@@ -8,6 +8,7 @@
 //! - Structured events are persisted in Neo4j with sequence numbers for replay
 //! - Inactive sessions are persisted in Neo4j with `cli_session_id` for resume
 //! - A cleanup task periodically closes timed-out sessions
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::config::ChatConfig;
@@ -44,6 +45,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::expand_tilde;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 mod recovery;
@@ -19231,6 +19233,7 @@ pub(crate) fn session_is_expired(
 #[cfg(test)]
 mod idle_expiry_tests {
     use super::{background_task_is_idle_dead, process_alive, session_is_expired};
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use std::time::Duration;
 
@@ -19683,6 +19686,7 @@ pub(crate) fn is_runner_spawned(spawned_by: Option<&str>) -> bool {
 #[cfg(test)]
 mod runner_spawn_tests {
     use super::is_runner_spawned;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]
@@ -19706,6 +19710,7 @@ mod runner_spawn_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     /// The review of #688 at 60a277e7 (finding D): a provider kind that does not
@@ -29300,6 +29305,7 @@ mod tests {
     mod activity {
         use super::super::{count_background_tasks, LiveSessionSnapshot};
         use crate::chat::types::{BackgroundTaskInfo, BackgroundTaskKind};
+        #[allow(unused_imports)]
         use crate::neo4j::traits::*;
         use uuid::Uuid;
 
@@ -36848,6 +36854,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod agent_env_tests {
     use super::server_secrets_to_hide;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]
@@ -36898,7 +36905,9 @@ mod refs_turn_services_tests {
         EnrichmentConfig, EnrichmentInput, EnrichmentPipeline, EnrichmentSource,
         ParallelEnrichmentStage, StageOutput,
     };
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::refs::types::{EntityRef, RefKind};
     use std::sync::Mutex as StdMutex;
@@ -36993,7 +37002,9 @@ mod auto_open_bounds_tests {
     use crate::chat::provider::resolver::REMOTE_PREFIX;
     use crate::chat::provider::settings::InstanceRecord;
     use crate::chat::types::RoutingPoolEntry;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn instance(id: &str, credential_ref: &str) -> InstanceRecord {
@@ -37336,6 +37347,7 @@ mod auto_open_bounds_tests {
 #[cfg(test)]
 mod agent_step_budget_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[tokio::test]
@@ -37373,6 +37385,7 @@ mod agent_step_budget_tests {
 mod held_context_tests {
     use super::*;
     use crate::chat::agent_runtime::{TurnOutcome, TurnServices};
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn test_config() -> ChatConfig {
@@ -37902,7 +37915,9 @@ mod image_turn_services_tests {
     use crate::chat::provider::cognitive::decision::{CognitiveDecision, DecideRequest, Decider};
     use crate::chat::provider::cognitive::scorer::PriorHints;
     use crate::chat::provider::cognitive::{LearningStage, ProviderRoutingMode, RoutingSettings};
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     struct Real;
@@ -38112,7 +38127,9 @@ mod grant_before_the_cli_tests {
     use super::super::session_grants::{cover, AskedCall, Asker, Cover, SessionGrants};
     use super::super::types::PermissionAnswerScope;
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     /// The call the session's pending `req-1` asks (`test_support`).
@@ -38318,6 +38335,7 @@ mod granted_answer_clock_tests {
     use super::super::session_grants::{AskedCall, Asker, SessionGrants};
     use super::super::tool_clock::ToolClock;
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use serde_json::json;
 

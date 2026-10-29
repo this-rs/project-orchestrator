@@ -9,6 +9,7 @@
 //! 3. Executes each hook's action in priority order
 //!
 //! Errors from individual hooks are logged but do **not** block subsequent hooks.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use crate::api::handlers::ServerState;
 use crate::events::{CrudEvent, EntityType};
 use crate::lifecycle::models::{LifecycleActionType, LifecycleHook, LifecycleScope};
 use crate::neo4j::models::{AlertNode, AlertSeverity};
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::notes::{Note, NoteImportance, NoteType};
 
@@ -347,7 +349,9 @@ mod tests {
     use crate::lifecycle::models::{LifecycleActionType, LifecycleHook, LifecycleScope};
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::GraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::orchestrator::Orchestrator;
 

@@ -7,6 +7,7 @@
 //! - Using directives (imports)
 //! - Namespace declarations
 //! - XML doc comments
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::neo4j::models::*;

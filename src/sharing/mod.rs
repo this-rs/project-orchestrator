@@ -3,6 +3,7 @@
 //! Provides the consent gate for the distillation pipeline,
 //! TTL management, tombstone verification, and P2P revocation
 //! broadcast utilities.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod consent_gate;

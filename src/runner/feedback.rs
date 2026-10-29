@@ -8,6 +8,7 @@
 //!
 //! All observations are stored as Notes of type `observation` with tag `runner-feedback`,
 //! linked to the ProtocolRun via PRODUCED_DURING.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use anyhow::Result;
@@ -583,6 +584,7 @@ pub fn contains_dissatisfaction(text: &str) -> Vec<&'static str> {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::protocol::models::ProtocolRun;
 

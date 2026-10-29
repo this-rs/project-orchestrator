@@ -23,6 +23,7 @@
 //! downstream — grounding a quote, highlighting a passage, mapping an
 //! extraction back to a line — rests on that property, so it is asserted
 //! directly in the tests rather than assumed.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
@@ -244,6 +245,7 @@ fn next_break_after(source: &str, from: usize, limit: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     /// The property everything else rests on.

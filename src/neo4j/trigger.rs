@@ -1,4 +1,5 @@
 //! Neo4j Trigger operations — trigger persistence and firing history
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;

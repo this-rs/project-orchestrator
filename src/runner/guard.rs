@@ -6,6 +6,7 @@
 //! - Task timeout (global time limit)
 //! - Compaction (re-inject task context after compaction)
 //! - AskUserQuestion (auto-respond for autonomous mode)
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::chat::compaction_context::CompactionContextBuilder;
@@ -481,6 +482,7 @@ fn hash_tool_call(tool: &str, input: &serde_json::Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

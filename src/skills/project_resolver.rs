@@ -16,6 +16,7 @@
 //! orchestrator`) while the CLI reports the real path as cwd. Plain string
 //! prefix matching then never matched ("no project matched" for every tool
 //! call in that project).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::neo4j::traits::GraphStore;
@@ -361,6 +362,7 @@ pub async fn resolve_project_from_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn make_entry(id: &str, slug: &str, root: &str) -> ResolvedProject {

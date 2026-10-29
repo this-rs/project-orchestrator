@@ -12,6 +12,7 @@
 //! `TIMEOUT_RETRY_BACKOFF`). Each run now handles the projects that are due,
 //! least-recently-maintained first, until [`SLICE_BUDGET`] is spent; the
 //! next run resumes with the rest.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
@@ -241,6 +242,7 @@ impl HeartbeatCheck for MaintenanceCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

@@ -13,12 +13,14 @@
 //! - Max 10 notes per materialization run
 //! - Max 50 auto-learned notes per project (checked before creation)
 //! - Semantic deduplication: skip if a note with cosine similarity > 0.85 exists
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use anyhow::Result;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::notes::models::{
@@ -322,6 +324,7 @@ async fn count_auto_learned_notes(graph: &dyn GraphStore, project_id: Uuid) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

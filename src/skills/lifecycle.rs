@@ -5,6 +5,7 @@
 //! - **Demotion**: Active → Dormant when energy drops or inactivity exceeds threshold
 //! - **Archival**: Dormant → Archived after prolonged inactivity
 //! - **Metrics**: Recalculates skill energy and cohesion from member notes/synapses
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
@@ -13,6 +14,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::skills::models::{SkillNode, SkillStatus};
 
@@ -738,6 +740,7 @@ pub async fn update_skill_lifecycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn make_skill(status: SkillStatus, energy: f64, cohesion: f64) -> SkillNode {

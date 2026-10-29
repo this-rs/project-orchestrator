@@ -4,6 +4,7 @@
 //! workspace next to a plan of the *same* project that has one, which one
 //! store cannot produce (a project belongs to one workspace or to none): the
 //! two items are therefore produced by two stores and compared one by one.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use super::test_support::{note_with, task_titled, user};
 use super::wire::RefSearchResponse;
 use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::models::{PlanNode, PlanStatus, TaskStatus};
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::notes::NoteType;

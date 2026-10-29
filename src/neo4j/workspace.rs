@@ -1,4 +1,5 @@
 //! Neo4j Workspace operations
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::client::{pascal_to_snake_case, status_variants, Neo4jClient};
@@ -1906,6 +1907,7 @@ impl Neo4jClient {
 #[cfg(test)]
 mod injection_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

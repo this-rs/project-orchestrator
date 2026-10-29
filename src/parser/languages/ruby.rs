@@ -5,6 +5,7 @@
 //! - Methods (instance and class)
 //! - Blocks and procs
 //! - Mixins (include/extend)
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::neo4j::models::*;

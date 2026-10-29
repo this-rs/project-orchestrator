@@ -6,6 +6,7 @@
 //! for the rs-stats behavior contract preserved here.
 //!
 //! Plan: `00f0ca9a-816f-4fcc-bc53-da88d595de34`, task R3.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 /// Arithmetic mean of `values`.
@@ -115,6 +116,7 @@ pub fn std_dev_sample(values: &[f64]) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::analytics::stats::golden_fixtures::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     // ─── mean ────────────────────────────────────────────────────────────────

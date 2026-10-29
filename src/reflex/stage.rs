@@ -2,6 +2,7 @@
 //!
 //! Runs after the biomimicry stage in the enrichment pipeline.
 //! Uses the ReflexEngine to generate suggestions based on the current context.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -147,6 +148,7 @@ fn extract_file_paths(message: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::chat::enrichment::{EnrichmentContext, ParallelEnrichmentStage};
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use std::collections::HashSet;
 

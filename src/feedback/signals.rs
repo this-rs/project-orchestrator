@@ -4,6 +4,7 @@
 //! - CrudEvents (TaskRestarted, PlanCompletedClean)
 //! - Git operations (CommitReverted — integration point for HeartbeatEngine)
 //! - Note access patterns (NoteHighActivation counter)
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
@@ -235,6 +236,7 @@ impl Default for ImplicitSignalDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use serde_json::json;
 

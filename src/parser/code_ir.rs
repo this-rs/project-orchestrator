@@ -10,6 +10,7 @@
 //!   `TreeCursor` walk pattern as [`crate::parser::helpers::calculate_complexity`].
 //! - [`build_code_ir`] normalizes [`ParsedFile`] + flow nodes into [`CodeIr`] (7 primitives),
 //!   folding the language-specific tree-sitter node kinds onto one canonical vocabulary.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::neo4j::models::FunctionNode;
@@ -553,6 +554,7 @@ impl IdCounter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::parser::CodeParser;
 

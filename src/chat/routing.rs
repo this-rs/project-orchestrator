@@ -25,6 +25,7 @@
 //! (scaffolding +     (neural weights +
 //!  intent rules)      learned preferences)
 //! ```
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use serde::Serialize;
@@ -603,6 +604,7 @@ impl RoutingProvider for DualTrackRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

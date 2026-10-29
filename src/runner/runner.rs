@@ -2,6 +2,7 @@
 //!
 //! Orchestrates: get_next_task → spawn agent → monitor → verify → update_status → next.
 //! The Runner owns task status transitions — agents update step statuses in real-time via MCP.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::chat::manager::ChatManager;
@@ -29,6 +30,7 @@ use crate::runner::state::{AttemptCost, BudgetBreach, RunBudget, RunnerState};
 use crate::runner::vector::VectorCollector;
 use crate::runner::verifier::TaskVerifier;
 
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -5886,6 +5888,7 @@ impl Clone for PlanRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::runner::models::TriggerSource;
 

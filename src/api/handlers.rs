@@ -1,4 +1,5 @@
 //! API request handlers
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::api::{
@@ -19,6 +20,7 @@ use crate::neo4j::plan::{compute_file_conflicts, WaveComputationResult};
 
 use crate::neo4j::StoreCapabilities;
 
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::plan::models::*;
@@ -12746,6 +12748,7 @@ pub(crate) mod tests {
 mod retry_plan_task_tests {
     use super::*;
     use crate::neo4j::models::TaskStatus;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
     use crate::orchestrator::{FileWatcher, Orchestrator};
@@ -13333,6 +13336,7 @@ mod retry_plan_task_tests {
 #[cfg(test)]
 mod fabric_emit_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]
@@ -13373,6 +13377,7 @@ fn transport_label(state: Option<crate::events::TransportState>) -> &'static str
 mod transport_label_tests {
     use super::transport_label;
     use crate::events::TransportState;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

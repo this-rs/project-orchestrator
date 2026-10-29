@@ -11,6 +11,7 @@
 //! worker), inside a dedicated and BOUNDED rayon pool, so the analytics can never take
 //! more than `ANALYTICS_THREADS` cores (default: a quarter of them, at least 2) and the
 //! rest of the server keeps running.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use anyhow::{anyhow, Result};
@@ -63,6 +64,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

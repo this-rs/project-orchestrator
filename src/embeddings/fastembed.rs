@@ -11,6 +11,7 @@
 //!
 //! Default model: `MultilingualE5Base` (768d, multilingual FR/EN/100+ languages)
 //! which matches the existing Neo4j vector index (768d, cosine).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::traits::EmbeddingProvider;
@@ -275,6 +276,7 @@ impl EmbeddingProvider for FastEmbedProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

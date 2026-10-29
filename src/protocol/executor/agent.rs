@@ -11,6 +11,7 @@
 //! - The agent calls `protocol(action: "transition", ...)` which is intercepted.
 //!
 //! If neither is found, falls back to outgoing transition heuristics.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::system::SystemExecutor;
@@ -639,6 +640,7 @@ impl Executor for AgentExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

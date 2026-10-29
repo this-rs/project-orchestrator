@@ -10,6 +10,7 @@
 //! | `bypassPermissions` | `trust` |
 //!
 //! The table mirrors the nexus Claude Code adapter (contract §6).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use nexus_claude::agent::{PolicyMode, ToolPolicy};
@@ -315,6 +316,7 @@ pub fn enforceable_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use nexus_claude::agent::{PolicyDecision, ToolCategory};
 

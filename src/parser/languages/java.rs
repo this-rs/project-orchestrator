@@ -7,6 +7,7 @@
 //! - Annotations
 //! - Generics
 //! - JavaDoc comments
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::neo4j::models::*;

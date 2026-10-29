@@ -53,6 +53,7 @@
 //! it is neither trusted nor echoed. Only the machine-readable `code`/`type` is
 //! matched, against a table, and only a code the table knows is ever repeated in
 //! the reason.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::time::Duration;
@@ -645,6 +646,7 @@ mod tests {
     use crate::chat::provider::settings::{
         InstanceScope, RateLimit, RateLimitKind, RateLimitScope, RateLimitUnit, RateLimitWindow,
     };
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn at(text: &str) -> DateTime<Utc> {

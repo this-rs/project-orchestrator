@@ -6,6 +6,7 @@
 //! - Open → HalfOpen: after a cooldown period.
 //! - HalfOpen → Closed: if the next call succeeds.
 //! - HalfOpen → Open: if the next call fails.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
@@ -178,6 +179,7 @@ impl Default for CircuitBreaker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

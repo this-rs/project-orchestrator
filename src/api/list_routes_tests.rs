@@ -5,6 +5,7 @@
 //! Fixture: two workspaces (`ws-a`, `ws-b`), one project each, with one item
 //! of every kind per project, so a workspace filter that is ignored (or a
 //! default that is not "all workspaces") makes an assertion fail.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::api::handlers::ServerState;
@@ -12,6 +13,7 @@ use crate::api::routes::create_router;
 use crate::events::EventBus;
 use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::models::*;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::notes::{Note, NoteImportance, NoteScope, NoteStatus, NoteType};

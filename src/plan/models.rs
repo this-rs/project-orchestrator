@@ -1,4 +1,5 @@
 //! Plan-related models and DTOs
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::neo4j::models::{
@@ -504,6 +505,7 @@ impl ConstraintNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     // =========================================================================

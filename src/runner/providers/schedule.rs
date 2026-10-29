@@ -6,6 +6,7 @@
 //! (so a tick that drifts or lands late misses no minute). A trigger due in one
 //! of those minutes goes to the `TriggerDispatcher` with that minute as its
 //! signal key: every instance reserves the same key, one run starts.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::TriggerProvider;
@@ -286,6 +287,7 @@ fn field_matches(field: &str, value: u32, min: u32, max: u32) -> Option<bool> {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::runner::dispatch::tests::{runnable_plan, trigger_of, RecordingStarter};
     use crate::runner::trigger::TriggerEngine;

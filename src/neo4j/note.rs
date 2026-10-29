@@ -1,4 +1,5 @@
 //! Neo4j Knowledge Note operations
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::client::{Neo4jClient, WhereBuilder, WhereParam};
@@ -3894,6 +3895,7 @@ impl Neo4jClient {
 
 #[cfg(test)]
 mod staleness_parity_tests {
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::notes::models::{Note, NoteType};
 
@@ -3936,6 +3938,7 @@ mod staleness_parity_tests {
 #[cfg(test)]
 mod injection_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     const PAYLOADS: &[&str] = &[
@@ -4015,6 +4018,7 @@ mod injection_tests {
 #[cfg(test)]
 mod synapse_param_tests {
     use super::synapse_bind_params;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use uuid::Uuid;
 
@@ -4040,6 +4044,7 @@ mod project_param_tests {
     //! string is a third state that reads back as `None` but that every
     //! `IS NULL` predicate misses, which is how 3 319 notes ended up stranded.
     use super::note_project_param;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use uuid::Uuid;
 

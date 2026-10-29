@@ -1,4 +1,5 @@
 //! Orchestrator module for coordinating agents
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod context;
@@ -64,6 +65,7 @@ pub fn should_ignore_path(path_str: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

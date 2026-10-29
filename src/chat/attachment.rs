@@ -32,6 +32,7 @@
 //!
 //! After a RESUME of a run, old sessions keep the OLD `run_id` and new ones
 //! carry the NEW one, with the same `plan_id`: the thread stays the plan's.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -46,6 +47,7 @@ use crate::api::attention::{
 use crate::chat::attention::{derive_attention, SessionAttentionInput};
 use crate::neo4j::models::{ChatEventRecord, ChatSessionNode, SessionLinkKind, SessionLinkRow};
 use crate::neo4j::traits::GraphStore;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 /// `spawned_by` types that denote a PLAN run (the `run_id` is a plan run's).
@@ -309,6 +311,7 @@ mod tests {
     use super::*;
     use crate::api::attention::RequestKind;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::test_helpers::test_chat_session;
     use std::sync::atomic::Ordering;

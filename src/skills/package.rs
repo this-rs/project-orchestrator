@@ -15,6 +15,7 @@
 //!   "decisions": [ ... ]
 //! }
 //! ```
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use anyhow::{anyhow, Context, Result};
@@ -648,6 +649,7 @@ pub fn validate_package(package: &SkillPackage) -> Result<(), Vec<PackageValidat
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::skills::models::SkillTrigger;
 

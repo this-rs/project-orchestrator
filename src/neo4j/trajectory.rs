@@ -3,6 +3,7 @@
 //! It keeps its own connection pool, so everything that depends on the driver
 //! lives here rather than in the composition root: the adapter owns its
 //! connections and the schema it needs.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;

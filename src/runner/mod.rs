@@ -16,6 +16,7 @@
 //! ├── dispatch.rs  — TriggerDispatcher: a firing trigger starts a plan run
 //! └── providers/   — trigger providers (schedule, webhook, event)
 //! ```
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod dispatch;

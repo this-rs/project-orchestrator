@@ -5,6 +5,7 @@
 //! `secret_ref: "vault:<nom>"`, résolue dans le coffre au moment de la réception
 //! (grant de portée `Provider("trigger:<id>")`, voir `api::vault_handlers`). Une clé
 //! `secret` en clair est refusée à la création et ignorée à la réception.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::runner::{Trigger, TriggerType};
@@ -183,6 +184,7 @@ pub fn sanitize_delivery_id(raw: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use serde_json::json;
 

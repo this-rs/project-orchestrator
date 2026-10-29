@@ -7,6 +7,7 @@
 //! This module is **independent** from the existing PageRank-weighted
 //! propagation in `get_context_notes`. Both systems coexist during
 //! Phase 3 (dual-run comparison).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod activation;

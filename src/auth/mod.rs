@@ -6,6 +6,7 @@
 //! - Legacy Google OAuth2 client (`google` submodule) — deprecated, use `oidc` instead
 //! - Axum middleware for route protection (`middleware` submodule)
 //! - AuthUser extractor for handlers (`extractor` submodule)
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod agent_tokens;

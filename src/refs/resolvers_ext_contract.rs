@@ -2,6 +2,7 @@
 //! found with its scope, it is refused outside the session's project, an
 //! unknown id reads `not_found`, and the picker finds it by a fragment of its
 //! name. The sensitive kinds get their own refusals.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use super::test_support::{user, world, World};
 use super::types::{EntityRef, RefId, RefKind};
 use super::wire::RefStatus;
 use crate::neo4j::models::{FileNode, PersonaNode};
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::skills::SkillNode;

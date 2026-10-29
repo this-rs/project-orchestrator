@@ -5,6 +5,7 @@
 //! enrichment output.
 //!
 //! Enabled by default. Disable with `ENRICHMENT_PERSONA=false`.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use crate::chat::enrichment::{
     EnrichmentConfig, EnrichmentInput, ParallelEnrichmentStage, StageOutput,
 };
 use crate::neo4j::traits::GraphStore;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 /// Enrichment stage that activates the best-matching persona for files
@@ -169,7 +171,9 @@ mod tests {
     use crate::chat::enrichment::ParallelEnrichmentStage;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{PersonaNode, PersonaStatus};
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use uuid::Uuid;
 

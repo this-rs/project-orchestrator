@@ -19,6 +19,7 @@
 //! Storage is local disk, not object storage: PO is self-hosted, and a remote
 //! bucket would add an operational dependency for no capability this layer
 //! needs.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::fs;
@@ -379,6 +380,7 @@ fn validate_digest(sha256: &str) -> Result<&str, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use tempfile::TempDir;
 

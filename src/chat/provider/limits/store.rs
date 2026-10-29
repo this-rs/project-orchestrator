@@ -10,6 +10,7 @@
 //! file) and [`FileStore`] (one JSON object, rewritten atomically). The trait is
 //! deliberately tiny and synchronous: a save is a few hundred bytes, and the
 //! ledger never holds its lock across it longer than the write itself.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
@@ -116,6 +117,7 @@ impl LedgerStore for FileStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn scratch(name: &str) -> PathBuf {

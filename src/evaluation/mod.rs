@@ -18,6 +18,7 @@
 //! English case under the same `pair` id: the share of pairs on which the
 //! classifier gives the same answer (the same metamorphic idea as
 //! `tests/routing_metamorphic.rs`, but on labelled data).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod classifiers;
@@ -232,6 +233,7 @@ pub fn run_embedded() -> Result<Vec<ClassifierScore>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn case(id: &str, lang: &str, pair: Option<&str>, label: &str) -> Case {

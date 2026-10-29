@@ -17,6 +17,7 @@
 //!
 //! Both assertions name the offending tools explicitly, so a failure is actionable
 //! without reading the test.
+#[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
 
 use std::collections::BTreeSet;

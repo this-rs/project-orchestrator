@@ -10,6 +10,7 @@
 //! - `HttpEmbeddingProvider`: optional implementation using any OpenAI-compatible
 //!   `/v1/embeddings` API (Ollama, OpenAI, LiteLLM, vLLM, etc.)
 //! - `MockEmbeddingProvider`: deterministic mock for tests
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 #[cfg(feature = "local-embeddings")]

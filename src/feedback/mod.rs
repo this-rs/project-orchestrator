@@ -7,6 +7,7 @@
 //!
 //! The OutcomeTracker works standalone (explicit feedback API) even if other
 //! subsystems (HeartbeatEngine, NeuralFeedback) are not deployed.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod handlers;

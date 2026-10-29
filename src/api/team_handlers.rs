@@ -6,6 +6,7 @@
 //! another session, nor reach a session outside its own team (its parent and its
 //! children, `chat::team::team_of`). A person has the chat itself: these routes answer
 //! an agent only.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use axum::{extract::State, Json};
@@ -196,6 +197,7 @@ pub async fn get_team(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn req(kind: Option<&str>) -> TeamMessageRequest {

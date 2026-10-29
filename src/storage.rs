@@ -4,6 +4,7 @@
 //! asks this module for a [`StorageBackend`], selected by configuration
 //! (`storage.backend`). This module is the only place in the repository allowed
 //! to call `Neo4jClient::new` and `MeiliClient::new`.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -102,6 +103,7 @@ impl StorageBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

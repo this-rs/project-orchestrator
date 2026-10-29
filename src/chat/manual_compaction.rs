@@ -13,6 +13,7 @@
 //!
 //! While a turn runs, `/compact` is refused (`turn_in_progress`, the nexus code): it is
 //! never queued behind the turn nor allowed to interrupt it.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use nexus_claude::agent::{CompactOutcome, ProviderError};
@@ -109,6 +110,7 @@ pub(crate) fn refusal_event(error: &ProviderError) -> ChatEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

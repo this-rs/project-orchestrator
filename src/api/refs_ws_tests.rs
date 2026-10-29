@@ -2,6 +2,7 @@
 //! real client, the real handler. Each test fails if the handler stops
 //! folding `refs` into the message, stops announcing the capability, or stops
 //! refusing a malformed list with the `refs_invalid` frame.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use uuid::Uuid;
 
 use crate::chat::manager::{test_support, ChatManager};
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::refs::test_support::{task_titled, world};

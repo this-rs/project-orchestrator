@@ -15,6 +15,7 @@
 //! and `audit-variance-semantic.md` for why both conventions co-exist.
 //!
 //! Plan: `00f0ca9a-816f-4fcc-bc53-da88d595de34`, task R4.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use statrs::distribution::{ContinuousCDF, StudentsT};
@@ -181,6 +182,7 @@ pub fn two_sample_t_test(a: &[f64], b: &[f64], assume_equal_variance: bool) -> O
 mod tests {
     use super::*;
     use crate::analytics::stats::golden_fixtures::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     // ─── two_tailed_p_value ──────────────────────────────────────────────────

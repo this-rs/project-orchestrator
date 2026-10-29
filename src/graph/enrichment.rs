@@ -8,6 +8,7 @@
 //! - [`NoopCommunityEnricher`] — returns labels unchanged (default, no LLM)
 //! - [`LlmCommunityEnricher`] — batches communities (5 per prompt) and calls
 //!   an OpenAI-compatible LLM endpoint. Falls back to heuristic on failure.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use anyhow::Result;
@@ -284,6 +285,7 @@ impl CommunityEnricher for LlmCommunityEnricher {
 mod tests {
     use super::*;
     use crate::graph::models::{CodeNode, CodeNodeType};
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn make_test_communities() -> (Vec<CommunityInfo>, CodeGraph, HashMap<String, NodeMetrics>) {

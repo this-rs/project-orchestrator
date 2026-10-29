@@ -13,6 +13,7 @@
 //!   default 2).
 //! * **A deadline** (`ANALYTICS_RUN_DEADLINE_SECS`, default 30 min): a pass that exceeds
 //!   it is abandoned with an error, its slot freed.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::engine::{AnalyticsEngine, ProjectAnalytics};
@@ -185,6 +186,7 @@ impl Cooldown {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

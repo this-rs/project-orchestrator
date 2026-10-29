@@ -41,6 +41,7 @@
 //! The functions are pure. The nonce is random per container
 //! ([`wrap_random`]) or supplied by the caller ([`wrap`]), so tests are
 //! deterministic ([`nonce_from_seed`]).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use sha2::{Digest, Sha256};
@@ -385,6 +386,7 @@ pub(crate) fn assert_payload_contained(text: &str, marker: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use proptest::prelude::*;
 
@@ -551,6 +553,7 @@ mod tests {
 #[cfg(test)]
 mod attr_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

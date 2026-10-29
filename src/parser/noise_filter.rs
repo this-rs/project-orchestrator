@@ -2,6 +2,7 @@
 //!
 //! Filters out common built-in function names across all supported languages
 //! to prevent polluting the call graph with noise (e.g., console.log, print, malloc).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashSet;
@@ -877,6 +878,7 @@ pub fn is_builtin_call(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

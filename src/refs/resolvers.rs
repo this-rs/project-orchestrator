@@ -23,6 +23,7 @@
 //! [`SCAN_CAP`] rows. The price is stated, not hidden: a task or decision older
 //! than the newest `SCAN_CAP` of its scope is not suggested by *text*; it can
 //! still be referenced by id or by dropping it, and it always resolves.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
@@ -37,6 +38,7 @@ use super::label;
 use super::types::{EntityRef, RefId, RefKind};
 use super::wire::ScopeLabel;
 use crate::neo4j::models::{DecisionNode, DecisionStatus, PlanNode, TaskWithPlan};
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::notes::{Note, NoteFilters, NoteType};
@@ -706,6 +708,7 @@ impl RefSource for GraphRefSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::refs::access::{AccessPolicy, Disclosure, Resolution};
     use crate::refs::test_support::{note_with, task_titled, user, world, Spy, World};

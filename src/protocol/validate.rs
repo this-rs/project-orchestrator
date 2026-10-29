@@ -12,6 +12,7 @@
 //! 3. **Reachability**: All states must be reachable from the start state (BFS on graph).
 //!
 //! The validator handles cycles (reprises, OnFailureStrategy) correctly via BFS.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -177,6 +178,7 @@ pub fn validate_protocol_structure<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn state(name: &str, state_type: StateType) -> ValidatableState<'_> {
@@ -336,6 +338,7 @@ mod tests {
 #[cfg(test)]
 mod real_graph {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     /// Validate ALL stored protocols against the real Neo4j graph.

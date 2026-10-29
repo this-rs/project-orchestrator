@@ -2,6 +2,7 @@
 //!
 //! These models define the data structures for the closed-loop learning system.
 //! ExplicitFeedback captures user ratings; ImplicitSignal captures system-detected events.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
@@ -338,6 +339,7 @@ impl Default for LearningStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

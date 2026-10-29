@@ -1,6 +1,7 @@
 //! Project Orchestrator - CLI Tool
 //!
 //! Command-line interface for interacting with the orchestrator.
+#[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
 
 use anyhow::Result;

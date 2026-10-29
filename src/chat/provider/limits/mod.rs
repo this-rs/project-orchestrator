@@ -23,6 +23,7 @@
 //! after it belongs to the chat path, and lands with the slice that wires it —
 //! this module exposes exactly what that slice needs ([`Ledger::try_reserve`],
 //! [`Ledger::settle`], [`Ledger::standing`]) without touching it today.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod classify;
@@ -58,6 +59,7 @@ mod tests {
     use crate::chat::provider::settings::{
         InstanceRecord, RateLimitScope, RateLimitStatus, RateLimitUnit, RateLimitWindow,
     };
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn record(limits: Vec<crate::chat::provider::settings::RateLimit>) -> InstanceRecord {

@@ -1,11 +1,13 @@
 //! Tests of the synaptic shadow layer. Every clock is injected (`now`
 //! parameters, paused tokio time): no test waits on the wall clock.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::*;
 use crate::chat::anchor::{AnchorActor, AnchorOp, NewAnchor};
 use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::models::TaskStatus;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::notes::{Note, NoteType};
 use chrono::TimeZone;

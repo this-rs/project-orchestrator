@@ -3,6 +3,7 @@
 //! Maintains per-peer trust scores that combine local observations with
 //! network-propagated trust, using an EigenTrust-inspired formula:
 //! `global_trust = α × local_trust + (1 - α) × network_trust`
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
@@ -167,6 +168,7 @@ impl TrustManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

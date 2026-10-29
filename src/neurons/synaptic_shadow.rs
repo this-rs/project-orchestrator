@@ -34,6 +34,7 @@
 //!   3 hops, tokens first, 10 % deterministic exploration).
 //! - [`SynapseShadowTrace`]: the versioned journal entry, with a fingerprint of
 //!   every weight the expansion read.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::cmp::Ordering;

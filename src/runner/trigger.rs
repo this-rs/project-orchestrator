@@ -2,6 +2,7 @@
 //!
 //! The engine checks the guards (enabled, cooldown, no active run) and records
 //! firings in Neo4j. `runner::dispatch::TriggerDispatcher` starts the run.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::neo4j::traits::GraphStore;
@@ -187,6 +188,7 @@ impl TriggerEngine {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn make_trigger(plan_id: Uuid, enabled: bool, cooldown_secs: u64) -> Trigger {

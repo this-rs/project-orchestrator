@@ -5,6 +5,7 @@
 //! scope and key, see `GraphStore::get_llm_setting`). Nothing here reads a
 //! secret: an instance carries a credential REFERENCE, never a value, and a
 //! body that names a secret field is refused outright.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::BTreeMap;
@@ -1758,6 +1759,7 @@ pub fn validate_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     /// CTX5: an `anthropic` instance runs the native harness on the Messages API. Its base

@@ -3,6 +3,7 @@
 //! Exports a skill and its members as a portable [`SkillPackage`] that can
 //! be imported into another project. Internal IDs are stripped — they are
 //! regenerated on import.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use anyhow::{Context, Result};
@@ -11,6 +12,7 @@ use uuid::Uuid;
 
 use crate::identity::InstanceIdentity;
 use crate::neo4j::traits::GraphStore;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::protocol::models::RunStatus;
 use crate::skills::models::TriggerType;
@@ -348,6 +350,7 @@ fn sanitize_paths(content: &str, project_root: Option<&str>) -> String {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[tokio::test]

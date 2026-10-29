@@ -3,6 +3,7 @@
 //! The trait is what the scorer, the feedback and the report depend on. The
 //! in-memory implementation serves the tests of every caller; the Neo4j one
 //! (`(:RoutingArm)`, `(:RoutingDecision)`) is written with the scorer.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
@@ -295,6 +296,7 @@ impl RoutingArmStore for InMemoryRoutingStore {
 #[cfg(test)]
 mod forgetting_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn key() -> ArmKey {
@@ -378,6 +380,7 @@ mod tests {
     use crate::chat::provider::cognitive::decision::Pick;
     use crate::chat::provider::cognitive::mode::{LearningStage, ProviderRoutingMode};
     use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn decision(project: &str, at_offset_s: i64) -> CognitiveDecision {

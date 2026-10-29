@@ -1,4 +1,5 @@
 //! API handlers for EventTriggers
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
@@ -291,6 +292,7 @@ mod tests {
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::events::EventBus;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::mock_app_state;

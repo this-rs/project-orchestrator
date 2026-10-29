@@ -4,6 +4,7 @@
 //! - Loops (same error seen N+ times)
 //! - Regressions (a test that was passing now fails)
 //! - Stagnation (no progress over K iterations)
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -298,6 +299,7 @@ impl RegressionDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use chrono::Utc;
 

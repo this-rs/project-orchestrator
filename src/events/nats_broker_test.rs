@@ -3,6 +3,7 @@
 //! loopback port. Enough for `async_nats` publish, subscribe and request/reply,
 //! so the cross-instance paths of the chat run against a real client without a
 //! `nats-server` on the machine.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
@@ -214,6 +215,7 @@ async fn serve(socket: tokio::net::TcpStream, conn: u64, port: u16, state: Arc<M
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use futures::StreamExt;
 

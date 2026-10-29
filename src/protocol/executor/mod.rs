@@ -9,6 +9,7 @@
 //!
 //! The runner loop ([`super::runner`]) selects the appropriate executor
 //! based on the protocol's `protocol_category`.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod agent;

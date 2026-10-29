@@ -3,6 +3,7 @@
 //! Searches episodic memory for past episodes semantically similar to
 //! the current context. Uses cosine similarity on embeddings when available,
 //! falls back gracefully to empty results.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use tracing::debug;
@@ -81,6 +82,7 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

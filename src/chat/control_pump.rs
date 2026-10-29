@@ -41,6 +41,7 @@
 //! here. Should the forward channel ever fill, the pump blocks on it and hook
 //! answering stalls with it; at 8192 entries that takes an implausible idle
 //! backlog, and it is logged.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
@@ -189,6 +190,7 @@ async fn answer_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use nexus_claude::{HookContext, HookInput, HookJSONOutput, SdkError, SyncHookJSONOutput};
     use std::sync::atomic::{AtomicUsize, Ordering};

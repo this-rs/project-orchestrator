@@ -3,12 +3,14 @@
 //! After a code sync, this hook runs `check_topology_rules()` and auto-creates
 //! gotcha notes for newly detected violations. Existing violations (already
 //! captured as notes) are skipped to avoid duplicates.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::graph::models::TopologySeverity;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::notes::models::{Note, NoteFilters, NoteImportance, NoteType};
@@ -179,7 +181,9 @@ mod tests {
         TopologyRule, TopologyRuleType, TopologySeverity, TopologyViolation,
     };
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[tokio::test]

@@ -30,6 +30,7 @@
 //! number of files.
 //!
 //! [`CrudEvent`]: super::types::CrudEvent
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -315,6 +316,7 @@ impl IngestionReporter {
 mod tests {
     use super::*;
     use crate::events::{CrudAction, CrudEvent, EventBus, HybridEmitter};
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn reporter(

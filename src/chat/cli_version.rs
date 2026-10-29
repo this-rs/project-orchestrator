@@ -2,6 +2,7 @@
 //!
 //! Uses the Nexus SDK's `find_claude_cli`, `get_cli_version`, `check_latest_npm_version`,
 //! and `download_cli` functions to provide a unified CLI management service.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use nexus_claude::{
@@ -419,6 +420,7 @@ impl ClaudeCliProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

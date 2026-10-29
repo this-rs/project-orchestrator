@@ -2,6 +2,7 @@
 //!
 //! Implements all CRUD, relation management, and subgraph assembly
 //! for the Living Personas system on the Neo4j graph.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
@@ -2255,6 +2256,7 @@ mod tests {
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::*;
     use crate::neo4j::traits::GraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use chrono::Utc;
     use uuid::Uuid;

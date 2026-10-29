@@ -1,4 +1,5 @@
 //! API handlers for Neural Skills
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
@@ -1218,6 +1219,7 @@ pub async fn search_skills(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

@@ -10,6 +10,7 @@
 //! invalidates every agent token — which is correct, since a restart also kills
 //! every agent subprocess that held one (they are children of the server and
 //! each resume mints a fresh token).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, HashSet};
@@ -233,6 +234,7 @@ pub fn minted_for(session_id: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

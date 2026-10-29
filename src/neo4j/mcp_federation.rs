@@ -3,6 +3,7 @@
 //! Stores external MCP server registrations and their discovered tools
 //! in the knowledge graph, enabling relationship tracking (EXPOSES,
 //! SIMILAR_TO, CO_ACTIVATED_WITH, OFTEN_FOLLOWS).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use anyhow::Result;

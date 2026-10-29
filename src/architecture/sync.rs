@@ -9,6 +9,7 @@
 //! derived, and may add what nobody recorded, but it never overwrites what a
 //! person wrote. Descriptions and tags already present are left alone, and
 //! components nobody derived are left in place.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::path::PathBuf;
@@ -176,6 +177,7 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{ComponentType, ProjectNode, WorkspaceNode};
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn temp_root(tag: &str) -> PathBuf {

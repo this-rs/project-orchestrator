@@ -12,6 +12,7 @@
 //! - `EMBEDDING_MODEL` (default: `nomic-embed-text`)
 //! - `EMBEDDING_API_KEY` (optional, for OpenAI/Voyage)
 //! - `EMBEDDING_DIMENSIONS` (default: `768`)
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::traits::EmbeddingProvider;
@@ -235,6 +236,7 @@ impl EmbeddingProvider for HttpEmbeddingProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     /// Combined test for env-based configuration to avoid race conditions.

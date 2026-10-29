@@ -1,4 +1,5 @@
 //! Neo4j persistence for the Skill Registry (PublishedSkill nodes)
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use anyhow::{Context, Result};

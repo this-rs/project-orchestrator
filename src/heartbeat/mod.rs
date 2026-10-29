@@ -4,6 +4,7 @@
 //! Each check implements `HeartbeatCheck` with its own interval.
 //! The engine evaluates all checks in a single tokio loop,
 //! respecting individual intervals and a 5s timeout per check.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod checks;

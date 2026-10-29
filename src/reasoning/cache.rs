@@ -9,6 +9,7 @@
 //!
 //! Uses `tokio::sync::RwLock<LruCache>` for concurrent access.
 //! Read-heavy workload (many cache lookups, rare inserts).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::num::NonZeroUsize;
@@ -295,6 +296,7 @@ impl Default for ReasoningTreeCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn make_tree(request: &str, project_id: Option<Uuid>) -> ReasoningTree {

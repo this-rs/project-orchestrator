@@ -3,6 +3,7 @@
 //! Runs `decay_synapses` to weaken unused neural links,
 //! then `update_energy_scores` to decay note energy based on
 //! time since last activation (exponential half-life model).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::time::Duration;
@@ -101,6 +102,7 @@ impl HeartbeatCheck for SynapseDecayCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

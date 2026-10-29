@@ -6,6 +6,7 @@
 //!
 //! Rule: completed tasks are skipped, blocked tasks are skipped (with a
 //! warning), everything else (pending, in_progress, failed) is (re)run.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::api::attention::{
@@ -160,6 +161,7 @@ pub async fn current_runner_state(
 mod tests {
     use super::*;
     use crate::neo4j::plan::Wave;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::runner::models::TriggerSource;
 

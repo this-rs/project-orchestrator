@@ -15,6 +15,7 @@
 //! | Activation (normalized) | 0.20   | SkillNode.activation_count    |
 //! | Success rate            | 0.30   | Protocol runs or hit_rate     |
 //! | Source projects count   | 0.10   | ExecutionHistory or 1         |
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
@@ -190,6 +191,7 @@ fn normalize_count(value: f64, half_life: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use uuid::Uuid;
 

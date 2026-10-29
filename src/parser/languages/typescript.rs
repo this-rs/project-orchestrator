@@ -7,6 +7,7 @@
 //! - Parameters with types
 //! - JSDoc comments
 //! - Decorators
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::neo4j::models::*;

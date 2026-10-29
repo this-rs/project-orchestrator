@@ -11,6 +11,7 @@
 //! is reserved by the `po-autonomic` entry of `docs/diagrams/INDEX.yml`: a new
 //! file there would be a source file no *verified* diagram could own without a
 //! shared-ownership collision.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::time::Duration;
@@ -63,6 +64,7 @@ impl HeartbeatCheck for ClassifierBenchCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

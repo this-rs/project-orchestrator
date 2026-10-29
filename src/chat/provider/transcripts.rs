@@ -54,6 +54,7 @@
 //! [`default_root`] moves the transcripts of that earlier location
 //! ([`migrate_legacy_root`]) on first use. A profile whose ACLs were widened still
 //! exposes the transcripts.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::path::{Path, PathBuf};
@@ -244,6 +245,7 @@ pub fn migrate_legacy_root(legacy: &Path, current: &Path) -> std::io::Result<usi
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use nexus_claude::model::ChatMessage;
     use nexus_claude::providers::native::TranscriptStore;

@@ -7,6 +7,7 @@
 //!
 //! The engine runs all three providers concurrently with a 300ms budget each.
 //! On empty graphs or failures, each provider gracefully returns an empty vec.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod co_change;
@@ -282,6 +283,7 @@ fn suggestion_score(s: &Suggestion) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn scar() -> Suggestion {

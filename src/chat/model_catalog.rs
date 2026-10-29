@@ -21,6 +21,7 @@
 //!   catalog borrows the OAuth token Claude Code itself logged in with (see
 //!   `read_claude_code_oauth_token`). The Models API accepts it, and every
 //!   install that can chat at all has one.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,7 @@ use crate::chat::provider::settings::{
 use crate::chat::provider::store as provider_store;
 use crate::events::{EntityType, EventEmitter};
 use crate::neo4j::models::{AlertNode, AlertSeverity};
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::vault::VaultService;
@@ -1137,6 +1139,7 @@ pub(crate) fn live_snapshot_from_listing(page: serde_json::Value) -> CatalogSnap
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

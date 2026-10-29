@@ -11,6 +11,7 @@
 //! coalesced by the [`AttentionRelay`] owned by the `HybridEmitter`: all
 //! changes about the same subject arriving inside [`COALESCE_WINDOW`] produce
 //! ONE event (reasons merged), enriched with the workspace slug.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::{BTreeSet, HashMap};
@@ -285,6 +286,7 @@ impl AttentionRelay {
 mod tests {
     use super::*;
     use crate::events::{EventBus, HybridEmitter};
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     struct FixedScope;

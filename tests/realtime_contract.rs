@@ -8,6 +8,7 @@
 //! happens to remember — so a renamed, added or dropped field fails here.
 //!
 //! Deliberately no Neo4j, no network, no clock: only serialization.
+#[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
 
 use project_orchestrator::api::ws_handlers::chat_frame;

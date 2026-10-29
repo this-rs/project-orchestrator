@@ -2,6 +2,7 @@
 //!
 //! Uses statistical analysis of note tags to compose human-readable skill names.
 //! No LLM needed — purely deterministic heuristic.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use regex::Regex;
@@ -106,6 +107,7 @@ fn title_case(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

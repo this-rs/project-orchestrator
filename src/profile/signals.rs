@@ -3,6 +3,7 @@
 //! Each signal variant represents an observable user behavior that can be
 //! translated into a profile dimension update. Signals are sent via an
 //! unbounded mpsc channel for non-blocking collection (< 1ms per signal).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
@@ -116,6 +117,7 @@ impl BehaviorSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

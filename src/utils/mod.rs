@@ -1,4 +1,5 @@
 //! Shared utility helpers.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
@@ -68,6 +69,7 @@ pub(crate) fn reciprocal_rank_fusion(channels: &[&[String]], anchor: f64) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     // -- Reciprocal Rank Fusion --------------------------------------------

@@ -31,6 +31,7 @@
 //!   attributable and replayable).
 //! * **Atomic.** An observation that is refused (turn not strictly increasing) leaves
 //!   the state exactly as it was.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -719,6 +720,7 @@ impl Segmenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn fp(labels: &[&str]) -> Fingerprint {

@@ -3,6 +3,7 @@
 //! Adds a POST /api/webhooks/:trigger_id endpoint that receives external
 //! payloads (e.g., GitHub push events). Validates HMAC-SHA256 signatures
 //! and filters by event type and branch pattern.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::TriggerProvider;
@@ -81,6 +82,7 @@ pub fn validate_github_signature(secret: &str, body: &[u8], signature_header: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

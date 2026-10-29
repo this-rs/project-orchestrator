@@ -20,6 +20,7 @@
 //! (Protocol)-[:BELONGS_TO_SKILL]->(Skill)
 //! (ProtocolState)-[:REFERENCES]->(Note)
 //! ```
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod engine;

@@ -3,6 +3,7 @@
 //! `GET /api/graph/neighborhood` — ego-graph around any entity. The query
 //! logic lives in `crate::graph::neighborhood` (selection, pure) and
 //! `GraphStore::get_entity_neighborhood` (bounded fetch).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
@@ -132,6 +133,7 @@ mod tests {
     use crate::events::EventBus;
     use crate::graph::neighborhood::{InMemoryGraph, RawNode};
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state_with_graph, test_bearer_token};

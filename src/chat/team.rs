@@ -28,6 +28,7 @@
 //! child that needs work outside its envelope (another project of the workspace) sends a
 //! `dispatch_request` UP, and the parent opens it with ITS envelope. The envelope itself
 //! is never widened.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::{Arc, Weak};
@@ -480,6 +481,7 @@ pub(crate) fn render_team_message(kind: &TeamMessageKind, text: &str) -> String 
 mod team2_tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
     use crate::test_helpers::test_chat_session;
@@ -592,6 +594,7 @@ mod team2_tests {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use std::sync::atomic::Ordering;
     use uuid::Uuid;

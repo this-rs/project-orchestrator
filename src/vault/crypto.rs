@@ -18,6 +18,7 @@
 //! persist. Each secret's NAME is bound as associated data — a ciphertext copied
 //! under another name fails to open, so an attacker who can edit the vault file
 //! cannot relabel one secret as another.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -230,6 +231,7 @@ pub enum CryptoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

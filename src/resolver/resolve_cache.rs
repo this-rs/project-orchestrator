@@ -7,6 +7,7 @@
 //! - `get() → None`: not in cache (cache miss)
 //! - `get() → Some(&vec![])`: cached as unresolvable (negative cache)
 //! - `get() → Some(&vec![...])`: cached as resolved to one or more paths
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use lru::LruCache;
@@ -135,6 +136,7 @@ impl std::fmt::Debug for ResolveCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

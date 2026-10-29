@@ -5,6 +5,7 @@
 //! This registry is the seam between the two: the stages record, the live snapshot
 //! reads. It is in memory only and bounded to the live sessions: a session that
 //! ends is forgotten the next time the snapshot is taken.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use serde::Serialize;
@@ -110,6 +111,7 @@ pub fn retain_live(live: &HashSet<Uuid>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn r(id: &str) -> ActivatedRef {

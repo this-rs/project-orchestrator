@@ -3,6 +3,7 @@
 //! Each gate implements the [`QualityGate`] trait and can be composed into pipelines.
 //! Gates wrap external CLI tools (`cargo`, `gh`, `npx`, etc.) and parse their output
 //! into structured [`GateResult`] values with metrics.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
@@ -521,6 +522,7 @@ impl QualityGate for PrChecksGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     // -- GateStatus serialization -------------------------------------------

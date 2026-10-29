@@ -6,6 +6,7 @@
 //! 3. BFS traversal from entry points through the CALLS graph
 //! 4. Deduplication (subset removal + endpoint dedup)
 //! 5. Classification (intra vs cross community)
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -739,6 +740,7 @@ pub fn detect_processes(
 mod tests {
     use super::*;
     use crate::graph::models::{CodeEdge, CodeNode};
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     /// Helper to create a Function node.

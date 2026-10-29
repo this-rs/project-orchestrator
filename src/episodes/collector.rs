@@ -8,6 +8,7 @@
 //!
 //! The resulting Episode can then be converted to a PortableEpisode for
 //! cross-instance exchange via SkillPackage v3.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use anyhow::{Context, Result};
@@ -15,6 +16,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::episodes::models::*;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 
@@ -380,6 +382,7 @@ impl DistillationBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use chrono::Utc;
 

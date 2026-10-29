@@ -9,6 +9,7 @@
 //!
 //! Each run is driven by a spawned tokio task with a CancellationToken
 //! for graceful shutdown.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::chat::manager::ChatManager;
@@ -401,7 +402,9 @@ mod tests {
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::ProjectNode;
     use crate::neo4j::traits::GraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::protocol::{Protocol, ProtocolCategory, ProtocolRun, ProtocolState, RunStatus};
     use std::sync::Arc;

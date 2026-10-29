@@ -75,6 +75,7 @@
 //! gone, stays without one (its tools run unauthorised rather than under a forged identity);
 //! when the server signs its tokens, such a session says it lacks the PO tools
 //! (`degraded_features`) instead of losing them silently.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::*;
@@ -917,6 +918,7 @@ fn credentials_locked(e: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn ev(seq: i64, event_type: &str, data: &str) -> ChatEventRecord {

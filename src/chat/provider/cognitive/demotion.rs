@@ -17,6 +17,7 @@
 //! [`CrudEvent`] of entity `project` / action `updated` whose payload carries
 //! `"event": "routing_demoted"`; [`demotion_event`] builds it so the
 //! caller can wire a dedicated type later without touching this module.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use serde::Serialize;
@@ -27,6 +28,7 @@ use super::store::{DecisionFilter, RoutingArmStore};
 use super::{load_routing, stored_routing, ROUTING_KEY};
 use crate::chat::provider::settings::{project_scope, GLOBAL};
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::notes::{Note, NoteImportance, NoteType};
@@ -239,8 +241,11 @@ mod tests {
     use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
     use crate::chat::provider::cognitive::store::InMemoryRoutingStore;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use uuid::Uuid;
 

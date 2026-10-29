@@ -14,11 +14,13 @@
 //!
 //! **NEVER block tool execution.** Any error → passthrough (continue_: true).
 //! Skills are a nice-to-have context injection, not a gating mechanism.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::api::hook_handlers::skill_cache;
 use crate::chat::hook_ledger::{cap_chars, HookLedger, InjectionKey, MAX_HOOK_CONTEXT_CHARS};
 use crate::neo4j::traits::GraphStore;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neurons::AutoReinforcementConfig;
 use crate::skills::activation::{
@@ -777,6 +779,7 @@ impl nexus_claude::HookCallback for SkillActivationHook {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use nexus_claude::{HookCallback, HookContext, HookInput};
 

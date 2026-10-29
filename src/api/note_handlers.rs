@@ -1,4 +1,5 @@
 //! API handlers for Knowledge Notes
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
@@ -6,6 +7,7 @@ use super::{PaginatedResponse, PaginationParams, SearchFilter};
 use crate::events::graph::GraphEvent;
 use crate::graph::algorithms::add_thermal_noise;
 
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::notes::{
     BackfillProgress, CreateAnchorRequest, CreateNoteRequest, EntityType, LinkNoteRequest, Note,
@@ -1923,6 +1925,7 @@ mod tests {
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
     use crate::events::EventBus;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_bearer_token};
@@ -3139,6 +3142,7 @@ mod tests {
 mod human_confirmation_tests {
     use super::confirmed_by_a_person;
     use crate::auth::jwt::{Claims, TOKEN_TYPE_AGENT_SESSION, TOKEN_TYPE_MCP};
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn person() -> Claims {

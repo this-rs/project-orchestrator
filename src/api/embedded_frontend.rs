@@ -18,6 +18,7 @@
 //! #[cfg(feature = "embedded-frontend")]
 //! router.fallback(embedded_frontend::serve_embedded)
 //! ```
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use axum::{
@@ -99,6 +100,7 @@ fn serve_file(path: &str, data: &[u8]) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     /// A missing static asset must 404, not fall back to index.html: serving

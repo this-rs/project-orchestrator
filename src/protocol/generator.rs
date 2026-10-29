@@ -8,6 +8,7 @@
 //! - MAX_RUNTIME_STATES_PER_GENERATOR = 50
 //! - Generation is idempotent: if RuntimeStates already exist for the
 //!   (run_id, generator_state_id) pair, generation is skipped.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::neo4j::traits::GraphStore;
@@ -139,6 +140,7 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::GraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::protocol::{
         GeneratorConfig, LinkingStrategy, Protocol, ProtocolCategory, ProtocolState,

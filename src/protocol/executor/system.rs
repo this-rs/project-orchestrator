@@ -6,10 +6,12 @@
 //!
 //! The SystemExecutor parses these action strings and calls the corresponding
 //! GraphStore methods directly (no LLM, no HTTP).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::{ExecutionResult, Executor};
 use crate::neo4j::traits::GraphStore;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::protocol::{Protocol, ProtocolRun, ProtocolState};
 use anyhow::{Context, Result};
@@ -304,6 +306,7 @@ impl Executor for SystemExecutor {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::protocol::ProtocolTransition;
     use uuid::Uuid;

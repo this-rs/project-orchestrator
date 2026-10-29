@@ -7,6 +7,7 @@
 //! provider factory as every session — never a client built by hand on the Claude CLI.
 //! The project's consent (A28) and the health of the instance are checked before anything
 //! is sent; a refusal is typed, never worked around.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -20,6 +21,7 @@ use nexus_claude::agent::{
 use super::resolver::{self, Candidate, ResolveError, ResolveInput, Role, RoutedBy};
 use super::{catalog, native_factory, settings, store};
 use crate::chat::agent_runtime::ProviderSource;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 
@@ -207,8 +209,11 @@ mod tests {
         INSTANCE_PREFIX, ROLES_KEY,
     };
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     async fn stored(graph: &MockGraphStore, id: &str) -> InstanceRecord {

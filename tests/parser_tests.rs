@@ -2,6 +2,7 @@
 //!
 //! These tests don't require external services.
 //! Run with: cargo test --test parser_tests
+#[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
 
 use project_orchestrator::parser::CodeParser;

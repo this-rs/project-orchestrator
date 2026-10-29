@@ -23,6 +23,7 @@
 //! | Project    | Synced        | bootstrap_knowledge_fabric / update_fabric   |
 //! | Task       | StatusChanged | Check if all plan tasks completed → auto-complete plan |
 //! | Plan       | StatusChanged | Collect episode if protocol run linked       |
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
@@ -39,6 +40,7 @@ use uuid::Uuid;
 
 use super::trigger::EventTrigger;
 use super::types::{CrudAction, CrudEvent, EntityType, EventEmitter};
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 
@@ -505,6 +507,7 @@ impl ReactorBuilder {
 mod tests {
     use super::*;
     use crate::events::EventEmitter;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use std::sync::atomic::AtomicUsize;
     use tokio::time::{sleep, Duration};

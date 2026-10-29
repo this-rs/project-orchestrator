@@ -1,4 +1,5 @@
 //! Neo4j Project operations
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::client::{Neo4jClient, WhereBuilder};

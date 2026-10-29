@@ -3,6 +3,7 @@
 //! Provides convenience functions for creating test objects with sensible defaults,
 //! and helpers for building mock AppState / Orchestrator / ToolHandler instances.
 #![allow(dead_code)]
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::meilisearch::mock::MockSearchStore;
@@ -809,6 +810,7 @@ pub async fn router_with_auth_and_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

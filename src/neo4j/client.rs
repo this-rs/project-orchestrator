@@ -1,4 +1,5 @@
 //! Neo4j client for interacting with the knowledge graph
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::neo4j::traits::StoreCapabilities;
@@ -1013,6 +1014,7 @@ where
 #[cfg(test)]
 mod read_retry_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use std::cell::Cell;
 
@@ -1135,6 +1137,7 @@ mod read_retry_tests {
 #[cfg(test)]
 mod where_builder_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     const EVIL: &str = "a' OR 1=1 //";
@@ -1335,6 +1338,7 @@ mod where_builder_tests {
 #[cfg(test)]
 mod schema_expectation_tests {
     use super::EXPECTED_CONSTRAINTS;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     /// Every `CREATE CONSTRAINT <name>` of this file must be in the list that

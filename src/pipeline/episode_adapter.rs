@@ -16,6 +16,7 @@
 //! | `gate_results`     | Each state visit → gate (passed = has exited_at without error)|
 //! | `duration_ms`      | From process.duration_ms                                      |
 //! | `retry_count`      | Count of duplicate state names in states_visited              |
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
@@ -168,6 +169,7 @@ async fn resolve_single_protocol_name(
 
 // ─── Synthetic Episode Generation (T3 — Replay Génératif) ──────────────────
 
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::notes::models::{Note, NoteType};
 
@@ -379,6 +381,7 @@ fn slug_desc(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::episodes::models::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use chrono::Utc;
 

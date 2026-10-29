@@ -1,4 +1,5 @@
 //! Chat API handlers — session management (streaming via WebSocket)
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::api::handlers::{AppError, OrchestratorState};
@@ -9,6 +10,7 @@ use crate::chat::types::{
 };
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use axum::{
     extract::{Path, Query, State},
@@ -2289,6 +2291,7 @@ mod tests {
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_bearer_token, test_chat_session};
@@ -6059,6 +6062,7 @@ fn switch_error(error: anyhow::Error, session_id: &str) -> AppError {
 mod switch_provider_tests {
     use super::*;
     use crate::chat::types::SwitchProviderError;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]
@@ -6165,7 +6169,9 @@ mod file_scope_lift_tests {
     use crate::auth::jwt::{Claims, TOKEN_TYPE_AGENT_SESSION, TOKEN_TYPE_MCP};
     use crate::chat::envelope::SpawnCaller;
     use crate::chat::types::ChatRequest;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn person() -> Claims {
@@ -6851,7 +6857,9 @@ pub mod anchors {
         use crate::chat::anchor_resolver::resolve_session_scope;
         use crate::graph::neighborhood::RawNode;
         use crate::neo4j::mock::MockGraphStore;
+        #[allow(unused_imports)]
         use crate::neo4j::traits::*;
+        #[allow(unused_imports)]
         use crate::neo4j::traits::*;
         use crate::neo4j::GraphStore;
         use crate::test_helpers::{

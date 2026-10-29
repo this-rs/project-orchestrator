@@ -5,6 +5,7 @@
 //!
 //! When NATS is not configured, the emitter works in local-only mode
 //! with zero overhead — no connection attempts, no errors.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::attention::AttentionRelay;
@@ -309,6 +310,7 @@ impl EventEmitter for HybridEmitter {
 mod tests {
     use super::*;
     use crate::events::{CrudAction, EntityType};
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[tokio::test]

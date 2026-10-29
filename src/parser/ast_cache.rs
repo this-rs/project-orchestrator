@@ -12,6 +12,7 @@
 //!
 //! The cache key is `"path:hash"` — same path with different content
 //! gets a new entry, naturally evicting the old one via LRU.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use lru::LruCache;
@@ -132,6 +133,7 @@ impl Default for AstCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn make_parsed(path: &str, hash: &str) -> ParsedFile {

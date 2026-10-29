@@ -6,6 +6,7 @@
 //! [`profile_task`] classification), or from what a delegating agent states.
 //! Its [`TaskSignature::arm_key`] names the bandit arm family a decision belongs
 //! to, so it must stay stable.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
@@ -420,6 +421,7 @@ fn context_need(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn task(files: usize, tags: &[&str]) -> TaskNode {

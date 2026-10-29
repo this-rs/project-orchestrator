@@ -8,6 +8,7 @@
 //! persona > run > project rule > global rule > configured default >
 //! `claude-code` when usable > the only other instance usable here (B2) >
 //! `no_provider`.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::fmt;
@@ -553,6 +554,7 @@ pub fn resolve_for_open(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     /// Table-driven catalog: `(id, healthy, allowed)`.

@@ -15,6 +15,7 @@
 //! Validation is enforced at write-time by [`Witness::validate`]. v1 of the RFC
 //! is warn-only at the API boundary; this module returns hard errors so callers
 //! can decide whether to log-and-pass or reject.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
@@ -253,6 +254,7 @@ impl Witness {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn dummy_code_ref() -> CodeRef {

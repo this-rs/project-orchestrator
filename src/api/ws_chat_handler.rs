@@ -7,6 +7,7 @@
 //! - Client → Server: JSON messages (user_message, interrupt, permission_response, input_response)
 //! - Server → Client: JSON events with `seq` field (0 for non-persisted stream_delta)
 //! - On connect: replay persisted events since `last_event` query param, then `replay_complete`
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
@@ -14,6 +15,7 @@ use super::ws_auth::CookieAuthResult;
 use crate::auth::jwt::Claims;
 use crate::chat::manager::{DeliveryRoute, MessageDeliveryError};
 
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use axum::{
     extract::{
@@ -1239,6 +1241,7 @@ fn live_frame(
 /// Allows at most `MAX_BOOSTS_PER_MINUTE` reinforcement batches per minute
 /// to avoid runaway energy inflation during rapid conversations.
 mod chat_reinforcement_limiter {
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -1711,6 +1714,7 @@ fn control_frame(event: &crate::chat::types::ChatEvent) -> Option<String> {
 mod tests {
     use super::*;
     use crate::chat::types::ChatEvent;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use std::collections::HashSet;
     use tokio::sync::broadcast;

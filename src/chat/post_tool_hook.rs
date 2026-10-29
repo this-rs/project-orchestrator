@@ -8,6 +8,7 @@
 //! # Error Policy
 //!
 //! **NEVER block tool execution.** Any error → passthrough (continue_: true).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::neo4j::traits::GraphStore;
@@ -325,6 +326,7 @@ impl nexus_claude::HookCallback for PostToolUseRedirectHook {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use nexus_claude::{HookCallback, HookContext};
 

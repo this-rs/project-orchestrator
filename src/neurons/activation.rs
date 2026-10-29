@@ -8,6 +8,7 @@
 //! This is an **independent** retrieval mechanism that coexists with the existing
 //! PageRank-weighted propagation in `get_context_notes`. Both systems run in
 //! parallel during Phase 3 (dual-run comparison).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, HashSet};
@@ -412,6 +413,7 @@ pub fn select_top(
 #[cfg(test)]
 mod pure_ranking_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn candidate(id: u128, score: f64) -> RankedCandidate {
@@ -459,6 +461,7 @@ mod pure_ranking_tests {
 #[cfg(test)]
 mod pure_rule_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn node(energy: f64) -> SpreadNode {
@@ -1114,6 +1117,7 @@ impl SpreadingActivationEngine {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
     use crate::notes::{NoteImportance, NoteType};

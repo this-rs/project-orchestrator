@@ -1,4 +1,5 @@
 //! Meilisearch client and index management
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod client;

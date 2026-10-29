@@ -10,6 +10,7 @@
 //! * `DELETE /api/chat/providers/{id}/quota` — forgets what is known (human only).
 //!
 //! Times are epoch milliseconds, the interface shows them in the person's time zone.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use axum::{
@@ -173,6 +174,7 @@ mod tests {
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
     use crate::auth::jwt::{generate_session_token, Claims};
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_auth_config, test_bearer_token};

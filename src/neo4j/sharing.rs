@@ -1,4 +1,5 @@
 //! Neo4j Sharing & Privacy operations
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
@@ -361,6 +362,7 @@ fn tombstone_from_stored(
 #[cfg(test)]
 mod tombstone_roundtrip_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::sharing::tombstone::{sign_tombstone, verify_tombstone};
 

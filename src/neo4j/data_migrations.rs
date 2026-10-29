@@ -13,6 +13,7 @@
 //! Every batch query takes a `$scope` parameter: `null` for the whole
 //! database, or a project id to restrict the migration to one project (used
 //! by the integration tests, which share one Neo4j instance).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::time::Instant;
@@ -449,6 +450,7 @@ impl Neo4jClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

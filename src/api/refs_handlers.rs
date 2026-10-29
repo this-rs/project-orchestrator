@@ -2,6 +2,7 @@
 //!
 //! Additive and read-only. All the logic lives in [`crate::refs`]; this is the
 //! glue: who is asking, which store, and how a refusal is spelled.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use axum::{
@@ -63,6 +64,7 @@ mod tests {
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::orchestrator::watcher::FileWatcher;
     use crate::orchestrator::Orchestrator;

@@ -16,6 +16,7 @@
 //! 4. Inject each activated skill's context, assembled from its current
 //!    members (notes/decisions still in force), like the PreToolUse hook
 //! 5. Async boost energy of activated skills (Hebbian reinforcement)
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use anyhow::Result;
@@ -28,6 +29,7 @@ use crate::chat::enrichment::{
 };
 use crate::neo4j::traits::GraphStore;
 
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neurons::intent::{IntentDetector, QueryIntentMode};
 use crate::skills::activation::evaluate_skill_match;
@@ -465,6 +467,7 @@ async fn boost_skill_member_notes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     /// T0f-bis: an activated skill warms its member notes of the session's

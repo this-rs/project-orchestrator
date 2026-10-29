@@ -13,6 +13,7 @@
 //! - **SkillActivationStage** — matches message against skill trigger patterns
 //! - **KnowledgeInjectionStage** — semantic search for notes/decisions
 //! - **StatusInjectionStage** — in-progress tasks/plans + reasoning tree
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use anyhow::Result;
@@ -717,6 +718,7 @@ pub fn enrich_prompt(prompt: &str, ctx: &EnrichmentContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     /// A mock stage for testing.

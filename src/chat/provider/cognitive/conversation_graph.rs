@@ -30,6 +30,7 @@
 //!    [`ConversationGraph::hub`] is the cheaper degree proxy.
 
 #![allow(clippy::needless_range_loop)]
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -266,6 +267,7 @@ impl ConversationGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use std::collections::BTreeSet;
 
@@ -482,6 +484,7 @@ fn jacobi_eigen(
 #[cfg(test)]
 mod spectral_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn t(turn: u32, labels: &[&str], tools: &[&str]) -> TurnNode {
@@ -665,6 +668,7 @@ impl ConversationGraph {
 #[cfg(test)]
 mod partition_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use std::collections::BTreeSet;
 
@@ -724,6 +728,7 @@ mod parity_tests {
     use crate::chat::provider::cognitive::segment::{
         Dimension, Fingerprint, Observation, SegmentPolicy, Segmenter,
     };
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use std::collections::{BTreeMap, BTreeSet};
 

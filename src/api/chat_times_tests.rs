@@ -3,6 +3,7 @@
 //! `created_at` in seconds since the epoch with the milliseconds as the
 //! fraction. Each test fails if a path drops the field or rounds it to the
 //! second.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use uuid::Uuid;
 use crate::chat::manager::{test_support, ChatManager};
 use crate::chat::types::ChatEvent;
 use crate::neo4j::models::ChatEventRecord;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::test_helpers::{mock_app_state_with_graph, test_chat_session};

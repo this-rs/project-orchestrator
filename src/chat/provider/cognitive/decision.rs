@@ -4,6 +4,7 @@
 //! or not. [`Decider`] is the one trait the rest of the backend (chat, runner,
 //! delegation, per-turn hook) calls: they depend on it, never on the scorer, so
 //! each can be built and tested against a fake while the scorer is written.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use async_trait::async_trait;
@@ -413,6 +414,7 @@ pub trait Decider: Send + Sync {
 #[cfg(test)]
 mod recompute_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn settings() -> super::super::mode::RoutingSettings {
@@ -465,6 +467,7 @@ mod tests {
     use super::*;
     use crate::chat::provider::cognitive::signature::TaskClass;
     use crate::chat::provider::cognitive::store::ArmKey;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn decision() -> CognitiveDecision {

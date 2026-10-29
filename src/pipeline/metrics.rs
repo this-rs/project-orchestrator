@@ -18,6 +18,7 @@
 //!
 //! - `decay_ineffective_notes()` — archives auto-learned notes with low energy after 7 days
 //! - `promote_battle_tested_notes()` — promotes high-energy old notes to consolidated
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use anyhow::Result;
@@ -27,6 +28,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::notes::models::{MemoryHorizon, NoteFilters, NoteStatus};
 
@@ -368,6 +370,7 @@ pub async fn promote_battle_tested_notes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

@@ -2,6 +2,7 @@
 //! loopback port (authentication off: the socket carries the anonymous user), a real
 //! client, the real handler. Each test fails if the loop stops checking who answers
 //! before anything is delivered, or lets an answer through when the owner cannot be read.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::chat::manager::{test_support, ChatManager};
 use crate::neo4j::models::ChatSessionNode;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::test_helpers::{mock_app_state_with_graph, test_chat_session};

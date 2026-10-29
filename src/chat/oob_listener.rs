@@ -50,6 +50,7 @@
 //!      flag first), the queued `PendingMessage` will be picked up by
 //!      `drain_pending_messages` after that turn ends — no event is
 //!      dropped.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1066,6 +1067,7 @@ fn user_message_source(m: &UserMessage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use nexus_claude::{TextContent, ToolResultContent};
     use serde_json::json;
@@ -1841,6 +1843,7 @@ mod agent_path_tests {
     use super::super::agent_runtime::{AgentRuntime, AgentSessionHandle};
     use super::super::types::ChatEvent;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
     use nexus_claude::agent::{

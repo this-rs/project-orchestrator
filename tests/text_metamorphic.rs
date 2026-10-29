@@ -9,6 +9,7 @@
 //! Each classifier has its own agreement threshold (`THRESHOLDS`), asserted in CI.
 //! Deterministic: no network, no embedding (`IntentDetector`, `TaskSignature`,
 //! `evaluate_skill_match` are lexical).
+#[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
 
 mod common;

@@ -2,6 +2,7 @@
 //!
 //! Routes are split into public (no auth) and protected (require valid JWT).
 //! The `require_auth` middleware is applied only to protected routes.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::auth_handlers;
@@ -2388,6 +2389,7 @@ fn protected_routes() -> Router<OrchestratorState> {
 mod tests {
     use super::*;
     use crate::events::EventBus;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

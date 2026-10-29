@@ -8,6 +8,7 @@
 //! inject active skills, current plan/task, and critical notes.
 //!
 //! Performance budget: < 200ms P99 for the complete request cycle.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
@@ -586,6 +587,7 @@ fn client_ip_from_extension(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use std::net::Ipv4Addr;
 

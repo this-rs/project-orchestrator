@@ -2,6 +2,7 @@
 //!
 //! Provides high-level operations for creating, reading, updating, and deleting notes,
 //! including linking notes to entities and managing note lifecycle.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::models::*;
@@ -12,6 +13,7 @@ use crate::meilisearch::indexes::NoteDocument;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::GraphStore;
 
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::utils::reciprocal_rank_fusion;
 use anyhow::Result;
@@ -2267,6 +2269,7 @@ fn fuse_dense_and_lexical(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::test_helpers::*;
 

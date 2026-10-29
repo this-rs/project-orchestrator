@@ -6,6 +6,7 @@
 //! - Interfaces
 //! - Objects and companions
 //! - Coroutines (suspend functions)
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::neo4j::models::*;

@@ -11,6 +11,7 @@
 //!
 //! Dev-server proxy configuration is where that edge is written down. It is
 //! hand-maintained by whoever wires the app up, and it names a concrete target.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::path::Path;
@@ -120,6 +121,7 @@ pub fn read_project_upstreams(root: &Path) -> Vec<ProxyUpstream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     /// Shaped after the orchestrator frontend's own vite.config.ts, which routes

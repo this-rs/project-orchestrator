@@ -19,6 +19,7 @@
 //! Each reaction is an async function that receives the [`CrudEvent`] and an
 //! `Arc<ServerState>`. They are registered via [`register_builtin_reactions`]
 //! which returns a configured [`ReactorBuilder`](super::ReactorBuilder).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::future::Future;
@@ -1431,6 +1432,7 @@ pub fn register_builtin_reactions(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     /// Serializes the tests that reset and read the process-global
     /// `LAST_FEEDBACK_ANALYSIS_TS`. Run in parallel, one test's `store(0)`

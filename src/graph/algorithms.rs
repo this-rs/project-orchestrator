@@ -15,6 +15,7 @@
 //! All algorithms operate on `CodeGraph` and return results indexed by node ID (String).
 //! The Louvain algorithm is implemented from scratch because the `graphina` crate
 //! requires Rust 1.86+ (our MSRV target is 1.70+).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use petgraph::graph::NodeIndex;
@@ -3767,6 +3768,7 @@ pub fn add_thermal_noise<T>(scores: &mut [(T, f64)], temperature: f64) {
 mod tests {
     use super::*;
     use crate::graph::models::{CodeEdge, CodeEdgeType, CodeNode, CodeNodeType, LargeGraphConfig};
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     /// Build a star graph: center → [leaf1, leaf2, ..., leafN]

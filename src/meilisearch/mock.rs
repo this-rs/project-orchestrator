@@ -1,4 +1,5 @@
 //! In-memory mock implementation of SearchStore for testing without a real Meilisearch instance.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::indexes::*;
@@ -489,6 +490,7 @@ impl SearchStore for MockSearchStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn sample_code_doc(path: &str, project_slug: &str) -> CodeDocument {

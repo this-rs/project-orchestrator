@@ -1,4 +1,5 @@
 //! HTTP API for the orchestrator
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod attention;

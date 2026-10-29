@@ -32,6 +32,7 @@
 //!
 //! Lasting rules live on the machine of the instance that owns the session; another
 //! instance (NATS) has its own directory.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::io::Write;
@@ -435,6 +436,7 @@ pub async fn keep(
 #[cfg(unix)]
 mod safe {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use std::fs::{File, OpenOptions};
     use std::io::Read;
@@ -561,6 +563,7 @@ mod safe {
 #[cfg(not(unix))]
 mod safe {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     pub(super) fn dir_is_safe(_dir: &Path, _create: bool) -> Result<bool, StoreError> {
@@ -580,6 +583,7 @@ mod safe {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;

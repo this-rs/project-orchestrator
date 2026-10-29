@@ -9,6 +9,7 @@
 //! per-distribution audit (formulas, skip rules, tolerances).
 //!
 //! Plan: `00f0ca9a-816f-4fcc-bc53-da88d595de34`, task R6.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use statrs::distribution::{
@@ -409,6 +410,7 @@ pub fn fit_all(data: &[f64]) -> anyhow::Result<Vec<FitResult>> {
 mod tests {
     use super::*;
     use crate::analytics::stats::golden_fixtures::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     // ─── KS helpers ──────────────────────────────────────────────────────────

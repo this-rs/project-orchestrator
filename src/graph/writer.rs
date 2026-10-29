@@ -5,6 +5,7 @@
 //! clustering coefficient, community ID, and component ID as node properties.
 //!
 //! The write is idempotent: re-running analytics overwrites previous scores.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use crate::neo4j::GraphStore;
@@ -249,6 +250,7 @@ mod tests {
         AnalyticsConfig, CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType,
     };
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     /// Build a small file graph for testing the writer.

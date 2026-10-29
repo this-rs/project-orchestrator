@@ -16,6 +16,7 @@
 //! - **Write**: extracts `file_path` field
 //! - **MCP mega-tools** (`mcp__*`): extracts `action` + key domain params
 //! - Other tools: returns `None` (skip)
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use regex::Regex;
@@ -815,6 +816,7 @@ pub fn enrich_redirect_with_context_card(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use serde_json::json;
 

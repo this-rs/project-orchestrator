@@ -5,6 +5,7 @@
 //! - `SuffixIndex`: O(1) file lookup by path suffix
 //! - `SymbolTable`: dual-index symbol resolution (by name and by file)
 //! - `ResolveCache`: LRU cache for resolved imports
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod resolve_cache;
@@ -260,6 +261,7 @@ fn extract_cmake_parens<'a>(line: &'a str, directive: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

@@ -6,6 +6,7 @@
 //!
 //! Sends CrudEvents to the HTTP server via POST /internal/events.
 //! Fire-and-forget: errors are logged but never block the caller.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::types::{CrudEvent, EventEmitter};
@@ -69,6 +70,7 @@ impl EventEmitter for EventNotifier {
 mod tests {
     use super::*;
     use crate::events::EntityType;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

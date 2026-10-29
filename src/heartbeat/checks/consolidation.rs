@@ -3,6 +3,7 @@
 //! Runs `consolidate_memory` on GraphStore every 2 hours for all projects.
 //! This promotes eligible ephemeral notes (old enough + high activation)
 //! to consolidated status and archives dead notes.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::time::Duration;
@@ -62,6 +63,7 @@ impl HeartbeatCheck for ConsolidationCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

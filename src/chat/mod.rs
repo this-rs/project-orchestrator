@@ -2,6 +2,7 @@
 //!
 //! Provides WebSocket streaming chat with bidirectional communication,
 //! event persistence with replay, session management, and auto-resume capabilities.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 pub mod attachment;

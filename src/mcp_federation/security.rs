@@ -5,6 +5,7 @@
 //! - Server allowlist (allowed_servers)
 //! - Rate limiting (max_calls_per_minute)
 //! - Credential isolation (prevent forwarding PO auth headers)
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
@@ -276,6 +277,7 @@ impl InferredCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

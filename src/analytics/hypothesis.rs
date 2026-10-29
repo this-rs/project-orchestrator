@@ -16,6 +16,7 @@
 //!   real p-value instead of a hardcoded threshold
 //! - **Synapse strength homogeneity**: test whether synapse weights within a
 //!   knowledge cluster are uniform (ANOVA across clusters)
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
@@ -205,6 +206,7 @@ pub fn test_stagnation(values: &[f64], reference_mean: f64) -> Option<TTestResul
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

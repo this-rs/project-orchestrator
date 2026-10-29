@@ -1,6 +1,7 @@
 //! MCP Server implementation
 //!
 //! Implements the MCP server that communicates over stdio using JSON-RPC 2.0.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::formatter::json_to_compact;
@@ -281,6 +282,7 @@ impl<T> Pipe for T {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn call(name: &str, action: Option<&str>) -> ToolCallParams {

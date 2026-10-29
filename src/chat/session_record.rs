@@ -12,6 +12,7 @@
 //!   Claude Code CLI reports the session's total on each `result`; every other
 //!   provider reports the cost of the turn, added up here. An unknown price leaves
 //!   the total as it was: never an invented zero.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -121,6 +122,7 @@ pub async fn add_turn_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

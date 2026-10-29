@@ -12,6 +12,7 @@
 //! validated ([`guard_cites`]). A token in a tool result or in a document is
 //! data: it is never read as a citation, and [`neutralize`] takes the power
 //! away from one wherever such text is carried.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::access::{AccessPolicy, Principal, RefSource};
@@ -276,6 +277,7 @@ pub fn neutralize_value(value: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]
@@ -320,6 +322,7 @@ mod tests {
 #[cfg(test)]
 mod cited_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::refs::RefKind;
 
@@ -468,6 +471,7 @@ mod cited_tests {
 #[cfg(test)]
 mod guard_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::refs::access::{Disclosure, SessionScope};
     use crate::refs::resolvers::GraphRefSource;
@@ -614,6 +618,7 @@ mod guard_tests {
 #[cfg(test)]
 mod neutralize_value_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use serde_json::json;
 

@@ -6,6 +6,7 @@
 //! and the drain, the WebSocket handler) and fails if that point is unplugged.
 //! The Claude CLI is a `MockTransport`: the test reads what the SDK would have
 //! written to the CLI's stdin.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use uuid::Uuid;
 use super::config::ChatConfig;
 use super::manager::{test_support, ChatManager};
 use super::types::{ChatEvent, PendingQueueEntry};
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::refs::compose::compose_user_message;

@@ -13,6 +13,7 @@
 //! spills, and a store that is unavailable (or a session without a transcript
 //! id) keeps the result inline — the existing truncation path handles it, so
 //! nothing is lost.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -295,6 +296,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use std::sync::atomic::AtomicI64;
 

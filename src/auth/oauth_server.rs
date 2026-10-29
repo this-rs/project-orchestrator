@@ -34,6 +34,7 @@
 //! `/oauth/token` issues the same revocable scoped MCP tokens as
 //! `POST /auth/mcp-tokens` (label `OAuth: {client_name}`) — inventory and
 //! revocation work identically for OAuth-issued and manually-issued tokens.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::jwt_crypto::{decode, encode};
@@ -891,6 +892,7 @@ fn oauth_error_json(status: StatusCode, error: &str, description: &str) -> Respo
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     const SECRET: &str = "test-secret-key-minimum-32-chars!!";

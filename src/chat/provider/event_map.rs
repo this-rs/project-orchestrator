@@ -10,6 +10,7 @@
 //!   does for the legacy path);
 //! - [`out_of_band_to_chat_events`] for the events received between turns,
 //!   regrouped by provider message number into `background_output`.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::collections::HashSet;
@@ -772,6 +773,7 @@ pub fn out_of_band_to_chat_events(
 mod tests {
     use super::*;
     use crate::chat::manager::ChatManager;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use nexus_claude::providers::claude_code::{map_message, MapState};
     use nexus_claude::{

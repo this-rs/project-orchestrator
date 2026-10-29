@@ -11,6 +11,7 @@
 //! by. [`Neo4jSegmentStore`] adapts any [`GraphStore`] to the [`SegmentStore`]
 //! the wiring depends on; the segment ids are deterministic, so a re-`put` merges
 //! onto the same nodes instead of duplicating them.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -220,6 +221,7 @@ mod tests {
         Dimension, Fingerprint, Observation, SegmentPolicy, Segmenter,
     };
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn obs(turn: u32, prints: &[(Dimension, &[&str])]) -> Observation {

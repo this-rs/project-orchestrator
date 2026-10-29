@@ -17,6 +17,7 @@
 //! - **Local trigger evaluation**: Skills are loaded from DB then matched in Rust,
 //!   avoiding per-trigger Neo4j round-trips.
 //! - **Context budget**: 3200 chars max (~800 tokens) to prevent additionalContext flooding.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use regex::RegexBuilder;
@@ -27,6 +28,7 @@ use std::sync::Arc;
 use crate::neo4j::models::DecisionNode;
 use crate::neo4j::traits::GraphStore;
 
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::neurons::AutoReinforcementConfig;
 use crate::notes::models::Note;
@@ -1807,6 +1809,7 @@ pub fn rank_skills(
 #[cfg(test)]
 mod rank_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::skills::{SkillNode, SkillStatus};
 
@@ -1886,6 +1889,7 @@ mod rank_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::notes::models::{NoteImportance, NoteScope, NoteStatus, NoteType};
     use crate::skills::models::{SkillNode, SkillStatus, SkillTrigger};

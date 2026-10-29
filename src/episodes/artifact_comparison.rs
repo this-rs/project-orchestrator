@@ -8,6 +8,7 @@
 //!
 //! PO enriched format: structure (co-change edges) + portable episodes
 //! (Stimulus → Process → Outcome → Validation → Lesson).
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
@@ -442,6 +443,7 @@ pub fn generate_fake_enriched(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     #[test]

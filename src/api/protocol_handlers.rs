@@ -1,9 +1,11 @@
 //! API handlers for Protocol (Pattern Federation)
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams};
 use crate::events::EventEmitter;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::protocol::{
     self, validate_protocol_structure, Protocol, ProtocolCategory, ProtocolRun, ProtocolState,
@@ -2207,6 +2209,7 @@ pub async fn validate_all_protocols(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::protocol::StateType;
 

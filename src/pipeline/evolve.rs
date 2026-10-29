@@ -25,6 +25,7 @@
 //!
 //! # References
 //! - EvoFSM (2026): "Controllable Self-Evolution for Deep Research with FSMs"
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use std::sync::Arc;
@@ -34,6 +35,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 use crate::pipeline::critic::{
     CriticMode, CriticScore, GraphBasedCritic, LearningConfig, MutationCandidate, MutationCritic,
@@ -735,6 +737,7 @@ fn compute_failure_rate(runs: &[crate::protocol::models::ProtocolRun]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn make_pattern(

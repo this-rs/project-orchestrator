@@ -5,6 +5,7 @@
 //! Pure: the handler gathers the facts (health, catalogue), this module only
 //! shapes them, so a secret can never reach the body: an instance carries a
 //! credential REFERENCE and the origin of its endpoint, nothing else.
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use nexus_claude::agent::{Capabilities, HealthStatus, ProviderError, ProviderHealth};
@@ -291,6 +292,7 @@ pub use super::endpoint_guard::origin_of;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
     fn caps() -> Capabilities {

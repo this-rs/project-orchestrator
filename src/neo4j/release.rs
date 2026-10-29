@@ -1,4 +1,5 @@
 //! Neo4j Release operations
+#[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
 use super::client::{pascal_to_snake_case, Neo4jClient, WhereBuilder};
@@ -416,6 +417,7 @@ mod parent_existence_tests {
     use super::super::models::{ReleaseNode, ReleaseStatus};
     use super::super::traits::GraphStore;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use uuid::Uuid;
 
