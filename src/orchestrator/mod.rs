@@ -46,6 +46,18 @@ pub const IGNORED_PATH_SEGMENTS: &[&str] = &[
     // IDE settings
     "/.idea/",
     "/.vscode/",
+    // Git WORKTREES. A worktree is a checkout of the same repository on another
+    // branch, not code of the project: indexing it multiplies every file and
+    // every symbol by the number of branches, and buries the real graph under
+    // copies. Measured on 29/10/2026 in the local store (4 665 569 nodes):
+    // 511 678 `Function`, 356 834 `Impl`, 317 250 `Import` and 98 195 `Struct`
+    // lived under these segments — more than a million nodes of duplicates,
+    // and FIVE times more `Impl` in the copies than in the real source. Each
+    // repository names its worktrees differently, hence one entry per name.
+    "/_wt/",
+    "/.wt/",
+    "/.rlwt/",
+    "/worktrees/",
 ];
 
 /// Check whether a file path should be ignored during sync.
@@ -93,6 +105,34 @@ mod tests {
         assert!(!should_ignore_path("/project/src/distribution.rs"));
         // "rebuild" should NOT be caught by "/build/"
         assert!(!should_ignore_path("/project/src/rebuild.rs"));
+    }
+
+    /// A worktree is a copy of the repository on another branch, never the
+    /// project's code: no path under `_wt/`, `.wt/`, `.rlwt/` or `worktrees/`
+    /// may enter the graph.
+    #[test]
+    fn a_worktree_is_never_synced() {
+        for path in [
+            "/repo/_wt/feature-a/src/lib.rs",
+            "/repo/.wt/feature-b/src/lib.rs",
+            "/repo/.rlwt/feature-c/src/lib.rs",
+            "/repo/worktrees/feature-d/src/lib.rs",
+        ] {
+            assert!(should_ignore_path(path), "{path} is a worktree, not code");
+        }
+    }
+
+    /// The rule is anchored on the DIRECTORY: a source file whose name merely
+    /// ends like a worktree directory is still the project's code.
+    #[test]
+    fn a_file_named_after_a_worktree_is_still_code() {
+        for path in [
+            "/repo/src/worktrees.rs",
+            "/repo/src/wt.rs",
+            "/repo/src/features/rlwt.rs",
+        ] {
+            assert!(!should_ignore_path(path), "{path} is project code");
+        }
     }
 
     #[test]

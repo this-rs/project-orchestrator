@@ -234,7 +234,12 @@ pub fn parse_npm_manifest(
 /// architecture of the workspace.
 pub fn read_project_manifests(root: &Path) -> Vec<ManifestDependency> {
     const MAX_DEPTH: usize = 3;
-    const SKIP_DIRS: [&str; 10] = [
+    // A git worktree is a checkout of the same repository on another branch:
+    // reading its manifests would describe the architecture of a COPY, and the
+    // copies outnumber the branches. Same rule as the code sync filter
+    // (`crate::orchestrator::IGNORED_PATH_SEGMENTS`), by directory NAME here
+    // because this walker compares `file_name`.
+    const SKIP_DIRS: [&str; 14] = [
         "node_modules",
         "target",
         "vendor",
@@ -245,6 +250,10 @@ pub fn read_project_manifests(root: &Path) -> Vec<ManifestDependency> {
         "benches",
         "tests",
         "fixtures",
+        "_wt",
+        ".wt",
+        ".rlwt",
+        "worktrees",
     ];
 
     let mut out = Vec::new();

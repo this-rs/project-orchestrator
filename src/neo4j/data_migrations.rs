@@ -203,6 +203,82 @@ SET n.energy = CASE WHEN intended > coalesce(n.energy, 0.0) THEN intended ELSE n
 RETURN count(n) AS processed
 "#;
 
+/// Re-home the KNOWLEDGE that points INTO a worktree copy, onto the canonical
+/// file, BEFORE the purge deletes the copies.
+///
+/// A worktree path `…/_wt/<branch>/<relpath>` (or `.wt`, `.rlwt`, `worktrees`)
+/// is a copy of the canonical `…/<relpath>`. Notes, decisions, feature graphs,
+/// sessions and process steps that linked to a copy — 257 123 edges measured on
+/// 29/10/2026, 96% of them onto `File` — must follow the file, not vanish with
+/// the copy.
+///
+/// Each edge is re-pointed to the canonical twin (`File` by `path`, the symbols
+/// by `id`, all indexed) with `apoc.merge.relationship`: a note already linked
+/// to the twin keeps one edge (dedup), one linked only to the copy moves. The
+/// copy edge is deleted in every case, so a branch-only file (no canonical
+/// twin) loses its link but the NOTE survives — the explicit, measured choice,
+/// not a silent `DETACH`.
+const REHOME_WORKTREE_KNOWLEDGE: &str = r#"
+MATCH (w)
+WHERE (w:File OR w:Function OR w:Struct OR w:Trait)
+  AND any(seg IN ['/_wt/', '/.wt/', '/.rlwt/', '/worktrees/'] WHERE
+        coalesce(w.path, '') CONTAINS seg OR coalesce(w.file_path, '') CONTAINS seg)
+  AND ($scope IS NULL OR w.project_id = $scope)
+MATCH (k)-[r]->(w)
+WHERE type(r) IN ['LINKED_TO', 'AFFECTS', 'INCLUDES_ENTITY', 'DISCUSSED', 'STEP_IN_PROCESS']
+WITH k, r, w, split(coalesce(w.path, w.file_path), '/') AS parts
+WITH k, r, w, parts, [i IN range(0, size(parts)-1) WHERE parts[i] IN ['_wt', 'worktrees', '.wt', '.rlwt'] | i] AS hits
+WITH k, r, w, parts, hits[0] AS i
+WHERE i IS NOT NULL
+WITH k, r, w, parts, i
+LIMIT $batch
+WITH k, r, w,
+     apoc.text.join(parts[0..i] + parts[i+2..], '/') AS canon,
+     CASE WHEN w:File THEN '' ELSE substring(coalesce(w.id, ''), size(coalesce(w.file_path, ''))) END AS rest
+OPTIONAL MATCH (cf:File {path: canon})
+OPTIONAL MATCH (cFn:Function {id: canon + rest})
+OPTIONAL MATCH (cSt:Struct {id: canon + rest})
+OPTIONAL MATCH (cTr:Trait {id: canon + rest})
+WITH k, r, coalesce(cf, cFn, cSt, cTr) AS c
+CALL apoc.do.when(c IS NOT NULL,
+  'CALL apoc.merge.relationship($k, $t, {}, $p, $c) YIELD rel RETURN 1',
+  'RETURN 0',
+  {k: k, t: type(r), p: properties(r), c: c}) YIELD value
+DELETE r
+RETURN count(*) AS processed
+"#;
+
+/// Delete the code graph of git WORKTREES.
+///
+/// A worktree is a checkout of the SAME repository on another branch, so every
+/// file and symbol under `_wt/`, `.wt/`, `.rlwt/` or `worktrees/` is a copy of
+/// code the project's own tree already carries. Indexing them multiplied the
+/// graph by the number of branches: measured on 29/10/2026, **1 424 108** of
+/// 4 665 569 nodes stood under those segments — 511 678 `Function` and 356 834
+/// `Impl`, five times more `Impl` in the copies than in the real source.
+///
+/// `DETACH DELETE` takes their edges with them. It runs AFTER
+/// [`REHOME_WORKTREE_KNOWLEDGE`], which already moved the knowledge onto the
+/// canonical files; what the purge drops is therefore the structural edges
+/// between copies plus the branch-only links (no canonical twin). No project
+/// has its `root_path` inside a worktree (verified), so nothing legitimate is
+/// lost.
+///
+/// This only cleans what was indexed BEFORE the sync filter learned the rule
+/// (`IGNORED_PATH_SEGMENTS`, `crate::orchestrator`), which keeps them from
+/// coming back.
+const PURGE_WORKTREE_NODES: &str = r#"
+MATCH (n)
+WHERE ($scope IS NULL OR n.project_id = $scope)
+  AND (n:File OR n:Function OR n:Struct OR n:Impl OR n:Enum OR n:Trait OR n:Import)
+  AND any(seg IN ['/_wt/', '/.wt/', '/.rlwt/', '/worktrees/'] WHERE
+        coalesce(n.path, '') CONTAINS seg OR coalesce(n.file_path, '') CONTAINS seg)
+WITH n LIMIT $batch
+WITH collect(n) AS doomed
+FOREACH (x IN doomed | DETACH DELETE x)
+RETURN size(doomed) AS processed
+"#;
+
 /// Outcome of one migration on this start.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MigrationOutcome {
@@ -247,6 +323,20 @@ impl Neo4jClient {
                 id: "2026-09-purge-empty-archived-skills",
                 description: "Delete archived skills with no member and no reference",
                 batch: purge_archived_empty_skills_query(),
+                finalize: None,
+            },
+            DataMigration {
+                id: "2026-10-rehome-worktree-knowledge",
+                description:
+                    "Re-point knowledge that links a worktree copy onto the canonical file",
+                batch: REHOME_WORKTREE_KNOWLEDGE.to_string(),
+                finalize: None,
+            },
+            DataMigration {
+                id: "2026-10-purge-worktree-nodes",
+                description:
+                    "Delete the code graph of git worktrees (copies of the same repository)",
+                batch: PURGE_WORKTREE_NODES.to_string(),
                 finalize: None,
             },
         ]
@@ -464,8 +554,29 @@ mod tests {
                 "2026-09-restore-energy-decay-victims",
                 "2026-09-rebase-active-note-energy",
                 "2026-09-purge-empty-archived-skills",
+                "2026-10-rehome-worktree-knowledge",
+                "2026-10-purge-worktree-nodes",
             ]
         );
+    }
+
+    /// The worktree purge deletes COPIES of the project's code, never the code
+    /// itself: the predicate is anchored on the directory segments the sync
+    /// filter excludes, and it must name all four of them.
+    #[test]
+    fn test_worktree_purge_only_matches_worktree_segments() {
+        let m = Neo4jClient::data_migrations()
+            .into_iter()
+            .find(|m| m.id == "2026-10-purge-worktree-nodes")
+            .expect("the worktree purge is registered");
+        for seg in ["/_wt/", "/.wt/", "/.rlwt/", "/worktrees/"] {
+            assert!(m.batch.contains(seg), "the purge must name {seg}");
+        }
+        // It reads the two properties that carry a path, and nothing else.
+        assert!(m.batch.contains("n.path"));
+        assert!(m.batch.contains("n.file_path"));
+        // A copy is only deleted outright: DETACH takes its edges with it.
+        assert!(m.batch.contains("DETACH DELETE"));
     }
 
     #[test]
