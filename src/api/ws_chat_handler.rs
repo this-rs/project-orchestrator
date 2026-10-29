@@ -26,6 +26,7 @@ use std::collections::HashSet;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+use crate::neo4j::ProjectStore;
 
 /// Query parameters for the chat WebSocket
 #[derive(Debug, Deserialize, Default)]

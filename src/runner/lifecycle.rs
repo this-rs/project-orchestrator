@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::neo4j::traits::GraphStore;
 use crate::protocol::engine;
 use crate::protocol::routing::{rank_protocols, ContextVector, DimensionWeights};
+use crate::neo4j::ProjectStore;
 
 /// Result of lifecycle protocol routing.
 #[derive(Debug, Clone)]

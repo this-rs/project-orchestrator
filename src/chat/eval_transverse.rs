@@ -60,6 +60,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use uuid::Uuid;
+use crate::neo4j::ProjectStore;
 
 const WORLD_JSON: &str = include_str!("../../tests/fixtures/eval_transverse/world.json");
 const QUESTIONS_JSON: &str = include_str!("../../tests/fixtures/eval_transverse/questions.json");

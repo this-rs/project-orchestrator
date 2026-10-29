@@ -12,6 +12,7 @@
 use crate::neo4j::traits::GraphStore;
 use crate::protocol::{GeneratorConfig, LinkingStrategy, ProtocolRun, ProtocolState, RuntimeState};
 use anyhow::{bail, Result};
+use crate::neo4j::ProjectStore;
 
 /// Maximum number of RuntimeStates a single Generator can produce.
 pub const MAX_RUNTIME_STATES_PER_GENERATOR: usize = 50;

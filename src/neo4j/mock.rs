@@ -9,7 +9,7 @@ use crate::events::trigger::EventTrigger;
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
 use crate::neo4j::document::{Document, DocumentChunk, DocumentChunkHit};
 use crate::neo4j::models::*;
-use crate::neo4j::traits::{GraphStore, StoreCapabilities};
+use crate::neo4j::traits::{GraphStore, ProjectStore, StoreCapabilities};
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
 };
@@ -882,110 +882,6 @@ impl GraphStore for MockGraphStore {
             // (mock.rs:22) with no begin / commit / rollback.
             explicit_transactions: false,
         }
-    }
-
-    // ========================================================================
-    // Project operations
-    // ========================================================================
-
-    async fn create_project(&self, project: &ProjectNode) -> Result<()> {
-        self.projects
-            .write()
-            .await
-            .insert(project.id, project.clone());
-        Ok(())
-    }
-
-    async fn get_project(&self, id: Uuid) -> Result<Option<ProjectNode>> {
-        self.count_read();
-        Ok(self.projects.read().await.get(&id).cloned())
-    }
-
-    async fn get_project_by_slug(&self, slug: &str) -> Result<Option<ProjectNode>> {
-        self.count_read();
-        Ok(self
-            .projects
-            .read()
-            .await
-            .values()
-            .find(|p| p.slug == slug)
-            .cloned())
-    }
-
-    async fn list_projects(&self) -> Result<Vec<ProjectNode>> {
-        Ok(self.projects.read().await.values().cloned().collect())
-    }
-
-    async fn update_project(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<Option<String>>,
-        root_path: Option<String>,
-        profile: Option<ProjectProfile>,
-    ) -> Result<()> {
-        if let Some(p) = self.projects.write().await.get_mut(&id) {
-            if let Some(n) = name {
-                p.name = n;
-            }
-            if let Some(d) = description {
-                p.description = d;
-            }
-            if let Some(r) = root_path {
-                p.root_path = r;
-            }
-            if let Some(pr) = profile {
-                p.profile = pr;
-            }
-        }
-        Ok(())
-    }
-
-    async fn update_project_synced(&self, id: Uuid) -> Result<()> {
-        if let Some(p) = self.projects.write().await.get_mut(&id) {
-            p.last_synced = Some(Utc::now());
-        }
-        Ok(())
-    }
-
-    async fn update_project_analytics_timestamp(&self, id: Uuid) -> Result<()> {
-        if let Some(p) = self.projects.write().await.get_mut(&id) {
-            p.analytics_computed_at = Some(Utc::now());
-        }
-        Ok(())
-    }
-
-    async fn delete_project(&self, id: Uuid, _project_name: &str) -> Result<()> {
-        self.projects.write().await.remove(&id);
-        // Cascade: remove project files
-        self.project_files.write().await.remove(&id);
-        // Cascade: remove project plans and their children
-        // Note: collect plan_ids first and drop the lock before calling delete_plan
-        // to avoid deadlock (delete_plan also acquires project_plans lock)
-        let plan_ids = self
-            .project_plans
-            .write()
-            .await
-            .remove(&id)
-            .unwrap_or_default();
-        for plan_id in plan_ids {
-            self.delete_plan(plan_id).await?;
-        }
-        self.project_releases.write().await.remove(&id);
-        self.project_milestones.write().await.remove(&id);
-        // Cascade: remove environments and their deployments
-        let env_ids: Vec<Uuid> = self
-            .environments
-            .read()
-            .await
-            .values()
-            .filter(|e| e.project_id == id)
-            .map(|e| e.id)
-            .collect();
-        for env_id in env_ids {
-            self.delete_environment(env_id).await?;
-        }
-        Ok(())
     }
 
     // ========================================================================
@@ -19341,4 +19237,112 @@ mod rescope_tests {
             "it must have left the transverse library"
         );
     }
+}
+
+#[async_trait]
+impl ProjectStore for MockGraphStore {
+    // ========================================================================
+    // Project operations
+    // ========================================================================
+
+    async fn create_project(&self, project: &ProjectNode) -> Result<()> {
+        self.projects
+            .write()
+            .await
+            .insert(project.id, project.clone());
+        Ok(())
+    }
+
+    async fn get_project(&self, id: Uuid) -> Result<Option<ProjectNode>> {
+        self.count_read();
+        Ok(self.projects.read().await.get(&id).cloned())
+    }
+
+    async fn get_project_by_slug(&self, slug: &str) -> Result<Option<ProjectNode>> {
+        self.count_read();
+        Ok(self
+            .projects
+            .read()
+            .await
+            .values()
+            .find(|p| p.slug == slug)
+            .cloned())
+    }
+
+    async fn list_projects(&self) -> Result<Vec<ProjectNode>> {
+        Ok(self.projects.read().await.values().cloned().collect())
+    }
+
+    async fn update_project(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<Option<String>>,
+        root_path: Option<String>,
+        profile: Option<ProjectProfile>,
+    ) -> Result<()> {
+        if let Some(p) = self.projects.write().await.get_mut(&id) {
+            if let Some(n) = name {
+                p.name = n;
+            }
+            if let Some(d) = description {
+                p.description = d;
+            }
+            if let Some(r) = root_path {
+                p.root_path = r;
+            }
+            if let Some(pr) = profile {
+                p.profile = pr;
+            }
+        }
+        Ok(())
+    }
+
+    async fn update_project_synced(&self, id: Uuid) -> Result<()> {
+        if let Some(p) = self.projects.write().await.get_mut(&id) {
+            p.last_synced = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn update_project_analytics_timestamp(&self, id: Uuid) -> Result<()> {
+        if let Some(p) = self.projects.write().await.get_mut(&id) {
+            p.analytics_computed_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn delete_project(&self, id: Uuid, _project_name: &str) -> Result<()> {
+        self.projects.write().await.remove(&id);
+        // Cascade: remove project files
+        self.project_files.write().await.remove(&id);
+        // Cascade: remove project plans and their children
+        // Note: collect plan_ids first and drop the lock before calling delete_plan
+        // to avoid deadlock (delete_plan also acquires project_plans lock)
+        let plan_ids = self
+            .project_plans
+            .write()
+            .await
+            .remove(&id)
+            .unwrap_or_default();
+        for plan_id in plan_ids {
+            self.delete_plan(plan_id).await?;
+        }
+        self.project_releases.write().await.remove(&id);
+        self.project_milestones.write().await.remove(&id);
+        // Cascade: remove environments and their deployments
+        let env_ids: Vec<Uuid> = self
+            .environments
+            .read()
+            .await
+            .values()
+            .filter(|e| e.project_id == id)
+            .map(|e| e.id)
+            .collect();
+        for env_id in env_ids {
+            self.delete_environment(env_id).await?;
+        }
+        Ok(())
+    }
+
 }

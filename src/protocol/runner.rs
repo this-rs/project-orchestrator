@@ -24,6 +24,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+use crate::neo4j::ProjectStore;
 
 /// Base backoff delay for retries (1 second).
 const BASE_BACKOFF_MS: u64 = 1000;

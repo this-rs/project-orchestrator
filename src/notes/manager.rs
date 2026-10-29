@@ -15,6 +15,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
+use crate::neo4j::ProjectStore;
 
 /// Most files read when resolving a relative path by suffix (enough to tell
 /// "one project" from "several" without scanning a large monorepo).

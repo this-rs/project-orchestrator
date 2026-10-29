@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+use crate::neo4j::ProjectStore;
 
 /// Shared server state
 pub struct ServerState {

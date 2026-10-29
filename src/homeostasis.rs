@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
 use crate::notes::manager::NoteManager;
+use crate::neo4j::ProjectStore;
 
 /// Maximum number of corrective actions per evaluation cycle.
 const MAX_ACTIONS_PER_CYCLE: usize = 2;

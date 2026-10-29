@@ -26,6 +26,7 @@ use crate::chat::types::{ChatRequest, SpawnedBy};
 use crate::neo4j::traits::GraphStore;
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
+use crate::neo4j::ProjectStore;
 
 /// How deep a spawned session may sit under a human-opened (or runner-opened)
 /// one. 1 = a child may exist, a grandchild may not.

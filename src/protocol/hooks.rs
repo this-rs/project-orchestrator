@@ -30,6 +30,7 @@ use dashmap::DashMap;
 use std::sync::{Arc, LazyLock};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use crate::neo4j::ProjectStore;
 
 /// Global registry of active protocol runner tasks.
 ///

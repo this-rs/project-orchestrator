@@ -25,6 +25,7 @@ use crate::protocol::{
 };
 use anyhow::{bail, Context, Result};
 use uuid::Uuid;
+use crate::neo4j::ProjectStore;
 
 /// Maximum nesting depth for hierarchical protocol runs.
 /// Prevents infinite recursion when protocols reference each other.

@@ -1,3 +1,4 @@
+use crate::neo4j::ProjectStore;
 //! Integration tests for the Protocol Runner.
 //!
 //! Covers 4 E2E scenarios:

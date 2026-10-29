@@ -1834,6 +1834,7 @@ use crate::neo4j::models::{
 };
 use crate::neo4j::GraphStore;
 use crate::notes::models::{Note, NoteFilters, NoteImportance, NoteStatus, NoteType};
+use crate::neo4j::ProjectStore;
 
 // ============================================================================
 // ProjectContext — all dynamic data fetched from Neo4j

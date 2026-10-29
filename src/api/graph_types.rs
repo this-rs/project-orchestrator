@@ -8,6 +8,7 @@ use crate::neo4j::GraphStore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
+use crate::neo4j::ProjectStore;
 
 // ============================================================================
 // Graph visualization types

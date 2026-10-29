@@ -26,6 +26,7 @@ use super::enrichment::{CommunityEnricher, NoopCommunityEnricher};
 use super::extraction::GraphExtractor;
 use super::models::{AnalyticsConfig, FabricWeights, GraphAnalytics};
 use super::writer::AnalyticsWriter;
+use crate::neo4j::ProjectStore;
 
 // ============================================================================
 // Output type

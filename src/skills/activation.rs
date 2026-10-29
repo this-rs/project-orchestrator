@@ -30,6 +30,7 @@ use crate::notes::models::Note;
 use crate::skills::cache::{evaluate_cached_skill, SkillCache};
 use crate::skills::hook_extractor::{extract_file_context, extract_pattern};
 use crate::skills::models::{HookActivateResponse, SkillNode, TriggerType};
+use crate::neo4j::ProjectStore;
 
 // ============================================================================
 // Configuration

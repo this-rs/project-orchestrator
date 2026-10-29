@@ -90,49 +90,13 @@ impl Default for StoreCapabilities {
 /// Every public async method of `Neo4jClient` (excluding `new`, `init_schema`,
 /// `execute`, `execute_with_params`, and private helpers) is represented here.
 #[async_trait]
-pub trait GraphStore: Send + Sync {
+pub trait GraphStore: ProjectStore + Send + Sync {
     /// Manifest of what this store actually supports.
     ///
     /// Every adapter states it explicitly, with the values its own code proves;
     /// there is deliberately no default, so a new adapter cannot inherit a
     /// flattering manifest by accident.
     fn capabilities(&self) -> StoreCapabilities;
-
-    // ========================================================================
-    // Project operations
-    // ========================================================================
-
-    /// Create a new project
-    async fn create_project(&self, project: &ProjectNode) -> Result<()>;
-
-    /// Get a project by ID
-    async fn get_project(&self, id: Uuid) -> Result<Option<ProjectNode>>;
-
-    /// Get a project by slug
-    async fn get_project_by_slug(&self, slug: &str) -> Result<Option<ProjectNode>>;
-
-    /// List all projects
-    async fn list_projects(&self) -> Result<Vec<ProjectNode>>;
-
-    /// Update project fields (name, description, root_path)
-    async fn update_project(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<Option<String>>,
-        root_path: Option<String>,
-        profile: Option<ProjectProfile>,
-    ) -> Result<()>;
-
-    /// Update project last_synced timestamp
-    async fn update_project_synced(&self, id: Uuid) -> Result<()>;
-
-    /// Update project analytics_computed_at timestamp
-    async fn update_project_analytics_timestamp(&self, id: Uuid) -> Result<()>;
-
-    /// Delete a project and all its data.
-    /// `project_name` is used to tag archived notes/decisions with the source project.
-    async fn delete_project(&self, id: Uuid, project_name: &str) -> Result<()>;
 
     // ========================================================================
     // Workspace operations
@@ -4622,4 +4586,52 @@ mod tests {
             assert!(!v, "default capability `{key}` must be false");
         }
     }
+}
+
+// ============================================================================
+// Project management domain
+// ============================================================================
+
+/// The project-management domain: the project entity and its lifecycle.
+///
+/// `GraphStore` is its supertrait, so a consumer keeps calling these methods
+/// on a `dyn GraphStore` without knowing the domain exists.
+#[async_trait]
+pub trait ProjectStore: Send + Sync {
+    // ========================================================================
+    // Project operations
+    // ========================================================================
+
+    /// Create a new project
+    async fn create_project(&self, project: &ProjectNode) -> Result<()>;
+
+    /// Get a project by ID
+    async fn get_project(&self, id: Uuid) -> Result<Option<ProjectNode>>;
+
+    /// Get a project by slug
+    async fn get_project_by_slug(&self, slug: &str) -> Result<Option<ProjectNode>>;
+
+    /// List all projects
+    async fn list_projects(&self) -> Result<Vec<ProjectNode>>;
+
+    /// Update project fields (name, description, root_path)
+    async fn update_project(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<Option<String>>,
+        root_path: Option<String>,
+        profile: Option<ProjectProfile>,
+    ) -> Result<()>;
+
+    /// Update project last_synced timestamp
+    async fn update_project_synced(&self, id: Uuid) -> Result<()>;
+
+    /// Update project analytics_computed_at timestamp
+    async fn update_project_analytics_timestamp(&self, id: Uuid) -> Result<()>;
+
+    /// Delete a project and all its data.
+    /// `project_name` is used to tag archived notes/decisions with the source project.
+    async fn delete_project(&self, id: Uuid, project_name: &str) -> Result<()>;
+
 }

@@ -49,6 +49,7 @@ use crate::notes::{Note, NoteFilters, NoteStatus, NoteType};
 use crate::runner::eligibility::{resume_breakdown, runner_occupancy};
 use crate::runner::models::PlanRunStatus;
 use crate::runner::RunnerState as PlanRunState;
+use crate::neo4j::ProjectStore;
 
 /// Sessions idle for longer than this (and not live) are out of the cockpit:
 /// a question asked months ago to a CLI that is long gone is not actionable.

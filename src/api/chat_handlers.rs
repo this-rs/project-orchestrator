@@ -13,6 +13,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use crate::neo4j::ProjectStore;
 
 // ============================================================================
 // Create session + send first message

@@ -16,6 +16,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use tracing::debug;
 use uuid::Uuid;
+use crate::neo4j::ProjectStore;
 
 /// Builder for creating rich agent context
 pub struct ContextBuilder {

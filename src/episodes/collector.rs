@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::episodes::models::*;
 use crate::neo4j::GraphStore;
+use crate::neo4j::ProjectStore;
 
 /// Collect a complete Episode from a completed ProtocolRun.
 ///

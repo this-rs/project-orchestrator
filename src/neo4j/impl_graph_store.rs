@@ -8,7 +8,7 @@ use uuid::Uuid;
 use super::client::Neo4jClient;
 use super::document::{Document, DocumentChunk, DocumentChunkHit};
 use super::models::*;
-use super::traits::{GraphStore, StoreCapabilities};
+use super::traits::{GraphStore, ProjectStore, StoreCapabilities};
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
@@ -19,50 +19,6 @@ use crate::plan::models::{TaskDetails, UpdatePlanRequest, UpdateStepRequest, Upd
 impl GraphStore for Neo4jClient {
     fn capabilities(&self) -> StoreCapabilities {
         Neo4jClient::storage_capabilities()
-    }
-
-    // ========================================================================
-    // Project operations
-    // ========================================================================
-
-    async fn create_project(&self, project: &ProjectNode) -> anyhow::Result<()> {
-        self.create_project(project).await
-    }
-
-    async fn get_project(&self, id: Uuid) -> anyhow::Result<Option<ProjectNode>> {
-        self.get_project(id).await
-    }
-
-    async fn get_project_by_slug(&self, slug: &str) -> anyhow::Result<Option<ProjectNode>> {
-        self.get_project_by_slug(slug).await
-    }
-
-    async fn list_projects(&self) -> anyhow::Result<Vec<ProjectNode>> {
-        self.list_projects().await
-    }
-
-    async fn update_project(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<Option<String>>,
-        root_path: Option<String>,
-        profile: Option<ProjectProfile>,
-    ) -> anyhow::Result<()> {
-        self.update_project(id, name, description, root_path, profile)
-            .await
-    }
-
-    async fn update_project_synced(&self, id: Uuid) -> anyhow::Result<()> {
-        self.update_project_synced(id).await
-    }
-
-    async fn update_project_analytics_timestamp(&self, id: Uuid) -> anyhow::Result<()> {
-        self.update_project_analytics_timestamp(id).await
-    }
-
-    async fn delete_project(&self, id: Uuid, project_name: &str) -> anyhow::Result<()> {
-        self.delete_project(id, project_name).await
     }
 
     // ========================================================================
@@ -4944,4 +4900,52 @@ impl GraphStore for Neo4jClient {
         self.get_scoped_entity_neighborhood(center_type, center_id, params, filter)
             .await
     }
+}
+
+#[async_trait]
+impl ProjectStore for Neo4jClient {
+    // ========================================================================
+    // Project operations
+    // ========================================================================
+
+    async fn create_project(&self, project: &ProjectNode) -> anyhow::Result<()> {
+        self.create_project(project).await
+    }
+
+    async fn get_project(&self, id: Uuid) -> anyhow::Result<Option<ProjectNode>> {
+        self.get_project(id).await
+    }
+
+    async fn get_project_by_slug(&self, slug: &str) -> anyhow::Result<Option<ProjectNode>> {
+        self.get_project_by_slug(slug).await
+    }
+
+    async fn list_projects(&self) -> anyhow::Result<Vec<ProjectNode>> {
+        self.list_projects().await
+    }
+
+    async fn update_project(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<Option<String>>,
+        root_path: Option<String>,
+        profile: Option<ProjectProfile>,
+    ) -> anyhow::Result<()> {
+        self.update_project(id, name, description, root_path, profile)
+            .await
+    }
+
+    async fn update_project_synced(&self, id: Uuid) -> anyhow::Result<()> {
+        self.update_project_synced(id).await
+    }
+
+    async fn update_project_analytics_timestamp(&self, id: Uuid) -> anyhow::Result<()> {
+        self.update_project_analytics_timestamp(id).await
+    }
+
+    async fn delete_project(&self, id: Uuid, project_name: &str) -> anyhow::Result<()> {
+        self.delete_project(id, project_name).await
+    }
+
 }

@@ -19,6 +19,7 @@ use crate::neo4j::models::{PlanNode, PlanStatus, TaskStatus};
 use crate::neo4j::GraphStore;
 use crate::notes::NoteType;
 use crate::test_helpers::{test_project, test_workspace};
+use crate::neo4j::ProjectStore;
 
 fn fixture() -> Value {
     let raw = include_str!("../../tests/fixtures/refs/search_response.json");
