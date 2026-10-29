@@ -10,6 +10,8 @@
 //! - **Skip**: abort import, return conflict info
 //! - **Merge**: add new notes/decisions to the existing skill
 //! - **Replace**: delete the existing skill, create a fresh one
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 use anyhow::{Context, Result};
 use chrono::Utc;

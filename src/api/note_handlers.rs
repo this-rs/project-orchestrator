@@ -1,11 +1,12 @@
 //! API handlers for Knowledge Notes
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams, SearchFilter};
 use crate::events::graph::GraphEvent;
 use crate::graph::algorithms::add_thermal_noise;
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
+
 use crate::notes::{
     BackfillProgress, CreateAnchorRequest, CreateNoteRequest, EntityType, LinkNoteRequest, Note,
     NoteContextResponse, NoteFilters, NoteImportance, NoteScope, NoteSearchHit, NoteStatus,
@@ -1922,6 +1923,7 @@ mod tests {
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
     use crate::events::EventBus;
+    use crate::neo4j::{ProjectStore, WorkspaceStore};
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_bearer_token};
     use axum::body::Body;

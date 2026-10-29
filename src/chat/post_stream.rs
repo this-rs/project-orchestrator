@@ -8,6 +8,8 @@
 //! - Streaming status updates
 //! - Event persistence to Neo4j
 //! - Memory/feedback/RFC recording
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 use super::manager::ActiveSession;
 use super::provider::cognitive::segment::{Boundary, Segment};
@@ -31,8 +33,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 use std::collections::VecDeque;
 
 /// Longest a single post-stream step may hold the turn.

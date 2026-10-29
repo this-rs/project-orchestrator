@@ -1,4 +1,6 @@
 //! API request handlers
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 use crate::api::{
     workspace_handlers::{MilestonePlanSummary, MilestoneStepSummary, MilestoneTaskSummary},
@@ -15,9 +17,9 @@ use crate::neo4j::models::{
     ReleaseStatus, StepNode, TaskNode, TaskStatus, TaskWithPlan,
 };
 use crate::neo4j::plan::{compute_file_conflicts, WaveComputationResult};
-use crate::neo4j::ProjectStore;
+
 use crate::neo4j::StoreCapabilities;
-use crate::neo4j::WorkspaceStore;
+
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::plan::models::*;
 use crate::AuthConfig;

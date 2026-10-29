@@ -1,4 +1,6 @@
 //! Chat API handlers — session management (streaming via WebSocket)
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 use crate::api::handlers::{AppError, OrchestratorState};
 use crate::api::query::{PaginatedResponse, PaginationParams};
@@ -7,8 +9,7 @@ use crate::chat::types::{
     MessageSearchResult, SessionActivity,
 };
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
+
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -6847,6 +6848,7 @@ pub mod anchors {
         use crate::graph::neighborhood::RawNode;
         use crate::neo4j::mock::MockGraphStore;
         use crate::neo4j::GraphStore;
+        use crate::neo4j::{ProjectStore, WorkspaceStore};
         use crate::test_helpers::{
             router_with_auth_and_events, test_bearer_token, test_chat_session, test_project_named,
         };

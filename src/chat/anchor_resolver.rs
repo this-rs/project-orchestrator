@@ -36,6 +36,8 @@
 //!   omis", which only counts readable nodes cut by the budget. Refused nodes
 //!   are kept as opaque ids in [`AnchorExpansion::denied`] for audit and are
 //!   never rendered, so the number of refused nodes cannot leak.
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 use crate::chat::anchor::{Anchor, AnchorRole, AnchorState, AnchorTargetType};
 use crate::chat::untrusted::{self, Origin};
@@ -45,8 +47,7 @@ use crate::graph::neighborhood::{
 };
 use crate::neo4j::models::ExecutionPlace;
 use crate::neo4j::GraphStore;
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
+
 use crate::sharing::consent_gate::{ConsentReader, ReadDenial, ReadVerdict};
 use anyhow::Result;
 use hmac::{digest::KeyInit, Hmac, Mac};

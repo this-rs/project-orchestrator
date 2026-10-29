@@ -13,6 +13,8 @@
 //! health and note density only, avoiding duplicate consolidation calls.
 //!
 //! Max 2 corrective actions per cycle to prevent runaway corrections.
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 use std::fmt;
 use std::sync::Arc;
@@ -23,8 +25,7 @@ use uuid::Uuid;
 
 use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
+
 use crate::notes::manager::NoteManager;
 
 /// Maximum number of corrective actions per evaluation cycle.

@@ -19,6 +19,8 @@
 //!    prompt; the stored/broadcast message keeps the visible text and the ids.
 //! 5. **No refs, no change.** A message without references is handled exactly as
 //!    before this module existed, attachments included.
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 use std::collections::HashSet;
 use std::sync::Arc;

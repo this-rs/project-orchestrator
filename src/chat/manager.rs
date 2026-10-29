@@ -8,6 +8,8 @@
 //! - Structured events are persisted in Neo4j with sequence numbers for replay
 //! - Inactive sessions are persisted in Neo4j with `cli_session_id` for resume
 //! - A cleanup task periodically closes timed-out sessions
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 use super::config::ChatConfig;
 use super::post_tool_hook;
@@ -43,8 +45,6 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::expand_tilde;
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 mod recovery;
 pub use recovery::{RecoveryReport, ScanReport};

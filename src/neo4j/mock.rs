@@ -885,672 +885,6 @@ impl GraphStore for MockGraphStore {
     }
 
     // ========================================================================
-    // Workspace Milestone operations
-    // ========================================================================
-
-    async fn create_workspace_milestone(&self, milestone: &WorkspaceMilestoneNode) -> Result<()> {
-        let ms_id = milestone.id;
-        let ws_id = milestone.workspace_id;
-        self.workspace_milestones
-            .write()
-            .await
-            .insert(ms_id, milestone.clone());
-        self.workspace_ws_milestones
-            .write()
-            .await
-            .entry(ws_id)
-            .or_default()
-            .push(ms_id);
-        Ok(())
-    }
-
-    async fn get_workspace_milestone(&self, id: Uuid) -> Result<Option<WorkspaceMilestoneNode>> {
-        Ok(self.workspace_milestones.read().await.get(&id).cloned())
-    }
-
-    async fn list_workspace_milestones(
-        &self,
-        workspace_id: Uuid,
-    ) -> Result<Vec<WorkspaceMilestoneNode>> {
-        let wm = self.workspace_ws_milestones.read().await;
-        let milestones = self.workspace_milestones.read().await;
-        let ids = wm.get(&workspace_id).cloned().unwrap_or_default();
-        Ok(ids
-            .iter()
-            .filter_map(|id| milestones.get(id).cloned())
-            .collect())
-    }
-
-    async fn list_workspace_milestones_filtered(
-        &self,
-        workspace_id: Uuid,
-        status: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<WorkspaceMilestoneNode>, usize)> {
-        let all = self.list_workspace_milestones(workspace_id).await?;
-        let filtered: Vec<_> = all
-            .into_iter()
-            .filter(|m| {
-                if let Some(s) = status {
-                    let ms = serde_json::to_string(&m.status)
-                        .unwrap_or_default()
-                        .trim_matches('"')
-                        .to_string();
-                    ms == s
-                } else {
-                    true
-                }
-            })
-            .collect();
-        let total = filtered.len();
-        Ok((paginate(&filtered, limit, offset), total))
-    }
-
-    async fn list_all_workspace_milestones_filtered(
-        &self,
-        workspace_id: Option<Uuid>,
-        status: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<(WorkspaceMilestoneNode, String, String, String)>> {
-        let milestones = self.workspace_milestones.read().await;
-        let workspaces = self.workspaces.read().await;
-        let mut results: Vec<(WorkspaceMilestoneNode, String, String, String)> = Vec::new();
-        for m in milestones.values() {
-            if let Some(ws_id) = workspace_id {
-                if m.workspace_id != ws_id {
-                    continue;
-                }
-            }
-            if let Some(s) = status {
-                let ms = serde_json::to_string(&m.status)
-                    .unwrap_or_default()
-                    .trim_matches('"')
-                    .to_string();
-                if ms != s {
-                    continue;
-                }
-            }
-            let ws = workspaces.get(&m.workspace_id);
-            let ws_id_str = m.workspace_id.to_string();
-            let ws_name = ws.map(|w| w.name.clone()).unwrap_or_default();
-            let ws_slug = ws.map(|w| w.slug.clone()).unwrap_or_default();
-            results.push((m.clone(), ws_id_str, ws_name, ws_slug));
-        }
-        Ok(paginate(&results, limit, offset))
-    }
-
-    async fn count_all_workspace_milestones(
-        &self,
-        workspace_id: Option<Uuid>,
-        status: Option<&str>,
-    ) -> Result<usize> {
-        let milestones = self.workspace_milestones.read().await;
-        let count = milestones
-            .values()
-            .filter(|m| {
-                if let Some(ws_id) = workspace_id {
-                    if m.workspace_id != ws_id {
-                        return false;
-                    }
-                }
-                if let Some(s) = status {
-                    let ms = serde_json::to_string(&m.status)
-                        .unwrap_or_default()
-                        .trim_matches('"')
-                        .to_string();
-                    if ms != s {
-                        return false;
-                    }
-                }
-                true
-            })
-            .count();
-        Ok(count)
-    }
-
-    async fn update_workspace_milestone(
-        &self,
-        id: Uuid,
-        title: Option<String>,
-        description: Option<String>,
-        status: Option<MilestoneStatus>,
-        target_date: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<bool> {
-        let mut milestones = self.workspace_milestones.write().await;
-        let Some(m) = milestones.get_mut(&id) else {
-            return Ok(false);
-        };
-        if let Some(t) = title {
-            m.title = t;
-        }
-        if let Some(d) = description {
-            m.description = Some(d);
-        }
-        if let Some(s) = status {
-            m.status = s;
-        }
-        if let Some(td) = target_date {
-            m.target_date = Some(td);
-        }
-        Ok(true)
-    }
-
-    async fn delete_workspace_milestone(&self, id: Uuid) -> Result<()> {
-        if let Some(m) = self.workspace_milestones.write().await.remove(&id) {
-            if let Some(ids) = self
-                .workspace_ws_milestones
-                .write()
-                .await
-                .get_mut(&m.workspace_id)
-            {
-                ids.retain(|i| *i != id);
-            }
-        }
-        self.ws_milestone_tasks.write().await.remove(&id);
-        Ok(())
-    }
-
-    async fn add_task_to_workspace_milestone(
-        &self,
-        milestone_id: Uuid,
-        task_id: Uuid,
-    ) -> Result<()> {
-        self.ws_milestone_tasks
-            .write()
-            .await
-            .entry(milestone_id)
-            .or_default()
-            .push(task_id);
-        Ok(())
-    }
-
-    async fn remove_task_from_workspace_milestone(
-        &self,
-        milestone_id: Uuid,
-        task_id: Uuid,
-    ) -> Result<()> {
-        if let Some(tasks) = self.ws_milestone_tasks.write().await.get_mut(&milestone_id) {
-            tasks.retain(|t| *t != task_id);
-        }
-        Ok(())
-    }
-
-    async fn link_plan_to_workspace_milestone(
-        &self,
-        plan_id: Uuid,
-        milestone_id: Uuid,
-    ) -> Result<()> {
-        let mut map = self.ws_milestone_plans.write().await;
-        let plans = map.entry(milestone_id).or_default();
-        if !plans.contains(&plan_id) {
-            plans.push(plan_id);
-        }
-        Ok(())
-    }
-
-    async fn unlink_plan_from_workspace_milestone(
-        &self,
-        plan_id: Uuid,
-        milestone_id: Uuid,
-    ) -> Result<()> {
-        if let Some(plans) = self.ws_milestone_plans.write().await.get_mut(&milestone_id) {
-            plans.retain(|p| *p != plan_id);
-        }
-        Ok(())
-    }
-
-    async fn get_workspace_milestone_progress(
-        &self,
-        milestone_id: Uuid,
-    ) -> Result<(u32, u32, u32, u32)> {
-        let task_ids = self
-            .ws_milestone_tasks
-            .read()
-            .await
-            .get(&milestone_id)
-            .cloned()
-            .unwrap_or_default();
-        let tasks = self.tasks.read().await;
-        let mut total = 0u32;
-        let mut completed = 0u32;
-        let mut in_progress = 0u32;
-        let mut pending = 0u32;
-        for tid in &task_ids {
-            if let Some(t) = tasks.get(tid) {
-                total += 1;
-                match t.status {
-                    TaskStatus::Completed => completed += 1,
-                    TaskStatus::InProgress => in_progress += 1,
-                    TaskStatus::Pending => pending += 1,
-                    _ => {}
-                }
-            }
-        }
-        Ok((total, completed, in_progress, pending))
-    }
-
-    async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskWithPlan>> {
-        let task_ids = self
-            .ws_milestone_tasks
-            .read()
-            .await
-            .get(&milestone_id)
-            .cloned()
-            .unwrap_or_default();
-        let tasks = self.tasks.read().await;
-        let plan_tasks = self.plan_tasks.read().await;
-        let plans = self.plans.read().await;
-
-        Ok(task_ids
-            .iter()
-            .filter_map(|id| {
-                let task = tasks.get(id)?.clone();
-                // Find which plan owns this task
-                let (plan_id, plan_title) = plan_tasks
-                    .iter()
-                    .find_map(|(pid, tids)| {
-                        if tids.contains(id) {
-                            let title = plans.get(pid).map(|p| p.title.clone()).unwrap_or_default();
-                            Some((*pid, title))
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-                let plan_status = plans.get(&plan_id).map(|p| {
-                    serde_json::to_value(&p.status)
-                        .unwrap()
-                        .as_str()
-                        .unwrap()
-                        .to_string()
-                });
-                Some(TaskWithPlan {
-                    task,
-                    plan_id,
-                    plan_title,
-                    plan_status,
-                })
-            })
-            .collect())
-    }
-
-    async fn get_workspace_milestone_steps(
-        &self,
-        milestone_id: Uuid,
-    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>> {
-        let task_ids = self
-            .ws_milestone_tasks
-            .read()
-            .await
-            .get(&milestone_id)
-            .cloned()
-            .unwrap_or_default();
-        let steps = self.steps.read().await;
-        let task_steps = self.task_steps.read().await;
-
-        let mut map: std::collections::HashMap<Uuid, Vec<StepNode>> =
-            std::collections::HashMap::new();
-        for tid in &task_ids {
-            if let Some(step_ids) = task_steps.get(tid) {
-                let mut task_step_list: Vec<StepNode> = step_ids
-                    .iter()
-                    .filter_map(|sid| steps.get(sid).cloned())
-                    .collect();
-                task_step_list.sort_by_key(|s| s.order);
-                map.insert(*tid, task_step_list);
-            }
-        }
-        Ok(map)
-    }
-
-    // ========================================================================
-    // Resource operations
-    // ========================================================================
-
-    async fn create_resource(&self, resource: &ResourceNode) -> Result<()> {
-        let rid = resource.id;
-        if let Some(ws_id) = resource.workspace_id {
-            self.workspace_resources
-                .write()
-                .await
-                .entry(ws_id)
-                .or_default()
-                .push(rid);
-        }
-        self.resources.write().await.insert(rid, resource.clone());
-        Ok(())
-    }
-
-    async fn get_resource(&self, id: Uuid) -> Result<Option<ResourceNode>> {
-        Ok(self.resources.read().await.get(&id).cloned())
-    }
-
-    async fn list_workspace_resources(&self, workspace_id: Uuid) -> Result<Vec<ResourceNode>> {
-        let wr = self.workspace_resources.read().await;
-        let resources = self.resources.read().await;
-        let ids = wr.get(&workspace_id).cloned().unwrap_or_default();
-        Ok(ids
-            .iter()
-            .filter_map(|id| resources.get(id).cloned())
-            .collect())
-    }
-
-    async fn update_resource(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        file_path: Option<String>,
-        url: Option<String>,
-        version: Option<String>,
-        description: Option<String>,
-    ) -> Result<bool> {
-        let mut resources = self.resources.write().await;
-        let Some(r) = resources.get_mut(&id) else {
-            return Ok(false);
-        };
-        if let Some(n) = name {
-            r.name = n;
-        }
-        if let Some(fp) = file_path {
-            r.file_path = fp;
-        }
-        if let Some(u) = url {
-            r.url = Some(u);
-        }
-        if let Some(v) = version {
-            r.version = Some(v);
-        }
-        if let Some(d) = description {
-            r.description = Some(d);
-        }
-        r.updated_at = Some(Utc::now());
-        Ok(true)
-    }
-
-    async fn delete_resource(&self, id: Uuid) -> Result<()> {
-        if let Some(r) = self.resources.write().await.remove(&id) {
-            if let Some(ws_id) = r.workspace_id {
-                if let Some(ids) = self.workspace_resources.write().await.get_mut(&ws_id) {
-                    ids.retain(|i| *i != id);
-                }
-            }
-        }
-        self.resource_implementers.write().await.remove(&id);
-        self.resource_consumers.write().await.remove(&id);
-        Ok(())
-    }
-
-    async fn link_project_implements_resource(
-        &self,
-        project_id: Uuid,
-        resource_id: Uuid,
-    ) -> Result<()> {
-        self.resource_implementers
-            .write()
-            .await
-            .entry(resource_id)
-            .or_default()
-            .push(project_id);
-        Ok(())
-    }
-
-    async fn link_project_uses_resource(&self, project_id: Uuid, resource_id: Uuid) -> Result<()> {
-        self.resource_consumers
-            .write()
-            .await
-            .entry(resource_id)
-            .or_default()
-            .push(project_id);
-        Ok(())
-    }
-
-    async fn get_resource_implementers(&self, resource_id: Uuid) -> Result<Vec<ProjectNode>> {
-        let ri = self.resource_implementers.read().await;
-        let projects = self.projects.read().await;
-        let ids = ri.get(&resource_id).cloned().unwrap_or_default();
-        Ok(ids
-            .iter()
-            .filter_map(|id| projects.get(id).cloned())
-            .collect())
-    }
-
-    async fn get_resource_consumers(&self, resource_id: Uuid) -> Result<Vec<ProjectNode>> {
-        let rc = self.resource_consumers.read().await;
-        let projects = self.projects.read().await;
-        let ids = rc.get(&resource_id).cloned().unwrap_or_default();
-        Ok(ids
-            .iter()
-            .filter_map(|id| projects.get(id).cloned())
-            .collect())
-    }
-
-    // ========================================================================
-    // Component operations (Topology)
-    // ========================================================================
-
-    async fn create_component(&self, component: &ComponentNode) -> Result<()> {
-        let cid = component.id;
-        let ws_id = component.workspace_id;
-        self.workspace_components
-            .write()
-            .await
-            .entry(ws_id)
-            .or_default()
-            .push(cid);
-        self.components.write().await.insert(cid, component.clone());
-        Ok(())
-    }
-
-    async fn get_component(&self, id: Uuid) -> Result<Option<ComponentNode>> {
-        Ok(self.components.read().await.get(&id).cloned())
-    }
-
-    async fn list_components(&self, workspace_id: Uuid) -> Result<Vec<ComponentNode>> {
-        let wc = self.workspace_components.read().await;
-        let components = self.components.read().await;
-        let ids = wc.get(&workspace_id).cloned().unwrap_or_default();
-        Ok(ids
-            .iter()
-            .filter_map(|id| components.get(id).cloned())
-            .collect())
-    }
-
-    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<bool> {
-        let ComponentUpdate {
-            name,
-            component_type,
-            description,
-            runtime,
-            config,
-            tags,
-        } = patch;
-        let mut components = self.components.write().await;
-        // Same contract as the store: an unknown id writes nothing and says so.
-        let Some(c) = components.get_mut(&id) else {
-            return Ok(false);
-        };
-        if let Some(n) = name {
-            c.name = n;
-        }
-        if let Some(t) = component_type {
-            c.component_type = t;
-        }
-        if let Some(d) = description {
-            c.description = Some(d);
-        }
-        if let Some(r) = runtime {
-            c.runtime = Some(r);
-        }
-        if let Some(cfg) = config {
-            c.config = cfg;
-        }
-        if let Some(t) = tags {
-            c.tags = t;
-        }
-        Ok(true)
-    }
-
-    async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> Result<Uuid> {
-        let DerivedComponentWrite {
-            workspace_id,
-            name,
-            component_type,
-            description,
-            runtime,
-            tags,
-            config,
-        } = write;
-        let mut components = self.components.write().await;
-
-        // Identity is (workspace, name) — mirrors the MERGE key in Cypher.
-        if let Some(existing) = components
-            .values_mut()
-            .find(|c| c.workspace_id == workspace_id && c.name == name)
-        {
-            existing.component_type = component_type;
-            existing.config = config;
-            if let Some(r) = runtime.filter(|r| !r.is_empty()) {
-                existing.runtime = Some(r);
-            }
-            // Human-authored text survives a re-derivation.
-            if existing
-                .description
-                .as_deref()
-                .unwrap_or_default()
-                .is_empty()
-            {
-                existing.description = description;
-            }
-            if existing.tags.is_empty() {
-                existing.tags = tags;
-            }
-            return Ok(existing.id);
-        }
-
-        let id = Uuid::new_v4();
-        components.insert(
-            id,
-            ComponentNode {
-                id,
-                workspace_id,
-                name,
-                component_type,
-                description,
-                runtime: runtime.filter(|r| !r.is_empty()),
-                config,
-                created_at: chrono::Utc::now(),
-                tags,
-            },
-        );
-        drop(components);
-
-        self.workspace_components
-            .write()
-            .await
-            .entry(workspace_id)
-            .or_default()
-            .push(id);
-
-        Ok(id)
-    }
-
-    async fn delete_component(&self, id: Uuid) -> Result<()> {
-        if let Some(c) = self.components.write().await.remove(&id) {
-            if let Some(ids) = self
-                .workspace_components
-                .write()
-                .await
-                .get_mut(&c.workspace_id)
-            {
-                ids.retain(|i| *i != id);
-            }
-        }
-        self.component_dependencies.write().await.remove(&id);
-        self.component_projects.write().await.remove(&id);
-        // Also remove this component from other components' dependency lists
-        let mut cd = self.component_dependencies.write().await;
-        for deps in cd.values_mut() {
-            deps.retain(|(dep_id, _, _)| *dep_id != id);
-        }
-        Ok(())
-    }
-
-    async fn add_component_dependency(
-        &self,
-        component_id: Uuid,
-        depends_on_id: Uuid,
-        protocol: Option<String>,
-        required: bool,
-    ) -> Result<()> {
-        self.component_dependencies
-            .write()
-            .await
-            .entry(component_id)
-            .or_default()
-            .push((depends_on_id, protocol, required));
-        Ok(())
-    }
-
-    async fn remove_component_dependency(
-        &self,
-        component_id: Uuid,
-        depends_on_id: Uuid,
-    ) -> Result<()> {
-        if let Some(deps) = self
-            .component_dependencies
-            .write()
-            .await
-            .get_mut(&component_id)
-        {
-            deps.retain(|(id, _, _)| *id != depends_on_id);
-        }
-        Ok(())
-    }
-
-    async fn map_component_to_project(&self, component_id: Uuid, project_id: Uuid) -> Result<()> {
-        self.component_projects
-            .write()
-            .await
-            .insert(component_id, project_id);
-        Ok(())
-    }
-
-    async fn get_workspace_topology(
-        &self,
-        workspace_id: Uuid,
-    ) -> Result<Vec<(ComponentNode, Option<String>, Vec<ComponentDependency>)>> {
-        let components = self.list_components(workspace_id).await?;
-        let cd = self.component_dependencies.read().await;
-        let cp = self.component_projects.read().await;
-        let projects = self.projects.read().await;
-
-        let mut result = Vec::new();
-        for comp in components {
-            let project_slug = cp
-                .get(&comp.id)
-                .and_then(|pid| projects.get(pid))
-                .map(|p| p.slug.clone());
-            let deps = cd
-                .get(&comp.id)
-                .map(|deps| {
-                    deps.iter()
-                        .map(|(to_id, protocol, required)| ComponentDependency {
-                            from_id: comp.id,
-                            to_id: *to_id,
-                            protocol: protocol.clone(),
-                            required: *required,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            result.push((comp, project_slug, deps));
-        }
-        Ok(result)
-    }
-
-    // ========================================================================
     // File operations
     // ========================================================================
 
@@ -19346,5 +18680,670 @@ impl WorkspaceStore for MockGraphStore {
             entries: Vec::new(),
             project_count: projects.len(),
         })
+    }
+    // ========================================================================
+    // Workspace Milestone operations
+    // ========================================================================
+
+    async fn create_workspace_milestone(&self, milestone: &WorkspaceMilestoneNode) -> Result<()> {
+        let ms_id = milestone.id;
+        let ws_id = milestone.workspace_id;
+        self.workspace_milestones
+            .write()
+            .await
+            .insert(ms_id, milestone.clone());
+        self.workspace_ws_milestones
+            .write()
+            .await
+            .entry(ws_id)
+            .or_default()
+            .push(ms_id);
+        Ok(())
+    }
+
+    async fn get_workspace_milestone(&self, id: Uuid) -> Result<Option<WorkspaceMilestoneNode>> {
+        Ok(self.workspace_milestones.read().await.get(&id).cloned())
+    }
+
+    async fn list_workspace_milestones(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Vec<WorkspaceMilestoneNode>> {
+        let wm = self.workspace_ws_milestones.read().await;
+        let milestones = self.workspace_milestones.read().await;
+        let ids = wm.get(&workspace_id).cloned().unwrap_or_default();
+        Ok(ids
+            .iter()
+            .filter_map(|id| milestones.get(id).cloned())
+            .collect())
+    }
+
+    async fn list_workspace_milestones_filtered(
+        &self,
+        workspace_id: Uuid,
+        status: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<WorkspaceMilestoneNode>, usize)> {
+        let all = self.list_workspace_milestones(workspace_id).await?;
+        let filtered: Vec<_> = all
+            .into_iter()
+            .filter(|m| {
+                if let Some(s) = status {
+                    let ms = serde_json::to_string(&m.status)
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_string();
+                    ms == s
+                } else {
+                    true
+                }
+            })
+            .collect();
+        let total = filtered.len();
+        Ok((paginate(&filtered, limit, offset), total))
+    }
+
+    async fn list_all_workspace_milestones_filtered(
+        &self,
+        workspace_id: Option<Uuid>,
+        status: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<(WorkspaceMilestoneNode, String, String, String)>> {
+        let milestones = self.workspace_milestones.read().await;
+        let workspaces = self.workspaces.read().await;
+        let mut results: Vec<(WorkspaceMilestoneNode, String, String, String)> = Vec::new();
+        for m in milestones.values() {
+            if let Some(ws_id) = workspace_id {
+                if m.workspace_id != ws_id {
+                    continue;
+                }
+            }
+            if let Some(s) = status {
+                let ms = serde_json::to_string(&m.status)
+                    .unwrap_or_default()
+                    .trim_matches('"')
+                    .to_string();
+                if ms != s {
+                    continue;
+                }
+            }
+            let ws = workspaces.get(&m.workspace_id);
+            let ws_id_str = m.workspace_id.to_string();
+            let ws_name = ws.map(|w| w.name.clone()).unwrap_or_default();
+            let ws_slug = ws.map(|w| w.slug.clone()).unwrap_or_default();
+            results.push((m.clone(), ws_id_str, ws_name, ws_slug));
+        }
+        Ok(paginate(&results, limit, offset))
+    }
+
+    async fn count_all_workspace_milestones(
+        &self,
+        workspace_id: Option<Uuid>,
+        status: Option<&str>,
+    ) -> Result<usize> {
+        let milestones = self.workspace_milestones.read().await;
+        let count = milestones
+            .values()
+            .filter(|m| {
+                if let Some(ws_id) = workspace_id {
+                    if m.workspace_id != ws_id {
+                        return false;
+                    }
+                }
+                if let Some(s) = status {
+                    let ms = serde_json::to_string(&m.status)
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_string();
+                    if ms != s {
+                        return false;
+                    }
+                }
+                true
+            })
+            .count();
+        Ok(count)
+    }
+
+    async fn update_workspace_milestone(
+        &self,
+        id: Uuid,
+        title: Option<String>,
+        description: Option<String>,
+        status: Option<MilestoneStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool> {
+        let mut milestones = self.workspace_milestones.write().await;
+        let Some(m) = milestones.get_mut(&id) else {
+            return Ok(false);
+        };
+        if let Some(t) = title {
+            m.title = t;
+        }
+        if let Some(d) = description {
+            m.description = Some(d);
+        }
+        if let Some(s) = status {
+            m.status = s;
+        }
+        if let Some(td) = target_date {
+            m.target_date = Some(td);
+        }
+        Ok(true)
+    }
+
+    async fn delete_workspace_milestone(&self, id: Uuid) -> Result<()> {
+        if let Some(m) = self.workspace_milestones.write().await.remove(&id) {
+            if let Some(ids) = self
+                .workspace_ws_milestones
+                .write()
+                .await
+                .get_mut(&m.workspace_id)
+            {
+                ids.retain(|i| *i != id);
+            }
+        }
+        self.ws_milestone_tasks.write().await.remove(&id);
+        Ok(())
+    }
+
+    async fn add_task_to_workspace_milestone(
+        &self,
+        milestone_id: Uuid,
+        task_id: Uuid,
+    ) -> Result<()> {
+        self.ws_milestone_tasks
+            .write()
+            .await
+            .entry(milestone_id)
+            .or_default()
+            .push(task_id);
+        Ok(())
+    }
+
+    async fn remove_task_from_workspace_milestone(
+        &self,
+        milestone_id: Uuid,
+        task_id: Uuid,
+    ) -> Result<()> {
+        if let Some(tasks) = self.ws_milestone_tasks.write().await.get_mut(&milestone_id) {
+            tasks.retain(|t| *t != task_id);
+        }
+        Ok(())
+    }
+
+    async fn link_plan_to_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> Result<()> {
+        let mut map = self.ws_milestone_plans.write().await;
+        let plans = map.entry(milestone_id).or_default();
+        if !plans.contains(&plan_id) {
+            plans.push(plan_id);
+        }
+        Ok(())
+    }
+
+    async fn unlink_plan_from_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> Result<()> {
+        if let Some(plans) = self.ws_milestone_plans.write().await.get_mut(&milestone_id) {
+            plans.retain(|p| *p != plan_id);
+        }
+        Ok(())
+    }
+
+    async fn get_workspace_milestone_progress(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<(u32, u32, u32, u32)> {
+        let task_ids = self
+            .ws_milestone_tasks
+            .read()
+            .await
+            .get(&milestone_id)
+            .cloned()
+            .unwrap_or_default();
+        let tasks = self.tasks.read().await;
+        let mut total = 0u32;
+        let mut completed = 0u32;
+        let mut in_progress = 0u32;
+        let mut pending = 0u32;
+        for tid in &task_ids {
+            if let Some(t) = tasks.get(tid) {
+                total += 1;
+                match t.status {
+                    TaskStatus::Completed => completed += 1,
+                    TaskStatus::InProgress => in_progress += 1,
+                    TaskStatus::Pending => pending += 1,
+                    _ => {}
+                }
+            }
+        }
+        Ok((total, completed, in_progress, pending))
+    }
+
+    async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskWithPlan>> {
+        let task_ids = self
+            .ws_milestone_tasks
+            .read()
+            .await
+            .get(&milestone_id)
+            .cloned()
+            .unwrap_or_default();
+        let tasks = self.tasks.read().await;
+        let plan_tasks = self.plan_tasks.read().await;
+        let plans = self.plans.read().await;
+
+        Ok(task_ids
+            .iter()
+            .filter_map(|id| {
+                let task = tasks.get(id)?.clone();
+                // Find which plan owns this task
+                let (plan_id, plan_title) = plan_tasks
+                    .iter()
+                    .find_map(|(pid, tids)| {
+                        if tids.contains(id) {
+                            let title = plans.get(pid).map(|p| p.title.clone()).unwrap_or_default();
+                            Some((*pid, title))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                let plan_status = plans.get(&plan_id).map(|p| {
+                    serde_json::to_value(&p.status)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                });
+                Some(TaskWithPlan {
+                    task,
+                    plan_id,
+                    plan_title,
+                    plan_status,
+                })
+            })
+            .collect())
+    }
+
+    async fn get_workspace_milestone_steps(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>> {
+        let task_ids = self
+            .ws_milestone_tasks
+            .read()
+            .await
+            .get(&milestone_id)
+            .cloned()
+            .unwrap_or_default();
+        let steps = self.steps.read().await;
+        let task_steps = self.task_steps.read().await;
+
+        let mut map: std::collections::HashMap<Uuid, Vec<StepNode>> =
+            std::collections::HashMap::new();
+        for tid in &task_ids {
+            if let Some(step_ids) = task_steps.get(tid) {
+                let mut task_step_list: Vec<StepNode> = step_ids
+                    .iter()
+                    .filter_map(|sid| steps.get(sid).cloned())
+                    .collect();
+                task_step_list.sort_by_key(|s| s.order);
+                map.insert(*tid, task_step_list);
+            }
+        }
+        Ok(map)
+    }
+
+    // ========================================================================
+    // Resource operations
+    // ========================================================================
+
+    async fn create_resource(&self, resource: &ResourceNode) -> Result<()> {
+        let rid = resource.id;
+        if let Some(ws_id) = resource.workspace_id {
+            self.workspace_resources
+                .write()
+                .await
+                .entry(ws_id)
+                .or_default()
+                .push(rid);
+        }
+        self.resources.write().await.insert(rid, resource.clone());
+        Ok(())
+    }
+
+    async fn get_resource(&self, id: Uuid) -> Result<Option<ResourceNode>> {
+        Ok(self.resources.read().await.get(&id).cloned())
+    }
+
+    async fn list_workspace_resources(&self, workspace_id: Uuid) -> Result<Vec<ResourceNode>> {
+        let wr = self.workspace_resources.read().await;
+        let resources = self.resources.read().await;
+        let ids = wr.get(&workspace_id).cloned().unwrap_or_default();
+        Ok(ids
+            .iter()
+            .filter_map(|id| resources.get(id).cloned())
+            .collect())
+    }
+
+    async fn update_resource(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        file_path: Option<String>,
+        url: Option<String>,
+        version: Option<String>,
+        description: Option<String>,
+    ) -> Result<bool> {
+        let mut resources = self.resources.write().await;
+        let Some(r) = resources.get_mut(&id) else {
+            return Ok(false);
+        };
+        if let Some(n) = name {
+            r.name = n;
+        }
+        if let Some(fp) = file_path {
+            r.file_path = fp;
+        }
+        if let Some(u) = url {
+            r.url = Some(u);
+        }
+        if let Some(v) = version {
+            r.version = Some(v);
+        }
+        if let Some(d) = description {
+            r.description = Some(d);
+        }
+        r.updated_at = Some(Utc::now());
+        Ok(true)
+    }
+
+    async fn delete_resource(&self, id: Uuid) -> Result<()> {
+        if let Some(r) = self.resources.write().await.remove(&id) {
+            if let Some(ws_id) = r.workspace_id {
+                if let Some(ids) = self.workspace_resources.write().await.get_mut(&ws_id) {
+                    ids.retain(|i| *i != id);
+                }
+            }
+        }
+        self.resource_implementers.write().await.remove(&id);
+        self.resource_consumers.write().await.remove(&id);
+        Ok(())
+    }
+
+    async fn link_project_implements_resource(
+        &self,
+        project_id: Uuid,
+        resource_id: Uuid,
+    ) -> Result<()> {
+        self.resource_implementers
+            .write()
+            .await
+            .entry(resource_id)
+            .or_default()
+            .push(project_id);
+        Ok(())
+    }
+
+    async fn link_project_uses_resource(&self, project_id: Uuid, resource_id: Uuid) -> Result<()> {
+        self.resource_consumers
+            .write()
+            .await
+            .entry(resource_id)
+            .or_default()
+            .push(project_id);
+        Ok(())
+    }
+
+    async fn get_resource_implementers(&self, resource_id: Uuid) -> Result<Vec<ProjectNode>> {
+        let ri = self.resource_implementers.read().await;
+        let projects = self.projects.read().await;
+        let ids = ri.get(&resource_id).cloned().unwrap_or_default();
+        Ok(ids
+            .iter()
+            .filter_map(|id| projects.get(id).cloned())
+            .collect())
+    }
+
+    async fn get_resource_consumers(&self, resource_id: Uuid) -> Result<Vec<ProjectNode>> {
+        let rc = self.resource_consumers.read().await;
+        let projects = self.projects.read().await;
+        let ids = rc.get(&resource_id).cloned().unwrap_or_default();
+        Ok(ids
+            .iter()
+            .filter_map(|id| projects.get(id).cloned())
+            .collect())
+    }
+
+    // ========================================================================
+    // Component operations (Topology)
+    // ========================================================================
+
+    async fn create_component(&self, component: &ComponentNode) -> Result<()> {
+        let cid = component.id;
+        let ws_id = component.workspace_id;
+        self.workspace_components
+            .write()
+            .await
+            .entry(ws_id)
+            .or_default()
+            .push(cid);
+        self.components.write().await.insert(cid, component.clone());
+        Ok(())
+    }
+
+    async fn get_component(&self, id: Uuid) -> Result<Option<ComponentNode>> {
+        Ok(self.components.read().await.get(&id).cloned())
+    }
+
+    async fn list_components(&self, workspace_id: Uuid) -> Result<Vec<ComponentNode>> {
+        let wc = self.workspace_components.read().await;
+        let components = self.components.read().await;
+        let ids = wc.get(&workspace_id).cloned().unwrap_or_default();
+        Ok(ids
+            .iter()
+            .filter_map(|id| components.get(id).cloned())
+            .collect())
+    }
+
+    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<bool> {
+        let ComponentUpdate {
+            name,
+            component_type,
+            description,
+            runtime,
+            config,
+            tags,
+        } = patch;
+        let mut components = self.components.write().await;
+        // Same contract as the store: an unknown id writes nothing and says so.
+        let Some(c) = components.get_mut(&id) else {
+            return Ok(false);
+        };
+        if let Some(n) = name {
+            c.name = n;
+        }
+        if let Some(t) = component_type {
+            c.component_type = t;
+        }
+        if let Some(d) = description {
+            c.description = Some(d);
+        }
+        if let Some(r) = runtime {
+            c.runtime = Some(r);
+        }
+        if let Some(cfg) = config {
+            c.config = cfg;
+        }
+        if let Some(t) = tags {
+            c.tags = t;
+        }
+        Ok(true)
+    }
+
+    async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> Result<Uuid> {
+        let DerivedComponentWrite {
+            workspace_id,
+            name,
+            component_type,
+            description,
+            runtime,
+            tags,
+            config,
+        } = write;
+        let mut components = self.components.write().await;
+
+        // Identity is (workspace, name) — mirrors the MERGE key in Cypher.
+        if let Some(existing) = components
+            .values_mut()
+            .find(|c| c.workspace_id == workspace_id && c.name == name)
+        {
+            existing.component_type = component_type;
+            existing.config = config;
+            if let Some(r) = runtime.filter(|r| !r.is_empty()) {
+                existing.runtime = Some(r);
+            }
+            // Human-authored text survives a re-derivation.
+            if existing
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                existing.description = description;
+            }
+            if existing.tags.is_empty() {
+                existing.tags = tags;
+            }
+            return Ok(existing.id);
+        }
+
+        let id = Uuid::new_v4();
+        components.insert(
+            id,
+            ComponentNode {
+                id,
+                workspace_id,
+                name,
+                component_type,
+                description,
+                runtime: runtime.filter(|r| !r.is_empty()),
+                config,
+                created_at: chrono::Utc::now(),
+                tags,
+            },
+        );
+        drop(components);
+
+        self.workspace_components
+            .write()
+            .await
+            .entry(workspace_id)
+            .or_default()
+            .push(id);
+
+        Ok(id)
+    }
+
+    async fn delete_component(&self, id: Uuid) -> Result<()> {
+        if let Some(c) = self.components.write().await.remove(&id) {
+            if let Some(ids) = self
+                .workspace_components
+                .write()
+                .await
+                .get_mut(&c.workspace_id)
+            {
+                ids.retain(|i| *i != id);
+            }
+        }
+        self.component_dependencies.write().await.remove(&id);
+        self.component_projects.write().await.remove(&id);
+        // Also remove this component from other components' dependency lists
+        let mut cd = self.component_dependencies.write().await;
+        for deps in cd.values_mut() {
+            deps.retain(|(dep_id, _, _)| *dep_id != id);
+        }
+        Ok(())
+    }
+
+    async fn add_component_dependency(
+        &self,
+        component_id: Uuid,
+        depends_on_id: Uuid,
+        protocol: Option<String>,
+        required: bool,
+    ) -> Result<()> {
+        self.component_dependencies
+            .write()
+            .await
+            .entry(component_id)
+            .or_default()
+            .push((depends_on_id, protocol, required));
+        Ok(())
+    }
+
+    async fn remove_component_dependency(
+        &self,
+        component_id: Uuid,
+        depends_on_id: Uuid,
+    ) -> Result<()> {
+        if let Some(deps) = self
+            .component_dependencies
+            .write()
+            .await
+            .get_mut(&component_id)
+        {
+            deps.retain(|(id, _, _)| *id != depends_on_id);
+        }
+        Ok(())
+    }
+
+    async fn map_component_to_project(&self, component_id: Uuid, project_id: Uuid) -> Result<()> {
+        self.component_projects
+            .write()
+            .await
+            .insert(component_id, project_id);
+        Ok(())
+    }
+
+    async fn get_workspace_topology(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Vec<(ComponentNode, Option<String>, Vec<ComponentDependency>)>> {
+        let components = self.list_components(workspace_id).await?;
+        let cd = self.component_dependencies.read().await;
+        let cp = self.component_projects.read().await;
+        let projects = self.projects.read().await;
+
+        let mut result = Vec::new();
+        for comp in components {
+            let project_slug = cp
+                .get(&comp.id)
+                .and_then(|pid| projects.get(pid))
+                .map(|p| p.slug.clone());
+            let deps = cd
+                .get(&comp.id)
+                .map(|deps| {
+                    deps.iter()
+                        .map(|(to_id, protocol, required)| ComponentDependency {
+                            from_id: comp.id,
+                            to_id: *to_id,
+                            protocol: protocol.clone(),
+                            required: *required,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            result.push((comp, project_slug, deps));
+        }
+        Ok(result)
     }
 }

@@ -11,6 +11,8 @@
 //!
 //! - **File graph**: nodes = files, edges = IMPORTS relationships
 //! - **Function graph**: nodes = functions, edges = CALLS relationships
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 use crate::neo4j::GraphStore;
 use anyhow::Result;
@@ -18,8 +20,6 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use super::models::{CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType, FabricWeights};
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 /// Parse a qualified function ID of the form `"file_path:function_name:index"`
 /// into `(Some(file_path), function_name)`.

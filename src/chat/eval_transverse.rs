@@ -41,6 +41,8 @@
 //! (default `target/eval-transverse/report.json` under the crate).
 //! `PO_EVAL_INJECT_LEAK=<item id>` makes the anchors arm inject that item: the
 //! red proof of the gate (also held by a test).
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 use crate::chat::anchor::{Anchor, AnchorActor, AnchorRole, AnchorState, AnchorTargetType};
 use crate::chat::anchor_resolver::{
@@ -54,8 +56,7 @@ use crate::graph::neighborhood::RawNode;
 use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::models::ExecutionPlace;
 use crate::neo4j::GraphStore;
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
+
 use crate::skills::project_resolver::{entries_for_projects, infer_project_slug, ResolvedProject};
 use serde::Deserialize;
 use serde_json::{json, Value};

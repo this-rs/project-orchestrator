@@ -1,4 +1,6 @@
 //! Main orchestrator runner
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 #[cfg(feature = "local-embeddings")]
 use crate::embeddings::FastEmbedProvider;
@@ -27,8 +29,6 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use super::context::ContextBuilder;
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 /// Normalize a file path to an absolute canonical form.
 /// - Resolves `~` to home directory

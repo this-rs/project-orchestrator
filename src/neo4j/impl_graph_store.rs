@@ -22,264 +22,6 @@ impl GraphStore for Neo4jClient {
     }
 
     // ========================================================================
-    // Workspace Milestone operations
-    // ========================================================================
-
-    async fn create_workspace_milestone(
-        &self,
-        milestone: &WorkspaceMilestoneNode,
-    ) -> anyhow::Result<()> {
-        self.create_workspace_milestone(milestone).await
-    }
-
-    async fn get_workspace_milestone(
-        &self,
-        id: Uuid,
-    ) -> anyhow::Result<Option<WorkspaceMilestoneNode>> {
-        self.get_workspace_milestone(id).await
-    }
-
-    async fn list_workspace_milestones(
-        &self,
-        workspace_id: Uuid,
-    ) -> anyhow::Result<Vec<WorkspaceMilestoneNode>> {
-        self.list_workspace_milestones(workspace_id).await
-    }
-
-    async fn list_workspace_milestones_filtered(
-        &self,
-        workspace_id: Uuid,
-        status: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<(Vec<WorkspaceMilestoneNode>, usize)> {
-        self.list_workspace_milestones_filtered(workspace_id, status, limit, offset)
-            .await
-    }
-
-    async fn list_all_workspace_milestones_filtered(
-        &self,
-        workspace_id: Option<Uuid>,
-        status: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<Vec<(WorkspaceMilestoneNode, String, String, String)>> {
-        self.list_all_workspace_milestones_filtered(workspace_id, status, limit, offset)
-            .await
-    }
-
-    async fn count_all_workspace_milestones(
-        &self,
-        workspace_id: Option<Uuid>,
-        status: Option<&str>,
-    ) -> anyhow::Result<usize> {
-        self.count_all_workspace_milestones(workspace_id, status)
-            .await
-    }
-
-    async fn update_workspace_milestone(
-        &self,
-        id: Uuid,
-        title: Option<String>,
-        description: Option<String>,
-        status: Option<MilestoneStatus>,
-        target_date: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> anyhow::Result<bool> {
-        self.update_workspace_milestone(id, title, description, status, target_date)
-            .await
-    }
-
-    async fn delete_workspace_milestone(&self, id: Uuid) -> anyhow::Result<()> {
-        self.delete_workspace_milestone(id).await
-    }
-
-    async fn add_task_to_workspace_milestone(
-        &self,
-        milestone_id: Uuid,
-        task_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.add_task_to_workspace_milestone(milestone_id, task_id)
-            .await
-    }
-
-    async fn remove_task_from_workspace_milestone(
-        &self,
-        milestone_id: Uuid,
-        task_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.remove_task_from_workspace_milestone(milestone_id, task_id)
-            .await
-    }
-
-    async fn link_plan_to_workspace_milestone(
-        &self,
-        plan_id: Uuid,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.link_plan_to_workspace_milestone(plan_id, milestone_id)
-            .await
-    }
-
-    async fn unlink_plan_from_workspace_milestone(
-        &self,
-        plan_id: Uuid,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.unlink_plan_from_workspace_milestone(plan_id, milestone_id)
-            .await
-    }
-
-    async fn get_workspace_milestone_progress(
-        &self,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<(u32, u32, u32, u32)> {
-        self.get_workspace_milestone_progress(milestone_id).await
-    }
-
-    async fn get_workspace_milestone_tasks(
-        &self,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<Vec<TaskWithPlan>> {
-        self.get_workspace_milestone_tasks(milestone_id).await
-    }
-
-    async fn get_workspace_milestone_steps(
-        &self,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<std::collections::HashMap<Uuid, Vec<StepNode>>> {
-        self.get_workspace_milestone_steps(milestone_id).await
-    }
-
-    // ========================================================================
-    // Resource operations
-    // ========================================================================
-
-    async fn create_resource(&self, resource: &ResourceNode) -> anyhow::Result<()> {
-        self.create_resource(resource).await
-    }
-
-    async fn get_resource(&self, id: Uuid) -> anyhow::Result<Option<ResourceNode>> {
-        self.get_resource(id).await
-    }
-
-    async fn list_workspace_resources(
-        &self,
-        workspace_id: Uuid,
-    ) -> anyhow::Result<Vec<ResourceNode>> {
-        self.list_workspace_resources(workspace_id).await
-    }
-
-    async fn update_resource(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        file_path: Option<String>,
-        url: Option<String>,
-        version: Option<String>,
-        description: Option<String>,
-    ) -> anyhow::Result<bool> {
-        self.update_resource(id, name, file_path, url, version, description)
-            .await
-    }
-
-    async fn delete_resource(&self, id: Uuid) -> anyhow::Result<()> {
-        self.delete_resource(id).await
-    }
-
-    async fn link_project_implements_resource(
-        &self,
-        project_id: Uuid,
-        resource_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.link_project_implements_resource(project_id, resource_id)
-            .await
-    }
-
-    async fn link_project_uses_resource(
-        &self,
-        project_id: Uuid,
-        resource_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.link_project_uses_resource(project_id, resource_id)
-            .await
-    }
-
-    async fn get_resource_implementers(
-        &self,
-        resource_id: Uuid,
-    ) -> anyhow::Result<Vec<ProjectNode>> {
-        self.get_resource_implementers(resource_id).await
-    }
-
-    async fn get_resource_consumers(&self, resource_id: Uuid) -> anyhow::Result<Vec<ProjectNode>> {
-        self.get_resource_consumers(resource_id).await
-    }
-
-    // ========================================================================
-    // Component operations (Topology)
-    // ========================================================================
-
-    async fn create_component(&self, component: &ComponentNode) -> anyhow::Result<()> {
-        self.create_component(component).await
-    }
-
-    async fn get_component(&self, id: Uuid) -> anyhow::Result<Option<ComponentNode>> {
-        self.get_component(id).await
-    }
-
-    async fn list_components(&self, workspace_id: Uuid) -> anyhow::Result<Vec<ComponentNode>> {
-        self.list_components(workspace_id).await
-    }
-
-    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> anyhow::Result<bool> {
-        self.update_component(id, patch).await
-    }
-
-    async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> anyhow::Result<Uuid> {
-        self.upsert_derived_component(write).await
-    }
-
-    async fn delete_component(&self, id: Uuid) -> anyhow::Result<()> {
-        self.delete_component(id).await
-    }
-
-    async fn add_component_dependency(
-        &self,
-        component_id: Uuid,
-        depends_on_id: Uuid,
-        protocol: Option<String>,
-        required: bool,
-    ) -> anyhow::Result<()> {
-        self.add_component_dependency(component_id, depends_on_id, protocol, required)
-            .await
-    }
-
-    async fn remove_component_dependency(
-        &self,
-        component_id: Uuid,
-        depends_on_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.remove_component_dependency(component_id, depends_on_id)
-            .await
-    }
-
-    async fn map_component_to_project(
-        &self,
-        component_id: Uuid,
-        project_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.map_component_to_project(component_id, project_id)
-            .await
-    }
-
-    async fn get_workspace_topology(
-        &self,
-        workspace_id: Uuid,
-    ) -> anyhow::Result<Vec<(ComponentNode, Option<String>, Vec<ComponentDependency>)>> {
-        self.get_workspace_topology(workspace_id).await
-    }
-
-    // ========================================================================
     // File operations
     // ========================================================================
 
@@ -4949,5 +4691,262 @@ impl WorkspaceStore for Neo4jClient {
         workspace_id: Uuid,
     ) -> anyhow::Result<crate::neo4j::models::CouplingMatrix> {
         self.compute_coupling_matrix(workspace_id).await
+    }
+    // ========================================================================
+    // Workspace Milestone operations
+    // ========================================================================
+
+    async fn create_workspace_milestone(
+        &self,
+        milestone: &WorkspaceMilestoneNode,
+    ) -> anyhow::Result<()> {
+        self.create_workspace_milestone(milestone).await
+    }
+
+    async fn get_workspace_milestone(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<WorkspaceMilestoneNode>> {
+        self.get_workspace_milestone(id).await
+    }
+
+    async fn list_workspace_milestones(
+        &self,
+        workspace_id: Uuid,
+    ) -> anyhow::Result<Vec<WorkspaceMilestoneNode>> {
+        self.list_workspace_milestones(workspace_id).await
+    }
+
+    async fn list_workspace_milestones_filtered(
+        &self,
+        workspace_id: Uuid,
+        status: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<WorkspaceMilestoneNode>, usize)> {
+        self.list_workspace_milestones_filtered(workspace_id, status, limit, offset)
+            .await
+    }
+
+    async fn list_all_workspace_milestones_filtered(
+        &self,
+        workspace_id: Option<Uuid>,
+        status: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<(WorkspaceMilestoneNode, String, String, String)>> {
+        self.list_all_workspace_milestones_filtered(workspace_id, status, limit, offset)
+            .await
+    }
+
+    async fn count_all_workspace_milestones(
+        &self,
+        workspace_id: Option<Uuid>,
+        status: Option<&str>,
+    ) -> anyhow::Result<usize> {
+        self.count_all_workspace_milestones(workspace_id, status)
+            .await
+    }
+
+    async fn update_workspace_milestone(
+        &self,
+        id: Uuid,
+        title: Option<String>,
+        description: Option<String>,
+        status: Option<MilestoneStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> anyhow::Result<bool> {
+        self.update_workspace_milestone(id, title, description, status, target_date)
+            .await
+    }
+
+    async fn delete_workspace_milestone(&self, id: Uuid) -> anyhow::Result<()> {
+        self.delete_workspace_milestone(id).await
+    }
+
+    async fn add_task_to_workspace_milestone(
+        &self,
+        milestone_id: Uuid,
+        task_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.add_task_to_workspace_milestone(milestone_id, task_id)
+            .await
+    }
+
+    async fn remove_task_from_workspace_milestone(
+        &self,
+        milestone_id: Uuid,
+        task_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.remove_task_from_workspace_milestone(milestone_id, task_id)
+            .await
+    }
+
+    async fn link_plan_to_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.link_plan_to_workspace_milestone(plan_id, milestone_id)
+            .await
+    }
+
+    async fn unlink_plan_from_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.unlink_plan_from_workspace_milestone(plan_id, milestone_id)
+            .await
+    }
+
+    async fn get_workspace_milestone_progress(
+        &self,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<(u32, u32, u32, u32)> {
+        self.get_workspace_milestone_progress(milestone_id).await
+    }
+
+    async fn get_workspace_milestone_tasks(
+        &self,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<Vec<TaskWithPlan>> {
+        self.get_workspace_milestone_tasks(milestone_id).await
+    }
+
+    async fn get_workspace_milestone_steps(
+        &self,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<std::collections::HashMap<Uuid, Vec<StepNode>>> {
+        self.get_workspace_milestone_steps(milestone_id).await
+    }
+
+    // ========================================================================
+    // Resource operations
+    // ========================================================================
+
+    async fn create_resource(&self, resource: &ResourceNode) -> anyhow::Result<()> {
+        self.create_resource(resource).await
+    }
+
+    async fn get_resource(&self, id: Uuid) -> anyhow::Result<Option<ResourceNode>> {
+        self.get_resource(id).await
+    }
+
+    async fn list_workspace_resources(
+        &self,
+        workspace_id: Uuid,
+    ) -> anyhow::Result<Vec<ResourceNode>> {
+        self.list_workspace_resources(workspace_id).await
+    }
+
+    async fn update_resource(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        file_path: Option<String>,
+        url: Option<String>,
+        version: Option<String>,
+        description: Option<String>,
+    ) -> anyhow::Result<bool> {
+        self.update_resource(id, name, file_path, url, version, description)
+            .await
+    }
+
+    async fn delete_resource(&self, id: Uuid) -> anyhow::Result<()> {
+        self.delete_resource(id).await
+    }
+
+    async fn link_project_implements_resource(
+        &self,
+        project_id: Uuid,
+        resource_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.link_project_implements_resource(project_id, resource_id)
+            .await
+    }
+
+    async fn link_project_uses_resource(
+        &self,
+        project_id: Uuid,
+        resource_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.link_project_uses_resource(project_id, resource_id)
+            .await
+    }
+
+    async fn get_resource_implementers(
+        &self,
+        resource_id: Uuid,
+    ) -> anyhow::Result<Vec<ProjectNode>> {
+        self.get_resource_implementers(resource_id).await
+    }
+
+    async fn get_resource_consumers(&self, resource_id: Uuid) -> anyhow::Result<Vec<ProjectNode>> {
+        self.get_resource_consumers(resource_id).await
+    }
+
+    // ========================================================================
+    // Component operations (Topology)
+    // ========================================================================
+
+    async fn create_component(&self, component: &ComponentNode) -> anyhow::Result<()> {
+        self.create_component(component).await
+    }
+
+    async fn get_component(&self, id: Uuid) -> anyhow::Result<Option<ComponentNode>> {
+        self.get_component(id).await
+    }
+
+    async fn list_components(&self, workspace_id: Uuid) -> anyhow::Result<Vec<ComponentNode>> {
+        self.list_components(workspace_id).await
+    }
+
+    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> anyhow::Result<bool> {
+        self.update_component(id, patch).await
+    }
+
+    async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> anyhow::Result<Uuid> {
+        self.upsert_derived_component(write).await
+    }
+
+    async fn delete_component(&self, id: Uuid) -> anyhow::Result<()> {
+        self.delete_component(id).await
+    }
+
+    async fn add_component_dependency(
+        &self,
+        component_id: Uuid,
+        depends_on_id: Uuid,
+        protocol: Option<String>,
+        required: bool,
+    ) -> anyhow::Result<()> {
+        self.add_component_dependency(component_id, depends_on_id, protocol, required)
+            .await
+    }
+
+    async fn remove_component_dependency(
+        &self,
+        component_id: Uuid,
+        depends_on_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.remove_component_dependency(component_id, depends_on_id)
+            .await
+    }
+
+    async fn map_component_to_project(
+        &self,
+        component_id: Uuid,
+        project_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.map_component_to_project(component_id, project_id)
+            .await
+    }
+
+    async fn get_workspace_topology(
+        &self,
+        workspace_id: Uuid,
+    ) -> anyhow::Result<Vec<(ComponentNode, Option<String>, Vec<ComponentDependency>)>> {
+        self.get_workspace_topology(workspace_id).await
     }
 }

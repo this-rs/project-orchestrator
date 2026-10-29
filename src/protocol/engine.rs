@@ -17,10 +17,11 @@
 //! 3. Guards are evaluated as simple string conditions (future: expression engine)
 //! 4. Reaching a terminal state automatically completes the run
 //! 5. Only `Running` runs can accept transitions
-
-use crate::neo4j::traits::GraphStore;
 use crate::neo4j::ProjectStore;
 use crate::neo4j::WorkspaceStore;
+
+use crate::neo4j::traits::GraphStore;
+
 use crate::protocol::{
     ChildCompletionInfo, CompletionStrategy, OnFailureStrategy, ProtocolRun, RunStatus, StateType,
     TransitionResult,

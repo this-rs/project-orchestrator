@@ -2,6 +2,8 @@
 //!
 //! Runs after the biomimicry stage in the enrichment pipeline.
 //! Uses the ReflexEngine to generate suggestions based on the current context.
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 use std::sync::Arc;
 
@@ -14,8 +16,6 @@ use crate::chat::enrichment::{
     EnrichmentConfig, EnrichmentInput, ParallelEnrichmentStage, StageOutput,
 };
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 /// Enrichment stage that injects reflex suggestions (co-change, episode recall, scar warnings).
 pub struct ReflexStage {

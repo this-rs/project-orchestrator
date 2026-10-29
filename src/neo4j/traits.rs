@@ -99,205 +99,6 @@ pub trait GraphStore: ProjectStore + WorkspaceStore + Send + Sync {
     fn capabilities(&self) -> StoreCapabilities;
 
     // ========================================================================
-    // Workspace Milestone operations
-    // ========================================================================
-
-    /// Create a workspace milestone
-    async fn create_workspace_milestone(&self, milestone: &WorkspaceMilestoneNode) -> Result<()>;
-
-    /// Get a workspace milestone by ID
-    async fn get_workspace_milestone(&self, id: Uuid) -> Result<Option<WorkspaceMilestoneNode>>;
-
-    /// List workspace milestones (unpaginated, used internally)
-    async fn list_workspace_milestones(
-        &self,
-        workspace_id: Uuid,
-    ) -> Result<Vec<WorkspaceMilestoneNode>>;
-
-    /// List workspace milestones with pagination and status filter
-    ///
-    /// Returns (milestones, total_count)
-    async fn list_workspace_milestones_filtered(
-        &self,
-        workspace_id: Uuid,
-        status: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<WorkspaceMilestoneNode>, usize)>;
-
-    /// List all workspace milestones across all workspaces with filters and pagination
-    ///
-    /// Returns (milestones_with_workspace_info, total_count)
-    async fn list_all_workspace_milestones_filtered(
-        &self,
-        workspace_id: Option<Uuid>,
-        status: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<(WorkspaceMilestoneNode, String, String, String)>>;
-
-    /// Count all workspace milestones across workspaces with optional filters
-    async fn count_all_workspace_milestones(
-        &self,
-        workspace_id: Option<Uuid>,
-        status: Option<&str>,
-    ) -> Result<usize>;
-
-    /// Update a workspace milestone
-    ///
-    /// Returns `false` when no milestone has this id (nothing was written).
-    async fn update_workspace_milestone(
-        &self,
-        id: Uuid,
-        title: Option<String>,
-        description: Option<String>,
-        status: Option<MilestoneStatus>,
-        target_date: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<bool>;
-
-    /// Delete a workspace milestone
-    async fn delete_workspace_milestone(&self, id: Uuid) -> Result<()>;
-
-    /// Add a task to a workspace milestone
-    async fn add_task_to_workspace_milestone(
-        &self,
-        milestone_id: Uuid,
-        task_id: Uuid,
-    ) -> Result<()>;
-
-    /// Remove a task from a workspace milestone
-    async fn remove_task_from_workspace_milestone(
-        &self,
-        milestone_id: Uuid,
-        task_id: Uuid,
-    ) -> Result<()>;
-
-    /// Link a plan to a workspace milestone
-    async fn link_plan_to_workspace_milestone(
-        &self,
-        plan_id: Uuid,
-        milestone_id: Uuid,
-    ) -> Result<()>;
-
-    /// Unlink a plan from a workspace milestone
-    async fn unlink_plan_from_workspace_milestone(
-        &self,
-        plan_id: Uuid,
-        milestone_id: Uuid,
-    ) -> Result<()>;
-
-    /// Get workspace milestone progress
-    async fn get_workspace_milestone_progress(
-        &self,
-        milestone_id: Uuid,
-    ) -> Result<(u32, u32, u32, u32)>;
-
-    /// Get tasks linked to a workspace milestone (with plan info)
-    async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskWithPlan>>;
-
-    /// Get all steps for all tasks linked to a workspace milestone (batch)
-    async fn get_workspace_milestone_steps(
-        &self,
-        milestone_id: Uuid,
-    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>>;
-
-    // ========================================================================
-    // Resource operations
-    // ========================================================================
-
-    /// Create a resource
-    async fn create_resource(&self, resource: &ResourceNode) -> Result<()>;
-
-    /// Get a resource by ID
-    async fn get_resource(&self, id: Uuid) -> Result<Option<ResourceNode>>;
-
-    /// List workspace resources
-    async fn list_workspace_resources(&self, workspace_id: Uuid) -> Result<Vec<ResourceNode>>;
-
-    /// Update a resource
-    ///
-    /// Returns `false` when no resource has this id (nothing was written).
-    async fn update_resource(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        file_path: Option<String>,
-        url: Option<String>,
-        version: Option<String>,
-        description: Option<String>,
-    ) -> Result<bool>;
-
-    /// Delete a resource
-    async fn delete_resource(&self, id: Uuid) -> Result<()>;
-
-    /// Link a project as implementing a resource
-    async fn link_project_implements_resource(
-        &self,
-        project_id: Uuid,
-        resource_id: Uuid,
-    ) -> Result<()>;
-
-    /// Link a project as using a resource
-    async fn link_project_uses_resource(&self, project_id: Uuid, resource_id: Uuid) -> Result<()>;
-
-    /// Get projects that implement a resource
-    async fn get_resource_implementers(&self, resource_id: Uuid) -> Result<Vec<ProjectNode>>;
-
-    /// Get projects that use a resource
-    async fn get_resource_consumers(&self, resource_id: Uuid) -> Result<Vec<ProjectNode>>;
-
-    // ========================================================================
-    // Component operations (Topology)
-    // ========================================================================
-
-    /// Create a component
-    async fn create_component(&self, component: &ComponentNode) -> Result<()>;
-
-    /// Get a component by ID
-    async fn get_component(&self, id: Uuid) -> Result<Option<ComponentNode>>;
-
-    /// List components in a workspace
-    async fn list_components(&self, workspace_id: Uuid) -> Result<Vec<ComponentNode>>;
-
-    /// Update a component
-    ///
-    /// Returns `false` when no component has this id (nothing was written).
-    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<bool>;
-
-    /// Create the component if absent, refresh it if present, and return its id.
-    /// Identity is (workspace, name). Used by architecture derivation, which runs
-    /// on every sync and must not stack duplicates the way `create_component` would.
-    async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> Result<Uuid>;
-
-    /// Delete a component
-    async fn delete_component(&self, id: Uuid) -> Result<()>;
-
-    /// Add a dependency between components
-    async fn add_component_dependency(
-        &self,
-        component_id: Uuid,
-        depends_on_id: Uuid,
-        protocol: Option<String>,
-        required: bool,
-    ) -> Result<()>;
-
-    /// Remove a dependency between components
-    async fn remove_component_dependency(
-        &self,
-        component_id: Uuid,
-        depends_on_id: Uuid,
-    ) -> Result<()>;
-
-    /// Map a component to a project
-    async fn map_component_to_project(&self, component_id: Uuid, project_id: Uuid) -> Result<()>;
-
-    /// Get the workspace topology (all components with their dependencies)
-    async fn get_workspace_topology(
-        &self,
-        workspace_id: Uuid,
-    ) -> Result<Vec<(ComponentNode, Option<String>, Vec<ComponentDependency>)>>;
-
-    // ========================================================================
     // File operations
     // ========================================================================
 
@@ -4644,4 +4445,202 @@ pub trait WorkspaceStore: Send + Sync {
         &self,
         workspace_id: Uuid,
     ) -> Result<crate::neo4j::models::CouplingMatrix>;
+    // ========================================================================
+    // Workspace Milestone operations
+    // ========================================================================
+
+    /// Create a workspace milestone
+    async fn create_workspace_milestone(&self, milestone: &WorkspaceMilestoneNode) -> Result<()>;
+
+    /// Get a workspace milestone by ID
+    async fn get_workspace_milestone(&self, id: Uuid) -> Result<Option<WorkspaceMilestoneNode>>;
+
+    /// List workspace milestones (unpaginated, used internally)
+    async fn list_workspace_milestones(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Vec<WorkspaceMilestoneNode>>;
+
+    /// List workspace milestones with pagination and status filter
+    ///
+    /// Returns (milestones, total_count)
+    async fn list_workspace_milestones_filtered(
+        &self,
+        workspace_id: Uuid,
+        status: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<WorkspaceMilestoneNode>, usize)>;
+
+    /// List all workspace milestones across all workspaces with filters and pagination
+    ///
+    /// Returns (milestones_with_workspace_info, total_count)
+    async fn list_all_workspace_milestones_filtered(
+        &self,
+        workspace_id: Option<Uuid>,
+        status: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<(WorkspaceMilestoneNode, String, String, String)>>;
+
+    /// Count all workspace milestones across workspaces with optional filters
+    async fn count_all_workspace_milestones(
+        &self,
+        workspace_id: Option<Uuid>,
+        status: Option<&str>,
+    ) -> Result<usize>;
+
+    /// Update a workspace milestone
+    ///
+    /// Returns `false` when no milestone has this id (nothing was written).
+    async fn update_workspace_milestone(
+        &self,
+        id: Uuid,
+        title: Option<String>,
+        description: Option<String>,
+        status: Option<MilestoneStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool>;
+
+    /// Delete a workspace milestone
+    async fn delete_workspace_milestone(&self, id: Uuid) -> Result<()>;
+
+    /// Add a task to a workspace milestone
+    async fn add_task_to_workspace_milestone(
+        &self,
+        milestone_id: Uuid,
+        task_id: Uuid,
+    ) -> Result<()>;
+
+    /// Remove a task from a workspace milestone
+    async fn remove_task_from_workspace_milestone(
+        &self,
+        milestone_id: Uuid,
+        task_id: Uuid,
+    ) -> Result<()>;
+
+    /// Link a plan to a workspace milestone
+    async fn link_plan_to_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> Result<()>;
+
+    /// Unlink a plan from a workspace milestone
+    async fn unlink_plan_from_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> Result<()>;
+
+    /// Get workspace milestone progress
+    async fn get_workspace_milestone_progress(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<(u32, u32, u32, u32)>;
+
+    /// Get tasks linked to a workspace milestone (with plan info)
+    async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskWithPlan>>;
+
+    /// Get all steps for all tasks linked to a workspace milestone (batch)
+    async fn get_workspace_milestone_steps(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>>;
+
+    // ========================================================================
+    // Resource operations
+    // ========================================================================
+
+    /// Create a resource
+    async fn create_resource(&self, resource: &ResourceNode) -> Result<()>;
+
+    /// Get a resource by ID
+    async fn get_resource(&self, id: Uuid) -> Result<Option<ResourceNode>>;
+
+    /// List workspace resources
+    async fn list_workspace_resources(&self, workspace_id: Uuid) -> Result<Vec<ResourceNode>>;
+
+    /// Update a resource
+    ///
+    /// Returns `false` when no resource has this id (nothing was written).
+    async fn update_resource(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        file_path: Option<String>,
+        url: Option<String>,
+        version: Option<String>,
+        description: Option<String>,
+    ) -> Result<bool>;
+
+    /// Delete a resource
+    async fn delete_resource(&self, id: Uuid) -> Result<()>;
+
+    /// Link a project as implementing a resource
+    async fn link_project_implements_resource(
+        &self,
+        project_id: Uuid,
+        resource_id: Uuid,
+    ) -> Result<()>;
+
+    /// Link a project as using a resource
+    async fn link_project_uses_resource(&self, project_id: Uuid, resource_id: Uuid) -> Result<()>;
+
+    /// Get projects that implement a resource
+    async fn get_resource_implementers(&self, resource_id: Uuid) -> Result<Vec<ProjectNode>>;
+
+    /// Get projects that use a resource
+    async fn get_resource_consumers(&self, resource_id: Uuid) -> Result<Vec<ProjectNode>>;
+
+    // ========================================================================
+    // Component operations (Topology)
+    // ========================================================================
+
+    /// Create a component
+    async fn create_component(&self, component: &ComponentNode) -> Result<()>;
+
+    /// Get a component by ID
+    async fn get_component(&self, id: Uuid) -> Result<Option<ComponentNode>>;
+
+    /// List components in a workspace
+    async fn list_components(&self, workspace_id: Uuid) -> Result<Vec<ComponentNode>>;
+
+    /// Update a component
+    ///
+    /// Returns `false` when no component has this id (nothing was written).
+    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<bool>;
+
+    /// Create the component if absent, refresh it if present, and return its id.
+    /// Identity is (workspace, name). Used by architecture derivation, which runs
+    /// on every sync and must not stack duplicates the way `create_component` would.
+    async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> Result<Uuid>;
+
+    /// Delete a component
+    async fn delete_component(&self, id: Uuid) -> Result<()>;
+
+    /// Add a dependency between components
+    async fn add_component_dependency(
+        &self,
+        component_id: Uuid,
+        depends_on_id: Uuid,
+        protocol: Option<String>,
+        required: bool,
+    ) -> Result<()>;
+
+    /// Remove a dependency between components
+    async fn remove_component_dependency(
+        &self,
+        component_id: Uuid,
+        depends_on_id: Uuid,
+    ) -> Result<()>;
+
+    /// Map a component to a project
+    async fn map_component_to_project(&self, component_id: Uuid, project_id: Uuid) -> Result<()>;
+
+    /// Get the workspace topology (all components with their dependencies)
+    async fn get_workspace_topology(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Vec<(ComponentNode, Option<String>, Vec<ComponentDependency>)>>;
 }

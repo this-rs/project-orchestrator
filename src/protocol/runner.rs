@@ -9,12 +9,13 @@
 //!
 //! Each run is driven by a spawned tokio task with a CancellationToken
 //! for graceful shutdown.
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 use crate::chat::manager::ChatManager;
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
+
 use crate::protocol::engine;
 use crate::protocol::executor::agent::AgentExecutor;
 use crate::protocol::executor::system::SystemExecutor;

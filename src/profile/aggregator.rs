@@ -5,6 +5,8 @@
 //!
 //! The aggregator runs as a background tokio task spawned at startup.
 //! It processes all accumulated signals in a batch, then sleeps.
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,8 +20,6 @@ use super::collector::SignalReceiver;
 use super::signals::BehaviorSignal;
 use super::UserProfile;
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 /// EMA smoothing factor — controls adaptation speed.
 /// 0.3 = moderate adaptation (balances stability and responsiveness).

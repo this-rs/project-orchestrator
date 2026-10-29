@@ -8,6 +8,8 @@
 //!
 //! The resulting Episode can then be converted to a PortableEpisode for
 //! cross-instance exchange via SkillPackage v3.
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -15,8 +17,6 @@ use uuid::Uuid;
 
 use crate::episodes::models::*;
 use crate::neo4j::GraphStore;
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 /// Collect a complete Episode from a completed ProtocolRun.
 ///

@@ -8,10 +8,11 @@
 //! - MAX_RUNTIME_STATES_PER_GENERATOR = 50
 //! - Generation is idempotent: if RuntimeStates already exist for the
 //!   (run_id, generator_state_id) pair, generation is skipped.
-
-use crate::neo4j::traits::GraphStore;
 use crate::neo4j::ProjectStore;
 use crate::neo4j::WorkspaceStore;
+
+use crate::neo4j::traits::GraphStore;
+
 use crate::protocol::{GeneratorConfig, LinkingStrategy, ProtocolRun, ProtocolState, RuntimeState};
 use anyhow::{bail, Result};
 

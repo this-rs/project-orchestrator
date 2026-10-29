@@ -25,6 +25,8 @@
 //! (grouped by plan ids) - whatever the number of plans or sessions. A source
 //! that fails does not fail the response: it is reported in `source_errors`
 //! with the bands it degrades, the others are served.
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -45,8 +47,7 @@ use crate::neo4j::models::{
     TaskNode, TaskStatus,
 };
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
+
 use crate::notes::{Note, NoteFilters, NoteStatus, NoteType};
 use crate::runner::eligibility::{resume_breakdown, runner_occupancy};
 use crate::runner::models::PlanRunStatus;
