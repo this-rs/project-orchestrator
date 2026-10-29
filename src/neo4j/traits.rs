@@ -23,7 +23,67 @@ use crate::protocol::{
 use crate::skills::{ActivatedSkillContext, SkillNode, SkillStatus};
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Manifest of the storage capabilities an adapter actually provides.
+///
+/// Each flag describes one concrete feature of the underlying engine. Adapters
+/// fill this in from what their own code really does (see the `capabilities`
+/// implementations, which cite the exact file and line proving each value). A
+/// `false` flag means the feature is absent, or applied differently than the
+/// flag describes (for example a filter applied after the vector search rather
+/// than inside it).
+///
+/// The [`Default`] is the conservative value — every flag `false` — so that a
+/// store which does not override [`GraphStore::capabilities`] advertises no
+/// capability at all instead of claiming one it does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreCapabilities {
+    /// The engine can search by embedding similarity (a vector index or an
+    /// in-memory cosine scan both qualify).
+    pub vector_search: bool,
+    /// Whether a filter (project / status / …) is applied *inside* the vector
+    /// search rather than after the nearest neighbours are returned.
+    pub vector_filter: bool,
+    /// The engine enforces single-property uniqueness constraints.
+    pub unique_constraints: bool,
+    /// The engine enforces composite (multi-property) uniqueness constraints.
+    pub composite_unique: bool,
+    /// The engine evaluates variable-length path patterns (`-[:R*..5]->`).
+    pub variable_length_paths: bool,
+    /// The engine can compute shortest paths (`shortestPath`).
+    pub shortest_path: bool,
+    /// The engine supports subqueries (`CALL { … }`).
+    pub subqueries: bool,
+    /// The engine performs datetime arithmetic inside queries
+    /// (`datetime() - duration(...)`).
+    pub datetime_arithmetic: bool,
+    /// The engine can index relationship properties.
+    pub relationship_property_index: bool,
+    /// The engine exposes explicit transactions (begin / commit / rollback).
+    pub explicit_transactions: bool,
+}
+
+impl Default for StoreCapabilities {
+    /// Conservative default: no capability is assumed. Every concrete adapter
+    /// must override [`GraphStore::capabilities`] to advertise what it really
+    /// supports.
+    fn default() -> Self {
+        Self {
+            vector_search: false,
+            vector_filter: false,
+            unique_constraints: false,
+            composite_unique: false,
+            variable_length_paths: false,
+            shortest_path: false,
+            subqueries: false,
+            datetime_arithmetic: false,
+            relationship_property_index: false,
+            explicit_transactions: false,
+        }
+    }
+}
 
 /// Abstract interface for all graph database operations.
 ///
@@ -31,6 +91,13 @@ use uuid::Uuid;
 /// `execute`, `execute_with_params`, and private helpers) is represented here.
 #[async_trait]
 pub trait GraphStore: Send + Sync {
+    /// Manifest of what this store actually supports.
+    ///
+    /// Every adapter states it explicitly, with the values its own code proves;
+    /// there is deliberately no default, so a new adapter cannot inherit a
+    /// flattering manifest by accident.
+    fn capabilities(&self) -> StoreCapabilities;
+
     // ========================================================================
     // Project operations
     // ========================================================================
@@ -4477,4 +4544,82 @@ pub trait GraphStore: Send + Sync {
         params: &crate::graph::neighborhood::NeighborhoodParams,
         filter: &crate::graph::neighborhood::ProjectFilter,
     ) -> Result<Option<crate::graph::neighborhood::ScopedNeighborhood>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StoreCapabilities;
+
+    /// The ten capabilities the manifest exposes, in declaration order. A field
+    /// added to `StoreCapabilities` without updating this list (or a field
+    /// renamed) is caught by `capabilities_manifest_serializes_all_keys`.
+    const EXPECTED_KEYS: [&str; 10] = [
+        "vector_search",
+        "vector_filter",
+        "unique_constraints",
+        "composite_unique",
+        "variable_length_paths",
+        "shortest_path",
+        "subqueries",
+        "datetime_arithmetic",
+        "relationship_property_index",
+        "explicit_transactions",
+    ];
+
+    #[test]
+    fn capabilities_manifest_serializes_all_keys() {
+        let json = serde_json::to_value(StoreCapabilities::default()).expect("serialize");
+        let obj = json.as_object().expect("object");
+        assert_eq!(
+            obj.len(),
+            EXPECTED_KEYS.len(),
+            "manifest key set changed (added or removed a capability): {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        for key in EXPECTED_KEYS {
+            assert!(obj.contains_key(key), "missing manifest key `{key}`");
+        }
+    }
+
+    #[test]
+    fn neo4j_adapter_declares_core_capabilities() {
+        let caps = crate::neo4j::client::Neo4jClient::storage_capabilities();
+        assert!(caps.unique_constraints, "unique_constraints must be true");
+        assert!(caps.vector_search, "vector_search must be true");
+        assert!(
+            caps.variable_length_paths,
+            "variable_length_paths must be true"
+        );
+    }
+
+    #[test]
+    fn default_is_conservative_and_exhaustive() {
+        let default = StoreCapabilities::default();
+        // Exhaustive literal: a field added to `StoreCapabilities` without being
+        // listed here (and in the `Default` impl) fails to compile, so a
+        // capability can never slip in with a silent implicit value.
+        let exhaustive = StoreCapabilities {
+            vector_search: false,
+            vector_filter: false,
+            unique_constraints: false,
+            composite_unique: false,
+            variable_length_paths: false,
+            shortest_path: false,
+            subqueries: false,
+            datetime_arithmetic: false,
+            relationship_property_index: false,
+            explicit_transactions: false,
+        };
+        assert_eq!(
+            default, exhaustive,
+            "Default must list every capability explicitly"
+        );
+        // The conservative default advertises nothing at all.
+        for key in EXPECTED_KEYS {
+            let v = serde_json::to_value(default).expect("serialize")[key]
+                .as_bool()
+                .expect("bool");
+            assert!(!v, "default capability `{key}` must be false");
+        }
+    }
 }

@@ -1,5 +1,6 @@
 //! Neo4j client for interacting with the knowledge graph
 
+use crate::neo4j::traits::StoreCapabilities;
 use anyhow::{Context, Result};
 use neo4rs::{query, ConfigBuilder, Graph, Query};
 use std::collections::HashMap;
@@ -310,6 +311,48 @@ impl WhereBuilder {
 }
 
 impl Neo4jClient {
+    /// Manifest of the capabilities this adapter actually provides.
+    ///
+    /// Each value is proven by the code cited in the adjacent comment: the
+    /// schema built by `init_schema` (constraints, indexes, vector indexes) and
+    /// the Cypher the adapter actually runs. Static so callers can inspect it
+    /// without opening a connection.
+    pub fn storage_capabilities() -> StoreCapabilities {
+        StoreCapabilities {
+            // client.rs:664-700 — HNSW vector indexes (Note/File/Function/
+            // DocumentChunk/Decision embeddings); note.rs:2300 — the search runs
+            // `CALL db.index.vector.queryNodes(...)`.
+            vector_search: true,
+            // note.rs:2293 + note.rs:2300-2308 — the vector index returns the
+            // nearest neighbours by similarity alone; the project/status filter
+            // is applied afterwards on the yielded nodes, not inside the index.
+            vector_filter: false,
+            // client.rs:396-430 — `CREATE CONSTRAINT ... REQUIRE x IS UNIQUE`.
+            unique_constraints: true,
+            // client.rs:435 (anchor_session_target) and client.rs:468
+            // (day_plan_key) — `REQUIRE (a, b) IS UNIQUE` over several properties.
+            composite_unique: true,
+            // code.rs:4163 (`[:IMPORTS|CALLS*1..5]`), topology.rs:376
+            // (`[:IMPORTS*..10]`) — variable-length path patterns.
+            variable_length_paths: true,
+            // code.rs:4163 and topology.rs:376 — `shortestPath(...)`.
+            shortest_path: true,
+            // code.rs:1475, code.rs:1802, persona.rs:909, neighborhood.rs:130 —
+            // `CALL { ... }` subqueries.
+            subqueries: true,
+            // persona.rs:1228 (`datetime() - duration('P7D')`), trigger.rs:317
+            // (`t.last_fired + duration({seconds: ...})`), note.rs:2072
+            // (`duration.between(...).days`) — datetime arithmetic in queries.
+            datetime_arithmetic: true,
+            // client.rs:582 and client.rs:584 — `FOR ()-[r:REL]-() ON (r.prop)`
+            // relationship property indexes.
+            relationship_property_index: true,
+            // chat.rs:2529 (`start_txn`), chat.rs:2642 (`commit`), chat.rs:2646
+            // (`rollback`) — explicit transactions.
+            explicit_transactions: true,
+        }
+    }
+
     /// Create a new Neo4j client
     ///
     /// Pool sizing is configurable via env vars, falling back to defaults well

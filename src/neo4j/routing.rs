@@ -217,7 +217,7 @@ impl Neo4jClient {
              WHERE ($project_slug = '' OR d.project_slug = $project_slug) \
                AND ($session_id = '' OR d.session_id = $session_id) \
                AND ($since = '' OR d.at >= $since) \
-             RETURN d.json AS json ORDER BY d.at DESC SKIP $offset LIMIT $limit",
+             RETURN d.json AS json ORDER BY d.at DESC, d.id DESC SKIP $offset LIMIT $limit",
         )
         .param(
             "project_slug",

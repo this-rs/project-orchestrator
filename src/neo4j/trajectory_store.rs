@@ -5,9 +5,9 @@ use neo4rs::{query, Graph};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::error::{NeuralRoutingError, Result};
-use crate::models::*;
-use crate::traits::TrajectoryStore;
+use neural_routing_core::error::{NeuralRoutingError, Result};
+use neural_routing_core::models::*;
+use neural_routing_core::traits::TrajectoryStore;
 
 /// Neo4j-backed trajectory storage.
 pub struct Neo4jTrajectoryStore {
@@ -828,6 +828,20 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
             .map_err(|e| NeuralRoutingError::Neo4j(e.to_string()))?;
 
         Ok(())
+    }
+
+    async fn link_tool_usages_batch(&self, node_id: &Uuid, usages: &[ToolUsage]) -> Result<()> {
+        // Delegate to the inherent method: it runs one transaction per node.
+        Neo4jTrajectoryStore::link_tool_usages_batch(self, node_id, usages).await
+    }
+
+    async fn link_touched_entities_batch(
+        &self,
+        node_id: &Uuid,
+        entities: &[TouchedEntity],
+    ) -> Result<()> {
+        // Delegate to the inherent method: it runs one transaction per node.
+        Neo4jTrajectoryStore::link_touched_entities_batch(self, node_id, entities).await
     }
 
     async fn delete_trajectory(&self, id: &Uuid) -> Result<bool> {

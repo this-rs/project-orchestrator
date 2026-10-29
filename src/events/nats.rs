@@ -5,10 +5,13 @@
 //!
 //! Fire-and-forget publishing: errors are logged but never block the caller.
 
-use super::types::{CrudEvent, EventEmitter};
+use super::types::{CrudEvent, EventEmitter, TransportState};
 use crate::chat::types::ChatEvent;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+
+use super::transport::{Message, Subject, Subscriber};
+use futures::StreamExt;
 
 // ============================================================================
 // RPC types for cross-instance chat session routing
@@ -86,6 +89,13 @@ pub struct NatsEmitter {
     cancel_rpc_timeout: std::time::Duration,
 }
 
+fn transport_message(msg: async_nats::Message) -> Message {
+    Message {
+        payload: msg.payload.to_vec(),
+        reply: msg.reply.map(|r| Subject::from(r.into_string())),
+    }
+}
+
 impl NatsEmitter {
     /// Create a new NatsEmitter with the given NATS client and subject prefix.
     ///
@@ -105,12 +115,37 @@ impl NatsEmitter {
         self
     }
 
+    /// Whether the client is currently connected to the server.
+    pub fn transport_state(&self) -> TransportState {
+        match self.client.connection_state() {
+            async_nats::connection::State::Connected => TransportState::Connected,
+            _ => TransportState::Disconnected,
+        }
+    }
+
     /// Get a reference to the underlying NATS client.
     ///
     /// Useful for creating subscribers or publishing to other subjects
     /// (e.g. chat events, interrupts).
     pub fn client(&self) -> &async_nats::Client {
         &self.client
+    }
+
+    /// Publish one payload on a reply subject (a reply inbox received on a
+    /// subscription). The subject is opaque to the caller: the conversion to
+    /// the transport's own subject type happens here.
+    pub async fn publish(
+        &self,
+        subject: &Subject,
+        payload: Vec<u8>,
+    ) -> Result<(), async_nats::PublishError> {
+        let subject = async_nats::Subject::from(subject.as_str());
+        self.client.publish(subject, payload.into()).await
+    }
+
+    /// Flush the transport, so a publish already queued reaches the server.
+    pub async fn flush(&self) -> Result<(), async_nats::client::FlushError> {
+        self.client.flush().await
     }
 
     /// Get the subject prefix (e.g. "events").
@@ -251,16 +286,13 @@ impl NatsEmitter {
     ///
     /// Returns a NATS subscriber that yields messages on `events.chat.{session_id}`.
     /// Each message payload is a JSON-serialized `ChatEvent`.
-    pub async fn subscribe_chat_events(
-        &self,
-        session_id: &str,
-    ) -> anyhow::Result<async_nats::Subscriber> {
+    pub async fn subscribe_chat_events(&self, session_id: &str) -> anyhow::Result<Subscriber> {
         let subject = self.chat_subject(session_id);
         let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
             anyhow::anyhow!("Failed to subscribe to NATS chat events {}: {}", subject, e)
         })?;
         debug!(subject = %subject, "Subscribed to NATS chat events");
-        Ok(subscriber)
+        Ok(Subscriber::from_stream(subscriber.map(transport_message)))
     }
 
     // ========================================================================
@@ -329,7 +361,7 @@ impl NatsEmitter {
     pub async fn subscribe_snapshot_requests(
         &self,
         session_id: &str,
-    ) -> anyhow::Result<async_nats::Subscriber> {
+    ) -> anyhow::Result<Subscriber> {
         let subject = self.snapshot_subject(session_id);
         let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
             anyhow::anyhow!(
@@ -339,30 +371,24 @@ impl NatsEmitter {
             )
         })?;
         debug!(subject = %subject, "Subscribed to NATS snapshot requests");
-        Ok(subscriber)
+        Ok(Subscriber::from_stream(subscriber.map(transport_message)))
     }
 
     /// Subscribe to interrupt signals for a session from NATS.
     ///
     /// Returns a NATS subscriber that yields messages on `events.chat.{session_id}.interrupt`.
-    pub async fn subscribe_interrupt(
-        &self,
-        session_id: &str,
-    ) -> anyhow::Result<async_nats::Subscriber> {
+    pub async fn subscribe_interrupt(&self, session_id: &str) -> anyhow::Result<Subscriber> {
         let subject = self.interrupt_subject(session_id);
         let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
             anyhow::anyhow!("Failed to subscribe to NATS interrupt {}: {}", subject, e)
         })?;
         debug!(subject = %subject, "Subscribed to NATS interrupt");
-        Ok(subscriber)
+        Ok(Subscriber::from_stream(subscriber.map(transport_message)))
     }
 
     /// Subscribe to cancel-tools signals for a session from NATS (T2 of
     /// plan 28e9afe3). Subject: `events.chat.{session_id}.cancel_tools`.
-    pub async fn subscribe_cancel_tools(
-        &self,
-        session_id: &str,
-    ) -> anyhow::Result<async_nats::Subscriber> {
+    pub async fn subscribe_cancel_tools(&self, session_id: &str) -> anyhow::Result<Subscriber> {
         let subject = self.cancel_tools_subject(session_id);
         let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
             anyhow::anyhow!(
@@ -372,7 +398,7 @@ impl NatsEmitter {
             )
         })?;
         debug!(subject = %subject, "Subscribed to NATS cancel_tools");
-        Ok(subscriber)
+        Ok(Subscriber::from_stream(subscriber.map(transport_message)))
     }
 
     // ========================================================================
@@ -402,7 +428,6 @@ impl NatsEmitter {
         is_provisional: &(dyn Fn(&[u8]) -> bool + Sync),
         grace: std::time::Duration,
     ) -> Result<Vec<u8>, RelayFailure> {
-        use futures::StreamExt;
         let transport = |e: &dyn std::fmt::Display| RelayFailure::Transport(e.to_string());
         let inbox = self.client.new_inbox();
         let mut answers = self
@@ -455,16 +480,13 @@ impl NatsEmitter {
 
     /// Subscribe to cancel-task requests for a session (the owning instance
     /// answers each on its reply subject).
-    pub async fn subscribe_cancel_task(
-        &self,
-        session_id: &str,
-    ) -> anyhow::Result<async_nats::Subscriber> {
+    pub async fn subscribe_cancel_task(&self, session_id: &str) -> anyhow::Result<Subscriber> {
         let subject = self.cancel_task_subject(session_id);
         let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
             anyhow::anyhow!("Failed to subscribe to NATS cancel_task {}: {}", subject, e)
         })?;
         debug!(subject = %subject, "Subscribed to NATS cancel_task");
-        Ok(subscriber)
+        Ok(Subscriber::from_stream(subscriber.map(transport_message)))
     }
 
     // ========================================================================
@@ -552,29 +574,26 @@ impl NatsEmitter {
     ///
     /// The owning instance subscribes and processes incoming messages,
     /// then replies with `ChatRpcResponse`.
-    pub async fn subscribe_rpc_send(
-        &self,
-        session_id: &str,
-    ) -> anyhow::Result<async_nats::Subscriber> {
+    pub async fn subscribe_rpc_send(&self, session_id: &str) -> anyhow::Result<Subscriber> {
         let subject = self.rpc_send_subject(session_id);
         let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
             anyhow::anyhow!("Failed to subscribe to NATS RPC send {}: {}", subject, e)
         })?;
         debug!(subject = %subject, "Subscribed to NATS RPC send requests");
-        Ok(subscriber)
+        Ok(Subscriber::from_stream(subscriber.map(transport_message)))
     }
 
     /// Subscribe to CRUD events from NATS.
     ///
     /// Returns a NATS subscriber that yields messages on `events.crud`.
     /// Each message payload is a JSON-serialized `CrudEvent`.
-    pub async fn subscribe_crud_events(&self) -> anyhow::Result<async_nats::Subscriber> {
+    pub async fn subscribe_crud_events(&self) -> anyhow::Result<Subscriber> {
         let subject = self.crud_subject();
         let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
             anyhow::anyhow!("Failed to subscribe to NATS CRUD events {}: {}", subject, e)
         })?;
         debug!(subject = %subject, "Subscribed to NATS CRUD events");
-        Ok(subscriber)
+        Ok(Subscriber::from_stream(subscriber.map(transport_message)))
     }
 
     /// Publish a graph event to NATS (fire-and-forget, like CRUD `emit`).
@@ -595,7 +614,7 @@ impl NatsEmitter {
     }
 
     /// Subscribe to NATS graph events (e.g. "events.graph").
-    pub async fn subscribe_graph_events(&self) -> anyhow::Result<async_nats::Subscriber> {
+    pub async fn subscribe_graph_events(&self) -> anyhow::Result<Subscriber> {
         let subject = self.graph_subject();
         let subscriber = self.client.subscribe(subject.clone()).await.map_err(|e| {
             anyhow::anyhow!(
@@ -605,7 +624,7 @@ impl NatsEmitter {
             )
         })?;
         debug!(subject = %subject, "Subscribed to NATS graph events");
-        Ok(subscriber)
+        Ok(Subscriber::from_stream(subscriber.map(transport_message)))
     }
 }
 

@@ -8,7 +8,7 @@ use uuid::Uuid;
 use super::client::Neo4jClient;
 use super::document::{Document, DocumentChunk, DocumentChunkHit};
 use super::models::*;
-use super::traits::GraphStore;
+use super::traits::{GraphStore, StoreCapabilities};
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
@@ -17,6 +17,10 @@ use crate::plan::models::{TaskDetails, UpdatePlanRequest, UpdateStepRequest, Upd
 
 #[async_trait]
 impl GraphStore for Neo4jClient {
+    fn capabilities(&self) -> StoreCapabilities {
+        Neo4jClient::storage_capabilities()
+    }
+
     // ========================================================================
     // Project operations
     // ========================================================================

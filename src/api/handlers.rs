@@ -15,6 +15,7 @@ use crate::neo4j::models::{
     ReleaseStatus, StepNode, TaskNode, TaskStatus, TaskWithPlan,
 };
 use crate::neo4j::plan::{compute_file_conflicts, WaveComputationResult};
+use crate::neo4j::StoreCapabilities;
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::plan::models::*;
 use crate::AuthConfig;
@@ -80,7 +81,7 @@ pub struct ServerState {
     pub trajectory_collector:
         std::sync::RwLock<Option<Arc<neural_routing_runtime::TrajectoryCollector>>>,
     /// Concrete Neo4j trajectory store — needed to create the collector at runtime.
-    pub trajectory_store_neo4j: Option<Arc<neural_routing_runtime::Neo4jTrajectoryStore>>,
+    pub trajectory_store_neo4j: Option<Arc<crate::neo4j::trajectory_store::Neo4jTrajectoryStore>>,
     /// Trajectory store — Neo4j CRUD + vector search for stored trajectories.
     pub trajectory_store: Option<Arc<dyn neural_routing_runtime::TrajectoryStore>>,
     /// EventReactor counters for the /api/reactor/status endpoint.
@@ -218,6 +219,8 @@ pub struct HealthResponse {
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub services: Option<ServiceHealthStatus>,
+    /// Manifest of the storage engine capabilities (see `StoreCapabilities`).
+    pub storage_capabilities: StoreCapabilities,
 }
 
 /// Health check handler — verifies actual connectivity to Neo4j, Meilisearch, and NATS.
@@ -241,17 +244,12 @@ pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json
         .unwrap_or(false);
 
     // NATS: check connection state if configured, otherwise "disabled"
-    let nats_status = match &state.nats_emitter {
-        Some(emitter) => {
-            let conn_state = emitter.client().connection_state();
-            if conn_state == async_nats::connection::State::Connected {
-                "connected"
-            } else {
-                "disconnected"
-            }
-        }
-        None => "disabled",
-    };
+    let nats_status = transport_label(
+        state
+            .nats_emitter
+            .as_ref()
+            .map(|emitter| emitter.transport_state()),
+    );
 
     let status = if neo4j_ok && meili_ok {
         "ok"
@@ -285,6 +283,7 @@ pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json
                 },
                 nats: nats_status.to_string(),
             }),
+            storage_capabilities: state.orchestrator.neo4j().capabilities(),
         }),
     )
 }
@@ -7918,6 +7917,60 @@ impl From<anyhow::Error> for AppError {
 pub(crate) mod tests {
     use super::*;
 
+    // ================================================================
+    // GET /health — JSON contract (frontend keys + backend capabilities)
+    // ================================================================
+
+    /// The `/health` payload keeps its frontend-contract keys — in particular
+    /// `services.neo4j` — and reports the capabilities of the backend that was
+    /// actually built (not a hard-coded manifest).
+    #[tokio::test]
+    async fn health_keeps_frontend_keys_and_reports_backend_capabilities() {
+        use crate::neo4j::mock::MockGraphStore;
+
+        let router =
+            crate::test_helpers::router_with_auth(std::sync::Arc::new(MockGraphStore::new())).await;
+
+        let resp = router
+            .oneshot(
+                axum::http::Request::get("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 10_000)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let obj = json.as_object().expect("health payload is an object");
+
+        for key in ["status", "version", "services", "storage_capabilities"] {
+            assert!(obj.contains_key(key), "missing top-level key `{key}`");
+        }
+
+        // `services.neo4j` is a frontend contract: kept even though the backend
+        // is now selected through the storage factory.
+        let services = obj["services"]
+            .as_object()
+            .expect("`services` is an object");
+        for key in ["neo4j", "meilisearch", "nats"] {
+            assert!(services.contains_key(key), "missing services key `{key}`");
+        }
+
+        // The capabilities reported are the ones the built backend declares.
+        let caps = obj["storage_capabilities"]
+            .as_object()
+            .expect("`storage_capabilities` is an object");
+        assert!(!caps.is_empty(), "capabilities must not be empty");
+        assert!(
+            caps["vector_search"].as_bool().unwrap_or(false),
+            "mock backend declares vector_search"
+        );
+    }
+
     // ── delegate_task: the spawn envelope (decision A17) ───────────────────
 
     fn parent_envelope(ceiling: &str) -> crate::chat::envelope::ParentEnvelope {
@@ -13292,5 +13345,41 @@ mod fabric_emit_tests {
         let comm = rx.try_recv().expect("a community_changed event");
         assert_eq!(format!("{:?}", comm.event_type), "CommunityChanged");
         assert_eq!(comm.delta["community_count"], serde_json::json!(3));
+    }
+}
+
+/// Label published in `/health` for the event transport.
+///
+/// Extracted from the handler so the mapping is provable without an emitter:
+/// `None` (nothing configured) and every "not usable right now" state read the
+/// same to a caller, and only a live connection says `connected`.
+fn transport_label(state: Option<crate::events::TransportState>) -> &'static str {
+    use crate::events::TransportState;
+
+    match state {
+        Some(TransportState::Connected) => "connected",
+        Some(TransportState::Disconnected) => "disconnected",
+        None | Some(TransportState::Disabled) | Some(TransportState::Unknown) => "disabled",
+    }
+}
+
+#[cfg(test)]
+mod transport_label_tests {
+    use super::transport_label;
+    use crate::events::TransportState;
+
+    #[test]
+    fn a_live_connection_is_the_only_thing_that_reads_connected() {
+        assert_eq!(transport_label(None), "disabled");
+        assert_eq!(transport_label(Some(TransportState::Disabled)), "disabled");
+        assert_eq!(transport_label(Some(TransportState::Unknown)), "disabled");
+        assert_eq!(
+            transport_label(Some(TransportState::Disconnected)),
+            "disconnected"
+        );
+        assert_eq!(
+            transport_label(Some(TransportState::Connected)),
+            "connected"
+        );
     }
 }

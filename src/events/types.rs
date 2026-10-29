@@ -166,6 +166,22 @@ pub struct CrudEvent {
     pub project_id: Option<String>,
 }
 
+/// State of the transport that carries events, as the emitter reports it.
+///
+/// Transport-agnostic on purpose: a caller (health endpoint, dashboard) must not
+/// need to know which client library sits behind the emitter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportState {
+    /// No transport configured — events stay in-process.
+    Disabled,
+    /// A transport is configured and reachable.
+    Connected,
+    /// A transport is configured but not reachable right now.
+    Disconnected,
+    /// The emitter does not expose its transport state.
+    Unknown,
+}
+
 /// Trait for emitting CRUD events.
 ///
 /// Implemented by `HybridEmitter` (local broadcast + optional NATS), `NatsEmitter`
@@ -174,6 +190,13 @@ pub struct CrudEvent {
 pub trait EventEmitter: Send + Sync {
     /// Emit a CrudEvent (fire-and-forget)
     fn emit(&self, event: CrudEvent);
+
+    /// Whether the transport carrying events is up, down, or not configured.
+    ///
+    /// Default: [`TransportState::Unknown`] — a purely local bus has nothing to report.
+    fn transport_state(&self) -> TransportState {
+        TransportState::Unknown
+    }
 
     /// Emit a GraphEvent for real-time visualization (fire-and-forget).
     ///
@@ -570,6 +593,12 @@ mod tests {
         fn emit(&self, event: CrudEvent) {
             self.events.lock().unwrap().push(event);
         }
+    }
+
+    #[test]
+    fn the_default_transport_state_is_unknown() {
+        let emitter = RecordingEmitter::new();
+        assert_eq!(emitter.transport_state(), TransportState::Unknown);
     }
 
     #[test]

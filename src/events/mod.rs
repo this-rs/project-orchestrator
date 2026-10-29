@@ -82,6 +82,7 @@ pub(crate) mod nats_broker_test;
 mod notifier;
 pub mod reactions;
 pub mod reactor;
+pub mod transport;
 pub mod trigger;
 pub mod trigger_routing;
 mod types;
@@ -100,6 +101,8 @@ pub use nats::{
 pub use notifier::EventNotifier;
 pub use reactions::register_builtin_reactions;
 pub use reactor::{EventReactor, ReactorBuilder, ReactorCounters, ReactorStats};
+pub use transport::{Message, Subject, Subscriber};
 pub use trigger::EventTrigger;
 pub use trigger_routing::{RoutingContext, RoutingDecision, TriggerRouter};
+pub use types::TransportState;
 pub use types::{CrudAction, CrudEvent, EntityType, EventEmitter, RelatedEntity};

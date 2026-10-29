@@ -9,7 +9,7 @@ use crate::events::trigger::EventTrigger;
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
 use crate::neo4j::document::{Document, DocumentChunk, DocumentChunkHit};
 use crate::neo4j::models::*;
-use crate::neo4j::traits::GraphStore;
+use crate::neo4j::traits::{GraphStore, StoreCapabilities};
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
 };
@@ -849,6 +849,41 @@ impl MockGraphStore {
 
 #[async_trait]
 impl GraphStore for MockGraphStore {
+    fn capabilities(&self) -> StoreCapabilities {
+        StoreCapabilities {
+            // mock.rs:7037 — `vector_search_notes` scores every note with
+            // `cosine_similarity(embedding, emb)` in memory.
+            vector_search: true,
+            // mock.rs:7017-7033 — the status / project / workspace filters run
+            // inline during the scan, before scoring, so the filter is applied
+            // inside the search (only the `min_similarity` threshold is applied
+            // after scoring).
+            vector_filter: true,
+            // mock.rs:842-846 — `create_project` inserts straight into a
+            // `HashMap` and overwrites an existing key silently: no uniqueness
+            // constraint is enforced.
+            unique_constraints: false,
+            // No composite uniqueness: the mock is a `RwLock<HashMap>` store
+            // (mock.rs:66) with no schema to declare one.
+            composite_unique: false,
+            // The mock evaluates no variable-length path patterns; it runs
+            // hand-written in-memory traversals, not a path engine.
+            variable_length_paths: false,
+            // No `shortestPath` equivalent: in-memory traversals are bespoke.
+            shortest_path: false,
+            // The mock executes no Cypher, so no `CALL { ... }` subqueries.
+            subqueries: false,
+            // No datetime arithmetic: timestamps are plain Rust values.
+            datetime_arithmetic: false,
+            // No indexes at all (node or relationship): lookups are `HashMap`
+            // reads.
+            relationship_property_index: false,
+            // No transactions: reads and writes go through `tokio::sync::RwLock`
+            // (mock.rs:22) with no begin / commit / rollback.
+            explicit_transactions: false,
+        }
+    }
+
     // ========================================================================
     // Project operations
     // ========================================================================

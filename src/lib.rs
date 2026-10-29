@@ -138,6 +138,7 @@ pub mod runner;
 pub mod setup_claude;
 pub mod sharing;
 pub mod skills;
+pub mod storage;
 pub mod transport;
 pub mod update;
 pub(crate) mod utils;
@@ -217,6 +218,9 @@ pub struct YamlConfig {
     /// Document storage section (optional — where uploaded blobs live)
     #[serde(default)]
     pub documents: DocumentsYamlConfig,
+    /// Storage backend selection (optional — which adapter builds the stores).
+    #[serde(default)]
+    pub storage: StorageYamlConfig,
 }
 
 /// Document storage configuration section.
@@ -228,6 +232,15 @@ pub struct DocumentsYamlConfig {
     /// subdirectory of the same per-platform application directory that already
     /// holds `config.yaml` and `identity.key`.
     pub storage_dir: Option<String>,
+}
+
+/// Storage backend selection.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct StorageYamlConfig {
+    /// Which storage backend builds the stores. Absent ⇒
+    /// [`crate::storage::DEFAULT_BACKEND`].
+    pub backend: Option<String>,
 }
 
 /// MCP Federation configuration section.
@@ -962,6 +975,10 @@ pub struct Config {
     /// Stored unexpanded; `DocumentStore::from_config` applies `expand_tilde`.
     pub documents_storage_dir: Option<String>,
 
+    /// Storage backend selection: which adapter builds the stores.
+    /// Priority: env var (STORAGE_BACKEND) > YAML (storage.backend) > default.
+    pub storage_backend: String,
+
     /// Resolved path to the config.yaml file that was loaded (if any).
     /// Used for persisting runtime changes back to disk.
     pub config_yaml_path: Option<std::path::PathBuf>,
@@ -1097,6 +1114,12 @@ impl Config {
             documents_storage_dir: std::env::var("DOCUMENTS_STORAGE_DIR")
                 .ok()
                 .or(yaml.documents.storage_dir),
+            // Storage backend selection (env var > YAML > default)
+            storage_backend: std::env::var("STORAGE_BACKEND").unwrap_or_else(|_| {
+                yaml.storage
+                    .backend
+                    .unwrap_or_else(|| crate::storage::DEFAULT_BACKEND.to_string())
+            }),
             // Neural routing config (env var overrides > YAML > defaults)
             neural_routing: {
                 let mut nr = yaml.neural_routing;
@@ -1223,7 +1246,7 @@ pub struct AppState {
     pub trajectory_collector:
         Arc<std::sync::RwLock<Option<Arc<neural_routing_runtime::TrajectoryCollector>>>>,
     /// Concrete Neo4j store — needed for lazy TrajectoryCollector creation.
-    pub trajectory_store_neo4j: Option<Arc<neural_routing_runtime::Neo4jTrajectoryStore>>,
+    pub trajectory_store_neo4j: Option<Arc<crate::neo4j::trajectory_store::Neo4jTrajectoryStore>>,
     /// Trajectory store — Neo4j CRUD + vector search for stored trajectories.
     pub trajectory_store: Arc<dyn neural_routing_runtime::TrajectoryStore>,
     /// MCP Federation registry — external MCP server connections.
@@ -1234,53 +1257,12 @@ pub struct AppState {
 impl AppState {
     /// Create new application state with all services initialized
     pub async fn new(config: Config) -> Result<Self> {
-        let neo4j = Arc::new(
-            neo4j::client::Neo4jClient::new(
-                &config.neo4j_uri,
-                &config.neo4j_user,
-                &config.neo4j_password,
-            )
-            .await?,
-        );
-
-        let meili = Arc::new(
-            meilisearch::client::MeiliClient::new(&config.meilisearch_url, &config.meilisearch_key)
-                .await?,
-        );
+        let backend = crate::storage::StorageBackend::from_config(&config).await?;
 
         let parser = Arc::new(parser::CodeParser::new()?);
 
-        // Initialize neural routing with its own Neo4j connection pool
-        let nr_graph = Arc::new(
-            neo4rs::Graph::new(
-                &config.neo4j_uri,
-                &config.neo4j_user,
-                &config.neo4j_password,
-            )
-            .await?,
-        );
-        let nr_store = Arc::new(neural_routing_runtime::Neo4jTrajectoryStore::new(nr_graph));
-
-        // The NN router answers with `CALL db.index.vector.queryNodes(
-        // 'trajectory_query_embedding_idx', …)`; a Neo4j VECTOR index is not
-        // implicit. This is the only place it is created: without it the call
-        // throws `There is no such vector schema index`, `NNRouter::route_internal`
-        // returns early, and the dashboard reads `hits: 0` while `total_queries`
-        // climbs — the state measured on 17/10/2026 (290 trajectories, no index).
-        // `IF NOT EXISTS` makes it idempotent and back-fills what is already stored.
-        if let Err(e) = nr_store.ensure_indexes().await {
-            tracing::warn!(
-                error = %e,
-                "neural-routing vector indexes not ensured — the NN router will miss on \
-                 every query (hits stays 0)"
-            );
-        }
-
-        let trajectory_store: Arc<dyn neural_routing_runtime::TrajectoryStore> = nr_store.clone();
-        let trajectory_store_api: Arc<dyn neural_routing_runtime::TrajectoryStore> =
-            nr_store.clone();
         let dual_router = neural_routing_runtime::DualTrackRouter::new(
-            trajectory_store,
+            backend.trajectories.clone(),
             config.neural_routing.clone(),
         );
         if config.neural_routing.enabled {
@@ -1294,7 +1276,10 @@ impl AppState {
         // Initialize trajectory collector (fire-and-forget decision capture)
         let trajectory_collector_inner = if config.neural_routing.collection.enabled {
             let (collector, _handle) = neural_routing_runtime::TrajectoryCollector::new(
-                nr_store.clone(),
+                backend
+                    .trajectory_store_concrete
+                    .clone()
+                    .expect("the default storage backend provides the concrete trajectory store"),
                 &config.neural_routing.collection,
                 None, // use default DecisionVectorBuilder
             );
@@ -1308,14 +1293,14 @@ impl AppState {
         };
 
         Ok(Self {
-            neo4j,
-            meili,
+            neo4j: backend.graph,
+            meili: backend.search,
             parser,
             config: Arc::new(config),
             neural_router,
             trajectory_collector: Arc::new(std::sync::RwLock::new(trajectory_collector_inner)),
-            trajectory_store_neo4j: Some(nr_store.clone()),
-            trajectory_store: trajectory_store_api,
+            trajectory_store_neo4j: backend.trajectory_store_concrete,
+            trajectory_store: backend.trajectories,
             mcp_registry: mcp_federation::registry::new_shared_registry(),
         })
     }

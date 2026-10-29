@@ -318,12 +318,12 @@ impl Neo4jClient {
         let (count_cypher, data_cypher) = if status.is_some() {
             (
                 "MATCH (p:Persona) WHERE p.project_id = $project_id AND p.status = $status RETURN count(p) AS total",
-                "MATCH (p:Persona) WHERE p.project_id = $project_id AND p.status = $status RETURN p ORDER BY p.energy DESC SKIP $offset LIMIT $limit",
+                "MATCH (p:Persona) WHERE p.project_id = $project_id AND p.status = $status RETURN p ORDER BY p.energy DESC, p.id DESC SKIP $offset LIMIT $limit",
             )
         } else {
             (
                 "MATCH (p:Persona) WHERE p.project_id = $project_id RETURN count(p) AS total",
-                "MATCH (p:Persona) WHERE p.project_id = $project_id RETURN p ORDER BY p.energy DESC SKIP $offset LIMIT $limit",
+                "MATCH (p:Persona) WHERE p.project_id = $project_id RETURN p ORDER BY p.energy DESC, p.id DESC SKIP $offset LIMIT $limit",
             )
         };
 

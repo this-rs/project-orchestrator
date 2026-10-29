@@ -17,6 +17,7 @@ mod environment;
 mod event_trigger;
 mod execution_place;
 mod feature_graph;
+pub mod graph_sampler;
 mod impl_graph_store;
 mod ingress;
 mod lifecycle_hook;
@@ -43,6 +44,9 @@ mod synapse_shadow;
 mod task;
 mod topology;
 pub mod traits;
+pub mod trajectory;
+pub mod trajectory_migration;
+pub mod trajectory_store;
 mod trigger;
 mod user;
 mod workspace;
@@ -52,7 +56,7 @@ pub use client::Neo4jClient;
 pub use document::{Document, DocumentChunk, DocumentChunkHit};
 pub use models::*;
 pub use segment::Neo4jSegmentStore;
-pub use traits::GraphStore;
+pub use traits::{GraphStore, StoreCapabilities};
 
 // The in-memory store. Unit tests get it through `cfg(test)`; the integration
 // test targets (tests/store_conformance.rs runs the same checks against it and

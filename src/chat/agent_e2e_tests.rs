@@ -6774,7 +6774,7 @@ mod parity {
 
     /// H3 NATS: another instance sees the session's events and reaches the session
     /// (a message, a held message, a snapshot, an interrupt), as for a Claude
-    /// Code session. A real `async_nats` client against an in-process broker.
+    /// Code session. A real transport client against an in-process broker.
     #[tokio::test]
     async fn another_instance_sees_the_events_and_reaches_the_session_through_nats() {
         use crate::events::nats_broker_test::TestBroker;
@@ -11970,7 +11970,9 @@ mod background_tasks {
         tokio::spawn(async move {
             while let Some(msg) = sub.next().await {
                 if let Some(reply) = msg.reply {
-                    let _ = client.publish(reply, "{\"ok\": true}".into()).await;
+                    let _ = client
+                        .publish(reply.to_string(), "{\"ok\": true}".into())
+                        .await;
                 }
             }
         });
@@ -12138,7 +12140,7 @@ mod background_tasks {
             while let Some(msg) = sub.next().await {
                 if let Some(reply) = msg.reply {
                     let _ = client
-                        .publish(reply, "{\"v\":2,\"gone\":true}".into())
+                        .publish(reply.to_string(), "{\"v\":2,\"gone\":true}".into())
                         .await;
                 }
             }
@@ -12162,7 +12164,7 @@ mod background_tasks {
         tokio::spawn(async move {
             while let Some(msg) = sub.next().await {
                 if let Some(reply) = msg.reply {
-                    let _ = client.publish(reply, "\"gone\"".into()).await;
+                    let _ = client.publish(reply.to_string(), "\"gone\"".into()).await;
                 }
             }
         });

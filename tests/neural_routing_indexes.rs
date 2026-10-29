@@ -22,7 +22,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use neural_routing_runtime::{Neo4jTrajectoryStore, Trajectory, TrajectoryNode, TrajectoryStore};
+use neural_routing_runtime::{Trajectory, TrajectoryNode, TrajectoryStore};
+use project_orchestrator::neo4j::trajectory_store::Neo4jTrajectoryStore;
 use uuid::Uuid;
 
 /// The startup path must create the vector index the router queries.
@@ -31,17 +32,26 @@ use uuid::Uuid;
 /// checked is that the code says so.
 #[test]
 fn startup_creates_the_vector_index_the_nn_router_queries() {
-    let lib = include_str!("../src/lib.rs");
+    // The chain is lib.rs → storage backend → neo4j::trajectory::open → ensure_indexes
+    // (the storage refactor moved the call out of lib.rs; the guard follows it).
+    let storage = include_str!("../src/storage.rs");
+    let trajectory = include_str!("../src/neo4j/trajectory.rs");
     assert!(
-        lib.contains("ensure_indexes"),
-        "the startup path never calls Neo4jTrajectoryStore::ensure_indexes: the NN router's \
-         `db.index.vector.queryNodes('trajectory_query_embedding_idx', …)` then throws \
-         `There is no such vector schema index`, every route is a miss and `hits` stays 0 forever"
+        storage.contains("trajectory::open("),
+        "the storage backend no longer opens the trajectory store: the startup path never \
+         reaches Neo4jTrajectoryStore::ensure_indexes, and the NN router's \
+         `db.index.vector.queryNodes('trajectory_query_embedding_idx', …)` throws \
+         `There is no such vector schema index`: every route is a miss and `hits` stays 0 forever"
+    );
+    assert!(
+        trajectory.contains("store.ensure_indexes()"),
+        "neo4j::trajectory::open no longer calls ensure_indexes: the vector index the NN router \
+         queries is never created"
     );
 
     // Tie the two halves together: a rename of the index can never silently
     // disconnect the query from its creation.
-    let store = include_str!("../crates/neural-routing-core/src/store.rs");
+    let store = include_str!("../src/neo4j/trajectory_store.rs");
     assert!(
         store.contains("trajectory_query_embedding_idx"),
         "the index the router queries must be the one ensure_indexes creates"
