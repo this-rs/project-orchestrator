@@ -2499,480 +2499,6 @@ impl AnalyticsStore for Neo4jClient {
     }
 
     // ========================================================================
-    // Chat session operations
-    // ========================================================================
-
-    async fn create_chat_session(&self, session: &ChatSessionNode) -> anyhow::Result<()> {
-        self.create_chat_session(session).await
-    }
-
-    async fn get_chat_session(&self, id: Uuid) -> anyhow::Result<Option<ChatSessionNode>> {
-        self.get_chat_session(id).await
-    }
-
-    async fn list_chat_sessions(
-        &self,
-        project_slug: Option<&str>,
-        workspace_slug: Option<&str>,
-        limit: usize,
-        offset: usize,
-        include_detached: bool,
-    ) -> anyhow::Result<(Vec<ChatSessionNode>, usize)> {
-        self.list_chat_sessions(
-            project_slug,
-            workspace_slug,
-            limit,
-            offset,
-            include_detached,
-        )
-        .await
-    }
-
-    async fn get_session_children(&self, parent_id: Uuid) -> anyhow::Result<Vec<ChatSessionNode>> {
-        self.get_session_children(parent_id).await
-    }
-
-    async fn create_spawned_by_relation(
-        &self,
-        child_session_id: &str,
-        parent_session_id: &str,
-        spawn_type: &str,
-        run_id: Option<Uuid>,
-        task_id: Option<Uuid>,
-    ) -> anyhow::Result<()> {
-        self.create_spawned_by_relation(
-            child_session_id,
-            parent_session_id,
-            spawn_type,
-            run_id,
-            task_id,
-        )
-        .await
-    }
-
-    async fn link_session_to_run(
-        &self,
-        session_id: &str,
-        run_id: Uuid,
-        plan_id: Option<Uuid>,
-        task_id: Option<Uuid>,
-    ) -> anyhow::Result<bool> {
-        self.link_session_to_run(session_id, run_id, plan_id, task_id)
-            .await
-    }
-
-    async fn get_session_link_rows(
-        &self,
-        session_ids: &[Uuid],
-    ) -> anyhow::Result<Vec<SessionLinkRow>> {
-        self.get_session_link_rows(session_ids).await
-    }
-
-    async fn get_plans_task_graph(&self, plan_ids: &[Uuid]) -> anyhow::Result<PlansTaskGraph> {
-        self.get_plans_task_graph(plan_ids).await
-    }
-
-    async fn list_project_workspace_rows(&self) -> anyhow::Result<Vec<ProjectWorkspaceRow>> {
-        self.list_project_workspace_rows().await
-    }
-
-    async fn get_session_tree(&self, session_id: &str) -> anyhow::Result<Vec<SessionTreeNode>> {
-        self.get_session_tree(session_id).await
-    }
-
-    async fn get_session_root(&self, session_id: &str) -> anyhow::Result<Option<String>> {
-        self.get_session_root(session_id).await
-    }
-
-    async fn get_run_sessions(&self, run_id: Uuid) -> anyhow::Result<Vec<SessionInfo>> {
-        self.get_run_sessions(run_id).await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn update_chat_session(
-        &self,
-        id: Uuid,
-        cli_session_id: Option<String>,
-        title: Option<String>,
-        message_count: Option<i64>,
-        total_cost_usd: Option<f64>,
-        conversation_id: Option<String>,
-        preview: Option<String>,
-    ) -> anyhow::Result<Option<ChatSessionNode>> {
-        self.update_chat_session(
-            id,
-            cli_session_id,
-            title,
-            message_count,
-            total_cost_usd,
-            conversation_id,
-            preview,
-        )
-        .await
-    }
-
-    async fn update_chat_session_permission_mode(
-        &self,
-        id: Uuid,
-        mode: &str,
-    ) -> anyhow::Result<()> {
-        self.update_chat_session_permission_mode(id, mode).await
-    }
-
-    async fn bind_chat_session_project(
-        &self,
-        id: Uuid,
-        project_slug: &str,
-    ) -> anyhow::Result<bool> {
-        Neo4jClient::bind_chat_session_project(self, id, project_slug).await
-    }
-
-    async fn add_chat_session_children_cost(
-        &self,
-        id: Uuid,
-        delta_usd: f64,
-    ) -> anyhow::Result<f64> {
-        Neo4jClient::add_chat_session_children_cost(self, id, delta_usd).await
-    }
-
-    async fn get_chat_session_children_cost(&self, id: Uuid) -> anyhow::Result<f64> {
-        Neo4jClient::get_chat_session_children_cost(self, id).await
-    }
-
-    async fn update_chat_session_file_scope_lifted(
-        &self,
-        id: Uuid,
-        lifted: bool,
-    ) -> anyhow::Result<()> {
-        self.update_chat_session_file_scope_lifted(id, lifted).await
-    }
-
-    async fn update_chat_session_model(&self, id: Uuid, model: &str) -> anyhow::Result<()> {
-        self.update_chat_session_model(id, model).await
-    }
-
-    async fn set_chat_session_fingerprint(
-        &self,
-        id: Uuid,
-        fingerprint: &str,
-    ) -> anyhow::Result<()> {
-        self.set_chat_session_fingerprint(id, fingerprint).await
-    }
-
-    async fn get_chat_session_fingerprint(&self, id: Uuid) -> anyhow::Result<Option<String>> {
-        self.get_chat_session_fingerprint(id).await
-    }
-
-    async fn update_chat_session_routing(
-        &self,
-        id: Uuid,
-        routing_mode: Option<&str>,
-        routing_pool: Option<&str>,
-        routed_by: Option<&str>,
-    ) -> anyhow::Result<bool> {
-        self.update_chat_session_routing(id, routing_mode, routing_pool, routed_by)
-            .await
-    }
-
-    async fn update_chat_session_provider(
-        &self,
-        id: Uuid,
-        provider_id: &str,
-        model: &str,
-        routed_by: &str,
-        engine: &str,
-    ) -> anyhow::Result<bool> {
-        self.update_chat_session_provider(id, provider_id, model, routed_by, engine)
-            .await
-    }
-
-    async fn restore_chat_session_provider(
-        &self,
-        node: &ChatSessionNode,
-        provider_id: &str,
-    ) -> anyhow::Result<bool> {
-        self.restore_chat_session_provider(node, provider_id).await
-    }
-
-    async fn get_llm_setting(&self, scope: &str, key: &str) -> anyhow::Result<Option<String>> {
-        self.get_llm_setting(scope, key).await
-    }
-    async fn put_llm_setting(&self, scope: &str, key: &str, value: &str) -> anyhow::Result<()> {
-        self.put_llm_setting(scope, key, value).await
-    }
-    async fn delete_llm_setting(&self, scope: &str, key: &str) -> anyhow::Result<bool> {
-        self.delete_llm_setting(scope, key).await
-    }
-    async fn list_llm_settings(
-        &self,
-        scope: &str,
-        prefix: &str,
-    ) -> anyhow::Result<Vec<(String, String)>> {
-        self.list_llm_settings(scope, prefix).await
-    }
-
-    async fn update_chat_session_harness(
-        &self,
-        id: Uuid,
-        capabilities: Option<&str>,
-        resume_token: Option<&str>,
-    ) -> anyhow::Result<()> {
-        self.update_chat_session_harness(id, capabilities, resume_token)
-            .await
-    }
-
-    async fn set_chat_session_shell_moved(&self, id: Uuid) -> anyhow::Result<()> {
-        self.set_chat_session_shell_moved(id).await
-    }
-
-    async fn get_chat_session_shell_moved(&self, id: Uuid) -> anyhow::Result<Option<bool>> {
-        self.get_chat_session_shell_moved(id).await
-    }
-
-    async fn backfill_chat_session_previews(&self) -> anyhow::Result<usize> {
-        self.backfill_chat_session_previews().await
-    }
-
-    async fn delete_chat_session(&self, id: Uuid) -> anyhow::Result<bool> {
-        self.delete_chat_session(id).await
-    }
-
-    async fn save_session_episode(
-        &self,
-        episode: &crate::episodes::models::Episode,
-    ) -> anyhow::Result<bool> {
-        self.save_session_episode(episode).await
-    }
-
-    async fn list_session_episodes(
-        &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> anyhow::Result<Vec<crate::episodes::models::Episode>> {
-        self.list_session_episodes(project_id, limit).await
-    }
-
-    async fn agent_identity_namespace(&self) -> anyhow::Result<Uuid> {
-        self.agent_identity_namespace().await
-    }
-
-    async fn search_episodes_by_embedding(
-        &self,
-        project_id: Uuid,
-        embedding: &[f32],
-        limit: usize,
-    ) -> anyhow::Result<Vec<(crate::episodes::models::Episode, f64)>> {
-        self.search_episodes_by_embedding(project_id, embedding, limit)
-            .await
-    }
-
-    async fn apply_anchor_op(
-        &self,
-        session_id: Uuid,
-        op: crate::chat::anchor::AnchorOp,
-    ) -> anyhow::Result<crate::chat::anchor::AnchorChange> {
-        self.apply_anchor_op(session_id, op).await
-    }
-
-    async fn apply_anchor_op_if(
-        &self,
-        session_id: Uuid,
-        op: crate::chat::anchor::AnchorOp,
-        if_match: Option<u64>,
-    ) -> anyhow::Result<crate::chat::anchor::AnchorSetChange> {
-        self.apply_anchor_op_if(session_id, op, if_match).await
-    }
-
-    async fn get_anchor_set(
-        &self,
-        session_id: Uuid,
-    ) -> anyhow::Result<Option<crate::chat::anchor::AnchorSet>> {
-        self.get_anchor_set(session_id).await
-    }
-
-    async fn list_session_anchors(
-        &self,
-        session_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::chat::anchor::Anchor>> {
-        self.list_session_anchors(session_id).await
-    }
-
-    async fn list_sessions_for_target(
-        &self,
-        target_type: crate::chat::anchor::AnchorTargetType,
-        target_id: &str,
-        state: Option<crate::chat::anchor::AnchorState>,
-        limit: usize,
-        cursor: Option<&str>,
-    ) -> anyhow::Result<crate::chat::anchor::AnchorPage> {
-        self.list_sessions_for_target(target_type, target_id, state, limit, cursor)
-            .await
-    }
-
-    async fn list_anchor_events(
-        &self,
-        session_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::chat::anchor::AnchorEvent>> {
-        self.list_anchor_events(session_id).await
-    }
-
-    async fn create_execution_place_event(
-        &self,
-        event: &crate::neo4j::models::ExecutionPlaceEvent,
-    ) -> anyhow::Result<()> {
-        self.create_execution_place_event(event).await
-    }
-
-    async fn list_execution_place_events(
-        &self,
-        task_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::neo4j::models::ExecutionPlaceEvent>> {
-        self.list_execution_place_events(task_id).await
-    }
-
-    async fn mark_anchors_dangling(
-        &self,
-        target_type: crate::chat::anchor::AnchorTargetType,
-        target_id: &str,
-    ) -> anyhow::Result<usize> {
-        self.mark_anchors_dangling(target_type, target_id).await
-    }
-
-    async fn backfill_project_anchors(
-        &self,
-    ) -> anyhow::Result<crate::chat::anchor::BackfillReport> {
-        self.backfill_project_anchors().await
-    }
-
-    async fn backfill_spawned_by_edges(&self) -> anyhow::Result<usize> {
-        self.backfill_spawned_by_edges().await
-    }
-
-    async fn revert_inferred_anchors(&self) -> anyhow::Result<usize> {
-        self.revert_inferred_anchors().await
-    }
-
-    // Chat event operations
-
-    async fn store_chat_events(
-        &self,
-        session_id: Uuid,
-        events: Vec<ChatEventRecord>,
-    ) -> anyhow::Result<()> {
-        self.store_chat_events(session_id, events).await
-    }
-
-    async fn get_chat_events(
-        &self,
-        session_id: Uuid,
-        after_seq: i64,
-        limit: i64,
-    ) -> anyhow::Result<Vec<ChatEventRecord>> {
-        self.get_chat_events(session_id, after_seq, limit).await
-    }
-
-    async fn get_attention_events(
-        &self,
-        session_ids: &[Uuid],
-    ) -> anyhow::Result<Vec<ChatEventRecord>> {
-        self.get_attention_events(session_ids).await
-    }
-
-    async fn get_chat_events_paginated(
-        &self,
-        session_id: Uuid,
-        offset: i64,
-        limit: i64,
-    ) -> anyhow::Result<Vec<ChatEventRecord>> {
-        self.get_chat_events_paginated(session_id, offset, limit)
-            .await
-    }
-
-    async fn count_chat_events(&self, session_id: Uuid) -> anyhow::Result<i64> {
-        self.count_chat_events(session_id).await
-    }
-
-    async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> anyhow::Result<i64> {
-        self.get_latest_chat_event_seq(session_id).await
-    }
-
-    async fn delete_chat_events(&self, session_id: Uuid) -> anyhow::Result<()> {
-        self.delete_chat_events(session_id).await
-    }
-
-    // ========================================================================
-    // Chat DISCUSSED relations
-    // ========================================================================
-
-    async fn add_discussed(
-        &self,
-        session_id: Uuid,
-        entities: &[(String, String)],
-    ) -> anyhow::Result<usize> {
-        self.add_discussed(session_id, entities).await
-    }
-
-    async fn get_session_entities(
-        &self,
-        session_id: Uuid,
-        project_id: Option<Uuid>,
-    ) -> anyhow::Result<Vec<DiscussedEntity>> {
-        self.get_session_entities(session_id, project_id).await
-    }
-
-    async fn get_discussed_co_changers(
-        &self,
-        project_id: Uuid,
-        max_sessions: i64,
-        max_results: i64,
-    ) -> anyhow::Result<Vec<CoChanger>> {
-        self.get_discussed_co_changers(project_id, max_sessions, max_results)
-            .await
-    }
-
-    async fn backfill_discussed(&self) -> anyhow::Result<(usize, usize, usize)> {
-        self.backfill_discussed().await
-    }
-
-    // ========================================================================
-    // Chat ↔ Plan/Task/RFC linking (ASSOCIATED_WITH relation)
-    // ========================================================================
-
-    async fn create_associated_with(
-        &self,
-        session_id: Uuid,
-        entity_type: &str,
-        entity_id: Uuid,
-        source: &str,
-    ) -> anyhow::Result<bool> {
-        self.create_associated_with(session_id, entity_type, entity_id, source)
-            .await
-    }
-
-    async fn get_session_links(&self, session_id: Uuid) -> anyhow::Result<LinkedSessionInfo> {
-        self.get_session_links(session_id).await
-    }
-
-    async fn get_sessions_for_plan(&self, plan_id: Uuid) -> anyhow::Result<Vec<SessionWithLinks>> {
-        self.get_sessions_for_plan(plan_id).await
-    }
-
-    async fn get_sessions_for_task(&self, task_id: Uuid) -> anyhow::Result<Vec<SessionWithLinks>> {
-        self.get_sessions_for_task(task_id).await
-    }
-
-    async fn get_session_links_batch(
-        &self,
-        session_ids: &[Uuid],
-    ) -> anyhow::Result<std::collections::HashMap<Uuid, LinkedSessionInfo>> {
-        self.get_session_links_batch(session_ids).await
-    }
-
-    async fn get_task_plan_id(&self, task_id: Uuid) -> anyhow::Result<Option<Uuid>> {
-        self.get_task_plan_id(task_id).await
-    }
-
-    // ========================================================================
     // Graph visualization queries (PM + Chat layers)
     // ========================================================================
 
@@ -4972,5 +4498,482 @@ impl AnalyticsStore for Neo4jClient {
     ) -> anyhow::Result<Option<crate::graph::neighborhood::ScopedNeighborhood>> {
         self.get_scoped_entity_neighborhood(center_type, center_id, params, filter)
             .await
+    }
+}
+
+#[async_trait]
+impl ChatStore for Neo4jClient {
+    // ========================================================================
+    // Chat session operations
+    // ========================================================================
+
+    async fn create_chat_session(&self, session: &ChatSessionNode) -> anyhow::Result<()> {
+        self.create_chat_session(session).await
+    }
+
+    async fn get_chat_session(&self, id: Uuid) -> anyhow::Result<Option<ChatSessionNode>> {
+        self.get_chat_session(id).await
+    }
+
+    async fn list_chat_sessions(
+        &self,
+        project_slug: Option<&str>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+        include_detached: bool,
+    ) -> anyhow::Result<(Vec<ChatSessionNode>, usize)> {
+        self.list_chat_sessions(
+            project_slug,
+            workspace_slug,
+            limit,
+            offset,
+            include_detached,
+        )
+        .await
+    }
+
+    async fn get_session_children(&self, parent_id: Uuid) -> anyhow::Result<Vec<ChatSessionNode>> {
+        self.get_session_children(parent_id).await
+    }
+
+    async fn create_spawned_by_relation(
+        &self,
+        child_session_id: &str,
+        parent_session_id: &str,
+        spawn_type: &str,
+        run_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> anyhow::Result<()> {
+        self.create_spawned_by_relation(
+            child_session_id,
+            parent_session_id,
+            spawn_type,
+            run_id,
+            task_id,
+        )
+        .await
+    }
+
+    async fn link_session_to_run(
+        &self,
+        session_id: &str,
+        run_id: Uuid,
+        plan_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> anyhow::Result<bool> {
+        self.link_session_to_run(session_id, run_id, plan_id, task_id)
+            .await
+    }
+
+    async fn get_session_link_rows(
+        &self,
+        session_ids: &[Uuid],
+    ) -> anyhow::Result<Vec<SessionLinkRow>> {
+        self.get_session_link_rows(session_ids).await
+    }
+
+    async fn get_plans_task_graph(&self, plan_ids: &[Uuid]) -> anyhow::Result<PlansTaskGraph> {
+        self.get_plans_task_graph(plan_ids).await
+    }
+
+    async fn list_project_workspace_rows(&self) -> anyhow::Result<Vec<ProjectWorkspaceRow>> {
+        self.list_project_workspace_rows().await
+    }
+
+    async fn get_session_tree(&self, session_id: &str) -> anyhow::Result<Vec<SessionTreeNode>> {
+        self.get_session_tree(session_id).await
+    }
+
+    async fn get_session_root(&self, session_id: &str) -> anyhow::Result<Option<String>> {
+        self.get_session_root(session_id).await
+    }
+
+    async fn get_run_sessions(&self, run_id: Uuid) -> anyhow::Result<Vec<SessionInfo>> {
+        self.get_run_sessions(run_id).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn update_chat_session(
+        &self,
+        id: Uuid,
+        cli_session_id: Option<String>,
+        title: Option<String>,
+        message_count: Option<i64>,
+        total_cost_usd: Option<f64>,
+        conversation_id: Option<String>,
+        preview: Option<String>,
+    ) -> anyhow::Result<Option<ChatSessionNode>> {
+        self.update_chat_session(
+            id,
+            cli_session_id,
+            title,
+            message_count,
+            total_cost_usd,
+            conversation_id,
+            preview,
+        )
+        .await
+    }
+
+    async fn update_chat_session_permission_mode(
+        &self,
+        id: Uuid,
+        mode: &str,
+    ) -> anyhow::Result<()> {
+        self.update_chat_session_permission_mode(id, mode).await
+    }
+
+    async fn bind_chat_session_project(
+        &self,
+        id: Uuid,
+        project_slug: &str,
+    ) -> anyhow::Result<bool> {
+        Neo4jClient::bind_chat_session_project(self, id, project_slug).await
+    }
+
+    async fn add_chat_session_children_cost(
+        &self,
+        id: Uuid,
+        delta_usd: f64,
+    ) -> anyhow::Result<f64> {
+        Neo4jClient::add_chat_session_children_cost(self, id, delta_usd).await
+    }
+
+    async fn get_chat_session_children_cost(&self, id: Uuid) -> anyhow::Result<f64> {
+        Neo4jClient::get_chat_session_children_cost(self, id).await
+    }
+
+    async fn update_chat_session_file_scope_lifted(
+        &self,
+        id: Uuid,
+        lifted: bool,
+    ) -> anyhow::Result<()> {
+        self.update_chat_session_file_scope_lifted(id, lifted).await
+    }
+
+    async fn update_chat_session_model(&self, id: Uuid, model: &str) -> anyhow::Result<()> {
+        self.update_chat_session_model(id, model).await
+    }
+
+    async fn set_chat_session_fingerprint(
+        &self,
+        id: Uuid,
+        fingerprint: &str,
+    ) -> anyhow::Result<()> {
+        self.set_chat_session_fingerprint(id, fingerprint).await
+    }
+
+    async fn get_chat_session_fingerprint(&self, id: Uuid) -> anyhow::Result<Option<String>> {
+        self.get_chat_session_fingerprint(id).await
+    }
+
+    async fn update_chat_session_routing(
+        &self,
+        id: Uuid,
+        routing_mode: Option<&str>,
+        routing_pool: Option<&str>,
+        routed_by: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        self.update_chat_session_routing(id, routing_mode, routing_pool, routed_by)
+            .await
+    }
+
+    async fn update_chat_session_provider(
+        &self,
+        id: Uuid,
+        provider_id: &str,
+        model: &str,
+        routed_by: &str,
+        engine: &str,
+    ) -> anyhow::Result<bool> {
+        self.update_chat_session_provider(id, provider_id, model, routed_by, engine)
+            .await
+    }
+
+    async fn restore_chat_session_provider(
+        &self,
+        node: &ChatSessionNode,
+        provider_id: &str,
+    ) -> anyhow::Result<bool> {
+        self.restore_chat_session_provider(node, provider_id).await
+    }
+
+    async fn get_llm_setting(&self, scope: &str, key: &str) -> anyhow::Result<Option<String>> {
+        self.get_llm_setting(scope, key).await
+    }
+    async fn put_llm_setting(&self, scope: &str, key: &str, value: &str) -> anyhow::Result<()> {
+        self.put_llm_setting(scope, key, value).await
+    }
+    async fn delete_llm_setting(&self, scope: &str, key: &str) -> anyhow::Result<bool> {
+        self.delete_llm_setting(scope, key).await
+    }
+    async fn list_llm_settings(
+        &self,
+        scope: &str,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        self.list_llm_settings(scope, prefix).await
+    }
+
+    async fn update_chat_session_harness(
+        &self,
+        id: Uuid,
+        capabilities: Option<&str>,
+        resume_token: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.update_chat_session_harness(id, capabilities, resume_token)
+            .await
+    }
+
+    async fn set_chat_session_shell_moved(&self, id: Uuid) -> anyhow::Result<()> {
+        self.set_chat_session_shell_moved(id).await
+    }
+
+    async fn get_chat_session_shell_moved(&self, id: Uuid) -> anyhow::Result<Option<bool>> {
+        self.get_chat_session_shell_moved(id).await
+    }
+
+    async fn backfill_chat_session_previews(&self) -> anyhow::Result<usize> {
+        self.backfill_chat_session_previews().await
+    }
+
+    async fn delete_chat_session(&self, id: Uuid) -> anyhow::Result<bool> {
+        self.delete_chat_session(id).await
+    }
+
+    async fn save_session_episode(
+        &self,
+        episode: &crate::episodes::models::Episode,
+    ) -> anyhow::Result<bool> {
+        self.save_session_episode(episode).await
+    }
+
+    async fn list_session_episodes(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::episodes::models::Episode>> {
+        self.list_session_episodes(project_id, limit).await
+    }
+
+    async fn agent_identity_namespace(&self) -> anyhow::Result<Uuid> {
+        self.agent_identity_namespace().await
+    }
+
+    async fn search_episodes_by_embedding(
+        &self,
+        project_id: Uuid,
+        embedding: &[f32],
+        limit: usize,
+    ) -> anyhow::Result<Vec<(crate::episodes::models::Episode, f64)>> {
+        self.search_episodes_by_embedding(project_id, embedding, limit)
+            .await
+    }
+
+    async fn apply_anchor_op(
+        &self,
+        session_id: Uuid,
+        op: crate::chat::anchor::AnchorOp,
+    ) -> anyhow::Result<crate::chat::anchor::AnchorChange> {
+        self.apply_anchor_op(session_id, op).await
+    }
+
+    async fn apply_anchor_op_if(
+        &self,
+        session_id: Uuid,
+        op: crate::chat::anchor::AnchorOp,
+        if_match: Option<u64>,
+    ) -> anyhow::Result<crate::chat::anchor::AnchorSetChange> {
+        self.apply_anchor_op_if(session_id, op, if_match).await
+    }
+
+    async fn get_anchor_set(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Option<crate::chat::anchor::AnchorSet>> {
+        self.get_anchor_set(session_id).await
+    }
+
+    async fn list_session_anchors(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::chat::anchor::Anchor>> {
+        self.list_session_anchors(session_id).await
+    }
+
+    async fn list_sessions_for_target(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+        state: Option<crate::chat::anchor::AnchorState>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> anyhow::Result<crate::chat::anchor::AnchorPage> {
+        self.list_sessions_for_target(target_type, target_id, state, limit, cursor)
+            .await
+    }
+
+    async fn list_anchor_events(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::chat::anchor::AnchorEvent>> {
+        self.list_anchor_events(session_id).await
+    }
+
+    async fn create_execution_place_event(
+        &self,
+        event: &crate::neo4j::models::ExecutionPlaceEvent,
+    ) -> anyhow::Result<()> {
+        self.create_execution_place_event(event).await
+    }
+
+    async fn list_execution_place_events(
+        &self,
+        task_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::ExecutionPlaceEvent>> {
+        self.list_execution_place_events(task_id).await
+    }
+
+    async fn mark_anchors_dangling(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+    ) -> anyhow::Result<usize> {
+        self.mark_anchors_dangling(target_type, target_id).await
+    }
+
+    async fn backfill_project_anchors(
+        &self,
+    ) -> anyhow::Result<crate::chat::anchor::BackfillReport> {
+        self.backfill_project_anchors().await
+    }
+
+    async fn backfill_spawned_by_edges(&self) -> anyhow::Result<usize> {
+        self.backfill_spawned_by_edges().await
+    }
+
+    async fn revert_inferred_anchors(&self) -> anyhow::Result<usize> {
+        self.revert_inferred_anchors().await
+    }
+
+    // Chat event operations
+
+    async fn store_chat_events(
+        &self,
+        session_id: Uuid,
+        events: Vec<ChatEventRecord>,
+    ) -> anyhow::Result<()> {
+        self.store_chat_events(session_id, events).await
+    }
+
+    async fn get_chat_events(
+        &self,
+        session_id: Uuid,
+        after_seq: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ChatEventRecord>> {
+        self.get_chat_events(session_id, after_seq, limit).await
+    }
+
+    async fn get_attention_events(
+        &self,
+        session_ids: &[Uuid],
+    ) -> anyhow::Result<Vec<ChatEventRecord>> {
+        self.get_attention_events(session_ids).await
+    }
+
+    async fn get_chat_events_paginated(
+        &self,
+        session_id: Uuid,
+        offset: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ChatEventRecord>> {
+        self.get_chat_events_paginated(session_id, offset, limit)
+            .await
+    }
+
+    async fn count_chat_events(&self, session_id: Uuid) -> anyhow::Result<i64> {
+        self.count_chat_events(session_id).await
+    }
+
+    async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> anyhow::Result<i64> {
+        self.get_latest_chat_event_seq(session_id).await
+    }
+
+    async fn delete_chat_events(&self, session_id: Uuid) -> anyhow::Result<()> {
+        self.delete_chat_events(session_id).await
+    }
+
+    // ========================================================================
+    // Chat DISCUSSED relations
+    // ========================================================================
+
+    async fn add_discussed(
+        &self,
+        session_id: Uuid,
+        entities: &[(String, String)],
+    ) -> anyhow::Result<usize> {
+        self.add_discussed(session_id, entities).await
+    }
+
+    async fn get_session_entities(
+        &self,
+        session_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<DiscussedEntity>> {
+        self.get_session_entities(session_id, project_id).await
+    }
+
+    async fn get_discussed_co_changers(
+        &self,
+        project_id: Uuid,
+        max_sessions: i64,
+        max_results: i64,
+    ) -> anyhow::Result<Vec<CoChanger>> {
+        self.get_discussed_co_changers(project_id, max_sessions, max_results)
+            .await
+    }
+
+    async fn backfill_discussed(&self) -> anyhow::Result<(usize, usize, usize)> {
+        self.backfill_discussed().await
+    }
+
+    // ========================================================================
+    // Chat ↔ Plan/Task/RFC linking (ASSOCIATED_WITH relation)
+    // ========================================================================
+
+    async fn create_associated_with(
+        &self,
+        session_id: Uuid,
+        entity_type: &str,
+        entity_id: Uuid,
+        source: &str,
+    ) -> anyhow::Result<bool> {
+        self.create_associated_with(session_id, entity_type, entity_id, source)
+            .await
+    }
+
+    async fn get_session_links(&self, session_id: Uuid) -> anyhow::Result<LinkedSessionInfo> {
+        self.get_session_links(session_id).await
+    }
+
+    async fn get_sessions_for_plan(&self, plan_id: Uuid) -> anyhow::Result<Vec<SessionWithLinks>> {
+        self.get_sessions_for_plan(plan_id).await
+    }
+
+    async fn get_sessions_for_task(&self, task_id: Uuid) -> anyhow::Result<Vec<SessionWithLinks>> {
+        self.get_sessions_for_task(task_id).await
+    }
+
+    async fn get_session_links_batch(
+        &self,
+        session_ids: &[Uuid],
+    ) -> anyhow::Result<std::collections::HashMap<Uuid, LinkedSessionInfo>> {
+        self.get_session_links_batch(session_ids).await
+    }
+
+    async fn get_task_plan_id(&self, task_id: Uuid) -> anyhow::Result<Option<Uuid>> {
+        self.get_task_plan_id(task_id).await
     }
 }
