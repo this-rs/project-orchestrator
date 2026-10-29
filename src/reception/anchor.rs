@@ -2,6 +2,7 @@
 //!
 //! Links imported P2P notes to existing local tags and supports
 //! tombstone-based content revocation.
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -184,6 +185,7 @@ pub fn anchor_notes(notes: &[ReplayedNote], local_tags: &[String]) -> AnchorResu
 mod tests {
     use super::*;
     use crate::episodes::distill_models::PortabilityLayer;
+    use crate::neo4j::traits::*;
 
     fn make_note(tags: Vec<String>) -> ReplayedNote {
         ReplayedNote {

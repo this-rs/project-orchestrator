@@ -34,6 +34,7 @@
 //! (`result`, `refused`, `failed`), and nothing for `timeout` / `gone` (its own
 //! timeout then gives its old no-op). The asker reads every format: v2 objects, the
 //! bare `"timeout"` / `"gone"` strings of the first v2 draft, and old objects.
+use crate::neo4j::traits::*;
 
 use std::future::Future;
 use std::time::Duration;
@@ -405,6 +406,7 @@ pub fn task_id_of(payload: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::chat::manager::CancelTaskResult;
+    use crate::neo4j::traits::*;
 
     fn done() -> CancelTaskResult {
         CancelTaskResult {

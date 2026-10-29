@@ -7,6 +7,7 @@
 //!
 //! The hit_rate = (activations - misses) / activations drives energy penalties:
 //! - hit_rate < 0.3 after 10+ activations → energy penalty (-0.05)
+use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
@@ -270,6 +271,7 @@ impl ActivationBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     fn make_buffer() -> ActivationBuffer {
         ActivationBuffer::new(FeedbackConfig {

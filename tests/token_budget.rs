@@ -54,6 +54,7 @@
 //! A failure here is not a bug in the test: it means the static prompt grew. Measure the
 //! split again (`cargo test --test token_budget -- --nocapture` and read the numbers),
 //! say in the PR what the growth buys, then raise the ceiling deliberately.
+use project_orchestrator::neo4j::traits::*;
 
 use project_orchestrator::chat::prompt::{BASE_SYSTEM_PROMPT, TOOL_REFERENCE};
 use project_orchestrator::chat::prompt_sections::all_base_sections;

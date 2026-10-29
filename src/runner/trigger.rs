@@ -2,6 +2,7 @@
 //!
 //! The engine checks the guards (enabled, cooldown, no active run) and records
 //! firings in Neo4j. `runner::dispatch::TriggerDispatcher` starts the run.
+use crate::neo4j::traits::*;
 
 use crate::neo4j::traits::GraphStore;
 use crate::runner::models::{Trigger, TriggerFiring, TriggerSource, TriggerType};

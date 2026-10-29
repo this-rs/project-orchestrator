@@ -13,6 +13,7 @@
 //!   default 2).
 //! * **A deadline** (`ANALYTICS_RUN_DEADLINE_SECS`, default 30 min): a pass that exceeds
 //!   it is abandoned with an error, its slot freed.
+use crate::neo4j::traits::*;
 
 use super::engine::{AnalyticsEngine, ProjectAnalytics};
 use super::models::{FabricWeights, GraphAnalytics};
@@ -184,6 +185,7 @@ impl Cooldown {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Counts passes, tracks how many overlap, and takes `delay` per pass.

@@ -37,6 +37,7 @@
 //! ```
 //!
 //! Each slide is one entry in [`ExtractedText::pages`], so a hit is "slide 4".
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Seek};
@@ -498,6 +499,7 @@ fn trim_trailing(text: &mut String, ch: char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 

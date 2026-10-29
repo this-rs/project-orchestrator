@@ -1,6 +1,7 @@
 //! The golden fixtures in `tests/fixtures/refs/` are the contract with the
 //! frontend. These tests keep them and the Rust types in step: change a type
 //! and a fixture goes red; change a fixture and the type refuses it.
+use project_orchestrator::neo4j::traits::*;
 
 use project_orchestrator::chat::message_attachments::{self, MessageAttachment};
 use project_orchestrator::refs::access::{Disclosure, Resolution};

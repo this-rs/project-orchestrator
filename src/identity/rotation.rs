@@ -2,6 +2,7 @@
 //!
 //! When an identity key is rotated, the old public key is archived so that
 //! signatures created before the rotation can still be verified.
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -81,6 +82,7 @@ impl KeyHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use ed25519_dalek::{Signer, SigningKey};
 
     #[test]

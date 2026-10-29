@@ -37,6 +37,7 @@
 //! │  └──────────┘                                           │
 //! └─────────────────────────────────────────────────────────┘
 //! ```
+use crate::neo4j::traits::*;
 
 use super::prompt::TOOL_REFERENCE;
 use super::prompt_sections::{
@@ -903,6 +904,7 @@ fn truncate_markdown_semantically(text: &str, char_budget: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     const PARENT: &str = "11111111-1111-4111-8111-111111111111";
 

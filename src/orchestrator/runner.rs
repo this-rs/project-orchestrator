@@ -1,4 +1,5 @@
 //! Main orchestrator runner
+use crate::neo4j::traits::*;
 
 #[cfg(feature = "local-embeddings")]
 use crate::embeddings::FastEmbedProvider;

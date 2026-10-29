@@ -50,6 +50,7 @@
 //! from the content hash, via [`DocumentStore::path_for`]. It is sanitised
 //! before being stored or echoed into a header, because it also ends up in a
 //! `Content-Disposition` and in the graph.
+use crate::neo4j::traits::*;
 
 use super::handlers::OrchestratorState;
 use crate::documents::{

@@ -8,6 +8,7 @@
 //!
 //! Also provides skill activation helpers that bridge the Neural Skills system
 //! into the Runner's execution loop.
+use crate::neo4j::traits::*;
 
 use crate::neo4j::models::{PersonaSubgraph, TaskNode};
 use crate::neo4j::traits::GraphStore;
@@ -776,6 +777,7 @@ pub async fn record_skill_feedback(
 mod tests {
     use super::*;
     use crate::neo4j::models::{PersonaSubgraphStats, PersonaWeightedRelation};
+    use crate::neo4j::traits::*;
     use chrono::Utc;
     use uuid::Uuid;
 

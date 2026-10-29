@@ -2,6 +2,7 @@
 //!
 //! These tests require Neo4j and Meilisearch to be running.
 //! Run with: cargo test --test workspace_tests
+use project_orchestrator::neo4j::traits::*;
 
 use project_orchestrator::neo4j::models::*;
 use project_orchestrator::{AppState, Config};

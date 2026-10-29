@@ -18,6 +18,7 @@
 //! persist. Each secret's NAME is bound as associated data — a ciphertext copied
 //! under another name fails to open, so an attacker who can edit the vault file
 //! cannot relabel one secret as another.
+use crate::neo4j::traits::*;
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::rand_core::RngCore;
@@ -229,6 +230,7 @@ pub enum CryptoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn seal_then_open_round_trips() {

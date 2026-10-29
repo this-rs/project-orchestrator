@@ -12,6 +12,7 @@
 //! - Top-level functions: `function_signature` + `function_body` as **siblings** under `source_file`
 //! - Class methods: `class_body` → `class_member` → (`method_signature` | `declaration`) + `function_body`
 //! - Imports: parsed as ERROR nodes by this grammar version — extracted via regex fallback
+use crate::neo4j::traits::*;
 
 use crate::neo4j::models::*;
 use crate::parser::helpers::*;

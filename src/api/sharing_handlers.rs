@@ -2,6 +2,7 @@
 //!
 //! These handlers back the MCP `sharing` mega-tool (12 actions) and provide
 //! the REST surface consumed by the frontend Sharing page.
+use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
 use crate::episodes::distill_models::{
@@ -499,6 +500,7 @@ mod tests {
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
     use crate::events::EventBus;
+    use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_bearer_token, test_project};
     use axum::body::Body;

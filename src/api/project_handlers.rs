@@ -1,4 +1,5 @@
 //! Project API handlers
+use crate::neo4j::traits::*;
 
 use crate::api::{PaginatedResponse, PaginationParams, SearchFilter};
 use crate::events::{EntityType, EventEmitter};
@@ -846,6 +847,7 @@ pub async fn get_transverse_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use std::sync::Arc;
 
     #[test]

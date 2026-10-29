@@ -7,6 +7,7 @@
 //! Sessions are discovered dynamically from `RUNNER_STATE.active_agents` and subscribed
 //! to via `ChatManager::subscribe()`. New sessions (from subsequent waves) are picked up
 //! automatically on each RunnerEvent::TaskStarted.
+use crate::neo4j::traits::*;
 
 use super::handlers::OrchestratorState;
 use super::ws_auth::CookieAuthResult;
@@ -395,6 +396,7 @@ async fn send_json<T: serde::Serialize>(
 mod tests {
     use super::*;
     use crate::events::{CrudAction, CrudEvent, EntityType};
+    use crate::neo4j::traits::*;
     use crate::runner::RunnerEvent;
     use uuid::Uuid;
 

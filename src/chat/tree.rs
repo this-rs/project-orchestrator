@@ -3,6 +3,7 @@
 //!
 //! Pure over data already loaded. A cost that is not known is not zero: a
 //! subtree cost is given only when every node under it has one.
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 
@@ -85,6 +86,7 @@ pub fn annotate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     fn node(id: &str, parent: Option<&str>) -> SessionTreeNode {
         SessionTreeNode {

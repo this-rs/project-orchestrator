@@ -32,6 +32,7 @@
 //!
 //! After a RESUME of a run, old sessions keep the OLD `run_id` and new ones
 //! carry the NEW one, with the same `plan_id`: the thread stays the plan's.
+use crate::neo4j::traits::*;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 

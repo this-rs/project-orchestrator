@@ -1,6 +1,7 @@
 //! Pure validation of what a client sends. No I/O, no clock, no graph: the
 //! same input always gives the same answer, which is what lets the tests pin
 //! every branch.
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -137,6 +138,7 @@ pub fn validate_search(q: &str, limit: Option<usize>) -> Result<usize, InvalidRe
 mod tests {
     use super::super::types::{IdFormat, RefKind};
     use super::*;
+    use crate::neo4j::traits::*;
 
     const ID_A: &str = "3adeffc9-c8b0-4e2f-a674-55bfcb293433";
     const ID_B: &str = "57cf05c9-25b6-495d-ab07-de4b11d64736";
@@ -344,6 +346,7 @@ mod tests {
 
     mod props {
         use super::*;
+        use crate::neo4j::traits::*;
         use proptest::prelude::*;
 
         proptest! {

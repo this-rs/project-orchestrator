@@ -4,6 +4,7 @@
 //! there to turn it OFF (`REFS_V1=0`) if it misbehaves in the field. Off, the
 //! server behaves exactly as before: the `refs` field is ignored, `auth_ok`
 //! carries no `features`, nothing is announced.
+use crate::neo4j::traits::*;
 
 /// Environment variable of the switch.
 pub const REFS_V1_VAR: &str = "REFS_V1";
@@ -34,6 +35,7 @@ pub fn features(enabled: bool) -> Option<Vec<&'static str>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn on_unless_explicitly_turned_off() {

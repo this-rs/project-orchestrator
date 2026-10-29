@@ -23,6 +23,7 @@
 //!
 //! The ledger is the same type on both doors: provider-neutral, reset on the
 //! compaction signal whichever door brings it.
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -334,6 +335,7 @@ impl nexus_claude::HookCallback for TestAdvisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     fn caps(hooks: HookSupport) -> Capabilities {
         let mut caps = Capabilities::none();

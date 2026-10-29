@@ -6,6 +6,7 @@
 //! 3. **Proposal**: Generates RFC notes with proposed protocol adjustments
 //! 4. **Application**: On RFC acceptance, composes new protocols and adds them to routing pool
 //! 5. **Trust**: Emerging protocols get a trust score based on evidence strength
+use crate::neo4j::traits::*;
 
 use anyhow::Result;
 use chrono::Utc;
@@ -879,6 +880,7 @@ pub struct AppliedProtocol {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
     use tracing::debug;
 
     // ========================================================================

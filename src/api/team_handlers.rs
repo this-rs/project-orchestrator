@@ -6,6 +6,7 @@
 //! another session, nor reach a session outside its own team (its parent and its
 //! children, `chat::team::team_of`). A person has the chat itself: these routes answer
 //! an agent only.
+use crate::neo4j::traits::*;
 
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};

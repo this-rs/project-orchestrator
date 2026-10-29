@@ -19,6 +19,7 @@
 //!
 //! This is enforced on the server (REST handlers). The MCP tool handlers run in
 //! the agent's own subprocess and are not a boundary.
+use crate::neo4j::traits::*;
 
 use crate::auth::jwt::Claims;
 use crate::chat::manager::ChatManager;

@@ -6,6 +6,7 @@
 //! - Task timeout (global time limit)
 //! - Compaction (re-inject task context after compaction)
 //! - AskUserQuestion (auto-respond for autonomous mode)
+use crate::neo4j::traits::*;
 
 use crate::chat::compaction_context::CompactionContextBuilder;
 use crate::chat::manager::ChatManager;

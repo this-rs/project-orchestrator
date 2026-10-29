@@ -7,6 +7,7 @@
 //! - Client → Server: JSON messages (user_message, interrupt, permission_response, input_response)
 //! - Server → Client: JSON events with `seq` field (0 for non-persisted stream_delta)
 //! - On connect: replay persisted events since `last_event` query param, then `replay_complete`
+use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
 use super::ws_auth::CookieAuthResult;

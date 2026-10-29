@@ -23,6 +23,7 @@
 //! | Project    | Synced        | bootstrap_knowledge_fabric / update_fabric   |
 //! | Task       | StatusChanged | Check if all plan tasks completed → auto-complete plan |
 //! | Plan       | StatusChanged | Collect episode if protocol run linked       |
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::fmt;

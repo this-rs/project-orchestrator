@@ -35,6 +35,7 @@
 //! * The browser (Obscura, N23) is attached only if its executable is found AND an operator
 //!   authorised it for the project (`browser` document). Its stealth mode is never passed: this
 //!   module takes no argument for the browser.
+use crate::neo4j::traits::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

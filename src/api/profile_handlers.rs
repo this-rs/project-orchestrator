@@ -1,6 +1,7 @@
 //! API handlers for Analysis Profiles
 //!
 //! CRUD for analysis profiles that weight edge types for contextual analytics.
+use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
 use crate::events::EventEmitter;
@@ -178,6 +179,7 @@ pub async fn delete_analysis_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use serde_json::json;
 
     #[test]

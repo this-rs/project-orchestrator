@@ -1,4 +1,5 @@
 //! API handlers for Neural Skills
+use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
 use super::hook_handlers::skill_cache;
@@ -1217,6 +1218,7 @@ pub async fn search_skills(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_validate_trigger_patterns_valid_regex() {

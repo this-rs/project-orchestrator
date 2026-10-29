@@ -6,6 +6,7 @@
 //!
 //! The SystemExecutor parses these action strings and calls the corresponding
 //! GraphStore methods directly (no LLM, no HTTP).
+use crate::neo4j::traits::*;
 
 use super::{ExecutionResult, Executor};
 use crate::neo4j::traits::GraphStore;

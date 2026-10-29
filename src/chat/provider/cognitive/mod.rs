@@ -7,6 +7,7 @@
 //! taken here yet; the signature, candidates, scorer and decision log come in
 //! later slices. Whatever the settings say, the resolver (`resolver.rs`) is
 //! unchanged until then.
+use crate::neo4j::traits::*;
 
 pub mod auto_models;
 pub mod candidates;

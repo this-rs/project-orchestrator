@@ -5,6 +5,7 @@
 //! Fixture: two workspaces (`ws-a`, `ws-b`), one project each, with one item
 //! of every kind per project, so a workspace filter that is ignored (or a
 //! default that is not "all workspaces") makes an assertion fail.
+use crate::neo4j::traits::*;
 
 use crate::api::handlers::ServerState;
 use crate::api::routes::create_router;

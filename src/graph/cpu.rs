@@ -11,6 +11,7 @@
 //! worker), inside a dedicated and BOUNDED rayon pool, so the analytics can never take
 //! more than `ANALYTICS_THREADS` cores (default: a quarter of them, at least 2) and the
 //! rest of the server keeps running.
+use crate::neo4j::traits::*;
 
 use anyhow::{anyhow, Result};
 use std::sync::OnceLock;
@@ -62,6 +63,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn the_default_pool_is_a_quarter_of_the_cores_and_never_below_two() {

@@ -23,6 +23,7 @@
 //! [`SCAN_CAP`] rows. The price is stated, not hidden: a task or decision older
 //! than the newest `SCAN_CAP` of its scope is not suggested by *text*; it can
 //! still be referenced by id or by dropping it, and it always resolves.
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -1,4 +1,5 @@
 //! Workspace API handlers
+use crate::neo4j::traits::*;
 
 use crate::api::{PaginatedResponse, PaginationParams, StatusFilter};
 use crate::neo4j::models::*;
@@ -2017,6 +2018,7 @@ mod tests {
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
     use crate::neo4j::models::{MilestoneStatus, WorkspaceMilestoneNode};
+    use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{
         mock_app_state, test_bearer_token, test_plan, test_task_titled, test_workspace,

@@ -5,6 +5,7 @@
 //!
 //! The aggregator runs as a background tokio task spawned at startup.
 //! It processes all accumulated signals in a batch, then sleeps.
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::sync::Arc;

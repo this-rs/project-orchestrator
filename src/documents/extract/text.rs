@@ -6,6 +6,7 @@
 //! something no specific extractor recognised. Accepting invalid UTF-8 here
 //! would turn a corrupt upload into a document full of replacement characters
 //! that chunks and aligns perfectly well and means nothing.
+use crate::neo4j::traits::*;
 
 use super::{DocumentFormat, ExtractError, ExtractedText, FormatProbe, TextExtractor};
 
@@ -71,6 +72,7 @@ impl TextExtractor for PlainTextExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     fn probe<'a>(bytes: &'a [u8], name: Option<&'a str>) -> FormatProbe<'a> {
         FormatProbe::new(bytes, name)

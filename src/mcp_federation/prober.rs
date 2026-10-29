@@ -27,6 +27,7 @@
 //!   ▼
 //! ToolProfile { latency_ms, response_shape, pagination, ... }
 //! ```
+use crate::neo4j::traits::*;
 
 use chrono::Utc;
 use serde_json::Value;
@@ -367,6 +368,7 @@ impl ToolProber {
 mod tests {
     use super::super::discovery::InferredCategory;
     use super::*;
+    use crate::neo4j::traits::*;
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
     use serde_json::json;

@@ -9,6 +9,7 @@
 //! - **Shrink**: Notes left the cluster (synapses broken) → remove members
 //!
 //! Evolutions are traced as observation Notes for auditability.
+use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, HashSet};
 

@@ -2,6 +2,7 @@
 //!
 //! Extracts the authenticated user's identity from request extensions
 //! (populated by the `require_auth` middleware).
+use crate::neo4j::traits::*;
 
 use crate::api::handlers::{AppError, OrchestratorState};
 use crate::auth::jwt::Claims;
@@ -76,6 +77,7 @@ impl FromRequestParts<OrchestratorState> for AuthUser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_auth_user_from_valid_claims() {

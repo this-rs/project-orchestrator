@@ -11,6 +11,7 @@
 //! The test prints a notice and returns when no Neo4j is reachable (a socket
 //! probe: a Cypher probe sits in neo4rs' retry loop for minutes);
 //! `HARNESS_NEO4J_REQUIRED=1` (set in CI) turns that into a failure.
+use project_orchestrator::neo4j::traits::*;
 
 use std::time::Duration;
 

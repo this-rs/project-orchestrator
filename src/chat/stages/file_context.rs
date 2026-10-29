@@ -9,6 +9,7 @@
 //! - Max 250 tokens per file (~800 tokens total)
 //! - Cache: 30s per file (avoids repeated Neo4j fetches)
 //! - Total stage budget: 100ms
+use crate::neo4j::traits::*;
 
 use crate::chat::enrichment::{
     EnrichmentConfig, EnrichmentInput, ParallelEnrichmentStage, StageOutput,

@@ -17,6 +17,7 @@
 //!   swept at start-up once they are older than [`ORPHAN_MAX_AGE`].
 //!
 //! It says WHERE the session runs. No tool permission is derived from it.
+use crate::neo4j::traits::*;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -135,6 +136,7 @@ fn sweep_under(root: &Path, max_age: Duration) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     fn scratch(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("po-neutral-test-{name}-{}", Uuid::new_v4()));

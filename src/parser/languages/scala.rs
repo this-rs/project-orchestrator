@@ -6,6 +6,7 @@
 //! - Enums (Scala 3)
 //! - Import declarations (standard, wildcard, selective, rename)
 //! - Package declarations
+use crate::neo4j::traits::*;
 
 use crate::neo4j::models::*;
 use crate::parser::helpers::*;

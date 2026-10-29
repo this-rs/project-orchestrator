@@ -20,6 +20,7 @@
 
 #![allow(clippy::excessive_precision)]
 #![allow(clippy::explicit_auto_deref)]
+use crate::neo4j::traits::*;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Input fixtures

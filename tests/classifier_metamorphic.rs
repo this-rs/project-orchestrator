@@ -23,6 +23,7 @@
 //!
 //! Where the code breaks a property, the test is kept with `#[ignore]` and the
 //! counterexample written above it. The code is not changed in this file.
+use project_orchestrator::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use project_orchestrator::chat::provider::cognitive::signature::{

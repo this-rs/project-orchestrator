@@ -16,6 +16,7 @@
 //! | `gate_results`     | Each state visit → gate (passed = has exited_at without error)|
 //! | `duration_ms`      | From process.duration_ms                                      |
 //! | `retry_count`      | Count of duplicate state names in states_visited              |
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 

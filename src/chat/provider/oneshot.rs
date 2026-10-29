@@ -7,6 +7,7 @@
 //! provider factory as every session — never a client built by hand on the Claude CLI.
 //! The project's consent (A28) and the health of the instance are checked before anything
 //! is sent; a refusal is typed, never worked around.
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -206,6 +207,7 @@ mod tests {
         INSTANCE_PREFIX, ROLES_KEY,
     };
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
     use crate::neo4j::traits::*;
     use crate::neo4j::traits::*;
 

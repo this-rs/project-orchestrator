@@ -2,6 +2,7 @@
 //!
 //! Implements CRUD operations for Protocol, ProtocolState, and ProtocolTransition
 //! entities on the Neo4j graph.
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use crate::protocol::{

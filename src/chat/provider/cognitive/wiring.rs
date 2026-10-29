@@ -1,6 +1,7 @@
 //! Boot wiring of the learning side of cognitive routing: the per-turn decider
 //! of mode `full` and the runner's routing handle. Both need the chat manager's
 //! pool, and the manager owns them, so they hold it weakly.
+use crate::neo4j::traits::*;
 
 use std::sync::{Arc, Weak};
 

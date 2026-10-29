@@ -3,6 +3,7 @@
 //! Provides two modes of prompt generation:
 //! - `generate_prompt()` — static markdown prompt (backward compatible)
 //! - `build_enriched_context()` — runs the EnrichmentPipeline before prompt assembly
+use crate::neo4j::traits::*;
 
 use crate::chat::enrichment::{EnrichmentInput, EnrichmentPipeline};
 use crate::meilisearch::SearchStore;
@@ -1209,6 +1210,7 @@ mod tests {
         ConstraintNode, ConstraintType, DecisionNode, DecisionStatus, StepNode, StepStatus,
         TaskNode, TaskStatus,
     };
+    use crate::neo4j::traits::*;
     use crate::neo4j::traits::*;
     use crate::notes::NoteScope;
     use crate::plan::models::{AgentContext, CodeReference, ContextNote, FileContext};

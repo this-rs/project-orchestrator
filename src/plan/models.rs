@@ -1,4 +1,5 @@
 //! Plan-related models and DTOs
+use crate::neo4j::traits::*;
 
 use crate::neo4j::models::{
     ConstraintNode, ConstraintType, DecisionNode, DecisionStatus, PlanNode, PlanStatus, StepNode,
@@ -503,6 +504,7 @@ impl ConstraintNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     // =========================================================================
     // PlanNode Tests

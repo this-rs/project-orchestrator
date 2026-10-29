@@ -6,6 +6,7 @@
 //! - Open → HalfOpen: after a cooldown period.
 //! - HalfOpen → Closed: if the next call succeeds.
 //! - HalfOpen → Open: if the next call fails.
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -177,6 +178,7 @@ impl Default for CircuitBreaker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_new_breaker_is_closed() {

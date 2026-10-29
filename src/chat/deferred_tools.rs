@@ -29,6 +29,7 @@
 //!   sessions opened after it (the native provider is rebuilt, see
 //!   `ChatManager::provider_for`), never to a running conversation — its cached prefix
 //!   would break.
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 

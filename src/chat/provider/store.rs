@@ -3,6 +3,7 @@
 //! One place for the keys and the decoding, shared by the settings API and by
 //! the manager when it resolves the provider of a session. A document that no
 //! longer decodes is skipped, never guessed.
+use crate::neo4j::traits::*;
 
 use anyhow::Result;
 

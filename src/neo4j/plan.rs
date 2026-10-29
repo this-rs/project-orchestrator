@@ -1,4 +1,5 @@
 //! Neo4j Plan operations
+use crate::neo4j::traits::*;
 
 use super::client::{pascal_to_snake_case, Neo4jClient, WhereBuilder};
 use super::models::*;
@@ -1456,6 +1457,7 @@ impl Neo4jClient {
 #[cfg(test)]
 mod injection_tests {
     use super::{plan_status_clause, plan_status_values};
+    use crate::neo4j::traits::*;
 
     #[test]
     fn plan_status_values_normalises_known_and_keeps_payload_as_data() {

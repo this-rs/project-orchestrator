@@ -3,6 +3,7 @@
 //! Two main entry points:
 //! - [`abstract_lesson`]: extracts a portable lesson from episode content.
 //! - [`create_envelope`]: wraps anonymized content + lesson into a signed envelope.
+use crate::neo4j::traits::*;
 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -242,6 +243,7 @@ pub fn create_envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     fn sample_episode_content() -> EpisodeContent {
         EpisodeContent {

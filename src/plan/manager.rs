@@ -1,4 +1,5 @@
 //! Plan management operations
+use crate::neo4j::traits::*;
 
 use super::models::*;
 use crate::embeddings::EmbeddingProvider;
@@ -765,6 +766,7 @@ impl PlanManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use crate::test_helpers::*;
 
     fn create_plan_manager() -> PlanManager {

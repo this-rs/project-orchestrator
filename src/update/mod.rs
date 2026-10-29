@@ -8,6 +8,7 @@
 //! This file holds the GitHub plumbing shared by the service and the
 //! `orchestrator update` CLI: release fetch, asset selection, checksum
 //! verification and atomic binary replacement.
+use crate::neo4j::traits::*;
 
 pub mod deployment;
 pub mod service;
@@ -557,6 +558,7 @@ fn atomic_replace(target: &Path, new_bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     fn asset(name: &str) -> ReleaseAsset {
         ReleaseAsset {

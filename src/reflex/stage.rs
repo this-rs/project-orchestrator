@@ -2,6 +2,7 @@
 //!
 //! Runs after the biomimicry stage in the enrichment pipeline.
 //! Uses the ReflexEngine to generate suggestions based on the current context.
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 

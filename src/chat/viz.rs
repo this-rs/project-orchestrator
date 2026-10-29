@@ -27,6 +27,7 @@
 //! | `ContextRouting` | Context routing visualization (Pattern Federation) | reserved |
 //! | `WaveProgress` | Wave computation progress (Pattern Federation) | reserved |
 //! | `Custom(String)` | Extension point for third-party viz | user-defined |
+use crate::neo4j::traits::*;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -1254,6 +1255,7 @@ impl VizRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     // --- VizType tests ---
 

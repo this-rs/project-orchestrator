@@ -11,6 +11,7 @@
 //! - [`runner`] — Pipeline run configuration ([`runner::PipelineConfig`])
 //! - [`regression`] — Loop and regression detection
 //! - [`progress`] — Objective progress measurement
+use crate::neo4j::traits::*;
 
 pub mod composer;
 pub mod critic;

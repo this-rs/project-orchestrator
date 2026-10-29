@@ -13,6 +13,7 @@
 //! - Max 10 notes per materialization run
 //! - Max 50 auto-learned notes per project (checked before creation)
 //! - Semantic deduplication: skip if a note with cosine similarity > 0.85 exists
+use crate::neo4j::traits::*;
 
 use anyhow::Result;
 use tracing::{debug, info, warn};

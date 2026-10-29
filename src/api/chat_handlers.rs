@@ -1,4 +1,5 @@
 //! Chat API handlers — session management (streaming via WebSocket)
+use crate::neo4j::traits::*;
 
 use crate::api::handlers::{AppError, OrchestratorState};
 use crate::api::query::{PaginatedResponse, PaginationParams};
@@ -6165,6 +6166,7 @@ mod file_scope_lift_tests {
     use crate::chat::envelope::SpawnCaller;
     use crate::chat::types::ChatRequest;
     use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     fn person() -> Claims {
         Claims {
@@ -6849,6 +6851,7 @@ pub mod anchors {
         use crate::chat::anchor_resolver::resolve_session_scope;
         use crate::graph::neighborhood::RawNode;
         use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::*;
         use crate::neo4j::traits::*;
         use crate::neo4j::GraphStore;
         use crate::test_helpers::{

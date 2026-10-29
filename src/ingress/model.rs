@@ -1,4 +1,5 @@
 //! Modèle du journal d'événements externes.
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

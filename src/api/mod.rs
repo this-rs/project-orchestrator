@@ -1,4 +1,5 @@
 //! HTTP API for the orchestrator
+use crate::neo4j::traits::*;
 
 pub mod attention;
 pub mod attention_aggregate;

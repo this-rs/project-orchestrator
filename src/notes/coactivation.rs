@@ -6,6 +6,7 @@
 //! projects. Synapses never cross projects, so the set is split per project
 //! first; each group is reinforced on its own and the returned count is the
 //! number of synapses really written.
+use crate::neo4j::traits::*;
 
 use std::collections::BTreeMap;
 

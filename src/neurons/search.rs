@@ -10,6 +10,7 @@
 //! 5. **Activation** — spreading activation score from graph structure
 //!
 //! Each signal is normalized to [0, 1] and blended via configurable weights.
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -275,6 +276,7 @@ impl SearchPipeline {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
     use crate::notes::{NoteImportance, NoteType};
 

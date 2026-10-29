@@ -10,6 +10,7 @@
 //! that was chosen. Both are best effort: a routing failure never stops work.
 //!
 //! No handle means nothing is decided and nothing recorded: today's behaviour.
+use crate::neo4j::traits::*;
 
 use std::sync::{Arc, RwLock};
 
@@ -401,6 +402,7 @@ mod tests {
         use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
         use crate::chat::provider::cognitive::store::InMemoryRoutingStore;
         use crate::chat::provider::resolver::CLAUDE_CODE;
+        use crate::neo4j::traits::*;
         use crate::neo4j::traits::*;
         use crate::neo4j::traits::*;
 

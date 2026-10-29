@@ -12,6 +12,7 @@
 //! 5. Compute approximate DecisionVectors using current graph features
 //! 6. Assign rewards retrospectively via RBCR-like heuristic
 //! 7. Persist as Trajectory with `source: migrated`
+use crate::neo4j::traits::*;
 
 use chrono::Utc;
 use neo4rs::{query, Graph};
@@ -468,6 +469,7 @@ fn estimate_session_reward(events: &[ParsedToolUse]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_estimate_confidence_ramp() {

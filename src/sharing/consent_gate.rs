@@ -3,6 +3,7 @@
 //!
 //! This is the privacy checkpoint that ensures only explicitly
 //! allowed content enters the distillation pipeline.
+use crate::neo4j::traits::*;
 
 use crate::episodes::distill_models::{
     ConsentStats, DenialDetail, DenialReason, SharingAction, SharingConsent, SharingMode,

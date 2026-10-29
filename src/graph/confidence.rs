@@ -7,6 +7,7 @@
 //!
 //! # References
 //! - ELL (2025) — "Experience-driven Lifelong Learning" — 4th pillar: self-evaluation
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -339,6 +340,7 @@ impl Default for ConfidenceTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_confidence_from_graph_density_sparse() {

@@ -2,6 +2,7 @@
 //!
 //! Implements all CRUD, membership, query, and activation operations
 //! for the Neural Skills system on the Neo4j graph.
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use super::models::DecisionNode;
@@ -1158,6 +1159,7 @@ pub(crate) fn scope_project_id(node: &neo4rs::Node) -> anyhow::Result<Option<Uui
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use crate::skills::{SkillTrigger, TriggerType};
 
     #[test]

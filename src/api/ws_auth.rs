@@ -18,6 +18,7 @@
 //! in a 401 HTTP response (no WS connection opened).
 //!
 //! In no-auth mode, anonymous Claims are returned immediately.
+use crate::neo4j::traits::*;
 
 use crate::auth::jwt::Claims;
 use crate::auth::refresh;

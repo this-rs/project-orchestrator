@@ -2,6 +2,7 @@
 //! real client, the real handler. Each test fails if the handler stops
 //! folding `refs` into the message, stops announcing the capability, or stops
 //! refusing a malformed list with the `refs_invalid` frame.
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 use std::time::Duration;

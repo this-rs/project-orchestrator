@@ -1,4 +1,5 @@
 //! Neo4j Project operations
+use crate::neo4j::traits::*;
 
 use super::client::{Neo4jClient, WhereBuilder};
 use super::models::*;

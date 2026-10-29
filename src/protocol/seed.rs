@@ -6,6 +6,7 @@
 //!
 //! Run via `admin(action: "seed_prompt_fragments")` or the REST endpoint
 //! `POST /api/admin/seed-prompt-fragments`.
+use crate::neo4j::traits::*;
 
 use anyhow::{Context, Result};
 use tracing::info;
@@ -695,6 +696,7 @@ No further action required until the next maintenance trigger.",
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_all_fragments_non_empty() {

@@ -4,6 +4,7 @@
 //! decay_synapses, apply_scars) to update the neural knowledge layer.
 //!
 //! All propagation goes through GraphStore — no raw Cypher here.
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 

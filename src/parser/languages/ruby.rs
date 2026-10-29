@@ -5,6 +5,7 @@
 //! - Methods (instance and class)
 //! - Blocks and procs
 //! - Mixins (include/extend)
+use crate::neo4j::traits::*;
 
 use crate::neo4j::models::*;
 use crate::parser::helpers::*;

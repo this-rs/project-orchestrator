@@ -7,6 +7,7 @@
 //! blob for the tree structure (not individual nodes — too heavy for v1).
 //! A `REASONING_FOR` relation links the tree to the ProtocolRun or Note
 //! that it was associated with.
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use crate::reasoning::models::ReasoningTree;

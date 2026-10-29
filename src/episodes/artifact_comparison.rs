@@ -8,6 +8,7 @@
 //!
 //! PO enriched format: structure (co-change edges) + portable episodes
 //! (Stimulus → Process → Outcome → Validation → Lesson).
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -441,6 +442,7 @@ pub fn generate_fake_enriched(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_generate_fake_the_source() {

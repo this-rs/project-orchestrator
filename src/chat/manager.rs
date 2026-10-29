@@ -8,6 +8,7 @@
 //! - Structured events are persisted in Neo4j with sequence numbers for replay
 //! - Inactive sessions are persisted in Neo4j with `cli_session_id` for resume
 //! - A cleanup task periodically closes timed-out sessions
+use crate::neo4j::traits::*;
 
 use super::config::ChatConfig;
 use super::post_tool_hook;
@@ -36898,6 +36899,7 @@ mod refs_turn_services_tests {
         ParallelEnrichmentStage, StageOutput,
     };
     use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::refs::types::{EntityRef, RefKind};
     use std::sync::Mutex as StdMutex;
 
@@ -36991,6 +36993,7 @@ mod auto_open_bounds_tests {
     use crate::chat::provider::resolver::REMOTE_PREFIX;
     use crate::chat::provider::settings::InstanceRecord;
     use crate::chat::types::RoutingPoolEntry;
+    use crate::neo4j::traits::*;
     use crate::neo4j::traits::*;
 
     fn instance(id: &str, credential_ref: &str) -> InstanceRecord {
@@ -37900,6 +37903,7 @@ mod image_turn_services_tests {
     use crate::chat::provider::cognitive::scorer::PriorHints;
     use crate::chat::provider::cognitive::{LearningStage, ProviderRoutingMode, RoutingSettings};
     use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     struct Real;
 
@@ -38108,6 +38112,7 @@ mod grant_before_the_cli_tests {
     use super::super::session_grants::{cover, AskedCall, Asker, Cover, SessionGrants};
     use super::super::types::PermissionAnswerScope;
     use super::*;
+    use crate::neo4j::traits::*;
     use crate::neo4j::traits::*;
 
     /// The call the session's pending `req-1` asks (`test_support`).

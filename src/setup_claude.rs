@@ -16,6 +16,7 @@
 //! Also configures `~/.claude/settings.json` to pre-approve all MCP tools
 //! from the Project Orchestrator server (`mcp__project-orchestrator__*`),
 //! so the user doesn't get a permission prompt for every tool call.
+use crate::neo4j::traits::*;
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
@@ -601,6 +602,7 @@ fn configure_allowed_tools_at(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use tempfile::TempDir;
 
     #[test]

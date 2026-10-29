@@ -2,6 +2,7 @@
 //!
 //! Every artifact received via P2P carries a mandatory TTL.
 //! When it expires the local copy is removed automatically.
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -116,6 +117,7 @@ pub fn find_expired(artifacts: &[SharedArtifactMeta]) -> Vec<&SharedArtifactMeta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_ttl_preset_durations() {

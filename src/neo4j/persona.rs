@@ -2,6 +2,7 @@
 //!
 //! Implements all CRUD, relation management, and subgraph assembly
 //! for the Living Personas system on the Neo4j graph.
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use crate::analytics::distribution::{adaptive_threshold, detect_outliers};

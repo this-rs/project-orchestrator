@@ -14,6 +14,7 @@
 //!
 //! **NEVER block tool execution.** Any error → passthrough (continue_: true).
 //! Skills are a nice-to-have context injection, not a gating mechanism.
+use crate::neo4j::traits::*;
 
 use crate::api::hook_handlers::skill_cache;
 use crate::chat::hook_ledger::{cap_chars, HookLedger, InjectionKey, MAX_HOOK_CONTEXT_CHARS};

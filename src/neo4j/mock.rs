@@ -4,6 +4,7 @@
 //! `tokio::sync::RwLock<HashMap<K, V>>` collections.
 //! Compiled under `#[cfg(test)]` and under the `mock-store` feature (the
 //! integration test targets, see tests/store_conformance.rs); never in a binary.
+use crate::neo4j::traits::*;
 
 use crate::events::trigger::EventTrigger;
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
@@ -5591,6 +5592,7 @@ mod cross_project_parity {
     use crate::neo4j::client::Neo4jClient;
     use crate::neo4j::traits::GraphStore;
     use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::notes::{EntityType, Note, NoteImportance, NoteType};
     use uuid::Uuid;
 
@@ -5763,6 +5765,7 @@ mod session_tree_tests {
     //! and tree tests built on it prove something. Red on the former stubs, which answered
     //! the session alone (tree) and the session itself (root) whatever the parents.
     use super::*;
+    use crate::neo4j::traits::*;
     use crate::neo4j::traits::*;
     use chrono::{DateTime, Utc};
 
@@ -5952,6 +5955,7 @@ mod bind_project_tests {
     use super::*;
     use crate::neo4j::traits::GraphStore;
     use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::test_helpers::test_chat_session;
 
     async fn session(store: &MockGraphStore, slug: Option<&str>) -> Uuid {
@@ -6037,6 +6041,7 @@ mod transverse_skill_tests {
     //! here instead of only in a query string.
     use super::*;
     use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::skills::{SkillNode, SkillStatus};
     use crate::test_helpers::test_project;
 
@@ -6116,6 +6121,7 @@ mod rescope_tests {
     //! the transverse level and a project without recreating it (and therefore
     //! without losing its members, states, transitions or runs).
     use super::*;
+    use crate::neo4j::traits::*;
     use crate::neo4j::traits::*;
     use crate::skills::{SkillNode, SkillStatus};
     use crate::test_helpers::test_project;

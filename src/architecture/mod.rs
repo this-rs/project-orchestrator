@@ -17,6 +17,7 @@
 //!
 //! Every derived element carries where it came from (`Provenance`): a graph nobody
 //! typed is only worth trusting if each edge can be traced to a file and a line.
+use crate::neo4j::traits::*;
 
 pub mod catalogue;
 pub mod compose;

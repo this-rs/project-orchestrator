@@ -11,6 +11,7 @@
 //! - `SameSite=Lax`: not sent on cross-site POST (CSRF protection)
 //! - `Path=/`: sent for all routes including `/ws/*` upgrades
 //! - `Secure`: only over HTTPS (omitted in localhost/non-TLS mode)
+use crate::neo4j::traits::*;
 
 use axum::http::HeaderValue;
 use sha2::{Digest, Sha256};
@@ -92,6 +93,7 @@ pub fn should_set_secure(public_url: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_generate_token_length_and_uniqueness() {

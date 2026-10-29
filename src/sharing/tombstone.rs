@@ -5,6 +5,7 @@
 //! issuer's did:key. Signature validity alone is NOT authority: use
 //! [`verify_tombstone_authority`] to also bind the revocation to the content's
 //! original owner.
+use crate::neo4j::traits::*;
 
 use crate::identity::did::{from_did_key, to_did_key};
 use crate::identity::InstanceIdentity;
@@ -189,6 +190,7 @@ pub fn annotate_tombstone(tombstone: SignedTombstone) -> AnnotatedTombstone {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     fn signed() -> SignedTombstone {
         let id = InstanceIdentity::generate();

@@ -85,6 +85,7 @@
 //! timeout. What a child spent is added to its parent's CHILDREN spend when the call ends
 //! ([`ChatManager::aggregated_cost_usd`] = own + children); the parent's own
 //! `total_cost_usd` is untouched, so its routing decision is not charged twice (PYSR-3).
+use crate::neo4j::traits::*;
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;

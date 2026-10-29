@@ -10,6 +10,7 @@
 //!
 //! Only `standalone` may replace its own executable. Every mode still gets the
 //! "new version available" notification.
+use crate::neo4j::traits::*;
 
 use serde::Serialize;
 use std::path::{Component, Path};
@@ -161,6 +162,7 @@ pub fn detect_supervisor() -> Option<Supervisor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use std::path::PathBuf;
 
     fn c(p: &str) -> DeploymentMode {

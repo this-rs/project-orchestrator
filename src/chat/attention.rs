@@ -33,6 +33,7 @@
 //! read ([`AnalyticsStore::get_attention_events`]) does not even fetch it.
 //!
 //! [`AnalyticsStore::get_attention_events`]: crate::neo4j::traits::AnalyticsStore::get_attention_events
+use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, HashSet};
 

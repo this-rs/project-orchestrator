@@ -1,4 +1,5 @@
 //! Neo4j Decision operations
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use super::models::*;

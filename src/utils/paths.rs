@@ -8,6 +8,7 @@
 //! - Neo4j `File` nodes keep their absolute `path` property (internal matching key).
 //! - All **exit points** (API responses, exports, triggers, anchors) are normalized
 //!   to relative paths via these helpers.
+use crate::neo4j::traits::*;
 
 use std::path::{Path, PathBuf};
 
@@ -134,6 +135,7 @@ pub fn is_relative(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_relativize_through_symlinked_root() {

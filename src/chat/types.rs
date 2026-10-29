@@ -1,4 +1,5 @@
 //! Chat types — request/response/event types for the chat system
+use crate::neo4j::traits::*;
 
 use crate::chat::provider::policy::SessionAccess;
 use crate::neo4j::models::ExecutionPlace;
@@ -2374,6 +2375,7 @@ impl SessionWorkLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use chrono::TimeZone;
 
     #[test]
@@ -4235,6 +4237,7 @@ mod tests {
 #[cfg(test)]
 mod pool_spans_providers_tests {
     use super::{pool_spans_providers, RoutingPoolEntry};
+    use crate::neo4j::traits::*;
 
     fn entry(provider: &str, model: &str) -> RoutingPoolEntry {
         RoutingPoolEntry {

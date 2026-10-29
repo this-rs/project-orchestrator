@@ -1,4 +1,5 @@
 //! Common helper functions for code parsing across all languages
+use crate::neo4j::traits::*;
 
 use crate::neo4j::models::*;
 
@@ -330,6 +331,7 @@ pub fn extract_type_parameters(node: &tree_sitter::Node, source: &str) -> Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     fn parse_rust(src: &str) -> tree_sitter::Tree {
         let mut p = tree_sitter::Parser::new();

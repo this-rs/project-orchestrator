@@ -1,4 +1,5 @@
 //! Trait abstraction for Meilisearch search operations
+use crate::neo4j::traits::*;
 
 use super::indexes::*;
 use anyhow::Result;

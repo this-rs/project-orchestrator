@@ -4,6 +4,7 @@
 //! Also handles chat event pub/sub and interrupt signaling via NATS.
 //!
 //! Fire-and-forget publishing: errors are logged but never block the caller.
+use crate::neo4j::traits::*;
 
 use super::types::{CrudEvent, EventEmitter, TransportState};
 use crate::chat::types::ChatEvent;
@@ -682,6 +683,7 @@ pub async fn connect_nats(url: &str) -> anyhow::Result<async_nats::Client> {
 mod tests {
     use super::*;
     use crate::events::{CrudAction, EntityType};
+    use crate::neo4j::traits::*;
 
     // ========================================================================
     // Subject construction

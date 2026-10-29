@@ -17,6 +17,7 @@
 //! 3. Guards are evaluated as simple string conditions (future: expression engine)
 //! 4. Reaching a terminal state automatically completes the run
 //! 5. Only `Running` runs can accept transitions
+use crate::neo4j::traits::*;
 
 use crate::neo4j::traits::GraphStore;
 

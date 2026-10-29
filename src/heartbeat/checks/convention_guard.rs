@@ -3,6 +3,7 @@
 //! Uses `compute_structural_drift` to find files that have drifted from their
 //! community centroid, then checks if relevant guideline notes exist.
 //! Creates alerts for drifted files that lack convention coverage.
+use crate::neo4j::traits::*;
 
 use std::time::Duration;
 
@@ -123,6 +124,7 @@ impl HeartbeatCheck for ConventionGuardCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_convention_guard_check_name() {

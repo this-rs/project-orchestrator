@@ -19,6 +19,7 @@
 //!
 //! The clock is injected ([`Clock`]): the exclusion and the re-admission at the reset are
 //! asserted with a clock a test drives by hand.
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -534,6 +535,7 @@ impl QuotaRegistry {
 mod tests {
     use super::*;
     use crate::chat::provider::limits::ManualClock;
+    use crate::neo4j::traits::*;
     use nexus_claude::agent::QuotaWindow;
 
     const T0: &str = "2026-10-21T10:00:00Z";

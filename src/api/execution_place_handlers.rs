@@ -14,6 +14,7 @@
 //! - `POST /api/execution-places/{id}/reject`: the person says no (`rejected`).
 //! - `GET /api/execution-places/{id}`: a pending placement.
 //! - `GET /api/tasks/{task_id}/execution-places`: the audit of a task, oldest first.
+use crate::neo4j::traits::*;
 
 use std::sync::LazyLock;
 

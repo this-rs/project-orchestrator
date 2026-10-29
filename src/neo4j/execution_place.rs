@@ -1,5 +1,6 @@
 //! Neo4j storage of the execution-place audit (T5): `ExecutionPlaceEvent` nodes, append-only,
 //! linked to their task by `(Task)-[:HAS_PLACE_EVENT]->(ExecutionPlaceEvent)` when the task exists.
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use super::models::{ExecutionPlaceEvent, ExecutionPlaceEventKind};

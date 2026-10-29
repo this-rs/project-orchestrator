@@ -7,6 +7,7 @@
 //! - [`ReasoningNode`]: A node in the tree, representing an activated entity
 //! - [`Action`]: A suggested MCP tool call derived from a leaf node
 //! - [`EntitySource`]: The type of entity that sourced a reasoning node
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -415,6 +416,7 @@ impl Default for ReasoningTreeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_entity_source_display_and_parse() {

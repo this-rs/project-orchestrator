@@ -4,6 +4,7 @@
 //! workspace next to a plan of the *same* project that has one, which one
 //! store cannot produce (a project belongs to one workspace or to none): the
 //! two items are therefore produced by two stores and compared one by one.
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 

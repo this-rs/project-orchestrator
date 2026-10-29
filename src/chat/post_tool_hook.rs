@@ -8,6 +8,7 @@
 //! # Error Policy
 //!
 //! **NEVER block tool execution.** Any error → passthrough (continue_: true).
+use crate::neo4j::traits::*;
 
 use crate::neo4j::traits::GraphStore;
 use crate::neurons::AutoReinforcementConfig;

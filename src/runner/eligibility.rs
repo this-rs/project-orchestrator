@@ -6,6 +6,7 @@
 //!
 //! Rule: completed tasks are skipped, blocked tasks are skipped (with a
 //! warning), everything else (pending, in_progress, failed) is (re)run.
+use crate::neo4j::traits::*;
 
 use crate::api::attention::{
     ResumePreview, RunnerOccupant, RunnerState as AttentionRunnerState, RunnerStatus, TaskRef,
@@ -159,6 +160,7 @@ pub async fn current_runner_state(
 mod tests {
     use super::*;
     use crate::neo4j::plan::Wave;
+    use crate::neo4j::traits::*;
     use crate::runner::models::TriggerSource;
 
     fn wt(status: TaskStatus, title: &str) -> WaveTask {

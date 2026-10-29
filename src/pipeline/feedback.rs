@@ -2,6 +2,7 @@
 //!
 //! Analyzes episodes from completed protocol runs to extract patterns
 //! of success/failure and create/enrich skills automatically.
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 
@@ -575,6 +576,7 @@ fn slug(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     fn make_episode(
         protocol: &str,

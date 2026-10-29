@@ -26,6 +26,7 @@
 //! a private address cannot be caught without a lookup, and a lookup is a
 //! network request. The check at read time (consent per origin) is where that
 //! belongs.
+use crate::neo4j::traits::*;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -135,6 +136,7 @@ pub fn host_label(normalized: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn a_public_https_address_is_normalized() {

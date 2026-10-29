@@ -1,4 +1,5 @@
 //! Neo4j Step operations
+use crate::neo4j::traits::*;
 
 use super::client::{pascal_to_snake_case, Neo4jClient};
 use super::models::*;

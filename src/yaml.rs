@@ -26,6 +26,7 @@
 //!   does not fully know (`config.yaml`, one section at a time). Scalars there are
 //!   resolved as serde_yaml did, so a rewrite keeps every other value as it was:
 //!   `password: 0123` stays the string `"0123"`, never the number 123.
+use crate::neo4j::traits::*;
 
 use indexmap::IndexMap;
 use serde::de::{DeserializeOwned, IgnoredAny};

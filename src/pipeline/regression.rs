@@ -4,6 +4,7 @@
 //! - Loops (same error seen N+ times)
 //! - Regressions (a test that was passing now fails)
 //! - Stagnation (no progress over K iterations)
+use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -297,6 +298,7 @@ impl RegressionDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use chrono::Utc;
 
     fn make_checkpoint(

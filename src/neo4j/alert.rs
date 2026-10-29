@@ -1,4 +1,5 @@
 //! Neo4j Alert operations (Heartbeat Engine)
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use super::models::*;

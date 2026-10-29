@@ -8,6 +8,7 @@
 //! - GET    /api/mcp-federation/servers/:id/tools     — list tools for a server
 //! - POST   /api/mcp-federation/servers/:id/probe     — probe a server's tools
 //! - POST   /api/mcp-federation/servers/:id/reconnect — reconnect a server
+use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
 use crate::mcp_federation::client::McpTransportConfig;
@@ -419,6 +420,7 @@ mod tests {
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
     use crate::events::EventBus;
+    use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_auth_config, test_bearer_token};
     use axum::{

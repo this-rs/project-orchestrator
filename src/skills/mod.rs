@@ -22,6 +22,7 @@
 //! - Louvain detects clusters of strongly connected notes → Skills
 //! - Triggers (Regex/FileGlob) match tool inputs to activate skills
 //! - Hook activation injects relevant notes into Claude Code context
+use crate::neo4j::traits::*;
 
 pub mod activation;
 pub mod cache;

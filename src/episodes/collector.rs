@@ -8,6 +8,7 @@
 //!
 //! The resulting Episode can then be converted to a PortableEpisode for
 //! cross-instance exchange via SkillPackage v3.
+use crate::neo4j::traits::*;
 
 use anyhow::{Context, Result};
 use chrono::Utc;

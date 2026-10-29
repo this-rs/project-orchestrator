@@ -1,5 +1,6 @@
 //! Routes of the network tools (P6): auth, validation, persistence, and the end-to-end effect on
 //! a native session's tool list.
+use crate::neo4j::traits::*;
 
 use crate::api::handlers::{OrchestratorState, ServerState};
 use crate::api::routes::create_router;

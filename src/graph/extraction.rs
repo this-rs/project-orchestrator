@@ -11,6 +11,7 @@
 //!
 //! - **File graph**: nodes = files, edges = IMPORTS relationships
 //! - **Function graph**: nodes = functions, edges = CALLS relationships
+use crate::neo4j::traits::*;
 
 use crate::neo4j::GraphStore;
 use anyhow::Result;

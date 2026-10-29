@@ -9,6 +9,7 @@
 //! and NATS are not files in the workspace — they exist solely as declared
 //! dependencies, which is why a derivation built on the code graph alone would
 //! silently lose every datastore in the system.
+use crate::neo4j::traits::*;
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -423,6 +424,7 @@ pub fn classify_path_dependency(manifest_path: &str, dep_path: &str) -> PathTarg
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     const CARGO: &str = r#"
 [package]

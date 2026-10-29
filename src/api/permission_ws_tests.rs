@@ -2,6 +2,7 @@
 //! loopback port (authentication off: the socket carries the anonymous user), a real
 //! client, the real handler. Each test fails if the loop stops checking who answers
 //! before anything is delivered, or lets an answer through when the owner cannot be read.
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 use std::time::Duration;

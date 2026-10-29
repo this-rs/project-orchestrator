@@ -5,6 +5,7 @@
 //!
 //! Notes can be linked to code entities and automatically surfaced to agents
 //! based on relevance and graph propagation.
+use crate::neo4j::traits::*;
 
 pub mod coactivation;
 pub mod hashing;

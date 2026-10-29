@@ -18,6 +18,7 @@
 //! #[cfg(feature = "embedded-frontend")]
 //! router.fallback(embedded_frontend::serve_embedded)
 //! ```
+use crate::neo4j::traits::*;
 
 use axum::{
     body::Body,
@@ -98,6 +99,7 @@ fn serve_file(path: &str, data: &[u8]) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     /// A missing static asset must 404, not fall back to index.html: serving
     /// index.html (text/html) for a *.js request makes the browser fail module

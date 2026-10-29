@@ -24,6 +24,7 @@
 //!
 //! **Do NOT** wire `record_path()` into `reason_handlers.rs` — that would cause
 //! double reinforcement for explicitly-rated trees.
+use crate::neo4j::traits::*;
 
 use std::collections::HashSet;
 use std::sync::Arc;

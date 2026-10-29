@@ -5,6 +5,7 @@
 //! 2. Message sending via POST /api/p2p/message
 //! 3. Delta sync via POST /api/p2p/sync (HAVE → WANT → DATA)
 //! 4. Full skill exchange: Alice distills → signs → syncs → Bob receives & verifies
+use project_orchestrator::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

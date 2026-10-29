@@ -50,6 +50,7 @@
 //! - Graceful degradation: each query has a 200ms timeout; failures are logged
 //!   and skipped. A timed-out or failed embedding simply drops the dense
 //!   channel — the turn falls back to BM25 instead of losing knowledge.
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::sync::Arc;

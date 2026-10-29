@@ -1,6 +1,7 @@
 //! Tree-sitter based code parser
 //!
 //! Supports multiple programming languages with full AST extraction.
+use crate::neo4j::traits::*;
 
 pub mod ast_cache;
 pub mod code_ir;
@@ -387,6 +388,7 @@ pub struct FunctionCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use std::path::PathBuf;
 
     // =========================================================================

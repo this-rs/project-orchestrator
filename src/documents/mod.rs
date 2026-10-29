@@ -23,6 +23,7 @@
 //! decisions assert things about files (`manager.rs:1933 does X`) and nothing
 //! ever re-checks the assertion. `staleness_score` measures *age*, not validity.
 //! [`align`] is the mechanism that turns that into a measured property.
+use crate::neo4j::traits::*;
 
 pub mod align;
 pub mod chunk;

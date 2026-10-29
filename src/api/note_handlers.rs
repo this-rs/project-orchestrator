@@ -1,4 +1,5 @@
 //! API handlers for Knowledge Notes
+use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams, SearchFilter};

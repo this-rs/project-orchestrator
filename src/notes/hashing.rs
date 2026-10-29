@@ -2,6 +2,7 @@
 //!
 //! Generates stable hashes that detect meaningful code changes while
 //! being tolerant to formatting changes (whitespace, comments).
+use crate::neo4j::traits::*;
 
 use sha2::{Digest, Sha256};
 
@@ -311,6 +312,7 @@ fn normalize_code(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_function_signature_hash_same_code() {

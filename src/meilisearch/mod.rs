@@ -1,4 +1,5 @@
 //! Meilisearch client and index management
+use crate::neo4j::traits::*;
 
 pub mod client;
 mod impl_search_store;

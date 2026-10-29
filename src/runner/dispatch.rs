@@ -11,6 +11,7 @@
 //!    `POST /api/plans/{id}/run` handler uses;
 //! 4. one [`TriggerFiring`] per firing, carrying the `plan_run_id` of the run
 //!    it started, or the `start_error` that kept it from starting.
+use crate::neo4j::traits::*;
 
 use crate::auth::jwt::Claims;
 use crate::chat::manager::ChatManager;

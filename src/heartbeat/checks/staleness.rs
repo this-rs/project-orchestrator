@@ -2,6 +2,7 @@
 //!
 //! Calls `GraphStore::update_staleness_scores()` to recompute
 //! staleness for all active notes based on file modification timestamps.
+use crate::neo4j::traits::*;
 
 use std::time::Duration;
 
@@ -34,6 +35,7 @@ impl HeartbeatCheck for StalenessCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_staleness_check_name() {

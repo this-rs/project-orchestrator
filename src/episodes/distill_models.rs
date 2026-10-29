@@ -2,6 +2,7 @@
 //!
 //! These types support the full distillation pipeline:
 //! collect -> abstract -> anonymize -> envelope -> package.
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -374,6 +375,7 @@ pub struct DistillationEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_sensitivity_level_default() {

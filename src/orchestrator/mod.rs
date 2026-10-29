@@ -1,4 +1,5 @@
 //! Orchestrator module for coordinating agents
+use crate::neo4j::traits::*;
 
 pub mod context;
 pub mod planner;
@@ -63,6 +64,7 @@ pub fn should_ignore_path(path_str: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_should_ignore_all_patterns() {

@@ -1,4 +1,5 @@
 //! Neo4j Code structure, symbols, imports, calls, exploration, impact, and embeddings
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use super::models::*;

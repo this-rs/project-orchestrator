@@ -18,6 +18,7 @@
 //!         ├── transport: Stdio { command, args }
 //!         └── ...
 //! ```
+use crate::neo4j::traits::*;
 
 pub mod circuit_breaker;
 pub mod client;
@@ -106,6 +107,7 @@ pub fn initialize_params() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_client_info() {

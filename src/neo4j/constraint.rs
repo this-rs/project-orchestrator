@@ -1,4 +1,5 @@
 //! Neo4j Constraint operations
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use super::models::*;

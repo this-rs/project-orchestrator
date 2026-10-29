@@ -14,6 +14,7 @@ mod tests {
     use crate::neo4j::models::ProjectNode;
     use crate::neo4j::traits::GraphStore;
     use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::protocol::engine;
     use crate::protocol::runner::run_protocol;
     use crate::protocol::{

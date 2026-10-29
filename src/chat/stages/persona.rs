@@ -5,6 +5,7 @@
 //! enrichment output.
 //!
 //! Enabled by default. Disable with `ENRICHMENT_PERSONA=false`.
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -168,6 +169,7 @@ mod tests {
     use crate::chat::enrichment::ParallelEnrichmentStage;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{PersonaNode, PersonaStatus};
+    use crate::neo4j::traits::*;
     use crate::neo4j::traits::*;
     use uuid::Uuid;
 

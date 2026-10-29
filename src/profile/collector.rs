@@ -6,6 +6,7 @@
 //!
 //! The receiver side is consumed by the `ProfileAggregator` (T2.3) which
 //! batches updates and persists to Neo4j every 30 seconds.
+use crate::neo4j::traits::*;
 
 use super::signals::BehaviorSignal;
 use tokio::sync::mpsc;
@@ -169,6 +170,7 @@ pub fn is_response_truncated(response_text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use uuid::Uuid;
 
     #[tokio::test]

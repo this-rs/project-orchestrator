@@ -5,6 +5,7 @@
 //! - `GET /api/episodes` — List episodes for a project
 //! - `POST /api/episodes/anonymize` — Convert an episode to portable format
 //! - `POST /api/episodes/export-artifact` — Export enriched artifact (structure + episodes)
+use crate::neo4j::traits::*;
 
 use crate::api::handlers::{AppError, OrchestratorState};
 use crate::episodes::collector;

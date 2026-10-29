@@ -3,6 +3,7 @@
 //! Pre-configured [`EventTrigger`] specs for common use-cases.
 //! These are **not** auto-created — they serve as templates that the
 //! reactor or admin can install via the trigger API.
+use crate::neo4j::traits::*;
 
 use chrono::Utc;
 use serde_json::json;
@@ -159,6 +160,7 @@ pub async fn install_builtin_triggers(
 mod tests {
     use super::*;
     use crate::events::types::{CrudAction, CrudEvent, EntityType};
+    use crate::neo4j::traits::*;
 
     fn make_event(
         entity_type: EntityType,

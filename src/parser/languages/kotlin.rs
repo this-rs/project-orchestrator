@@ -6,6 +6,7 @@
 //! - Interfaces
 //! - Objects and companions
 //! - Coroutines (suspend functions)
+use crate::neo4j::traits::*;
 
 use crate::neo4j::models::*;
 use crate::parser::helpers::*;

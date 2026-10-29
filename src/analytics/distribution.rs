@@ -15,6 +15,7 @@
 //! let analysis = analyze_distribution(&pageranks);
 //! let p95_threshold = adaptive_threshold(&pageranks, 0.95);
 //! ```
+use crate::neo4j::traits::*;
 
 use crate::analytics::stats::fitting::FitResult;
 use serde::{Deserialize, Serialize};
@@ -260,6 +261,7 @@ pub fn detect_outliers(values: &[f64], k: f64) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_analyze_distribution_empty() {

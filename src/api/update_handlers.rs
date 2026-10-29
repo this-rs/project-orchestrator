@@ -13,6 +13,7 @@
 //! - `POST /api/update/restart` — exit with the supervisor restart code so the
 //!   staged binary starts. Refused unless an update is staged AND a supervisor
 //!   will bring the server back.
+use crate::neo4j::traits::*;
 
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde::Serialize;
@@ -192,6 +193,7 @@ pub async fn restart_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use crate::update::deployment::{DeploymentMode, Supervisor};
     use crate::update::service::UpdateServiceConfig;
     use crate::update::version::resolve_build_version;

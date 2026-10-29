@@ -1,4 +1,5 @@
 //! Neo4j LifecycleHook operations
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use crate::lifecycle::{
@@ -317,6 +318,7 @@ mod tests {
     };
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::GraphStore;
+    use crate::neo4j::traits::*;
     use crate::neo4j::traits::*;
 
     fn make_hook(name: &str, scope: LifecycleScope, on_status: &str) -> LifecycleHook {

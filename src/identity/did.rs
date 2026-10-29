@@ -3,6 +3,7 @@
 //! Implements the did:key method using multicodec prefix 0xed01 (Ed25519 public key)
 //! and multibase base58btc encoding, producing identifiers like:
 //! `did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK`
+use crate::neo4j::traits::*;
 
 use anyhow::{anyhow, Result};
 use ed25519_dalek::VerifyingKey;
@@ -69,6 +70,7 @@ pub fn from_did_key(did: &str) -> Result<VerifyingKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use ed25519_dalek::SigningKey;
 
     #[test]

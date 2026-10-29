@@ -9,6 +9,7 @@
 //! derived, and may add what nobody recorded, but it never overwrites what a
 //! person wrote. Descriptions and tags already present are left alone, and
 //! components nobody derived are left in place.
+use crate::neo4j::traits::*;
 
 use std::path::PathBuf;
 use std::sync::Arc;

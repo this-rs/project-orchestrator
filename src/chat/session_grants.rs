@@ -66,6 +66,7 @@
 //! ([`lasting_grant_for`]: no file tool, one simple command without operator, redirection
 //! or glob), and are kept by `chat::lasting_rules` per person and project; the backend
 //! answers the later requests they cover ([`cover`]), never the provider.
+use crate::neo4j::traits::*;
 
 use serde_json::Value;
 
@@ -1261,6 +1262,7 @@ impl SessionGrants {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use serde_json::json;
 
     fn call(asker: Asker, tool: &str, canonical: Option<&str>, input: Value) -> AskedCall {

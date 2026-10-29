@@ -11,6 +11,7 @@
 //! once a project has consented to its origin and credential reference. The
 //! security gate (A32) refuses to create one on a server running without
 //! authentication.
+use crate::neo4j::traits::*;
 
 use axum::{
     extract::{Path, State},

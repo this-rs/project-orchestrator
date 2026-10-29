@@ -2,5 +2,6 @@
 //! hence the `dead_code` allowance.
 
 #![allow(dead_code)]
+use project_orchestrator::neo4j::traits::*;
 
 pub mod metamorphic;

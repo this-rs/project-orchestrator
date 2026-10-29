@@ -26,6 +26,7 @@
 //! Every step is written to the append-only audit (`ExecutionPlaceEvent`) by the handlers.
 //! Requests are idempotent (the same task, owner and repository give back the same pending
 //! placement) and bounded ([`MAX_PENDING_PER_OWNER`], [`MAX_PENDING`], [`PENDING_TTL`]).
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -371,6 +372,7 @@ impl<T: Clone> PlacementBook<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use std::path::PathBuf;
 
     fn place(path: &str) -> PlannedWorktree {

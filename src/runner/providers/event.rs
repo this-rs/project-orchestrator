@@ -2,6 +2,7 @@
 //!
 //! Subscribes to the CrudEvent broadcast channel and evaluates Event-type
 //! triggers when matching events are received (e.g., plan_completed → start plan B).
+use crate::neo4j::traits::*;
 
 use super::TriggerProvider;
 use crate::events::{CrudEvent, EntityType};

@@ -2,6 +2,7 @@
 //!
 //! Uses the Nexus SDK's `find_claude_cli`, `get_cli_version`, `check_latest_npm_version`,
 //! and `download_cli` functions to provide a unified CLI management service.
+use crate::neo4j::traits::*;
 
 use nexus_claude::{
     check_latest_npm_version, download_cli, find_claude_cli, get_cached_cli_path, get_cli_version,
@@ -418,6 +419,7 @@ impl ClaudeCliProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn a_configured_cli_path_is_present_only_when_the_file_is_there() {

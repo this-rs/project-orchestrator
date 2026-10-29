@@ -7,6 +7,7 @@
 //! - Parameters with types
 //! - JSDoc comments
 //! - Decorators
+use crate::neo4j::traits::*;
 
 use crate::neo4j::models::*;
 use crate::parser::helpers::*;

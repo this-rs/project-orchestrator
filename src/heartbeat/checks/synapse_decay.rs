@@ -3,6 +3,7 @@
 //! Runs `decay_synapses` to weaken unused neural links,
 //! then `update_energy_scores` to decay note energy based on
 //! time since last activation (exponential half-life model).
+use crate::neo4j::traits::*;
 
 use std::time::Duration;
 

@@ -10,6 +10,7 @@
 //! Run locally against a throwaway instance:
 //!   docker run -d --rm --name po-mig -p 17687:7687 -e NEO4J_AUTH=neo4j/testpassword neo4j:5
 //!   NEO4J_URI=bolt://localhost:17687 NEO4J_PASSWORD=testpassword cargo test --test data_migrations
+use project_orchestrator::neo4j::traits::*;
 
 use neo4rs::{query, Graph};
 use project_orchestrator::neo4j::client::Neo4jClient;

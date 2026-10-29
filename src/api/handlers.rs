@@ -1,4 +1,5 @@
 //! API request handlers
+use crate::neo4j::traits::*;
 
 use crate::api::{
     workspace_handlers::{MilestonePlanSummary, MilestoneStepSummary, MilestoneTaskSummary},

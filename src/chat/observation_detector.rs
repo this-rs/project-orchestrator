@@ -10,6 +10,7 @@
 //! VizBlock with pre-filled note content for user approval.
 //!
 //! **Constraint**: Maximum 1 suggestion per response, confidence > 0.8.
+use crate::neo4j::traits::*;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -411,6 +412,7 @@ pub fn build_suggestion_vizblock(obs: &DetectedObservation) -> VizBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_detect_bug_resolution_en() {

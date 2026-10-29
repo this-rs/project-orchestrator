@@ -8,6 +8,7 @@
 //! Stored as one JSON document per scope (`LlmSetting {scope, key: "routing"}`,
 //! see [`super::load_routing`]); every field is read with a default, so an
 //! older document, or no document at all, is valid (no migration).
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -436,6 +437,7 @@ impl From<(RoutingSettings, RoutingScope)> for EffectiveRouting {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use serde_json::json;
 
     #[test]

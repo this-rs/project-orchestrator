@@ -10,6 +10,7 @@
 //!
 //! [`Neo4jRoutingStore`] adapts any [`GraphStore`] to the
 //! [`RoutingArmStore`] the scorer, the feedback and the report depend on.
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 
@@ -310,6 +311,7 @@ mod tests {
     use crate::chat::provider::cognitive::mode::{LearningStage, ProviderRoutingMode};
     use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
 
     fn decision() -> CognitiveDecision {
         CognitiveDecision {

@@ -25,6 +25,7 @@
 //!
 //! # References
 //! - EvoFSM (2026): "Controllable Self-Evolution for Deep Research with FSMs"
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 

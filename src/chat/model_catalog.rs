@@ -21,6 +21,7 @@
 //!   catalog borrows the OAuth token Claude Code itself logged in with (see
 //!   `read_claude_code_oauth_token`). The Models API accepts it, and every
 //!   install that can chat at all has one.
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;

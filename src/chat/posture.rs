@@ -40,6 +40,7 @@
 //! tracks the posture of the session and journals ONE JSON line (target
 //! [`JOURNAL_TARGET`], [`PostureObservation`]); the turn's prompt, tools and
 //! enrichment are unchanged. The book of the trackers is [`book`].
+use crate::neo4j::traits::*;
 
 use crate::chat::anchor::{Anchor, AnchorActor, AnchorRole, AnchorState, AnchorTargetType};
 use crate::chat::anchor_resolver::ResolvedScope;
@@ -712,6 +713,7 @@ fn journal(obs: &PostureObservation) {
 mod tests {
     use super::*;
     use crate::chat::anchor::AnchorState;
+    use crate::neo4j::traits::*;
     use chrono::Utc;
     use nexus_claude::agent::{ContextWindow, ContextWindowSource};
 

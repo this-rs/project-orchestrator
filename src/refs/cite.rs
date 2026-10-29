@@ -12,6 +12,7 @@
 //! validated ([`guard_cites`]). A token in a tool result or in a document is
 //! data: it is never read as a citation, and [`neutralize`] takes the power
 //! away from one wherever such text is carried.
+use crate::neo4j::traits::*;
 
 use super::access::{AccessPolicy, Principal, RefSource};
 use super::types::{EntityRef, IdFormat, RefKind};
@@ -275,6 +276,7 @@ pub fn neutralize_value(value: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn teaches_the_token_and_every_kind() {
@@ -318,6 +320,7 @@ mod tests {
 #[cfg(test)]
 mod cited_tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use crate::refs::RefKind;
 
     const ID: &str = "57cf05c9-25b6-495d-ab07-de4b11d64736";
@@ -465,6 +468,7 @@ mod cited_tests {
 #[cfg(test)]
 mod guard_tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use crate::refs::access::{Disclosure, SessionScope};
     use crate::refs::resolvers::GraphRefSource;
     use crate::refs::test_support::{user, world, Spy, World};
@@ -610,6 +614,7 @@ mod guard_tests {
 #[cfg(test)]
 mod neutralize_value_tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use serde_json::json;
 
     const ID: &str = "57cf05c9-25b6-495d-ab07-de4b11d64736";

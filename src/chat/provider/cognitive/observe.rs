@@ -37,6 +37,7 @@
 //! the turn's message text; `Problem`/`Resolution` come from `TaskSignature`'s
 //! class key. (Decision recorded 2026-10, S2: keep both hystereses; do not wire a
 //! second independent latch.)
+use crate::neo4j::traits::*;
 
 use std::collections::BTreeMap;
 
@@ -86,6 +87,7 @@ pub fn observation(
 mod tests {
     use super::*;
     use crate::chat::provider::resolver::Role;
+    use crate::neo4j::traits::*;
 
     fn signature(attempt: u32) -> TaskSignature {
         TaskSignature {

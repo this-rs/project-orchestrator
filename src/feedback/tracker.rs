@@ -2,6 +2,7 @@
 //!
 //! Maintains in-memory stores for feedback and signal state, provides
 //! aggregation queries, and coordinates the signal detector + propagator.
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -258,6 +259,7 @@ impl Default for OutcomeTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[tokio::test]
     async fn test_record_and_list_feedback() {

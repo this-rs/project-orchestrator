@@ -8,6 +8,7 @@
 //! - Streaming status updates
 //! - Event persistence to Neo4j
 //! - Memory/feedback/RFC recording
+use crate::neo4j::traits::*;
 
 use super::manager::ActiveSession;
 use super::provider::cognitive::segment::{Boundary, Segment};
@@ -1655,6 +1656,7 @@ mod integration_tests {
     use crate::chat::types::PendingMessageKind;
     use crate::meilisearch::mock::MockSearchStore;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
     use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
     use crate::test_helpers::{test_project_named, test_task_titled};

@@ -2,6 +2,7 @@
 //!
 //! Handles automatic detection of note obsolescence during code sync,
 //! staleness calculation, and note status transitions.
+use crate::neo4j::traits::*;
 
 use super::hashing::{hash_function_body, hash_function_signature, similarity_score};
 use super::models::*;
@@ -902,6 +903,7 @@ pub struct AssertionVerificationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_consolidated_notes_are_never_auto_archived() {

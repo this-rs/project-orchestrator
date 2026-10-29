@@ -9,6 +9,7 @@
 //! The declared aliases (`fast`, `deep`) are a PRIOR on a fresh arm, never a
 //! rule: one extra success on the classes the alias suits, and the evidence
 //! overrides it as soon as the arm has observations.
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 
@@ -401,6 +402,7 @@ pub fn arm_key_of(signature: &TaskSignature, candidate: &ModelFacts) -> ArmKey {
 mod tests {
     use super::*;
     use crate::chat::provider::cognitive::signature::ContextHints;
+    use crate::neo4j::traits::*;
     use nexus_claude::agent::{CostBasis, ModelPrice};
 
     fn facts(provider: &str, model: &str, input_price: Option<f64>) -> ModelFacts {

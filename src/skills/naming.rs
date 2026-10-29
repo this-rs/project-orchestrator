@@ -2,6 +2,7 @@
 //!
 //! Uses statistical analysis of note tags to compose human-readable skill names.
 //! No LLM needed — purely deterministic heuristic.
+use crate::neo4j::traits::*;
 
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -105,6 +106,7 @@ fn title_case(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_generate_skill_name_basic() {

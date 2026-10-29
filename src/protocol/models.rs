@@ -6,6 +6,7 @@
 //! - [`ProtocolTransition`]: A transition between two states
 //! - [`ProtocolCategory`]: System vs Business protocol classification
 //! - [`StateType`]: Start, Intermediate, or Terminal state classification
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -1123,6 +1124,7 @@ pub struct UpdateProtocolRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     // --- ProtocolCategory tests ---
 

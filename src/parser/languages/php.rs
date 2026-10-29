@@ -6,6 +6,7 @@
 //! - Traits
 //! - Namespaces
 //! - Type hints
+use crate::neo4j::traits::*;
 
 use crate::neo4j::models::*;
 use crate::parser::helpers::*;

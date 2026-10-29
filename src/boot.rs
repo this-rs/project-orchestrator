@@ -12,6 +12,7 @@
 //! Details are redacted on the way in ([`redact`]): a snapshot is meant to be shown to the user and
 //! one day served over HTTP, so a connection error that carries `bolt://user:secret@host` must not
 //! leak the secret.
+use crate::neo4j::traits::*;
 
 use std::fmt::Display;
 use std::future::Future;
@@ -306,6 +307,7 @@ pub fn redact(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     fn phase<'a>(snapshot: &'a BootSnapshot, id: &str) -> &'a Phase {
         snapshot.phases.iter().find(|p| p.id == id).unwrap()

@@ -1,4 +1,5 @@
 //! Neo4j Task operations
+use crate::neo4j::traits::*;
 
 use super::client::{pascal_to_snake_case, Neo4jClient, WhereBuilder};
 use super::models::*;

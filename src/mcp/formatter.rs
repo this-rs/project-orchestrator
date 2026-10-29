@@ -11,6 +11,7 @@
 //! - Simple arrays are inlined: `tags: [a, b, c]`
 //! - Object arrays use `- ` prefix (YAML-style)
 //! - Nested objects are indented by 2 spaces
+use crate::neo4j::traits::*;
 
 use serde_json::Value;
 
@@ -207,6 +208,7 @@ fn push_indent(out: &mut String, n: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use serde_json::json;
 
     #[test]

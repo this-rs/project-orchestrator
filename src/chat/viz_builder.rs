@@ -21,6 +21,7 @@
 //! 3. Call the appropriate helper to fetch real data from the graph
 //! 4. Build a [`VizBlock`] with real data and auto-generated fallback text
 //! 5. Return `Vec<ContentBlock>` with alternating Text and Viz blocks
+use crate::neo4j::traits::*;
 
 use crate::neo4j::traits::GraphStore;
 use anyhow::Result;
@@ -687,6 +688,7 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{PlanNode, PlanStatus, TaskNode, TaskStatus};
+    use crate::neo4j::traits::*;
     use crate::reasoning::models::{EntitySource, ReasoningNode};
 
     fn make_mock_graph() -> Arc<MockGraphStore> {

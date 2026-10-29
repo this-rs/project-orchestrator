@@ -14,6 +14,7 @@
 //! `wb` the debug class and the compaction summary, `pm` loses everywhere. What a test
 //! asserts is where the TURNS went (requests seen by each fake; the capability probes the
 //! pool sends to every instance are metadata, filtered out) and what the store recorded.
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 use std::time::Duration;

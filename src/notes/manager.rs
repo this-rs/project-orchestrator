@@ -2,6 +2,7 @@
 //!
 //! Provides high-level operations for creating, reading, updating, and deleting notes,
 //! including linking notes to entities and managing note lifecycle.
+use crate::neo4j::traits::*;
 
 use super::models::*;
 use crate::embeddings::EmbeddingProvider;

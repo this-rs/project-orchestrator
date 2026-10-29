@@ -2,6 +2,7 @@
 //!
 //! [`PipelineConfig`] is the configuration of a pipeline run. It is consumed
 //! by the MCP pipeline handler (`mcp::pipeline_handler`).
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +44,7 @@ impl Default for PipelineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     // -- PipelineConfig defaults --------------------------------------------
 

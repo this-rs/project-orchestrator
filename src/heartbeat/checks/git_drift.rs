@@ -2,6 +2,7 @@
 //!
 //! Runs `git fetch` + `git log HEAD..origin/main` per watched project.
 //! Creates an alert if there are new upstream commits.
+use crate::neo4j::traits::*;
 
 use std::time::Duration;
 
@@ -149,6 +150,7 @@ impl HeartbeatCheck for GitDriftCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     /// A clone that is `behind` commits behind its origin's main.
     fn repo_behind(behind: usize) -> (tempfile::TempDir, String) {

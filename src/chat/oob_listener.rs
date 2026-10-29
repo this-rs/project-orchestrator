@@ -50,6 +50,7 @@
 //!      flag first), the queued `PendingMessage` will be picked up by
 //!      `drain_pending_messages` after that turn ends — no event is
 //!      dropped.
+use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -1840,6 +1841,7 @@ mod agent_path_tests {
     use super::super::agent_runtime::{AgentRuntime, AgentSessionHandle};
     use super::super::types::ChatEvent;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
     use nexus_claude::agent::{
         AgentEvent, BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus,

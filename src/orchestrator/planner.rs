@@ -1,5 +1,6 @@
 //! Implementation Flow Planner — analyzes the knowledge graph to produce
 //! a DAG of implementation phases (sequential + parallel branches).
+use crate::neo4j::traits::*;
 
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::{StepNode as StepNodeModel, StepStatus};

@@ -17,6 +17,7 @@
 //! - **Local trigger evaluation**: Skills are loaded from DB then matched in Rust,
 //!   avoiding per-trigger Neo4j round-trips.
 //! - **Context budget**: 3200 chars max (~800 tokens) to prevent additionalContext flooding.
+use crate::neo4j::traits::*;
 
 use regex::RegexBuilder;
 use uuid::Uuid;

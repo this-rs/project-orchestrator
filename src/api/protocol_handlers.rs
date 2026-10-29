@@ -1,4 +1,5 @@
 //! API handlers for Protocol (Pattern Federation)
+use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams};

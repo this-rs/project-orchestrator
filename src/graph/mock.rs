@@ -2,6 +2,7 @@
 //!
 //! Returns pre-configured `GraphAnalytics` results without performing
 //! any actual computation or database access.
+use crate::neo4j::traits::*;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -108,6 +109,7 @@ impl AnalyticsEngine for MockAnalyticsEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use std::collections::HashMap;
 
     #[tokio::test]

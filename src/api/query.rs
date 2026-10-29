@@ -1,4 +1,5 @@
 //! Common query parameter structs for pagination and filtering
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use std::str::FromStr;
@@ -198,6 +199,7 @@ impl<T> PaginatedResponse<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     // =========================================================================
     // PaginationParams Tests

@@ -8,6 +8,7 @@
 //! compared here: the model is rewritten by every legitimate switch (Auto changes it
 //! from one turn to the next) and the prompt embeds the date and the project's live
 //! instructions, so a difference there is the normal state of a resumed session.
+use crate::neo4j::traits::*;
 
 use nexus_claude::agent::{ResumeFingerprint, ResumeIncompatible};
 use tracing::warn;
@@ -62,6 +63,7 @@ pub(crate) fn check_servers_kept(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

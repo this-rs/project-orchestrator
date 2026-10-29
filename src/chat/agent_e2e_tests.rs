@@ -8,6 +8,7 @@
 //! fake_openai --bin fake_mcp`. `NEXUS_FAKES_DIR` names the directory holding
 //! them (default: `<repo>/../.target-nexus-fakes/debug`). Missing binaries FAIL
 //! the tests: a test that cannot run must not pass.
+use crate::neo4j::traits::*;
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -1298,6 +1299,7 @@ mod cognitive_routing {
     use crate::chat::provider::cognitive::store::{DecisionFilter, RoutingArmStore};
     use crate::chat::provider::resolver::{ProviderChoice, RoutedBy};
     use crate::neo4j::routing::Neo4jRoutingStore;
+    use crate::neo4j::traits::*;
     use crate::neo4j::traits::*;
     use crate::neo4j::traits::*;
 
@@ -2668,6 +2670,7 @@ mod auto_on_a_locked_vault {
     use crate::chat::provider::errors::{classify_open_error, AutoVaultLocked};
     use crate::chat::provider::resolver::ProviderChoice;
     use crate::neo4j::routing::Neo4jRoutingStore;
+    use crate::neo4j::traits::*;
     use crate::neo4j::traits::*;
 
     const PASS: &str = "correct horse battery staple";
@@ -4846,6 +4849,7 @@ mod provider_switch {
         };
         use crate::chat::provider::cognitive::{LearningStage, ProviderRoutingMode, ROUTING_KEY};
         use crate::chat::types::{RoutingPoolEntry, SessionRoutingRequest};
+        use crate::neo4j::traits::*;
         use crate::neo4j::traits::*;
         use crate::neo4j::traits::*;
         use std::collections::VecDeque;
@@ -7539,6 +7543,7 @@ mod legacy_nats_permission {
     use crate::chat::manager::{DeliveryRoute, PermissionDeliveryError};
     use crate::events::nats_broker_test::TestBroker;
     use crate::events::NatsEmitter;
+    use crate::neo4j::traits::*;
     use crate::neo4j::traits::*;
 
     fn emit(v: Value) -> Value {

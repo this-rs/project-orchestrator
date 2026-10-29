@@ -3,6 +3,7 @@
 //! Defines the abstract interface for all Neo4j graph operations.
 //! This trait mirrors all public async methods of `Neo4jClient`,
 //! enabling testing with mock implementations and future backend swaps.
+use crate::neo4j::traits::*;
 
 use crate::events::trigger::EventTrigger;
 use crate::graph::models::{

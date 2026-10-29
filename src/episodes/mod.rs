@@ -6,6 +6,7 @@
 //!
 //! Episodes are the bridge between local knowledge (notes, decisions,
 //! protocol runs) and portable knowledge (SkillPackage v3).
+use crate::neo4j::traits::*;
 
 pub mod anonymize;
 pub mod artifact_comparison;

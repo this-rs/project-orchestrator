@@ -2,6 +2,7 @@
 //!
 //! This module provides an MCP server that exposes the orchestrator API
 //! as tools for Claude Code and other MCP clients.
+use crate::neo4j::traits::*;
 
 pub mod formatter;
 pub mod handlers;

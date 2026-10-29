@@ -13,6 +13,7 @@
 //!
 //! Grants hold no secret material, so they persist while the vault is locked;
 //! they are merely inert until it is opened again.
+use crate::neo4j::traits::*;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -281,6 +282,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     fn t0() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-10-01T09:00:00Z")

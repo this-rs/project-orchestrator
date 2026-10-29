@@ -6,6 +6,7 @@
 //!
 //! If no lifecycle protocol exists (project without seeds), returns None
 //! for graceful fallback to the existing runner behavior.
+use crate::neo4j::traits::*;
 
 use anyhow::Result;
 use std::sync::Arc;

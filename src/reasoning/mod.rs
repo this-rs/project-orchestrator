@@ -10,6 +10,7 @@
 //! Trees are **ephemeral** — cached in-memory with TTL, not persisted to Neo4j.
 //! A feedback loop (`reason_feedback`) reinforces the underlying synapses,
 //! making future trees for similar queries more accurate over time.
+use crate::neo4j::traits::*;
 
 pub mod cache;
 pub mod engine;

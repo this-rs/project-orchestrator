@@ -10,6 +10,7 @@
 //! `"testing"`); short single words (three characters or fewer) match only as
 //! whole words, so abbreviations like `"ci"`, `"api"` or `"fix"` do not fire
 //! inside unrelated words (`"merci"`, `"rapide"`, `"prefix"`).
+use crate::neo4j::traits::*;
 
 /// A single-word keyword this short (or shorter) is matched against whole words
 /// rather than as a substring. Longer words are matched as substrings so their
@@ -316,6 +317,7 @@ pub fn topic_labels(message: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn french_and_english_map_to_the_same_label() {

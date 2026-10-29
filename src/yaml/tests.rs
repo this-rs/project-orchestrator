@@ -3,6 +3,7 @@
 //!
 //! "Pinned" below means: checked against serde_yaml 0.9 on the same input before
 //! it was removed. Where the behaviour changed, the test says so.
+use crate::neo4j::traits::*;
 
 use super::*;
 use crate::YamlConfig;

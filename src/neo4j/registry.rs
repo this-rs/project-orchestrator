@@ -1,4 +1,5 @@
 //! Neo4j persistence for the Skill Registry (PublishedSkill nodes)
+use crate::neo4j::traits::*;
 
 use anyhow::{Context, Result};
 use neo4rs::*;

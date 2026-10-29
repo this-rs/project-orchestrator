@@ -2,6 +2,7 @@
 //!
 //! Loads notes attached to affected files and filters by scar_intensity > 0.6.
 //! Produces ScarWarning suggestions with truncated content.
+use crate::neo4j::traits::*;
 
 use tracing::debug;
 
@@ -74,6 +75,7 @@ fn truncate_content(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_truncate_content_short() {

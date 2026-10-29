@@ -5,6 +5,7 @@
 //! l'authentification ne sont comptés qu'en mémoire (`guard`). Ce module ne
 //! contient aucun secret (la règle ne porte qu'une référence `vault:<nom>`) et ne
 //! journalise jamais le corps de la requête.
+use crate::neo4j::traits::*;
 
 pub mod guard;
 pub mod model;

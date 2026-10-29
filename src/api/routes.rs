@@ -2,6 +2,7 @@
 //!
 //! Routes are split into public (no auth) and protected (require valid JWT).
 //! The `require_auth` middleware is applied only to protected routes.
+use crate::neo4j::traits::*;
 
 use super::auth_handlers;
 use super::chat_handlers;

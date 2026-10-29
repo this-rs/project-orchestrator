@@ -103,6 +103,7 @@
 //! `force_open_until` is the one door the QUOTA task writes through, so a
 //! known reset time also flows through this single short-circuit rather
 //! than a parallel one.
+use crate::neo4j::traits::*;
 
 use std::time::{Duration, Instant};
 
@@ -321,6 +322,7 @@ impl CircuitBreaker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     const COOLDOWN: Duration = Duration::from_secs(60);
     const PROBE_TIMEOUT: Duration = Duration::from_secs(10);

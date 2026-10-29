@@ -2,6 +2,7 @@
 //! for candidates, keep what is in the requested scope **and** that the access
 //! policy lets this principal see, and shape the answer the golden fixture
 //! `tests/fixtures/refs/search_response.json` pins.
+use crate::neo4j::traits::*;
 
 use std::collections::VecDeque;
 use std::sync::Arc;

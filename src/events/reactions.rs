@@ -19,6 +19,7 @@
 //! Each reaction is an async function that receives the [`CrudEvent`] and an
 //! `Arc<ServerState>`. They are registered via [`register_builtin_reactions`]
 //! which returns a configured [`ReactorBuilder`](super::ReactorBuilder).
+use crate::neo4j::traits::*;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -1430,6 +1431,7 @@ pub fn register_builtin_reactions(
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     /// Serializes the tests that reset and read the process-global
     /// `LAST_FEEDBACK_ANALYSIS_TS`. Run in parallel, one test's `store(0)`
     /// re-opens the cooldown in the middle of another's two calls, which then

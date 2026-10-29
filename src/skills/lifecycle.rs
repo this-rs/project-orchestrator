@@ -5,6 +5,7 @@
 //! - **Demotion**: Active → Dormant when energy drops or inactivity exceeds threshold
 //! - **Archival**: Dormant → Archived after prolonged inactivity
 //! - **Metrics**: Recalculates skill energy and cohesion from member notes/synapses
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

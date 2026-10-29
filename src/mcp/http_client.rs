@@ -3,6 +3,7 @@
 //! Used in HTTP mode where the MCP server delegates tool calls to the REST API
 //! instead of directly using the Orchestrator. The auth token (JWT session token)
 //! is read from the `PO_AUTH_TOKEN` env var and injected as `Authorization: Bearer`.
+use crate::neo4j::traits::*;
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::{Client, Response, StatusCode};
@@ -370,6 +371,7 @@ pub fn extract_string_array(args: &Value, field: &str) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use serde_json::json;
 
     #[test]

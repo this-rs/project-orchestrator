@@ -12,6 +12,7 @@
 //! - `EMBEDDING_MODEL` (default: `nomic-embed-text`)
 //! - `EMBEDDING_API_KEY` (optional, for OpenAI/Voyage)
 //! - `EMBEDDING_DIMENSIONS` (default: `768`)
+use crate::neo4j::traits::*;
 
 use super::traits::EmbeddingProvider;
 use anyhow::{Context, Result};
@@ -234,6 +235,7 @@ impl EmbeddingProvider for HttpEmbeddingProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     /// Combined test for env-based configuration to avoid race conditions.
     /// Env vars are process-global, so parallel tests interfere with each other.

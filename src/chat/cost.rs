@@ -8,6 +8,7 @@
 //! - an `unknown` cost has no amount: it is counted apart, never as zero.
 //!
 //! Pure over the facts stored on each `AgentExecution`.
+use crate::neo4j::traits::*;
 
 use std::collections::BTreeMap;
 
@@ -196,6 +197,7 @@ pub fn session_usage<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use uuid::Uuid;
 
     fn ae(

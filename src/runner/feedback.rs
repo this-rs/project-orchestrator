@@ -8,6 +8,7 @@
 //!
 //! All observations are stored as Notes of type `observation` with tag `runner-feedback`,
 //! linked to the ProtocolRun via PRODUCED_DURING.
+use crate::neo4j::traits::*;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -582,6 +583,7 @@ pub fn contains_dissatisfaction(text: &str) -> Vec<&'static str> {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
     use crate::protocol::models::ProtocolRun;
 
     /// Helper: create a mock graph with a completed protocol run.

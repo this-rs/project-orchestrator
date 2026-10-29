@@ -6,6 +6,7 @@
 //! and the drain, the WebSocket handler) and fails if that point is unplugged.
 //! The Claude CLI is a `MockTransport`: the test reads what the SDK would have
 //! written to the CLI's stdin.
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 use std::time::Duration;

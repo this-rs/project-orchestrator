@@ -14,6 +14,7 @@
 //! The affinity is a weighted dot product across 5 dimensions, producing a
 //! composite score ∈ [0, 1]. Each dimension contributes independently, and
 //! the weights are configurable via `DimensionWeights`.
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -445,6 +446,7 @@ pub fn rank_protocols(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_perfect_match() {

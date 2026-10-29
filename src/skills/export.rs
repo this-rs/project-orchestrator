@@ -3,6 +3,7 @@
 //! Exports a skill and its members as a portable [`SkillPackage`] that can
 //! be imported into another project. Internal IDs are stripped — they are
 //! regenerated on import.
+use crate::neo4j::traits::*;
 
 use anyhow::{Context, Result};
 use chrono::Utc;

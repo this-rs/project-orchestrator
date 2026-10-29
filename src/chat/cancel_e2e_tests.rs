@@ -25,6 +25,7 @@
 //! Not here: the lazy recovery after a crash of the server (kill -9, restart) — an
 //! in-process test cannot crash its own server; the recovery itself is covered by
 //! `chat::manager::tests::test_recovery_*`.
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

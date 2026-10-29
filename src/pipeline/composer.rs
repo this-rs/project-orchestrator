@@ -2,6 +2,7 @@
 //!
 //! Analyzes a Plan (tasks, waves, constraints, affected_files) and generates
 //! a hierarchical Protocol for automated verification.
+use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, HashSet};
 
@@ -405,6 +406,7 @@ impl PipelineSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     // -- detect_tech_stack ---------------------------------------------------
 

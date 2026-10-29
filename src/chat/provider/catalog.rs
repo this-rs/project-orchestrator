@@ -4,6 +4,7 @@
 //! The resolver stays pure ([`super::resolver::InstanceCatalog`] is a sync
 //! trait over facts); this module loads those facts once per opening, so a
 //! decision is taken on one consistent view.
+use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, HashSet};
 
@@ -197,6 +198,7 @@ pub fn resolve_input<'a>(
 mod tests {
     use super::*;
     use crate::chat::provider::resolver::{resolve, RoutedBy};
+    use crate::neo4j::traits::*;
 
     fn instance(id: &str, origin: &str) -> InstanceRecord {
         InstanceRecord {

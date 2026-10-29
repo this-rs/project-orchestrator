@@ -16,6 +16,7 @@
 //!   the block to draw chips ([`split`] has a TypeScript twin);
 //! * the **agent's prompt** is built once, in `stream_response`, by
 //!   [`expand_for_agent`], which swaps the block for the extracted text.
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 
@@ -251,6 +252,7 @@ pub async fn load_images(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     fn att(name: &str) -> MessageAttachment {
         MessageAttachment {

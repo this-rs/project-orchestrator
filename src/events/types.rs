@@ -5,6 +5,7 @@
 //! - [`CrudAction`] — the mutation action performed (8 variants)
 //! - [`CrudEvent`] — the event payload sent over WebSocket/NATS
 //! - [`EventEmitter`] — trait with convenience methods for emitting events
+use crate::neo4j::traits::*;
 
 use super::graph::GraphEvent;
 use serde::{Deserialize, Serialize};
@@ -382,6 +383,7 @@ impl CrudEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_entity_type_serde_roundtrip() {

@@ -1,4 +1,5 @@
 //! Neo4j graph models representing code structure and plans
+use crate::neo4j::traits::*;
 
 use crate::chat::provider::policy::SessionAccess;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -3309,6 +3310,7 @@ pub struct McpToolNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     // ── FeatureGraphEntity enrichment ──
 
@@ -4241,6 +4243,7 @@ mod tests {
 #[cfg(test)]
 mod status_display_tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     /// Regression: status Display must use snake_case (matching serde), not
     /// Debug (PascalCase). Before the fix, `format!("{:?}", TaskStatus::Failed)`

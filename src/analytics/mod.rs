@@ -7,6 +7,7 @@
 //!
 //! All public functions are **panic-free**: errors are returned as `Option` or
 //! logged and replaced with sensible defaults so callers never crash.
+use crate::neo4j::traits::*;
 
 pub mod distribution;
 pub mod hypothesis;

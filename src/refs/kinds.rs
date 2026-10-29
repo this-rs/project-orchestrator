@@ -11,6 +11,7 @@
 //! the entry points at). No other list has to be touched; the tests at the
 //! bottom, and the exhaustiveness tests of the registry, fail if one is
 //! forgotten.
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 
@@ -412,6 +413,7 @@ pub const fn historical() -> [RefKind; 5] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     /// Variant names of `pub enum RefKind` read from `types.rs`.
     fn variants() -> Vec<String> {

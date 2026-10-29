@@ -11,6 +11,7 @@
 //!
 //! The legacy path stays as it was; the manager decides which one serves a
 //! session and a session never changes engine.
+use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};

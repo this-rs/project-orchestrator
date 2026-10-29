@@ -24,6 +24,7 @@
 //!   ▼
 //! Vec<DiscoveredTool>
 //! ```
+use crate::neo4j::traits::*;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -677,6 +678,7 @@ impl ToolIntrospector {
 mod tests {
     use super::*;
     use crate::embeddings::MockEmbeddingProvider;
+    use crate::neo4j::traits::*;
     use serde_json::json;
 
     // ── Classification tests ──────────────────────────────────────────────

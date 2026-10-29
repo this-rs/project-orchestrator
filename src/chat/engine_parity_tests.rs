@@ -36,6 +36,7 @@
 //! read as a parity gap: a `fake_openai` that does not record request headers hides
 //! `anthropic-version`, and the cell then accused the harness on a `main` whose CI was
 //! green (28/10/2026, see [`anthropic_messages_verdict`]).
+use crate::neo4j::traits::*;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};

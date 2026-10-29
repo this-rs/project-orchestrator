@@ -16,6 +16,7 @@
 //! 4. Inject each activated skill's context, assembled from its current
 //!    members (notes/decisions still in force), like the PreToolUse hook
 //! 5. Async boost energy of activated skills (Hebbian reinforcement)
+use crate::neo4j::traits::*;
 
 use anyhow::Result;
 use std::sync::Arc;

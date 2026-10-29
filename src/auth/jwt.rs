@@ -3,6 +3,7 @@
 //! The JWT contains user identity claims and is used for both
 //! HTTP API authentication (Bearer header) and WebSocket auth
 //! (first message after connection).
+use crate::neo4j::traits::*;
 
 use super::jwt_crypto::{decode, encode};
 use anyhow::{Context, Result};
@@ -421,6 +422,7 @@ pub fn decode_jwt(token: &str, secret: &str) -> Result<Claims> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     const TEST_SECRET: &str = "test-secret-key-minimum-32-chars!!";
 

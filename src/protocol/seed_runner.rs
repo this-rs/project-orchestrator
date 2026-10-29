@@ -11,6 +11,7 @@
 //! Run via `admin(action: "seed_runner_protocols")` or called from the main seed.
 //!
 //! Idempotent — skips protocols that already exist by name.
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 

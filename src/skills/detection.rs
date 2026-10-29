@@ -3,6 +3,7 @@
 //! Detects emergent neural skill clusters by analyzing the SYNAPSE (Note↔Note)
 //! subgraph using the Louvain algorithm. Each detected community of strongly
 //! connected notes becomes a candidate skill.
+use crate::neo4j::traits::*;
 
 use crate::graph::algorithms::{compute_cohesion, louvain_communities};
 use crate::graph::{AnalyticsConfig, CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType};

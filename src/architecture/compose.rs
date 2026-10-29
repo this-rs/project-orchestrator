@@ -12,6 +12,7 @@
 //!
 //! The manifest catalogue remains the fallback for projects that ship no compose
 //! file — most frontends, and libraries.
+use crate::neo4j::traits::*;
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -203,6 +204,7 @@ pub fn parse_compose(raw: &str) -> anyhow::Result<Vec<ComposedService>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     /// Shaped after the orchestrator's own compose file.
     const COMPOSE: &str = r#"

@@ -8,6 +8,7 @@
 //!
 //! V1 is entirely LLM-free — builds knowledge from git log + diff.
 //! V2 will add LLM-enriched summaries via ChatManager oneshot mode.
+use crate::neo4j::traits::*;
 
 use crate::neo4j::models::{CommitNode, FileChangedInfo};
 use crate::neo4j::traits::GraphStore;
@@ -644,6 +645,7 @@ impl TaskEnricher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_enrich_result_default() {

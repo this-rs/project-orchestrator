@@ -1,6 +1,7 @@
 //! Language-specific extractors for code parsing
 //!
 //! Each module implements extraction for a specific programming language.
+use crate::neo4j::traits::*;
 
 pub mod bash;
 pub mod c;

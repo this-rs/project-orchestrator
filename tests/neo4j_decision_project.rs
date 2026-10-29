@@ -10,6 +10,7 @@
 //!
 //! The test prints a notice and returns when no Neo4j is reachable;
 //! `HARNESS_NEO4J_REQUIRED=1` (set in CI) turns that into a failure.
+use project_orchestrator::neo4j::traits::*;
 
 use neo4rs::{query, Graph};
 use project_orchestrator::neo4j::client::Neo4jClient;

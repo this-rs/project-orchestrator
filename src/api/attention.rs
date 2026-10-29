@@ -19,6 +19,7 @@
 //! The shared fixtures live in `tests/fixtures/attention/*.json` and are
 //! byte-identical copies of the frontend's
 //! `src/services/__fixtures__/attention/*.json` (see `MANIFEST.sha256`).
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -566,6 +567,7 @@ pub fn contract_violations(r: &AttentionResponse) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use serde_json::{json, Value};
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;

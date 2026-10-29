@@ -1,4 +1,5 @@
 //! MCP Server Registry — manages connections to external MCP servers.
+use crate::neo4j::traits::*;
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -620,6 +621,7 @@ pub fn new_shared_registry() -> SharedRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_new_registry_is_empty() {

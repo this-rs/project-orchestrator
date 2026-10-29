@@ -1,6 +1,7 @@
 //! `GraphStore` implementation for `Neo4jClient`.
 //!
 //! Every method simply delegates to the corresponding inherent method on `Neo4jClient`.
+use crate::neo4j::traits::*;
 
 use async_trait::async_trait;
 use uuid::Uuid;

@@ -17,6 +17,7 @@
 //!   uncommitted changes (untracked files included), or commits that are neither in the base nor
 //!   on any remote-tracking branch (unpushed work), or when either cannot be verified. Such a
 //!   worktree and its branch are KEPT and the reason is returned; nothing committed is ever lost.
+use crate::neo4j::traits::*;
 
 use std::path::{Path, PathBuf};
 
@@ -340,6 +341,7 @@ impl EphemeralWorktree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     fn run(cwd: &Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")

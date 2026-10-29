@@ -6,6 +6,7 @@
 //! (so a tick that drifts or lands late misses no minute). A trigger due in one
 //! of those minutes goes to the `TriggerDispatcher` with that minute as its
 //! signal key: every instance reserves the same key, one run starts.
+use crate::neo4j::traits::*;
 
 use super::TriggerProvider;
 use crate::neo4j::traits::GraphStore;

@@ -8,6 +8,7 @@
 //!
 //! Each level can be triggered manually via the admin MCP tool or API,
 //! or automatically via an optional background timer.
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};

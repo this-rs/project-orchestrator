@@ -9,6 +9,7 @@
 //! Events from both local and remote sources (NATS) arrive via the local
 //! broadcast bus thanks to the NATS→local bridge in `HybridEmitter`.
 //! WS handlers only need to subscribe to the local bus.
+use crate::neo4j::traits::*;
 
 use super::handlers::OrchestratorState;
 use super::ws_auth::CookieAuthResult;
@@ -546,6 +547,7 @@ mod tests {
     use super::*;
     use crate::events::graph::{GraphEventType, GraphLayer};
     use crate::events::{CrudAction, EntityType};
+    use crate::neo4j::traits::*;
 
     // ================================================================
     // passes_filters (CRUD events)

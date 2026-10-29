@@ -7,6 +7,7 @@
 //! - Using directives (imports)
 //! - Namespace declarations
 //! - XML doc comments
+use crate::neo4j::traits::*;
 
 use crate::neo4j::models::*;
 use crate::parser::helpers::*;

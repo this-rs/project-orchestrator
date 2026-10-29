@@ -28,6 +28,7 @@
 //! child that needs work outside its envelope (another project of the workspace) sends a
 //! `dispatch_request` UP, and the parent opens it with ITS envelope. The envelope itself
 //! is never widened.
+use crate::neo4j::traits::*;
 
 use std::sync::{Arc, Weak};
 

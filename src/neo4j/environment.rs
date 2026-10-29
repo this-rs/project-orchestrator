@@ -8,6 +8,7 @@
 //! Timestamps are persisted as fixed-width RFC 3339 strings (microsecond precision,
 //! `Z` suffix) so that lexicographic `ORDER BY` is chronological. Optional strings
 //! follow the repo convention of "empty string means absent".
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use super::models::*;

@@ -8,6 +8,7 @@
 //! or content to the prompt.
 //!
 //! Controlled by `ENRICHMENT_MCP_FEDERATION` env var (default: true).
+use crate::neo4j::traits::*;
 
 use anyhow::Result;
 use tracing::debug;
@@ -149,6 +150,7 @@ mod tests {
         ConnectionStatus, McpServerConnection, McpServerRegistry, ServerStats,
     };
     use crate::mcp_federation::McpTransport;
+    use crate::neo4j::traits::*;
     use chrono::Utc;
     use serde_json::Value;
     use std::collections::HashSet;

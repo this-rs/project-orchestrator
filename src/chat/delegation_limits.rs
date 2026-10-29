@@ -15,6 +15,7 @@
 //!   that already has that many. Raising it takes effect on the very next delegation.
 //! - The compilation governor still bounds the real parallelism of builds; this number
 //!   bounds sessions, not CPU.
+use crate::neo4j::traits::*;
 
 use std::sync::atomic::Ordering;
 

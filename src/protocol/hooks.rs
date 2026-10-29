@@ -21,6 +21,7 @@
 //!
 //! Each protocol has a `last_triggered_at` timestamp. Auto-triggers are skipped
 //! if the protocol was triggered less than [`MIN_TRIGGER_INTERVAL_SECS`] seconds ago.
+use crate::neo4j::traits::*;
 
 use crate::chat::manager::ChatManager;
 use crate::events::EventEmitter;

@@ -1,6 +1,7 @@
 //! P5 End-to-End Integration Tests for the P2P pipeline.
 //!
 //! Tests the full cycle: identity -> distill -> anonymize -> envelope -> verify -> score -> replay -> anchor.
+use project_orchestrator::neo4j::traits::*;
 
 use std::collections::HashMap;
 

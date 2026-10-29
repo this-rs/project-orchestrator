@@ -1,4 +1,5 @@
 //! Neo4j Knowledge Note operations
+use crate::neo4j::traits::*;
 
 use super::client::{Neo4jClient, WhereBuilder, WhereParam};
 use super::models::DecisionNode;
@@ -3893,6 +3894,7 @@ impl Neo4jClient {
 
 #[cfg(test)]
 mod staleness_parity_tests {
+    use crate::neo4j::traits::*;
     use crate::notes::models::{Note, NoteType};
 
     /// Every note type's `WHEN 'x' THEN N` in the staleness Cypher must equal
@@ -3934,6 +3936,7 @@ mod staleness_parity_tests {
 #[cfg(test)]
 mod injection_tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     const PAYLOADS: &[&str] = &[
         "a' OR 1=1 //",
@@ -4012,6 +4015,7 @@ mod injection_tests {
 #[cfg(test)]
 mod synapse_param_tests {
     use super::synapse_bind_params;
+    use crate::neo4j::traits::*;
     use uuid::Uuid;
 
     #[test]
@@ -4036,6 +4040,7 @@ mod project_param_tests {
     //! string is a third state that reads back as `None` but that every
     //! `IS NULL` predicate misses, which is how 3 319 notes ended up stranded.
     use super::note_project_param;
+    use crate::neo4j::traits::*;
     use uuid::Uuid;
 
     #[test]

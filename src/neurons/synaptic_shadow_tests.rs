@@ -1,5 +1,6 @@
 //! Tests of the synaptic shadow layer. Every clock is injected (`now`
 //! parameters, paused tokio time): no test waits on the wall clock.
+use crate::neo4j::traits::*;
 
 use super::*;
 use crate::chat::anchor::{AnchorActor, AnchorOp, NewAnchor};

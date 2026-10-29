@@ -3,6 +3,7 @@
 //! Each spawned agent gets its own AgentExecution node, linked to both the PlanRun
 //! and the Task it executes. This enables per-agent vector collection and
 //! fine-grained historical analysis.
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use anyhow::Result;

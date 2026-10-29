@@ -8,6 +8,7 @@
 //! 3. **Persistence**: Write scores back to Neo4j via `AnalyticsWriter`
 //!
 //! The trait also enables mocking in downstream consumer tests.
+use crate::neo4j::traits::*;
 
 use crate::neo4j::GraphStore;
 use anyhow::Result;

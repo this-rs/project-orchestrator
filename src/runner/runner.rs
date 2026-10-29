@@ -2,6 +2,7 @@
 //!
 //! Orchestrates: get_next_task → spawn agent → monitor → verify → update_status → next.
 //! The Runner owns task status transitions — agents update step statuses in real-time via MCP.
+use crate::neo4j::traits::*;
 
 use crate::chat::manager::ChatManager;
 use crate::chat::provider::cognitive::signature::{ContextHints, TaskSignature};

@@ -18,6 +18,7 @@
 //! *publication* of knowledge, not reading). [`OpenInstanceRule`] says exactly
 //! that, and [`ScopeRule`] is the seam where a project/workspace rule will go
 //! without touching a caller.
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 
@@ -270,6 +271,7 @@ impl AccessPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const A: &str = "3adeffc9-c8b0-4e2f-a674-55bfcb293433";

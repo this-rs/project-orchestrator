@@ -3,6 +3,7 @@
 //! Detects the user's full PATH by spawning their login shell and reading `$PATH`.
 //! This is useful when the application is launched from macOS Dock or a desktop
 //! environment where the inherited PATH is minimal (`/usr/bin:/bin`).
+use crate::neo4j::traits::*;
 
 use tracing::{debug, warn};
 
@@ -116,6 +117,7 @@ fn find_shell() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[cfg(unix)]
     #[test]

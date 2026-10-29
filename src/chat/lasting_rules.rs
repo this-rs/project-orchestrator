@@ -32,6 +32,7 @@
 //!
 //! Lasting rules live on the machine of the instance that owns the session; another
 //! instance (NATS) has its own directory.
+use crate::neo4j::traits::*;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -434,6 +435,7 @@ pub async fn keep(
 #[cfg(unix)]
 mod safe {
     use super::*;
+    use crate::neo4j::traits::*;
     use std::fs::{File, OpenOptions};
     use std::io::Read;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -559,6 +561,7 @@ mod safe {
 #[cfg(not(unix))]
 mod safe {
     use super::*;
+    use crate::neo4j::traits::*;
 
     pub(super) fn dir_is_safe(_dir: &Path, _create: bool) -> Result<bool, StoreError> {
         Err(StoreError::Unsupported)
@@ -577,6 +580,7 @@ mod safe {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
 

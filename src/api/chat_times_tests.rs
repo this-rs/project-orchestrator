@@ -3,6 +3,7 @@
 //! `created_at` in seconds since the epoch with the milliseconds as the
 //! fraction. Each test fails if a path drops the field or rounds it to the
 //! second.
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 use std::time::Duration;

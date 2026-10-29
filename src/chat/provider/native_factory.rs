@@ -5,6 +5,7 @@
 //! and a resolver; the key is read per request (`read_for_provider` under a
 //! grant for that instance) and never kept. No fallback exists: a locked vault
 //! is `credentials_locked`, a missing grant `auth_required`.
+use crate::neo4j::traits::*;
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -656,6 +657,7 @@ impl nexus_claude::agent::AgentSession for KeyedSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     /// CTX6: a transcript root inside a git work tree is never written: the instance
     /// still builds, with its transcripts in memory.

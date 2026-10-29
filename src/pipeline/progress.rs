@@ -2,6 +2,7 @@
 //!
 //! Measures pipeline execution progress using metrics from quality gates.
 //! Calculates a normalized score \[0,1\] and detects stagnation.
+use crate::neo4j::traits::*;
 
 use std::collections::VecDeque;
 
@@ -326,6 +327,7 @@ impl ProgressOracle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
     use chrono::Utc;
 
     /// Helper: build a checkpoint with the given parameters.

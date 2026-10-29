@@ -1,4 +1,5 @@
 //! API handlers for Living Personas
+use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams};
@@ -1587,6 +1588,7 @@ pub async fn get_learning_health(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::traits::*;
 
     // ================================================================
     // Unit tests (deserialization / parsing)
