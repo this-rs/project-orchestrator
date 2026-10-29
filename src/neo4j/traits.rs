@@ -100,6 +100,8 @@ pub trait GraphStore:
     + ReleaseStore
     + NoteStore
     + AnalyticsStore
+    + AuthStore
+    + ChatStore
     + Send
     + Sync
 {
@@ -2278,510 +2280,6 @@ pub trait AnalyticsStore: Send + Sync {
     async fn get_all_synapse_weights(&self, project_id: Option<Uuid>) -> Result<Vec<f64>>;
 
     // ========================================================================
-    // Chat session operations
-    // ========================================================================
-
-    /// Create a new chat session
-    async fn create_chat_session(&self, session: &ChatSessionNode) -> Result<()>;
-
-    /// Get a chat session by ID
-    async fn get_chat_session(&self, id: Uuid) -> Result<Option<ChatSessionNode>>;
-
-    /// List chat sessions with optional project_slug filter and pagination
-    ///
-    /// Returns (sessions, total_count)
-    async fn list_chat_sessions(
-        &self,
-        project_slug: Option<&str>,
-        workspace_slug: Option<&str>,
-        limit: usize,
-        offset: usize,
-        include_detached: bool,
-    ) -> Result<(Vec<ChatSessionNode>, usize)>;
-
-    /// Get child sessions spawned by a parent session
-    async fn get_session_children(&self, parent_id: Uuid) -> Result<Vec<ChatSessionNode>>;
-
-    /// Create a SPAWNED_BY relation between two chat sessions
-    async fn create_spawned_by_relation(
-        &self,
-        child_session_id: &str,
-        parent_session_id: &str,
-        spawn_type: &str,
-        run_id: Option<Uuid>,
-        task_id: Option<Uuid>,
-    ) -> Result<()>;
-
-    /// Get the full session tree rooted at a session (recursive SPAWNED_BY traversal, max 10 levels)
-    async fn get_session_tree(&self, session_id: &str) -> Result<Vec<SessionTreeNode>>;
-
-    /// Follow SPAWNED_BY upward to find the root session
-    async fn get_session_root(&self, session_id: &str) -> Result<Option<String>>;
-
-    /// Link a runner-spawned session to its PlanRun:
-    /// `(:ChatSession)-[:SPAWNED_BY_RUN {run_id, plan_id, task_id}]->(:PlanRun)`.
-    /// Idempotent (MERGE). A runner has no parent session, so the parent-based
-    /// `SPAWNED_BY` relation cannot be used (and pointing it at a PlanRun
-    /// would break `get_session_root`). Returns `false` when the session or
-    /// the run does not exist (nothing linked).
-    async fn link_session_to_run(
-        &self,
-        session_id: &str,
-        run_id: Uuid,
-        plan_id: Option<Uuid>,
-        task_id: Option<Uuid>,
-    ) -> Result<bool>;
-
-    /// Stored links (run relation, task / plan association) of many sessions,
-    /// in ONE grouped query whatever the number of sessions.
-    async fn get_session_link_rows(&self, session_ids: &[Uuid]) -> Result<Vec<SessionLinkRow>>;
-
-    /// Tasks + dependency edges of many plans in ONE grouped read.
-    async fn get_plans_task_graph(&self, plan_ids: &[Uuid]) -> Result<PlansTaskGraph>;
-
-    /// Every project with its workspace, in ONE read (project -> lane map).
-    async fn list_project_workspace_rows(&self) -> Result<Vec<ProjectWorkspaceRow>>;
-
-    /// Get all sessions for a PlanRun via SPAWNED_BY relation metadata
-    async fn get_run_sessions(&self, run_id: Uuid) -> Result<Vec<SessionInfo>>;
-
-    /// Update a chat session (partial update, None fields are skipped)
-    #[allow(clippy::too_many_arguments)]
-    async fn update_chat_session(
-        &self,
-        id: Uuid,
-        cli_session_id: Option<String>,
-        title: Option<String>,
-        message_count: Option<i64>,
-        total_cost_usd: Option<f64>,
-        conversation_id: Option<String>,
-        preview: Option<String>,
-    ) -> Result<Option<ChatSessionNode>>;
-
-    /// Update the permission_mode field on a chat session node
-    async fn update_chat_session_permission_mode(&self, id: Uuid, mode: &str) -> Result<()>;
-
-    /// Bind the project a session actually works on, when the node carries none.
-    ///
-    /// Returns `true` when it was written. Never overwrites an existing slug: the
-    /// explicit `project_slug` of a session, or one already bound before, wins.
-    async fn bind_chat_session_project(&self, id: Uuid, project_slug: &str) -> Result<bool>;
-
-    /// Adds `delta_usd` to the spend of the CHILDREN of a session (sub-agents of the `Agent`
-    /// tool, PYSR-3) and returns the new children total. Kept APART from `total_cost_usd`, which
-    /// stays the session's OWN cost: the routing decision of the parent is closed on its own
-    /// cost only, the child's cost being carried by the child's own decision (AUTO-SUB).
-    async fn add_chat_session_children_cost(&self, id: Uuid, delta_usd: f64) -> Result<f64>;
-
-    /// The spend of the children of a session (`0.0` when none was recorded).
-    async fn get_chat_session_children_cost(&self, id: Uuid) -> Result<f64>;
-
-    /// Record whether a PERSON lifted the session's file scope (decision fce98b8a):
-    /// [`ChatSessionNode::file_scope_lifted`].
-    async fn update_chat_session_file_scope_lifted(&self, id: Uuid, lifted: bool) -> Result<()>;
-
-    /// Update the model field on a chat session node (so a mid-session model switch
-    /// survives idle-cleanup and is honored on resume/respawn)
-    async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()>;
-
-    /// Records the resume fingerprint of a session (JSON of `ResumeFingerprint`): the MCP
-    /// servers it was opened with (PYSR-2). Written at each opening and each in-place
-    /// provider switch, so it always describes the servers the session last ran with.
-    async fn set_chat_session_fingerprint(&self, id: Uuid, fingerprint: &str) -> Result<()>;
-
-    /// The resume fingerprint recorded for a session; `None` for a session opened before
-    /// PYSR-2 (never refused) or when nothing was recorded.
-    async fn get_chat_session_fingerprint(&self, id: Uuid) -> Result<Option<String>>;
-
-    /// Replace the routing of ONE conversation (`PUT /api/chat/sessions/{id}/routing`):
-    /// mode, pool (JSON) and `routed_by`, `None` = cleared. Additive properties, read
-    /// with defaults. `false` when the session does not exist.
-    async fn update_chat_session_routing(
-        &self,
-        id: Uuid,
-        routing_mode: Option<&str>,
-        routing_pool: Option<&str>,
-        routed_by: Option<&str>,
-    ) -> Result<bool>;
-
-    /// Re-target a chat session IN PLACE to another provider (B-SW phase 1): set
-    /// `provider_id`, `model`, `routed_by` and `engine`, and clear the provider-specific
-    /// fields that do not survive a move across provider families (`resume_token`,
-    /// `capabilities`, `cli_session_id`). `engine` names the engine the target runs on
-    /// (`agent` or `legacy`), so a later resume routes on the SAME branch the switch
-    /// reopened with. `false` when the session does not exist.
-    async fn update_chat_session_provider(
-        &self,
-        id: Uuid,
-        provider_id: &str,
-        model: &str,
-        routed_by: &str,
-        engine: &str,
-    ) -> Result<bool>;
-
-    /// Restore the provider fields of a chat session after a FAILED in-place re-target:
-    /// `provider_id` is `provider_id` (the resolved id it was on), while `model`, `routed_by`
-    /// and the provider-specific state [`Self::update_chat_session_provider`] cleared
-    /// (`resume_token`, `capabilities`, `cli_session_id`, `engine`) come back from `node`
-    /// (the session as it was before the re-target). `false` when the session does not exist.
-    async fn restore_chat_session_provider(
-        &self,
-        node: &ChatSessionNode,
-        provider_id: &str,
-    ) -> Result<bool>;
-
-    /// Settings of the provider harness (instances, consents, roles, aliases,
-    /// policy), one JSON document per (scope, key). Scope is `global` or
-    /// `project:<slug>`.
-    async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>>;
-    /// Creates or replaces a setting document.
-    async fn put_llm_setting(&self, scope: &str, key: &str, value: &str) -> Result<()>;
-    /// Deletes a setting document; `true` when it existed.
-    async fn delete_llm_setting(&self, scope: &str, key: &str) -> Result<bool>;
-    /// All documents of a scope whose key starts with `prefix`, as (key, value).
-    async fn list_llm_settings(&self, scope: &str, prefix: &str) -> Result<Vec<(String, String)>>;
-
-    /// Record what the provider reported at open: the frozen capability
-    /// snapshot (JSON) and the resume token (wire form). `None` leaves a field as is.
-    async fn update_chat_session_harness(
-        &self,
-        id: Uuid,
-        capabilities: Option<&str>,
-        resume_token: Option<&str>,
-    ) -> Result<()>;
-
-    /// Records that the session's shell may have left its project root (a command that is
-    /// not one plain read-only command ran: `chat::session_grants::SessionGrants::observe_tool_use`).
-    /// Never cleared: a resumed session keeps it, so its lasting rules still do not cover a
-    /// command there.
-    async fn set_chat_session_shell_moved(&self, id: Uuid) -> Result<()>;
-
-    /// Whether the session's shell may have left its project root: `Some(false)` for a
-    /// session created since the flag exists and whose shell never moved, `None` when the
-    /// flag was never written (a session created before it existed, or no such session).
-    async fn get_chat_session_shell_moved(&self, id: Uuid) -> Result<Option<bool>>;
-
-    /// Backfill title and preview for sessions that don't have them yet
-    async fn backfill_chat_session_previews(&self) -> Result<usize>;
-
-    /// Delete a chat session
-    async fn delete_chat_session(&self, id: Uuid) -> Result<bool>;
-
-    // ------------------------------------------------------------------
-    // Chat anchors (typed context anchors of a conversation). See
-    // `crate::chat::anchor` for the model and the rules. Rule violations are
-    // `AnchorError`s inside the `anyhow::Error` (`err.downcast_ref::<AnchorError>()`).
-    // ------------------------------------------------------------------
-
-    /// Apply one operation to the anchors of `session_id`: the rules of
-    /// `crate::chat::anchor::apply_op`, the new state and its journal entry
-    /// written in ONE transaction. Fails with `SessionNotFound` if the
-    /// session does not exist.
-    async fn apply_anchor_op(
-        &self,
-        session_id: Uuid,
-        op: crate::chat::anchor::AnchorOp,
-    ) -> Result<crate::chat::anchor::AnchorChange> {
-        Ok(self.apply_anchor_op_if(session_id, op, None).await?.change)
-    }
-
-    /// [`Self::apply_anchor_op`] with an optimistic check on the whole anchor
-    /// set: when `if_match` is `Some(v)` and the set of the session is no longer
-    /// at version `v`, nothing is written and the error is
-    /// `AnchorError::SetVersionConflict`. The check and the write happen in the
-    /// same transaction, under the session's lock. Returns the version of the
-    /// set after the operation.
-    async fn apply_anchor_op_if(
-        &self,
-        session_id: Uuid,
-        op: crate::chat::anchor::AnchorOp,
-        if_match: Option<u64>,
-    ) -> Result<crate::chat::anchor::AnchorSetChange>;
-
-    /// The anchors of a session (oldest first) and the version of the set, read
-    /// together. `None` when the session does not exist.
-    async fn get_anchor_set(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Option<crate::chat::anchor::AnchorSet>>;
-
-    /// Anchor a session on an entity (idempotent for a role set already held).
-    async fn add_anchor(
-        &self,
-        session_id: Uuid,
-        new: crate::chat::anchor::NewAnchor,
-    ) -> Result<crate::chat::anchor::Anchor> {
-        Ok(self
-            .apply_anchor_op(session_id, crate::chat::anchor::AnchorOp::Add(new))
-            .await?
-            .anchor)
-    }
-
-    /// Give an anchor one more role (optimistic `expected_version`).
-    async fn promote_anchor_role(
-        &self,
-        session_id: Uuid,
-        anchor_id: Uuid,
-        role: crate::chat::anchor::AnchorRole,
-        expected_version: u64,
-        by: crate::chat::anchor::AnchorActor,
-        actor: &str,
-    ) -> Result<crate::chat::anchor::Anchor> {
-        Ok(self
-            .apply_anchor_op(
-                session_id,
-                crate::chat::anchor::AnchorOp::Promote {
-                    anchor_id,
-                    role,
-                    expected_version,
-                    by,
-                    actor: actor.to_string(),
-                },
-            )
-            .await?
-            .anchor)
-    }
-
-    /// Take one role away from an anchor (optimistic `expected_version`).
-    async fn demote_anchor_role(
-        &self,
-        session_id: Uuid,
-        anchor_id: Uuid,
-        role: crate::chat::anchor::AnchorRole,
-        expected_version: u64,
-        by: crate::chat::anchor::AnchorActor,
-        actor: &str,
-    ) -> Result<crate::chat::anchor::Anchor> {
-        Ok(self
-            .apply_anchor_op(
-                session_id,
-                crate::chat::anchor::AnchorOp::Demote {
-                    anchor_id,
-                    role,
-                    expected_version,
-                    by,
-                    actor: actor.to_string(),
-                },
-            )
-            .await?
-            .anchor)
-    }
-
-    /// Remove an anchor (never the origin one). The target is left alone.
-    async fn remove_anchor(
-        &self,
-        session_id: Uuid,
-        anchor_id: Uuid,
-        expected_version: u64,
-        by: crate::chat::anchor::AnchorActor,
-        actor: &str,
-    ) -> Result<()> {
-        self.apply_anchor_op(
-            session_id,
-            crate::chat::anchor::AnchorOp::Remove {
-                anchor_id,
-                expected_version,
-                by,
-                actor: actor.to_string(),
-            },
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// Move an anchor to another state (live -> moved -> dangling ...).
-    /// `expected_version = None` skips the optimistic check (system transitions).
-    async fn set_anchor_state(
-        &self,
-        session_id: Uuid,
-        anchor_id: Uuid,
-        state: crate::chat::anchor::AnchorState,
-        expected_version: Option<u64>,
-        by: crate::chat::anchor::AnchorActor,
-        actor: &str,
-    ) -> Result<crate::chat::anchor::Anchor> {
-        Ok(self
-            .apply_anchor_op(
-                session_id,
-                crate::chat::anchor::AnchorOp::SetState {
-                    anchor_id,
-                    state,
-                    expected_version,
-                    by,
-                    actor: actor.to_string(),
-                },
-            )
-            .await?
-            .anchor)
-    }
-
-    /// All anchors of a session, oldest first.
-    async fn list_session_anchors(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Vec<crate::chat::anchor::Anchor>>;
-
-    /// Reverse query: the anchors (hence the sessions) on one entity, ordered
-    /// by anchor id, keyset-paginated (`cursor` = `next_cursor` of the previous page).
-    async fn list_sessions_for_target(
-        &self,
-        target_type: crate::chat::anchor::AnchorTargetType,
-        target_id: &str,
-        state: Option<crate::chat::anchor::AnchorState>,
-        limit: usize,
-        cursor: Option<&str>,
-    ) -> Result<crate::chat::anchor::AnchorPage>;
-
-    /// The journal of a session, oldest first.
-    async fn list_anchor_events(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Vec<crate::chat::anchor::AnchorEvent>>;
-
-    /// Append one entry to the execution-place audit (T5). Never updates an entry.
-    async fn create_execution_place_event(
-        &self,
-        event: &crate::neo4j::models::ExecutionPlaceEvent,
-    ) -> Result<()>;
-
-    /// The execution-place audit of a task, oldest first.
-    async fn list_execution_place_events(
-        &self,
-        task_id: Uuid,
-    ) -> Result<Vec<crate::neo4j::models::ExecutionPlaceEvent>>;
-
-    /// Mark every anchor on a (deleted/archived) target `dangling`, with a
-    /// journal entry each. Returns how many changed. Not wired to entity
-    /// deletion yet. Anchors are never deleted by this.
-    async fn mark_anchors_dangling(
-        &self,
-        target_type: crate::chat::anchor::AnchorTargetType,
-        target_id: &str,
-    ) -> Result<usize>;
-
-    /// Migration (never run at startup): one inferred `project` anchor (focus,
-    /// by system, confidence 1.0) per session whose `project_slug` resolves to
-    /// exactly one project. Idempotent.
-    async fn backfill_project_anchors(&self) -> Result<crate::chat::anchor::BackfillReport>;
-
-    /// Migration (never run at startup): writes the `(:ChatSession)-[:SPAWNED_BY]->(:ChatSession)`
-    /// edge for every session whose `spawned_by` JSON names a parent session
-    /// and that has no such edge yet (sessions created before the edge existed).
-    /// Idempotent: a second run creates nothing. Returns the edges written.
-    async fn backfill_spawned_by_edges(&self) -> Result<usize>;
-
-    /// Inverse of the backfill: deletes only the anchors it created and nobody
-    /// modified since (inferred, by system, added by the migration, version 1),
-    /// with their journal entries. Returns how many.
-    async fn revert_inferred_anchors(&self) -> Result<usize>;
-
-    // ========================================================================
-    // Chat event operations (WebSocket replay & persistence)
-    // ========================================================================
-
-    /// Store a batch of chat events for a session
-    async fn store_chat_events(&self, session_id: Uuid, events: Vec<ChatEventRecord>)
-        -> Result<()>;
-
-    /// Get chat events for a session after a given sequence number (for replay)
-    async fn get_chat_events(
-        &self,
-        session_id: Uuid,
-        after_seq: i64,
-        limit: i64,
-    ) -> Result<Vec<ChatEventRecord>>;
-
-    /// Get chat events for a session with offset-based pagination (for REST/MCP).
-    async fn get_chat_events_paginated(
-        &self,
-        session_id: Uuid,
-        offset: i64,
-        limit: i64,
-    ) -> Result<Vec<ChatEventRecord>>;
-
-    /// Count total chat events for a session.
-    async fn count_chat_events(&self, session_id: Uuid) -> Result<i64>;
-
-    /// Grouped read for the attention derivation: the events needed to decide
-    /// what is still pending, for ALL the given sessions in ONE query (never
-    /// one query per session).
-    ///
-    /// Returns, ordered by `(session_id, seq)`: `permission_request`,
-    /// `permission_decision`, `ask_user_question` (full payload) and
-    /// `user_message` (payload blanked: only its `seq` matters here) and
-    /// `session_error` (the CLI died).
-    /// `input_request` is deliberately NOT read: it is a dead type, never
-    /// emitted in production, and counting it would invent phantom requests.
-    async fn get_attention_events(&self, session_ids: &[Uuid]) -> Result<Vec<ChatEventRecord>>;
-
-    /// Get the latest sequence number for a session (0 if no events)
-    async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> Result<i64>;
-
-    /// Delete all chat events for a session
-    async fn delete_chat_events(&self, session_id: Uuid) -> Result<()>;
-
-    // ========================================================================
-    // Chat DISCUSSED relations (ChatSession → Entity)
-    // ========================================================================
-
-    /// Add DISCUSSED relations between a chat session and entities (MERGE-based, idempotent).
-    /// Each entity is `(entity_type, entity_id)`.
-    async fn add_discussed(&self, session_id: Uuid, entities: &[(String, String)])
-        -> Result<usize>;
-
-    /// Get all entities discussed in a chat session, optionally scoped by project_id.
-    async fn get_session_entities(
-        &self,
-        session_id: Uuid,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<DiscussedEntity>>;
-
-    /// WorldModel predictive context (biomimicry T7):
-    /// Get co-changers of files discussed in the last N sessions.
-    async fn get_discussed_co_changers(
-        &self,
-        project_id: Uuid,
-        max_sessions: i64,
-        max_results: i64,
-    ) -> Result<Vec<CoChanger>>;
-
-    /// Backfill DISCUSSED relations on all existing sessions.
-    /// Returns `(sessions_processed, entities_found, relations_created)`.
-    async fn backfill_discussed(&self) -> Result<(usize, usize, usize)>;
-
-    // ========================================================================
-    // Chat ↔ Plan/Task/RFC linking (ASSOCIATED_WITH relation)
-    // ========================================================================
-
-    /// Create an ASSOCIATED_WITH relation between a ChatSession and a Task or Plan.
-    /// Uses MERGE for idempotence. `entity_type` must be "Task" or "Plan".
-    async fn create_associated_with(
-        &self,
-        session_id: Uuid,
-        entity_type: &str,
-        entity_id: Uuid,
-        source: &str,
-    ) -> Result<bool>;
-
-    /// Get all linked plans, tasks, and RFCs for a chat session (dual-path query).
-    async fn get_session_links(&self, session_id: Uuid) -> Result<LinkedSessionInfo>;
-
-    /// Get all chat sessions linked to a plan (via AgentExecution + ASSOCIATED_WITH).
-    async fn get_sessions_for_plan(&self, plan_id: Uuid) -> Result<Vec<SessionWithLinks>>;
-
-    /// Get all chat sessions linked to a specific task.
-    async fn get_sessions_for_task(&self, task_id: Uuid) -> Result<Vec<SessionWithLinks>>;
-
-    /// Batch get linked session info for multiple sessions (avoids N+1).
-    async fn get_session_links_batch(
-        &self,
-        session_ids: &[Uuid],
-    ) -> Result<std::collections::HashMap<Uuid, LinkedSessionInfo>>;
-
-    /// Get the plan_id for a task (via HAS_TASK relation).
-    async fn get_task_plan_id(&self, task_id: Uuid) -> Result<Option<Uuid>>;
-
-    // ========================================================================
     // Graph visualization queries (PM + Chat layers)
     // ========================================================================
 
@@ -2803,103 +2301,6 @@ pub trait AnalyticsStore: Send + Sync {
         project_id: Uuid,
         limit: usize,
     ) -> Result<(Vec<ChatGraphSession>, Vec<ChatGraphDiscussed>)>;
-
-    // ========================================================================
-    // User / Auth operations
-    // ========================================================================
-
-    /// Upsert a user (create or update). Returns the resulting UserNode.
-    ///
-    /// For OIDC users: MERGE on (auth_provider + external_id).
-    /// For password users: MERGE on (auth_provider + email).
-    async fn upsert_user(&self, user: &UserNode) -> Result<UserNode>;
-
-    /// Get a user by internal ID
-    async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserNode>>;
-
-    /// Get a user by provider and external ID (for OIDC lookups)
-    async fn get_user_by_provider_id(
-        &self,
-        provider: &str,
-        external_id: &str,
-    ) -> Result<Option<UserNode>>;
-
-    /// Get a user by email and auth provider
-    async fn get_user_by_email_and_provider(
-        &self,
-        email: &str,
-        provider: &str,
-    ) -> Result<Option<UserNode>>;
-
-    /// Get a user by email (any provider)
-    async fn get_user_by_email(&self, email: &str) -> Result<Option<UserNode>>;
-
-    /// Create a password-authenticated user
-    async fn create_password_user(
-        &self,
-        email: &str,
-        name: &str,
-        password_hash: &str,
-    ) -> Result<UserNode>;
-
-    /// List all users
-    async fn list_users(&self) -> Result<Vec<UserNode>>;
-
-    // ================================================================
-    // Refresh Tokens
-    // ================================================================
-
-    /// Store a new refresh token (hashed) linked to a user.
-    async fn create_refresh_token(
-        &self,
-        user_id: Uuid,
-        token_hash: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<()>;
-
-    /// Validate a refresh token by its hash. Returns the token if valid
-    /// (not expired, not revoked).
-    async fn validate_refresh_token(
-        &self,
-        token_hash: &str,
-    ) -> Result<Option<crate::neo4j::models::RefreshTokenNode>>;
-
-    /// Revoke a single refresh token by its hash.
-    async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool>;
-
-    /// Revoke all refresh tokens for a given user (e.g. on password change).
-    async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64>;
-
-    // ================================================================
-    // MCP Tokens (long-lived, revocable, scoped — remote MCP transport)
-    // ================================================================
-
-    /// Record a newly issued MCP token (keyed by its JWT `jti` claim).
-    async fn create_mcp_token(
-        &self,
-        user_id: Uuid,
-        jti: &str,
-        label: &str,
-        scope: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<()>;
-
-    /// Check whether an MCP token (by `jti`) exists, is not revoked, and is
-    /// not expired.
-    async fn is_mcp_token_active(&self, jti: &str) -> Result<bool>;
-
-    /// Revoke a single MCP token by `jti` (scoped to its owning user).
-    async fn revoke_mcp_token(&self, user_id: Uuid, jti: &str) -> Result<bool>;
-
-    /// List all MCP tokens for a user (inventory; includes revoked/expired).
-    async fn list_mcp_tokens(
-        &self,
-        user_id: Uuid,
-    ) -> Result<Vec<crate::neo4j::models::McpTokenNode>>;
-
-    /// Permanently remove a user's dead MCP token records (revoked or
-    /// expired). Never removes an active token. Returns the count removed.
-    async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64>;
 
     // ================================================================
     // Feature Graphs
@@ -4415,52 +3816,6 @@ pub trait AnalyticsStore: Send + Sync {
     async fn get_works_on(&self, user_id: &str) -> Result<Vec<crate::profile::WorksOnRelation>>;
 
     // ========================================================================
-    // Session episodes (the episode a chat session leaves at its close)
-    // ========================================================================
-
-    /// Store the episode of a chat session, `episode.session` naming it. One per
-    /// session: a later close of the same session (after a resume) replaces it.
-    /// Written only while the session exists, in one statement, so a session deleted
-    /// meanwhile never gets an orphan episode. `Ok(false)`: the session is gone, or
-    /// the episode names no session.
-    async fn save_session_episode(
-        &self,
-        episode: &crate::episodes::models::Episode,
-    ) -> Result<bool>;
-
-    /// The session episodes of a project, most recent close first.
-    async fn list_session_episodes(
-        &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> Result<Vec<crate::episodes::models::Episode>>;
-
-    /// The root the agent ids are derived from (`crate::notes::provenance`): created on the
-    /// first call, atomically, and the same on every call after — two first calls at
-    /// once still agree on one root.
-    async fn agent_identity_namespace(&self) -> Result<Uuid>;
-
-    // ========================================================================
-    // Episode embedding search (ReflexEngine)
-    // ========================================================================
-
-    /// Search episodes by embedding similarity (cosine).
-    ///
-    /// Returns up to `limit` episodes with their cosine similarity score (0.0-1.0).
-    /// Used by the ReflexEngine for episode recall suggestions.
-    ///
-    /// Default implementation returns an empty vec (graceful fallback for
-    /// implementations that don't support embedding search yet).
-    async fn search_episodes_by_embedding(
-        &self,
-        _project_id: Uuid,
-        _embedding: &[f32],
-        _limit: usize,
-    ) -> Result<Vec<(crate::episodes::models::Episode, f64)>> {
-        Ok(Vec::new())
-    }
-
-    // ========================================================================
     // Alert operations (Heartbeat Engine)
     // ========================================================================
 
@@ -4648,6 +4003,670 @@ pub trait AnalyticsStore: Send + Sync {
         params: &crate::graph::neighborhood::NeighborhoodParams,
         filter: &crate::graph::neighborhood::ProjectFilter,
     ) -> Result<Option<crate::graph::neighborhood::ScopedNeighborhood>>;
+}
+
+// ============================================================================
+// Chat domain
+// ============================================================================
+
+/// The chat domain: sessions, their anchors, the event log replayed over the
+/// websocket, the entities a conversation discussed, and what it is linked to.
+#[async_trait]
+pub trait ChatStore: Send + Sync {
+    // ========================================================================
+    // Chat session operations
+    // ========================================================================
+
+    /// Create a new chat session
+    async fn create_chat_session(&self, session: &ChatSessionNode) -> Result<()>;
+
+    /// Get a chat session by ID
+    async fn get_chat_session(&self, id: Uuid) -> Result<Option<ChatSessionNode>>;
+
+    /// List chat sessions with optional project_slug filter and pagination
+    ///
+    /// Returns (sessions, total_count)
+    async fn list_chat_sessions(
+        &self,
+        project_slug: Option<&str>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+        include_detached: bool,
+    ) -> Result<(Vec<ChatSessionNode>, usize)>;
+
+    /// Get child sessions spawned by a parent session
+    async fn get_session_children(&self, parent_id: Uuid) -> Result<Vec<ChatSessionNode>>;
+
+    /// Create a SPAWNED_BY relation between two chat sessions
+    async fn create_spawned_by_relation(
+        &self,
+        child_session_id: &str,
+        parent_session_id: &str,
+        spawn_type: &str,
+        run_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> Result<()>;
+
+    /// Get the full session tree rooted at a session (recursive SPAWNED_BY traversal, max 10 levels)
+    async fn get_session_tree(&self, session_id: &str) -> Result<Vec<SessionTreeNode>>;
+
+    /// Follow SPAWNED_BY upward to find the root session
+    async fn get_session_root(&self, session_id: &str) -> Result<Option<String>>;
+
+    /// Link a runner-spawned session to its PlanRun:
+    /// `(:ChatSession)-[:SPAWNED_BY_RUN {run_id, plan_id, task_id}]->(:PlanRun)`.
+    /// Idempotent (MERGE). A runner has no parent session, so the parent-based
+    /// `SPAWNED_BY` relation cannot be used (and pointing it at a PlanRun
+    /// would break `get_session_root`). Returns `false` when the session or
+    /// the run does not exist (nothing linked).
+    async fn link_session_to_run(
+        &self,
+        session_id: &str,
+        run_id: Uuid,
+        plan_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> Result<bool>;
+
+    /// Stored links (run relation, task / plan association) of many sessions,
+    /// in ONE grouped query whatever the number of sessions.
+    async fn get_session_link_rows(&self, session_ids: &[Uuid]) -> Result<Vec<SessionLinkRow>>;
+
+    /// Tasks + dependency edges of many plans in ONE grouped read.
+    async fn get_plans_task_graph(&self, plan_ids: &[Uuid]) -> Result<PlansTaskGraph>;
+
+    /// Every project with its workspace, in ONE read (project -> lane map).
+    async fn list_project_workspace_rows(&self) -> Result<Vec<ProjectWorkspaceRow>>;
+
+    /// Get all sessions for a PlanRun via SPAWNED_BY relation metadata
+    async fn get_run_sessions(&self, run_id: Uuid) -> Result<Vec<SessionInfo>>;
+
+    /// Update a chat session (partial update, None fields are skipped)
+    #[allow(clippy::too_many_arguments)]
+    async fn update_chat_session(
+        &self,
+        id: Uuid,
+        cli_session_id: Option<String>,
+        title: Option<String>,
+        message_count: Option<i64>,
+        total_cost_usd: Option<f64>,
+        conversation_id: Option<String>,
+        preview: Option<String>,
+    ) -> Result<Option<ChatSessionNode>>;
+
+    /// Update the permission_mode field on a chat session node
+    async fn update_chat_session_permission_mode(&self, id: Uuid, mode: &str) -> Result<()>;
+
+    /// Bind the project a session actually works on, when the node carries none.
+    ///
+    /// Returns `true` when it was written. Never overwrites an existing slug: the
+    /// explicit `project_slug` of a session, or one already bound before, wins.
+    async fn bind_chat_session_project(&self, id: Uuid, project_slug: &str) -> Result<bool>;
+
+    /// Adds `delta_usd` to the spend of the CHILDREN of a session (sub-agents of the `Agent`
+    /// tool, PYSR-3) and returns the new children total. Kept APART from `total_cost_usd`, which
+    /// stays the session's OWN cost: the routing decision of the parent is closed on its own
+    /// cost only, the child's cost being carried by the child's own decision (AUTO-SUB).
+    async fn add_chat_session_children_cost(&self, id: Uuid, delta_usd: f64) -> Result<f64>;
+
+    /// The spend of the children of a session (`0.0` when none was recorded).
+    async fn get_chat_session_children_cost(&self, id: Uuid) -> Result<f64>;
+
+    /// Record whether a PERSON lifted the session's file scope (decision fce98b8a):
+    /// [`ChatSessionNode::file_scope_lifted`].
+    async fn update_chat_session_file_scope_lifted(&self, id: Uuid, lifted: bool) -> Result<()>;
+
+    /// Update the model field on a chat session node (so a mid-session model switch
+    /// survives idle-cleanup and is honored on resume/respawn)
+    async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()>;
+
+    /// Records the resume fingerprint of a session (JSON of `ResumeFingerprint`): the MCP
+    /// servers it was opened with (PYSR-2). Written at each opening and each in-place
+    /// provider switch, so it always describes the servers the session last ran with.
+    async fn set_chat_session_fingerprint(&self, id: Uuid, fingerprint: &str) -> Result<()>;
+
+    /// The resume fingerprint recorded for a session; `None` for a session opened before
+    /// PYSR-2 (never refused) or when nothing was recorded.
+    async fn get_chat_session_fingerprint(&self, id: Uuid) -> Result<Option<String>>;
+
+    /// Replace the routing of ONE conversation (`PUT /api/chat/sessions/{id}/routing`):
+    /// mode, pool (JSON) and `routed_by`, `None` = cleared. Additive properties, read
+    /// with defaults. `false` when the session does not exist.
+    async fn update_chat_session_routing(
+        &self,
+        id: Uuid,
+        routing_mode: Option<&str>,
+        routing_pool: Option<&str>,
+        routed_by: Option<&str>,
+    ) -> Result<bool>;
+
+    /// Re-target a chat session IN PLACE to another provider (B-SW phase 1): set
+    /// `provider_id`, `model`, `routed_by` and `engine`, and clear the provider-specific
+    /// fields that do not survive a move across provider families (`resume_token`,
+    /// `capabilities`, `cli_session_id`). `engine` names the engine the target runs on
+    /// (`agent` or `legacy`), so a later resume routes on the SAME branch the switch
+    /// reopened with. `false` when the session does not exist.
+    async fn update_chat_session_provider(
+        &self,
+        id: Uuid,
+        provider_id: &str,
+        model: &str,
+        routed_by: &str,
+        engine: &str,
+    ) -> Result<bool>;
+
+    /// Restore the provider fields of a chat session after a FAILED in-place re-target:
+    /// `provider_id` is `provider_id` (the resolved id it was on), while `model`, `routed_by`
+    /// and the provider-specific state [`Self::update_chat_session_provider`] cleared
+    /// (`resume_token`, `capabilities`, `cli_session_id`, `engine`) come back from `node`
+    /// (the session as it was before the re-target). `false` when the session does not exist.
+    async fn restore_chat_session_provider(
+        &self,
+        node: &ChatSessionNode,
+        provider_id: &str,
+    ) -> Result<bool>;
+
+    /// Settings of the provider harness (instances, consents, roles, aliases,
+    /// policy), one JSON document per (scope, key). Scope is `global` or
+    /// `project:<slug>`.
+    async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>>;
+    /// Creates or replaces a setting document.
+    async fn put_llm_setting(&self, scope: &str, key: &str, value: &str) -> Result<()>;
+    /// Deletes a setting document; `true` when it existed.
+    async fn delete_llm_setting(&self, scope: &str, key: &str) -> Result<bool>;
+    /// All documents of a scope whose key starts with `prefix`, as (key, value).
+    async fn list_llm_settings(&self, scope: &str, prefix: &str) -> Result<Vec<(String, String)>>;
+
+    /// Record what the provider reported at open: the frozen capability
+    /// snapshot (JSON) and the resume token (wire form). `None` leaves a field as is.
+    async fn update_chat_session_harness(
+        &self,
+        id: Uuid,
+        capabilities: Option<&str>,
+        resume_token: Option<&str>,
+    ) -> Result<()>;
+
+    /// Records that the session's shell may have left its project root (a command that is
+    /// not one plain read-only command ran: `chat::session_grants::SessionGrants::observe_tool_use`).
+    /// Never cleared: a resumed session keeps it, so its lasting rules still do not cover a
+    /// command there.
+    async fn set_chat_session_shell_moved(&self, id: Uuid) -> Result<()>;
+
+    /// Whether the session's shell may have left its project root: `Some(false)` for a
+    /// session created since the flag exists and whose shell never moved, `None` when the
+    /// flag was never written (a session created before it existed, or no such session).
+    async fn get_chat_session_shell_moved(&self, id: Uuid) -> Result<Option<bool>>;
+
+    /// Backfill title and preview for sessions that don't have them yet
+    async fn backfill_chat_session_previews(&self) -> Result<usize>;
+
+    /// Delete a chat session
+    async fn delete_chat_session(&self, id: Uuid) -> Result<bool>;
+
+    // ------------------------------------------------------------------
+    // Chat anchors (typed context anchors of a conversation). See
+    // `crate::chat::anchor` for the model and the rules. Rule violations are
+    // `AnchorError`s inside the `anyhow::Error` (`err.downcast_ref::<AnchorError>()`).
+    // ------------------------------------------------------------------
+
+    /// Apply one operation to the anchors of `session_id`: the rules of
+    /// `crate::chat::anchor::apply_op`, the new state and its journal entry
+    /// written in ONE transaction. Fails with `SessionNotFound` if the
+    /// session does not exist.
+    async fn apply_anchor_op(
+        &self,
+        session_id: Uuid,
+        op: crate::chat::anchor::AnchorOp,
+    ) -> Result<crate::chat::anchor::AnchorChange> {
+        Ok(self.apply_anchor_op_if(session_id, op, None).await?.change)
+    }
+
+    /// [`Self::apply_anchor_op`] with an optimistic check on the whole anchor
+    /// set: when `if_match` is `Some(v)` and the set of the session is no longer
+    /// at version `v`, nothing is written and the error is
+    /// `AnchorError::SetVersionConflict`. The check and the write happen in the
+    /// same transaction, under the session's lock. Returns the version of the
+    /// set after the operation.
+    async fn apply_anchor_op_if(
+        &self,
+        session_id: Uuid,
+        op: crate::chat::anchor::AnchorOp,
+        if_match: Option<u64>,
+    ) -> Result<crate::chat::anchor::AnchorSetChange>;
+
+    /// The anchors of a session (oldest first) and the version of the set, read
+    /// together. `None` when the session does not exist.
+    async fn get_anchor_set(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<crate::chat::anchor::AnchorSet>>;
+
+    /// Anchor a session on an entity (idempotent for a role set already held).
+    async fn add_anchor(
+        &self,
+        session_id: Uuid,
+        new: crate::chat::anchor::NewAnchor,
+    ) -> Result<crate::chat::anchor::Anchor> {
+        Ok(self
+            .apply_anchor_op(session_id, crate::chat::anchor::AnchorOp::Add(new))
+            .await?
+            .anchor)
+    }
+
+    /// Give an anchor one more role (optimistic `expected_version`).
+    async fn promote_anchor_role(
+        &self,
+        session_id: Uuid,
+        anchor_id: Uuid,
+        role: crate::chat::anchor::AnchorRole,
+        expected_version: u64,
+        by: crate::chat::anchor::AnchorActor,
+        actor: &str,
+    ) -> Result<crate::chat::anchor::Anchor> {
+        Ok(self
+            .apply_anchor_op(
+                session_id,
+                crate::chat::anchor::AnchorOp::Promote {
+                    anchor_id,
+                    role,
+                    expected_version,
+                    by,
+                    actor: actor.to_string(),
+                },
+            )
+            .await?
+            .anchor)
+    }
+
+    /// Take one role away from an anchor (optimistic `expected_version`).
+    async fn demote_anchor_role(
+        &self,
+        session_id: Uuid,
+        anchor_id: Uuid,
+        role: crate::chat::anchor::AnchorRole,
+        expected_version: u64,
+        by: crate::chat::anchor::AnchorActor,
+        actor: &str,
+    ) -> Result<crate::chat::anchor::Anchor> {
+        Ok(self
+            .apply_anchor_op(
+                session_id,
+                crate::chat::anchor::AnchorOp::Demote {
+                    anchor_id,
+                    role,
+                    expected_version,
+                    by,
+                    actor: actor.to_string(),
+                },
+            )
+            .await?
+            .anchor)
+    }
+
+    /// Remove an anchor (never the origin one). The target is left alone.
+    async fn remove_anchor(
+        &self,
+        session_id: Uuid,
+        anchor_id: Uuid,
+        expected_version: u64,
+        by: crate::chat::anchor::AnchorActor,
+        actor: &str,
+    ) -> Result<()> {
+        self.apply_anchor_op(
+            session_id,
+            crate::chat::anchor::AnchorOp::Remove {
+                anchor_id,
+                expected_version,
+                by,
+                actor: actor.to_string(),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Move an anchor to another state (live -> moved -> dangling ...).
+    /// `expected_version = None` skips the optimistic check (system transitions).
+    async fn set_anchor_state(
+        &self,
+        session_id: Uuid,
+        anchor_id: Uuid,
+        state: crate::chat::anchor::AnchorState,
+        expected_version: Option<u64>,
+        by: crate::chat::anchor::AnchorActor,
+        actor: &str,
+    ) -> Result<crate::chat::anchor::Anchor> {
+        Ok(self
+            .apply_anchor_op(
+                session_id,
+                crate::chat::anchor::AnchorOp::SetState {
+                    anchor_id,
+                    state,
+                    expected_version,
+                    by,
+                    actor: actor.to_string(),
+                },
+            )
+            .await?
+            .anchor)
+    }
+
+    /// All anchors of a session, oldest first.
+    async fn list_session_anchors(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::chat::anchor::Anchor>>;
+
+    /// Reverse query: the anchors (hence the sessions) on one entity, ordered
+    /// by anchor id, keyset-paginated (`cursor` = `next_cursor` of the previous page).
+    async fn list_sessions_for_target(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+        state: Option<crate::chat::anchor::AnchorState>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<crate::chat::anchor::AnchorPage>;
+
+    /// The journal of a session, oldest first.
+    async fn list_anchor_events(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::chat::anchor::AnchorEvent>>;
+
+    /// Append one entry to the execution-place audit (T5). Never updates an entry.
+    async fn create_execution_place_event(
+        &self,
+        event: &crate::neo4j::models::ExecutionPlaceEvent,
+    ) -> Result<()>;
+
+    /// The execution-place audit of a task, oldest first.
+    async fn list_execution_place_events(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::models::ExecutionPlaceEvent>>;
+
+    /// Mark every anchor on a (deleted/archived) target `dangling`, with a
+    /// journal entry each. Returns how many changed. Not wired to entity
+    /// deletion yet. Anchors are never deleted by this.
+    async fn mark_anchors_dangling(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+    ) -> Result<usize>;
+
+    /// Migration (never run at startup): one inferred `project` anchor (focus,
+    /// by system, confidence 1.0) per session whose `project_slug` resolves to
+    /// exactly one project. Idempotent.
+    async fn backfill_project_anchors(&self) -> Result<crate::chat::anchor::BackfillReport>;
+
+    /// Migration (never run at startup): writes the `(:ChatSession)-[:SPAWNED_BY]->(:ChatSession)`
+    /// edge for every session whose `spawned_by` JSON names a parent session
+    /// and that has no such edge yet (sessions created before the edge existed).
+    /// Idempotent: a second run creates nothing. Returns the edges written.
+    async fn backfill_spawned_by_edges(&self) -> Result<usize>;
+
+    /// Inverse of the backfill: deletes only the anchors it created and nobody
+    /// modified since (inferred, by system, added by the migration, version 1),
+    /// with their journal entries. Returns how many.
+    async fn revert_inferred_anchors(&self) -> Result<usize>;
+
+    // ========================================================================
+    // Chat event operations (WebSocket replay & persistence)
+    // ========================================================================
+
+    /// Store a batch of chat events for a session
+    async fn store_chat_events(&self, session_id: Uuid, events: Vec<ChatEventRecord>)
+        -> Result<()>;
+
+    /// Get chat events for a session after a given sequence number (for replay)
+    async fn get_chat_events(
+        &self,
+        session_id: Uuid,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<ChatEventRecord>>;
+
+    /// Get chat events for a session with offset-based pagination (for REST/MCP).
+    async fn get_chat_events_paginated(
+        &self,
+        session_id: Uuid,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<ChatEventRecord>>;
+
+    /// Count total chat events for a session.
+    async fn count_chat_events(&self, session_id: Uuid) -> Result<i64>;
+
+    /// Grouped read for the attention derivation: the events needed to decide
+    /// what is still pending, for ALL the given sessions in ONE query (never
+    /// one query per session).
+    ///
+    /// Returns, ordered by `(session_id, seq)`: `permission_request`,
+    /// `permission_decision`, `ask_user_question` (full payload) and
+    /// `user_message` (payload blanked: only its `seq` matters here) and
+    /// `session_error` (the CLI died).
+    /// `input_request` is deliberately NOT read: it is a dead type, never
+    /// emitted in production, and counting it would invent phantom requests.
+    async fn get_attention_events(&self, session_ids: &[Uuid]) -> Result<Vec<ChatEventRecord>>;
+
+    /// Get the latest sequence number for a session (0 if no events)
+    async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> Result<i64>;
+
+    /// Delete all chat events for a session
+    async fn delete_chat_events(&self, session_id: Uuid) -> Result<()>;
+
+    // ========================================================================
+    // Chat DISCUSSED relations (ChatSession → Entity)
+    // ========================================================================
+
+    /// Add DISCUSSED relations between a chat session and entities (MERGE-based, idempotent).
+    /// Each entity is `(entity_type, entity_id)`.
+    async fn add_discussed(&self, session_id: Uuid, entities: &[(String, String)])
+        -> Result<usize>;
+
+    /// Get all entities discussed in a chat session, optionally scoped by project_id.
+    async fn get_session_entities(
+        &self,
+        session_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<DiscussedEntity>>;
+
+    /// WorldModel predictive context (biomimicry T7):
+    /// Get co-changers of files discussed in the last N sessions.
+    async fn get_discussed_co_changers(
+        &self,
+        project_id: Uuid,
+        max_sessions: i64,
+        max_results: i64,
+    ) -> Result<Vec<CoChanger>>;
+
+    /// Backfill DISCUSSED relations on all existing sessions.
+    /// Returns `(sessions_processed, entities_found, relations_created)`.
+    async fn backfill_discussed(&self) -> Result<(usize, usize, usize)>;
+
+    // ========================================================================
+    // Chat ↔ Plan/Task/RFC linking (ASSOCIATED_WITH relation)
+    // ========================================================================
+
+    /// Create an ASSOCIATED_WITH relation between a ChatSession and a Task or Plan.
+    /// Uses MERGE for idempotence. `entity_type` must be "Task" or "Plan".
+    async fn create_associated_with(
+        &self,
+        session_id: Uuid,
+        entity_type: &str,
+        entity_id: Uuid,
+        source: &str,
+    ) -> Result<bool>;
+
+    /// Get all linked plans, tasks, and RFCs for a chat session (dual-path query).
+    async fn get_session_links(&self, session_id: Uuid) -> Result<LinkedSessionInfo>;
+
+    /// Get all chat sessions linked to a plan (via AgentExecution + ASSOCIATED_WITH).
+    async fn get_sessions_for_plan(&self, plan_id: Uuid) -> Result<Vec<SessionWithLinks>>;
+
+    /// Get all chat sessions linked to a specific task.
+    async fn get_sessions_for_task(&self, task_id: Uuid) -> Result<Vec<SessionWithLinks>>;
+
+    /// Batch get linked session info for multiple sessions (avoids N+1).
+    async fn get_session_links_batch(
+        &self,
+        session_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, LinkedSessionInfo>>;
+
+    /// Get the plan_id for a task (via HAS_TASK relation).
+    async fn get_task_plan_id(&self, task_id: Uuid) -> Result<Option<Uuid>>;
+    // ========================================================================
+    // Session episodes (the episode a chat session leaves at its close)
+    // ========================================================================
+
+    /// Store the episode of a chat session, `episode.session` naming it. One per
+    /// session: a later close of the same session (after a resume) replaces it.
+    /// Written only while the session exists, in one statement, so a session deleted
+    /// meanwhile never gets an orphan episode. `Ok(false)`: the session is gone, or
+    /// the episode names no session.
+    async fn save_session_episode(
+        &self,
+        episode: &crate::episodes::models::Episode,
+    ) -> Result<bool>;
+
+    /// The session episodes of a project, most recent close first.
+    async fn list_session_episodes(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<crate::episodes::models::Episode>>;
+
+    /// The root the agent ids are derived from (`crate::notes::provenance`): created on the
+    /// first call, atomically, and the same on every call after — two first calls at
+    /// once still agree on one root.
+    async fn agent_identity_namespace(&self) -> Result<Uuid>;
+
+    // ========================================================================
+    // Episode embedding search (ReflexEngine)
+    // ========================================================================
+
+    /// Search episodes by embedding similarity (cosine).
+    ///
+    /// Returns up to `limit` episodes with their cosine similarity score (0.0-1.0).
+    /// Used by the ReflexEngine for episode recall suggestions.
+    ///
+    /// Default implementation returns an empty vec (graceful fallback for
+    /// implementations that don't support embedding search yet).
+    async fn search_episodes_by_embedding(
+        &self,
+        _project_id: Uuid,
+        _embedding: &[f32],
+        _limit: usize,
+    ) -> Result<Vec<(crate::episodes::models::Episode, f64)>> {
+        Ok(Vec::new())
+    }
+}
+
+// ============================================================================
+// Auth domain
+// ============================================================================
+
+/// The auth domain: users and works-on relations, refresh tokens, and the
+/// long-lived scoped tokens used by the remote MCP transport.
+#[async_trait]
+pub trait AuthStore: Send + Sync {
+    // ========================================================================
+    // User / Auth operations
+    // ========================================================================
+
+    /// Upsert a user (create or update). Returns the resulting UserNode.
+    ///
+    /// For OIDC users: MERGE on (auth_provider + external_id).
+    /// For password users: MERGE on (auth_provider + email).
+    async fn upsert_user(&self, user: &UserNode) -> Result<UserNode>;
+
+    /// Get a user by internal ID
+    async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserNode>>;
+
+    /// Get a user by provider and external ID (for OIDC lookups)
+    async fn get_user_by_provider_id(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<Option<UserNode>>;
+
+    /// Get a user by email and auth provider
+    async fn get_user_by_email_and_provider(
+        &self,
+        email: &str,
+        provider: &str,
+    ) -> Result<Option<UserNode>>;
+
+    /// Get a user by email (any provider)
+    async fn get_user_by_email(&self, email: &str) -> Result<Option<UserNode>>;
+
+    /// Create a password-authenticated user
+    async fn create_password_user(
+        &self,
+        email: &str,
+        name: &str,
+        password_hash: &str,
+    ) -> Result<UserNode>;
+
+    /// List all users
+    async fn list_users(&self) -> Result<Vec<UserNode>>;
+
+    // ================================================================
+    // Refresh Tokens
+    // ================================================================
+
+    /// Store a new refresh token (hashed) linked to a user.
+    async fn create_refresh_token(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()>;
+
+    /// Validate a refresh token by its hash. Returns the token if valid
+    /// (not expired, not revoked).
+    async fn validate_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<crate::neo4j::models::RefreshTokenNode>>;
+
+    /// Revoke a single refresh token by its hash.
+    async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool>;
+
+    /// Revoke all refresh tokens for a given user (e.g. on password change).
+    async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64>;
+
+    // ================================================================
+    // MCP Tokens (long-lived, revocable, scoped — remote MCP transport)
+    // ================================================================
+
+    /// Record a newly issued MCP token (keyed by its JWT `jti` claim).
+    async fn create_mcp_token(
+        &self,
+        user_id: Uuid,
+        jti: &str,
+        label: &str,
+        scope: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()>;
+
+    /// Check whether an MCP token (by `jti`) exists, is not revoked, and is
+    /// not expired.
+    async fn is_mcp_token_active(&self, jti: &str) -> Result<bool>;
+
+    /// Revoke a single MCP token by `jti` (scoped to its owning user).
+    async fn revoke_mcp_token(&self, user_id: Uuid, jti: &str) -> Result<bool>;
+
+    /// List all MCP tokens for a user (inventory; includes revoked/expired).
+    async fn list_mcp_tokens(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::models::McpTokenNode>>;
+
+    /// Permanently remove a user's dead MCP token records (revoked or
+    /// expired). Never removes an active token. Returns the count removed.
+    async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64>;
 }
 
 #[cfg(test)]

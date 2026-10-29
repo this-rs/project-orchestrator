@@ -13468,1187 +13468,6 @@ impl AnalyticsStore for MockGraphStore {
     }
 
     // ========================================================================
-    // Chat session operations
-    // ========================================================================
-
-    async fn create_chat_session(&self, session: &ChatSessionNode) -> Result<()> {
-        if self
-            .fail_session_writes
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            anyhow::bail!("injected failure of create_chat_session");
-        }
-        // As the Neo4j store: a session is created with its shell at home.
-        self.session_shell_moved
-            .write()
-            .await
-            .insert(session.id, false);
-        self.chat_sessions
-            .write()
-            .await
-            .insert(session.id, session.clone());
-        Ok(())
-    }
-
-    async fn get_chat_session(&self, id: Uuid) -> Result<Option<ChatSessionNode>> {
-        self.count_read();
-        // Failure injection without a `read_log` entry (counted read logs stay as they are).
-        if self
-            .fail_reads
-            .lock()
-            .is_ok_and(|f| f.contains("get_chat_session"))
-        {
-            anyhow::bail!("injected failure of get_chat_session");
-        }
-        Ok(self.chat_sessions.read().await.get(&id).cloned())
-    }
-
-    async fn list_chat_sessions(
-        &self,
-        project_slug: Option<&str>,
-        workspace_slug: Option<&str>,
-        limit: usize,
-        offset: usize,
-        include_detached: bool,
-    ) -> Result<(Vec<ChatSessionNode>, usize)> {
-        self.log_read("list_chat_sessions")?;
-        let sessions = self.chat_sessions.read().await;
-        // Collect workspace project slugs for membership check
-        let ws_project_slugs: Vec<String> = if let Some(ws) = workspace_slug {
-            let workspaces = self.workspaces.read().await;
-            if let Some(w) = workspaces.values().find(|w| w.slug == ws) {
-                let wp = self.workspace_projects.read().await;
-                let projects = self.projects.read().await;
-                wp.get(&w.id)
-                    .cloned()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|pid| projects.get(pid).map(|p| p.slug.clone()))
-                    .collect()
-            } else {
-                vec![]
-            }
-        } else {
-            vec![]
-        };
-        let mut filtered: Vec<_> = sessions
-            .values()
-            .filter(|s| {
-                // Filter out detached sessions unless explicitly requested
-                if !include_detached && s.spawned_by.is_some() {
-                    return false;
-                }
-                if let Some(slug) = project_slug {
-                    s.project_slug.as_deref() == Some(slug)
-                } else if let Some(ws) = workspace_slug {
-                    // Match workspace_slug OR project_slug membership
-                    s.workspace_slug.as_deref() == Some(ws)
-                        || s.project_slug
-                            .as_deref()
-                            .is_some_and(|ps| ws_project_slugs.iter().any(|wps| wps == ps))
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .collect();
-        // Sort by updated_at descending
-        filtered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        let total = filtered.len();
-        let page = paginate(&filtered, limit, offset);
-        Ok((page, total))
-    }
-
-    async fn get_session_children(&self, parent_id: Uuid) -> Result<Vec<ChatSessionNode>> {
-        let sessions = self.chat_sessions.read().await;
-        let parent_str = parent_id.to_string();
-        // A parent that no longer exists has no children (same as the Neo4j store).
-        let parent_exists = sessions.contains_key(&parent_id);
-        let mut children: Vec<_> = sessions
-            .values()
-            .filter(|_| parent_exists)
-            .filter(|s| {
-                s.spawned_by
-                    .as_ref()
-                    .is_some_and(|sb| sb.contains(&parent_str))
-            })
-            .cloned()
-            .collect();
-        children.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-        drop(sessions);
-        let landing = self
-            .land_children_after_read
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&parent_id);
-        if let Some(landing) = landing {
-            let mut sessions = self.chat_sessions.write().await;
-            for child in landing {
-                sessions.insert(child.id, child);
-            }
-        }
-        Ok(children)
-    }
-
-    async fn create_spawned_by_relation(
-        &self,
-        child_session_id: &str,
-        parent_session_id: &str,
-        _spawn_type: &str,
-        run_id: Option<Uuid>,
-        task_id: Option<Uuid>,
-    ) -> Result<()> {
-        // Mock: only the thread-relevant part is tracked, as the link row the
-        // real store derives (plan of the run carried, else of the parent).
-        let (Ok(child), Ok(parent)) = (
-            child_session_id.parse::<Uuid>(),
-            parent_session_id.parse::<Uuid>(),
-        ) else {
-            return Ok(());
-        };
-        let mut rows = self.session_link_rows.write().await;
-        let plan = rows
-            .iter()
-            .filter(|r| {
-                r.session_id == parent
-                    && matches!(
-                        r.kind,
-                        SessionLinkKind::RunRelation | SessionLinkKind::PlanAssociation
-                    )
-            })
-            .find_map(|r| r.thread_plan_id);
-        rows.push(SessionLinkRow {
-            session_id: child,
-            kind: SessionLinkKind::SpawnedByRelation,
-            run_id,
-            task_id,
-            plan_id: plan,
-            thread_plan_id: plan,
-        });
-        Ok(())
-    }
-
-    async fn link_session_to_run(
-        &self,
-        session_id: &str,
-        run_id: Uuid,
-        plan_id: Option<Uuid>,
-        task_id: Option<Uuid>,
-    ) -> Result<bool> {
-        let Ok(sid) = session_id.parse::<Uuid>() else {
-            return Ok(false);
-        };
-        if !self.chat_sessions.read().await.contains_key(&sid) {
-            return Ok(false);
-        }
-        let mut rows = self.session_link_rows.write().await;
-        let already = rows.iter().any(|r| {
-            r.session_id == sid
-                && r.kind == SessionLinkKind::RunRelation
-                && r.run_id == Some(run_id)
-        });
-        if !already {
-            rows.push(SessionLinkRow {
-                session_id: sid,
-                kind: SessionLinkKind::RunRelation,
-                run_id: Some(run_id),
-                task_id,
-                plan_id,
-                thread_plan_id: plan_id,
-            });
-        }
-        Ok(true)
-    }
-
-    async fn get_session_link_rows(&self, session_ids: &[Uuid]) -> Result<Vec<SessionLinkRow>> {
-        self.log_read("get_session_link_rows")?;
-        self.session_link_reads
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let rows = self.session_link_rows.read().await;
-        Ok(rows
-            .iter()
-            .filter(|r| session_ids.contains(&r.session_id))
-            .cloned()
-            .collect())
-    }
-
-    async fn get_plans_task_graph(&self, plan_ids: &[Uuid]) -> Result<PlansTaskGraph> {
-        self.log_read("get_plans_task_graph")?;
-        let plan_tasks = self.plan_tasks.read().await;
-        let tasks = self.tasks.read().await;
-        let deps = self.task_dependencies.read().await;
-        let mut graph = PlansTaskGraph::default();
-        for pid in plan_ids {
-            for tid in plan_tasks.get(pid).into_iter().flatten() {
-                if let Some(t) = tasks.get(tid) {
-                    graph.tasks.push((*pid, t.clone()));
-                }
-                for d in deps.get(tid).into_iter().flatten() {
-                    graph.edges.push((*tid, *d));
-                }
-            }
-        }
-        Ok(graph)
-    }
-
-    async fn list_project_workspace_rows(&self) -> Result<Vec<ProjectWorkspaceRow>> {
-        self.log_read("list_project_workspace_rows")?;
-        let workspaces = self.workspaces.read().await;
-        let projects = self.projects.read().await;
-        let wp = self.workspace_projects.read().await;
-        let mut rows = Vec::new();
-        for (wid, pids) in wp.iter() {
-            let Some(w) = workspaces.get(wid) else {
-                continue;
-            };
-            for pid in pids {
-                if let Some(p) = projects.get(pid) {
-                    rows.push(ProjectWorkspaceRow {
-                        project_id: p.id,
-                        project_slug: p.slug.clone(),
-                        workspace_id: w.id,
-                        workspace_slug: w.slug.clone(),
-                    });
-                }
-            }
-        }
-        Ok(rows)
-    }
-
-    /// P18-suite (point 12): a real traversal of the mock's `spawned_by`, with the
-    /// semantics of the Neo4j query — the session itself at depth 0, then every
-    /// descendant found through the JSON parent, breadth first, siblings by
-    /// `created_at`; an unknown session is an empty tree. `status`, provider, model
-    /// and costs stay unset here: the API fills them, as it does for the real store.
-    async fn get_session_tree(&self, session_id: &str) -> Result<Vec<SessionTreeNode>> {
-        let sessions = self.chat_sessions.read().await;
-        let Some(root) = sessions.values().find(|s| s.id.to_string() == session_id) else {
-            return Ok(Vec::new());
-        };
-        let node_of = |s: &ChatSessionNode, depth: u32| {
-            let spawn = spawned_by_of(s);
-            SessionTreeNode {
-                session_id: s.id.to_string(),
-                parent_session_id: if depth == 0 {
-                    None
-                } else {
-                    spawn.parent.clone()
-                },
-                spawn_type: if depth == 0 { None } else { spawn.kind.clone() },
-                run_id: if depth == 0 { None } else { spawn.run_id },
-                task_id: if depth == 0 { None } else { spawn.task_id },
-                depth,
-                created_at: Some(s.created_at),
-                provider_id: None,
-                model: None,
-                cost_usd: None,
-                subtree_cost_usd: None,
-                max_depth: None,
-                max_children: None,
-                status: "closed".to_string(),
-                routed_by: None,
-            }
-        };
-        let mut nodes = vec![node_of(root, 0)];
-        let mut frontier = vec![root.id.to_string()];
-        let mut seen: std::collections::HashSet<String> = frontier.iter().cloned().collect();
-        let mut depth = 0u32;
-        // The real query stops at ten hops (`SPAWNED_BY*0..10`).
-        while !frontier.is_empty() && depth < 10 {
-            depth += 1;
-            let mut next = Vec::new();
-            for parent in &frontier {
-                let mut children: Vec<&ChatSessionNode> = sessions
-                    .values()
-                    .filter(|s| spawned_by_of(s).parent.as_deref() == Some(parent.as_str()))
-                    .filter(|s| !seen.contains(&s.id.to_string()))
-                    .collect();
-                children.sort_by_key(|s| s.created_at);
-                for child in children {
-                    seen.insert(child.id.to_string());
-                    nodes.push(node_of(child, depth));
-                    next.push(child.id.to_string());
-                }
-            }
-            frontier = next;
-        }
-        Ok(nodes)
-    }
-
-    /// P18-suite (point 12): follow the JSON parent upward to the session that has
-    /// none — ten hops at most, a cycle stops the walk — or `None` for an unknown
-    /// session, as the Neo4j query answers.
-    async fn get_session_root(&self, session_id: &str) -> Result<Option<String>> {
-        let sessions = self.chat_sessions.read().await;
-        let by_id = |id: &str| sessions.values().find(|s| s.id.to_string() == id);
-        let Some(mut current) = by_id(session_id) else {
-            return Ok(None);
-        };
-        let mut seen = std::collections::HashSet::from([current.id.to_string()]);
-        for _ in 0..10 {
-            let Some(parent_id) = spawned_by_of(current).parent else {
-                break;
-            };
-            if !seen.insert(parent_id.clone()) {
-                break;
-            }
-            match by_id(&parent_id) {
-                Some(parent) => current = parent,
-                // A parent the store no longer holds: the walk ends on the last known session.
-                None => break,
-            }
-        }
-        Ok(Some(current.id.to_string()))
-    }
-
-    async fn get_run_sessions(&self, _run_id: Uuid) -> Result<Vec<SessionInfo>> {
-        // Mock: return empty
-        Ok(vec![])
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn update_chat_session(
-        &self,
-        id: Uuid,
-        cli_session_id: Option<String>,
-        title: Option<String>,
-        message_count: Option<i64>,
-        total_cost_usd: Option<f64>,
-        conversation_id: Option<String>,
-        preview: Option<String>,
-    ) -> Result<Option<ChatSessionNode>> {
-        let mut sessions = self.chat_sessions.write().await;
-        if let Some(session) = sessions.get_mut(&id) {
-            session.updated_at = Utc::now();
-            if let Some(v) = cli_session_id {
-                session.cli_session_id = Some(v);
-            }
-            if let Some(v) = title {
-                session.title = Some(v);
-            }
-            if let Some(v) = message_count {
-                session.message_count = v;
-            }
-            if let Some(v) = total_cost_usd {
-                session.total_cost_usd = Some(v);
-            }
-            if let Some(v) = conversation_id {
-                session.conversation_id = Some(v);
-            }
-            if let Some(v) = preview {
-                session.preview = Some(v);
-            }
-            Ok(Some(session.clone()))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn add_chat_session_children_cost(&self, id: Uuid, delta_usd: f64) -> Result<f64> {
-        let delta = if delta_usd.is_finite() && delta_usd > 0.0 {
-            delta_usd
-        } else {
-            0.0
-        };
-        let mut costs = self.chat_children_costs.write().await;
-        let total = costs.entry(id).or_insert(0.0);
-        *total += delta;
-        Ok(*total)
-    }
-
-    async fn get_chat_session_children_cost(&self, id: Uuid) -> Result<f64> {
-        Ok(self
-            .chat_children_costs
-            .read()
-            .await
-            .get(&id)
-            .copied()
-            .unwrap_or(0.0))
-    }
-
-    async fn update_chat_session_permission_mode(&self, id: Uuid, mode: &str) -> Result<()> {
-        let mut sessions = self.chat_sessions.write().await;
-        if let Some(session) = sessions.get_mut(&id) {
-            session.permission_mode = Some(mode.to_string());
-            session.updated_at = Utc::now();
-        }
-        Ok(())
-    }
-
-    async fn bind_chat_session_project(&self, id: Uuid, project_slug: &str) -> Result<bool> {
-        let mut sessions = self.chat_sessions.write().await;
-        let Some(session) = sessions.get_mut(&id) else {
-            return Ok(false);
-        };
-        if session
-            .project_slug
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
-        {
-            return Ok(false);
-        }
-        session.project_slug = Some(project_slug.to_string());
-        session.updated_at = Utc::now();
-        Ok(true)
-    }
-
-    async fn update_chat_session_file_scope_lifted(&self, id: Uuid, lifted: bool) -> Result<()> {
-        let mut sessions = self.chat_sessions.write().await;
-        if let Some(session) = sessions.get_mut(&id) {
-            session.file_scope_lifted = lifted;
-            session.updated_at = Utc::now();
-        }
-        Ok(())
-    }
-
-    async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()> {
-        let mut sessions = self.chat_sessions.write().await;
-        if let Some(session) = sessions.get_mut(&id) {
-            session.model = model.to_string();
-            session.updated_at = Utc::now();
-        }
-        Ok(())
-    }
-
-    async fn set_chat_session_fingerprint(&self, id: Uuid, fingerprint: &str) -> Result<()> {
-        self.chat_fingerprints
-            .write()
-            .await
-            .insert(id, fingerprint.to_string());
-        Ok(())
-    }
-
-    async fn get_chat_session_fingerprint(&self, id: Uuid) -> Result<Option<String>> {
-        Ok(self.chat_fingerprints.read().await.get(&id).cloned())
-    }
-
-    async fn update_chat_session_routing(
-        &self,
-        id: Uuid,
-        routing_mode: Option<&str>,
-        routing_pool: Option<&str>,
-        routed_by: Option<&str>,
-    ) -> Result<bool> {
-        let mut sessions = self.chat_sessions.write().await;
-        let Some(session) = sessions.get_mut(&id) else {
-            return Ok(false);
-        };
-        session.routing_mode = routing_mode.map(str::to_owned);
-        session.routing_pool = routing_pool.map(str::to_owned);
-        session.routed_by = routed_by.map(str::to_owned);
-        session.updated_at = Utc::now();
-        Ok(true)
-    }
-
-    async fn update_chat_session_provider(
-        &self,
-        id: Uuid,
-        provider_id: &str,
-        model: &str,
-        routed_by: &str,
-        engine: &str,
-    ) -> Result<bool> {
-        let mut sessions = self.chat_sessions.write().await;
-        let Some(session) = sessions.get_mut(&id) else {
-            return Ok(false);
-        };
-        session.provider_id = Some(provider_id.to_owned());
-        session.model = model.to_owned();
-        session.routed_by = Some(routed_by.to_owned());
-        // Providers do not share a session format: a resume token is refused across
-        // families, so the provider-specific fields are cleared (as the Neo4j store does).
-        session.resume_token = None;
-        session.capabilities = None;
-        session.cli_session_id = None;
-        session.engine = Some(engine.to_owned());
-        session.updated_at = Utc::now();
-        Ok(true)
-    }
-
-    async fn restore_chat_session_provider(
-        &self,
-        node: &ChatSessionNode,
-        provider_id: &str,
-    ) -> Result<bool> {
-        let mut sessions = self.chat_sessions.write().await;
-        let Some(session) = sessions.get_mut(&node.id) else {
-            return Ok(false);
-        };
-        session.provider_id = Some(provider_id.to_owned());
-        session.model = node.model.clone();
-        session.routed_by = node.routed_by.clone();
-        session.resume_token = node.resume_token.clone();
-        session.capabilities = node.capabilities.clone();
-        session.cli_session_id = node.cli_session_id.clone();
-        session.engine = node.engine.clone();
-        session.updated_at = Utc::now();
-        Ok(true)
-    }
-
-    async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>> {
-        loop {
-            let released = self.llm_setting_writes_released.notified();
-            let stalled = self
-                .stall_llm_setting_reads_of
-                .lock()
-                .is_ok_and(|s| s.contains(key));
-            if !stalled {
-                break;
-            }
-            released.await;
-        }
-        if self
-            .fail_llm_setting_reads_of
-            .lock()
-            .is_ok_and(|s| s.contains(key))
-        {
-            anyhow::bail!("mock: injected failure of the read of setting {key}");
-        }
-        Ok(self
-            .llm_settings
-            .read()
-            .await
-            .get(&(scope.to_string(), key.to_string()))
-            .cloned())
-    }
-    async fn put_llm_setting(&self, scope: &str, key: &str, value: &str) -> Result<()> {
-        if scope == "journal"
-            && self
-                .fail_journal_writes
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            anyhow::bail!("mock: the send journal cannot be written");
-        }
-        self.llm_setting_write_gate(key, false).await?;
-        self.llm_settings
-            .write()
-            .await
-            .insert((scope.to_string(), key.to_string()), value.to_string());
-        Ok(())
-    }
-    async fn delete_llm_setting(&self, scope: &str, key: &str) -> Result<bool> {
-        self.llm_setting_write_gate(key, true).await?;
-        Ok(self
-            .llm_settings
-            .write()
-            .await
-            .remove(&(scope.to_string(), key.to_string()))
-            .is_some())
-    }
-    async fn list_llm_settings(&self, scope: &str, prefix: &str) -> Result<Vec<(String, String)>> {
-        let mut rows: Vec<(String, String)> = self
-            .llm_settings
-            .read()
-            .await
-            .iter()
-            .filter(|((s, k), _)| s == scope && k.starts_with(prefix))
-            .map(|((_, k), v)| (k.clone(), v.clone()))
-            .collect();
-        rows.sort();
-        Ok(rows)
-    }
-
-    async fn update_chat_session_harness(
-        &self,
-        id: Uuid,
-        capabilities: Option<&str>,
-        resume_token: Option<&str>,
-    ) -> Result<()> {
-        if self
-            .fail_harness_writes
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            anyhow::bail!("mock: the capability snapshot write failed");
-        }
-        let mut sessions = self.chat_sessions.write().await;
-        if let Some(session) = sessions.get_mut(&id) {
-            if let Some(c) = capabilities {
-                session.capabilities = Some(c.to_string());
-            }
-            if let Some(t) = resume_token {
-                session.resume_token = Some(t.to_string());
-            }
-            session.updated_at = Utc::now();
-        }
-        Ok(())
-    }
-
-    async fn set_chat_session_shell_moved(&self, id: Uuid) -> Result<()> {
-        if self.chat_sessions.read().await.contains_key(&id) {
-            self.session_shell_moved.write().await.insert(id, true);
-        }
-        Ok(())
-    }
-
-    async fn get_chat_session_shell_moved(&self, id: Uuid) -> Result<Option<bool>> {
-        Ok(self.session_shell_moved.read().await.get(&id).copied())
-    }
-
-    async fn backfill_chat_session_previews(&self) -> Result<usize> {
-        // Mock: no events stored, nothing to backfill
-        Ok(0)
-    }
-
-    async fn delete_chat_session(&self, id: Uuid) -> Result<bool> {
-        // Anchors and their journal go with the session; their targets stay.
-        let mut anchors = self.anchor_store.write().await;
-        anchors.anchors.retain(|_, a| a.session_id != id);
-        anchors.events.retain(|e| e.session_id != id);
-        anchors.versions.remove(&id);
-        drop(anchors);
-        // Same lock order as `save_session_episode` (sessions, then episodes).
-        let mut sessions = self.chat_sessions.write().await;
-        let existed = sessions.remove(&id).is_some();
-        self.session_episodes.write().await.remove(&id);
-        Ok(existed)
-    }
-
-    // Session episodes — same rules as the Neo4j store: written only while the session
-    // exists, one per session.
-
-    async fn save_session_episode(
-        &self,
-        episode: &crate::episodes::models::Episode,
-    ) -> Result<bool> {
-        self.session_episode_save_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self
-            .fail_session_episode_writes
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            anyhow::bail!("mock: session episode write failed");
-        }
-        let Some(session) = episode.session.as_ref() else {
-            return Ok(false);
-        };
-        // The session lock held across the write: a delete cannot slip in between.
-        let sessions = self.chat_sessions.read().await;
-        if !sessions.contains_key(&session.session_id) {
-            return Ok(false);
-        }
-        self.session_episodes
-            .write()
-            .await
-            .insert(session.session_id, episode.clone());
-        Ok(true)
-    }
-
-    async fn list_session_episodes(
-        &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> Result<Vec<crate::episodes::models::Episode>> {
-        let mut out: Vec<_> = self
-            .session_episodes
-            .read()
-            .await
-            .values()
-            .filter(|e| e.project_id == project_id)
-            .cloned()
-            .collect();
-        out.sort_by(|a, b| b.collected_at.cmp(&a.collected_at));
-        out.truncate(limit);
-        Ok(out)
-    }
-
-    /// Over the session episodes, as the Neo4j store does (cosine on the stored
-    /// embedding; an episode without one is never a hit).
-    async fn search_episodes_by_embedding(
-        &self,
-        project_id: Uuid,
-        embedding: &[f32],
-        limit: usize,
-    ) -> Result<Vec<(crate::episodes::models::Episode, f64)>> {
-        let mut hits: Vec<(crate::episodes::models::Episode, f64)> = self
-            .session_episodes
-            .read()
-            .await
-            .values()
-            .filter(|e| e.project_id == project_id)
-            .filter_map(|e| {
-                let stored = e.embedding.as_ref()?;
-                Some((e.clone(), cosine_similarity(stored, embedding)))
-            })
-            .collect();
-        hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        hits.truncate(limit);
-        Ok(hits)
-    }
-
-    async fn agent_identity_namespace(&self) -> Result<Uuid> {
-        // One lock for the read and the creation: the MERGE of the Neo4j store.
-        let mut root = self
-            .agent_identity_root
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(*root.get_or_insert_with(Uuid::new_v4))
-    }
-
-    // Chat anchors — same rules as the Neo4j store (both call `anchor::apply_op`).
-
-    async fn apply_anchor_op_if(
-        &self,
-        session_id: Uuid,
-        op: crate::chat::anchor::AnchorOp,
-        if_match: Option<u64>,
-    ) -> Result<crate::chat::anchor::AnchorSetChange> {
-        use crate::chat::anchor::*;
-        // One lock over anchors + journal: state and event change together.
-        let mut store = self.anchor_store.write().await;
-        if !self.chat_sessions.read().await.contains_key(&session_id) {
-            return Err(AnchorError::SessionNotFound(session_id).into());
-        }
-        let current = store.versions.get(&session_id).copied().unwrap_or(0);
-        if let Some(expected) = if_match.filter(|v| *v != current) {
-            return Err(AnchorError::SetVersionConflict {
-                expected,
-                actual: current,
-            }
-            .into());
-        }
-        let existing: Vec<Anchor> = store
-            .anchors
-            .values()
-            .filter(|a| a.session_id == session_id)
-            .cloned()
-            .collect();
-        let mut change = apply_op(session_id, &existing, op, chrono::Utc::now())?;
-        let next_seq = current + 1;
-        if let Some(ev) = change.event.as_mut() {
-            ev.seq = next_seq;
-        }
-        let version = if change.event.is_some() {
-            store.versions.insert(session_id, next_seq);
-            next_seq
-        } else {
-            current
-        };
-        if change.deleted {
-            store.anchors.remove(&change.anchor.id);
-        } else if change.event.is_some() {
-            store
-                .anchors
-                .insert(change.anchor.id, change.anchor.clone());
-        }
-        if let Some(ev) = &change.event {
-            store.events.push(ev.clone());
-        }
-        Ok(AnchorSetChange { change, version })
-    }
-
-    async fn get_anchor_set(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Option<crate::chat::anchor::AnchorSet>> {
-        // Same lock as the writes: anchors and version are one consistent read.
-        let store = self.anchor_store.read().await;
-        if !self.chat_sessions.read().await.contains_key(&session_id) {
-            return Ok(None);
-        }
-        let mut anchors: Vec<_> = store
-            .anchors
-            .values()
-            .filter(|a| a.session_id == session_id)
-            .cloned()
-            .collect();
-        anchors.sort_by_key(|a| (a.created_at, a.id));
-        Ok(Some(crate::chat::anchor::AnchorSet {
-            version: store.versions.get(&session_id).copied().unwrap_or(0),
-            anchors,
-        }))
-    }
-
-    async fn list_session_anchors(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Vec<crate::chat::anchor::Anchor>> {
-        self.count_read();
-        let store = self.anchor_store.read().await;
-        let mut v: Vec<_> = store
-            .anchors
-            .values()
-            .filter(|a| a.session_id == session_id)
-            .cloned()
-            .collect();
-        v.sort_by_key(|a| (a.created_at, a.id));
-        Ok(v)
-    }
-
-    async fn list_sessions_for_target(
-        &self,
-        target_type: crate::chat::anchor::AnchorTargetType,
-        target_id: &str,
-        state: Option<crate::chat::anchor::AnchorState>,
-        limit: usize,
-        cursor: Option<&str>,
-    ) -> Result<crate::chat::anchor::AnchorPage> {
-        let limit = limit.clamp(1, 200);
-        let after = cursor.unwrap_or("").to_string();
-        let store = self.anchor_store.read().await;
-        let mut items: Vec<_> = store
-            .anchors
-            .values()
-            .filter(|a| a.target_type == target_type && a.target_id == target_id)
-            .filter(|a| state.is_none_or(|s| a.state == s))
-            .filter(|a| after.is_empty() || a.id.to_string() > after)
-            .cloned()
-            .collect();
-        items.sort_by_key(|a| a.id.to_string());
-        items.truncate(limit + 1);
-        let next_cursor = if items.len() > limit {
-            items.truncate(limit);
-            items.last().map(|a| a.id.to_string())
-        } else {
-            None
-        };
-        Ok(crate::chat::anchor::AnchorPage { items, next_cursor })
-    }
-
-    async fn list_anchor_events(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Vec<crate::chat::anchor::AnchorEvent>> {
-        let store = self.anchor_store.read().await;
-        let mut out: Vec<_> = store
-            .events
-            .iter()
-            .filter(|e| e.session_id == session_id)
-            .cloned()
-            .collect();
-        out.sort_by_key(|e| (e.seq, e.at, e.id));
-        Ok(out)
-    }
-
-    async fn create_execution_place_event(
-        &self,
-        event: &crate::neo4j::models::ExecutionPlaceEvent,
-    ) -> Result<()> {
-        self.execution_place_events
-            .write()
-            .await
-            .push(event.clone());
-        Ok(())
-    }
-
-    async fn list_execution_place_events(
-        &self,
-        task_id: Uuid,
-    ) -> Result<Vec<crate::neo4j::models::ExecutionPlaceEvent>> {
-        let mut out: Vec<_> = self
-            .execution_place_events
-            .read()
-            .await
-            .iter()
-            .filter(|e| e.task_id == task_id)
-            .cloned()
-            .collect();
-        out.sort_by_key(|e| (e.at, e.id));
-        Ok(out)
-    }
-
-    async fn mark_anchors_dangling(
-        &self,
-        target_type: crate::chat::anchor::AnchorTargetType,
-        target_id: &str,
-    ) -> Result<usize> {
-        use crate::chat::anchor::*;
-        let todo: Vec<(Uuid, Uuid)> = self
-            .anchor_store
-            .read()
-            .await
-            .anchors
-            .values()
-            .filter(|a| {
-                a.target_type == target_type
-                    && a.target_id == target_id
-                    && a.state != AnchorState::Dangling
-            })
-            .map(|a| (a.session_id, a.id))
-            .collect();
-        let mut changed = 0;
-        for (session_id, anchor_id) in todo {
-            let op = AnchorOp::SetState {
-                anchor_id,
-                state: AnchorState::Dangling,
-                expected_version: None,
-                by: AnchorActor::System,
-                actor: DANGLING_ACTOR.to_string(),
-            };
-            if self.apply_anchor_op(session_id, op).await?.event.is_some() {
-                changed += 1;
-            }
-        }
-        Ok(changed)
-    }
-
-    async fn backfill_project_anchors(&self) -> Result<crate::chat::anchor::BackfillReport> {
-        use crate::chat::anchor::*;
-        let mut sessions: Vec<(Uuid, String)> = self
-            .chat_sessions
-            .read()
-            .await
-            .values()
-            .filter_map(|s| {
-                s.project_slug
-                    .clone()
-                    .filter(|p| !p.is_empty())
-                    .map(|p| (s.id, p))
-            })
-            .collect();
-        sessions.sort();
-        let mut report = BackfillReport::default();
-        for (session_id, slug) in sessions {
-            let matches: Vec<ProjectNode> = self
-                .projects
-                .read()
-                .await
-                .values()
-                .filter(|p| p.slug == slug)
-                .cloned()
-                .collect();
-            let [project] = matches.as_slice() else {
-                report.skipped_unresolved += 1;
-                continue;
-            };
-            match self
-                .apply_anchor_op(session_id, AnchorOp::Add(backfill_new_anchor(project)))
-                .await
-            {
-                Ok(c) if c.created => report.created += 1,
-                Ok(_) => report.already_present += 1,
-                Err(e) => match e.downcast_ref::<AnchorError>() {
-                    Some(AnchorError::AlreadyAnchored { .. }) => report.already_present += 1,
-                    Some(AnchorError::SessionNotFound(_)) => report.skipped_unresolved += 1,
-                    Some(_) => report.skipped_by_rule += 1,
-                    None => return Err(e),
-                },
-            }
-        }
-        Ok(report)
-    }
-
-    async fn backfill_spawned_by_edges(&self) -> Result<usize> {
-        // The mock keeps no edges: its only lineage is the `spawned_by` JSON.
-        Ok(0)
-    }
-
-    async fn revert_inferred_anchors(&self) -> Result<usize> {
-        use crate::chat::anchor::*;
-        let mut store = self.anchor_store.write().await;
-        let doomed: Vec<Uuid> = store
-            .anchors
-            .values()
-            .filter(|a| {
-                let added_by = store
-                    .events
-                    .iter()
-                    .find(|e| e.anchor_id == a.id && e.kind == AnchorEventKind::Added)
-                    .map(|e| e.actor.as_str());
-                is_revertible_backfill(a, added_by)
-            })
-            .map(|a| a.id)
-            .collect();
-        for id in &doomed {
-            store.anchors.remove(id);
-        }
-        store.events.retain(|e| !doomed.contains(&e.anchor_id));
-        Ok(doomed.len())
-    }
-
-    // Chat event operations
-
-    async fn store_chat_events(
-        &self,
-        session_id: Uuid,
-        events: Vec<ChatEventRecord>,
-    ) -> Result<()> {
-        loop {
-            // Created before the check: a release in between still wakes it.
-            let released = self.chat_events_released.notified();
-            let stalled = self
-                .stall_chat_events_of
-                .lock()
-                .is_ok_and(|s| events.iter().any(|e| s.contains(&e.event_type)));
-            if !stalled {
-                break;
-            }
-            released.await;
-        }
-        let mut store = self.chat_events.write().await;
-        let entry = store.entry(session_id).or_default();
-        entry.extend(events);
-        Ok(())
-    }
-
-    async fn get_chat_events(
-        &self,
-        session_id: Uuid,
-        after_seq: i64,
-        limit: i64,
-    ) -> Result<Vec<ChatEventRecord>> {
-        let store = self.chat_events.read().await;
-        let events = store
-            .get(&session_id)
-            .map(|v| {
-                v.iter()
-                    .filter(|e| e.seq > after_seq)
-                    .take(limit as usize)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        Ok(events)
-    }
-
-    async fn get_attention_events(&self, session_ids: &[Uuid]) -> Result<Vec<ChatEventRecord>> {
-        self.log_read("get_attention_events")?;
-        let store = self.chat_events.read().await;
-        let mut out = Vec::new();
-        for id in session_ids {
-            if let Some(events) = store.get(id) {
-                for e in events {
-                    if matches!(
-                        e.event_type.as_str(),
-                        "permission_request"
-                            | "permission_decision"
-                            | "ask_user_question"
-                            | "session_error"
-                    ) {
-                        out.push(e.clone());
-                    } else if e.event_type == "user_message" {
-                        let mut e = e.clone();
-                        e.data = String::new();
-                        out.push(e);
-                    }
-                }
-            }
-        }
-        out.sort_by_key(|e| (e.session_id, e.seq));
-        Ok(out)
-    }
-
-    async fn get_chat_events_paginated(
-        &self,
-        session_id: Uuid,
-        offset: i64,
-        limit: i64,
-    ) -> Result<Vec<ChatEventRecord>> {
-        let store = self.chat_events.read().await;
-        let events = store
-            .get(&session_id)
-            .map(|v| {
-                let mut sorted = v.clone();
-                sorted.sort_by_key(|e| e.seq);
-                sorted
-                    .into_iter()
-                    .skip(offset as usize)
-                    .take(limit as usize)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        Ok(events)
-    }
-
-    async fn count_chat_events(&self, session_id: Uuid) -> Result<i64> {
-        let store = self.chat_events.read().await;
-        let count = store.get(&session_id).map(|v| v.len() as i64).unwrap_or(0);
-        Ok(count)
-    }
-
-    async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> Result<i64> {
-        let store = self.chat_events.read().await;
-        let max_seq = store
-            .get(&session_id)
-            .and_then(|v| v.iter().map(|e| e.seq).max())
-            .unwrap_or(0);
-        Ok(max_seq)
-    }
-
-    async fn delete_chat_events(&self, session_id: Uuid) -> Result<()> {
-        self.chat_events.write().await.remove(&session_id);
-        Ok(())
-    }
-
-    // ========================================================================
-    // Chat DISCUSSED relations
-    // ========================================================================
-
-    async fn add_discussed(
-        &self,
-        session_id: Uuid,
-        entities: &[(String, String)],
-    ) -> Result<usize> {
-        // Mock: record the call and answer as if all were created
-        self.discussed_calls
-            .write()
-            .await
-            .push((session_id, entities.to_vec()));
-        Ok(entities.len())
-    }
-
-    async fn get_session_entities(
-        &self,
-        _session_id: Uuid,
-        _project_id: Option<Uuid>,
-    ) -> Result<Vec<DiscussedEntity>> {
-        Ok(Vec::new())
-    }
-
-    async fn get_discussed_co_changers(
-        &self,
-        _project_id: Uuid,
-        _max_sessions: i64,
-        _max_results: i64,
-    ) -> Result<Vec<CoChanger>> {
-        Ok(Vec::new())
-    }
-
-    async fn backfill_discussed(&self) -> Result<(usize, usize, usize)> {
-        Ok((0, 0, 0))
-    }
-
-    // ========================================================================
-    // Chat ↔ Plan/Task/RFC linking (ASSOCIATED_WITH relation)
-    // ========================================================================
-
-    async fn create_associated_with(
-        &self,
-        _session_id: Uuid,
-        _entity_type: &str,
-        _entity_id: Uuid,
-        _source: &str,
-    ) -> Result<bool> {
-        Ok(true)
-    }
-
-    async fn get_session_links(&self, _session_id: Uuid) -> Result<LinkedSessionInfo> {
-        Ok(LinkedSessionInfo::default())
-    }
-
-    async fn get_sessions_for_plan(&self, _plan_id: Uuid) -> Result<Vec<SessionWithLinks>> {
-        Ok(Vec::new())
-    }
-
-    async fn get_sessions_for_task(&self, _task_id: Uuid) -> Result<Vec<SessionWithLinks>> {
-        Ok(Vec::new())
-    }
-
-    async fn get_session_links_batch(
-        &self,
-        _session_ids: &[Uuid],
-    ) -> Result<std::collections::HashMap<Uuid, LinkedSessionInfo>> {
-        Ok(std::collections::HashMap::new())
-    }
-
-    async fn get_task_plan_id(&self, task_id: Uuid) -> Result<Option<Uuid>> {
-        let pt = self.plan_tasks.read().await;
-        Ok(pt
-            .iter()
-            .find(|(_, ids)| ids.contains(&task_id))
-            .map(|(plan_id, _)| *plan_id))
-    }
-
-    // ========================================================================
     // Graph visualization queries (PM + Chat layers)
     // ========================================================================
 
@@ -14666,243 +13485,6 @@ impl AnalyticsStore for MockGraphStore {
         _limit: usize,
     ) -> Result<(Vec<ChatGraphSession>, Vec<ChatGraphDiscussed>)> {
         Ok((Vec::new(), Vec::new()))
-    }
-
-    // ========================================================================
-    // User / Auth operations
-    // ========================================================================
-
-    async fn upsert_user(&self, user: &UserNode) -> Result<UserNode> {
-        use crate::neo4j::models::AuthProvider;
-
-        let mut users = self.users.write().await;
-
-        // Find existing user based on auth provider strategy
-        let existing_id = match user.auth_provider {
-            AuthProvider::Oidc => {
-                // OIDC: match on auth_provider + external_id
-                let ext_id = user.external_id.as_deref().unwrap_or_default();
-                users
-                    .values()
-                    .find(|u| {
-                        u.auth_provider == AuthProvider::Oidc
-                            && u.external_id.as_deref() == Some(ext_id)
-                    })
-                    .map(|u| u.id)
-            }
-            AuthProvider::Password => {
-                // Password: match on auth_provider + email
-                users
-                    .values()
-                    .find(|u| u.auth_provider == AuthProvider::Password && u.email == user.email)
-                    .map(|u| u.id)
-            }
-        };
-
-        if let Some(id) = existing_id {
-            // Update existing user
-            let existing = users.get_mut(&id).unwrap();
-            existing.email = user.email.clone();
-            existing.name = user.name.clone();
-            existing.picture_url = user.picture_url.clone();
-            existing.last_login_at = user.last_login_at;
-            Ok(existing.clone())
-        } else {
-            // Insert new user
-            users.insert(user.id, user.clone());
-            Ok(user.clone())
-        }
-    }
-
-    async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserNode>> {
-        Ok(self.users.read().await.get(&id).cloned())
-    }
-
-    async fn get_user_by_provider_id(
-        &self,
-        provider: &str,
-        external_id: &str,
-    ) -> Result<Option<UserNode>> {
-        let provider_parsed: crate::neo4j::models::AuthProvider =
-            provider.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-        Ok(self
-            .users
-            .read()
-            .await
-            .values()
-            .find(|u| {
-                u.auth_provider == provider_parsed && u.external_id.as_deref() == Some(external_id)
-            })
-            .cloned())
-    }
-
-    async fn get_user_by_email_and_provider(
-        &self,
-        email: &str,
-        provider: &str,
-    ) -> Result<Option<UserNode>> {
-        let provider_parsed: crate::neo4j::models::AuthProvider =
-            provider.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-        Ok(self
-            .users
-            .read()
-            .await
-            .values()
-            .find(|u| u.email == email && u.auth_provider == provider_parsed)
-            .cloned())
-    }
-
-    async fn get_user_by_email(&self, email: &str) -> Result<Option<UserNode>> {
-        Ok(self
-            .users
-            .read()
-            .await
-            .values()
-            .find(|u| u.email == email)
-            .cloned())
-    }
-
-    async fn create_password_user(
-        &self,
-        email: &str,
-        name: &str,
-        password_hash: &str,
-    ) -> Result<UserNode> {
-        let now = chrono::Utc::now();
-        let user = UserNode {
-            id: Uuid::new_v4(),
-            email: email.to_string(),
-            name: name.to_string(),
-            picture_url: None,
-            auth_provider: crate::neo4j::models::AuthProvider::Password,
-            external_id: None,
-            password_hash: Some(password_hash.to_string()),
-            created_at: now,
-            last_login_at: now,
-        };
-        self.upsert_user(&user).await
-    }
-
-    async fn list_users(&self) -> Result<Vec<UserNode>> {
-        Ok(self.users.read().await.values().cloned().collect())
-    }
-
-    // Refresh Tokens
-    async fn create_refresh_token(
-        &self,
-        user_id: Uuid,
-        token_hash: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<()> {
-        let token = crate::neo4j::models::RefreshTokenNode {
-            token_hash: token_hash.to_string(),
-            user_id,
-            expires_at,
-            created_at: chrono::Utc::now(),
-            revoked: false,
-        };
-        self.refresh_tokens
-            .write()
-            .await
-            .insert(token_hash.to_string(), token);
-        Ok(())
-    }
-
-    async fn validate_refresh_token(
-        &self,
-        token_hash: &str,
-    ) -> Result<Option<crate::neo4j::models::RefreshTokenNode>> {
-        let tokens = self.refresh_tokens.read().await;
-        match tokens.get(token_hash) {
-            Some(token) if !token.revoked && token.expires_at > chrono::Utc::now() => {
-                Ok(Some(token.clone()))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool> {
-        let mut tokens = self.refresh_tokens.write().await;
-        match tokens.get_mut(token_hash) {
-            Some(token) => {
-                token.revoked = true;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
-    async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64> {
-        let mut tokens = self.refresh_tokens.write().await;
-        let mut count = 0u64;
-        for token in tokens.values_mut() {
-            if token.user_id == user_id && !token.revoked {
-                token.revoked = true;
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-
-    // MCP Tokens
-    async fn create_mcp_token(
-        &self,
-        user_id: Uuid,
-        jti: &str,
-        label: &str,
-        scope: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<()> {
-        let token = crate::neo4j::models::McpTokenNode {
-            jti: jti.to_string(),
-            user_id,
-            label: label.to_string(),
-            scope: scope.to_string(),
-            expires_at,
-            created_at: chrono::Utc::now(),
-            revoked: false,
-        };
-        self.mcp_tokens.write().await.insert(jti.to_string(), token);
-        Ok(())
-    }
-
-    async fn is_mcp_token_active(&self, jti: &str) -> Result<bool> {
-        let tokens = self.mcp_tokens.read().await;
-        Ok(tokens
-            .get(jti)
-            .is_some_and(|t| !t.revoked && t.expires_at > chrono::Utc::now()))
-    }
-
-    async fn revoke_mcp_token(&self, user_id: Uuid, jti: &str) -> Result<bool> {
-        let mut tokens = self.mcp_tokens.write().await;
-        match tokens.get_mut(jti) {
-            Some(token) if token.user_id == user_id => {
-                token.revoked = true;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    async fn list_mcp_tokens(
-        &self,
-        user_id: Uuid,
-    ) -> Result<Vec<crate::neo4j::models::McpTokenNode>> {
-        let tokens = self.mcp_tokens.read().await;
-        Ok(tokens
-            .values()
-            .filter(|t| t.user_id == user_id)
-            .cloned()
-            .collect())
-    }
-
-    async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64> {
-        let mut tokens = self.mcp_tokens.write().await;
-        let now = chrono::Utc::now();
-        let before = tokens.len();
-        // Same predicate as the Cypher: owned by this user AND already dead.
-        tokens.retain(|_, t| !(t.user_id == user_id && (t.revoked || t.expires_at < now)));
-        Ok((before - tokens.len()) as u64)
     }
 
     // Feature Graphs
@@ -19385,5 +17967,1429 @@ impl AnalyticsStore for MockGraphStore {
             params,
             filter,
         ))
+    }
+}
+
+#[async_trait]
+impl ChatStore for MockGraphStore {
+    // ========================================================================
+    // Chat session operations
+    // ========================================================================
+
+    async fn create_chat_session(&self, session: &ChatSessionNode) -> Result<()> {
+        if self
+            .fail_session_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected failure of create_chat_session");
+        }
+        // As the Neo4j store: a session is created with its shell at home.
+        self.session_shell_moved
+            .write()
+            .await
+            .insert(session.id, false);
+        self.chat_sessions
+            .write()
+            .await
+            .insert(session.id, session.clone());
+        Ok(())
+    }
+
+    async fn get_chat_session(&self, id: Uuid) -> Result<Option<ChatSessionNode>> {
+        self.count_read();
+        // Failure injection without a `read_log` entry (counted read logs stay as they are).
+        if self
+            .fail_reads
+            .lock()
+            .is_ok_and(|f| f.contains("get_chat_session"))
+        {
+            anyhow::bail!("injected failure of get_chat_session");
+        }
+        Ok(self.chat_sessions.read().await.get(&id).cloned())
+    }
+
+    async fn list_chat_sessions(
+        &self,
+        project_slug: Option<&str>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+        include_detached: bool,
+    ) -> Result<(Vec<ChatSessionNode>, usize)> {
+        self.log_read("list_chat_sessions")?;
+        let sessions = self.chat_sessions.read().await;
+        // Collect workspace project slugs for membership check
+        let ws_project_slugs: Vec<String> = if let Some(ws) = workspace_slug {
+            let workspaces = self.workspaces.read().await;
+            if let Some(w) = workspaces.values().find(|w| w.slug == ws) {
+                let wp = self.workspace_projects.read().await;
+                let projects = self.projects.read().await;
+                wp.get(&w.id)
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|pid| projects.get(pid).map(|p| p.slug.clone()))
+                    .collect()
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+        let mut filtered: Vec<_> = sessions
+            .values()
+            .filter(|s| {
+                // Filter out detached sessions unless explicitly requested
+                if !include_detached && s.spawned_by.is_some() {
+                    return false;
+                }
+                if let Some(slug) = project_slug {
+                    s.project_slug.as_deref() == Some(slug)
+                } else if let Some(ws) = workspace_slug {
+                    // Match workspace_slug OR project_slug membership
+                    s.workspace_slug.as_deref() == Some(ws)
+                        || s.project_slug
+                            .as_deref()
+                            .is_some_and(|ps| ws_project_slugs.iter().any(|wps| wps == ps))
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        // Sort by updated_at descending
+        filtered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let total = filtered.len();
+        let page = paginate(&filtered, limit, offset);
+        Ok((page, total))
+    }
+
+    async fn get_session_children(&self, parent_id: Uuid) -> Result<Vec<ChatSessionNode>> {
+        let sessions = self.chat_sessions.read().await;
+        let parent_str = parent_id.to_string();
+        // A parent that no longer exists has no children (same as the Neo4j store).
+        let parent_exists = sessions.contains_key(&parent_id);
+        let mut children: Vec<_> = sessions
+            .values()
+            .filter(|_| parent_exists)
+            .filter(|s| {
+                s.spawned_by
+                    .as_ref()
+                    .is_some_and(|sb| sb.contains(&parent_str))
+            })
+            .cloned()
+            .collect();
+        children.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        drop(sessions);
+        let landing = self
+            .land_children_after_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&parent_id);
+        if let Some(landing) = landing {
+            let mut sessions = self.chat_sessions.write().await;
+            for child in landing {
+                sessions.insert(child.id, child);
+            }
+        }
+        Ok(children)
+    }
+
+    async fn create_spawned_by_relation(
+        &self,
+        child_session_id: &str,
+        parent_session_id: &str,
+        _spawn_type: &str,
+        run_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> Result<()> {
+        // Mock: only the thread-relevant part is tracked, as the link row the
+        // real store derives (plan of the run carried, else of the parent).
+        let (Ok(child), Ok(parent)) = (
+            child_session_id.parse::<Uuid>(),
+            parent_session_id.parse::<Uuid>(),
+        ) else {
+            return Ok(());
+        };
+        let mut rows = self.session_link_rows.write().await;
+        let plan = rows
+            .iter()
+            .filter(|r| {
+                r.session_id == parent
+                    && matches!(
+                        r.kind,
+                        SessionLinkKind::RunRelation | SessionLinkKind::PlanAssociation
+                    )
+            })
+            .find_map(|r| r.thread_plan_id);
+        rows.push(SessionLinkRow {
+            session_id: child,
+            kind: SessionLinkKind::SpawnedByRelation,
+            run_id,
+            task_id,
+            plan_id: plan,
+            thread_plan_id: plan,
+        });
+        Ok(())
+    }
+
+    async fn link_session_to_run(
+        &self,
+        session_id: &str,
+        run_id: Uuid,
+        plan_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> Result<bool> {
+        let Ok(sid) = session_id.parse::<Uuid>() else {
+            return Ok(false);
+        };
+        if !self.chat_sessions.read().await.contains_key(&sid) {
+            return Ok(false);
+        }
+        let mut rows = self.session_link_rows.write().await;
+        let already = rows.iter().any(|r| {
+            r.session_id == sid
+                && r.kind == SessionLinkKind::RunRelation
+                && r.run_id == Some(run_id)
+        });
+        if !already {
+            rows.push(SessionLinkRow {
+                session_id: sid,
+                kind: SessionLinkKind::RunRelation,
+                run_id: Some(run_id),
+                task_id,
+                plan_id,
+                thread_plan_id: plan_id,
+            });
+        }
+        Ok(true)
+    }
+
+    async fn get_session_link_rows(&self, session_ids: &[Uuid]) -> Result<Vec<SessionLinkRow>> {
+        self.log_read("get_session_link_rows")?;
+        self.session_link_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let rows = self.session_link_rows.read().await;
+        Ok(rows
+            .iter()
+            .filter(|r| session_ids.contains(&r.session_id))
+            .cloned()
+            .collect())
+    }
+
+    async fn get_plans_task_graph(&self, plan_ids: &[Uuid]) -> Result<PlansTaskGraph> {
+        self.log_read("get_plans_task_graph")?;
+        let plan_tasks = self.plan_tasks.read().await;
+        let tasks = self.tasks.read().await;
+        let deps = self.task_dependencies.read().await;
+        let mut graph = PlansTaskGraph::default();
+        for pid in plan_ids {
+            for tid in plan_tasks.get(pid).into_iter().flatten() {
+                if let Some(t) = tasks.get(tid) {
+                    graph.tasks.push((*pid, t.clone()));
+                }
+                for d in deps.get(tid).into_iter().flatten() {
+                    graph.edges.push((*tid, *d));
+                }
+            }
+        }
+        Ok(graph)
+    }
+
+    async fn list_project_workspace_rows(&self) -> Result<Vec<ProjectWorkspaceRow>> {
+        self.log_read("list_project_workspace_rows")?;
+        let workspaces = self.workspaces.read().await;
+        let projects = self.projects.read().await;
+        let wp = self.workspace_projects.read().await;
+        let mut rows = Vec::new();
+        for (wid, pids) in wp.iter() {
+            let Some(w) = workspaces.get(wid) else {
+                continue;
+            };
+            for pid in pids {
+                if let Some(p) = projects.get(pid) {
+                    rows.push(ProjectWorkspaceRow {
+                        project_id: p.id,
+                        project_slug: p.slug.clone(),
+                        workspace_id: w.id,
+                        workspace_slug: w.slug.clone(),
+                    });
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// P18-suite (point 12): a real traversal of the mock's `spawned_by`, with the
+    /// semantics of the Neo4j query — the session itself at depth 0, then every
+    /// descendant found through the JSON parent, breadth first, siblings by
+    /// `created_at`; an unknown session is an empty tree. `status`, provider, model
+    /// and costs stay unset here: the API fills them, as it does for the real store.
+    async fn get_session_tree(&self, session_id: &str) -> Result<Vec<SessionTreeNode>> {
+        let sessions = self.chat_sessions.read().await;
+        let Some(root) = sessions.values().find(|s| s.id.to_string() == session_id) else {
+            return Ok(Vec::new());
+        };
+        let node_of = |s: &ChatSessionNode, depth: u32| {
+            let spawn = spawned_by_of(s);
+            SessionTreeNode {
+                session_id: s.id.to_string(),
+                parent_session_id: if depth == 0 {
+                    None
+                } else {
+                    spawn.parent.clone()
+                },
+                spawn_type: if depth == 0 { None } else { spawn.kind.clone() },
+                run_id: if depth == 0 { None } else { spawn.run_id },
+                task_id: if depth == 0 { None } else { spawn.task_id },
+                depth,
+                created_at: Some(s.created_at),
+                provider_id: None,
+                model: None,
+                cost_usd: None,
+                subtree_cost_usd: None,
+                max_depth: None,
+                max_children: None,
+                status: "closed".to_string(),
+                routed_by: None,
+            }
+        };
+        let mut nodes = vec![node_of(root, 0)];
+        let mut frontier = vec![root.id.to_string()];
+        let mut seen: std::collections::HashSet<String> = frontier.iter().cloned().collect();
+        let mut depth = 0u32;
+        // The real query stops at ten hops (`SPAWNED_BY*0..10`).
+        while !frontier.is_empty() && depth < 10 {
+            depth += 1;
+            let mut next = Vec::new();
+            for parent in &frontier {
+                let mut children: Vec<&ChatSessionNode> = sessions
+                    .values()
+                    .filter(|s| spawned_by_of(s).parent.as_deref() == Some(parent.as_str()))
+                    .filter(|s| !seen.contains(&s.id.to_string()))
+                    .collect();
+                children.sort_by_key(|s| s.created_at);
+                for child in children {
+                    seen.insert(child.id.to_string());
+                    nodes.push(node_of(child, depth));
+                    next.push(child.id.to_string());
+                }
+            }
+            frontier = next;
+        }
+        Ok(nodes)
+    }
+
+    /// P18-suite (point 12): follow the JSON parent upward to the session that has
+    /// none — ten hops at most, a cycle stops the walk — or `None` for an unknown
+    /// session, as the Neo4j query answers.
+    async fn get_session_root(&self, session_id: &str) -> Result<Option<String>> {
+        let sessions = self.chat_sessions.read().await;
+        let by_id = |id: &str| sessions.values().find(|s| s.id.to_string() == id);
+        let Some(mut current) = by_id(session_id) else {
+            return Ok(None);
+        };
+        let mut seen = std::collections::HashSet::from([current.id.to_string()]);
+        for _ in 0..10 {
+            let Some(parent_id) = spawned_by_of(current).parent else {
+                break;
+            };
+            if !seen.insert(parent_id.clone()) {
+                break;
+            }
+            match by_id(&parent_id) {
+                Some(parent) => current = parent,
+                // A parent the store no longer holds: the walk ends on the last known session.
+                None => break,
+            }
+        }
+        Ok(Some(current.id.to_string()))
+    }
+
+    async fn get_run_sessions(&self, _run_id: Uuid) -> Result<Vec<SessionInfo>> {
+        // Mock: return empty
+        Ok(vec![])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn update_chat_session(
+        &self,
+        id: Uuid,
+        cli_session_id: Option<String>,
+        title: Option<String>,
+        message_count: Option<i64>,
+        total_cost_usd: Option<f64>,
+        conversation_id: Option<String>,
+        preview: Option<String>,
+    ) -> Result<Option<ChatSessionNode>> {
+        let mut sessions = self.chat_sessions.write().await;
+        if let Some(session) = sessions.get_mut(&id) {
+            session.updated_at = Utc::now();
+            if let Some(v) = cli_session_id {
+                session.cli_session_id = Some(v);
+            }
+            if let Some(v) = title {
+                session.title = Some(v);
+            }
+            if let Some(v) = message_count {
+                session.message_count = v;
+            }
+            if let Some(v) = total_cost_usd {
+                session.total_cost_usd = Some(v);
+            }
+            if let Some(v) = conversation_id {
+                session.conversation_id = Some(v);
+            }
+            if let Some(v) = preview {
+                session.preview = Some(v);
+            }
+            Ok(Some(session.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn add_chat_session_children_cost(&self, id: Uuid, delta_usd: f64) -> Result<f64> {
+        let delta = if delta_usd.is_finite() && delta_usd > 0.0 {
+            delta_usd
+        } else {
+            0.0
+        };
+        let mut costs = self.chat_children_costs.write().await;
+        let total = costs.entry(id).or_insert(0.0);
+        *total += delta;
+        Ok(*total)
+    }
+
+    async fn get_chat_session_children_cost(&self, id: Uuid) -> Result<f64> {
+        Ok(self
+            .chat_children_costs
+            .read()
+            .await
+            .get(&id)
+            .copied()
+            .unwrap_or(0.0))
+    }
+
+    async fn update_chat_session_permission_mode(&self, id: Uuid, mode: &str) -> Result<()> {
+        let mut sessions = self.chat_sessions.write().await;
+        if let Some(session) = sessions.get_mut(&id) {
+            session.permission_mode = Some(mode.to_string());
+            session.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn bind_chat_session_project(&self, id: Uuid, project_slug: &str) -> Result<bool> {
+        let mut sessions = self.chat_sessions.write().await;
+        let Some(session) = sessions.get_mut(&id) else {
+            return Ok(false);
+        };
+        if session
+            .project_slug
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            return Ok(false);
+        }
+        session.project_slug = Some(project_slug.to_string());
+        session.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    async fn update_chat_session_file_scope_lifted(&self, id: Uuid, lifted: bool) -> Result<()> {
+        let mut sessions = self.chat_sessions.write().await;
+        if let Some(session) = sessions.get_mut(&id) {
+            session.file_scope_lifted = lifted;
+            session.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()> {
+        let mut sessions = self.chat_sessions.write().await;
+        if let Some(session) = sessions.get_mut(&id) {
+            session.model = model.to_string();
+            session.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn set_chat_session_fingerprint(&self, id: Uuid, fingerprint: &str) -> Result<()> {
+        self.chat_fingerprints
+            .write()
+            .await
+            .insert(id, fingerprint.to_string());
+        Ok(())
+    }
+
+    async fn get_chat_session_fingerprint(&self, id: Uuid) -> Result<Option<String>> {
+        Ok(self.chat_fingerprints.read().await.get(&id).cloned())
+    }
+
+    async fn update_chat_session_routing(
+        &self,
+        id: Uuid,
+        routing_mode: Option<&str>,
+        routing_pool: Option<&str>,
+        routed_by: Option<&str>,
+    ) -> Result<bool> {
+        let mut sessions = self.chat_sessions.write().await;
+        let Some(session) = sessions.get_mut(&id) else {
+            return Ok(false);
+        };
+        session.routing_mode = routing_mode.map(str::to_owned);
+        session.routing_pool = routing_pool.map(str::to_owned);
+        session.routed_by = routed_by.map(str::to_owned);
+        session.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    async fn update_chat_session_provider(
+        &self,
+        id: Uuid,
+        provider_id: &str,
+        model: &str,
+        routed_by: &str,
+        engine: &str,
+    ) -> Result<bool> {
+        let mut sessions = self.chat_sessions.write().await;
+        let Some(session) = sessions.get_mut(&id) else {
+            return Ok(false);
+        };
+        session.provider_id = Some(provider_id.to_owned());
+        session.model = model.to_owned();
+        session.routed_by = Some(routed_by.to_owned());
+        // Providers do not share a session format: a resume token is refused across
+        // families, so the provider-specific fields are cleared (as the Neo4j store does).
+        session.resume_token = None;
+        session.capabilities = None;
+        session.cli_session_id = None;
+        session.engine = Some(engine.to_owned());
+        session.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    async fn restore_chat_session_provider(
+        &self,
+        node: &ChatSessionNode,
+        provider_id: &str,
+    ) -> Result<bool> {
+        let mut sessions = self.chat_sessions.write().await;
+        let Some(session) = sessions.get_mut(&node.id) else {
+            return Ok(false);
+        };
+        session.provider_id = Some(provider_id.to_owned());
+        session.model = node.model.clone();
+        session.routed_by = node.routed_by.clone();
+        session.resume_token = node.resume_token.clone();
+        session.capabilities = node.capabilities.clone();
+        session.cli_session_id = node.cli_session_id.clone();
+        session.engine = node.engine.clone();
+        session.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>> {
+        loop {
+            let released = self.llm_setting_writes_released.notified();
+            let stalled = self
+                .stall_llm_setting_reads_of
+                .lock()
+                .is_ok_and(|s| s.contains(key));
+            if !stalled {
+                break;
+            }
+            released.await;
+        }
+        if self
+            .fail_llm_setting_reads_of
+            .lock()
+            .is_ok_and(|s| s.contains(key))
+        {
+            anyhow::bail!("mock: injected failure of the read of setting {key}");
+        }
+        Ok(self
+            .llm_settings
+            .read()
+            .await
+            .get(&(scope.to_string(), key.to_string()))
+            .cloned())
+    }
+    async fn put_llm_setting(&self, scope: &str, key: &str, value: &str) -> Result<()> {
+        if scope == "journal"
+            && self
+                .fail_journal_writes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("mock: the send journal cannot be written");
+        }
+        self.llm_setting_write_gate(key, false).await?;
+        self.llm_settings
+            .write()
+            .await
+            .insert((scope.to_string(), key.to_string()), value.to_string());
+        Ok(())
+    }
+    async fn delete_llm_setting(&self, scope: &str, key: &str) -> Result<bool> {
+        self.llm_setting_write_gate(key, true).await?;
+        Ok(self
+            .llm_settings
+            .write()
+            .await
+            .remove(&(scope.to_string(), key.to_string()))
+            .is_some())
+    }
+    async fn list_llm_settings(&self, scope: &str, prefix: &str) -> Result<Vec<(String, String)>> {
+        let mut rows: Vec<(String, String)> = self
+            .llm_settings
+            .read()
+            .await
+            .iter()
+            .filter(|((s, k), _)| s == scope && k.starts_with(prefix))
+            .map(|((_, k), v)| (k.clone(), v.clone()))
+            .collect();
+        rows.sort();
+        Ok(rows)
+    }
+
+    async fn update_chat_session_harness(
+        &self,
+        id: Uuid,
+        capabilities: Option<&str>,
+        resume_token: Option<&str>,
+    ) -> Result<()> {
+        if self
+            .fail_harness_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("mock: the capability snapshot write failed");
+        }
+        let mut sessions = self.chat_sessions.write().await;
+        if let Some(session) = sessions.get_mut(&id) {
+            if let Some(c) = capabilities {
+                session.capabilities = Some(c.to_string());
+            }
+            if let Some(t) = resume_token {
+                session.resume_token = Some(t.to_string());
+            }
+            session.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn set_chat_session_shell_moved(&self, id: Uuid) -> Result<()> {
+        if self.chat_sessions.read().await.contains_key(&id) {
+            self.session_shell_moved.write().await.insert(id, true);
+        }
+        Ok(())
+    }
+
+    async fn get_chat_session_shell_moved(&self, id: Uuid) -> Result<Option<bool>> {
+        Ok(self.session_shell_moved.read().await.get(&id).copied())
+    }
+
+    async fn backfill_chat_session_previews(&self) -> Result<usize> {
+        // Mock: no events stored, nothing to backfill
+        Ok(0)
+    }
+
+    async fn delete_chat_session(&self, id: Uuid) -> Result<bool> {
+        // Anchors and their journal go with the session; their targets stay.
+        let mut anchors = self.anchor_store.write().await;
+        anchors.anchors.retain(|_, a| a.session_id != id);
+        anchors.events.retain(|e| e.session_id != id);
+        anchors.versions.remove(&id);
+        drop(anchors);
+        // Same lock order as `save_session_episode` (sessions, then episodes).
+        let mut sessions = self.chat_sessions.write().await;
+        let existed = sessions.remove(&id).is_some();
+        self.session_episodes.write().await.remove(&id);
+        Ok(existed)
+    }
+
+    // Session episodes — same rules as the Neo4j store: written only while the session
+    // exists, one per session.
+
+    async fn save_session_episode(
+        &self,
+        episode: &crate::episodes::models::Episode,
+    ) -> Result<bool> {
+        self.session_episode_save_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .fail_session_episode_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("mock: session episode write failed");
+        }
+        let Some(session) = episode.session.as_ref() else {
+            return Ok(false);
+        };
+        // The session lock held across the write: a delete cannot slip in between.
+        let sessions = self.chat_sessions.read().await;
+        if !sessions.contains_key(&session.session_id) {
+            return Ok(false);
+        }
+        self.session_episodes
+            .write()
+            .await
+            .insert(session.session_id, episode.clone());
+        Ok(true)
+    }
+
+    async fn list_session_episodes(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<crate::episodes::models::Episode>> {
+        let mut out: Vec<_> = self
+            .session_episodes
+            .read()
+            .await
+            .values()
+            .filter(|e| e.project_id == project_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.collected_at.cmp(&a.collected_at));
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Over the session episodes, as the Neo4j store does (cosine on the stored
+    /// embedding; an episode without one is never a hit).
+    async fn search_episodes_by_embedding(
+        &self,
+        project_id: Uuid,
+        embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(crate::episodes::models::Episode, f64)>> {
+        let mut hits: Vec<(crate::episodes::models::Episode, f64)> = self
+            .session_episodes
+            .read()
+            .await
+            .values()
+            .filter(|e| e.project_id == project_id)
+            .filter_map(|e| {
+                let stored = e.embedding.as_ref()?;
+                Some((e.clone(), cosine_similarity(stored, embedding)))
+            })
+            .collect();
+        hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    async fn agent_identity_namespace(&self) -> Result<Uuid> {
+        // One lock for the read and the creation: the MERGE of the Neo4j store.
+        let mut root = self
+            .agent_identity_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(*root.get_or_insert_with(Uuid::new_v4))
+    }
+
+    // Chat anchors — same rules as the Neo4j store (both call `anchor::apply_op`).
+
+    async fn apply_anchor_op_if(
+        &self,
+        session_id: Uuid,
+        op: crate::chat::anchor::AnchorOp,
+        if_match: Option<u64>,
+    ) -> Result<crate::chat::anchor::AnchorSetChange> {
+        use crate::chat::anchor::*;
+        // One lock over anchors + journal: state and event change together.
+        let mut store = self.anchor_store.write().await;
+        if !self.chat_sessions.read().await.contains_key(&session_id) {
+            return Err(AnchorError::SessionNotFound(session_id).into());
+        }
+        let current = store.versions.get(&session_id).copied().unwrap_or(0);
+        if let Some(expected) = if_match.filter(|v| *v != current) {
+            return Err(AnchorError::SetVersionConflict {
+                expected,
+                actual: current,
+            }
+            .into());
+        }
+        let existing: Vec<Anchor> = store
+            .anchors
+            .values()
+            .filter(|a| a.session_id == session_id)
+            .cloned()
+            .collect();
+        let mut change = apply_op(session_id, &existing, op, chrono::Utc::now())?;
+        let next_seq = current + 1;
+        if let Some(ev) = change.event.as_mut() {
+            ev.seq = next_seq;
+        }
+        let version = if change.event.is_some() {
+            store.versions.insert(session_id, next_seq);
+            next_seq
+        } else {
+            current
+        };
+        if change.deleted {
+            store.anchors.remove(&change.anchor.id);
+        } else if change.event.is_some() {
+            store
+                .anchors
+                .insert(change.anchor.id, change.anchor.clone());
+        }
+        if let Some(ev) = &change.event {
+            store.events.push(ev.clone());
+        }
+        Ok(AnchorSetChange { change, version })
+    }
+
+    async fn get_anchor_set(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<crate::chat::anchor::AnchorSet>> {
+        // Same lock as the writes: anchors and version are one consistent read.
+        let store = self.anchor_store.read().await;
+        if !self.chat_sessions.read().await.contains_key(&session_id) {
+            return Ok(None);
+        }
+        let mut anchors: Vec<_> = store
+            .anchors
+            .values()
+            .filter(|a| a.session_id == session_id)
+            .cloned()
+            .collect();
+        anchors.sort_by_key(|a| (a.created_at, a.id));
+        Ok(Some(crate::chat::anchor::AnchorSet {
+            version: store.versions.get(&session_id).copied().unwrap_or(0),
+            anchors,
+        }))
+    }
+
+    async fn list_session_anchors(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::chat::anchor::Anchor>> {
+        self.count_read();
+        let store = self.anchor_store.read().await;
+        let mut v: Vec<_> = store
+            .anchors
+            .values()
+            .filter(|a| a.session_id == session_id)
+            .cloned()
+            .collect();
+        v.sort_by_key(|a| (a.created_at, a.id));
+        Ok(v)
+    }
+
+    async fn list_sessions_for_target(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+        state: Option<crate::chat::anchor::AnchorState>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<crate::chat::anchor::AnchorPage> {
+        let limit = limit.clamp(1, 200);
+        let after = cursor.unwrap_or("").to_string();
+        let store = self.anchor_store.read().await;
+        let mut items: Vec<_> = store
+            .anchors
+            .values()
+            .filter(|a| a.target_type == target_type && a.target_id == target_id)
+            .filter(|a| state.is_none_or(|s| a.state == s))
+            .filter(|a| after.is_empty() || a.id.to_string() > after)
+            .cloned()
+            .collect();
+        items.sort_by_key(|a| a.id.to_string());
+        items.truncate(limit + 1);
+        let next_cursor = if items.len() > limit {
+            items.truncate(limit);
+            items.last().map(|a| a.id.to_string())
+        } else {
+            None
+        };
+        Ok(crate::chat::anchor::AnchorPage { items, next_cursor })
+    }
+
+    async fn list_anchor_events(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::chat::anchor::AnchorEvent>> {
+        let store = self.anchor_store.read().await;
+        let mut out: Vec<_> = store
+            .events
+            .iter()
+            .filter(|e| e.session_id == session_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|e| (e.seq, e.at, e.id));
+        Ok(out)
+    }
+
+    async fn create_execution_place_event(
+        &self,
+        event: &crate::neo4j::models::ExecutionPlaceEvent,
+    ) -> Result<()> {
+        self.execution_place_events
+            .write()
+            .await
+            .push(event.clone());
+        Ok(())
+    }
+
+    async fn list_execution_place_events(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::models::ExecutionPlaceEvent>> {
+        let mut out: Vec<_> = self
+            .execution_place_events
+            .read()
+            .await
+            .iter()
+            .filter(|e| e.task_id == task_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|e| (e.at, e.id));
+        Ok(out)
+    }
+
+    async fn mark_anchors_dangling(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+    ) -> Result<usize> {
+        use crate::chat::anchor::*;
+        let todo: Vec<(Uuid, Uuid)> = self
+            .anchor_store
+            .read()
+            .await
+            .anchors
+            .values()
+            .filter(|a| {
+                a.target_type == target_type
+                    && a.target_id == target_id
+                    && a.state != AnchorState::Dangling
+            })
+            .map(|a| (a.session_id, a.id))
+            .collect();
+        let mut changed = 0;
+        for (session_id, anchor_id) in todo {
+            let op = AnchorOp::SetState {
+                anchor_id,
+                state: AnchorState::Dangling,
+                expected_version: None,
+                by: AnchorActor::System,
+                actor: DANGLING_ACTOR.to_string(),
+            };
+            if self.apply_anchor_op(session_id, op).await?.event.is_some() {
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
+
+    async fn backfill_project_anchors(&self) -> Result<crate::chat::anchor::BackfillReport> {
+        use crate::chat::anchor::*;
+        let mut sessions: Vec<(Uuid, String)> = self
+            .chat_sessions
+            .read()
+            .await
+            .values()
+            .filter_map(|s| {
+                s.project_slug
+                    .clone()
+                    .filter(|p| !p.is_empty())
+                    .map(|p| (s.id, p))
+            })
+            .collect();
+        sessions.sort();
+        let mut report = BackfillReport::default();
+        for (session_id, slug) in sessions {
+            let matches: Vec<ProjectNode> = self
+                .projects
+                .read()
+                .await
+                .values()
+                .filter(|p| p.slug == slug)
+                .cloned()
+                .collect();
+            let [project] = matches.as_slice() else {
+                report.skipped_unresolved += 1;
+                continue;
+            };
+            match self
+                .apply_anchor_op(session_id, AnchorOp::Add(backfill_new_anchor(project)))
+                .await
+            {
+                Ok(c) if c.created => report.created += 1,
+                Ok(_) => report.already_present += 1,
+                Err(e) => match e.downcast_ref::<AnchorError>() {
+                    Some(AnchorError::AlreadyAnchored { .. }) => report.already_present += 1,
+                    Some(AnchorError::SessionNotFound(_)) => report.skipped_unresolved += 1,
+                    Some(_) => report.skipped_by_rule += 1,
+                    None => return Err(e),
+                },
+            }
+        }
+        Ok(report)
+    }
+
+    async fn backfill_spawned_by_edges(&self) -> Result<usize> {
+        // The mock keeps no edges: its only lineage is the `spawned_by` JSON.
+        Ok(0)
+    }
+
+    async fn revert_inferred_anchors(&self) -> Result<usize> {
+        use crate::chat::anchor::*;
+        let mut store = self.anchor_store.write().await;
+        let doomed: Vec<Uuid> = store
+            .anchors
+            .values()
+            .filter(|a| {
+                let added_by = store
+                    .events
+                    .iter()
+                    .find(|e| e.anchor_id == a.id && e.kind == AnchorEventKind::Added)
+                    .map(|e| e.actor.as_str());
+                is_revertible_backfill(a, added_by)
+            })
+            .map(|a| a.id)
+            .collect();
+        for id in &doomed {
+            store.anchors.remove(id);
+        }
+        store.events.retain(|e| !doomed.contains(&e.anchor_id));
+        Ok(doomed.len())
+    }
+
+    // Chat event operations
+
+    async fn store_chat_events(
+        &self,
+        session_id: Uuid,
+        events: Vec<ChatEventRecord>,
+    ) -> Result<()> {
+        loop {
+            // Created before the check: a release in between still wakes it.
+            let released = self.chat_events_released.notified();
+            let stalled = self
+                .stall_chat_events_of
+                .lock()
+                .is_ok_and(|s| events.iter().any(|e| s.contains(&e.event_type)));
+            if !stalled {
+                break;
+            }
+            released.await;
+        }
+        let mut store = self.chat_events.write().await;
+        let entry = store.entry(session_id).or_default();
+        entry.extend(events);
+        Ok(())
+    }
+
+    async fn get_chat_events(
+        &self,
+        session_id: Uuid,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<ChatEventRecord>> {
+        let store = self.chat_events.read().await;
+        let events = store
+            .get(&session_id)
+            .map(|v| {
+                v.iter()
+                    .filter(|e| e.seq > after_seq)
+                    .take(limit as usize)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(events)
+    }
+
+    async fn get_attention_events(&self, session_ids: &[Uuid]) -> Result<Vec<ChatEventRecord>> {
+        self.log_read("get_attention_events")?;
+        let store = self.chat_events.read().await;
+        let mut out = Vec::new();
+        for id in session_ids {
+            if let Some(events) = store.get(id) {
+                for e in events {
+                    if matches!(
+                        e.event_type.as_str(),
+                        "permission_request"
+                            | "permission_decision"
+                            | "ask_user_question"
+                            | "session_error"
+                    ) {
+                        out.push(e.clone());
+                    } else if e.event_type == "user_message" {
+                        let mut e = e.clone();
+                        e.data = String::new();
+                        out.push(e);
+                    }
+                }
+            }
+        }
+        out.sort_by_key(|e| (e.session_id, e.seq));
+        Ok(out)
+    }
+
+    async fn get_chat_events_paginated(
+        &self,
+        session_id: Uuid,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<ChatEventRecord>> {
+        let store = self.chat_events.read().await;
+        let events = store
+            .get(&session_id)
+            .map(|v| {
+                let mut sorted = v.clone();
+                sorted.sort_by_key(|e| e.seq);
+                sorted
+                    .into_iter()
+                    .skip(offset as usize)
+                    .take(limit as usize)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(events)
+    }
+
+    async fn count_chat_events(&self, session_id: Uuid) -> Result<i64> {
+        let store = self.chat_events.read().await;
+        let count = store.get(&session_id).map(|v| v.len() as i64).unwrap_or(0);
+        Ok(count)
+    }
+
+    async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> Result<i64> {
+        let store = self.chat_events.read().await;
+        let max_seq = store
+            .get(&session_id)
+            .and_then(|v| v.iter().map(|e| e.seq).max())
+            .unwrap_or(0);
+        Ok(max_seq)
+    }
+
+    async fn delete_chat_events(&self, session_id: Uuid) -> Result<()> {
+        self.chat_events.write().await.remove(&session_id);
+        Ok(())
+    }
+
+    // ========================================================================
+    // Chat DISCUSSED relations
+    // ========================================================================
+
+    async fn add_discussed(
+        &self,
+        session_id: Uuid,
+        entities: &[(String, String)],
+    ) -> Result<usize> {
+        // Mock: record the call and answer as if all were created
+        self.discussed_calls
+            .write()
+            .await
+            .push((session_id, entities.to_vec()));
+        Ok(entities.len())
+    }
+
+    async fn get_session_entities(
+        &self,
+        _session_id: Uuid,
+        _project_id: Option<Uuid>,
+    ) -> Result<Vec<DiscussedEntity>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_discussed_co_changers(
+        &self,
+        _project_id: Uuid,
+        _max_sessions: i64,
+        _max_results: i64,
+    ) -> Result<Vec<CoChanger>> {
+        Ok(Vec::new())
+    }
+
+    async fn backfill_discussed(&self) -> Result<(usize, usize, usize)> {
+        Ok((0, 0, 0))
+    }
+
+    // ========================================================================
+    // Chat ↔ Plan/Task/RFC linking (ASSOCIATED_WITH relation)
+    // ========================================================================
+
+    async fn create_associated_with(
+        &self,
+        _session_id: Uuid,
+        _entity_type: &str,
+        _entity_id: Uuid,
+        _source: &str,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn get_session_links(&self, _session_id: Uuid) -> Result<LinkedSessionInfo> {
+        Ok(LinkedSessionInfo::default())
+    }
+
+    async fn get_sessions_for_plan(&self, _plan_id: Uuid) -> Result<Vec<SessionWithLinks>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_sessions_for_task(&self, _task_id: Uuid) -> Result<Vec<SessionWithLinks>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_session_links_batch(
+        &self,
+        _session_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, LinkedSessionInfo>> {
+        Ok(std::collections::HashMap::new())
+    }
+
+    async fn get_task_plan_id(&self, task_id: Uuid) -> Result<Option<Uuid>> {
+        let pt = self.plan_tasks.read().await;
+        Ok(pt
+            .iter()
+            .find(|(_, ids)| ids.contains(&task_id))
+            .map(|(plan_id, _)| *plan_id))
+    }
+}
+
+#[async_trait]
+impl AuthStore for MockGraphStore {
+    // ========================================================================
+    // User / Auth operations
+    // ========================================================================
+
+    async fn upsert_user(&self, user: &UserNode) -> Result<UserNode> {
+        use crate::neo4j::models::AuthProvider;
+
+        let mut users = self.users.write().await;
+
+        // Find existing user based on auth provider strategy
+        let existing_id = match user.auth_provider {
+            AuthProvider::Oidc => {
+                // OIDC: match on auth_provider + external_id
+                let ext_id = user.external_id.as_deref().unwrap_or_default();
+                users
+                    .values()
+                    .find(|u| {
+                        u.auth_provider == AuthProvider::Oidc
+                            && u.external_id.as_deref() == Some(ext_id)
+                    })
+                    .map(|u| u.id)
+            }
+            AuthProvider::Password => {
+                // Password: match on auth_provider + email
+                users
+                    .values()
+                    .find(|u| u.auth_provider == AuthProvider::Password && u.email == user.email)
+                    .map(|u| u.id)
+            }
+        };
+
+        if let Some(id) = existing_id {
+            // Update existing user
+            let existing = users.get_mut(&id).unwrap();
+            existing.email = user.email.clone();
+            existing.name = user.name.clone();
+            existing.picture_url = user.picture_url.clone();
+            existing.last_login_at = user.last_login_at;
+            Ok(existing.clone())
+        } else {
+            // Insert new user
+            users.insert(user.id, user.clone());
+            Ok(user.clone())
+        }
+    }
+
+    async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserNode>> {
+        Ok(self.users.read().await.get(&id).cloned())
+    }
+
+    async fn get_user_by_provider_id(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<Option<UserNode>> {
+        let provider_parsed: crate::neo4j::models::AuthProvider =
+            provider.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+        Ok(self
+            .users
+            .read()
+            .await
+            .values()
+            .find(|u| {
+                u.auth_provider == provider_parsed && u.external_id.as_deref() == Some(external_id)
+            })
+            .cloned())
+    }
+
+    async fn get_user_by_email_and_provider(
+        &self,
+        email: &str,
+        provider: &str,
+    ) -> Result<Option<UserNode>> {
+        let provider_parsed: crate::neo4j::models::AuthProvider =
+            provider.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+        Ok(self
+            .users
+            .read()
+            .await
+            .values()
+            .find(|u| u.email == email && u.auth_provider == provider_parsed)
+            .cloned())
+    }
+
+    async fn get_user_by_email(&self, email: &str) -> Result<Option<UserNode>> {
+        Ok(self
+            .users
+            .read()
+            .await
+            .values()
+            .find(|u| u.email == email)
+            .cloned())
+    }
+
+    async fn create_password_user(
+        &self,
+        email: &str,
+        name: &str,
+        password_hash: &str,
+    ) -> Result<UserNode> {
+        let now = chrono::Utc::now();
+        let user = UserNode {
+            id: Uuid::new_v4(),
+            email: email.to_string(),
+            name: name.to_string(),
+            picture_url: None,
+            auth_provider: crate::neo4j::models::AuthProvider::Password,
+            external_id: None,
+            password_hash: Some(password_hash.to_string()),
+            created_at: now,
+            last_login_at: now,
+        };
+        self.upsert_user(&user).await
+    }
+
+    async fn list_users(&self) -> Result<Vec<UserNode>> {
+        Ok(self.users.read().await.values().cloned().collect())
+    }
+
+    // Refresh Tokens
+    async fn create_refresh_token(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let token = crate::neo4j::models::RefreshTokenNode {
+            token_hash: token_hash.to_string(),
+            user_id,
+            expires_at,
+            created_at: chrono::Utc::now(),
+            revoked: false,
+        };
+        self.refresh_tokens
+            .write()
+            .await
+            .insert(token_hash.to_string(), token);
+        Ok(())
+    }
+
+    async fn validate_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<crate::neo4j::models::RefreshTokenNode>> {
+        let tokens = self.refresh_tokens.read().await;
+        match tokens.get(token_hash) {
+            Some(token) if !token.revoked && token.expires_at > chrono::Utc::now() => {
+                Ok(Some(token.clone()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool> {
+        let mut tokens = self.refresh_tokens.write().await;
+        match tokens.get_mut(token_hash) {
+            Some(token) => {
+                token.revoked = true;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64> {
+        let mut tokens = self.refresh_tokens.write().await;
+        let mut count = 0u64;
+        for token in tokens.values_mut() {
+            if token.user_id == user_id && !token.revoked {
+                token.revoked = true;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    // MCP Tokens
+    async fn create_mcp_token(
+        &self,
+        user_id: Uuid,
+        jti: &str,
+        label: &str,
+        scope: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let token = crate::neo4j::models::McpTokenNode {
+            jti: jti.to_string(),
+            user_id,
+            label: label.to_string(),
+            scope: scope.to_string(),
+            expires_at,
+            created_at: chrono::Utc::now(),
+            revoked: false,
+        };
+        self.mcp_tokens.write().await.insert(jti.to_string(), token);
+        Ok(())
+    }
+
+    async fn is_mcp_token_active(&self, jti: &str) -> Result<bool> {
+        let tokens = self.mcp_tokens.read().await;
+        Ok(tokens
+            .get(jti)
+            .is_some_and(|t| !t.revoked && t.expires_at > chrono::Utc::now()))
+    }
+
+    async fn revoke_mcp_token(&self, user_id: Uuid, jti: &str) -> Result<bool> {
+        let mut tokens = self.mcp_tokens.write().await;
+        match tokens.get_mut(jti) {
+            Some(token) if token.user_id == user_id => {
+                token.revoked = true;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn list_mcp_tokens(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::models::McpTokenNode>> {
+        let tokens = self.mcp_tokens.read().await;
+        Ok(tokens
+            .values()
+            .filter(|t| t.user_id == user_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64> {
+        let mut tokens = self.mcp_tokens.write().await;
+        let now = chrono::Utc::now();
+        let before = tokens.len();
+        // Same predicate as the Cypher: owned by this user AND already dead.
+        tokens.retain(|_, t| !(t.user_id == user_id && (t.revoked || t.expires_at < now)));
+        Ok((before - tokens.len()) as u64)
     }
 }

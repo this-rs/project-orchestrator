@@ -698,7 +698,7 @@ mod tests {
         let mut orphan = crate::test_helpers::test_chat_session(Some("gone"));
         orphan.preview = Some("hello".into());
         let orphan_id = orphan.id;
-        crate::neo4j::AnalyticsStore::create_chat_session(&store, &orphan)
+        crate::neo4j::ChatStore::create_chat_session(&store, &orphan)
             .await
             .unwrap();
         assert!(collect_session_episode(&store, orphan_id, "closed")
