@@ -742,21 +742,35 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn an_offline_catalog_leaves_every_claude_code_model_ineligible_by_name() {
+        async fn an_offline_catalog_still_lets_claude_code_models_through() {
+            // The static fallback carries 200K windows, so the cognitive router
+            // does not reject every model as WindowUnknown(CatalogOffline).
             let offline = ModelCatalogCache::new(None).snapshot().await;
             assert!(!offline.live);
             let pool = facts(CLAUDE_CODE, &offline);
-            assert!(
-                !pool.is_empty(),
-                "the models stay listed, with their reason"
-            );
+            assert!(!pool.is_empty(), "the models stay listed");
             let out = apply(Slot::Automatic, &turn(10_000), &pool).unwrap();
-            assert!(out.eligible.is_empty());
+            assert!(
+                !out.eligible.is_empty(),
+                "offline models with curated 200K windows are eligible"
+            );
+            assert!(
+                out.rejected.is_empty()
+                    || out
+                        .rejected
+                        .iter()
+                        .all(|r| !matches!(r.reason, RejectReason::WindowUnknown { .. })),
+                "no WindowUnknown rejections"
+            );
+        }
+
+        #[test]
+        fn window_unknown_reason_serializes_correctly() {
+            // Split from the offline test: the enum variants still work.
             let reason = RejectReason::WindowUnknown {
                 need: 10_000,
                 why: UnknownWindow::CatalogOffline,
             };
-            assert!(out.rejected.iter().all(|r| r.reason == reason));
             assert_eq!(reason.code(), "window_unknown");
             assert_eq!(
                 UnknownWindow::CatalogOffline.to_string(),

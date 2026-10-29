@@ -392,9 +392,7 @@ mod tests {
     mod claude_code_window {
         use super::*;
         use crate::chat::model_catalog::{refreshed_cache_for_test, ModelCatalogCache};
-        use crate::chat::provider::cognitive::candidates::{
-            self, ModelFacts, RejectReason, Slot, UnknownWindow,
-        };
+        use crate::chat::provider::cognitive::candidates::{self, ModelFacts, Slot};
         use crate::chat::provider::cognitive::decider::CognitiveRouting;
         use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
         use crate::chat::provider::cognitive::store::InMemoryRoutingStore;
@@ -460,17 +458,17 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn offline_every_claude_code_model_is_listed_and_rejected_by_name() {
+        async fn offline_claude_code_models_are_still_eligible() {
+            // The static fallback carries 200K windows so the cognitive router
+            // does not reject models as WindowUnknown(CatalogOffline).
             let pool = claude_code_pool(ModelCatalogCache::new(None)).await;
             assert!(!pool.is_empty());
             let signature = TaskSignature::utility(TaskClass::UtilityFeatureGraph, 10_000, None);
             let out = candidates::apply(Slot::Automatic, &signature, &pool).unwrap();
-            assert!(out.eligible.is_empty());
-            assert!(out.rejected.iter().all(|r| r.reason
-                == RejectReason::WindowUnknown {
-                    need: 10_000,
-                    why: UnknownWindow::CatalogOffline
-                }));
+            assert!(
+                !out.eligible.is_empty(),
+                "offline models with curated 200K windows are eligible"
+            );
         }
     }
 
