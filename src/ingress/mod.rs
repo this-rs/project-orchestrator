@@ -5,7 +5,6 @@
 //! l'authentification ne sont comptés qu'en mémoire (`guard`). Ce module ne
 //! contient aucun secret (la règle ne porte qu'une référence `vault:<nom>`) et ne
 //! journalise jamais le corps de la requête.
-use crate::neo4j::AnalyticsStore;
 
 pub mod guard;
 pub mod model;
@@ -33,10 +32,7 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::GraphStore;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     fn event(trigger_id: uuid::Uuid, received_at: chrono::DateTime<chrono::Utc>) -> ExternalEvent {
         ExternalEvent {

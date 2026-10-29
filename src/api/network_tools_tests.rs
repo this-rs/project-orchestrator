@@ -7,10 +7,7 @@ use crate::chat::provider::nexus_tools::{GraphConsents, ToolConsents};
 use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::GraphStore;
 
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::traits::*;
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::test_helpers::{mock_app_state_with_graph, test_bearer_token, test_project_named};
 use axum::body::Body;

@@ -20,7 +20,6 @@ use crate::neo4j::traits::GraphStore;
 
 use super::derive::{derive_topology, ProjectInput};
 use super::DERIVED_CONFIG_KEY;
-use crate::neo4j::WorkspaceStore;
 
 /// What a derivation run changed, for logs and for the API response.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -176,10 +175,7 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{ComponentType, ProjectNode, WorkspaceNode};
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     fn temp_root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(

@@ -39,6 +39,7 @@ use uuid::Uuid;
 use super::trigger::EventTrigger;
 use super::types::{CrudAction, CrudEvent, EntityType, EventEmitter};
 use crate::neo4j::GraphStore;
+use crate::neo4j::traits::*;
 
 /// Type alias for async reaction handler functions.
 ///
@@ -503,10 +504,7 @@ impl ReactorBuilder {
 mod tests {
     use super::*;
     use crate::events::EventEmitter;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use std::sync::atomic::AtomicUsize;
     use tokio::time::{sleep, Duration};
 

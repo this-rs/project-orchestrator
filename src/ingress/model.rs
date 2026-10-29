@@ -44,10 +44,7 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::GraphStore;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use chrono::TimeZone;
 
     fn event(trigger_id: Uuid, outcome: IngressOutcome, secs: i64) -> ExternalEvent {

@@ -28,6 +28,7 @@ use crate::runner::state::{AttemptCost, BudgetBreach, RunBudget, RunnerState};
 use crate::runner::vector::VectorCollector;
 use crate::runner::verifier::TaskVerifier;
 
+use crate::neo4j::traits::*;
 use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -5884,10 +5885,7 @@ impl Clone for PlanRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::runner::models::TriggerSource;
 
     /// Mutex to serialize tests that touch global RUNNER_STATE / RUNNER_CANCEL

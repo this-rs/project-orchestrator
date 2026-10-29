@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::episodes::models::*;
 use crate::neo4j::GraphStore;
+use crate::neo4j::traits::*;
 
 /// Collect a complete Episode from a completed ProtocolRun.
 ///
@@ -378,10 +379,7 @@ impl DistillationBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use chrono::Utc;
 
     fn sample_episode() -> Episode {

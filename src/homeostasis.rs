@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
 
+use crate::neo4j::traits::*;
 use crate::notes::manager::NoteManager;
 
 /// Maximum number of corrective actions per evaluation cycle.
@@ -424,10 +425,7 @@ pub async fn execute_actions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     /// Helper to build metrics with defaults.
     fn healthy_metrics() -> HomeostasisMetrics {

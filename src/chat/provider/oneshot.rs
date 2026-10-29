@@ -20,6 +20,7 @@ use super::resolver::{self, Candidate, ResolveError, ResolveInput, Role, RoutedB
 use super::{catalog, native_factory, settings, store};
 use crate::chat::agent_runtime::ProviderSource;
 use crate::neo4j::GraphStore;
+use crate::neo4j::traits::*;
 
 /// How long the health preflight of a one-shot may take.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -205,10 +206,7 @@ mod tests {
         INSTANCE_PREFIX, ROLES_KEY,
     };
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     async fn stored(graph: &MockGraphStore, id: &str) -> InstanceRecord {
         let record = InstanceRecord {

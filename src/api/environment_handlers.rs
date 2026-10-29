@@ -17,6 +17,7 @@ use crate::neo4j::models::{
     DeploymentMatrixEntry, DeploymentNode, DeploymentStatus, EnvironmentKind, EnvironmentNode,
 };
 
+use crate::neo4j::traits::*;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -429,10 +430,7 @@ mod tests {
     use crate::events::CrudAction;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::GraphStore;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::orchestrator::watcher::FileWatcher;
     use crate::orchestrator::Orchestrator;
     use crate::test_helpers::{

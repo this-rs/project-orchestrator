@@ -26,6 +26,7 @@ use std::sync::Arc;
 use crate::neo4j::models::DecisionNode;
 use crate::neo4j::traits::GraphStore;
 
+use crate::neo4j::traits::*;
 use crate::neurons::AutoReinforcementConfig;
 use crate::notes::models::Note;
 use crate::skills::cache::{evaluate_cached_skill, SkillCache};
@@ -1805,10 +1806,7 @@ pub fn rank_skills(
 #[cfg(test)]
 mod rank_tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::skills::{SkillNode, SkillStatus};
 
     fn skill(name: &str, project_id: Option<Uuid>) -> SkillNode {

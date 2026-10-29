@@ -36,7 +36,6 @@ use serde::{Deserialize, Serialize};
 
 use super::manager::ChatManager;
 use super::provider::settings::GLOBAL;
-use crate::neo4j::AnalyticsStore;
 use crate::neo4j::GraphStore;
 
 /// Key of the stored document, under the [`GLOBAL`] scope.
@@ -236,10 +235,7 @@ mod tests {
     use super::*;
     use crate::mcp::tools::all_tools;
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()

@@ -37,6 +37,7 @@ use crate::chat::observation_detector::{detect_observations, DetectedObservation
 use crate::events::EventEmitter;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
+use crate::neo4j::traits::*;
 use crate::notes::models::{MemoryHorizon, Note, NoteImportance, NoteType};
 
 // ============================================================================
@@ -906,10 +907,7 @@ pub async fn cited_refs_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     #[tokio::test]
     async fn test_session_cache_dedup() {

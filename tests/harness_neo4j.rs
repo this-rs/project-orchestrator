@@ -16,7 +16,7 @@ use neo4rs::{query, Graph};
 use project_orchestrator::neo4j::client::Neo4jClient;
 use project_orchestrator::neo4j::models::ChatSessionNode;
 use project_orchestrator::neo4j::GraphStore;
-use project_orchestrator::neo4j::{AnalyticsStore, NoteStore, ProjectStore, WorkspaceStore};
+use project_orchestrator::neo4j::traits::*;
 use uuid::Uuid;
 
 struct Env {
@@ -406,7 +406,7 @@ mod anchors {
     use super::*;
     use project_orchestrator::chat::anchor::*;
     use project_orchestrator::chat::types::SpawnedBy;
-    use project_orchestrator::neo4j::{AnalyticsStore, ProjectStore};
+use project_orchestrator::neo4j::traits::*;
 
     fn typed(e: anyhow::Error) -> AnchorError {
         e.downcast::<AnchorError>().expect("a typed AnchorError")

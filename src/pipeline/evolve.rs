@@ -33,6 +33,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
+use crate::neo4j::traits::*;
 use crate::pipeline::critic::{
     CriticMode, CriticScore, GraphBasedCritic, LearningConfig, MutationCandidate, MutationCritic,
 };
@@ -733,10 +734,7 @@ fn compute_failure_rate(runs: &[crate::protocol::models::ProtocolRun]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     fn make_pattern(
         pattern_type: PatternType,

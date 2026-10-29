@@ -32,6 +32,7 @@ use crate::chat::enrichment::{
 use crate::neo4j::models::TaskStatus;
 use crate::neo4j::traits::GraphStore;
 
+use crate::neo4j::traits::*;
 use crate::reasoning::{ReasoningTree, ReasoningTreeConfig, ReasoningTreeEngine};
 
 // ============================================================================
@@ -639,10 +640,7 @@ mod tests {
     use crate::chat::enrichment::ParallelEnrichmentStage;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::PlanStatus;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     // ── Config tests ────────────────────────────────────────────────────
 

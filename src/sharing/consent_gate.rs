@@ -8,6 +8,7 @@ use crate::episodes::distill_models::{
     ConsentStats, DenialDetail, DenialReason, SharingAction, SharingConsent, SharingMode,
     SharingPolicy,
 };
+use crate::neo4j::traits::*;
 use crate::notes::models::Note;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -535,10 +536,7 @@ pub fn apply_consent_gate_to_report<'a>(
 mod tests {
     use super::*;
     use crate::episodes::distill_models::{SharingAction, SharingConsent, SharingMode};
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::notes::models::Note;
     use std::collections::HashMap;
 

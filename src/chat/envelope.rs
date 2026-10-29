@@ -25,6 +25,7 @@ use crate::chat::manager::ChatManager;
 use crate::chat::types::{ChatRequest, SpawnedBy};
 use crate::neo4j::traits::GraphStore;
 
+use crate::neo4j::traits::*;
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
@@ -776,10 +777,7 @@ pub fn conversation_spawned_by(parent_session_id: Uuid) -> String {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::test_helpers::test_chat_session;
 
     struct FakeLive {

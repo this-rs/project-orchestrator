@@ -43,6 +43,7 @@ use super::types::{
 };
 use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::GraphStore;
+use crate::neo4j::traits::*;
 
 const BROADCAST_BUFFER: usize = 1024;
 
@@ -3489,10 +3490,7 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod mask_tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::vault::mask::Masker;
     use nexus_claude::agent::ToolOutput;
 
@@ -6825,10 +6823,7 @@ mod tool_timing_tests {
     use super::fake::FakeProvider;
     use super::*;
     use crate::neo4j::traits::GraphStore as _;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use serde_json::json;
 
     /// The provider is slow to take the answer and the tool is fast: its result is

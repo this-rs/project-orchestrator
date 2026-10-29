@@ -27,6 +27,7 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use super::context::ContextBuilder;
+use crate::neo4j::traits::*;
 
 /// Normalize a file path to an absolute canonical form.
 /// - Resolves `~` to home directory
@@ -5894,10 +5895,7 @@ pub struct SyncResult {
 mod tests {
     use super::*;
     use crate::events::{CrudAction, EntityType as EventEntityType, EventBus, HybridEmitter};
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::parser::FunctionCall;
     use crate::test_helpers::*;
 

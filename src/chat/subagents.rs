@@ -101,7 +101,6 @@ use super::provider::cognitive::signature::TaskClass;
 use super::provider::policy::SessionAccess;
 use super::session_pool::{WarmFacts, WarmKey};
 use super::types::{ChatEvent, ChatRequest, SpawnedBy};
-use crate::neo4j::AnalyticsStore;
 
 // ── Sub-agent type registry (ISO2) ──────────────────────────────────────────
 
@@ -1479,10 +1478,7 @@ pub(crate) mod panic_injection {
 mod tests {
     use super::*;
     use crate::neo4j::traits::GraphStore;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     fn bare_manager() -> (Arc<crate::neo4j::mock::MockGraphStore>, Arc<ChatManager>) {
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());

@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::neo4j::traits::*;
 use std::collections::VecDeque;
 
 /// Longest a single post-stream step may hold the turn.
@@ -1365,10 +1366,7 @@ pub(crate) async fn continuation_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     fn base_input() -> ObjectiveCheckInput {
         ObjectiveCheckInput {

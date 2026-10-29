@@ -68,6 +68,7 @@ use crate::chat::stages::intent_weights::IntentWeightMap;
 use crate::embeddings::EmbeddingProvider;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
+use crate::neo4j::traits::*;
 use crate::neurons::intent::{IntentDetector, QueryIntentMode};
 use crate::notes::models::EntityType as NoteEntityType;
 use crate::sharing::consent_gate::ConsentReader;
@@ -1826,10 +1827,7 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     // ── currency check: newer knowledge wins ────────────────────────────
 

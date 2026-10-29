@@ -33,6 +33,7 @@ use super::wire::{RefResolution, RefStatus};
 use crate::chat::message_attachments;
 use crate::chat::types::ChatEvent;
 use crate::neo4j::traits::GraphStore;
+use crate::neo4j::traits::*;
 
 /// Time the whole turn may spend resolving its references. A reference still
 /// unresolved when it runs out reads as unavailable: a slow store delays a
@@ -372,10 +373,7 @@ pub fn render_context(nonce: &str, resolved: &[RefResolution]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::refs::access::{RefMeta, ScopeRule};
     use crate::refs::test_support::{store_with_document, world};
     use async_trait::async_trait;

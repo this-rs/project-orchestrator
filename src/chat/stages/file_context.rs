@@ -15,7 +15,6 @@ use crate::chat::enrichment::{
 };
 use crate::graph::models::ContextCard;
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::AnalyticsStore;
 use crate::neurons::AutoReinforcementConfig;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -258,10 +257,7 @@ impl ParallelEnrichmentStage for FileContextStage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     #[test]
     fn test_extract_file_paths() {

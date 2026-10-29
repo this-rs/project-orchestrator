@@ -9,10 +9,7 @@ use crate::events::trigger::EventTrigger;
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
 use crate::neo4j::document::{Document, DocumentChunk, DocumentChunkHit};
 use crate::neo4j::models::*;
-use crate::neo4j::traits::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, GraphStore, NoteStore, PlanStore,
-    ProjectStore, ReleaseStore, StoreCapabilities, WorkspaceStore,
-};
+use crate::neo4j::traits::*;
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
 };

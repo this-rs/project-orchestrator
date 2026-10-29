@@ -11,6 +11,7 @@ use crate::meilisearch::indexes::NoteDocument;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::GraphStore;
 
+use crate::neo4j::traits::*;
 use crate::utils::reciprocal_rank_fusion;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -2265,10 +2266,7 @@ fn fuse_dense_and_lexical(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::test_helpers::*;
 
     // -- Hybrid ranking: dense ∪ lexical, fused by RRF ----------------------

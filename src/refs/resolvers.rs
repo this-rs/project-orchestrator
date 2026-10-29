@@ -37,6 +37,7 @@ use super::types::{EntityRef, RefId, RefKind};
 use super::wire::ScopeLabel;
 use crate::neo4j::models::{DecisionNode, DecisionStatus, PlanNode, TaskWithPlan};
 use crate::neo4j::GraphStore;
+use crate::neo4j::traits::*;
 use crate::notes::{Note, NoteFilters, NoteType};
 
 /// Most rows a text filter done in memory looks at, per kind.

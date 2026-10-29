@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::graph::models::TopologySeverity;
 use crate::neo4j::GraphStore;
+use crate::neo4j::traits::*;
 use crate::notes::models::{Note, NoteFilters, NoteImportance, NoteType};
 
 /// Result of a post-sync topology check.
@@ -177,10 +178,7 @@ mod tests {
         TopologyRule, TopologyRuleType, TopologySeverity, TopologyViolation,
     };
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     #[tokio::test]
     async fn test_no_violations_returns_empty() {

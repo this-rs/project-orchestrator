@@ -17,7 +17,6 @@ use crate::chat::enrichment::{
     EnrichmentConfig, EnrichmentInput, ParallelEnrichmentStage, StageOutput,
 };
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::AnalyticsStore;
 
 /// Enrichment stage that loads the user's adaptive profile.
 pub struct UserProfileStage {
@@ -119,10 +118,7 @@ impl ParallelEnrichmentStage for UserProfileStage {
 mod tests {
     use super::*;
     use crate::chat::enrichment::EnrichmentInput;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use std::sync::Arc;
     use uuid::Uuid;
 

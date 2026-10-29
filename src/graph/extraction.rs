@@ -18,6 +18,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use super::models::{CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType, FabricWeights};
+use crate::neo4j::traits::*;
 
 /// Parse a qualified function ID of the form `"file_path:function_name:index"`
 /// into `(Some(file_path), function_name)`.
@@ -376,10 +377,7 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{FunctionNode, Visibility};
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::test_helpers::test_project;
 
     /// The per-file SYNAPSE cap defaults to a BOUNDED value: `0` (unbounded) was the

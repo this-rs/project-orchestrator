@@ -40,7 +40,6 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::manager::ChatManager;
-use crate::neo4j::AnalyticsStore;
 
 pub(crate) struct TeamHooks {
     /// Inner hooks (SubagentHooks or GraphSessionHooks), if any.
@@ -481,10 +480,7 @@ mod team2_tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::GraphStore;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::test_helpers::test_chat_session;
 
     fn member(id: &str, name: &str) -> TeamMember {

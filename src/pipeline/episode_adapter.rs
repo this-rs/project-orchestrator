@@ -167,6 +167,7 @@ async fn resolve_single_protocol_name(
 
 // ─── Synthetic Episode Generation (T3 — Replay Génératif) ──────────────────
 
+use crate::neo4j::traits::*;
 use crate::notes::models::{Note, NoteType};
 
 /// Generate synthetic episodes from detected patterns and knowledge notes.
@@ -377,10 +378,7 @@ fn slug_desc(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::episodes::models::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use chrono::Utc;
 
     fn sample_episode() -> Episode {

@@ -42,6 +42,7 @@ use uuid::Uuid;
 use crate::api::attention::{OrphanRequest, QuestionOption, RequestKind, WaitingRequest};
 use crate::chat::types::ChatEvent;
 use crate::neo4j::models::ChatEventRecord;
+use crate::neo4j::traits::*;
 
 /// Everything the derivation needs to know about one session, except its
 /// events (passed separately so the grouped read can be split per session).
@@ -367,10 +368,7 @@ fn question_text_and_options(questions: &serde_json::Value) -> (String, Vec<Ques
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use chrono::TimeZone;
     use serde_json::json;
 

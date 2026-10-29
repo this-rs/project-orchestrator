@@ -1834,6 +1834,7 @@ use crate::neo4j::models::{
 };
 use crate::neo4j::GraphStore;
 
+use crate::neo4j::traits::*;
 use crate::notes::models::{Note, NoteFilters, NoteImportance, NoteStatus, NoteType};
 
 // ============================================================================
@@ -2663,10 +2664,7 @@ pub fn truncate_dynamic_context_default(dynamic_context: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     #[test]
     fn test_base_system_prompt_contains_key_sections() {

@@ -6,6 +6,7 @@ use crate::api::handlers::AppError;
 use crate::neo4j::models::ProjectNode;
 use crate::neo4j::GraphStore;
 
+use crate::neo4j::traits::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -1420,10 +1421,7 @@ mod transverse_graph_tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::GraphStore;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::protocol::Protocol;
     use crate::skills::{SkillNode, SkillStatus};
     use crate::test_helpers::{test_note, test_project};

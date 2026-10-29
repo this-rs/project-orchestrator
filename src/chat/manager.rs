@@ -43,6 +43,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::expand_tilde;
+use crate::neo4j::traits::*;
 
 mod recovery;
 pub use recovery::{RecoveryReport, ScanReport};
@@ -19229,10 +19230,7 @@ pub(crate) fn session_is_expired(
 #[cfg(test)]
 mod idle_expiry_tests {
     use super::{background_task_is_idle_dead, process_alive, session_is_expired};
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use std::time::Duration;
 
     const T: Duration = Duration::from_secs(1800);
@@ -29299,10 +29297,7 @@ mod tests {
     mod activity {
         use super::super::{count_background_tasks, LiveSessionSnapshot};
         use crate::chat::types::{BackgroundTaskInfo, BackgroundTaskKind};
-        use crate::neo4j::{
-            AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore,
-            ProjectStore, ReleaseStore, WorkspaceStore,
-        };
+use crate::neo4j::traits::*;
         use uuid::Uuid;
 
         fn task(kind: BackgroundTaskKind, dying: bool) -> BackgroundTaskInfo {

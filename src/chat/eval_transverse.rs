@@ -55,10 +55,7 @@ use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::models::ExecutionPlace;
 use crate::neo4j::GraphStore;
 
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::traits::*;
 use crate::skills::project_resolver::{entries_for_projects, infer_project_slug, ResolvedProject};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -1587,10 +1584,7 @@ fn gate(run: &Run) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     /// The run of the CI: the whole fixture set, the 10 000-resolution replay,
     /// the report written, then the gate.

@@ -9,6 +9,7 @@ use crate::meilisearch::SearchStore;
 use crate::neo4j::models::*;
 use crate::neo4j::GraphStore;
 
+use crate::neo4j::traits::*;
 use crate::notes::{EntityType, Note, NoteManager};
 use crate::plan::models::*;
 use crate::plan::PlanManager;
@@ -1208,10 +1209,7 @@ mod tests {
         ConstraintNode, ConstraintType, DecisionNode, DecisionStatus, StepNode, StepStatus,
         TaskNode, TaskStatus,
     };
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::notes::NoteScope;
     use crate::plan::models::{AgentContext, CodeReference, ContextNote, FileContext};
 

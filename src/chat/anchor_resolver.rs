@@ -46,6 +46,7 @@ use crate::graph::neighborhood::{
 use crate::neo4j::models::ExecutionPlace;
 use crate::neo4j::GraphStore;
 
+use crate::neo4j::traits::*;
 use crate::sharing::consent_gate::{ConsentReader, ReadDenial, ReadVerdict};
 use anyhow::Result;
 use hmac::{digest::KeyInit, Hmac, Mac};
@@ -1680,10 +1681,7 @@ mod tests {
     use crate::episodes::distill_models::{SharingConsent, SharingMode, SharingPolicy};
     use crate::graph::neighborhood::{RawNode, ScopedNode};
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::test_helpers::{test_chat_session, test_project_named};
 
     const SECRET: &[u8] = b"session-secret";

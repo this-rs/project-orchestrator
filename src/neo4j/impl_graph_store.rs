@@ -8,10 +8,7 @@ use uuid::Uuid;
 use super::client::Neo4jClient;
 use super::document::{Document, DocumentChunk, DocumentChunkHit};
 use super::models::*;
-use super::traits::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, GraphStore, NoteStore, PlanStore,
-    ProjectStore, ReleaseStore, StoreCapabilities, WorkspaceStore,
-};
+use super::traits::*;
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,

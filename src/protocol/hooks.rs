@@ -26,6 +26,7 @@ use crate::chat::manager::ChatManager;
 use crate::events::EventEmitter;
 use crate::neo4j::traits::GraphStore;
 
+use crate::neo4j::traits::*;
 use crate::protocol::engine;
 use dashmap::DashMap;
 use std::sync::{Arc, LazyLock};
@@ -710,10 +711,7 @@ async fn run_scheduled_protocols(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::protocol::{
         Protocol, ProtocolCategory, ProtocolState, ProtocolTransition, TriggerConfig, TriggerMode,
     };

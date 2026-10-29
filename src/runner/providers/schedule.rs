@@ -9,7 +9,6 @@
 
 use super::TriggerProvider;
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::AnalyticsStore;
 use crate::runner::dispatch::{DispatchOutcome, FireRequest, TriggerDispatcher};
 use crate::runner::models::{Trigger, TriggerType};
 use anyhow::Result;

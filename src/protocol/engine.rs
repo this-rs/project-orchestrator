@@ -20,7 +20,6 @@
 
 use crate::neo4j::traits::GraphStore;
 
-use crate::neo4j::AnalyticsStore;
 use crate::protocol::{
     ChildCompletionInfo, CompletionStrategy, OnFailureStrategy, ProtocolRun, RunStatus, StateType,
     TransitionResult,
@@ -575,10 +574,7 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::GraphStore;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::protocol::{
         Protocol, ProtocolCategory, ProtocolState, ProtocolTransition, RunStatus,
     };

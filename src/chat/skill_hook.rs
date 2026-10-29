@@ -18,6 +18,7 @@
 use crate::api::hook_handlers::skill_cache;
 use crate::chat::hook_ledger::{cap_chars, HookLedger, InjectionKey, MAX_HOOK_CONTEXT_CHARS};
 use crate::neo4j::traits::GraphStore;
+use crate::neo4j::traits::*;
 use crate::neurons::AutoReinforcementConfig;
 use crate::skills::activation::{
     activate_for_hook_cached, spawn_activation_increment, spawn_hook_reinforcement,
@@ -775,10 +776,7 @@ impl nexus_claude::HookCallback for SkillActivationHook {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use nexus_claude::{HookCallback, HookContext, HookInput};
 
     /// Helper to create a minimal HookContext for tests

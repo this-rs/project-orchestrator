@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
 
+use crate::neo4j::traits::*;
 use crate::protocol::engine;
 use crate::protocol::routing::{rank_protocols, ContextVector, DimensionWeights};
 
@@ -168,10 +169,7 @@ pub async fn route_lifecycle_protocol(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::test_helpers::test_project;
 
     /// Helper: create a plan in the mock store with a project.

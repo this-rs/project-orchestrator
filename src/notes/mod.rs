@@ -50,10 +50,7 @@ pub use witness::{CodeRef, ExternalRef, Witness, WitnessKind, WitnessValidationE
 #[cfg(test)]
 mod current_knowledge_tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     #[test]
     fn test_only_current_real_knowledge_reaches_the_agent() {
@@ -186,10 +183,7 @@ pub mod provenance {
     mod tests {
         use super::*;
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::{
-            AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore,
-            ProjectStore, ReleaseStore, WorkspaceStore,
-        };
+use crate::neo4j::traits::*;
 
         async fn session_of(graph: &MockGraphStore, model: &str) -> Uuid {
             let mut s = crate::test_helpers::test_chat_session(Some("alpha"));

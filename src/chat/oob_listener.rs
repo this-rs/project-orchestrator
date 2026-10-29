@@ -71,7 +71,6 @@ use super::manager::{ActiveSession, ChatManager};
 use super::types::{ChatEvent, PendingMessage};
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
-use crate::neo4j::AnalyticsStore;
 use crate::neo4j::GraphStore;
 
 /// Dependencies needed to trigger a fresh `stream_response` from an
@@ -1066,10 +1065,7 @@ fn user_message_source(m: &UserMessage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use nexus_claude::{TextContent, ToolResultContent};
     use serde_json::json;
 

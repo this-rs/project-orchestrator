@@ -31,7 +31,6 @@ use crate::chat::provider::settings::{
     ModelPolicy, RoleAssignments, SettingsError, ALIASES_KEY, CONSENT_PREFIX, GLOBAL,
     INSTANCE_PREFIX, POLICY_KEY, ROLES_KEY,
 };
-use crate::neo4j::AnalyticsStore;
 use crate::neo4j::GraphStore;
 use std::sync::Arc;
 
@@ -1561,10 +1560,7 @@ mod agent_surface_tests {
     //! The agent surface the MCP `provider` mega-tool calls: THE SAME answers as
     //! the person's settings routes (no second set of validations), plus the two
     //! grants an agent may not give itself.
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     use super::*;
     use axum::body::Body;

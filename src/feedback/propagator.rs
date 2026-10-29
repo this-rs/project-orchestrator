@@ -15,6 +15,7 @@ use crate::neo4j::traits::GraphStore;
 use crate::notes::models::{Note, NoteImportance, NoteType};
 
 use super::models::{ExplicitFeedback, FeedbackTarget, ImplicitSignal};
+use crate::neo4j::traits::*;
 
 // ============================================================================
 // Constants
@@ -480,10 +481,7 @@ async fn handle_high_activation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     #[tokio::test]
     async fn test_propagate_positive_feedback() {

@@ -8,6 +8,7 @@ use crate::chat::types::{
 };
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 
+use crate::neo4j::traits::*;
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -2287,10 +2288,7 @@ mod tests {
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_bearer_token, test_chat_session};
     use axum::body::Body;
@@ -6850,10 +6848,7 @@ pub mod anchors {
         use crate::graph::neighborhood::RawNode;
         use crate::neo4j::mock::MockGraphStore;
         use crate::neo4j::GraphStore;
-        use crate::neo4j::{
-            AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore,
-            ProjectStore, ReleaseStore, WorkspaceStore,
-        };
+use crate::neo4j::traits::*;
         use crate::test_helpers::{
             router_with_auth_and_events, test_bearer_token, test_chat_session, test_project_named,
         };

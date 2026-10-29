@@ -5,6 +5,7 @@ use crate::meilisearch::SearchStore;
 use crate::neo4j::models::{StepNode as StepNodeModel, StepStatus};
 use crate::neo4j::GraphStore;
 
+use crate::neo4j::traits::*;
 use crate::notes::models::EntityType;
 use crate::notes::NoteManager;
 use crate::plan::models::CreatePlanRequest;
@@ -1787,10 +1788,7 @@ impl ImplementationPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
 
     #[test]
     fn test_plan_request_serde_roundtrip() {

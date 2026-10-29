@@ -26,7 +26,6 @@ use super::enrichment::{CommunityEnricher, NoopCommunityEnricher};
 use super::extraction::GraphExtractor;
 use super::models::{AnalyticsConfig, FabricWeights, GraphAnalytics};
 use super::writer::AnalyticsWriter;
-use crate::neo4j::AnalyticsStore;
 
 // ============================================================================
 // Output type
@@ -483,10 +482,7 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{FileNode, FunctionNode, Visibility};
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+use crate::neo4j::traits::*;
     use crate::test_helpers::test_project;
 
     /// Seed a project with files forming two clusters connected by one edge.
