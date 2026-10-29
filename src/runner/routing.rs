@@ -408,7 +408,6 @@ mod tests {
         use crate::neo4j::traits::*;
         #[allow(unused_imports)]
         #[allow(unused_imports)]
-
         /// The Claude Code part of the pool of a manager routed over `catalog`,
         /// Claude Code measured healthy (no CLI is needed for the pool itself).
         async fn claude_code_pool(catalog: Arc<ModelCatalogCache>) -> Vec<ModelFacts> {

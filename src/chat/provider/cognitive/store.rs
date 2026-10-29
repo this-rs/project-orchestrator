@@ -381,7 +381,6 @@ mod tests {
     use crate::chat::provider::cognitive::mode::{LearningStage, ProviderRoutingMode};
     use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
     #[allow(unused_imports)]
-
     fn decision(project: &str, at_offset_s: i64) -> CognitiveDecision {
         let mut signature =
             TaskSignature::utility(TaskClass::UtilityFeatureGraph, 9_000, Some(project));

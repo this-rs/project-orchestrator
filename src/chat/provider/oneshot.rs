@@ -212,7 +212,6 @@ mod tests {
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
     #[allow(unused_imports)]
-
     async fn stored(graph: &MockGraphStore, id: &str) -> InstanceRecord {
         let record = InstanceRecord {
             id: id.into(),

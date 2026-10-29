@@ -19707,7 +19707,6 @@ mod runner_spawn_tests {
 mod tests {
     use super::*;
     #[allow(unused_imports)]
-
     /// The review of #688 at 60a277e7 (finding D): a provider kind that does not
     /// serialize to a name falls back to `unknown` (no session grant), never to a
     /// permissive kind.
@@ -36995,7 +36994,6 @@ mod auto_open_bounds_tests {
     use crate::chat::types::RoutingPoolEntry;
     #[allow(unused_imports)]
     #[allow(unused_imports)]
-
     fn instance(id: &str, credential_ref: &str) -> InstanceRecord {
         InstanceRecord {
             id: id.to_string(),
@@ -37373,7 +37371,6 @@ mod held_context_tests {
     use super::*;
     use crate::chat::agent_runtime::{TurnOutcome, TurnServices};
     #[allow(unused_imports)]
-
     fn test_config() -> ChatConfig {
         ChatConfig {
             max_sessions: 10,
@@ -37903,7 +37900,6 @@ mod image_turn_services_tests {
     use crate::chat::provider::cognitive::{LearningStage, ProviderRoutingMode, RoutingSettings};
     #[allow(unused_imports)]
     #[allow(unused_imports)]
-
     struct Real;
 
     #[async_trait::async_trait]
@@ -38113,7 +38109,6 @@ mod grant_before_the_cli_tests {
     use super::*;
     #[allow(unused_imports)]
     #[allow(unused_imports)]
-
     /// The call the session's pending `req-1` asks (`test_support`).
     fn ls() -> AskedCall {
         AskedCall {

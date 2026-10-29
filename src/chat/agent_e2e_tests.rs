@@ -1304,7 +1304,6 @@ mod cognitive_routing {
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
     #[allow(unused_imports)]
-
     struct NoBuiltin;
 
     impl ProviderSource for NoBuiltin {
@@ -2674,7 +2673,6 @@ mod auto_on_a_locked_vault {
     use crate::neo4j::routing::Neo4jRoutingStore;
     #[allow(unused_imports)]
     #[allow(unused_imports)]
-
     const PASS: &str = "correct horse battery staple";
 
     struct NoBuiltin;
@@ -3971,7 +3969,6 @@ mod provider_switch {
     use super::*;
     use crate::chat::types::SwitchProviderError;
     #[allow(unused_imports)]
-
     fn two_turn_script() -> Value {
         json!([
             sse_route("Call the ping tool now", vec![
@@ -7384,7 +7381,6 @@ mod claude_code_resume_token {
 mod legacy_conversation_after_the_switch {
     use super::*;
     #[allow(unused_imports)]
-
     const CLI_SESSION: &str = "legacy-cli-session-1";
 
     fn turn(answer: &str) -> String {
@@ -7548,7 +7544,6 @@ mod legacy_nats_permission {
     use crate::events::NatsEmitter;
     #[allow(unused_imports)]
     #[allow(unused_imports)]
-
     fn emit(v: Value) -> Value {
         json!({"op": "emit_json", "json": v})
     }
@@ -8609,7 +8604,6 @@ mod attached_images {
     mod legacy_engine {
         use super::*;
         #[allow(unused_imports)]
-
         struct LegacyCli {
             dir: tempfile::TempDir,
             graph: Arc<MockGraphStore>,
@@ -8946,7 +8940,6 @@ mod attached_images {
 mod legacy_session_record {
     use super::*;
     #[allow(unused_imports)]
-
     fn turn(text: &str, cost: f64) -> [Value; 3] {
         [
             json!({"op": "await_stdin", "contains": "\"type\":\"user\"", "timeout_ms": 30000}),
@@ -9340,7 +9333,6 @@ mod legacy_session_record {
 mod native_transcripts {
     use super::*;
     #[allow(unused_imports)]
-
     fn answer(key: &str) -> Value {
         sse_route(
             key,
@@ -9585,7 +9577,6 @@ mod native_transcripts {
 mod legacy_interrupt_stale_result {
     use super::*;
     #[allow(unused_imports)]
-
     fn emit(v: Value) -> Value {
         json!({"op": "emit_json", "json": v})
     }
@@ -9789,7 +9780,6 @@ mod legacy_interrupt_stale_result {
 mod legacy_oob_lag {
     use super::*;
     #[allow(unused_imports)]
-
     fn emit(v: Value) -> Value {
         json!({"op": "emit_json", "json": v})
     }
@@ -9965,7 +9955,6 @@ mod permission_scopes {
     use crate::chat::manager::PermissionDeliveryError;
     use crate::chat::types::PermissionAnswerScope;
     #[allow(unused_imports)]
-
     fn emit(v: Value) -> Value {
         json!({"op": "emit_json", "json": v})
     }
@@ -12376,7 +12365,6 @@ mod background_tasks {
 mod native_session_record {
     use super::*;
     #[allow(unused_imports)]
-
     fn answer(key: &str) -> Value {
         sse_route(
             key,
@@ -12484,7 +12472,6 @@ mod native_session_record {
 mod agent_lifecycle {
     use super::*;
     #[allow(unused_imports)]
-
     fn configured(
         graph: Arc<MockGraphStore>,
         edit: impl FnOnce(&mut super::super::config::ChatConfig),
@@ -13046,7 +13033,6 @@ mod post_turn {
 mod compaction_loop {
     use super::*;
     #[allow(unused_imports)]
-
     const SUMMARY_PROMPT: &str = "You are compacting the history";
     const TURNS: [&str; 5] = [
         "turn two",
@@ -13178,7 +13164,6 @@ mod openclaw_delegation {
     use super::super::provider::settings::{process_origin, AcpCommand};
     use super::*;
     #[allow(unused_imports)]
-
     const INIT: &str = r#"{"op": "expect", "method": "initialize", "reply": {"protocolVersion": 1, "agentCapabilities": {"loadSession": true, "promptCapabilities": {"image": true, "audio": false, "embeddedContext": true}, "mcpCapabilities": {"http": false, "sse": false}}, "agentInfo": {"name": "openclaw-acp", "version": "2026.9.9"}, "authMethods": []}}"#;
 
     fn turn() -> [Value; 3] {
@@ -13801,7 +13786,6 @@ mod codex_switch {
     use super::super::provider::settings::process_origin;
     use super::*;
     #[allow(unused_imports)]
-
     /// Shell wrapper around `fake_codex` that hard-codes `FAKE_CODEX_TRANSCRIPT`
     /// so the backend never touches the test's process environment.
     /// Also owns a `codex-homes/` directory with a fake `auth.json` so that
@@ -15531,7 +15515,6 @@ mod native_subagents {
 mod legacy_turn_end_at_boot {
     use super::*;
     #[allow(unused_imports)]
-
     fn emit(v: Value) -> Value {
         json!({"op": "emit_json", "json": v})
     }

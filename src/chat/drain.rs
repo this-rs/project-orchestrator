@@ -619,7 +619,6 @@ mod tests {
 mod stop_tests {
     use super::*;
     #[allow(unused_imports)]
-
     fn q(items: Vec<PendingMessage>) -> VecDeque<PendingMessage> {
         items.into_iter().collect()
     }

@@ -48,7 +48,6 @@ use crate::chat::attention::{derive_attention, SessionAttentionInput};
 use crate::neo4j::models::{ChatEventRecord, ChatSessionNode, SessionLinkKind, SessionLinkRow};
 use crate::neo4j::traits::GraphStore;
 #[allow(unused_imports)]
-
 /// `spawned_by` types that denote a PLAN run (the `run_id` is a plan run's).
 /// `protocol_runner` carries a PROTOCOL run id and must not be read as one.
 pub const PLAN_RUN_SPAWN_TYPES: [&str; 3] = ["runner", "pipeline", "gate"];

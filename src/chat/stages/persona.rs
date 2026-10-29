@@ -20,7 +20,6 @@ use crate::chat::enrichment::{
 };
 use crate::neo4j::traits::GraphStore;
 #[allow(unused_imports)]
-
 /// Enrichment stage that activates the best-matching persona for files
 /// mentioned in the user message.
 pub struct PersonaStage {

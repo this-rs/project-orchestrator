@@ -339,7 +339,6 @@ mod tests {
 mod real_graph {
     use super::*;
     #[allow(unused_imports)]
-
     /// Validate ALL stored protocols against the real Neo4j graph.
     ///
     /// PYSR-4 criterion 4: prove that existing protocols pass structural validation.

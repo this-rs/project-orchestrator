@@ -485,7 +485,6 @@ fn jacobi_eigen(
 mod spectral_tests {
     use super::*;
     #[allow(unused_imports)]
-
     fn t(turn: u32, labels: &[&str], tools: &[&str]) -> TurnNode {
         TurnNode {
             turn,

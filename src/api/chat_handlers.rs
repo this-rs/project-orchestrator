@@ -6168,7 +6168,6 @@ mod file_scope_lift_tests {
     use crate::chat::types::ChatRequest;
     #[allow(unused_imports)]
     #[allow(unused_imports)]
-
     fn person() -> Claims {
         Claims {
             sub: uuid::Uuid::new_v4().to_string(),

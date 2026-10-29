@@ -564,7 +564,6 @@ mod safe {
 mod safe {
     use super::*;
     #[allow(unused_imports)]
-
     pub(super) fn dir_is_safe(_dir: &Path, _create: bool) -> Result<bool, StoreError> {
         Err(StoreError::Unsupported)
     }
