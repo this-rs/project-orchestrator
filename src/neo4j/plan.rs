@@ -1236,7 +1236,7 @@ impl Neo4jClient {
             "MATCH (proj:Project {id: $pid})-[:HAS_PLAN]->(p:Plan)
              RETURN p.id AS id, 'plan' AS type, p.title AS label,
                     p.status AS status, p.priority AS priority,
-                    null AS target_date, null AS version, null AS description
+                    null AS target_date, null AS version, null AS description, null AS step_order
              ORDER BY p.priority DESC
              LIMIT $lim
 
@@ -1245,7 +1245,7 @@ impl Neo4jClient {
              MATCH (proj:Project {id: $pid})-[:HAS_PLAN]->(pl:Plan)-[:HAS_TASK]->(t:Task)
              RETURN t.id AS id, 'task' AS type, t.title AS label,
                     t.status AS status, t.priority AS priority,
-                    null AS target_date, null AS version, null AS description
+                    null AS target_date, null AS version, null AS description, null AS step_order
              LIMIT $lim
 
              UNION ALL
@@ -1253,7 +1253,7 @@ impl Neo4jClient {
              MATCH (proj:Project {id: $pid})-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(t:Task)-[:HAS_STEP]->(s:Step)
              RETURN s.id AS id, 'step' AS type, s.description AS label,
                     s.status AS status, null AS priority,
-                    null AS target_date, null AS version, null AS description
+                    null AS target_date, null AS version, null AS description, s.order AS step_order
              LIMIT $lim
 
              UNION ALL
@@ -1261,7 +1261,7 @@ impl Neo4jClient {
              MATCH (proj:Project {id: $pid})-[:HAS_MILESTONE]->(m:Milestone)
              RETURN m.id AS id, 'milestone' AS type, m.title AS label,
                     m.status AS status, null AS priority,
-                    m.target_date AS target_date, null AS version, m.description AS description
+                    m.target_date AS target_date, null AS version, m.description AS description, null AS step_order
              LIMIT $lim
 
              UNION ALL
@@ -1269,7 +1269,7 @@ impl Neo4jClient {
              MATCH (proj:Project {id: $pid})-[:HAS_RELEASE]->(r:Release)
              RETURN r.id AS id, 'release' AS type, r.title AS label,
                     r.status AS status, null AS priority,
-                    r.target_date AS target_date, r.version AS version, null AS description
+                    r.target_date AS target_date, r.version AS version, null AS description, null AS step_order
              LIMIT $lim
 
              UNION ALL
@@ -1278,7 +1278,7 @@ impl Neo4jClient {
              RETURN c.sha AS id, 'commit' AS type,
                     COALESCE(substring(c.message, 0, 60), c.sha) AS label,
                     null AS status, null AS priority,
-                    c.timestamp AS target_date, null AS version, null AS description
+                    c.timestamp AS target_date, null AS version, null AS description, null AS step_order
              LIMIT $lim
 
              UNION ALL
@@ -1287,7 +1287,7 @@ impl Neo4jClient {
              RETURN c.sha AS id, 'commit' AS type,
                     COALESCE(substring(c.message, 0, 60), c.sha) AS label,
                     null AS status, null AS priority,
-                    c.timestamp AS target_date, null AS version, null AS description
+                    c.timestamp AS target_date, null AS version, null AS description, null AS step_order
              LIMIT $lim",
         )
         .param("pid", pid.clone())
@@ -1304,6 +1304,9 @@ impl Neo4jClient {
             let target_date: Option<String> =
                 row.get::<Option<String>>("target_date").ok().flatten();
             let version: Option<String> = row.get::<Option<String>>("version").ok().flatten();
+            // Position of a step inside its task (Step.order): the client draws the
+            // agent's progress arc in this order instead of guessing it from the status.
+            let step_order: Option<i64> = row.get::<Option<i64>>("step_order").ok().flatten();
 
             nodes.push(PmGraphNode {
                 id,
@@ -1319,6 +1322,7 @@ impl Neo4jClient {
                     "priority": priority,
                     "target_date": target_date,
                     "version": version,
+                    "order": step_order,
                 }),
             });
         }
