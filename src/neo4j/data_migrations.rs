@@ -203,6 +203,35 @@ SET n.energy = CASE WHEN intended > coalesce(n.energy, 0.0) THEN intended ELSE n
 RETURN count(n) AS processed
 "#;
 
+/// Delete the code graph of git WORKTREES.
+///
+/// A worktree is a checkout of the SAME repository on another branch, so every
+/// file and symbol under `_wt/`, `.wt/`, `.rlwt/` or `worktrees/` is a copy of
+/// code the project's own tree already carries. Indexing them multiplied the
+/// graph by the number of branches: measured on 29/10/2026, **1 424 108** of
+/// 4 665 569 nodes stood under those segments — 511 678 `Function` and 356 834
+/// `Impl`, five times more `Impl` in the copies than in the real source.
+///
+/// `DETACH DELETE` takes their edges with them. Two checks were made before
+/// choosing that: no other label references those paths (only `File`/symbols
+/// carry them, via `path` / `file_path`), and no project has its `root_path`
+/// inside a worktree — so nothing legitimate is lost.
+///
+/// This only cleans what was indexed BEFORE the sync filter learned the rule
+/// (`IGNORED_PATH_SEGMENTS`, `crate::orchestrator`), which keeps them from
+/// coming back.
+const PURGE_WORKTREE_NODES: &str = r#"
+MATCH (n)
+WHERE ($scope IS NULL OR n.project_id = $scope)
+  AND (n:File OR n:Function OR n:Struct OR n:Impl OR n:Enum OR n:Trait OR n:Import)
+  AND any(seg IN ['/_wt/', '/.wt/', '/.rlwt/', '/worktrees/'] WHERE
+        coalesce(n.path, '') CONTAINS seg OR coalesce(n.file_path, '') CONTAINS seg)
+WITH n LIMIT $batch
+WITH collect(n) AS doomed
+FOREACH (x IN doomed | DETACH DELETE x)
+RETURN size(doomed) AS processed
+"#;
+
 /// Outcome of one migration on this start.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MigrationOutcome {
@@ -247,6 +276,13 @@ impl Neo4jClient {
                 id: "2026-09-purge-empty-archived-skills",
                 description: "Delete archived skills with no member and no reference",
                 batch: purge_archived_empty_skills_query(),
+                finalize: None,
+            },
+            DataMigration {
+                id: "2026-10-purge-worktree-nodes",
+                description:
+                    "Delete the code graph of git worktrees (copies of the same repository)",
+                batch: PURGE_WORKTREE_NODES.to_string(),
                 finalize: None,
             },
         ]
@@ -464,8 +500,28 @@ mod tests {
                 "2026-09-restore-energy-decay-victims",
                 "2026-09-rebase-active-note-energy",
                 "2026-09-purge-empty-archived-skills",
+                "2026-10-purge-worktree-nodes",
             ]
         );
+    }
+
+    /// The worktree purge deletes COPIES of the project's code, never the code
+    /// itself: the predicate is anchored on the directory segments the sync
+    /// filter excludes, and it must name all four of them.
+    #[test]
+    fn test_worktree_purge_only_matches_worktree_segments() {
+        let m = Neo4jClient::data_migrations()
+            .into_iter()
+            .find(|m| m.id == "2026-10-purge-worktree-nodes")
+            .expect("the worktree purge is registered");
+        for seg in ["/_wt/", "/.wt/", "/.rlwt/", "/worktrees/"] {
+            assert!(m.batch.contains(seg), "the purge must name {seg}");
+        }
+        // It reads the two properties that carry a path, and nothing else.
+        assert!(m.batch.contains("n.path"));
+        assert!(m.batch.contains("n.file_path"));
+        // A copy is only deleted outright: DETACH takes its edges with it.
+        assert!(m.batch.contains("DETACH DELETE"));
     }
 
     #[test]
