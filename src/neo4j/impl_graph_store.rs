@@ -2756,6 +2756,14 @@ impl AnalyticsStore for Neo4jClient {
         self.agent_identity_namespace().await
     }
 
+    async fn ensure_agent(&self, agent_id: Uuid, model: Option<&str>) -> anyhow::Result<bool> {
+        self.ensure_agent(agent_id, model).await
+    }
+
+    async fn backfill_agents(&self) -> anyhow::Result<crate::neo4j::models::AgentBackfill> {
+        self.backfill_agents().await
+    }
+
     async fn search_episodes_by_embedding(
         &self,
         project_id: Uuid,

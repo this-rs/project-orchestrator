@@ -299,6 +299,13 @@ pub async fn collect_session_episode(
         }
     };
 
+    // The agent that lived it is a node, and the model it ran on a dated fact beside it.
+    if let Some(id) = agent_id {
+        if let Err(e) = neo4j.ensure_agent(id, Some(&session.model)).await {
+            tracing::warn!(session_id = %session_id, error = %e, "the node of the agent of a closed session could not be made");
+        }
+    }
+
     let journal = read_session_journal(neo4j, session_id).await;
 
     let spawned = session
@@ -834,6 +841,49 @@ mod tests {
         assert_eq!(episode.outcome.files_modified, 0);
         // No events: the node's count stands, it is never lowered.
         assert_eq!(episode.session.unwrap().message_count, 4);
+    }
+
+    #[tokio::test]
+    async fn the_agent_of_a_closed_session_is_a_node_and_the_backfill_rebuilds_the_rest() {
+        use crate::neo4j::models::AgentBackfill;
+        let (store, sid, project_id) = store_with_session(Some("alpha"), Some("work")).await;
+
+        // Taking the episode names the agent AND makes its node, with the model as a fact.
+        let episode = collect_session_episode(&store, sid, "closed")
+            .await
+            .unwrap()
+            .unwrap();
+        let named = episode.session.as_ref().unwrap().agent_id.unwrap();
+        assert_eq!(
+            store.agents.lock().unwrap().get(&named),
+            Some(&Some(crate::test_helpers::test_chat_session(None).model))
+        );
+
+        // Another agent wrote a note and never became a node (history before this change).
+        let other = Uuid::new_v4();
+        let mut note = crate::test_helpers::test_note(
+            project_id.unwrap(),
+            crate::notes::NoteType::Tip,
+            "written before agents were nodes",
+        );
+        note.created_by = crate::notes::provenance::actor(other);
+        store.notes.write().await.insert(note.id, note);
+        store.session_episodes.write().await.insert(sid, episode);
+
+        let first = store.backfill_agents().await.unwrap();
+        assert_eq!(
+            first,
+            AgentBackfill {
+                before: 1,
+                after: 2,
+                from_notes: 1,
+                from_episodes: 1
+            },
+            "the older agent appears; the one already a node is not made twice"
+        );
+        let second = store.backfill_agents().await.unwrap();
+        assert_eq!(second.before, second.after, "a second run creates nothing");
+        assert_eq!(second.after, 2);
     }
 
     #[tokio::test]

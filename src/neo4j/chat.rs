@@ -911,6 +911,101 @@ impl Neo4jClient {
         Ok(Uuid::parse_str(&ns)?)
     }
 
+    /// See [`crate::neo4j::AnalyticsStore::ensure_agent`]. One statement: the durable self, the
+    /// model identity and the edge between them are MERGEd together, so a concurrent first call
+    /// matches what the other made (both ids are under a uniqueness constraint).
+    pub async fn ensure_agent(&self, agent_id: Uuid, model: Option<&str>) -> Result<bool> {
+        let root = self.agent_identity_namespace().await?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MERGE (s:Agent {id: $root}) ON CREATE SET s.kind = 'self', s.created_at = $now \
+                     MERGE (f:Agent {id: $id}) \
+                     ON CREATE SET f.kind = 'model', f.created_at = $now \
+                     SET f.last_seen = $now, \
+                         f.model = CASE WHEN $model = '' THEN f.model ELSE $model END \
+                     MERGE (f)-[:FACET_OF]->(s) \
+                     RETURN f.created_at = $now AS created",
+                )
+                .param("root", root.to_string())
+                .param("id", agent_id.to_string())
+                .param("now", now)
+                .param("model", model.unwrap_or_default().to_string()),
+            )
+            .await?;
+        let row = result
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("MERGE of an agent returned no row"))?;
+        Ok(row.get::<bool>("created").unwrap_or(false))
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::backfill_agents`].
+    pub async fn backfill_agents(&self) -> Result<AgentBackfill> {
+        let before = self.count_model_agents().await?;
+
+        let mut from_notes = std::collections::HashSet::new();
+        let mut rows = self
+            .graph
+            .execute(query(
+                "MATCH (n:Note) WHERE n.created_by STARTS WITH 'agent:' \
+                 RETURN DISTINCT n.created_by AS by",
+            ))
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let by: String = row.get("by")?;
+            if let Some(id) = crate::notes::provenance::parse_actor(&by) {
+                from_notes.insert(id);
+            }
+        }
+
+        let mut from_episodes = std::collections::HashSet::new();
+        let mut rows = self
+            .graph
+            .execute(query(
+                "MATCH (e:SessionEpisode) RETURN e.payload AS payload",
+            ))
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let payload: String = row.get("payload")?;
+            match serde_json::from_str::<crate::episodes::models::Episode>(&payload) {
+                Ok(episode) => {
+                    if let Some(id) = episode.session.and_then(|s| s.agent_id) {
+                        from_episodes.insert(id);
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "unreadable SessionEpisode payload, skipped"),
+            }
+        }
+
+        for id in from_notes.union(&from_episodes) {
+            self.ensure_agent(*id, None).await?;
+        }
+        let after = self.count_model_agents().await?;
+        Ok(AgentBackfill {
+            before,
+            after,
+            from_notes: from_notes.len(),
+            from_episodes: from_episodes.len(),
+        })
+    }
+
+    async fn count_model_agents(&self) -> Result<usize> {
+        let mut rows = self
+            .graph
+            .execute(query(
+                "MATCH (a:Agent {kind: 'model'}) RETURN count(a) AS n",
+            ))
+            .await?;
+        let n: i64 = match rows.next().await? {
+            Some(row) => row.get("n")?,
+            None => 0,
+        };
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
     /// See [`crate::neo4j::GraphStore::list_session_episodes`]. A payload that no longer
     /// parses is skipped with a warning, not an error: one bad node must not hide the rest.
     pub async fn list_session_episodes(

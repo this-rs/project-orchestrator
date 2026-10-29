@@ -207,6 +207,8 @@ pub struct MockGraphStore {
     pub session_episodes: RwLock<HashMap<Uuid, crate::episodes::models::Episode>>,
     /// The root of the agent ids, made on first use (`agent_identity_namespace`).
     pub agent_identity_root: std::sync::Mutex<Option<Uuid>>,
+    /// The model identities made by `ensure_agent`: id, then the last model recorded.
+    pub agents: std::sync::Mutex<HashMap<Uuid, Option<String>>>,
     /// Makes every `create_chat_session` fail once set (a session written after it, such as
     /// the mirror of a sub-agent, is lost; the sessions already written are untouched).
     pub fail_session_writes: std::sync::atomic::AtomicBool,
@@ -459,6 +461,7 @@ impl MockGraphStore {
             session_episode_save_calls: std::sync::atomic::AtomicUsize::new(0),
             session_episodes: RwLock::new(HashMap::new()),
             agent_identity_root: std::sync::Mutex::new(None),
+            agents: std::sync::Mutex::new(HashMap::new()),
             fail_session_writes: std::sync::atomic::AtomicBool::new(false),
             land_children_after_read: std::sync::Mutex::new(HashMap::new()),
             plan_tasks: RwLock::new(HashMap::new()),
@@ -14182,6 +14185,52 @@ impl AnalyticsStore for MockGraphStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(*root.get_or_insert_with(Uuid::new_v4))
+    }
+
+    async fn ensure_agent(&self, agent_id: Uuid, model: Option<&str>) -> Result<bool> {
+        let mut agents = self
+            .agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let created = !agents.contains_key(&agent_id);
+        let entry = agents.entry(agent_id).or_insert(None);
+        if let Some(model) = model.filter(|m| !m.is_empty()) {
+            *entry = Some(model.to_string());
+        }
+        Ok(created)
+    }
+
+    async fn backfill_agents(&self) -> Result<crate::neo4j::models::AgentBackfill> {
+        let count = |m: &Self| {
+            m.agents
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        };
+        let before = count(self);
+        let from_notes: std::collections::HashSet<Uuid> = self
+            .notes
+            .read()
+            .await
+            .values()
+            .filter_map(|n| crate::notes::provenance::parse_actor(&n.created_by))
+            .collect();
+        let from_episodes: std::collections::HashSet<Uuid> = self
+            .session_episodes
+            .read()
+            .await
+            .values()
+            .filter_map(|e| e.session.as_ref().and_then(|s| s.agent_id))
+            .collect();
+        for id in from_notes.union(&from_episodes) {
+            self.ensure_agent(*id, None).await?;
+        }
+        Ok(crate::neo4j::models::AgentBackfill {
+            before,
+            after: count(self),
+            from_notes: from_notes.len(),
+            from_episodes: from_episodes.len(),
+        })
     }
 
     // Chat anchors — same rules as the Neo4j store (both call `anchor::apply_op`).

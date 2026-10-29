@@ -4440,6 +4440,18 @@ pub trait AnalyticsStore: Send + Sync {
     /// once still agree on one root.
     async fn agent_identity_namespace(&self) -> Result<Uuid>;
 
+    /// Makes the agent `agent_id` a node of the graph, idempotently: a `(:Agent {kind:'model'})`
+    /// under its id, attached by `FACET_OF` to the durable `(:Agent {kind:'self'})` whose id is
+    /// [`Self::agent_identity_namespace`] (generated once, persisted, never derived from a model).
+    /// `model`, when known, is recorded as a dated fact (`last_seen`), not as the identity.
+    /// Returns `true` when the node did not exist and was created by this call.
+    async fn ensure_agent(&self, agent_id: Uuid, model: Option<&str>) -> Result<bool>;
+
+    /// Rebuilds the agent nodes of what is already written: the distinct `agent:<id>` of the
+    /// `created_by` of notes and the agent of each session episode. Idempotent (a second run
+    /// creates nothing) and it reports what it found, before and after.
+    async fn backfill_agents(&self) -> Result<crate::neo4j::models::AgentBackfill>;
+
     // ========================================================================
     // Episode embedding search (ReflexEngine)
     // ========================================================================

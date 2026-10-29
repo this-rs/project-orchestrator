@@ -1685,7 +1685,8 @@ pub async fn search_messages(
 // ============================================================================
 
 /// POST /api/chat/sessions/backfill-previews — Backfill title/preview for existing
-/// sessions, and the record of the sessions of the agent engine (`agent_records`).
+/// sessions, the record of the sessions of the agent engine (`agent_records`), and the
+/// `:Agent` nodes of what is already written (`agents`: found and made, before and after).
 pub async fn backfill_previews(
     State(state): State<OrchestratorState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1718,9 +1719,18 @@ pub async fn backfill_previews(
         0
     };
 
+    // Phase 4: the agents that wrote notes or lived sessions before they were nodes.
+    let agents = state
+        .orchestrator
+        .neo4j()
+        .backfill_agents()
+        .await
+        .map_err(AppError::Internal)?;
+
     let total = neo4j_count + meili_count;
     Ok(Json(serde_json::json!({
         "updated": total,
+        "agents": agents,
         "from_neo4j": neo4j_count,
         "from_meilisearch": meili_count,
         "agent_records": agent_count,
