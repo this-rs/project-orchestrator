@@ -445,6 +445,21 @@ fn mime_for(format: DocumentFormat, filename: &str, bytes: &[u8]) -> &'static st
     "application/octet-stream"
 }
 
+/// The media types an agent actually RECEIVES as a picture.
+///
+/// Exactly the four raster types [`mime_for`] can recognise, and exactly the
+/// set [`crate::chat::message_attachments::is_image`] sends inline to the
+/// model (`agent_runtime::turn_input` → `InputBlock::Image`). Kept as a list
+/// rather than a `starts_with("image/")` test on purpose: the day `mime_for`
+/// learns to recognise an SVG or a HEIC, whether the model can see it must be
+/// a deliberate decision, not an accident of the prefix.
+const INLINE_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// Is this media type one the platform shows and sends as a picture?
+fn is_inline_image(mime_type: &str) -> bool {
+    INLINE_IMAGE_TYPES.contains(&mime_type)
+}
+
 // ============================================================================
 // Ingestion pipeline
 // ============================================================================
@@ -616,11 +631,18 @@ impl Ingestor {
         // the extractor said (see `UploadedDocument::warnings`).
         let mut response_warnings = extracted.warnings.clone();
         if is_opaque {
-            response_warnings.push(
-                "this file type is not readable by the platform — it is stored and can be \
-                 downloaded, but it has no text and will not appear in search"
-                    .to_string(),
-            );
+            // An image is NOT "not readable by the platform". The chat draws it
+            // and the agent receives it inline as a picture; the only thing it
+            // lacks is text to index. Warning on it put a yellow banner on every
+            // screenshot ever pasted — the kind of noise that trains people to
+            // ignore the warnings that matter (a .zip, a .mov, a corrupted PDF).
+            if !is_inline_image(mime_type) {
+                response_warnings.push(
+                    "this file type is not readable by the platform — it is stored and can be \
+                     downloaded, but it has no text and will not appear in search"
+                        .to_string(),
+                );
+            }
         } else if chunks.is_empty() {
             response_warnings.push(
                 "no text could be extracted from this document — it is stored, but it will not \
@@ -1380,6 +1402,57 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// A screenshot is stored as an opaque document — no extractor reads pixels
+    /// — but it is NOT "unreadable by the platform": the chat draws it and the
+    /// agent receives it inline (`agent_runtime::turn_input`). The opaque
+    /// warning used to fire here too, putting a yellow banner on every pasted
+    /// screenshot; that is the noise this test pins down.
+    #[tokio::test]
+    async fn an_image_is_stored_opaque_without_the_unreadable_warning() {
+        let h = Harness::new();
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&[0u8; 64]);
+        let out = h
+            .ingestor(None)
+            .ingest(bytes.clone(), "Capture d'écran 17.16.26.png", None, None)
+            .await
+            .expect("an image is a valid attachment");
+
+        assert_eq!(out.format, DocumentFormat::Binary);
+        assert_eq!(out.mime_type, "image/png");
+        assert!(!out.extracted);
+        assert_eq!(out.chunk_count, 0);
+        assert!(
+            out.warnings.is_empty(),
+            "a picture the agent sees is not an unreadable file: {:?}",
+            out.warnings
+        );
+        // The bytes are kept byte for byte, which is what `/raw` serves to the
+        // thumbnail and what the runtime base64-encodes for the model.
+        assert_eq!(h.store.get(&out.sha256).unwrap(), bytes);
+    }
+
+    /// The other side of the line: something the platform genuinely cannot read
+    /// keeps its warning.
+    #[tokio::test]
+    async fn an_archive_still_warns_that_it_is_not_readable() {
+        let h = Harness::new();
+        let mut bytes = b"PK\x03\x04".to_vec();
+        bytes.extend_from_slice(&[0u8; 32]);
+        let out = h
+            .ingestor(None)
+            .ingest(bytes, "deliverables.zip", None, None)
+            .await
+            .expect("an archive is still a valid attachment");
+
+        assert_eq!(out.mime_type, "application/zip");
+        assert!(
+            out.warnings.iter().any(|w| w.contains("not readable")),
+            "an archive the agent cannot open must say so: {:?}",
+            out.warnings
+        );
     }
 
     #[tokio::test]
