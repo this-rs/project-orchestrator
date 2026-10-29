@@ -5139,6 +5139,8 @@ mod tests {
 
 #[cfg(test)]
 mod anchor_tests {
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::anchor::*;
     #[allow(unused_imports)]
@@ -5587,6 +5589,8 @@ mod anchor_tests {
 /// (`HARNESS_NEO4J_REQUIRED=1` turns the skip into a failure).
 #[cfg(test)]
 mod cross_project_parity {
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use super::MockGraphStore;
     use crate::episodes::distill_models::SharingConsent;
     use crate::neo4j::client::Neo4jClient;
@@ -5760,6 +5764,8 @@ fn spawned_by_of(session: &ChatSessionNode) -> SpawnedByFields {
 
 #[cfg(test)]
 mod session_tree_tests {
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     //! P18-suite (point 12): the mock's session tree is a real traversal, so the cascade
     //! and tree tests built on it prove something. Red on the former stubs, which answered
     //! the session alone (tree) and the session itself (root) whatever the parents.
@@ -5946,6 +5952,8 @@ mod session_tree_tests {
 
 #[cfg(test)]
 mod bind_project_tests {
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     //! `bind_chat_session_project` (P18): the project a session actually works on is
     //! written once on the node, and an explicit project is never overwritten. Before
     //! it, a session opened without `project_slug` stayed anonymous in
@@ -6031,6 +6039,8 @@ mod bind_project_tests {
 
 #[cfg(test)]
 mod transverse_skill_tests {
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     //! A skill with no project is transverse: it belongs to the instance and is
     //! visible from every project. The rule lives in three places — the Neo4j
     //! query, this in-memory store, and the trigger matcher — so it is pinned
@@ -6112,6 +6122,8 @@ mod transverse_skill_tests {
 
 #[cfg(test)]
 mod rescope_tests {
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     //! Re-scoping is the operation T3 depends on: it must move a node between
     //! the transverse level and a project without recreating it (and therefore
     //! without losing its members, states, transitions or runs).
