@@ -1,6 +1,8 @@
 //! Configuration for the Spreading Activation engine.
 //!
 //! All parameters have sensible defaults and can be overridden per-query.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -137,6 +139,8 @@ impl Default for AutoReinforcementConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_default_config() {

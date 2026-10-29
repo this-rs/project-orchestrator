@@ -1,6 +1,8 @@
 //! `GraphStore` implementation for `Neo4jClient`.
 //!
 //! Every method simply delegates to the corresponding inherent method on `Neo4jClient`.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -8,7 +10,8 @@ use uuid::Uuid;
 use super::client::Neo4jClient;
 use super::document::{Document, DocumentChunk, DocumentChunkHit};
 use super::models::*;
-use super::traits::{GraphStore, StoreCapabilities};
+#[allow(unused_imports)]
+use super::traits::*;
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
@@ -21,6 +24,17 @@ impl GraphStore for Neo4jClient {
         Neo4jClient::storage_capabilities()
     }
 
+    async fn get_progress_batch(
+        &self,
+        kind: ProgressKind,
+        ids: &[Uuid],
+    ) -> anyhow::Result<std::collections::HashMap<Uuid, TaskCounts>> {
+        self.get_progress_batch(kind, ids).await
+    }
+}
+
+#[async_trait]
+impl ProjectStore for Neo4jClient {
     // ========================================================================
     // Project operations
     // ========================================================================
@@ -64,7 +78,10 @@ impl GraphStore for Neo4jClient {
     async fn delete_project(&self, id: Uuid, project_name: &str) -> anyhow::Result<()> {
         self.delete_project(id, project_name).await
     }
+}
 
+#[async_trait]
+impl WorkspaceStore for Neo4jClient {
     // ========================================================================
     // Workspace operations
     // ========================================================================
@@ -139,7 +156,6 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<crate::neo4j::models::CouplingMatrix> {
         self.compute_coupling_matrix(workspace_id).await
     }
-
     // ========================================================================
     // Workspace Milestone operations
     // ========================================================================
@@ -397,7 +413,10 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<Vec<(ComponentNode, Option<String>, Vec<ComponentDependency>)>> {
         self.get_workspace_topology(workspace_id).await
     }
+}
 
+#[async_trait]
+impl CodeStore for Neo4jClient {
     // ========================================================================
     // File operations
     // ========================================================================
@@ -939,7 +958,10 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<Vec<ImplBlockDetailNode>> {
         self.get_type_impl_blocks_detailed(type_name).await
     }
+}
 
+#[async_trait]
+impl PlanStore for Neo4jClient {
     // ========================================================================
     // Plan operations
     // ========================================================================
@@ -1229,7 +1251,10 @@ impl GraphStore for Neo4jClient {
     async fn delete_constraint(&self, constraint_id: Uuid) -> anyhow::Result<()> {
         self.delete_constraint(constraint_id).await
     }
+}
 
+#[async_trait]
+impl DecisionStore for Neo4jClient {
     // ========================================================================
     // Decision operations
     // ========================================================================
@@ -1378,7 +1403,10 @@ impl GraphStore for Neo4jClient {
         self.list_decisions_by_status(status, project_id, workspace_slug, limit, offset)
             .await
     }
+}
 
+#[async_trait]
+impl CommitStore for Neo4jClient {
     // ========================================================================
     // Dependency analysis
     // ========================================================================
@@ -1534,7 +1562,10 @@ impl GraphStore for Neo4jClient {
         self.get_file_transitive_co_changers(file_path, min_score, limit)
             .await
     }
+}
 
+#[async_trait]
+impl ReleaseStore for Neo4jClient {
     // ========================================================================
     // Release operations
     // ========================================================================
@@ -1767,14 +1798,6 @@ impl GraphStore for Neo4jClient {
         self.get_project_progress(project_id).await
     }
 
-    async fn get_progress_batch(
-        &self,
-        kind: ProgressKind,
-        ids: &[Uuid],
-    ) -> anyhow::Result<std::collections::HashMap<Uuid, TaskCounts>> {
-        self.get_progress_batch(kind, ids).await
-    }
-
     async fn get_project_task_dependencies(
         &self,
         project_id: Uuid,
@@ -1889,7 +1912,10 @@ impl GraphStore for Neo4jClient {
         self.list_projects_filtered(search, limit, offset, sort_by, sort_order)
             .await
     }
+}
 
+#[async_trait]
+impl NoteStore for Neo4jClient {
     // ========================================================================
     // Document operations
     // ========================================================================
@@ -2205,7 +2231,10 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<(Vec<Note>, usize)> {
         self.list_notes_without_embedding(limit, offset).await
     }
+}
 
+#[async_trait]
+impl AnalyticsStore for Neo4jClient {
     // ========================================================================
     // Code embedding operations (File & Function vector search)
     // ========================================================================

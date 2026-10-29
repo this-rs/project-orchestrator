@@ -25,6 +25,8 @@
 //!
 //! # References
 //! - EvoFSM (2026): "Controllable Self-Evolution for Deep Research with FSMs"
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 
@@ -33,6 +35,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
+#[allow(unused_imports)]
 use crate::pipeline::critic::{
     CriticMode, CriticScore, GraphBasedCritic, LearningConfig, MutationCandidate, MutationCritic,
 };
@@ -733,6 +736,8 @@ fn compute_failure_rate(runs: &[crate::protocol::models::ProtocolRun]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn make_pattern(
         pattern_type: PatternType,
@@ -861,7 +866,6 @@ mod tests {
     // ── Async tests with MockGraphStore ──────────────────────────────────
 
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::traits::GraphStore;
     use crate::protocol::models::{Protocol, ProtocolState};
 
     /// Helper: set up a mock store with a protocol and start/implement/done states.
@@ -1039,7 +1043,7 @@ mod tests {
         let task_id = Uuid::new_v4();
         let mut parent = crate::test_helpers::test_task();
         parent.id = task_id;
-        crate::neo4j::GraphStore::create_task(store.as_ref(), Uuid::new_v4(), &parent)
+        crate::neo4j::PlanStore::create_task(store.as_ref(), Uuid::new_v4(), &parent)
             .await
             .unwrap();
         let result = evolver

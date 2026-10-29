@@ -4,6 +4,8 @@
 //! - POST /api/registry/publish    — publish a skill to the registry
 //! - GET  /api/registry/search     — search published skills
 //! - GET  /api/registry/:id        — get a specific published skill (with full package)
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
 use super::hook_handlers::skill_cache;

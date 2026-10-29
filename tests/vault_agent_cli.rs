@@ -11,6 +11,8 @@
 //!    the argv of the orchestrator process names the secret, never its value,
 //!    and the child does not inherit the session token.
 //! 3. Without a grant, `secret exec` runs nothing at all.
+#[allow(unused_imports)]
+use project_orchestrator::neo4j::traits::*;
 
 use std::path::Path;
 use std::process::{Command, Output};

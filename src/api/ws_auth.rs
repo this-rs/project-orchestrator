@@ -18,6 +18,8 @@
 //! in a 401 HTTP response (no WS connection opened).
 //!
 //! In no-auth mode, anonymous Claims are returned immediately.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::auth::jwt::Claims;
 use crate::auth::refresh;
@@ -380,6 +382,8 @@ pub async fn wait_ready_then_auth_ok(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::test_helpers::test_auth_config;
     use axum::http::HeaderMap;
 

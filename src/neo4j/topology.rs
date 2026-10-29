@@ -3,6 +3,8 @@
 //! CRUD for topology rules and violation checking.
 //! Inspired by GraIL negative triples — encodes architectural constraints
 //! as forbidden relationships in the knowledge graph.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use crate::graph::models::{

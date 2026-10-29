@@ -11,6 +11,8 @@
 //! outcomes as strings; `Report` counts agreement and mean similarity.
 //!
 //! Nothing here touches the network or an embedding model.
+#[allow(unused_imports)]
+use project_orchestrator::neo4j::traits::*;
 
 use std::collections::BTreeSet;
 

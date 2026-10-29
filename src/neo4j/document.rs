@@ -33,6 +33,8 @@
 //! `vector_search_notes` do. The HNSW index is `document_chunk_embeddings`,
 //! declared next to the others in `init_schema` (see `client.rs`) — this project
 //! keeps its schema there, `migrations/` holds one-off data conversions only.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::batch::{run_unwind_in_chunks_with, BoltMap};
 use super::client::Neo4jClient;
@@ -822,8 +824,8 @@ mod tests {
     use super::*;
     use crate::neo4j::batch::BATCH_SIZE;
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::traits::GraphStore;
-
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     fn a_document(project_id: Option<Uuid>) -> Document {
         Document {
             id: Uuid::new_v4(),

@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -224,6 +226,8 @@ impl SyncSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     // -----------------------------------------------------------------------
     // VectorClock tests

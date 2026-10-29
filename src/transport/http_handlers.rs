@@ -7,6 +7,8 @@
 //! - `GET  /api/p2p/identity`  — return this instance's PeerInfo
 //! - `POST /api/p2p/message`   — receive a message from a peer
 //! - `POST /api/p2p/sync`      — handle HAVE/WANT/DATA sync exchange
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -272,6 +274,8 @@ fn sha2_hash(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use std::collections::HashSet;
 
     #[test]

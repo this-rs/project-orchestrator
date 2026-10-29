@@ -41,6 +41,8 @@
 //! (default `target/eval-transverse/report.json` under the crate).
 //! `PO_EVAL_INJECT_LEAK=<item id>` makes the anchors arm inject that item: the
 //! red proof of the gate (also held by a test).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::chat::anchor::{Anchor, AnchorActor, AnchorRole, AnchorState, AnchorTargetType};
 use crate::chat::anchor_resolver::{
@@ -53,7 +55,8 @@ use crate::episodes::distill_models::SharingConsent;
 use crate::graph::neighborhood::RawNode;
 use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::models::ExecutionPlace;
-use crate::neo4j::GraphStore;
+
+#[allow(unused_imports)]
 use crate::skills::project_resolver::{entries_for_projects, infer_project_slug, ResolvedProject};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -1582,6 +1585,8 @@ fn gate(run: &Run) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     /// The run of the CI: the whole fixture set, the 10 000-resolution replay,
     /// the report written, then the gate.

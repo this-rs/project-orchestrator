@@ -1,4 +1,6 @@
 //! API request handlers
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::api::{
     workspace_handlers::{MilestonePlanSummary, MilestoneStepSummary, MilestoneTaskSummary},
@@ -15,7 +17,10 @@ use crate::neo4j::models::{
     ReleaseStatus, StepNode, TaskNode, TaskStatus, TaskWithPlan,
 };
 use crate::neo4j::plan::{compute_file_conflicts, WaveComputationResult};
+
 use crate::neo4j::StoreCapabilities;
+
+#[allow(unused_imports)]
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::plan::models::*;
 use crate::AuthConfig;
@@ -9503,7 +9508,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_update_plan_status_event_carries_snake_case_status() {
-        use crate::neo4j::GraphStore as _;
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let plan = crate::test_helpers::test_plan();
         graph.create_plan(&plan).await.unwrap();
@@ -9524,7 +9528,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_update_task_status_event_carries_snake_case_status() {
-        use crate::neo4j::GraphStore as _;
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let plan = crate::test_helpers::test_plan();
         graph.create_plan(&plan).await.unwrap();
@@ -9547,7 +9550,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_add_constraint_event_carries_snake_case_type() {
-        use crate::neo4j::GraphStore as _;
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let plan = crate::test_helpers::test_plan();
         graph.create_plan(&plan).await.unwrap();
@@ -9566,7 +9568,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_update_release_status_event_carries_snake_case_status() {
-        use crate::neo4j::GraphStore as _;
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let project = crate::test_helpers::test_project();
         graph.create_project(&project).await.unwrap();
@@ -9587,7 +9588,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_update_milestone_status_event_carries_snake_case_status() {
-        use crate::neo4j::GraphStore as _;
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let project = crate::test_helpers::test_project();
         graph.create_project(&project).await.unwrap();
@@ -11606,7 +11606,6 @@ pub(crate) mod tests {
     /// any handler.
     #[tokio::test]
     async fn a_third_party_write_with_a_non_canonical_id_segment_is_marked_or_refused() {
-        use crate::neo4j::traits::GraphStore;
         let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let (app, _) = test_app_parts(mock.clone()).await;
         let plan = crate::test_helpers::test_plan();
@@ -11660,7 +11659,6 @@ pub(crate) mod tests {
     /// running full after a mixed run — while an edit of the task's text marks.
     #[tokio::test]
     async fn a_status_update_by_a_third_party_agent_does_not_mark_but_a_description_edit_does() {
-        use crate::neo4j::traits::GraphStore;
         let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let (app, _) = test_app_parts(mock.clone()).await;
         let plan = crate::test_helpers::test_plan();
@@ -12178,7 +12176,6 @@ pub(crate) mod tests {
     ) {
         let (app_state, graph, _meili) = crate::test_helpers::mock_app_state_with_stores();
         let project = crate::test_helpers::test_project();
-        use crate::neo4j::traits::GraphStore as _;
         graph.create_project(&project).await.unwrap();
         graph
             .mock_fail_set_watch_enabled
@@ -12548,8 +12545,6 @@ pub(crate) mod tests {
     /// Neo4j semantics): replace / append / remove / read round-trips.
     #[tokio::test]
     async fn day_plan_store_round_trip() {
-        use crate::neo4j::GraphStore;
-
         let store = crate::neo4j::mock::MockGraphStore::new();
         let user = Uuid::new_v4();
         let a = Uuid::new_v4();
@@ -12709,8 +12704,6 @@ pub(crate) mod tests {
     /// slice (`due_date`, `estimated_minutes`).
     #[tokio::test]
     async fn update_task_persists_due_date_and_estimated_minutes() {
-        use crate::neo4j::GraphStore;
-
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let plan_id = Uuid::new_v4();
         let task = crate::neo4j::models::TaskNode::new("Seed task".to_string());
@@ -12742,6 +12735,8 @@ pub(crate) mod tests {
 mod retry_plan_task_tests {
     use super::*;
     use crate::neo4j::models::TaskStatus;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_auth_config, test_bearer_token, test_task};
@@ -13328,7 +13323,6 @@ mod retry_plan_task_tests {
 #[cfg(test)]
 mod fabric_emit_tests {
     use super::*;
-
     #[test]
     fn fabric_refresh_helpers_emit_the_expected_graph_events() {
         let bus = HybridEmitter::new(Arc::new(crate::events::EventBus::default()));
@@ -13367,7 +13361,6 @@ fn transport_label(state: Option<crate::events::TransportState>) -> &'static str
 mod transport_label_tests {
     use super::transport_label;
     use crate::events::TransportState;
-
     #[test]
     fn a_live_connection_is_the_only_thing_that_reads_connected() {
         assert_eq!(transport_label(None), "disabled");

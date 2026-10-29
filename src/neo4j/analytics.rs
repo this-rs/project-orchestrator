@@ -1,4 +1,6 @@
 //! Neo4j Analytics operations (communities, health, GDS metrics)
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use super::models::*;
@@ -3293,6 +3295,8 @@ fn prune_targets(targets: &mut std::collections::HashMap<&str, (f64, u32)>, top_
 #[cfg(test)]
 mod synapse_bridge_tests {
     use super::bridge_synapses;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use std::collections::HashMap;
 
     fn links(entries: &[(&str, &[(&str, bool)])]) -> HashMap<String, Vec<(String, bool)>> {

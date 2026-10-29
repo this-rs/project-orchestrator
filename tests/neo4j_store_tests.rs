@@ -27,6 +27,8 @@
 //!
 //! WARNING: point `NEO4J_URI` at a disposable instance. The default
 //! `bolt://localhost:7687` is a real Neo4j on many dev machines.
+#[allow(unused_imports)]
+use project_orchestrator::neo4j::traits::*;
 
 use project_orchestrator::chat::provider::cognitive::segment::{
     Boundary, Dimension, Fingerprint, Observation, Segment, SegmentPolicy, Segmenter,

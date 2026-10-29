@@ -1,4 +1,6 @@
 //! Neo4j LifecycleHook operations
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use crate::lifecycle::{
@@ -316,8 +318,8 @@ mod tests {
         LifecycleActionType, LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest,
     };
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::traits::GraphStore;
-
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     fn make_hook(name: &str, scope: LifecycleScope, on_status: &str) -> LifecycleHook {
         LifecycleHook::new(
             name.to_string(),

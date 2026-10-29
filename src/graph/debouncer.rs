@@ -19,6 +19,8 @@
 //! let debouncer = AnalyticsDebouncer::new(analytics_engine, 2000);
 //! debouncer.trigger(project_id); // non-blocking
 //! ```
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -500,6 +502,8 @@ mod tests {
     use super::*;
     use crate::graph::mock::MockAnalyticsEngine;
     use crate::graph::models::{CodeHealthReport, GraphAnalytics};
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, Ordering};
 

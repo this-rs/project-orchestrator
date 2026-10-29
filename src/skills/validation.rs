@@ -5,6 +5,8 @@
 //! - Metrics track adoption: activation count, hit rate, energy trend
 //! - Accelerated degradation for unused imported skills (7-day probation)
 //! - Validated skills are promoted and marked as proven
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -338,6 +340,8 @@ pub fn qualifies_for_validation(skill: &SkillNode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use chrono::Duration;
     use uuid::Uuid;
 

@@ -10,11 +10,14 @@
 //!
 //! Like `data_migrations`, the tests print a notice and return when no Neo4j is
 //! reachable; `HARNESS_NEO4J_REQUIRED=1` turns that into a failure.
+#[allow(unused_imports)]
+use project_orchestrator::neo4j::traits::*;
 
 use chrono::Utc;
 use neo4rs::{query, Graph};
 use project_orchestrator::neo4j::client::Neo4jClient;
 use project_orchestrator::neo4j::models::ChatSessionNode;
+#[allow(unused_imports)]
 use project_orchestrator::neo4j::GraphStore;
 use uuid::Uuid;
 
@@ -405,6 +408,8 @@ mod anchors {
     use super::*;
     use project_orchestrator::chat::anchor::*;
     use project_orchestrator::chat::types::SpawnedBy;
+    #[allow(unused_imports)]
+    use project_orchestrator::neo4j::traits::*;
 
     fn typed(e: anyhow::Error) -> AnchorError {
         e.downcast::<AnchorError>().expect("a typed AnchorError")
@@ -804,6 +809,7 @@ mod anchors {
 mod synapse_scope {
     use super::*;
     use project_orchestrator::episodes::distill_models::SharingConsent;
+    #[allow(unused_imports)]
     use project_orchestrator::notes::{EntityType, Note, NoteImportance, NoteType};
 
     fn note(project: Uuid, importance: NoteImportance, consent: SharingConsent) -> Note {
@@ -1101,7 +1107,6 @@ mod synapse_scope {
 mod anchor_followups {
     use super::*;
     use project_orchestrator::chat::types::SpawnedBy;
-
     fn spawned(parent: Uuid) -> String {
         SpawnedBy::Conversation {
             parent_session_id: parent,
@@ -1466,6 +1471,7 @@ mod anchor_scope {
         RawNode, ScopedNeighborhood, DEFAULT_FANOUT, HIERARCHY_V1,
     };
     use project_orchestrator::neo4j::models::ProjectNode;
+    #[allow(unused_imports)]
     use project_orchestrator::notes::{Note, NoteType};
     use project_orchestrator::sharing::consent_gate::ReadDenial;
     use std::collections::{BTreeSet, HashMap};

@@ -6,6 +6,8 @@
 //! - [`SkillTrigger`]: Pattern matching rules for hook activation
 //! - [`TriggerType`]: Type of trigger (Regex, FileGlob, Semantic)
 //! - [`ActivatedSkillContext`]: Response payload for hook activation
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -631,6 +633,8 @@ impl DetectionResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     // --- SkillStatus tests ---
 

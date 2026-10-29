@@ -14,6 +14,8 @@
 //! - `POST /api/execution-places/{id}/reject`: the person says no (`rejected`).
 //! - `GET /api/execution-places/{id}`: a pending placement.
 //! - `GET /api/tasks/{task_id}/execution-places`: the audit of a task, oldest first.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::sync::LazyLock;
 
@@ -36,6 +38,7 @@ use crate::chat::place_confirmation::{
 };
 use crate::neo4j::models::{ExecutionPlaceEvent, ExecutionPlaceEventKind};
 use crate::neo4j::GraphStore;
+
 use crate::runner::ephemeral_worktree::{self, EphemeralWorktree, PlannedWorktree, ReleaseOutcome};
 
 /// The value of `execution_place` that asks for an ephemeral worktree.
@@ -617,6 +620,8 @@ pub async fn list_execution_place_events(
 mod tests {
     use super::*;
     use crate::api::handlers::{delegate_task, DelegateTaskRequest};
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use std::sync::Arc;
 
     const OWNER: &str = "22222222-2222-2222-2222-222222222222";

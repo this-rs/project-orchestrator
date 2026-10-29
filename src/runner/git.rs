@@ -9,6 +9,8 @@
 //! - `MergeResult` / `WorktreeResolution` — structured results for the runner
 //!
 //! A `Mutex` serializes git operations to prevent race conditions in parallel waves.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -703,6 +705,8 @@ pub async fn collect_worktree_commits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     // ----------------------------------------------------------------
     // parse_worktree_porcelain — pure parsing, no git needed

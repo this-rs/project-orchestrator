@@ -5,6 +5,8 @@
 //!
 //! The aggregator runs as a background tokio task spawned at startup.
 //! It processes all accumulated signals in a batch, then sleeps.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -256,6 +258,8 @@ fn apply_ema_updates(profile: &mut UserProfile, updates: &PendingUpdates) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::profile::collector::create_signal_channel;
 
     #[test]

@@ -7,6 +7,8 @@
 //! the client. The one exception is the cause of an unreachable endpoint, which
 //! is echoed **only** when `safe_cause` proves it is a short, URL- and
 //! credential-free line (ERR-1: the cause is data, but a leak is not).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use nexus_claude::agent::ProviderError;
 use serde::Serialize;
@@ -655,6 +657,8 @@ pub fn resolve_failure(err: &ResolveError) -> OpenFailure {
 mod tests {
     use super::super::resolver::Role;
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     // ── SDK errors raised while starting the CLI ───────────────────────────
 
@@ -1422,7 +1426,6 @@ mod tests {
 #[cfg(test)]
 mod auto_vault_locked_tests {
     use super::*;
-
     #[test]
     fn auto_on_a_locked_vault_is_credentials_locked_with_its_fallbacks() {
         let err = anyhow::Error::new(AutoVaultLocked {

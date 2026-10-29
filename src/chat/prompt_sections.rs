@@ -9,6 +9,8 @@
 //!
 //! Backward compatibility: at scaffolding level 0 without FSM, all 16 sections
 //! activate — producing output identical to the original monolith.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::fmt;
 
@@ -1977,6 +1979,8 @@ pub fn extract_tool_reference(tool_reference: &str, groups: &[ToolRefGroupId]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     /// The Claude Code needles are the sections' own text, and the `Agent` vocabulary
     /// leaves no Claude Code sub-agent word behind, in the full and compact variants.
@@ -2174,6 +2178,8 @@ mod tests {
     /// `focal`, `lathe`, `capsule`, `repeat`, `torus` (frontend PRs #407/#408/#409).
     /// Re-copy it when the frontend's contract moves.
     mod iso_contract {
+        #[allow(unused_imports)]
+        use crate::neo4j::traits::*;
         pub const SCENE_KEYS: &[&str] = &[
             "title",
             "caption",

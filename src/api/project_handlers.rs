@@ -1,4 +1,6 @@
 //! Project API handlers
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::api::{PaginatedResponse, PaginationParams, SearchFilter};
 use crate::events::{EntityType, EventEmitter};
@@ -851,6 +853,8 @@ pub async fn get_transverse_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use std::sync::Arc;
 
     #[test]

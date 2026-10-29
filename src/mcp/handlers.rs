@@ -3,6 +3,8 @@
 //! All tool calls are proxied to the REST API via McpHttpClient.
 //! Mega-tool names (e.g. "project") are resolved to legacy names
 //! (e.g. "list_projects") before HTTP routing.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -6581,6 +6583,8 @@ mod update_body_tests {
     //! nothing. These pin the three cases, because only one of them may erase
     //! a scope.
     use super::{update_body, PROTOCOL_UPDATE_KEYS, SKILL_UPDATE_KEYS};
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use serde_json::json;
 
     #[test]
@@ -6625,6 +6629,7 @@ mod update_body_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use serde_json::json;
 
     // ========================================================================
@@ -12513,6 +12518,8 @@ mod tests {
         };
         use crate::mcp_federation::McpTransport;
         use crate::mcp_federation::{DiscoveredTool, InferredCategory, McpSecurityPolicy};
+        #[allow(unused_imports)]
+        use crate::neo4j::traits::*;
         use anyhow::Result;
         use async_trait::async_trait;
         use chrono::Utc;
@@ -12972,6 +12979,7 @@ mod tests {
 #[cfg(test)]
 mod schema_drift_tests {
     use super::*;
+    #[allow(unused_imports)]
     use std::collections::{BTreeMap, BTreeSet};
 
     /// Published keys that no explicit handler arm reads, because the arm forwards

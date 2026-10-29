@@ -20,6 +20,8 @@
 //!
 //! Regenerate after a DELIBERATE change — read the diff before committing it:
 //! `UPDATE_CHAT_EVENT_GOLDEN=1 cargo test --test chat_event_golden`
+#[allow(unused_imports)]
+use project_orchestrator::neo4j::traits::*;
 
 use nexus_claude::Message;
 use project_orchestrator::chat::manager::ChatManager;

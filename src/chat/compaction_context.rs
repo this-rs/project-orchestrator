@@ -11,6 +11,8 @@
 //! - Critical notes
 //!
 //! Output uses `<system-reminder>` XML tags to distinguish from user content.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::fmt::Write as FmtWrite;
 use std::sync::Arc;
@@ -813,6 +815,8 @@ fn truncate(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn sample_context() -> CompactionContext {
         CompactionContext {

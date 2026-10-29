@@ -16,6 +16,8 @@
 //!
 //! ## Configuration
 //! - [`AnalyticsConfig`] — tuning parameters for the analytics algorithms
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::analytics::distribution::DistributionAnalysis;
 use crate::analytics::hypothesis::AnovaResult;
@@ -1969,6 +1971,8 @@ pub struct MultiSignalImpact {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     // --- AnalyticsConfig ---
 

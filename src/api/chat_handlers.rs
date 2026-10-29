@@ -1,4 +1,6 @@
 //! Chat API handlers — session management (streaming via WebSocket)
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::api::handlers::{AppError, OrchestratorState};
 use crate::api::query::{PaginatedResponse, PaginationParams};
@@ -7,6 +9,8 @@ use crate::chat::types::{
     MessageSearchResult, SessionActivity,
 };
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
+
+#[allow(unused_imports)]
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -2286,6 +2290,8 @@ mod tests {
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_bearer_token, test_chat_session};
     use axum::body::Body;
@@ -6055,7 +6061,6 @@ fn switch_error(error: anyhow::Error, session_id: &str) -> AppError {
 mod switch_provider_tests {
     use super::*;
     use crate::chat::types::SwitchProviderError;
-
     #[test]
     fn an_unknown_session_is_a_404_that_names_it() {
         let err = switch_error(anyhow::Error::new(SwitchProviderError::NotFound), "abc");
@@ -6160,7 +6165,6 @@ mod file_scope_lift_tests {
     use crate::auth::jwt::{Claims, TOKEN_TYPE_AGENT_SESSION, TOKEN_TYPE_MCP};
     use crate::chat::envelope::SpawnCaller;
     use crate::chat::types::ChatRequest;
-
     fn person() -> Claims {
         Claims {
             sub: uuid::Uuid::new_v4().to_string(),
@@ -6844,7 +6848,9 @@ pub mod anchors {
         use crate::chat::anchor_resolver::resolve_session_scope;
         use crate::graph::neighborhood::RawNode;
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::GraphStore;
+        #[allow(unused_imports)]
+        use crate::neo4j::traits::*;
+        #[allow(unused_imports)]
         use crate::test_helpers::{
             router_with_auth_and_events, test_bearer_token, test_chat_session, test_project_named,
         };

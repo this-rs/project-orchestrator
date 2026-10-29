@@ -3,6 +3,8 @@
 //! Defines the abstract interface for vector embedding generation.
 //! This trait follows the same pattern as `GraphStore` and `SearchStore`:
 //! async trait + Send + Sync for Arc<dyn EmbeddingProvider> usage.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use anyhow::Result;
 use async_trait::async_trait;

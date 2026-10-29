@@ -48,6 +48,8 @@
 //! (`ChatManager::send_message`): a move opens a new session through the relay
 //! (`moved_by: auto`) and the message is sent there, never to the old session. The hook
 //! then uses the decision already taken for its turn instead of asking again.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1910,6 +1912,8 @@ impl TurnRouting {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use nexus_claude::agent::ToolCategory;
     use nexus_claude::{
         HookCallback, HookSpecificOutput, PostToolUseHookSpecificOutput,
@@ -2437,6 +2441,7 @@ mod tests {
 mod provider_move_tests {
     use super::*;
     use crate::chat::provider::cognitive::decision::DecisionAlternative;
+    #[allow(unused_imports)]
     use chrono::Utc;
     use nexus_claude::agent::CostBasis;
     use std::sync::Mutex as StdMutex;
@@ -3509,6 +3514,7 @@ mod image_routing_tests {
     use crate::chat::provider::cognitive::candidates::RejectReason;
     use crate::chat::provider::cognitive::decider::decide_with;
     use crate::chat::provider::cognitive::scorer::PriorHints;
+    #[allow(unused_imports)]
     use chrono::Utc;
     use nexus_claude::agent::CostBasis;
     use std::sync::Mutex as StdMutex;
@@ -4108,6 +4114,7 @@ mod segment_tests {
     use crate::chat::provider::cognitive::decision::DecisionAlternative;
     use crate::chat::provider::cognitive::segment::BoundaryReason;
     use crate::chat::provider::cognitive::segment_store::{InMemorySegmentStore, SegmentStore};
+    #[allow(unused_imports)]
     use chrono::Utc;
     use nexus_claude::agent::CostBasis;
     use std::sync::Mutex as StdMutex;

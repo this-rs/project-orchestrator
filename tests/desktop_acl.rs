@@ -14,6 +14,8 @@
 //! validates every capability at build time) or that a window really reaches a
 //! command (that needs a webview). What is: nobody is granted a command that does not
 //! exist, nothing is granted by accident, and a new command forces a decision.
+#[allow(unused_imports)]
+use project_orchestrator::neo4j::traits::*;
 
 use std::collections::BTreeSet;
 use std::fs;

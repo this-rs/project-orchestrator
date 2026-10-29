@@ -1,6 +1,8 @@
 //! Les garde-fous EN MÉMOIRE de la route publique : drapeau, taille, délai,
 //! concurrence, débit par déclencheur, et compteur des refus qui précèdent
 //! l'authentification (ces refus n'écrivent RIEN en base).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -248,6 +250,8 @@ impl IngressRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn off_by_default_with_the_documented_limits() {

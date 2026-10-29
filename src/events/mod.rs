@@ -69,6 +69,8 @@
 //! | CommunityChanged  | Skills     | Louvain recomputation                                |
 //! | BatchCreated      | Code       | project sync completion (bulk IMPORTS/CALLS)          |
 //! | ScoresUpdated     | Fabric     | update_fabric_scores, bootstrap_knowledge_fabric     |
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 pub mod attention;
 pub mod builtin_triggers;

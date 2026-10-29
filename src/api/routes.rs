@@ -2,6 +2,8 @@
 //!
 //! Routes are split into public (no auth) and protected (require valid JWT).
 //! The `require_auth` middleware is applied only to protected routes.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::auth_handlers;
 use super::chat_handlers;
@@ -2387,6 +2389,8 @@ fn protected_routes() -> Router<OrchestratorState> {
 mod tests {
     use super::*;
     use crate::events::EventBus;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn static_assets_detected_but_spa_routes_with_dots_are_not() {
@@ -2576,8 +2580,6 @@ mod tests {
     /// registration is open to anyone.
     #[tokio::test]
     async fn test_oauth_authorize_requires_explicit_consent() {
-        use crate::neo4j::traits::GraphStore;
-
         // A user with a live session (refresh cookie).
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let user_id = uuid::Uuid::new_v4();

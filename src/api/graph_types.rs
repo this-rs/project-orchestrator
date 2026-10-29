@@ -1,10 +1,11 @@
 //! Shared graph types and helpers for project and workspace graph endpoints.
 //!
 //! Extracted from `project_handlers.rs` to enable reuse by `workspace_handlers.rs`.
-
 use crate::api::handlers::AppError;
 use crate::neo4j::models::ProjectNode;
-use crate::neo4j::GraphStore;
+use crate::neo4j::traits::*;
+
+#[allow(unused_imports)]
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -1449,7 +1450,7 @@ mod transverse_graph_tests {
     //! the selection (a project note must NOT leak into it).
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::traits::GraphStore;
+    #[allow(unused_imports)]
     use crate::protocol::Protocol;
     use crate::skills::{SkillNode, SkillStatus};
     use crate::test_helpers::{test_note, test_project};
@@ -1538,6 +1539,7 @@ mod knowledge_layer_tests {
     //! showed 50 and said nothing.
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::test_helpers::{test_note, test_project};
 
     #[tokio::test]

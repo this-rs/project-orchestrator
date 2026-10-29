@@ -21,6 +21,8 @@
 //! yet); DeepSeek is `Unproven` for the same reason; the generic
 //! OpenAI-compatible vocabulary is `Documented` because that family publishes its
 //! error codes.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::time::Duration;
 
@@ -203,6 +205,8 @@ fn host_of(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn every_preset_has_exactly_one_row_and_the_generic_one_is_first() {

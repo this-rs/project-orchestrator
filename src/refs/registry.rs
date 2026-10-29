@@ -6,6 +6,8 @@
 //! stop compiling (the `classify_*` matches have no wildcard) *and* fail a test
 //! that names the variant, so nobody can add an entity type without deciding
 //! whether it can be referenced.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::events::EntityType as EventsEntity;
 use crate::notes::models::{EntityType as NotesEntity, NoteType};
@@ -189,6 +191,8 @@ pub fn classify_notes(e: &NotesEntity) -> Classification {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     /// Variant names of `pub enum <name>` read from the source text, so that
     /// the lists below cannot silently fall behind the enums.

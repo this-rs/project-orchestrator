@@ -6,6 +6,8 @@
 //!
 //! Populated from `ParsedFile` results during sync, then used by all
 //! language-specific import resolvers.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 
@@ -226,6 +228,8 @@ impl Default for SymbolTable {
 mod tests {
     use super::*;
     use crate::neo4j::models::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::parser::ParsedFile;
 
     fn make_parsed_file(

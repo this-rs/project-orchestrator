@@ -16,6 +16,8 @@
 //! - "Episodic Memory in AI Agents Poses Risks That Should Be Studied and
 //!   Mitigated" (2025) — motivates multi-layered anonymization and differential
 //!   privacy for exported episodic memories.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use regex::Regex;
 use std::collections::HashMap;
@@ -874,6 +876,8 @@ fn count_placeholder_occurrences(text: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     // --- L3-FORBIDDEN tests (should block) ---
 

@@ -32,6 +32,8 @@
 //! [`close_decision_with`] also hands the closed decision to a
 //! [`TrajectorySink`]; [`CollectorSink`] feeds the neural-routing collector
 //! with a `routing.select_model` decision record.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use uuid::Uuid;
 
@@ -356,6 +358,8 @@ mod tests {
     use crate::chat::provider::cognitive::mode::{LearningStage, ProviderRoutingMode};
     use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
     use crate::chat::provider::cognitive::store::{ArmKey, InMemoryRoutingStore};
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn decision(chosen: Option<Pick>) -> CognitiveDecision {
         CognitiveDecision {

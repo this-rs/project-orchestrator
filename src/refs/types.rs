@@ -1,4 +1,6 @@
 //! The wire shapes of a reference.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -315,6 +317,8 @@ pub fn split_token(token: &str) -> Option<(char, RawRef)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn id() -> Uuid {
         Uuid::parse_str("3adeffc9-c8b0-4e2f-a674-55bfcb293433").unwrap()

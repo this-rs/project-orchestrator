@@ -2,6 +2,8 @@
 //!
 //! Validates cryptographic trust proofs and content integrity before
 //! an envelope is accepted into the local reception pipeline.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -80,6 +82,8 @@ mod tests {
         DistillationEnvelope, DistillationMeta, DistilledLesson, PortabilityLayer,
         SensitivityLevel, TrustProof,
     };
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;

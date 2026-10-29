@@ -7,11 +7,15 @@
 //! - Client → Server: JSON messages (user_message, interrupt, permission_response, input_response)
 //! - Server → Client: JSON events with `seq` field (0 for non-persisted stream_delta)
 //! - On connect: replay persisted events since `last_event` query param, then `replay_complete`
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
 use super::ws_auth::CookieAuthResult;
 use crate::auth::jwt::Claims;
 use crate::chat::manager::{DeliveryRoute, MessageDeliveryError};
+
+#[allow(unused_imports)]
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -1236,6 +1240,9 @@ fn live_frame(
 /// Allows at most `MAX_BOOSTS_PER_MINUTE` reinforcement batches per minute
 /// to avoid runaway energy inflation during rapid conversations.
 mod chat_reinforcement_limiter {
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     /// Maximum reinforcement batches per minute window.
@@ -1706,6 +1713,7 @@ fn control_frame(event: &crate::chat::types::ChatEvent) -> Option<String> {
 mod tests {
     use super::*;
     use crate::chat::types::ChatEvent;
+    #[allow(unused_imports)]
     use std::collections::HashSet;
     use tokio::sync::broadcast;
 
@@ -1840,7 +1848,6 @@ mod tests {
     /// and anyone's on a session nobody owns go through.
     #[tokio::test]
     async fn only_the_owner_answers_on_the_websocket() {
-        use crate::neo4j::traits::GraphStore;
         let mock = crate::neo4j::mock::MockGraphStore::new();
         let owner = uuid::Uuid::new_v4().to_string();
         let owned = crate::neo4j::models::ChatSessionNode {
@@ -1883,7 +1890,6 @@ mod tests {
     /// local routing does not check the owner again.
     #[tokio::test]
     async fn a_websocket_answer_is_refused_when_the_owner_cannot_be_read() {
-        use crate::neo4j::traits::GraphStore;
         let mock = crate::neo4j::mock::MockGraphStore::new();
         let free = crate::test_helpers::test_chat_session(None);
         mock.create_chat_session(&free).await.unwrap();
@@ -2128,7 +2134,6 @@ mod tests {
         project: Uuid,
         path: &str,
     ) -> Uuid {
-        use crate::neo4j::traits::GraphStore;
         let mut n = crate::notes::Note::new(
             Some(project),
             crate::notes::NoteType::Guideline,
@@ -2146,7 +2151,6 @@ mod tests {
 
     #[tokio::test]
     async fn neural_reinforcement_boosts_only_the_session_project() {
-        use crate::neo4j::traits::GraphStore;
         let mock = crate::neo4j::mock::MockGraphStore::new();
         let mut project = crate::test_helpers::test_project();
         project.slug = "mine".into();
@@ -2185,7 +2189,6 @@ mod tests {
 
     #[tokio::test]
     async fn neural_reinforcement_without_session_project_boosts_nothing() {
-        use crate::neo4j::traits::GraphStore;
         let mock = crate::neo4j::mock::MockGraphStore::new();
         let session = crate::test_helpers::test_chat_session(None);
         mock.create_chat_session(&session).await.unwrap();

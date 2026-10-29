@@ -30,6 +30,8 @@
 //! [`MAX_COLUMNS`] columns, and the declared decompressed size of the whole
 //! archive at [`MAX_DECLARED_UNCOMPRESSED_BYTES`]. Whatever is cut is reported
 //! in `warnings`, never silently dropped.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::io::Cursor;
 
@@ -250,6 +252,8 @@ fn push_cell(out: &mut String, value: &Data) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 

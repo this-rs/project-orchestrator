@@ -11,6 +11,8 @@
 //! Run via `admin(action: "seed_runner_protocols")` or called from the main seed.
 //!
 //! Idempotent — skips protocols that already exist by name.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 
@@ -1119,6 +1121,8 @@ flag for human attention via a high-importance gotcha note.",
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_runner_protocol_defs_count() {

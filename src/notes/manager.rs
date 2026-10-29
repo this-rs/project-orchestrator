@@ -2,6 +2,8 @@
 //!
 //! Provides high-level operations for creating, reading, updating, and deleting notes,
 //! including linking notes to entities and managing note lifecycle.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::models::*;
 use crate::embeddings::EmbeddingProvider;
@@ -10,6 +12,8 @@ use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType, EventE
 use crate::meilisearch::indexes::NoteDocument;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::GraphStore;
+
+#[allow(unused_imports)]
 use crate::utils::reciprocal_rank_fusion;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -2264,6 +2268,8 @@ fn fuse_dense_and_lexical(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::test_helpers::*;
 
     // -- Hybrid ranking: dense ∪ lexical, fused by RRF ----------------------
@@ -3882,7 +3888,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_relative_path_resolves_to_its_single_project() {
-        use crate::neo4j::traits::GraphStore;
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let (p, q) = (Uuid::new_v4(), Uuid::new_v4());
         graph
@@ -3934,7 +3939,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_ambiguous_relative_path_never_widens_the_scope() {
-        use crate::neo4j::traits::GraphStore;
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let (p, q, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         graph

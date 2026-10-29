@@ -5,6 +5,8 @@
 //!
 //! For backward compatibility, legacy `google_*` config fields are mapped to
 //! an OidcClient with hardcoded Google endpoints.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -451,6 +453,8 @@ impl OidcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::test_helpers::test_auth_config;
 
     #[test]

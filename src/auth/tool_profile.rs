@@ -18,6 +18,8 @@
 //! No profile in the token = the full profile (today's behaviour). An unknown
 //! profile name = the restricted one: never an allow on something we do not
 //! recognise.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::mcp::protocol::ToolDefinition;
 use axum::http::Method;
@@ -870,6 +872,8 @@ impl ToolProfile {
 mod tests {
     use super::*;
     use crate::mcp::tools::all_tools;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn actions_of(tools: &[ToolDefinition], name: &str) -> Vec<String> {
         tools

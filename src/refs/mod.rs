@@ -19,6 +19,8 @@
 //!
 //! The golden fixtures in `tests/fixtures/refs/` are the contract with the
 //! frontend; `tests/refs_contract.rs` keeps them and the types in step.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 pub mod access;
 pub mod block;

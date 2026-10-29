@@ -3,6 +3,8 @@
 //! The RunnerState is persisted as a (:PlanRun) node in Neo4j,
 //! linked to the Plan via (:PlanRun)-[:RUNS]->(:Plan).
 //! This enables recovery after server crashes.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -382,6 +384,8 @@ impl RunnerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_runner_state_new() {

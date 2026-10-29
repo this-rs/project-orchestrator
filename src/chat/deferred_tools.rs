@@ -29,6 +29,8 @@
 //!   sessions opened after it (the native provider is rebuilt, see
 //!   `ChatManager::provider_for`), never to a running conversation — its cached prefix
 //!   would break.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 
@@ -235,6 +237,8 @@ mod tests {
     use super::*;
     use crate::mcp::tools::all_tools;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()

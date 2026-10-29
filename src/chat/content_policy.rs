@@ -20,6 +20,8 @@
 //! needed. Routing a conversation that DOES need the material to a permissive provider
 //! (a candidate-filter reject reason, the cognitive layer's auto-move) is the planned
 //! follow-up; this module is the shared vocabulary both halves read.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 /// Reserved tag marking a note or persona as carrying material a restricted provider's
 /// safety classifier refuses (legitimate security / exploitation work). Case-insensitive.
@@ -99,6 +101,8 @@ pub fn tags_are_sensitive(tags: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn claude_code_and_the_empty_default_are_restricted_others_permissive() {

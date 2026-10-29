@@ -36,6 +36,8 @@
 //! read as a parity gap: a `fake_openai` that does not record request headers hides
 //! `anthropic-version`, and the cell then accused the harness on a `main` whose CI was
 //! green (28/10/2026, see [`anthropic_messages_verdict`]).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -66,6 +68,8 @@ use crate::events::nats_broker_test::TestBroker;
 use crate::events::NatsEmitter;
 use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::GraphStore;
+
+#[allow(unused_imports)]
 use crate::refs::types::{EntityRef, RefKind};
 use crate::test_helpers::mock_app_state;
 

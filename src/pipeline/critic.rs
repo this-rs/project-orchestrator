@@ -13,6 +13,8 @@
 //! - EvoFSM (2026): "Controllable Self-Evolution for Deep Research with FSMs"
 //!   — separates Flow optimization (protocol structure) from Skill optimization
 //!   — uses a critic to gate mutations before application
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -259,6 +261,8 @@ impl Default for LearningConfig {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::pipeline::feedback::PatternType;
     use uuid::Uuid;
 

@@ -5,6 +5,8 @@
 //! 2. Backward compatibility — manual fire_transition works without runner
 //! 3. Server restart mid-run — resume from last state (not from scratch)
 //! 4. Cancel during execution — clean shutdown, no orphan tasks
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 #[cfg(test)]
 mod tests {
@@ -12,6 +14,9 @@ mod tests {
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::ProjectNode;
     use crate::neo4j::traits::GraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::protocol::engine;
     use crate::protocol::runner::run_protocol;
     use crate::protocol::{

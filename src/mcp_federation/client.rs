@@ -4,6 +4,8 @@
 //! - **Stdio**: spawn a child process, JSON-RPC 2.0 over stdin/stdout
 //! - **SSE**: legacy HTTP GET (server→client SSE) + HTTP POST (client→server)
 //! - **StreamableHTTP**: POST with optional SSE response (MCP 2025-03)
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -921,6 +923,8 @@ impl McpClient for SseMcpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_augmented_path_adds_homebrew_to_minimal_launchd_path() {

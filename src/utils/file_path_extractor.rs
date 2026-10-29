@@ -3,6 +3,8 @@
 //! Provides a single, robust implementation for extracting file paths mentioned
 //! in free-form text (chat messages, notes, etc.). Consolidates 6 previously
 //! divergent implementations into one canonical function.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashSet;
 
@@ -314,6 +316,8 @@ fn validate_and_normalize_path(token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_path_with_slash() {

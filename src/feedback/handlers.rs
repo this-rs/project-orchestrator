@@ -3,6 +3,8 @@
 //! - POST /api/feedback — submit explicit feedback
 //! - GET  /api/feedback — list feedback entries
 //! - GET  /api/feedback/stats — aggregated statistics
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use axum::{
     extract::{Query, State},
@@ -130,6 +132,8 @@ pub async fn get_feedback_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_score_validation_in_range() {

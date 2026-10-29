@@ -28,6 +28,8 @@
 //! - [`engine`] — `AnalyticsEngine` trait and `GraphAnalyticsEngine` orchestrator
 //! - [`debouncer`] — `AnalyticsDebouncer` for coalescing rapid-fire triggers
 //! - [`mock`] — `MockAnalyticsEngine` for testing (cfg(test) only)
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 pub mod algorithms;
 pub mod confidence;

@@ -12,6 +12,8 @@
 //!
 //! Uses `tokio::sync::RwLock<HashMap>` — read-heavy workload (many hook
 //! activations, rare mutations). DashMap is not in Cargo.toml.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -343,6 +345,8 @@ pub fn evaluate_cached_skill(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn make_test_skill(name: &str, triggers: Vec<(TriggerType, &str)>) -> SkillNode {
         use crate::skills::models::SkillTrigger;

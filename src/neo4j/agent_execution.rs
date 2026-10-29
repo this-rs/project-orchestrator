@@ -3,6 +3,8 @@
 //! Each spawned agent gets its own AgentExecution node, linked to both the PlanRun
 //! and the Task it executes. This enables per-agent vector collection and
 //! fine-grained historical analysis.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use anyhow::Result;
@@ -875,6 +877,8 @@ impl Neo4jClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use chrono::Utc;
 
     fn make_agent_execution(
@@ -1068,7 +1072,6 @@ mod tests {
     #[tokio::test]
     async fn test_agent_execution_record_fields_mock_roundtrip() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
 
         let g = MockGraphStore::new();
         let ae = make_fully_recorded_execution();
@@ -1487,7 +1490,6 @@ mod tests {
     #[tokio::test]
     async fn recording_a_verification_sets_the_flat_verdict_on_the_mock() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
         let g = MockGraphStore::new();
         let ae = make_agent_execution(None, None);
         g.create_agent_execution(&ae).await.unwrap();

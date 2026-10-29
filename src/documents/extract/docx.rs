@@ -27,6 +27,8 @@
 //! boundaries, and a document with none of either collapses into one
 //! unsplittable chunk. So `</w:p>` emits a newline, `<w:br/>` a newline and
 //! `<w:tab/>` a tab — the layout elements are content, not decoration.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::io::{Cursor, Read};
 
@@ -320,6 +322,8 @@ fn extract_body_text(xml: &str, warnings: &mut Vec<String>) -> Result<String, Ex
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 

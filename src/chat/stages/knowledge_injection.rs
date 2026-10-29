@@ -50,6 +50,8 @@
 //! - Graceful degradation: each query has a 200ms timeout; failures are logged
 //!   and skipped. A timed-out or failed embedding simply drops the dense
 //!   channel — the turn falls back to BM25 instead of losing knowledge.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -68,6 +70,7 @@ use crate::chat::stages::intent_weights::IntentWeightMap;
 use crate::embeddings::EmbeddingProvider;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
+#[allow(unused_imports)]
 use crate::neurons::intent::{IntentDetector, QueryIntentMode};
 use crate::notes::models::EntityType as NoteEntityType;
 use crate::sharing::consent_gate::ConsentReader;
@@ -1826,6 +1829,8 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     // ── currency check: newer knowledge wins ────────────────────────────
 
@@ -3639,6 +3644,7 @@ mod pinned_settings_tests {
     use super::*;
     use crate::chat::enrichment::ParallelEnrichmentStage;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::notes::{Note, NoteType};
 
     fn stage(graph: Arc<MockGraphStore>, configured: Vec<Uuid>) -> KnowledgeInjectionStage {

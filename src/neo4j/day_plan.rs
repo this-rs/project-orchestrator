@@ -4,6 +4,8 @@
 //! `(:DayPlan {user_id, date, updated_at})` node with ordered
 //! `[:INCLUDES {order}]->(:Task)` edges. It is the server-side home of the
 //! "today plan": shared across clients and readable by the chat agent.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use anyhow::Result;

@@ -50,6 +50,8 @@
 //! from the content hash, via [`DocumentStore::path_for`]. It is sanitised
 //! before being stored or echoed into a header, because it also ends up in a
 //! `Content-Disposition` and in the graph.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::handlers::OrchestratorState;
 use crate::documents::{
@@ -58,6 +60,7 @@ use crate::documents::{
 };
 use crate::embeddings::EmbeddingProvider;
 use crate::neo4j::document::{Document, DocumentChunk};
+#[allow(unused_imports)]
 use crate::neo4j::GraphStore;
 use crate::notes::EntityType;
 use axum::{
@@ -1066,6 +1069,8 @@ mod tests {
     use super::*;
     use crate::embeddings::MockEmbeddingProvider;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;

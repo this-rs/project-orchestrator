@@ -35,6 +35,8 @@
 //! ```text
 //! NEO4J_URI=bolt://127.0.0.1:27687 NEO4J_PASSWORD=... cargo test --test store_conformance
 //! ```
+#[allow(unused_imports)]
+use project_orchestrator::neo4j::traits::*;
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;

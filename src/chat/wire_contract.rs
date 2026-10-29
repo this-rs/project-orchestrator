@@ -17,6 +17,8 @@
 //!
 //! Regenerate after any change of the wire:
 //! `UPDATE_CHAT_CONTRACT=1 cargo test --lib chat::wire_contract`
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::api::ws_chat_handler::WsChatClientMessage;
 use crate::chat::message_attachments::MessageAttachment;

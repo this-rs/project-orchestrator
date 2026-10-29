@@ -8,6 +8,8 @@
 //! 3. **Persistence**: Write scores back to Neo4j via `AnalyticsWriter`
 //!
 //! The trait also enables mocking in downstream consumer tests.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::neo4j::GraphStore;
 use anyhow::Result;
@@ -482,6 +484,8 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{FileNode, FunctionNode, Visibility};
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::test_helpers::test_project;
 
     /// Seed a project with files forming two clusters connected by one edge.

@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -179,6 +181,8 @@ impl Default for PeerRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn make_peer(did: &str) -> PeerInfo {
         PeerInfo {

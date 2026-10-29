@@ -4,6 +4,8 @@
 //! 1. Generate the authorization URL (user redirects to Google)
 //! 2. Exchange the authorization code for an access token
 //! 3. Fetch user info from Google's userinfo endpoint
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -155,6 +157,8 @@ impl GoogleOAuthClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn test_auth_config() -> AuthConfig {
         AuthConfig {

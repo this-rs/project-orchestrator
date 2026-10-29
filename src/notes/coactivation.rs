@@ -6,6 +6,8 @@
 //! projects. Synapses never cross projects, so the set is split per project
 //! first; each group is reinforced on its own and the returned count is the
 //! number of synapses really written.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::BTreeMap;
 
@@ -14,7 +16,6 @@ use uuid::Uuid;
 
 use super::models::Note;
 use crate::neo4j::traits::GraphStore;
-
 /// Note ids grouped by owning project. Duplicates are merged; notes without a
 /// `project_id` belong to no group (they cannot be reinforced).
 pub fn group_by_project(notes: &[Note]) -> BTreeMap<Uuid, Vec<Uuid>> {
@@ -120,6 +121,8 @@ pub async fn session_project_id(graph: &dyn GraphStore, session_id: Uuid) -> Opt
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::notes::models::NoteType;
 
     fn note(project: Option<Uuid>) -> Note {

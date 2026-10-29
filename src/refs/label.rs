@@ -2,6 +2,8 @@
 //! from a client. Three kinds have no title of their own (a note has only its
 //! content, a decision only its description, a task may have no title): the
 //! label is derived here, in one place, with one length limit.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 /// Longest label, in characters, ellipsis included.
 pub const MAX_LABEL_CHARS: usize = 80;
@@ -47,6 +49,8 @@ pub fn derive(kind: &str, id: &uuid::Uuid, texts: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use uuid::Uuid;
 
     #[test]

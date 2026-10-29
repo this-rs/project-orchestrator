@@ -11,6 +11,8 @@
 //! once a project has consented to its origin and credential reference. The
 //! security gate (A32) refuses to create one on a server running without
 //! authentication.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use axum::{
     extract::{Path, State},
@@ -1562,6 +1564,8 @@ mod agent_surface_tests {
     //! The agent surface the MCP `provider` mega-tool calls: THE SAME answers as
     //! the person's settings routes (no second set of validations), plus the two
     //! grants an agent may not give itself.
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     use super::*;
     use axum::body::Body;
@@ -1591,7 +1595,6 @@ mod agent_surface_tests {
     #[tokio::test]
     async fn deleting_an_instance_forgets_its_quota_so_a_new_one_starts_clean() {
         use crate::chat::provider::quota::QUOTA_PREFIX;
-        use crate::neo4j::GraphStore;
 
         let (app, graph) = app().await;
         let id = "deepseek-spent";
@@ -2133,7 +2136,6 @@ mod agent_surface_tests {
 #[cfg(test)]
 mod listed_models_tests {
     use super::merge_listed_models;
-
     fn v(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|x| x.to_string()).collect()
     }
@@ -2163,6 +2165,7 @@ mod listed_models_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 

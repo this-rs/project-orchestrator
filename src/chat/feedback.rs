@@ -24,6 +24,8 @@
 //!
 //! **Do NOT** wire `record_path()` into `reason_handlers.rs` — that would cause
 //! double reinforcement for explicitly-rated trees.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -37,6 +39,7 @@ use crate::chat::observation_detector::{detect_observations, DetectedObservation
 use crate::events::EventEmitter;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
+#[allow(unused_imports)]
 use crate::notes::models::{MemoryHorizon, Note, NoteImportance, NoteType};
 
 // ============================================================================
@@ -906,6 +909,8 @@ pub async fn cited_refs_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[tokio::test]
     async fn test_session_cache_dedup() {
@@ -1520,6 +1525,7 @@ mod tests {
 #[cfg(test)]
 mod cited_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::refs::test_support::world;
 
     #[tokio::test]

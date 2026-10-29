@@ -38,6 +38,8 @@
 //!   `focus`, nor take `origin`, nor demote/remove an anchor holding `focus`;
 //! - the target id is validated by type ([`validate_target_id`]);
 //! - modifications carry the `version` the caller read (optimistic concurrency).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::neo4j::models::ProjectNode;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -787,6 +789,8 @@ pub fn format_ts(t: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use AnchorActor::*;
     use AnchorRole::*;
     use AnchorTargetType as T;

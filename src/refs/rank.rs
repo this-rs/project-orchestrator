@@ -17,6 +17,8 @@
 //! | 7    | every word of the text is in the title or body   | 10    |
 //!
 //! An empty text scores `0` for everything (recency decides).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use unicode_normalization::char::is_combining_mark;
 use unicode_normalization::UnicodeNormalization;
@@ -74,6 +76,8 @@ pub fn score(needle: &str, title: &str, body: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn folding_ignores_case_accents_and_blanks() {

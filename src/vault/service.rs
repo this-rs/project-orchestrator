@@ -4,6 +4,8 @@
 //! Every path that hands out a value goes through [`VaultService::read_for_agent`]
 //! (an agent, under a grant) — and every value handed out is registered with the
 //! masker first, so it is masked before the caller can possibly print it.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -595,6 +597,8 @@ impl VaultService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     const PASS: &str = "correct horse battery staple";
 

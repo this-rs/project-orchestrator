@@ -3,6 +3,8 @@
 //! Queries the knowledge graph for files that frequently co-change with
 //! the affected files. Filters by coupling > 0.5, excludes files already
 //! in the affected set, and limits to 3 suggestions.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::time::Duration;
 
@@ -109,6 +111,8 @@ pub async fn fetch_co_change_suggestions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_constants() {

@@ -1,4 +1,6 @@
 //! Modèle du journal d'événements externes.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -43,7 +45,8 @@ pub struct ExternalEvent {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::traits::GraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use chrono::TimeZone;
 
     fn event(trigger_id: Uuid, outcome: IngressOutcome, secs: i64) -> ExternalEvent {

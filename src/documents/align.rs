@@ -21,6 +21,8 @@
 //! [`locate`] turns "is this citation still true?" into a measured property with
 //! three degrees, so a re-check can distinguish *moved* from *rewritten* from
 //! *gone*.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -277,6 +279,8 @@ fn locate_fuzzy(source: &str, needle: &str, config: &AlignConfig) -> Option<Alig
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     const SRC: &str = "The quick brown fox jumps over the lazy dog.\n\
                        Pack my box with five dozen liquor jugs.\n\

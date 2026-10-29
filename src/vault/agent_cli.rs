@@ -13,6 +13,8 @@
 //! Identity comes from `PO_VAULT_TOKEN`, injected by the chat manager and signed
 //! with the session id: an agent cannot read another session's grants by
 //! editing its environment.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use zeroize::Zeroizing;
 
@@ -120,6 +122,8 @@ pub async fn exec(mappings: &[(String, String)], command: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn mappings_are_validated() {

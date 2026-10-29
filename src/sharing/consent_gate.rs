@@ -3,11 +3,14 @@
 //!
 //! This is the privacy checkpoint that ensures only explicitly
 //! allowed content enters the distillation pipeline.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::episodes::distill_models::{
     ConsentStats, DenialDetail, DenialReason, SharingAction, SharingConsent, SharingMode,
     SharingPolicy,
 };
+#[allow(unused_imports)]
 use crate::notes::models::Note;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -535,6 +538,8 @@ pub fn apply_consent_gate_to_report<'a>(
 mod tests {
     use super::*;
     use crate::episodes::distill_models::{SharingAction, SharingConsent, SharingMode};
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::notes::models::Note;
     use std::collections::HashMap;
 
@@ -702,7 +707,6 @@ mod tests {
     // ------------------------------------------------------------------
 
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::GraphStore;
 
     fn policy(enabled: bool, mode: SharingMode) -> SharingPolicy {
         SharingPolicy {

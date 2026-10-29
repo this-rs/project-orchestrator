@@ -5,10 +5,14 @@
 //! - `GET /api/episodes` — List episodes for a project
 //! - `POST /api/episodes/anonymize` — Convert an episode to portable format
 //! - `POST /api/episodes/export-artifact` — Export enriched artifact (structure + episodes)
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::api::handlers::{AppError, OrchestratorState};
 use crate::episodes::collector;
 use crate::events::EventEmitter;
+
+#[allow(unused_imports)]
 use axum::{
     extract::{Query, State},
     Json,
@@ -343,6 +347,8 @@ pub async fn export_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use serde_json::{json, Value};
 
     #[test]
@@ -568,7 +574,6 @@ mod tests {
     /// `source=session` and `source=all`, never by default (run episodes only).
     #[tokio::test]
     async fn session_episodes_are_listed_only_when_asked_for() {
-        use crate::neo4j::GraphStore;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
         use tower::ServiceExt;

@@ -25,6 +25,8 @@
 //! (grouped by plan ids) - whatever the number of plans or sessions. A source
 //! that fails does not fail the response: it is reported in `source_errors`
 //! with the bands it degrades, the others are served.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -45,6 +47,8 @@ use crate::neo4j::models::{
     TaskNode, TaskStatus,
 };
 use crate::neo4j::traits::GraphStore;
+
+#[allow(unused_imports)]
 use crate::notes::{Note, NoteFilters, NoteStatus, NoteType};
 use crate::runner::eligibility::{resume_breakdown, runner_occupancy};
 use crate::runner::models::PlanRunStatus;
@@ -1258,6 +1262,9 @@ mod tests {
     use crate::chat::types::ChatEvent;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{AlertNode, AlertSeverity, SessionLinkKind, SessionLinkRow};
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::notes::{NoteImportance, NoteScope};
     use crate::protocol::{Protocol, ProtocolRun};
     use crate::runner::models::TriggerSource;

@@ -15,6 +15,8 @@
 //!   that already has that many. Raising it takes effect on the very next delegation.
 //! - The compilation governor still bounds the real parallelism of builds; this number
 //!   bounds sessions, not CPU.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::sync::atomic::Ordering;
 
@@ -23,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use super::envelope::MAX_LIVE_CHILDREN;
 use super::manager::ChatManager;
 use super::provider::settings::GLOBAL;
+#[allow(unused_imports)]
 use crate::neo4j::GraphStore;
 
 /// Key of the stored document, under the [`GLOBAL`] scope.
@@ -142,6 +145,8 @@ impl ChatManager {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn only_a_cap_between_one_and_the_ceiling_is_allowed() {

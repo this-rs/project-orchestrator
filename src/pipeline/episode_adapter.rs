@@ -16,6 +16,8 @@
 //! | `gate_results`     | Each state visit → gate (passed = has exited_at without error)|
 //! | `duration_ms`      | From process.duration_ms                                      |
 //! | `retry_count`      | Count of duplicate state names in states_visited              |
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 
@@ -167,6 +169,7 @@ async fn resolve_single_protocol_name(
 
 // ─── Synthetic Episode Generation (T3 — Replay Génératif) ──────────────────
 
+#[allow(unused_imports)]
 use crate::notes::models::{Note, NoteType};
 
 /// Generate synthetic episodes from detected patterns and knowledge notes.
@@ -377,6 +380,8 @@ fn slug_desc(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::episodes::models::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use chrono::Utc;
 
     fn sample_episode() -> Episode {
@@ -603,7 +608,6 @@ mod tests {
     #[tokio::test]
     async fn resolve_protocol_names_from_run() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
         use crate::protocol::models::{Protocol, ProtocolRun, ProtocolState};
 
         let store = MockGraphStore::new();

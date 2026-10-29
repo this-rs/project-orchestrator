@@ -9,6 +9,8 @@
 //! - `t_test::*_t_test(n-1)` — Bessel-corrected sample std (matches rs-stats internal `calculate_variance`)
 //!
 //! See `docs/migration/rs-stats/audit-variance-semantic.md` for why both exist.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 pub mod anova;
 pub mod fitting;

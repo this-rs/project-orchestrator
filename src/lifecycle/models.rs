@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -94,6 +96,8 @@ pub struct UpdateLifecycleHookRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_lifecycle_hook_new_defaults() {

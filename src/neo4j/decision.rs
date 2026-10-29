@@ -1,4 +1,6 @@
 //! Neo4j Decision operations
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use super::models::*;
@@ -1010,8 +1012,9 @@ impl Neo4jClient {
 #[cfg(test)]
 mod parent_existence_tests {
     use super::super::models::{DecisionNode, DecisionStatus};
-    use super::super::traits::GraphStore;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use uuid::Uuid;
 
     fn dummy_decision(task_id: Uuid) -> DecisionNode {
@@ -1087,7 +1090,6 @@ mod parent_existence_tests {
 #[cfg(test)]
 mod injection_tests {
     use super::safe_entity_label;
-
     #[test]
     fn entity_label_is_whitelisted() {
         assert_eq!(safe_entity_label("File").unwrap(), "File");

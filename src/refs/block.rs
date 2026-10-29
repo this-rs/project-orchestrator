@@ -5,6 +5,8 @@
 //! one trailing block — ids only, never a label or any content. The block is
 //! written before the `<po-attachments>` block (so attachments stay last) and
 //! read after it. The frontend has a TypeScript twin of [`split`].
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::types::{EntityRef, RawRef};
 use super::validate::{validate_refs, MAX_REFS_PER_MESSAGE};
@@ -63,6 +65,8 @@ mod tests {
     use super::super::types::RefKind;
     use super::*;
     use crate::chat::message_attachments as attachments;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use uuid::Uuid;
 
     fn r(kind: RefKind, id: &str) -> EntityRef {
@@ -74,6 +78,8 @@ mod tests {
 
     mod props {
         use super::*;
+        #[allow(unused_imports)]
+        use crate::neo4j::traits::*;
         use proptest::prelude::*;
 
         proptest! {

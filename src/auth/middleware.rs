@@ -3,6 +3,8 @@
 //! Validates JWT Bearer tokens and injects Claims into request extensions.
 //! In no-auth mode (auth_config is None), anonymous Claims are injected
 //! and requests pass through freely (open access).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::api::handlers::{AppError, OrchestratorState};
 use crate::auth::jwt::{decode_jwt, Claims, ANONYMOUS_USER_ID};
@@ -508,6 +510,8 @@ pub async fn enforce_token_policy(
 #[cfg(test)]
 mod target_tests {
     use super::chat_session_target;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn the_target_of_a_chat_session_route_is_its_id() {
@@ -527,6 +531,7 @@ mod tests {
     use super::*;
     use crate::auth::jwt::{encode_jwt, Claims};
     use crate::events::EventBus;
+    #[allow(unused_imports)]
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::mock_app_state;
     use crate::AuthConfig;

@@ -2,6 +2,8 @@
 //!
 //! Defines configuration, state machine, events, and result types
 //! for the PlanRunner execution engine.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -978,6 +980,8 @@ pub struct TriggerFiring {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_runner_config_defaults() {

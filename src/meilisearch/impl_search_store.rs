@@ -2,6 +2,8 @@
 //!
 //! Each trait method delegates directly to the corresponding inherent method
 //! on `MeiliClient`.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use anyhow::Result;
 use async_trait::async_trait;

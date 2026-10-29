@@ -1,4 +1,6 @@
 //! Neo4j Step operations
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::client::{pascal_to_snake_case, Neo4jClient};
 use super::models::*;

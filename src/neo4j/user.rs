@@ -1,4 +1,6 @@
 //! Neo4j User / Auth operations
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use super::models::*;

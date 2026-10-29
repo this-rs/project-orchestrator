@@ -7,6 +7,8 @@
 //! - `run_pipeline`     — build + create a run config for execution
 //! - `pipeline_status`  — get current pipeline execution status
 //! - `pipeline_history` — compare past pipeline runs
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -480,6 +482,8 @@ pub async fn handle_pipeline_history(http: &McpHttpClient, args: &Value) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     // -- parse_waves --------------------------------------------------------
 

@@ -17,8 +17,11 @@
 //! 3. Guards are evaluated as simple string conditions (future: expression engine)
 //! 4. Reaching a terminal state automatically completes the run
 //! 5. Only `Running` runs can accept transitions
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::neo4j::traits::GraphStore;
+
 use crate::protocol::{
     ChildCompletionInfo, CompletionStrategy, OnFailureStrategy, ProtocolRun, RunStatus, StateType,
     TransitionResult,
@@ -572,7 +575,8 @@ fn last_state_name(run: &ProtocolRun) -> String {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::traits::GraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::protocol::{
         Protocol, ProtocolCategory, ProtocolState, ProtocolTransition, RunStatus,
     };

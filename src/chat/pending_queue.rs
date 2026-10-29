@@ -23,6 +23,8 @@
 //! The functions here mutate a `VecDeque` and say what happened; locking,
 //! broadcasting and interrupting stay in `ChatManager` (and in the NATS RPC
 //! handler, for a session that runs on another instance).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::message_attachments;
 use super::types::{PendingMessage, PendingMessageKind, PendingQueueEntry};
@@ -195,6 +197,8 @@ pub fn take(queue: &mut VecDeque<PendingMessage>, id: Uuid) -> Option<PendingMes
 mod tests {
     use super::*;
     use crate::chat::message_attachments::MessageAttachment;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn held(text: &str) -> PendingMessage {
         PendingMessage::held_user(text.to_string())

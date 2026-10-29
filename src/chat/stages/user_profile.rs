@@ -5,6 +5,8 @@
 //! its responses to the user's preferences (verbosity, language, expertise).
 //!
 //! Controlled by `ENRICHMENT_USER_PROFILE=true` (disabled by default).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -118,6 +120,8 @@ impl ParallelEnrichmentStage for UserProfileStage {
 mod tests {
     use super::*;
     use crate::chat::enrichment::EnrichmentInput;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use std::sync::Arc;
     use uuid::Uuid;
 

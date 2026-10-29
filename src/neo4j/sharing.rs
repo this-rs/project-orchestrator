@@ -1,4 +1,6 @@
 //! Neo4j Sharing & Privacy operations
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use crate::episodes::distill_models::{ConsentCounts, SharingConsent, SharingEvent, SharingPolicy};
@@ -360,6 +362,8 @@ fn tombstone_from_stored(
 #[cfg(test)]
 mod tombstone_roundtrip_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::sharing::tombstone::{sign_tombstone, verify_tombstone};
 
     /// sign -> store (datetime() of the RFC 3339 param; toString() on read;

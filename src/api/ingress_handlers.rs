@@ -28,6 +28,8 @@
 //! Si le journal échoue après la réservation, la réservation est libérée (500) : la
 //! relivraison sera acceptée, pas refusée comme rejeu. Aucun secret, aucun corps ne
 //! sort dans les réponses ni dans les journaux.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::api::handlers::OrchestratorState;
 use crate::ingress::rule::{self, Rule, MIN_SECRET_BYTES};
@@ -353,6 +355,9 @@ mod tests {
     use crate::api::handlers::ServerState;
     use crate::ingress::{IngressConfig, IngressRuntime};
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::runner::{Trigger, TriggerType};
     use crate::vault::grants::{GrantScope, SecretSelector};
     use axum::http::Request;

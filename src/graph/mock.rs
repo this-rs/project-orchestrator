@@ -2,6 +2,8 @@
 //!
 //! Returns pre-configured `GraphAnalytics` results without performing
 //! any actual computation or database access.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -108,6 +110,8 @@ impl AnalyticsEngine for MockAnalyticsEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use std::collections::HashMap;
 
     #[tokio::test]

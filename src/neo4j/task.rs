@@ -1,4 +1,6 @@
 //! Neo4j Task operations
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::client::{pascal_to_snake_case, Neo4jClient, WhereBuilder};
 use super::models::*;

@@ -85,6 +85,8 @@
 //! timeout. What a child spent is added to its parent's CHILDREN spend when the call ends
 //! ([`ChatManager::aggregated_cost_usd`] = own + children); the parent's own
 //! `total_cost_usd` is untouched, so its routing decision is not charged twice (PYSR-3).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -1478,6 +1480,8 @@ pub(crate) mod panic_injection {
 mod tests {
     use super::*;
     use crate::neo4j::traits::GraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn bare_manager() -> (Arc<crate::neo4j::mock::MockGraphStore>, Arc<ChatManager>) {
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());

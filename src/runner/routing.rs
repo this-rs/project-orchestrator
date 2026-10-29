@@ -10,6 +10,8 @@
 //! that was chosen. Both are best effort: a routing failure never stops work.
 //!
 //! No handle means nothing is decided and nothing recorded: today's behaviour.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::sync::{Arc, RwLock};
 
@@ -23,6 +25,7 @@ use crate::chat::provider::cognitive::load_routing;
 use crate::chat::provider::cognitive::signature::TaskSignature;
 use crate::chat::provider::cognitive::store::RoutingArmStore;
 use crate::neo4j::agent_execution::{AgentExecutionNode, AgentExecutionStatus};
+#[allow(unused_imports)]
 use crate::neo4j::GraphStore;
 
 /// Every (instance, model) a project could use, with its facts. The scorer's
@@ -364,6 +367,8 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[tokio::test]
     async fn the_chat_pool_is_the_managers_pool_and_empty_when_no_router_is_wired() {
@@ -397,7 +402,8 @@ mod tests {
         use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
         use crate::chat::provider::cognitive::store::InMemoryRoutingStore;
         use crate::chat::provider::resolver::CLAUDE_CODE;
-
+        #[allow(unused_imports)]
+        use crate::neo4j::traits::*;
         /// The Claude Code part of the pool of a manager routed over `catalog`,
         /// Claude Code measured healthy (no CLI is needed for the pool itself).
         async fn claude_code_pool(catalog: Arc<ModelCatalogCache>) -> Vec<ModelFacts> {

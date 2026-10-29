@@ -3,9 +3,13 @@
 //! Detects emergent neural skill clusters by analyzing the SYNAPSE (Note↔Note)
 //! subgraph using the Louvain algorithm. Each detected community of strongly
 //! connected notes becomes a candidate skill.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::graph::algorithms::{compute_cohesion, louvain_communities};
 use crate::graph::{AnalyticsConfig, CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType};
+
+#[allow(unused_imports)]
 use crate::notes::NoteManager;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -975,6 +979,8 @@ pub async fn generate_triggers_for_skills(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     /// Helper: create a set of SYNAPSE edges forming 3 distinct clusters.
     fn make_3_clusters() -> Vec<(String, String, f64)> {
@@ -1430,7 +1436,6 @@ mod tests {
     async fn test_pipeline_runs_auto_anchor_prelude() {
         use crate::neo4j::mock::MockGraphStore;
         use crate::neo4j::models::{FileNode, ProjectNode};
-        use crate::neo4j::traits::GraphStore;
         use crate::notes::models::{Note, NoteImportance, NoteScope, NoteStatus, NoteType};
         use chrono::Utc;
 
@@ -1663,8 +1668,6 @@ mod tests {
         project_id: Uuid,
         count: usize,
     ) {
-        use crate::neo4j::traits::GraphStore;
-
         for i in 0..count {
             let note = crate::notes::Note::new(
                 Some(project_id),
@@ -1684,7 +1687,6 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_synapse_graph_health_skips_without_note_manager() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
 
         let store = MockGraphStore::new();
         let project = crate::test_helpers::test_project();
@@ -1802,7 +1804,6 @@ mod tests {
     #[tokio::test]
     async fn test_persist_new_skill() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
 
         let store = MockGraphStore::new();
         let project_id = Uuid::new_v4();
@@ -1850,7 +1851,6 @@ mod tests {
     #[tokio::test]
     async fn test_persist_merge_existing_skill() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
 
         let store = MockGraphStore::new();
         let project_id = Uuid::new_v4();

@@ -19,6 +19,8 @@
 //!    prompt; the stored/broadcast message keeps the visible text and the ids.
 //! 5. **No refs, no change.** A message without references is handled exactly as
 //!    before this module existed, attachments included.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -33,7 +35,6 @@ use super::wire::{RefResolution, RefStatus};
 use crate::chat::message_attachments;
 use crate::chat::types::ChatEvent;
 use crate::neo4j::traits::GraphStore;
-
 /// Time the whole turn may spend resolving its references. A reference still
 /// unresolved when it runs out reads as unavailable: a slow store delays a
 /// turn by seconds at most, never holds it.
@@ -372,6 +373,8 @@ pub fn render_context(nonce: &str, resolved: &[RefResolution]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::refs::access::{RefMeta, ScopeRule};
     use crate::refs::test_support::{store_with_document, world};
     use async_trait::async_trait;

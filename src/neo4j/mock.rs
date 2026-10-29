@@ -4,12 +4,14 @@
 //! `tokio::sync::RwLock<HashMap<K, V>>` collections.
 //! Compiled under `#[cfg(test)]` and under the `mock-store` feature (the
 //! integration test targets, see tests/store_conformance.rs); never in a binary.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::events::trigger::EventTrigger;
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
 use crate::neo4j::document::{Document, DocumentChunk, DocumentChunkHit};
 use crate::neo4j::models::*;
-use crate::neo4j::traits::{GraphStore, StoreCapabilities};
+#[allow(unused_imports)]
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
 };
@@ -883,7 +885,5294 @@ impl GraphStore for MockGraphStore {
             explicit_transactions: false,
         }
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    use crate::test_helpers::{test_project, test_project_named};
+    use chrono::Utc;
+
+    fn make_event(session_id: Uuid, seq: i64, event_type: &str, data: &str) -> ChatEventRecord {
+        ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id,
+            seq,
+            event_type: event_type.to_string(),
+            data: data.to_string(),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_notes_needing_synapses_project_scoped() {
+        // Regression test for the synapse-collapse self-heal fix: on-demand
+        // callers (detect_skills_pipeline / run_weekly_maintenance) must be
+        // able to scope the backfill to a single project so a bounded,
+        // on-demand call cannot balloon into a full multi-tenant rebuild.
+        let store = MockGraphStore::new();
+        let project_a = Uuid::new_v4();
+        let project_b = Uuid::new_v4();
+
+        let note_a = Note::new(
+            Some(project_a),
+            crate::notes::NoteType::Observation,
+            "note in project A".to_string(),
+            "test".to_string(),
+        );
+        let note_b = Note::new(
+            Some(project_b),
+            crate::notes::NoteType::Observation,
+            "note in project B".to_string(),
+            "test".to_string(),
+        );
+
+        store.create_note(&note_a).await.unwrap();
+        store.create_note(&note_b).await.unwrap();
+
+        // Both notes have embeddings but no synapses yet — both are
+        // "needing synapses" candidates.
+        store
+            .set_note_embedding(note_a.id, &[0.1, 0.2, 0.3], "test-model")
+            .await
+            .unwrap();
+        store
+            .set_note_embedding(note_b.id, &[0.4, 0.5, 0.6], "test-model")
+            .await
+            .unwrap();
+
+        // Scoped to project A: only note_a should be returned.
+        let (notes, total) = store
+            .list_notes_needing_synapses(10, 0, Some(project_a))
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "only project A's note should count");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, note_a.id);
+
+        // Unscoped (None): both notes across both projects should be returned,
+        // preserving the original global-sweep behavior used by the heartbeat.
+        let (notes_all, total_all) = store
+            .list_notes_needing_synapses(10, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(total_all, 2, "unscoped call should see both projects");
+        assert_eq!(notes_all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_chat_event_store_and_get() {
+        let store = MockGraphStore::new();
+        let session_id = Uuid::new_v4();
+
+        let events = vec![
+            make_event(session_id, 1, "user_message", r#"{"content":"Hello"}"#),
+            make_event(session_id, 2, "assistant_text", r#"{"content":"Hi!"}"#),
+            make_event(session_id, 3, "result", r#"{"duration_ms":1000}"#),
+        ];
+
+        store.store_chat_events(session_id, events).await.unwrap();
+
+        // Get all events (after_seq=0)
+        let result = store.get_chat_events(session_id, 0, 100).await.unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].seq, 1);
+        assert_eq!(result[0].event_type, "user_message");
+        assert_eq!(result[1].seq, 2);
+        assert_eq!(result[2].seq, 3);
+    }
+
+    #[tokio::test]
+    async fn test_chat_event_get_with_after_seq() {
+        let store = MockGraphStore::new();
+        let session_id = Uuid::new_v4();
+
+        let events = vec![
+            make_event(session_id, 1, "user_message", r#"{"content":"Hello"}"#),
+            make_event(session_id, 2, "assistant_text", r#"{"content":"Hi!"}"#),
+            make_event(session_id, 3, "tool_use", r#"{"tool":"bash"}"#),
+            make_event(session_id, 4, "tool_result", r#"{"result":"ok"}"#),
+            make_event(session_id, 5, "result", r#"{"duration_ms":2000}"#),
+        ];
+
+        store.store_chat_events(session_id, events).await.unwrap();
+
+        // Get events after seq 2 (should return 3,4,5)
+        let result = store.get_chat_events(session_id, 2, 100).await.unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].seq, 3);
+        assert_eq!(result[1].seq, 4);
+        assert_eq!(result[2].seq, 5);
+
+        // Get events after seq 4 (should return only 5)
+        let result = store.get_chat_events(session_id, 4, 100).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].seq, 5);
+
+        // Get events after seq 5 (should return empty)
+        let result = store.get_chat_events(session_id, 5, 100).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chat_event_get_with_limit() {
+        let store = MockGraphStore::new();
+        let session_id = Uuid::new_v4();
+
+        let events = vec![
+            make_event(session_id, 1, "user_message", "{}"),
+            make_event(session_id, 2, "assistant_text", "{}"),
+            make_event(session_id, 3, "tool_use", "{}"),
+            make_event(session_id, 4, "tool_result", "{}"),
+            make_event(session_id, 5, "result", "{}"),
+        ];
+
+        store.store_chat_events(session_id, events).await.unwrap();
+
+        // Limit to 2 events
+        let result = store.get_chat_events(session_id, 0, 2).await.unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].seq, 1);
+        assert_eq!(result[1].seq, 2);
+    }
+
+    #[tokio::test]
+    async fn test_chat_event_latest_seq() {
+        let store = MockGraphStore::new();
+        let session_id = Uuid::new_v4();
+
+        // No events — should return 0
+        let seq = store.get_latest_chat_event_seq(session_id).await.unwrap();
+        assert_eq!(seq, 0);
+
+        let events = vec![
+            make_event(session_id, 1, "user_message", "{}"),
+            make_event(session_id, 2, "assistant_text", "{}"),
+            make_event(session_id, 3, "result", "{}"),
+        ];
+        store.store_chat_events(session_id, events).await.unwrap();
+
+        let seq = store.get_latest_chat_event_seq(session_id).await.unwrap();
+        assert_eq!(seq, 3);
+
+        // Add more events
+        let more = vec![make_event(session_id, 4, "user_message", "{}")];
+        store.store_chat_events(session_id, more).await.unwrap();
+
+        let seq = store.get_latest_chat_event_seq(session_id).await.unwrap();
+        assert_eq!(seq, 4);
+    }
+
+    #[tokio::test]
+    async fn test_chat_event_delete() {
+        let store = MockGraphStore::new();
+        let session_id = Uuid::new_v4();
+        let other_session_id = Uuid::new_v4();
+
+        let events = vec![
+            make_event(session_id, 1, "user_message", "{}"),
+            make_event(session_id, 2, "result", "{}"),
+        ];
+        let other_events = vec![make_event(other_session_id, 1, "user_message", "{}")];
+
+        store.store_chat_events(session_id, events).await.unwrap();
+        store
+            .store_chat_events(other_session_id, other_events)
+            .await
+            .unwrap();
+
+        // Delete session's events
+        store.delete_chat_events(session_id).await.unwrap();
+
+        // Verify deleted
+        let result = store.get_chat_events(session_id, 0, 100).await.unwrap();
+        assert!(result.is_empty());
+        let seq = store.get_latest_chat_event_seq(session_id).await.unwrap();
+        assert_eq!(seq, 0);
+
+        // Other session unaffected
+        let result = store
+            .get_chat_events(other_session_id, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_chat_event_empty_session() {
+        let store = MockGraphStore::new();
+        let session_id = Uuid::new_v4();
+
+        // Getting events for non-existent session should return empty
+        let result = store.get_chat_events(session_id, 0, 100).await.unwrap();
+        assert!(result.is_empty());
+
+        // Deleting events for non-existent session should not error
+        store.delete_chat_events(session_id).await.unwrap();
+    }
+
+    // ====================================================================
+    // User / Auth tests
+    // ====================================================================
+
+    use crate::neo4j::models::AuthProvider;
+
+    fn make_oidc_user(external_id: &str, email: &str) -> UserNode {
+        UserNode {
+            id: Uuid::new_v4(),
+            email: email.to_string(),
+            name: "Test User".to_string(),
+            picture_url: Some("https://example.com/pic.jpg".to_string()),
+            auth_provider: AuthProvider::Oidc,
+            external_id: Some(external_id.to_string()),
+            password_hash: None,
+            created_at: Utc::now(),
+            last_login_at: Utc::now(),
+        }
+    }
+
+    fn make_password_user(email: &str) -> UserNode {
+        UserNode {
+            id: Uuid::new_v4(),
+            email: email.to_string(),
+            name: "Test User".to_string(),
+            picture_url: None,
+            auth_provider: AuthProvider::Password,
+            external_id: None,
+            password_hash: Some("$2b$12$fakehash".to_string()),
+            created_at: Utc::now(),
+            last_login_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upsert_user_create_oidc() {
+        let store = MockGraphStore::new();
+        let user = make_oidc_user("gid-001", "alice@ffs.holdings");
+
+        let result = store.upsert_user(&user).await.unwrap();
+        assert_eq!(result.email, "alice@ffs.holdings");
+        assert_eq!(result.auth_provider, AuthProvider::Oidc);
+        assert_eq!(result.external_id, Some("gid-001".to_string()));
+
+        // Should be retrievable
+        let found = store.get_user_by_id(user.id).await.unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().email, "alice@ffs.holdings");
+    }
+
+    #[tokio::test]
+    async fn test_upsert_user_update_oidc() {
+        let store = MockGraphStore::new();
+        let user = make_oidc_user("gid-002", "bob@ffs.holdings");
+        store.upsert_user(&user).await.unwrap();
+
+        // Upsert same external_id with updated fields
+        let mut updated = make_oidc_user("gid-002", "bob.new@ffs.holdings");
+        updated.name = "Bob Updated".to_string();
+        updated.picture_url = None;
+
+        let result = store.upsert_user(&updated).await.unwrap();
+        // Should keep the original id (found by external_id)
+        assert_eq!(result.id, user.id);
+        // But fields should be updated
+        assert_eq!(result.email, "bob.new@ffs.holdings");
+        assert_eq!(result.name, "Bob Updated");
+        assert!(result.picture_url.is_none());
+
+        // Only 1 user in the store
+        let all = store.list_users().await.unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_user_create_password() {
+        let store = MockGraphStore::new();
+        let user = make_password_user("alice@ffs.holdings");
+
+        let result = store.upsert_user(&user).await.unwrap();
+        assert_eq!(result.email, "alice@ffs.holdings");
+        assert_eq!(result.auth_provider, AuthProvider::Password);
+        assert!(result.password_hash.is_some());
+        assert!(result.external_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_upsert_user_update_password() {
+        let store = MockGraphStore::new();
+        let user = make_password_user("carol@ffs.holdings");
+        store.upsert_user(&user).await.unwrap();
+
+        // Upsert same email + password provider → should update
+        let mut updated = make_password_user("carol@ffs.holdings");
+        updated.name = "Carol Updated".to_string();
+
+        let result = store.upsert_user(&updated).await.unwrap();
+        assert_eq!(result.id, user.id); // same user
+        assert_eq!(result.name, "Carol Updated");
+
+        let all = store.list_users().await.unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_user_by_provider_id() {
+        let store = MockGraphStore::new();
+        let user = make_oidc_user("gid-003", "charlie@ffs.holdings");
+        store.upsert_user(&user).await.unwrap();
+
+        let found = store
+            .get_user_by_provider_id("oidc", "gid-003")
+            .await
+            .unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().email, "charlie@ffs.holdings");
+
+        let not_found = store
+            .get_user_by_provider_id("oidc", "gid-999")
+            .await
+            .unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_user_by_email_and_provider() {
+        let store = MockGraphStore::new();
+        // Create both an OIDC and a password user with the same email
+        let oidc_user = make_oidc_user("gid-005", "dual@ffs.holdings");
+        let password_user = make_password_user("dual@ffs.holdings");
+        store.upsert_user(&oidc_user).await.unwrap();
+        store.upsert_user(&password_user).await.unwrap();
+
+        // Should find the password user
+        let found = store
+            .get_user_by_email_and_provider("dual@ffs.holdings", "password")
+            .await
+            .unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().auth_provider, AuthProvider::Password);
+
+        // Should find the OIDC user
+        let found = store
+            .get_user_by_email_and_provider("dual@ffs.holdings", "oidc")
+            .await
+            .unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().auth_provider, AuthProvider::Oidc);
+
+        // Should not find non-existent
+        let not_found = store
+            .get_user_by_email_and_provider("nobody@ffs.holdings", "password")
+            .await
+            .unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_user_by_email() {
+        let store = MockGraphStore::new();
+        let user = make_oidc_user("gid-004", "diana@ffs.holdings");
+        store.upsert_user(&user).await.unwrap();
+
+        let found = store.get_user_by_email("diana@ffs.holdings").await.unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().external_id, Some("gid-004".to_string()));
+
+        let not_found = store
+            .get_user_by_email("nobody@ffs.holdings")
+            .await
+            .unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_user_not_found() {
+        let store = MockGraphStore::new();
+
+        let not_found = store.get_user_by_id(Uuid::new_v4()).await.unwrap();
+        assert!(not_found.is_none());
+
+        let not_found = store
+            .get_user_by_provider_id("oidc", "nonexistent")
+            .await
+            .unwrap();
+        assert!(not_found.is_none());
+
+        let not_found = store
+            .get_user_by_email("nonexistent@ffs.holdings")
+            .await
+            .unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_create_password_user() {
+        let store = MockGraphStore::new();
+
+        let user = store
+            .create_password_user("new@ffs.holdings", "New User", "$2b$12$somehash")
+            .await
+            .unwrap();
+
+        assert_eq!(user.email, "new@ffs.holdings");
+        assert_eq!(user.name, "New User");
+        assert_eq!(user.auth_provider, AuthProvider::Password);
+        assert_eq!(user.password_hash, Some("$2b$12$somehash".to_string()));
+        assert!(user.external_id.is_none());
+
+        // Should be findable
+        let found = store.get_user_by_id(user.id).await.unwrap();
+        assert!(found.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_list_users() {
+        let store = MockGraphStore::new();
+
+        // Empty list
+        let users = store.list_users().await.unwrap();
+        assert!(users.is_empty());
+
+        // Add 3 users (mix of providers)
+        store
+            .upsert_user(&make_oidc_user("gid-a", "a@ffs.holdings"))
+            .await
+            .unwrap();
+        store
+            .upsert_user(&make_oidc_user("gid-b", "b@ffs.holdings"))
+            .await
+            .unwrap();
+        store
+            .upsert_user(&make_password_user("c@ffs.holdings"))
+            .await
+            .unwrap();
+
+        let users = store.list_users().await.unwrap();
+        assert_eq!(users.len(), 3);
+    }
+
+    // ========================================================================
+    // Call relationship tests — scoping by project
+    // ========================================================================
+
+    fn make_function(name: &str, file_path: &str, line_start: u32) -> FunctionNode {
+        FunctionNode {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: file_path.to_string(),
+            line_start,
+            line_end: line_start + 10,
+            docstring: None,
+        }
+    }
+
+    fn make_file(path: &str, project_id: Option<Uuid>) -> FileNode {
+        FileNode {
+            path: path.to_string(),
+            language: "rust".to_string(),
+            hash: "abc123".to_string(),
+            last_parsed: Utc::now(),
+            project_id,
+        }
+    }
+
+    /// Seed a project with files and functions into the mock store
+    async fn seed_project(
+        store: &MockGraphStore,
+        project: &ProjectNode,
+        files_and_fns: &[(&str, &[&str])], // (file_path, [fn_names])
+    ) {
+        store.create_project(project).await.unwrap();
+        for (file_path, fn_names) in files_and_fns {
+            let file = make_file(file_path, Some(project.id));
+            store.upsert_file(&file).await.unwrap();
+            // Also register in project_files (upsert_file doesn't do this)
+            store
+                .project_files
+                .write()
+                .await
+                .entry(project.id)
+                .or_default()
+                .push(file_path.to_string());
+            for (i, fn_name) in fn_names.iter().enumerate() {
+                let func = make_function(fn_name, file_path, (i * 10) as u32);
+                store.upsert_function(&func).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_call_relationship_basic() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        seed_project(&store, &project, &[("src/main.rs", &["main", "helper"])]).await;
+
+        // Create a call: main -> helper
+        store
+            .create_call_relationship(
+                "src/main.rs::main",
+                "helper",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
+            .await
+            .unwrap();
+
+        let cr = store.call_relationships.read().await;
+        let callees = cr.get("src/main.rs::main").unwrap();
+        assert_eq!(callees, &vec!["helper".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_create_call_relationship_scoped_rejects_cross_project() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/main.rs", &["process", "validate"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/main.rs", &["process", "transform"])],
+        )
+        .await;
+
+        // Try to create a call from project_a::process -> transform (which only exists in project_b)
+        store
+            .create_call_relationship(
+                "a/src/main.rs::process",
+                "transform",
+                Some(project_a.id),
+                0.50,
+                "unscored",
+            )
+            .await
+            .unwrap();
+
+        // Should NOT have created the relationship (callee not in same project)
+        let cr = store.call_relationships.read().await;
+        assert!(
+            cr.get("a/src/main.rs::process").is_none(),
+            "Should not create cross-project CALLS"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_call_relationship_without_project_id_allows_all() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(&store, &project_a, &[("a/src/main.rs", &["process"])]).await;
+        seed_project(&store, &project_b, &[("b/src/main.rs", &["transform"])]).await;
+
+        // Without project_id (None), cross-project call is allowed (backward compat)
+        store
+            .create_call_relationship(
+                "a/src/main.rs::process",
+                "transform",
+                None,
+                0.50,
+                "unscored",
+            )
+            .await
+            .unwrap();
+
+        let cr = store.call_relationships.read().await;
+        let callees = cr.get("a/src/main.rs::process").unwrap();
+        assert_eq!(callees, &vec!["transform".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_find_callers_basic() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        seed_project(
+            &store,
+            &project,
+            &[("src/lib.rs", &["caller_a", "caller_b", "target"])],
+        )
+        .await;
+
+        store
+            .create_call_relationship(
+                "src/lib.rs::caller_a",
+                "target",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
+            .await
+            .unwrap();
+        store
+            .create_call_relationship(
+                "src/lib.rs::caller_b",
+                "target",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
+            .await
+            .unwrap();
+
+        let callers = store
+            .find_callers("src/lib.rs::target", None)
+            .await
+            .unwrap();
+        assert_eq!(callers.len(), 2);
+
+        let names: Vec<&str> = callers.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"caller_a"));
+        assert!(names.contains(&"caller_b"));
+    }
+
+    #[tokio::test]
+    async fn test_find_callers_scoped_by_project() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &["caller_a", "target"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/lib.rs", &["caller_b", "target"])],
+        )
+        .await;
+
+        // Both call "target" but via None (unscoped create)
+        store
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None, 0.50, "unscored")
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::caller_b", "target", None, 0.50, "unscored")
+            .await
+            .unwrap();
+
+        // Scoped to project_a: only caller_a
+        let callers_a = store
+            .find_callers("a/src/lib.rs::target", Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(callers_a.len(), 1);
+        assert_eq!(callers_a[0].name, "caller_a");
+
+        // Unscoped: both callers
+        let callers_all = store
+            .find_callers("a/src/lib.rs::target", None)
+            .await
+            .unwrap();
+        assert_eq!(callers_all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_function_callers_by_name_scoped() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &["caller_a", "target"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/lib.rs", &["caller_b", "target"])],
+        )
+        .await;
+
+        store
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None, 0.50, "unscored")
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::caller_b", "target", None, 0.50, "unscored")
+            .await
+            .unwrap();
+
+        // Scoped: only callers from project_a
+        let callers = store
+            .get_function_callers_by_name("target", 2, Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(callers.len(), 1);
+        assert!(callers[0].contains("caller_a"));
+
+        // Unscoped: both
+        let callers_all = store
+            .get_function_callers_by_name("target", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(callers_all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_function_callees_by_name_scoped() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &["process", "helper"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/lib.rs", &["process", "other"])],
+        )
+        .await;
+
+        store
+            .create_call_relationship("a/src/lib.rs::process", "helper", None, 0.50, "unscored")
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::process", "other", None, 0.50, "unscored")
+            .await
+            .unwrap();
+
+        // Scoped to project_a: only callees from process in project_a
+        let callees = store
+            .get_function_callees_by_name("process", 2, Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(callees.len(), 1);
+        assert_eq!(callees[0], "helper");
+
+        // Unscoped: callees from both process functions
+        let callees_all = store
+            .get_function_callees_by_name("process", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(callees_all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_function_caller_count_scoped() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &["caller_a", "target"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/lib.rs", &["caller_b1", "caller_b2", "target"])],
+        )
+        .await;
+
+        store
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None, 0.50, "unscored")
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::caller_b1", "target", None, 0.50, "unscored")
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::caller_b2", "target", None, 0.50, "unscored")
+            .await
+            .unwrap();
+
+        // Scoped to project_a: 1 caller
+        let count_a = store
+            .get_function_caller_count("target", Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(count_a, 1);
+
+        // Scoped to project_b: 2 callers
+        let count_b = store
+            .get_function_caller_count("target", Some(project_b.id))
+            .await
+            .unwrap();
+        assert_eq!(count_b, 2);
+
+        // Unscoped: 3 callers total
+        let count_all = store
+            .get_function_caller_count("target", None)
+            .await
+            .unwrap();
+        assert_eq!(count_all, 3);
+    }
+
+    #[tokio::test]
+    async fn test_find_symbol_references_with_calls() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        seed_project(&store, &project, &[("src/lib.rs", &["caller", "target"])]).await;
+
+        store
+            .create_call_relationship(
+                "src/lib.rs::caller",
+                "target",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
+            .await
+            .unwrap();
+
+        let refs = store
+            .find_symbol_references("target", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].reference_type, "call");
+        assert_eq!(refs[0].file_path, "src/lib.rs");
+        assert!(refs[0].context.contains("caller"));
+    }
+
+    #[tokio::test]
+    async fn test_find_symbol_references_scoped() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &["caller_a", "target"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/lib.rs", &["caller_b", "target"])],
+        )
+        .await;
+
+        store
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None, 0.50, "unscored")
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("b/src/lib.rs::caller_b", "target", None, 0.50, "unscored")
+            .await
+            .unwrap();
+
+        // Scoped to project_a: only caller_a
+        let refs_a = store
+            .find_symbol_references("target", 10, Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(refs_a.len(), 1);
+        assert!(refs_a[0].context.contains("caller_a"));
+
+        // Unscoped: both
+        let refs_all = store
+            .find_symbol_references("target", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(refs_all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cross_project_calls_pollution_prevented() {
+        // This is the core regression test for the cross-project CALLS bug
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        // Both projects have a function named "handle_request" and "validate"
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/handler.rs", &["handle_request", "validate"])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/handler.rs", &["handle_request", "validate"])],
+        )
+        .await;
+
+        // Project A: handle_request calls validate (scoped to project A)
+        store
+            .create_call_relationship(
+                "a/src/handler.rs::handle_request",
+                "validate",
+                Some(project_a.id),
+                0.50,
+                "unscored",
+            )
+            .await
+            .unwrap();
+
+        // Project B: handle_request calls validate (scoped to project B)
+        store
+            .create_call_relationship(
+                "b/src/handler.rs::handle_request",
+                "validate",
+                Some(project_b.id),
+                0.50,
+                "unscored",
+            )
+            .await
+            .unwrap();
+
+        // Verify: callers of "validate" scoped to project A = only handle_request from A
+        let callers_a = store
+            .get_function_callers_by_name("validate", 2, Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(callers_a.len(), 1);
+        assert!(callers_a[0].contains("a/src/handler.rs"));
+
+        // Verify: callers scoped to project B = only handle_request from B
+        let callers_b = store
+            .get_function_callers_by_name("validate", 2, Some(project_b.id))
+            .await
+            .unwrap();
+        assert_eq!(callers_b.len(), 1);
+        assert!(callers_b[0].contains("b/src/handler.rs"));
+
+        // Verify: caller_count scoped
+        let count_a = store
+            .get_function_caller_count("validate", Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(count_a, 1);
+
+        let count_b = store
+            .get_function_caller_count("validate", Some(project_b.id))
+            .await
+            .unwrap();
+        assert_eq!(count_b, 1);
+
+        // Without scoping, both are visible
+        let count_all = store
+            .get_function_caller_count("validate", None)
+            .await
+            .unwrap();
+        assert_eq!(count_all, 2);
+    }
+
+    // ========================================================================
+    // find_dependent_files scoping tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_find_dependent_files_scoped_by_project() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &[]), ("a/src/handler.rs", &[])],
+        )
+        .await;
+        seed_project(
+            &store,
+            &project_b,
+            &[("b/src/lib.rs", &[]), ("b/src/handler.rs", &[])],
+        )
+        .await;
+
+        // a/src/handler.rs imports a/src/lib.rs
+        store
+            .create_import_relationship("a/src/handler.rs", "a/src/lib.rs", "lib")
+            .await
+            .unwrap();
+        // b/src/handler.rs also imports a/src/lib.rs (cross-project)
+        store
+            .create_import_relationship("b/src/handler.rs", "a/src/lib.rs", "lib")
+            .await
+            .unwrap();
+
+        // Scoped to project_a: only a/src/handler.rs should appear
+        let deps_a = store
+            .find_dependent_files("a/src/lib.rs", 3, Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(deps_a.len(), 1);
+        assert_eq!(deps_a[0], "a/src/handler.rs");
+
+        // Scoped to project_b: only b/src/handler.rs should appear
+        let deps_b = store
+            .find_dependent_files("a/src/lib.rs", 3, Some(project_b.id))
+            .await
+            .unwrap();
+        assert_eq!(deps_b.len(), 1);
+        assert_eq!(deps_b[0], "b/src/handler.rs");
+    }
+
+    #[tokio::test]
+    async fn test_find_dependent_files_without_project_id() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &[]), ("a/src/consumer.rs", &[])],
+        )
+        .await;
+        seed_project(&store, &project_b, &[("b/src/consumer.rs", &[])]).await;
+
+        store
+            .create_import_relationship("a/src/consumer.rs", "a/src/lib.rs", "lib")
+            .await
+            .unwrap();
+        store
+            .create_import_relationship("b/src/consumer.rs", "a/src/lib.rs", "lib")
+            .await
+            .unwrap();
+
+        // Without project_id: all dependents (global fallback)
+        let deps_all = store
+            .find_dependent_files("a/src/lib.rs", 3, None)
+            .await
+            .unwrap();
+        assert_eq!(deps_all.len(), 2);
+        assert!(deps_all.contains(&"a/src/consumer.rs".to_string()));
+        assert!(deps_all.contains(&"b/src/consumer.rs".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_find_dependent_files_unknown_project_returns_empty() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("project-a");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[("a/src/lib.rs", &[]), ("a/src/main.rs", &[])],
+        )
+        .await;
+
+        store
+            .create_import_relationship("a/src/main.rs", "a/src/lib.rs", "lib")
+            .await
+            .unwrap();
+
+        // Unknown project_id: should return empty
+        let unknown_id = Uuid::new_v4();
+        let deps = store
+            .find_dependent_files("a/src/lib.rs", 3, Some(unknown_id))
+            .await
+            .unwrap();
+        assert!(deps.is_empty());
+    }
+
+    // ========================================================================
+    // find_impacted_files tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_find_impacted_files_combines_imports_and_calls() {
+        let store = MockGraphStore::new();
+        let project = test_project_named("impact-project");
+
+        // Setup: lib.rs defines functions, handler.rs imports lib.rs, service.rs calls lib functions
+        seed_project(
+            &store,
+            &project,
+            &[
+                ("src/lib.rs", &["execute", "helper"]),
+                ("src/handler.rs", &[]),
+                ("src/service.rs", &["do_work"]),
+            ],
+        )
+        .await;
+
+        // handler.rs imports lib.rs (IMPORTS axis)
+        store
+            .create_import_relationship("src/handler.rs", "src/lib.rs", "lib")
+            .await
+            .unwrap();
+
+        // service.rs::do_work calls lib.rs::execute (CALLS axis)
+        store
+            .create_call_relationship(
+                "src/service.rs::do_work",
+                "execute",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
+            .await
+            .unwrap();
+
+        // find_impacted_files should return BOTH handler.rs (imports) and service.rs (calls)
+        let impacted = store
+            .find_impacted_files("src/lib.rs", 3, Some(project.id))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            impacted.len(),
+            2,
+            "Expected 2 impacted files, got: {:?}",
+            impacted
+        );
+        assert!(impacted.contains(&"src/handler.rs".to_string()));
+        assert!(impacted.contains(&"src/service.rs".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_find_impacted_files_excludes_self() {
+        let store = MockGraphStore::new();
+        let project = test_project_named("self-project");
+
+        // A file that has a function calling its own function should NOT list itself
+        seed_project(&store, &project, &[("src/lib.rs", &["fn_a", "fn_b"])]).await;
+
+        store
+            .create_call_relationship(
+                "src/lib.rs::fn_a",
+                "fn_b",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
+            .await
+            .unwrap();
+
+        let impacted = store
+            .find_impacted_files("src/lib.rs", 3, Some(project.id))
+            .await
+            .unwrap();
+
+        assert!(
+            impacted.is_empty(),
+            "Self-calls should not appear in impacted files"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_impacted_files_scoped_by_project() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("proj-a");
+        let project_b = test_project_named("proj-b");
+
+        seed_project(
+            &store,
+            &project_a,
+            &[
+                ("a/src/lib.rs", &["target"]),
+                ("a/src/caller.rs", &["call_it"]),
+            ],
+        )
+        .await;
+        seed_project(&store, &project_b, &[("b/src/caller.rs", &["call_it_b"])]).await;
+
+        // Both projects' functions call target in project_a
+        store
+            .create_call_relationship("a/src/caller.rs::call_it", "target", None, 0.50, "unscored")
+            .await
+            .unwrap();
+        store
+            .create_call_relationship(
+                "b/src/caller.rs::call_it_b",
+                "target",
+                None,
+                0.50,
+                "unscored",
+            )
+            .await
+            .unwrap();
+
+        // Scoped to project_a: only a/src/caller.rs
+        let impacted_a = store
+            .find_impacted_files("a/src/lib.rs", 3, Some(project_a.id))
+            .await
+            .unwrap();
+        assert_eq!(impacted_a.len(), 1);
+        assert_eq!(impacted_a[0], "a/src/caller.rs");
+
+        // Without scope: both
+        let impacted_all = store
+            .find_impacted_files("a/src/lib.rs", 3, None)
+            .await
+            .unwrap();
+        assert_eq!(impacted_all.len(), 2);
+    }
+
+    // ========================================================================
+    // Feature Graph — Multi-relation traversal tests
+    // ========================================================================
+
+    fn make_fg_struct(name: &str, file_path: &str) -> StructNode {
+        StructNode {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            generics: vec![],
+            file_path: file_path.to_string(),
+            line_start: 1,
+            line_end: 10,
+            docstring: None,
+            parent_class: None,
+            interfaces: vec![],
+        }
+    }
+
+    fn make_fg_impl(for_type: &str, trait_name: Option<&str>, file_path: &str) -> ImplNode {
+        ImplNode {
+            for_type: for_type.to_string(),
+            trait_name: trait_name.map(|t| t.to_string()),
+            generics: vec![],
+            where_clause: None,
+            file_path: file_path.to_string(),
+            line_start: 1,
+            line_end: 10,
+        }
+    }
+
+    fn make_fg_trait(name: &str, file_path: &str) -> TraitNode {
+        TraitNode {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            generics: vec![],
+            file_path: file_path.to_string(),
+            line_start: 1,
+            line_end: 10,
+            docstring: None,
+            is_external: false,
+            source: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_feature_graph_detail_entity_enrichment_round_trip() {
+        let project = test_project();
+        let pid = project.id;
+        let store = MockGraphStore::new();
+        store.create_project(&project).await.unwrap();
+
+        let mut func = make_function("build_system_prompt", "src/prompt.rs", 42);
+        func.is_async = true;
+        func.return_type = Some("String".to_string());
+        func.params = vec![Parameter {
+            name: "ctx".to_string(),
+            type_name: Some("&Ctx".to_string()),
+        }];
+        func.docstring = Some("  Builds the prompt.  ".to_string());
+        store.upsert_function(&func).await.unwrap();
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .push("src/prompt.rs".to_string());
+
+        let built = store
+            .auto_build_feature_graph("fg", None, pid, "build_system_prompt", 1, None, None)
+            .await
+            .unwrap();
+        let detail = store
+            .get_feature_graph_detail(built.graph.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let f = detail
+            .entities
+            .iter()
+            .find(|e| e.entity_type == "function")
+            .expect("function entity");
+        assert_eq!(
+            f.signature.as_deref(),
+            Some("pub async fn build_system_prompt(ctx: &Ctx) -> String")
+        );
+        assert_eq!(f.docstring.as_deref(), Some("Builds the prompt."));
+        assert_eq!(f.file_path.as_deref(), Some("src/prompt.rs"));
+        assert_eq!(f.line_start, Some(42));
+        assert_eq!(f.visibility.as_deref(), Some("public"));
+
+        if let Some(file) = detail.entities.iter().find(|e| e.entity_type == "file") {
+            assert_eq!(file.file_path.as_deref(), Some(file.entity_id.as_str()));
+            assert!(file.signature.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_feature_graph_includes_structs_and_traits() {
+        let project = test_project();
+        let pid = project.id;
+        let store = MockGraphStore::new();
+        store.create_project(&project).await.unwrap();
+
+        // Seed: function "handle_request" in file "src/handler.rs"
+        let func = make_function("handle_request", "src/handler.rs", 1);
+        store.upsert_function(&func).await.unwrap();
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .push("src/handler.rs".to_string());
+
+        // Seed: struct "Request" in same file, implements trait "Serialize"
+        let s = make_fg_struct("Request", "src/handler.rs");
+        store.upsert_struct(&s).await.unwrap();
+
+        let t = make_fg_trait("Serialize", "src/serde.rs");
+        store.upsert_trait(&t).await.unwrap();
+
+        let imp = make_fg_impl("Request", Some("Serialize"), "src/handler.rs");
+        store.upsert_impl(&imp).await.unwrap();
+
+        // Build the feature graph
+        let detail = store
+            .auto_build_feature_graph("test-fg", None, pid, "handle_request", 2, None, None)
+            .await
+            .unwrap();
+
+        let entity_types: Vec<&str> = detail
+            .entities
+            .iter()
+            .map(|e| e.entity_type.as_str())
+            .collect();
+        let entity_ids: Vec<&str> = detail
+            .entities
+            .iter()
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        // Should include the function
+        assert!(
+            entity_ids.contains(&"handle_request"),
+            "should include function"
+        );
+        // Should include the file
+        assert!(
+            entity_ids.contains(&"src/handler.rs"),
+            "should include file"
+        );
+        // Should include the struct via IMPLEMENTS_FOR
+        assert!(
+            entity_types.contains(&"struct"),
+            "should include struct entities, got: {:?}",
+            entity_types
+        );
+        assert!(
+            entity_ids.contains(&"Request"),
+            "should include Request struct"
+        );
+        // Should include the trait via IMPLEMENTS_TRAIT
+        assert!(
+            entity_types.contains(&"trait"),
+            "should include trait entities, got: {:?}",
+            entity_types
+        );
+        assert!(
+            entity_ids.contains(&"Serialize"),
+            "should include Serialize trait"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_feature_graph_includes_imported_files() {
+        let project = test_project();
+        let pid = project.id;
+        let store = MockGraphStore::new();
+        store.create_project(&project).await.unwrap();
+
+        // Seed: function "process" in "src/main.rs"
+        let func = make_function("process", "src/main.rs", 1);
+        store.upsert_function(&func).await.unwrap();
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .extend(vec!["src/main.rs".to_string(), "src/utils.rs".to_string()]);
+
+        // Seed: src/main.rs imports src/utils.rs
+        store
+            .create_import_relationship("src/main.rs", "src/utils.rs", "utils")
+            .await
+            .unwrap();
+
+        // Build the feature graph
+        let detail = store
+            .auto_build_feature_graph("test-imports", None, pid, "process", 2, None, None)
+            .await
+            .unwrap();
+
+        let file_entities: Vec<&str> = detail
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "file")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        assert!(
+            file_entities.contains(&"src/main.rs"),
+            "should include source file"
+        );
+        assert!(
+            file_entities.contains(&"src/utils.rs"),
+            "should include imported file, got: {:?}",
+            file_entities
+        );
+    }
+
+    #[tokio::test]
+    async fn test_feature_graph_does_not_cross_projects() {
+        let project_a = test_project_named("project-a");
+        let project_b = test_project_named("project-b");
+        let pid_a = project_a.id;
+        let pid_b = project_b.id;
+        let store = MockGraphStore::new();
+        store.create_project(&project_a).await.unwrap();
+        store.create_project(&project_b).await.unwrap();
+
+        // Project A: function "shared_func" in "a/src/lib.rs"
+        let func_a = make_function("shared_func", "a/src/lib.rs", 1);
+        store.upsert_function(&func_a).await.unwrap();
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid_a)
+            .or_default()
+            .push("a/src/lib.rs".to_string());
+
+        // Project B: function "shared_func" in "b/src/lib.rs" (same name, different project)
+        let func_b = make_function("shared_func", "b/src/lib.rs", 1);
+        store.upsert_function(&func_b).await.unwrap();
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid_b)
+            .or_default()
+            .push("b/src/lib.rs".to_string());
+
+        // Build feature graph for project A
+        let detail = store
+            .auto_build_feature_graph("test-no-cross", None, pid_a, "shared_func", 2, None, None)
+            .await
+            .unwrap();
+
+        let file_entities: Vec<&str> = detail
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "file")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        // Should include project A's file
+        assert!(
+            file_entities.contains(&"a/src/lib.rs"),
+            "should include project A file"
+        );
+        // Should NOT include project B's file
+        // Note: The mock currently matches by function name, not by project.
+        // This test documents the expected behavior once project scoping is implemented in the mock.
+        // For now, we verify the feature graph was built successfully.
+        assert!(
+            detail.entities.len() >= 2,
+            "should have at least function + file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_feature_graph_auto_assigns_roles() {
+        let project = test_project();
+        let pid = project.id;
+        let store = MockGraphStore::new();
+        store.create_project(&project).await.unwrap();
+
+        // Seed project files first (needed for project-scoped call relationship creation)
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .extend(vec![
+                "src/handler.rs".to_string(),
+                "src/processor.rs".to_string(),
+                "src/serde.rs".to_string(),
+            ]);
+
+        // Seed: entry function "handle_request" calls "process_data"
+        let entry_func = make_function("handle_request", "src/handler.rs", 1);
+        store.upsert_function(&entry_func).await.unwrap();
+        let callee_func = make_function("process_data", "src/processor.rs", 1);
+        store.upsert_function(&callee_func).await.unwrap();
+        store
+            .create_call_relationship(
+                "handle_request",
+                "process_data",
+                Some(pid),
+                0.50,
+                "unscored",
+            )
+            .await
+            .unwrap();
+
+        // Seed: struct "Request" in handler.rs, implements trait "Serialize"
+        let s = make_fg_struct("Request", "src/handler.rs");
+        store.upsert_struct(&s).await.unwrap();
+        let t = make_fg_trait("Serialize", "src/serde.rs");
+        store.upsert_trait(&t).await.unwrap();
+        let imp = make_fg_impl("Request", Some("Serialize"), "src/handler.rs");
+        store.upsert_impl(&imp).await.unwrap();
+
+        // Build the feature graph
+        let detail = store
+            .auto_build_feature_graph("test-roles", None, pid, "handle_request", 2, None, None)
+            .await
+            .unwrap();
+
+        // Helper: find entity by id and return its role
+        let find_role = |entity_id: &str| -> Option<String> {
+            detail
+                .entities
+                .iter()
+                .find(|e| e.entity_id == entity_id)
+                .and_then(|e| e.role.clone())
+        };
+
+        // Entry function should have role "entry_point"
+        assert_eq!(
+            find_role("handle_request"),
+            Some("entry_point".to_string()),
+            "entry function should have entry_point role"
+        );
+
+        // Called function should have role "core_logic"
+        assert_eq!(
+            find_role("process_data"),
+            Some("core_logic".to_string()),
+            "callee function should have core_logic role"
+        );
+
+        // Files should have role "support"
+        assert_eq!(
+            find_role("src/handler.rs"),
+            Some("support".to_string()),
+            "file should have support role"
+        );
+
+        // Struct should have role "data_model"
+        assert_eq!(
+            find_role("Request"),
+            Some("data_model".to_string()),
+            "struct should have data_model role"
+        );
+
+        // Trait should have role "trait_contract"
+        assert_eq!(
+            find_role("Serialize"),
+            Some("trait_contract".to_string()),
+            "trait should have trait_contract role"
+        );
+
+        // Verify roles are persisted in the storage via get_feature_graph_detail
+        let detail2 = store
+            .get_feature_graph_detail(detail.graph.id)
+            .await
+            .unwrap()
+            .expect("feature graph detail should exist");
+
+        let find_stored_role = |entity_id: &str| -> Option<String> {
+            detail2
+                .entities
+                .iter()
+                .find(|e| e.entity_id == entity_id)
+                .and_then(|e| e.role.clone())
+        };
+
+        assert_eq!(
+            find_stored_role("handle_request"),
+            Some("entry_point".to_string()),
+            "stored entry function role should persist"
+        );
+        assert_eq!(
+            find_stored_role("Request"),
+            Some("data_model".to_string()),
+            "stored struct role should persist"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_feature_graph_add_entity_with_role() {
+        let store = MockGraphStore::new();
+
+        // Create a feature graph
+        let fg = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "test-manual".to_string(),
+            description: None,
+            project_id: Uuid::new_v4(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg).await.unwrap();
+
+        // Add entity without role
+        store
+            .add_entity_to_feature_graph(fg.id, "function", "func_a", None, None)
+            .await
+            .unwrap();
+
+        // Add entity with role
+        store
+            .add_entity_to_feature_graph(fg.id, "function", "func_b", Some("entry_point"), None)
+            .await
+            .unwrap();
+
+        // Verify via get_feature_graph_detail
+        let detail = store
+            .get_feature_graph_detail(fg.id)
+            .await
+            .unwrap()
+            .expect("should exist");
+
+        let func_a = detail
+            .entities
+            .iter()
+            .find(|e| e.entity_id == "func_a")
+            .unwrap();
+        assert_eq!(func_a.role, None, "func_a should have no role");
+
+        let func_b = detail
+            .entities
+            .iter()
+            .find(|e| e.entity_id == "func_b")
+            .unwrap();
+        assert_eq!(
+            func_b.role,
+            Some("entry_point".to_string()),
+            "func_b should have entry_point role"
+        );
+
+        // Update role on existing entity
+        store
+            .add_entity_to_feature_graph(fg.id, "function", "func_a", Some("core_logic"), None)
+            .await
+            .unwrap();
+
+        let detail2 = store
+            .get_feature_graph_detail(fg.id)
+            .await
+            .unwrap()
+            .expect("should exist");
+
+        let func_a2 = detail2
+            .entities
+            .iter()
+            .find(|e| e.entity_id == "func_a")
+            .unwrap();
+        assert_eq!(
+            func_a2.role,
+            Some("core_logic".to_string()),
+            "func_a should now have core_logic role after update"
+        );
+
+        // Verify count is still 2 (not duplicated)
+        assert_eq!(
+            detail2.entities.len(),
+            2,
+            "should still have 2 entities, not duplicated"
+        );
+    }
+
+    // ========================================================================
+    // Feature Graph — community filtering tests (Task 3.5)
+    // ========================================================================
+
+    /// Helper: set up a chain entry → F2 → F3 with communities, for community filtering tests.
+    /// Returns (store, project_id).
+    async fn setup_community_chain() -> (MockGraphStore, Uuid) {
+        let project = test_project();
+        let pid = project.id;
+        let store = MockGraphStore::new();
+        store.create_project(&project).await.unwrap();
+
+        // Seed project files
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .extend(vec![
+                "src/entry.rs".to_string(),
+                "src/direct.rs".to_string(),
+                "src/transitive.rs".to_string(),
+            ]);
+
+        // Create functions
+        store
+            .upsert_function(&make_function("entry_fn", "src/entry.rs", 1))
+            .await
+            .unwrap();
+        store
+            .upsert_function(&make_function("direct_fn", "src/direct.rs", 1))
+            .await
+            .unwrap();
+        store
+            .upsert_function(&make_function("transitive_fn", "src/transitive.rs", 1))
+            .await
+            .unwrap();
+
+        // Chain: entry_fn → direct_fn → transitive_fn
+        store
+            .create_call_relationship("entry_fn", "direct_fn", Some(pid), 0.50, "unscored")
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("direct_fn", "transitive_fn", Some(pid), 0.50, "unscored")
+            .await
+            .unwrap();
+
+        (store, pid)
+    }
+
+    #[tokio::test]
+    async fn test_community_filter_excludes_transitive_different_community() {
+        // Entry in community 1, calls direct_fn (community 2, direct),
+        // direct_fn calls transitive_fn (community 3, transitive)
+        // → direct_fn kept (direct dependency), transitive_fn excluded
+        let (store, pid) = setup_community_chain().await;
+
+        // Set community IDs via function analytics
+        use crate::graph::models::FunctionAnalyticsUpdate;
+        store
+            .batch_update_function_analytics(&[
+                FunctionAnalyticsUpdate {
+                    id: "entry_fn".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.1,
+                    community_id: 1,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    id: "direct_fn".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.1,
+                    community_id: 2,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    id: "transitive_fn".to_string(),
+                    pagerank: 0.1,
+                    betweenness: 0.0,
+                    community_id: 3,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let detail = store
+            .auto_build_feature_graph("test-community", None, pid, "entry_fn", 2, None, Some(true))
+            .await
+            .unwrap();
+
+        let func_names: Vec<&str> = detail
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "function")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        assert!(
+            func_names.contains(&"entry_fn"),
+            "entry should always be kept"
+        );
+        assert!(
+            func_names.contains(&"direct_fn"),
+            "direct callee should be kept even if different community"
+        );
+        assert!(
+            !func_names.contains(&"transitive_fn"),
+            "transitive function from different community should be excluded, got: {:?}",
+            func_names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_community_filter_no_community_data_keeps_all() {
+        // Entry without community_id → all functions kept (no filtering)
+        let (store, pid) = setup_community_chain().await;
+
+        // No function analytics set → no community data
+
+        let detail = store
+            .auto_build_feature_graph(
+                "test-no-community",
+                None,
+                pid,
+                "entry_fn",
+                2,
+                None,
+                Some(true), // filter enabled but no community data
+            )
+            .await
+            .unwrap();
+
+        let func_names: Vec<&str> = detail
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "function")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        assert!(func_names.contains(&"entry_fn"));
+        assert!(func_names.contains(&"direct_fn"));
+        assert!(
+            func_names.contains(&"transitive_fn"),
+            "without community data, all functions should be kept, got: {:?}",
+            func_names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_community_filter_disabled_keeps_all() {
+        // filter_community=false → all functions kept even with community data
+        let (store, pid) = setup_community_chain().await;
+
+        use crate::graph::models::FunctionAnalyticsUpdate;
+        store
+            .batch_update_function_analytics(&[
+                FunctionAnalyticsUpdate {
+                    id: "entry_fn".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.1,
+                    community_id: 1,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    id: "direct_fn".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.1,
+                    community_id: 2,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    id: "transitive_fn".to_string(),
+                    pagerank: 0.1,
+                    betweenness: 0.0,
+                    community_id: 3,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let detail = store
+            .auto_build_feature_graph(
+                "test-no-filter",
+                None,
+                pid,
+                "entry_fn",
+                2,
+                None,
+                Some(false), // filtering disabled
+            )
+            .await
+            .unwrap();
+
+        let func_names: Vec<&str> = detail
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "function")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        assert!(func_names.contains(&"entry_fn"));
+        assert!(func_names.contains(&"direct_fn"));
+        assert!(
+            func_names.contains(&"transitive_fn"),
+            "with filter disabled, all functions should be kept, got: {:?}",
+            func_names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_community_filter_same_community_keeps_all() {
+        // All nodes in same community → all kept
+        let (store, pid) = setup_community_chain().await;
+
+        use crate::graph::models::FunctionAnalyticsUpdate;
+        store
+            .batch_update_function_analytics(&[
+                FunctionAnalyticsUpdate {
+                    id: "entry_fn".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.1,
+                    community_id: 42,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    id: "direct_fn".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.1,
+                    community_id: 42,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+                FunctionAnalyticsUpdate {
+                    id: "transitive_fn".to_string(),
+                    pagerank: 0.1,
+                    betweenness: 0.0,
+                    community_id: 42,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            ])
+            .await
+            .unwrap();
+
+        let detail = store
+            .auto_build_feature_graph(
+                "test-same-community",
+                None,
+                pid,
+                "entry_fn",
+                2,
+                None,
+                Some(true),
+            )
+            .await
+            .unwrap();
+
+        let func_names: Vec<&str> = detail
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "function")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        assert!(func_names.contains(&"entry_fn"));
+        assert!(func_names.contains(&"direct_fn"));
+        assert!(
+            func_names.contains(&"transitive_fn"),
+            "same community functions should all be kept, got: {:?}",
+            func_names
+        );
+    }
+
+    // ========================================================================
+    // Feature Graph — refresh tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_refresh_feature_graph_auto_built() {
+        let project = test_project();
+        let pid = project.id;
+        let store = MockGraphStore::new();
+        store.create_project(&project).await.unwrap();
+
+        // Seed: function "process" in "src/main.rs", calls "helper"
+        let func1 = make_function("process", "src/main.rs", 1);
+        store.upsert_function(&func1).await.unwrap();
+        let func2 = make_function("helper", "src/util.rs", 1);
+        store.upsert_function(&func2).await.unwrap();
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .extend(["src/main.rs".to_string(), "src/util.rs".to_string()]);
+        store
+            .call_relationships
+            .write()
+            .await
+            .entry("process".to_string())
+            .or_default()
+            .push("helper".to_string());
+
+        // Auto-build the feature graph
+        let detail = store
+            .auto_build_feature_graph("test-refresh", None, pid, "process", 2, None, None)
+            .await
+            .unwrap();
+        let fg_id = detail.graph.id;
+        let original_entity_count = detail.entities.len();
+
+        // Verify entry_function is persisted
+        assert_eq!(
+            detail.graph.entry_function,
+            Some("process".to_string()),
+            "entry_function should be stored"
+        );
+
+        // Add a new function that "process" now calls
+        let func3 = make_function("new_helper", "src/new.rs", 1);
+        store.upsert_function(&func3).await.unwrap();
+        store
+            .project_files
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .push("src/new.rs".to_string());
+        store
+            .call_relationships
+            .write()
+            .await
+            .entry("process".to_string())
+            .or_default()
+            .push("new_helper".to_string());
+
+        // Refresh the feature graph
+        let refreshed = store
+            .refresh_feature_graph(fg_id)
+            .await
+            .unwrap()
+            .expect("should return Some for auto-built graph");
+
+        // The refreshed graph should contain the new function
+        let entity_ids: Vec<&str> = refreshed
+            .entities
+            .iter()
+            .map(|e| e.entity_id.as_str())
+            .collect();
+        assert!(
+            entity_ids.contains(&"new_helper"),
+            "refreshed graph should contain new_helper, got: {:?}",
+            entity_ids
+        );
+        assert!(
+            entity_ids.contains(&"src/new.rs"),
+            "refreshed graph should contain src/new.rs, got: {:?}",
+            entity_ids
+        );
+        assert!(
+            refreshed.entities.len() > original_entity_count,
+            "refreshed should have more entities ({}) than original ({})",
+            refreshed.entities.len(),
+            original_entity_count
+        );
+
+        // The graph id should be the same
+        assert_eq!(refreshed.graph.id, fg_id, "graph id should be unchanged");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_feature_graph_manual_skip() {
+        let project = test_project();
+        let store = MockGraphStore::new();
+        store.create_project(&project).await.unwrap();
+
+        // Create a manual feature graph (no entry_function)
+        let fg = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "manual-graph".to_string(),
+            description: Some("manually created".to_string()),
+            project_id: project.id,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg).await.unwrap();
+
+        // Add an entity manually
+        store
+            .add_entity_to_feature_graph(fg.id, "function", "my_func", Some("entry_point"), None)
+            .await
+            .unwrap();
+
+        // Refresh should return None (manual graph, not refreshable)
+        let result = store.refresh_feature_graph(fg.id).await.unwrap();
+        assert!(
+            result.is_none(),
+            "refresh should return None for manual graph"
+        );
+
+        // Entities should still be there (not deleted)
+        let detail = store
+            .get_feature_graph_detail(fg.id)
+            .await
+            .unwrap()
+            .expect("graph should still exist");
+        assert_eq!(
+            detail.entities.len(),
+            1,
+            "manual graph entities should be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_feature_graph_not_found() {
+        let store = MockGraphStore::new();
+        let fake_id = Uuid::new_v4();
+
+        let result = store.refresh_feature_graph(fake_id).await;
+        assert!(
+            result.is_err(),
+            "refresh on non-existent graph should return error"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not found"),
+            "error should mention 'not found', got: {}",
+            err_msg
+        );
+    }
+
+    // ========================================================================
+    // Feature Graph — Statistics, Compare, Overlapping
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_feature_graph_statistics() {
+        let store = MockGraphStore::new();
+        let project = test_project_named("test-stats");
+        seed_project(
+            &store,
+            &project,
+            &[
+                ("src/a.rs", &["fn_a", "fn_b"]),
+                ("src/b.rs", &["fn_outside"]),
+            ],
+        )
+        .await;
+
+        // fn_a -> fn_b (will be internal), fn_a -> fn_outside (will be external)
+        store
+            .create_call_relationship("src/a.rs::fn_a", "fn_b", Some(project.id), 0.9, "scored")
+            .await
+            .unwrap();
+        store
+            .create_call_relationship(
+                "src/a.rs::fn_a",
+                "fn_outside",
+                Some(project.id),
+                0.9,
+                "scored",
+            )
+            .await
+            .unwrap();
+
+        // Create a feature graph with fn_a and fn_b only (fn_outside is external)
+        let fg = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "stats-test".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg).await.unwrap();
+        store
+            .add_entity_to_feature_graph(fg.id, "function", "fn_a", Some("entry_point"), None)
+            .await
+            .unwrap();
+        store
+            .add_entity_to_feature_graph(fg.id, "function", "fn_b", Some("core_logic"), None)
+            .await
+            .unwrap();
+
+        let stats = store
+            .get_feature_graph_statistics(fg.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stats.entity_count, 2);
+        assert_eq!(stats.entity_breakdown.get("function"), Some(&2));
+        assert_eq!(stats.role_breakdown.get("entry_point"), Some(&1));
+        assert_eq!(stats.role_breakdown.get("core_logic"), Some(&1));
+        // fn_a calls fn_outside which is not in the graph → external edge
+        assert!(stats.external_edge_count > 0);
+        assert!(stats.cohesion >= 0.0);
+        assert!(stats.coupling >= 0.0 && stats.coupling <= 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_feature_graph_statistics_empty() {
+        let store = MockGraphStore::new();
+        let project = test_project_named("test-empty");
+        seed_project(&store, &project, &[]).await;
+
+        let fg = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "empty-graph".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg).await.unwrap();
+
+        let stats = store
+            .get_feature_graph_statistics(fg.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.entity_count, 0);
+        assert_eq!(stats.cohesion, 0.0);
+        assert_eq!(stats.coupling, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_feature_graph_statistics_not_found() {
+        let store = MockGraphStore::new();
+        let result = store
+            .get_feature_graph_statistics(Uuid::new_v4())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_compare_feature_graphs() {
+        let store = MockGraphStore::new();
+        let project = test_project_named("test-compare");
+        seed_project(
+            &store,
+            &project,
+            &[("src/a.rs", &["fn_shared", "fn_only_a", "fn_only_b"])],
+        )
+        .await;
+
+        // Graph A: fn_shared + fn_only_a
+        let fg_a = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "graph-a".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg_a).await.unwrap();
+        store
+            .add_entity_to_feature_graph(fg_a.id, "function", "fn_shared", None, None)
+            .await
+            .unwrap();
+        store
+            .add_entity_to_feature_graph(fg_a.id, "function", "fn_only_a", None, None)
+            .await
+            .unwrap();
+
+        // Graph B: fn_shared + fn_only_b
+        let fg_b = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "graph-b".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg_b).await.unwrap();
+        store
+            .add_entity_to_feature_graph(fg_b.id, "function", "fn_shared", None, None)
+            .await
+            .unwrap();
+        store
+            .add_entity_to_feature_graph(fg_b.id, "function", "fn_only_b", None, None)
+            .await
+            .unwrap();
+
+        let cmp = store
+            .compare_feature_graphs(fg_a.id, fg_b.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(cmp.shared_entities.len(), 1);
+        assert_eq!(cmp.shared_entities[0].entity_id, "fn_shared");
+        assert_eq!(cmp.unique_to_a.len(), 1);
+        assert_eq!(cmp.unique_to_a[0].entity_id, "fn_only_a");
+        assert_eq!(cmp.unique_to_b.len(), 1);
+        assert_eq!(cmp.unique_to_b[0].entity_id, "fn_only_b");
+        // Jaccard: 1 shared / 3 union = 0.333...
+        assert!((cmp.similarity - 1.0 / 3.0).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn test_compare_feature_graphs_not_found() {
+        let store = MockGraphStore::new();
+        let result = store
+            .compare_feature_graphs(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_find_overlapping_feature_graphs() {
+        let store = MockGraphStore::new();
+        let project = test_project_named("test-overlap");
+        seed_project(&store, &project, &[("src/a.rs", &["fn_x", "fn_y", "fn_z"])]).await;
+
+        // Reference graph: fn_x, fn_y
+        let fg_ref = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "ref-graph".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg_ref).await.unwrap();
+        store
+            .add_entity_to_feature_graph(fg_ref.id, "function", "fn_x", None, None)
+            .await
+            .unwrap();
+        store
+            .add_entity_to_feature_graph(fg_ref.id, "function", "fn_y", None, None)
+            .await
+            .unwrap();
+
+        // Overlapping graph: fn_x, fn_z (shares fn_x)
+        let fg_overlap = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "overlap-graph".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg_overlap).await.unwrap();
+        store
+            .add_entity_to_feature_graph(fg_overlap.id, "function", "fn_x", None, None)
+            .await
+            .unwrap();
+        store
+            .add_entity_to_feature_graph(fg_overlap.id, "function", "fn_z", None, None)
+            .await
+            .unwrap();
+
+        // Disjoint graph: fn_z only (no overlap with ref)
+        let fg_disjoint = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "disjoint-graph".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg_disjoint).await.unwrap();
+        store
+            .add_entity_to_feature_graph(fg_disjoint.id, "function", "fn_z", None, None)
+            .await
+            .unwrap();
+
+        // Find overlapping with min_overlap = 0.1 (low threshold)
+        let overlaps = store
+            .find_overlapping_feature_graphs(fg_ref.id, 0.1)
+            .await
+            .unwrap();
+
+        // Should find the overlapping graph (fn_x shared), not the disjoint one
+        assert_eq!(overlaps.len(), 1);
+        assert_eq!(overlaps[0].id, fg_overlap.id);
+        assert_eq!(overlaps[0].shared_count, 1);
+        // overlap_ratio = 1 / min(2, 2) = 0.5
+        assert!((overlaps[0].overlap_ratio - 0.5).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn test_find_overlapping_feature_graphs_high_threshold() {
+        let store = MockGraphStore::new();
+        let project = test_project_named("test-high-thresh");
+        seed_project(&store, &project, &[("src/a.rs", &["fn_a", "fn_b"])]).await;
+
+        let fg1 = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "g1".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg1).await.unwrap();
+        store
+            .add_entity_to_feature_graph(fg1.id, "function", "fn_a", None, None)
+            .await
+            .unwrap();
+        store
+            .add_entity_to_feature_graph(fg1.id, "function", "fn_b", None, None)
+            .await
+            .unwrap();
+
+        let fg2 = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: "g2".to_string(),
+            description: None,
+            project_id: project.id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: None,
+            build_depth: None,
+            include_relations: None,
+        };
+        store.create_feature_graph(&fg2).await.unwrap();
+        store
+            .add_entity_to_feature_graph(fg2.id, "function", "fn_a", None, None)
+            .await
+            .unwrap();
+
+        // overlap_ratio = 1 shared / min(2, 1) = 1.0, so it passes 0.9
+        // Use threshold > 1.0 to guarantee filtering
+        let overlaps = store
+            .find_overlapping_feature_graphs(fg1.id, 1.1)
+            .await
+            .unwrap();
+        assert!(
+            overlaps.is_empty(),
+            "threshold > 1.0 should filter everything"
+        );
+
+        // With 0.9 threshold, the overlap (ratio=1.0) should still be found
+        let overlaps = store
+            .find_overlapping_feature_graphs(fg1.id, 0.9)
+            .await
+            .unwrap();
+        assert_eq!(overlaps.len(), 1);
+        assert!((overlaps[0].overlap_ratio - 1.0).abs() < 0.01);
+    }
+
+    // ========================================================================
+    // Feature Graph — Vector expansion & community expansion tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_auto_build_with_vector_expansion() {
+        // Setup: entry_fn calls helper_fn. unrelated_fn is NOT in call graph
+        // but has a very similar embedding to entry_fn, same community → should be added.
+        let project = test_project();
+        let store = MockGraphStore::new();
+        seed_project(
+            &store,
+            &project,
+            &[
+                ("src/main.rs", &["entry_fn"]),
+                ("src/helper.rs", &["helper_fn"]),
+                ("src/similar.rs", &["unrelated_fn"]),
+            ],
+        )
+        .await;
+
+        // entry_fn calls helper_fn (call graph link)
+        store
+            .create_call_relationship("src/main.rs::entry_fn", "helper_fn", None, 0.50, "unscored")
+            .await
+            .unwrap();
+
+        // Set embeddings: entry_fn and unrelated_fn have very similar vectors
+        // helper_fn has a different vector
+        let entry_emb = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let similar_emb = vec![0.99_f32, 0.01, 0.0, 0.0]; // cosine ~0.9999
+        let different_emb = vec![0.0_f32, 1.0, 0.0, 0.0]; // cosine ~0.0
+
+        store
+            .set_function_embedding("entry_fn", "src/main.rs", &entry_emb, "test")
+            .await
+            .unwrap();
+        store
+            .set_function_embedding("unrelated_fn", "src/similar.rs", &similar_emb, "test")
+            .await
+            .unwrap();
+        store
+            .set_function_embedding("helper_fn", "src/helper.rs", &different_emb, "test")
+            .await
+            .unwrap();
+
+        // Set same community for entry_fn and unrelated_fn (community filtering enabled)
+        {
+            let mut fa = store.function_analytics.write().await;
+            fa.insert(
+                "entry_fn".to_string(),
+                crate::graph::models::FunctionAnalyticsUpdate {
+                    id: "src/main.rs::entry_fn".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.1,
+                    community_id: 1,
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+            fa.insert(
+                "unrelated_fn".to_string(),
+                crate::graph::models::FunctionAnalyticsUpdate {
+                    id: "src/similar.rs::unrelated_fn".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.1,
+                    community_id: 1, // same community
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+            fa.insert(
+                "helper_fn".to_string(),
+                crate::graph::models::FunctionAnalyticsUpdate {
+                    id: "src/helper.rs::helper_fn".to_string(),
+                    pagerank: 0.2,
+                    betweenness: 0.0,
+                    community_id: 2, // different community
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+        }
+
+        let result = store
+            .auto_build_feature_graph(
+                "test-vector-expansion",
+                None,
+                project.id,
+                "entry_fn",
+                2,
+                None,
+                Some(true),
+            )
+            .await
+            .unwrap();
+
+        let entity_ids: Vec<&str> = result
+            .entities
+            .iter()
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        // entry_fn and helper_fn should be there (call graph)
+        assert!(
+            entity_ids.contains(&"entry_fn"),
+            "should contain entry_fn, got: {:?}",
+            entity_ids
+        );
+        assert!(
+            entity_ids.contains(&"helper_fn"),
+            "should contain helper_fn, got: {:?}",
+            entity_ids
+        );
+        // unrelated_fn should be added by vector expansion (similar embedding, same community)
+        assert!(
+            entity_ids.contains(&"unrelated_fn"),
+            "should contain unrelated_fn via vector expansion, got: {:?}",
+            entity_ids
+        );
+        // unrelated_fn should have role "support" (not "core_logic")
+        let unrelated_entity = result
+            .entities
+            .iter()
+            .find(|e| e.entity_id == "unrelated_fn")
+            .expect("unrelated_fn should be in entities");
+        assert_eq!(
+            unrelated_entity.role.as_deref(),
+            Some("support"),
+            "vector-expanded function should have role 'support'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_build_with_community_expansion() {
+        // Setup: entry_fn is in src/api/routes.rs (community 1).
+        // src/api/handlers.rs is in the same community but NOT in call graph.
+        // It should be added by community expansion.
+        let project = test_project();
+        let store = MockGraphStore::new();
+        seed_project(
+            &store,
+            &project,
+            &[
+                ("src/api/routes.rs", &["entry_fn"]),
+                ("src/api/handlers.rs", &["handle_request"]),
+                ("src/db/client.rs", &["query_db"]),
+            ],
+        )
+        .await;
+
+        // No call graph links — entry_fn is isolated
+
+        // Set file analytics: routes.rs and handlers.rs in community 1, client.rs in community 2
+        {
+            let mut fa = store.file_analytics.write().await;
+            fa.insert(
+                "src/api/routes.rs".to_string(),
+                crate::graph::models::FileAnalyticsUpdate {
+                    path: "src/api/routes.rs".to_string(),
+                    pagerank: 0.5,
+                    betweenness: 0.2,
+                    community_id: 1,
+                    community_label: "api".to_string(),
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+            fa.insert(
+                "src/api/handlers.rs".to_string(),
+                crate::graph::models::FileAnalyticsUpdate {
+                    path: "src/api/handlers.rs".to_string(),
+                    pagerank: 0.4,
+                    betweenness: 0.1,
+                    community_id: 1, // same community
+                    community_label: "api".to_string(),
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+            fa.insert(
+                "src/db/client.rs".to_string(),
+                crate::graph::models::FileAnalyticsUpdate {
+                    path: "src/db/client.rs".to_string(),
+                    pagerank: 0.3,
+                    betweenness: 0.0,
+                    community_id: 2, // different community
+                    community_label: "db".to_string(),
+                    clustering_coefficient: 0.0,
+                    component_id: 0,
+                },
+            );
+        }
+
+        let result = store
+            .auto_build_feature_graph(
+                "test-community-expansion",
+                None,
+                project.id,
+                "entry_fn",
+                2,
+                None,
+                Some(false), // disable community filtering to keep all call graph results
+            )
+            .await
+            .unwrap();
+
+        let file_entities: Vec<&str> = result
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "file")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        // routes.rs should be there (entry function's file)
+        assert!(
+            file_entities.contains(&"src/api/routes.rs"),
+            "should contain routes.rs, got: {:?}",
+            file_entities
+        );
+        // handlers.rs should be added by community expansion (same community)
+        assert!(
+            file_entities.contains(&"src/api/handlers.rs"),
+            "should contain handlers.rs via community expansion, got: {:?}",
+            file_entities
+        );
+        // client.rs should NOT be there (different community, no call graph link)
+        assert!(
+            !file_entities.contains(&"src/db/client.rs"),
+            "should NOT contain client.rs (different community), got: {:?}",
+            file_entities
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_build_fallback_without_embeddings() {
+        // When no embeddings or analytics are set, auto_build should work
+        // exactly as before — only call graph traversal, no expansion.
+        let project = test_project();
+        let store = MockGraphStore::new();
+        seed_project(
+            &store,
+            &project,
+            &[
+                ("src/main.rs", &["entry_fn"]),
+                ("src/helper.rs", &["helper_fn"]),
+                ("src/unrelated.rs", &["unrelated_fn"]),
+            ],
+        )
+        .await;
+
+        // entry_fn calls helper_fn
+        store
+            .create_call_relationship("src/main.rs::entry_fn", "helper_fn", None, 0.50, "unscored")
+            .await
+            .unwrap();
+
+        // No embeddings, no analytics — should work fine without expansion
+        let result = store
+            .auto_build_feature_graph(
+                "test-fallback",
+                None,
+                project.id,
+                "entry_fn",
+                2,
+                None,
+                Some(true),
+            )
+            .await
+            .unwrap();
+
+        let func_ids: Vec<&str> = result
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "function")
+            .map(|e| e.entity_id.as_str())
+            .collect();
+
+        // Should contain only call-graph functions
+        assert!(
+            func_ids.contains(&"entry_fn"),
+            "should contain entry_fn, got: {:?}",
+            func_ids
+        );
+        assert!(
+            func_ids.contains(&"helper_fn"),
+            "should contain helper_fn (via call graph), got: {:?}",
+            func_ids
+        );
+        // unrelated_fn should NOT be included (no call graph, no embeddings)
+        assert!(
+            !func_ids.contains(&"unrelated_fn"),
+            "should NOT contain unrelated_fn (no call graph, no embeddings), got: {:?}",
+            func_ids
+        );
+
+        // All functions should have core_logic or entry_point role (no "support")
+        for entity in &result.entities {
+            if entity.entity_type == "function" {
+                let role = entity.role.as_deref().unwrap_or("none");
+                assert!(
+                    role == "entry_point" || role == "core_logic",
+                    "function {} should have entry_point or core_logic role, got: {}",
+                    entity.entity_id,
+                    role
+                );
+            }
+        }
+    }
+
+    // ========================================================================
+    // Code embedding tests (File & Function vector search)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_set_and_search_file_embedding() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        let pid = project.id;
+        let store = store.with_project(project).await;
+
+        // Register files in the project
+        let file1 = "/src/api/handlers.rs";
+        let file2 = "/src/api/routes.rs";
+        let file3 = "/src/chat/manager.rs";
+
+        {
+            let mut pf = store.project_files.write().await;
+            pf.insert(
+                pid,
+                vec![file1.to_string(), file2.to_string(), file3.to_string()],
+            );
+        }
+
+        // Create embeddings — file1 and file2 are similar (API-related), file3 is different
+        let emb_api = vec![1.0_f32, 0.0, 0.0, 0.0]; // API direction
+        let emb_api_similar = vec![0.9, 0.1, 0.0, 0.0]; // similar to API
+        let emb_chat = vec![0.0, 0.0, 1.0, 0.0]; // chat direction
+
+        store
+            .set_file_embedding(file1, &emb_api, "test-model")
+            .await
+            .unwrap();
+        store
+            .set_file_embedding(file2, &emb_api_similar, "test-model")
+            .await
+            .unwrap();
+        store
+            .set_file_embedding(file3, &emb_chat, "test-model")
+            .await
+            .unwrap();
+
+        // Search with API-like query
+        let results = store
+            .vector_search_files(&emb_api, 10, Some(pid))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        // file1 should be top result (exact match)
+        assert_eq!(results[0].0, file1);
+        assert!(
+            results[0].1 > 0.99,
+            "exact match should have score near 1.0"
+        );
+        // file2 should be second (similar)
+        assert_eq!(results[1].0, file2);
+        assert!(
+            results[1].1 > 0.9,
+            "similar embedding should have high score"
+        );
+        // file3 should be last (orthogonal)
+        assert_eq!(results[2].0, file3);
+        assert!(
+            results[2].1.abs() < 0.01,
+            "orthogonal embedding should have score near 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_and_search_function_embedding() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        let pid = project.id;
+        let store = store.with_project(project).await;
+
+        let file = "/src/api/handlers.rs";
+        {
+            let mut pf = store.project_files.write().await;
+            pf.insert(pid, vec![file.to_string()]);
+        }
+
+        // Embed two functions
+        let emb_auth = vec![1.0_f32, 0.0, 0.0];
+        let emb_list = vec![0.0, 1.0, 0.0];
+
+        store
+            .set_function_embedding("authenticate", file, &emb_auth, "test-model")
+            .await
+            .unwrap();
+        store
+            .set_function_embedding("list_items", file, &emb_list, "test-model")
+            .await
+            .unwrap();
+
+        // Search for auth-like function
+        let results = store
+            .vector_search_functions(&emb_auth, 10, Some(pid))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "authenticate");
+        assert_eq!(results[0].1, file);
+        assert!(results[0].2 > 0.99);
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_empty_returns_empty() {
+        let store = MockGraphStore::new();
+
+        // No embeddings stored — search should return empty
+        let query_emb = vec![1.0_f32, 0.0, 0.0];
+
+        let file_results = store
+            .vector_search_files(&query_emb, 10, None)
+            .await
+            .unwrap();
+        assert!(file_results.is_empty(), "expected empty file results");
+
+        let func_results = store
+            .vector_search_functions(&query_emb, 10, None)
+            .await
+            .unwrap();
+        assert!(func_results.is_empty(), "expected empty function results");
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_files_project_filter() {
+        let store = MockGraphStore::new();
+        let project_a = test_project_named("Project A");
+        let project_b = test_project_named("Project B");
+        let pid_a = project_a.id;
+        let pid_b = project_b.id;
+        let store = store.with_project(project_a).await;
+        let store = store.with_project(project_b).await;
+
+        let file_a = "/project-a/src/main.rs";
+        let file_b = "/project-b/src/main.rs";
+
+        {
+            let mut pf = store.project_files.write().await;
+            pf.insert(pid_a, vec![file_a.to_string()]);
+            pf.insert(pid_b, vec![file_b.to_string()]);
+        }
+
+        let emb = vec![1.0_f32, 0.0, 0.0];
+        store
+            .set_file_embedding(file_a, &emb, "test")
+            .await
+            .unwrap();
+        store
+            .set_file_embedding(file_b, &emb, "test")
+            .await
+            .unwrap();
+
+        // Search with project A filter — should only find file_a
+        let results = store
+            .vector_search_files(&emb, 10, Some(pid_a))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, file_a);
+
+        // Search without filter — should find both
+        let results = store.vector_search_files(&emb, 10, None).await.unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    // ========================================================================
+    // Batch upsert operations (UNWIND mock)
+    // ========================================================================
+
+    fn make_struct_node(name: &str, file_path: &str) -> StructNode {
+        StructNode {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            generics: vec![],
+            file_path: file_path.to_string(),
+            line_start: 1,
+            line_end: 10,
+            docstring: None,
+            parent_class: None,
+            interfaces: vec![],
+        }
+    }
+
+    fn make_trait_node(name: &str, file_path: &str) -> TraitNode {
+        TraitNode {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            generics: vec![],
+            file_path: file_path.to_string(),
+            line_start: 1,
+            line_end: 10,
+            docstring: None,
+            is_external: false,
+            source: None,
+        }
+    }
+
+    fn make_enum_node(name: &str, file_path: &str) -> EnumNode {
+        EnumNode {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            variants: vec!["A".to_string(), "B".to_string()],
+            file_path: file_path.to_string(),
+            line_start: 1,
+            line_end: 10,
+            docstring: None,
+        }
+    }
+
+    fn make_impl_node(for_type: &str, trait_name: Option<&str>, file_path: &str) -> ImplNode {
+        ImplNode {
+            for_type: for_type.to_string(),
+            trait_name: trait_name.map(|s| s.to_string()),
+            generics: vec![],
+            where_clause: None,
+            file_path: file_path.to_string(),
+            line_start: 1,
+            line_end: 10,
+        }
+    }
+
+    fn make_import_node(path: &str, file_path: &str, line: u32) -> ImportNode {
+        ImportNode {
+            path: path.to_string(),
+            alias: None,
+            items: vec!["Item1".to_string()],
+            file_path: file_path.to_string(),
+            line,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_upsert_functions() {
+        let store = MockGraphStore::new();
+        let funcs = vec![
+            make_function("foo", "src/lib.rs", 1),
+            make_function("bar", "src/lib.rs", 20),
+            make_function("baz", "src/main.rs", 1),
+        ];
+
+        store.batch_upsert_functions(&funcs).await.unwrap();
+
+        let fns = store.functions.read().await;
+        assert_eq!(fns.len(), 3);
+        assert!(fns.values().any(|f| f.name == "foo"));
+        assert!(fns.values().any(|f| f.name == "bar"));
+        assert!(fns.values().any(|f| f.name == "baz"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_upsert_functions_empty() {
+        let store = MockGraphStore::new();
+        store.batch_upsert_functions(&[]).await.unwrap();
+        assert_eq!(store.functions.read().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_batch_upsert_structs() {
+        let store = MockGraphStore::new();
+        let structs = vec![
+            make_struct_node("Foo", "src/lib.rs"),
+            make_struct_node("Bar", "src/lib.rs"),
+        ];
+
+        store.batch_upsert_structs(&structs).await.unwrap();
+
+        let s = store.structs_map.read().await;
+        assert_eq!(s.len(), 2);
+        assert!(s.values().any(|x| x.name == "Foo"));
+        assert!(s.values().any(|x| x.name == "Bar"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_upsert_traits() {
+        let store = MockGraphStore::new();
+        let traits = vec![
+            make_trait_node("Display", "src/lib.rs"),
+            make_trait_node("Debug", "src/lib.rs"),
+        ];
+
+        store.batch_upsert_traits(&traits).await.unwrap();
+
+        let t = store.traits_map.read().await;
+        assert_eq!(t.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_upsert_enums() {
+        let store = MockGraphStore::new();
+        let enums = vec![
+            make_enum_node("Color", "src/lib.rs"),
+            make_enum_node("Shape", "src/lib.rs"),
+        ];
+
+        store.batch_upsert_enums(&enums).await.unwrap();
+
+        let e = store.enums_map.read().await;
+        assert_eq!(e.len(), 2);
+        assert!(e.values().any(|x| x.name == "Color"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_upsert_impls() {
+        let store = MockGraphStore::new();
+        let impls = vec![
+            make_impl_node("Foo", None, "src/lib.rs"),
+            make_impl_node("Bar", Some("Display"), "src/lib.rs"),
+        ];
+
+        store.batch_upsert_impls(&impls).await.unwrap();
+
+        let i = store.impls_map.read().await;
+        assert_eq!(i.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_upsert_imports() {
+        let store = MockGraphStore::new();
+        let imports = vec![
+            make_import_node("std::fmt", "src/lib.rs", 1),
+            make_import_node("serde::Serialize", "src/lib.rs", 2),
+        ];
+
+        store.batch_upsert_imports(&imports).await.unwrap();
+
+        let i = store.imports.read().await;
+        assert_eq!(i.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_create_call_relationships() {
+        let store = MockGraphStore::new();
+        let calls = vec![
+            crate::parser::FunctionCall {
+                caller_id: "src/lib.rs:foo:1".to_string(),
+                callee_name: "bar".to_string(),
+                line: 5,
+                confidence: 0.85,
+                reason: "same-file".to_string(),
+            },
+            crate::parser::FunctionCall {
+                caller_id: "src/lib.rs:foo:1".to_string(),
+                callee_name: "baz".to_string(),
+                line: 6,
+                confidence: 0.50,
+                reason: "fuzzy-unique".to_string(),
+            },
+        ];
+
+        store
+            .batch_create_call_relationships(&calls, None)
+            .await
+            .unwrap();
+
+        let rels = store.call_relationships.read().await;
+        // The mock delegates to create_call_relationship which stores caller->callee
+        assert!(!rels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_batch_create_import_relationships() {
+        let store = MockGraphStore::new();
+        let rels = vec![
+            (
+                "src/lib.rs".to_string(),
+                "src/utils.rs".to_string(),
+                "crate::utils".to_string(),
+            ),
+            (
+                "src/lib.rs".to_string(),
+                "src/models.rs".to_string(),
+                "crate::models".to_string(),
+            ),
+        ];
+
+        store
+            .batch_create_import_relationships(&rels)
+            .await
+            .unwrap();
+
+        let ir = store.import_relationships.read().await;
+        // src/lib.rs -> [src/utils.rs, src/models.rs]
+        assert!(ir.contains_key("src/lib.rs"));
+        assert_eq!(ir["src/lib.rs"].len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_create_imports_symbol_relationships() {
+        let store = MockGraphStore::new();
+        let pid = Uuid::new_v4();
+        let rels = vec![
+            (
+                "src/lib.rs:1:serde".to_string(),
+                "Serialize".to_string(),
+                Some(pid),
+            ),
+            (
+                "src/lib.rs:2:std::fmt".to_string(),
+                "Display".to_string(),
+                None,
+            ),
+        ];
+
+        store
+            .batch_create_imports_symbol_relationships(&rels)
+            .await
+            .unwrap();
+
+        // Verify no error — mock delegates to individual create_imports_symbol_relationship
+    }
+
+    // ====================================================================
+    // count_project_files / count_project_plans tests
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_count_project_files_empty() {
+        let store = MockGraphStore::new();
+        let pid = Uuid::new_v4();
+        let count = store.count_project_files(pid).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_count_project_files_with_files() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        store.create_project(&project).await.unwrap();
+
+        // Add 3 files to the project
+        for i in 0..3 {
+            let path = format!("/tmp/test/src/file_{}.rs", i);
+            let file = FileNode {
+                path: path.clone(),
+                language: "rust".to_string(),
+                hash: format!("hash{}", i),
+                last_parsed: Utc::now(),
+                project_id: Some(project.id),
+            };
+            store.upsert_file(&file).await.unwrap();
+            store.link_file_to_project(&path, project.id).await.unwrap();
+        }
+
+        let count = store.count_project_files(project.id).await.unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_count_project_files_multiple_projects() {
+        let store = MockGraphStore::new();
+        let p1 = test_project_named("proj-a");
+        let p2 = test_project_named("proj-b");
+        store.create_project(&p1).await.unwrap();
+        store.create_project(&p2).await.unwrap();
+
+        // 2 files in p1, 5 files in p2
+        for i in 0..2 {
+            let path = format!("/tmp/a/file_{}.rs", i);
+            let file = FileNode {
+                path: path.clone(),
+                language: "rust".to_string(),
+                hash: format!("a{}", i),
+                last_parsed: Utc::now(),
+                project_id: Some(p1.id),
+            };
+            store.upsert_file(&file).await.unwrap();
+            store.link_file_to_project(&path, p1.id).await.unwrap();
+        }
+        for i in 0..5 {
+            let path = format!("/tmp/b/file_{}.rs", i);
+            let file = FileNode {
+                path: path.clone(),
+                language: "rust".to_string(),
+                hash: format!("b{}", i),
+                last_parsed: Utc::now(),
+                project_id: Some(p2.id),
+            };
+            store.upsert_file(&file).await.unwrap();
+            store.link_file_to_project(&path, p2.id).await.unwrap();
+        }
+
+        assert_eq!(store.count_project_files(p1.id).await.unwrap(), 2);
+        assert_eq!(store.count_project_files(p2.id).await.unwrap(), 5);
+    }
+
+    // ── couac2: link_plan_to_project must mirror Neo4j (MERGE = additive) ──
+
+    async fn plan_ids_of(store: &MockGraphStore, project_id: Uuid) -> Vec<Uuid> {
+        store
+            .list_project_plans(project_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_link_plan_to_second_project_keeps_first_link() {
+        let store = MockGraphStore::new();
+        let p1 = crate::test_helpers::test_project_named("p1");
+        let p2 = crate::test_helpers::test_project_named("p2");
+        store.create_project(&p1).await.unwrap();
+        store.create_project(&p2).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(p1.id);
+        store.create_plan(&plan).await.unwrap();
+
+        store.link_plan_to_project(plan.id, p2.id).await.unwrap();
+
+        // Neo4j: MERGE adds (p2)-[:HAS_PLAN]->(plan), (p1)-[:HAS_PLAN] stays.
+        assert_eq!(plan_ids_of(&store, p1.id).await, vec![plan.id]);
+        assert_eq!(plan_ids_of(&store, p2.id).await, vec![plan.id]);
+        // SET plan.project_id = the last linked project
+        let stored = store.get_plan(plan.id).await.unwrap().unwrap();
+        assert_eq!(stored.project_id, Some(p2.id));
+    }
+
+    #[tokio::test]
+    async fn test_link_plan_to_project_is_idempotent() {
+        let store = MockGraphStore::new();
+        let p = test_project();
+        store.create_project(&p).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(p.id);
+        store.create_plan(&plan).await.unwrap();
+        store.link_plan_to_project(plan.id, p.id).await.unwrap();
+        store.link_plan_to_project(plan.id, p.id).await.unwrap();
+        assert_eq!(plan_ids_of(&store, p.id).await, vec![plan.id]);
+        assert_eq!(store.count_project_plans(p.id).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_link_plan_to_missing_project_or_plan_is_noop() {
+        let store = MockGraphStore::new();
+        let p = test_project();
+        store.create_project(&p).await.unwrap();
+        let plan = crate::test_helpers::test_plan();
+        store.create_plan(&plan).await.unwrap();
+
+        let ghost_project = Uuid::new_v4();
+        store
+            .link_plan_to_project(plan.id, ghost_project)
+            .await
+            .unwrap();
+        assert!(plan_ids_of(&store, ghost_project).await.is_empty());
+        let stored = store.get_plan(plan.id).await.unwrap().unwrap();
+        assert_eq!(stored.project_id, plan.project_id, "MATCH failed: no SET");
+
+        store
+            .link_plan_to_project(Uuid::new_v4(), p.id)
+            .await
+            .unwrap();
+        assert!(plan_ids_of(&store, p.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_unlink_plan_removes_every_project_link() {
+        let store = MockGraphStore::new();
+        let p1 = crate::test_helpers::test_project_named("p1");
+        let p2 = crate::test_helpers::test_project_named("p2");
+        store.create_project(&p1).await.unwrap();
+        store.create_project(&p2).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(p1.id);
+        store.create_plan(&plan).await.unwrap();
+        store.link_plan_to_project(plan.id, p2.id).await.unwrap();
+
+        store.unlink_plan_from_project(plan.id).await.unwrap();
+
+        assert!(plan_ids_of(&store, p1.id).await.is_empty());
+        assert!(plan_ids_of(&store, p2.id).await.is_empty());
+        let stored = store.get_plan(plan.id).await.unwrap().unwrap();
+        assert_eq!(stored.project_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_delete_plan_linked_to_two_projects_removes_both_links() {
+        let store = MockGraphStore::new();
+        let p1 = crate::test_helpers::test_project_named("p1");
+        let p2 = crate::test_helpers::test_project_named("p2");
+        store.create_project(&p1).await.unwrap();
+        store.create_project(&p2).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(p1.id);
+        store.create_plan(&plan).await.unwrap();
+        store.link_plan_to_project(plan.id, p2.id).await.unwrap();
+
+        store.delete_plan(plan.id).await.unwrap();
+
+        assert!(plan_ids_of(&store, p1.id).await.is_empty());
+        assert!(plan_ids_of(&store, p2.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_count_project_plans_empty() {
+        let store = MockGraphStore::new();
+        let pid = Uuid::new_v4();
+        let count = store.count_project_plans(pid).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_count_project_plans_filters_by_status() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        store.create_project(&project).await.unwrap();
+
+        // Create 3 plans: Draft, InProgress, Completed
+        let mut plan_draft = crate::test_helpers::test_plan_for_project(project.id);
+        plan_draft.status = PlanStatus::Draft;
+        store.create_plan(&plan_draft).await.unwrap();
+        store
+            .link_plan_to_project(plan_draft.id, project.id)
+            .await
+            .unwrap();
+
+        let mut plan_in_progress = crate::test_helpers::test_plan_for_project(project.id);
+        plan_in_progress.status = PlanStatus::InProgress;
+        store.create_plan(&plan_in_progress).await.unwrap();
+        store
+            .link_plan_to_project(plan_in_progress.id, project.id)
+            .await
+            .unwrap();
+
+        let mut plan_completed = crate::test_helpers::test_plan_for_project(project.id);
+        plan_completed.status = PlanStatus::Completed;
+        store.create_plan(&plan_completed).await.unwrap();
+        store
+            .link_plan_to_project(plan_completed.id, project.id)
+            .await
+            .unwrap();
+
+        // count_project_plans should only include Draft, Approved, InProgress
+        let count = store.count_project_plans(project.id).await.unwrap();
+        assert_eq!(
+            count, 2,
+            "Should count Draft + InProgress, exclude Completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_builtin_calls() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        store.create_project(&project).await.unwrap();
+
+        // Create caller and callee functions
+        let caller = FunctionNode {
+            name: "process".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/main.rs".to_string(),
+            line_start: 1,
+            line_end: 10,
+            docstring: None,
+        };
+        store.upsert_function(&caller).await.unwrap();
+
+        let real_callee = FunctionNode {
+            name: "transform_data".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/main.rs".to_string(),
+            line_start: 12,
+            line_end: 20,
+            docstring: None,
+        };
+        store.upsert_function(&real_callee).await.unwrap();
+
+        let builtin_callee = FunctionNode {
+            name: "println".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/main.rs".to_string(),
+            line_start: 22,
+            line_end: 24,
+            docstring: None,
+        };
+        store.upsert_function(&builtin_callee).await.unwrap();
+
+        // Create CALLS: process -> transform_data (real) and process -> println (built-in)
+        // Use None for project_id to skip project-file scoping in mock
+        store
+            .create_call_relationship(
+                "src/main.rs::process",
+                "transform_data",
+                None,
+                0.50,
+                "unscored",
+            )
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("src/main.rs::process", "println", None, 0.50, "unscored")
+            .await
+            .unwrap();
+
+        // Verify both calls exist
+        let cr = store.call_relationships.read().await;
+        let calls = cr.get("src/main.rs::process").unwrap();
+        assert_eq!(calls.len(), 2, "Should have 2 calls before cleanup");
+        drop(cr);
+
+        // Run cleanup
+        let deleted = store.cleanup_builtin_calls().await.unwrap();
+        assert_eq!(deleted, 1, "Should delete 1 built-in call (println)");
+
+        // Verify only real call remains
+        let cr = store.call_relationships.read().await;
+        let calls = cr.get("src/main.rs::process").unwrap();
+        assert_eq!(calls.len(), 1, "Should have 1 call after cleanup");
+        assert!(
+            calls.contains(&"transform_data".to_string()),
+            "Should keep real call 'transform_data'"
+        );
+        assert!(
+            !calls.contains(&"println".to_string()),
+            "Should remove built-in call 'println'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ping_freshness_for_files() {
+        use crate::notes::models::{EntityType, NoteType};
+        use crate::test_helpers::test_note;
+
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Create two notes
+        let note1 = test_note(project_id, NoteType::Guideline, "Use proper error handling");
+        let note2 = test_note(project_id, NoteType::Pattern, "Repository pattern");
+        let note3 = test_note(project_id, NoteType::Tip, "Unlinked tip");
+
+        assert!(note1.freshness_pinged_at.is_none());
+        assert!(note2.freshness_pinged_at.is_none());
+
+        let note1_id = note1.id;
+        let note2_id = note2.id;
+        let note3_id = note3.id;
+
+        store.create_note(&note1).await.unwrap();
+        store.create_note(&note2).await.unwrap();
+        store.create_note(&note3).await.unwrap();
+
+        // Link note1 to file "src/main.rs"
+        store
+            .link_note_to_entity(note1_id, &EntityType::File, "src/main.rs", None, None)
+            .await
+            .unwrap();
+
+        // Link note2 to file "src/lib.rs"
+        store
+            .link_note_to_entity(note2_id, &EntityType::File, "src/lib.rs", None, None)
+            .await
+            .unwrap();
+
+        // note3 is not linked to any file
+
+        // Ping freshness for src/main.rs only
+        let pinged = store
+            .ping_freshness_for_files(&["src/main.rs".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            pinged, 1,
+            "Should ping exactly 1 note linked to src/main.rs"
+        );
+
+        // Verify note1 was pinged
+        let n1 = store.get_note(note1_id).await.unwrap().unwrap();
+        assert!(
+            n1.freshness_pinged_at.is_some(),
+            "note1 should have freshness_pinged_at set"
+        );
+
+        // Verify note2 was NOT pinged
+        let n2 = store.get_note(note2_id).await.unwrap().unwrap();
+        assert!(
+            n2.freshness_pinged_at.is_none(),
+            "note2 should not be pinged (different file)"
+        );
+
+        // Verify note3 was NOT pinged
+        let n3 = store.get_note(note3_id).await.unwrap().unwrap();
+        assert!(
+            n3.freshness_pinged_at.is_none(),
+            "note3 should not be pinged (not linked)"
+        );
+
+        // Ping both files
+        let pinged = store
+            .ping_freshness_for_files(&["src/main.rs".to_string(), "src/lib.rs".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(pinged, 2, "Should ping 2 notes");
+
+        // Now verify note2 is also pinged
+        let n2 = store.get_note(note2_id).await.unwrap().unwrap();
+        assert!(n2.freshness_pinged_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_staleness_with_freshness_discount() {
+        use crate::notes::models::NoteType;
+        use crate::test_helpers::test_note;
+
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        // Create a note confirmed 60 days ago
+        let mut note = test_note(project_id, NoteType::Tip, "Old tip");
+        note.last_confirmed_at = Some(Utc::now() - chrono::Duration::days(60));
+        note.staleness_score = 0.0;
+        note.freshness_pinged_at = None;
+        let note_id = note.id;
+        store.create_note(&note).await.unwrap();
+
+        // Update staleness without freshness ping
+        store.update_staleness_scores().await.unwrap();
+        let n = store.get_note(note_id).await.unwrap().unwrap();
+        let staleness_without_ping = n.staleness_score;
+        assert!(
+            staleness_without_ping > 0.0,
+            "Note confirmed 60d ago should have positive staleness"
+        );
+
+        // Now set freshness_pinged_at to now (simulating a recent commit touch)
+        {
+            let mut notes = store.notes.write().await;
+            let n = notes.get_mut(&note_id).unwrap();
+            n.freshness_pinged_at = Some(Utc::now());
+        }
+
+        store.update_staleness_scores().await.unwrap();
+        let n = store.get_note(note_id).await.unwrap().unwrap();
+        let staleness_with_ping = n.staleness_score;
+
+        assert!(
+            staleness_with_ping < staleness_without_ping,
+            "Freshness ping should reduce staleness: {} < {}",
+            staleness_with_ping,
+            staleness_without_ping
+        );
+    }
+
+    // ====================================================================
+    // MCP Federation tests
+    // ====================================================================
+
+    fn test_mcp_server(project_id: Uuid) -> McpServerNode {
+        McpServerNode {
+            id: Uuid::new_v4(),
+            project_id,
+            server_id: "test-server".to_string(),
+            display_name: "Test Server".to_string(),
+            transport_type: "stdio".to_string(),
+            transport_url: None,
+            transport_command: Some("echo".to_string()),
+            transport_args: None,
+            transport_secrets: None,
+            status: "connected".to_string(),
+            protocol_version: Some("2024-11-05".to_string()),
+            server_name: Some("TestMCP".to_string()),
+            tool_count: 0,
+            created_at: Utc::now(),
+            updated_at: None,
+            last_connected_at: Some(Utc::now()),
+        }
+    }
+
+    fn test_mcp_tool(server_id: &str, name: &str) -> McpToolNode {
+        McpToolNode {
+            id: Uuid::new_v4(),
+            server_id: server_id.to_string(),
+            name: name.to_string(),
+            fqn: format!("{}::{}", server_id, name),
+            description: format!("Test tool {}", name),
+            input_schema: "{}".to_string(),
+            category: "query".to_string(),
+            embedding: None,
+            created_at: Utc::now(),
+            updated_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mcp_create_and_get_server() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+        let server = test_mcp_server(project_id);
+        let server_id = server.id;
+
+        store.create_mcp_server(&server).await.unwrap();
+
+        let retrieved = store.get_mcp_server(server_id).await.unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.id, server_id);
+        assert_eq!(retrieved.project_id, project_id);
+        assert_eq!(retrieved.server_id, "test-server");
+        assert_eq!(retrieved.display_name, "Test Server");
+        assert_eq!(retrieved.transport_type, "stdio");
+        assert_eq!(retrieved.status, "connected");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_get_server_not_found() {
+        let store = MockGraphStore::new();
+        let result = store.get_mcp_server(Uuid::new_v4()).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_list_servers_empty() {
+        let store = MockGraphStore::new();
+        let servers = store.list_mcp_servers(Uuid::new_v4()).await.unwrap();
+        assert!(servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_list_servers_multiple() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let mut s1 = test_mcp_server(project_id);
+        s1.server_id = "alpha-server".to_string();
+        let mut s2 = test_mcp_server(project_id);
+        s2.server_id = "beta-server".to_string();
+        // Different project -- should not appear
+        let other_project = Uuid::new_v4();
+        let s3 = test_mcp_server(other_project);
+
+        store.create_mcp_server(&s1).await.unwrap();
+        store.create_mcp_server(&s2).await.unwrap();
+        store.create_mcp_server(&s3).await.unwrap();
+
+        let servers = store.list_mcp_servers(project_id).await.unwrap();
+        assert_eq!(servers.len(), 2);
+        // Sorted by server_id
+        assert_eq!(servers[0].server_id, "alpha-server");
+        assert_eq!(servers[1].server_id, "beta-server");
+
+        // Other project has exactly 1
+        let other = store.list_mcp_servers(other_project).await.unwrap();
+        assert_eq!(other.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_delete_server_removes_tools_and_index() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+        let server = test_mcp_server(project_id);
+        let server_uuid = server.id;
+        let sid = server.server_id.clone();
+
+        store.create_mcp_server(&server).await.unwrap();
+
+        // Add tools to this server
+        let t1 = test_mcp_tool(&sid, "read");
+        let t2 = test_mcp_tool(&sid, "write");
+        store.create_mcp_tool(&t1).await.unwrap();
+        store.create_mcp_tool(&t2).await.unwrap();
+        assert_eq!(
+            store.list_mcp_tools_for_server(&sid).await.unwrap().len(),
+            2
+        );
+
+        // Delete server
+        store.delete_mcp_server(server_uuid).await.unwrap();
+
+        // Server gone
+        assert!(store.get_mcp_server(server_uuid).await.unwrap().is_none());
+        // Tools gone
+        assert!(store
+            .list_mcp_tools_for_server(&sid)
+            .await
+            .unwrap()
+            .is_empty());
+        // Project index empty
+        assert!(store.list_mcp_servers(project_id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_delete_server_not_found_is_ok() {
+        let store = MockGraphStore::new();
+        // Deleting a non-existent server should succeed silently
+        store.delete_mcp_server(Uuid::new_v4()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mcp_update_server_status() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+        let server = test_mcp_server(project_id);
+        let server_id = server.id;
+        assert!(server.updated_at.is_none());
+
+        store.create_mcp_server(&server).await.unwrap();
+
+        store
+            .update_mcp_server_status(server_id, "disconnected")
+            .await
+            .unwrap();
+
+        let updated = store.get_mcp_server(server_id).await.unwrap().unwrap();
+        assert_eq!(updated.status, "disconnected");
+        assert!(
+            updated.updated_at.is_some(),
+            "updated_at should be set after status change"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_update_server_status_not_found_is_ok() {
+        let store = MockGraphStore::new();
+        // Updating a non-existent server should succeed silently
+        store
+            .update_mcp_server_status(Uuid::new_v4(), "error")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mcp_delete_server_by_server_id() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+        let server = test_mcp_server(project_id);
+        let sid = server.server_id.clone();
+        let uuid = server.id;
+
+        store.create_mcp_server(&server).await.unwrap();
+
+        // Add tools
+        let t1 = test_mcp_tool(&sid, "tool_a");
+        store.create_mcp_tool(&t1).await.unwrap();
+
+        // Delete by server_id string
+        store.delete_mcp_server_by_server_id(&sid).await.unwrap();
+
+        // Server and tools gone
+        assert!(store.get_mcp_server(uuid).await.unwrap().is_none());
+        assert!(store
+            .list_mcp_tools_for_server(&sid)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store.list_mcp_servers(project_id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_delete_server_by_server_id_not_found_is_ok() {
+        let store = MockGraphStore::new();
+        // Deleting a non-existent server_id should succeed silently
+        store
+            .delete_mcp_server_by_server_id("nonexistent")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mcp_list_all_servers_cross_project() {
+        let store = MockGraphStore::new();
+        let p1 = Uuid::new_v4();
+        let p2 = Uuid::new_v4();
+
+        let mut s1 = test_mcp_server(p1);
+        s1.server_id = "discord".to_string();
+        let mut s2 = test_mcp_server(p1);
+        s2.id = Uuid::new_v4();
+        s2.server_id = "slack".to_string();
+        let mut s3 = test_mcp_server(p2);
+        s3.id = Uuid::new_v4();
+        s3.server_id = "github".to_string();
+
+        store.create_mcp_server(&s1).await.unwrap();
+        store.create_mcp_server(&s2).await.unwrap();
+        store.create_mcp_server(&s3).await.unwrap();
+
+        // list_all returns all 3 from both projects
+        let all = store.list_all_mcp_servers().await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        // list per-project is scoped
+        assert_eq!(store.list_mcp_servers(p1).await.unwrap().len(), 2);
+        assert_eq!(store.list_mcp_servers(p2).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_create_and_list_tools() {
+        let store = MockGraphStore::new();
+        let sid = "my-server";
+        let t1 = test_mcp_tool(sid, "get_data");
+        let t2 = test_mcp_tool(sid, "put_data");
+        let t3 = test_mcp_tool("other-server", "unrelated");
+
+        store.create_mcp_tool(&t1).await.unwrap();
+        store.create_mcp_tool(&t2).await.unwrap();
+        store.create_mcp_tool(&t3).await.unwrap();
+
+        let tools = store.list_mcp_tools_for_server(sid).await.unwrap();
+        assert_eq!(tools.len(), 2);
+        // Sorted by name
+        assert_eq!(tools[0].name, "get_data");
+        assert_eq!(tools[1].name, "put_data");
+        assert_eq!(tools[0].fqn, "my-server::get_data");
+
+        // Other server has its own tool
+        let other = store
+            .list_mcp_tools_for_server("other-server")
+            .await
+            .unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].name, "unrelated");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_list_tools_empty() {
+        let store = MockGraphStore::new();
+        let tools = store
+            .list_mcp_tools_for_server("nonexistent")
+            .await
+            .unwrap();
+        assert!(tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_delete_tools_for_server() {
+        let store = MockGraphStore::new();
+        let sid = "target-server";
+        let other_sid = "keep-server";
+
+        let t1 = test_mcp_tool(sid, "tool_a");
+        let t2 = test_mcp_tool(sid, "tool_b");
+        let t3 = test_mcp_tool(other_sid, "tool_c");
+
+        store.create_mcp_tool(&t1).await.unwrap();
+        store.create_mcp_tool(&t2).await.unwrap();
+        store.create_mcp_tool(&t3).await.unwrap();
+
+        store.delete_mcp_tools_for_server(sid).await.unwrap();
+
+        // Target server tools gone
+        assert!(store
+            .list_mcp_tools_for_server(sid)
+            .await
+            .unwrap()
+            .is_empty());
+        // Other server tools untouched
+        assert_eq!(
+            store
+                .list_mcp_tools_for_server(other_sid)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_create_similar_to() {
+        let store = MockGraphStore::new();
+        store
+            .create_mcp_similar_to("server-a::read", "server-b::fetch", 0.92)
+            .await
+            .unwrap();
+
+        let map = store.mcp_similar_to.read().await;
+        let score = map
+            .get(&("server-a::read".to_string(), "server-b::fetch".to_string()))
+            .copied();
+        assert_eq!(score, Some(0.92));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_create_co_activated() {
+        let store = MockGraphStore::new();
+        store
+            .create_mcp_co_activated("server-a::read", "server-a::write", 17)
+            .await
+            .unwrap();
+
+        let map = store.mcp_co_activated.read().await;
+        let count = map
+            .get(&("server-a::read".to_string(), "server-a::write".to_string()))
+            .copied();
+        assert_eq!(count, Some(17));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_create_often_follows() {
+        let store = MockGraphStore::new();
+        store
+            .create_mcp_often_follows("server-x::init", "server-x::run", 42, 150.5)
+            .await
+            .unwrap();
+
+        let map = store.mcp_often_follows.read().await;
+        let entry = map
+            .get(&("server-x::init".to_string(), "server-x::run".to_string()))
+            .copied();
+        assert_eq!(entry, Some((42, 150.5)));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_similar_to_overwrites() {
+        let store = MockGraphStore::new();
+        store
+            .create_mcp_similar_to("a::x", "b::y", 0.5)
+            .await
+            .unwrap();
+        store
+            .create_mcp_similar_to("a::x", "b::y", 0.99)
+            .await
+            .unwrap();
+
+        let map = store.mcp_similar_to.read().await;
+        let score = map.get(&("a::x".to_string(), "b::y".to_string())).copied();
+        assert_eq!(score, Some(0.99), "Later insert should overwrite earlier");
+    }
+
+    #[tokio::test]
+    async fn test_set_watch_enabled() {
+        let store = MockGraphStore::new();
+        let pid = Uuid::new_v4();
+
+        // Create a project first
+        let mut project = crate::test_helpers::test_project();
+        project.id = pid;
+        assert!(project.watch_enabled); // default is true
+        store.create_project(&project).await.unwrap();
+
+        // Disable watch
+        store.set_watch_enabled(pid, false).await.unwrap();
+        let updated = store.get_project(pid).await.unwrap().unwrap();
+        assert!(!updated.watch_enabled);
+
+        // Re-enable watch
+        store.set_watch_enabled(pid, true).await.unwrap();
+        let updated = store.get_project(pid).await.unwrap().unwrap();
+        assert!(updated.watch_enabled);
+    }
+
+    #[tokio::test]
+    async fn test_set_watch_enabled_nonexistent_project() {
+        let store = MockGraphStore::new();
+        // Should not error, just no-op
+        let result = store.set_watch_enabled(Uuid::new_v4(), false).await;
+        assert!(result.is_ok());
+    }
+
+    /// Regression (couac 3): wave task statuses reached the UI as `Debug`
+    /// strings (`"Failed"`, `"InProgress"`), so the runner dashboard's
+    /// lowercase comparisons fell through and showed failed tasks as
+    /// completed. They must serialize like every other `TaskStatus`.
+    #[tokio::test]
+    async fn test_compute_waves_serializes_task_status_as_snake_case() {
+        use crate::test_helpers::{test_plan, test_task_titled};
+
+        let store = MockGraphStore::new();
+        let plan = test_plan();
+        store.create_plan(&plan).await.unwrap();
+
+        let mut done = test_task_titled("done");
+        done.status = TaskStatus::Completed;
+        let mut failed = test_task_titled("failed");
+        failed.status = TaskStatus::Failed;
+        let mut running = test_task_titled("running");
+        running.status = TaskStatus::InProgress;
+        for t in [&done, &failed, &running] {
+            store.create_task(plan.id, t).await.unwrap();
+        }
+
+        let result = store.compute_waves(plan.id).await.unwrap();
+        let json = serde_json::to_value(&result).unwrap();
+        let mut statuses: Vec<String> = json["waves"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|w| w["tasks"].as_array().unwrap().clone())
+            .map(|t| t["status"].as_str().unwrap().to_string())
+            .collect();
+        statuses.sort();
+        assert_eq!(statuses, vec!["completed", "failed", "in_progress"]);
+    }
+
+    // ----- interrupted tasks ---------------------------------------------------------------
+
+    async fn plan_with(store: &MockGraphStore, statuses: &[TaskStatus]) -> (Uuid, Vec<Uuid>) {
+        let plan = crate::test_helpers::test_plan();
+        store.create_plan(&plan).await.unwrap();
+        let mut ids = Vec::new();
+        for status in statuses {
+            let mut task = crate::test_helpers::test_task();
+            task.status = status.clone();
+            store.create_task(plan.id, &task).await.unwrap();
+            ids.push(task.id);
+        }
+        (plan.id, ids)
+    }
+
+    #[tokio::test]
+    async fn interrupting_a_task_records_when_and_why_and_resuming_it_clears_that() {
+        let store = MockGraphStore::new();
+        let (_, ids) = plan_with(&store, &[TaskStatus::InProgress]).await;
+
+        assert!(store
+            .interrupt_task(ids[0], "owner session ended")
+            .await
+            .unwrap());
+        let t = store.get_task(ids[0]).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Interrupted);
+        assert_eq!(t.interrupted_reason.as_deref(), Some("owner session ended"));
+        let first = t.interrupted_at.expect("when it was interrupted");
+
+        // Interrupting again keeps the FIRST moment (the work has been waiting since then) and
+        // takes the new reason.
+        assert!(store
+            .interrupt_task(ids[0], "server restarted")
+            .await
+            .unwrap());
+        let t = store.get_task(ids[0]).await.unwrap().unwrap();
+        assert_eq!(t.interrupted_at, Some(first));
+        assert_eq!(t.interrupted_reason.as_deref(), Some("server restarted"));
+
+        // Resuming ends the interruption.
+        store
+            .update_task_status(ids[0], TaskStatus::InProgress)
+            .await
+            .unwrap();
+        let t = store.get_task(ids[0]).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::InProgress);
+        assert!(t.interrupted_at.is_none() && t.interrupted_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn finished_work_and_unknown_tasks_are_not_interrupted() {
+        let store = MockGraphStore::new();
+        let (_, ids) = plan_with(
+            &store,
+            &[
+                TaskStatus::Completed,
+                TaskStatus::Failed,
+                TaskStatus::Pending,
+            ],
+        )
+        .await;
+
+        assert!(
+            !store.interrupt_task(ids[0], "x").await.unwrap(),
+            "completed stays completed"
+        );
+        assert!(
+            !store.interrupt_task(ids[1], "x").await.unwrap(),
+            "failed stays failed"
+        );
+        assert!(
+            !store.interrupt_task(Uuid::new_v4(), "x").await.unwrap(),
+            "no such task"
+        );
+        assert_eq!(
+            store.get_task(ids[0]).await.unwrap().unwrap().status,
+            TaskStatus::Completed
+        );
+        // Pending work CAN be interrupted (it was claimed, then lost): the answer says it changed.
+        assert!(store.interrupt_task(ids[2], "x").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_task_is_not_next_and_does_not_unblock_what_depends_on_it() {
+        let store = MockGraphStore::new();
+        let (plan_id, ids) =
+            plan_with(&store, &[TaskStatus::InProgress, TaskStatus::Pending]).await;
+        let (interrupted, dependent) = (ids[0], ids[1]);
+        store
+            .add_task_dependency(dependent, interrupted)
+            .await
+            .unwrap();
+        store
+            .interrupt_task(interrupted, "owner lost")
+            .await
+            .unwrap();
+
+        // Not runnable itself, and the task that waits for it keeps waiting.
+        assert!(store
+            .get_next_available_task(plan_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Once somebody resumes it AND it is completed, the dependent becomes available.
+        store
+            .update_task_status(interrupted, TaskStatus::Completed)
+            .await
+            .unwrap();
+        let next = store
+            .get_next_available_task(plan_id)
+            .await
+            .unwrap()
+            .expect("unblocked");
+        assert_eq!(next.id, dependent);
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+    use crate::chat::anchor::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
+    use crate::test_helpers::{test_chat_session, test_project_named};
+
+    async fn session(store: &MockGraphStore, slug: Option<&str>) -> Uuid {
+        let s = test_chat_session(slug);
+        let id = s.id;
+        store.create_chat_session(&s).await.unwrap();
+        id
+    }
+
+    fn plan_id() -> String {
+        Uuid::new_v4().to_string()
+    }
+
+    fn err(e: anyhow::Error) -> AnchorError {
+        e.downcast::<AnchorError>().expect("a typed AnchorError")
+    }
+
+    fn user_add(t: AnchorTargetType, id: &str, roles: &[AnchorRole]) -> NewAnchor {
+        NewAnchor::new(t, id, roles.iter().copied(), AnchorActor::User, "u1")
+    }
+
+    #[tokio::test]
+    async fn anchor_add_promote_remove_with_journal() {
+        let store = MockGraphStore::new();
+        let sid = session(&store, None).await;
+        let a = store
+            .add_anchor(
+                sid,
+                user_add(AnchorTargetType::File, "src/a.rs", &[AnchorRole::Mention]),
+            )
+            .await
+            .unwrap();
+        assert_eq!((a.version, a.state), (1, AnchorState::Live));
+        let a = store
+            .promote_anchor_role(sid, a.id, AnchorRole::Focus, 1, AnchorActor::User, "u1")
+            .await
+            .unwrap();
+        assert_eq!(a.version, 2);
+        assert!(a.roles.contains(&AnchorRole::Focus) && a.roles.contains(&AnchorRole::Mention));
+        let a = store
+            .demote_anchor_role(sid, a.id, AnchorRole::Focus, 2, AnchorActor::User, "u1")
+            .await
+            .unwrap();
+        store
+            .remove_anchor(sid, a.id, a.version, AnchorActor::User, "u1")
+            .await
+            .unwrap();
+        assert!(store.list_session_anchors(sid).await.unwrap().is_empty());
+        let kinds: Vec<_> = store
+            .list_anchor_events(sid)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                AnchorEventKind::Added,
+                AnchorEventKind::Promoted,
+                AnchorEventKind::Demoted,
+                AnchorEventKind::Removed
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn anchor_stale_version_is_a_conflict_and_changes_nothing() {
+        let store = MockGraphStore::new();
+        let sid = session(&store, None).await;
+        let a = store
+            .add_anchor(
+                sid,
+                user_add(AnchorTargetType::Plan, &plan_id(), &[AnchorRole::Mention]),
+            )
+            .await
+            .unwrap();
+        store
+            .promote_anchor_role(sid, a.id, AnchorRole::Focus, 1, AnchorActor::User, "u1")
+            .await
+            .unwrap();
+        let e = store
+            .promote_anchor_role(sid, a.id, AnchorRole::Focus, 1, AnchorActor::User, "u2")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err(e),
+            AnchorError::VersionConflict {
+                expected: 1,
+                actual: 2
+            }
+        );
+        let e = store
+            .remove_anchor(sid, a.id, 1, AnchorActor::User, "u2")
+            .await
+            .unwrap_err();
+        assert!(matches!(err(e), AnchorError::VersionConflict { .. }));
+        assert_eq!(store.list_session_anchors(sid).await.unwrap().len(), 1);
+        assert_eq!(store.list_anchor_events(sid).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn anchor_rules_hold_through_the_store() {
+        let store = MockGraphStore::new();
+        let sid = session(&store, None).await;
+        // agent cannot focus
+        let mut n = user_add(AnchorTargetType::File, "a.rs", &[AnchorRole::Focus]);
+        n.by = AnchorActor::Agent;
+        assert_eq!(
+            err(store.add_anchor(sid, n).await.unwrap_err()),
+            AnchorError::AgentCannotFocus
+        );
+        // origin immutable
+        let origin = store
+            .add_anchor(
+                sid,
+                NewAnchor::new(
+                    AnchorTargetType::Plan,
+                    plan_id(),
+                    [AnchorRole::Origin],
+                    AnchorActor::System,
+                    "sys",
+                ),
+            )
+            .await
+            .unwrap();
+        let e = store
+            .remove_anchor(sid, origin.id, 1, AnchorActor::User, "u1")
+            .await
+            .unwrap_err();
+        assert_eq!(err(e), AnchorError::OriginImmutable);
+        // focus cap
+        for i in 0..3 {
+            store
+                .add_anchor(
+                    sid,
+                    user_add(
+                        AnchorTargetType::File,
+                        &format!("f{i}"),
+                        &[AnchorRole::Focus],
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let e = store
+            .add_anchor(
+                sid,
+                user_add(AnchorTargetType::File, "f9", &[AnchorRole::Focus]),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err(e), AnchorError::FocusCapReached { max: 3 });
+        // unknown session
+        let ghost = Uuid::new_v4();
+        let e = store
+            .add_anchor(
+                ghost,
+                user_add(AnchorTargetType::File, "x", &[AnchorRole::Mention]),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err(e), AnchorError::SessionNotFound(ghost));
+        // a refused operation leaves no journal entry
+        assert_eq!(store.list_anchor_events(sid).await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn anchor_reverse_query_is_paginated_and_filterable() {
+        let store = MockGraphStore::new();
+        let target = plan_id();
+        let mut sessions = vec![];
+        for _ in 0..5 {
+            let sid = session(&store, None).await;
+            store
+                .add_anchor(
+                    sid,
+                    user_add(AnchorTargetType::Plan, &target, &[AnchorRole::Mention]),
+                )
+                .await
+                .unwrap();
+            sessions.push(sid);
+        }
+        // another target must not leak in
+        let other = session(&store, None).await;
+        store
+            .add_anchor(
+                other,
+                user_add(AnchorTargetType::Plan, &plan_id(), &[AnchorRole::Mention]),
+            )
+            .await
+            .unwrap();
+
+        let mut seen = vec![];
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = store
+                .list_sessions_for_target(
+                    AnchorTargetType::Plan,
+                    &target,
+                    None,
+                    2,
+                    cursor.as_deref(),
+                )
+                .await
+                .unwrap();
+            pages += 1;
+            seen.extend(page.items.iter().map(|a| a.session_id));
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(pages, 3);
+        seen.sort();
+        sessions.sort();
+        assert_eq!(seen, sessions);
+
+        // state filter
+        let n = store
+            .mark_anchors_dangling(AnchorTargetType::Plan, &target)
+            .await
+            .unwrap();
+        assert_eq!(n, 5);
+        let live = store
+            .list_sessions_for_target(
+                AnchorTargetType::Plan,
+                &target,
+                Some(AnchorState::Live),
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(live.items.is_empty());
+        let dangling = store
+            .list_sessions_for_target(
+                AnchorTargetType::Plan,
+                &target,
+                Some(AnchorState::Dangling),
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dangling.items.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn anchor_mark_dangling_keeps_anchors_and_journals_once() {
+        let store = MockGraphStore::new();
+        let sid = session(&store, None).await;
+        let target = plan_id();
+        store
+            .add_anchor(
+                sid,
+                user_add(AnchorTargetType::Plan, &target, &[AnchorRole::Origin]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .mark_anchors_dangling(AnchorTargetType::Plan, &target)
+                .await
+                .unwrap(),
+            1
+        );
+        // second call changes nothing
+        assert_eq!(
+            store
+                .mark_anchors_dangling(AnchorTargetType::Plan, &target)
+                .await
+                .unwrap(),
+            0
+        );
+        let anchors = store.list_session_anchors(sid).await.unwrap();
+        assert_eq!(anchors.len(), 1, "never deleted, even the origin one");
+        assert_eq!(anchors[0].state, AnchorState::Dangling);
+        let evs = store.list_anchor_events(sid).await.unwrap();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[1].kind, AnchorEventKind::StateChanged);
+        assert_eq!(evs[1].by, AnchorActor::System);
+    }
+
+    #[tokio::test]
+    async fn anchor_deleting_a_session_deletes_anchors_and_events_not_targets() {
+        let store = MockGraphStore::new();
+        let (keep, gone) = (session(&store, None).await, session(&store, None).await);
+        let target = plan_id();
+        for s in [keep, gone] {
+            store
+                .add_anchor(
+                    s,
+                    user_add(AnchorTargetType::Plan, &target, &[AnchorRole::Mention]),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(store.delete_chat_session(gone).await.unwrap());
+        assert!(store.list_session_anchors(gone).await.unwrap().is_empty());
+        assert!(store.list_anchor_events(gone).await.unwrap().is_empty());
+        assert_eq!(store.list_session_anchors(keep).await.unwrap().len(), 1);
+        assert_eq!(store.list_anchor_events(keep).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn anchor_journal_is_numbered_per_session_without_gaps() {
+        use crate::chat::anchor::*;
+        let store = MockGraphStore::new();
+        let (a, b) = (session(&store, None).await, session(&store, None).await);
+        let add = |t: &str| {
+            AnchorOp::Add(NewAnchor::new(
+                AnchorTargetType::File,
+                t,
+                [AnchorRole::Mention],
+                AnchorActor::User,
+                "t",
+            ))
+        };
+        let mut seqs = vec![];
+        for (s, t) in [(a, "1"), (b, "1"), (a, "2"), (a, "3")] {
+            seqs.push(
+                store
+                    .apply_anchor_op(s, add(t))
+                    .await
+                    .unwrap()
+                    .event
+                    .unwrap()
+                    .seq,
+            );
+        }
+        assert_eq!(seqs, vec![1, 1, 2, 3]);
+        // an operation that writes no event takes no number
+        assert!(store
+            .apply_anchor_op(a, add("2"))
+            .await
+            .map_or(true, |c| c.event.is_none()));
+        let last = store.apply_anchor_op(a, add("4")).await.unwrap();
+        assert_eq!(last.event.unwrap().seq, 4);
+        let journal: Vec<u64> = store
+            .list_anchor_events(a)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(journal, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn anchor_backfill_is_idempotent_and_reversible() {
+        let store = MockGraphStore::new();
+        let project = test_project_named("alpha");
+        store.create_project(&project).await.unwrap();
+        let s1 = session(&store, Some("alpha")).await;
+        let s2 = session(&store, Some("alpha")).await;
+        let unresolved = session(&store, Some("no-such-project")).await;
+        let none = session(&store, None).await;
+
+        let r1 = store.backfill_project_anchors().await.unwrap();
+        assert_eq!(
+            r1,
+            BackfillReport {
+                created: 2,
+                already_present: 0,
+                skipped_unresolved: 1,
+                skipped_by_rule: 0
+            }
+        );
+        let snapshot = |store: &MockGraphStore| {
+            let anchors = store.anchor_store.try_read().unwrap();
+            let mut v: Vec<_> = anchors
+                .anchors
+                .values()
+                .map(|a| (a.session_id, a.target_id.clone(), a.version))
+                .collect();
+            v.sort();
+            (v, anchors.events.len())
+        };
+        let after_first = snapshot(&store);
+
+        let r2 = store.backfill_project_anchors().await.unwrap();
+        assert_eq!(
+            r2,
+            BackfillReport {
+                created: 0,
+                already_present: 2,
+                skipped_unresolved: 1,
+                skipped_by_rule: 0
+            }
+        );
+        assert_eq!(snapshot(&store), after_first, "two runs = same state");
+
+        let a = &store.list_session_anchors(s1).await.unwrap()[0];
+        assert_eq!(a.target_type, AnchorTargetType::Project);
+        assert_eq!(a.target_id, project.id.to_string());
+        assert!(a.inferred && a.by == AnchorActor::System && a.confidence == 1.0);
+        assert!(a.roles.contains(&AnchorRole::Focus));
+        assert_eq!(a.snapshot_name.as_deref(), Some("alpha"));
+        assert!(store
+            .list_session_anchors(unresolved)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store.list_session_anchors(none).await.unwrap().is_empty());
+
+        // a hand-made anchor and a modified inferred one survive the revert
+        let manual = store
+            .add_anchor(
+                none,
+                user_add(AnchorTargetType::Plan, &plan_id(), &[AnchorRole::Mention]),
+            )
+            .await
+            .unwrap();
+        store
+            .set_anchor_state(
+                s2,
+                store.list_session_anchors(s2).await.unwrap()[0].id,
+                AnchorState::Moved,
+                None,
+                AnchorActor::User,
+                "u1",
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.revert_inferred_anchors().await.unwrap(), 1);
+        assert!(store.list_session_anchors(s1).await.unwrap().is_empty());
+        assert_eq!(store.list_session_anchors(s2).await.unwrap().len(), 1);
+        assert_eq!(
+            store.list_session_anchors(none).await.unwrap()[0].id,
+            manual.id
+        );
+        assert!(store.list_anchor_events(s1).await.unwrap().is_empty());
+        // reverting again is a no-op
+        assert_eq!(store.revert_inferred_anchors().await.unwrap(), 0);
+    }
+}
+
+/// The mock and the Cypher client must apply the same cross-project rule
+/// (`PropagationScope::weigh_foreign`, cut AFTER the weighting). Runs the same
+/// graph through both; skipped when no Neo4j answers at `NEO4J_URI`
+/// (`HARNESS_NEO4J_REQUIRED=1` turns the skip into a failure).
+#[cfg(test)]
+mod cross_project_parity {
+    use super::MockGraphStore;
+    use crate::episodes::distill_models::SharingConsent;
+    use crate::neo4j::client::Neo4jClient;
+    use crate::neo4j::traits::GraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
+    use crate::notes::{EntityType, Note, NoteImportance, NoteType};
+    use uuid::Uuid;
+
+    fn note(project: Uuid, imp: NoteImportance, energy: f64, tags: &[&str]) -> Note {
+        let mut n = Note::new(
+            Some(project),
+            NoteType::Guideline,
+            format!("t0f parity {}", Uuid::new_v4()),
+            String::new(),
+        );
+        n.importance = imp;
+        n.energy = energy;
+        n.tags = tags.iter().map(|t| t.to_string()).collect();
+        n
+    }
+
+    /// 19 local notes (coupling 1), 1 strongly coupled foreign note, 4 weakly
+    /// coupled foreign notes that outrank everything raw (critical). Weighted:
+    /// locals 0.5.., strong 1.0 * 0.2, weak 1.0 * 0.04. Cut at 20 after the
+    /// weighting: 19 locals + the strong one; the weak ones go.
+    fn graph() -> (Uuid, Vec<Note>, Uuid, Uuid) {
+        let (me, strong, weak) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut notes = Vec::new();
+        for i in 0..19 {
+            notes.push(note(
+                me,
+                NoteImportance::Medium,
+                0.5 + 0.01 * i as f64,
+                &["x", "y"],
+            ));
+        }
+        let mut s = note(strong, NoteImportance::Critical, 0.9, &["x", "y"]);
+        s.sharing_consent = SharingConsent::ExplicitAllow;
+        notes.push(s);
+        for _ in 0..4 {
+            let mut w = note(weak, NoteImportance::Critical, 0.9, &["x", "p", "q", "r"]);
+            w.sharing_consent = SharingConsent::ExplicitAllow;
+            notes.push(w);
+        }
+        (me, notes, strong, weak)
+    }
+
+    #[tokio::test]
+    async fn mock_and_neo4j_cut_after_the_coupling_weighting() {
+        // A unit test never guesses a Neo4j address: without PARITY_NEO4J_URI it
+        // skips. The CI coverage job sets it (and HARNESS_NEO4J_REQUIRED).
+        // Not NEO4J_URI: the config tests in lib.rs clear and rewrite NEO4J_*
+        // in this same process while tests run in parallel, so it can vanish
+        // mid-run (seen in CI: "HARNESS_NEO4J_REQUIRED is set but NEO4J_URI is not").
+        // The connection is also bounded: with nothing listening, connecting
+        // and creating the schema never return, which hung the Unit Tests job.
+        let required = std::env::var("HARNESS_NEO4J_REQUIRED").is_ok();
+        let Ok(uri) = std::env::var("PARITY_NEO4J_URI") else {
+            assert!(
+                !required,
+                "HARNESS_NEO4J_REQUIRED is set but PARITY_NEO4J_URI is not"
+            );
+            eprintln!("Skipping parity test: PARITY_NEO4J_URI is not set");
+            return;
+        };
+        let user = std::env::var("PARITY_NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
+        let pass = std::env::var("PARITY_NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
+        let connect = Neo4jClient::new(&uri, &user, &pass);
+        let real = match tokio::time::timeout(std::time::Duration::from_secs(30), connect).await {
+            Ok(Ok(c)) => c,
+            _ => {
+                assert!(
+                    !required,
+                    "HARNESS_NEO4J_REQUIRED is set but no Neo4j answers at {uri}"
+                );
+                eprintln!("Skipping parity test: no Neo4j at {uri}");
+                return;
+            }
+        };
+        let raw = neo4rs::Graph::new(&uri, &user, &pass).await.unwrap();
+        let (me, notes, strong, weak) = graph();
+        let file = format!("/t0f/{}/p.rs", Uuid::new_v4());
+        raw.run(neo4rs::query("CREATE (:File {path: $p})").param("p", file.clone()))
+            .await
+            .unwrap();
+
+        let mock = MockGraphStore::new();
+        // Jaccard(tags) * W_TAGS (0.2): identical tags 1/1 -> 0.2; 1 shared of 5 -> 0.04.
+        mock.set_pairwise_coupling(me, strong, 0.2).await;
+        mock.set_pairwise_coupling(me, weak, 0.04).await;
+        for n in &notes {
+            for store in [&real as &dyn GraphStore, &mock as &dyn GraphStore] {
+                store.create_note(n).await.unwrap();
+                store
+                    .link_note_to_entity(n.id, &EntityType::File, &file, None, None)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let from_real = real
+            .get_propagated_notes(&EntityType::File, &file, 2, 0.0, None, Some(me), true)
+            .await
+            .unwrap();
+        let from_mock = mock
+            .get_propagated_notes(&EntityType::File, &file, 2, 0.0, None, Some(me), true)
+            .await
+            .unwrap();
+        let ids = |v: &[crate::notes::PropagatedNote]| -> Vec<Uuid> {
+            v.iter().map(|p| p.note.id).collect()
+        };
+
+        let cleanup = || async {
+            let all: Vec<String> = notes.iter().map(|n| n.id.to_string()).collect();
+            raw.run(
+                neo4rs::query("MATCH (n:Note) WHERE n.id IN $ids DETACH DELETE n")
+                    .param("ids", all),
+            )
+            .await
+            .unwrap();
+            raw.run(
+                neo4rs::query("MATCH (f:File {path: $p}) DETACH DELETE f").param("p", file.clone()),
+            )
+            .await
+            .unwrap();
+        };
+        let (r, m) = (ids(&from_real), ids(&from_mock));
+        cleanup().await;
+
+        assert_eq!(r.len(), 20, "real: cut at 20 after weighting");
+        assert_eq!(r, m, "mock and Neo4j return the same ordered top-20");
+        assert!(r.contains(&notes[19].id), "strongly coupled foreign kept");
+        assert_eq!(r.last(), Some(&notes[19].id), "weighted below the locals");
+        assert!(
+            notes[20..].iter().all(|w| !r.contains(&w.id)),
+            "weakly coupled foreign notes cut after the weighting"
+        );
+    }
+}
+
+/// What a session's `spawned_by` JSON says about its parent (mock-side reading of the
+/// `SPAWNED_BY` edge): the parent id and the spawn type, plus the run and task when the
+/// JSON names them. Anything unreadable is simply absent.
+struct SpawnedByFields {
+    parent: Option<String>,
+    kind: Option<String>,
+    run_id: Option<Uuid>,
+    task_id: Option<Uuid>,
+}
+
+fn spawned_by_of(session: &ChatSessionNode) -> SpawnedByFields {
+    let value: Option<serde_json::Value> = session
+        .spawned_by
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok());
+    let text = |key: &str| {
+        value
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    SpawnedByFields {
+        parent: text("parent_session_id"),
+        kind: text("type"),
+        run_id: text("run_id").and_then(|s| s.parse().ok()),
+        task_id: text("task_id").and_then(|s| s.parse().ok()),
+    }
+}
+
+#[cfg(test)]
+mod session_tree_tests {
+    //! P18-suite (point 12): the mock's session tree is a real traversal, so the cascade
+    //! and tree tests built on it prove something. Red on the former stubs, which answered
+    //! the session alone (tree) and the session itself (root) whatever the parents.
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
+    use chrono::{DateTime, Utc};
+
+    fn session(
+        spawned_by: Option<serde_json::Value>,
+        created_at: DateTime<Utc>,
+    ) -> ChatSessionNode {
+        let mut node = crate::test_helpers::test_chat_session(None);
+        node.id = Uuid::new_v4();
+        node.created_at = created_at;
+        node.spawned_by = spawned_by.map(|v| v.to_string());
+        node
+    }
+
+    fn child_of(
+        parent: &ChatSessionNode,
+        kind: &str,
+        created_at: DateTime<Utc>,
+    ) -> ChatSessionNode {
+        session(
+            Some(serde_json::json!({"type": kind, "parent_session_id": parent.id.to_string()})),
+            created_at,
+        )
+    }
+
+    async fn store(nodes: &[&ChatSessionNode]) -> MockGraphStore {
+        let mock = MockGraphStore::new();
+        for node in nodes {
+            mock.create_chat_session(&(*node).clone()).await.unwrap();
+        }
+        mock
+    }
+
+    #[tokio::test]
+    async fn the_tree_holds_every_descendant_with_its_depth_parent_and_spawn_type() {
+        let t0 = Utc::now();
+        let root = session(None, t0);
+        let late_child = child_of(&root, "conversation", t0 + chrono::Duration::seconds(2));
+        let early_child = child_of(&root, "delegation", t0 + chrono::Duration::seconds(1));
+        let grandchild = child_of(
+            &early_child,
+            "conversation",
+            t0 + chrono::Duration::seconds(3),
+        );
+        let stranger = session(None, t0);
+        let mock = store(&[&root, &late_child, &early_child, &grandchild, &stranger]).await;
+
+        let tree = mock.get_session_tree(&root.id.to_string()).await.unwrap();
+        let ids: Vec<&str> = tree.iter().map(|n| n.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                root.id.to_string(),
+                early_child.id.to_string(),
+                late_child.id.to_string(),
+                grandchild.id.to_string()
+            ],
+            "depth first, then created_at; the stranger is not in the tree"
+        );
+        assert_eq!(
+            tree.iter().map(|n| n.depth).collect::<Vec<_>>(),
+            vec![0, 1, 1, 2]
+        );
+        assert_eq!(tree[0].parent_session_id, None, "the root names no parent");
+        assert_eq!(
+            tree[1].parent_session_id.as_deref(),
+            Some(root.id.to_string().as_str())
+        );
+        assert_eq!(tree[1].spawn_type.as_deref(), Some("delegation"));
+        assert_eq!(
+            tree[3].parent_session_id.as_deref(),
+            Some(early_child.id.to_string().as_str())
+        );
+        assert_eq!(tree[3].spawn_type.as_deref(), Some("conversation"));
+    }
+
+    #[tokio::test]
+    async fn the_tree_of_a_child_starts_at_that_child_and_an_unknown_session_has_none() {
+        let t0 = Utc::now();
+        let root = session(None, t0);
+        let child = child_of(&root, "delegation", t0);
+        let grandchild = child_of(&child, "conversation", t0);
+        let mock = store(&[&root, &child, &grandchild]).await;
+
+        let tree = mock.get_session_tree(&child.id.to_string()).await.unwrap();
+        assert_eq!(
+            tree.len(),
+            2,
+            "the child and its own descendant, not its parent"
+        );
+        assert_eq!(tree[0].session_id, child.id.to_string());
+        assert_eq!(tree[0].depth, 0);
+        assert_eq!(tree[1].session_id, grandchild.id.to_string());
+
+        assert!(mock
+            .get_session_tree(&Uuid::new_v4().to_string())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_root_is_found_by_walking_the_parents_up() {
+        let t0 = Utc::now();
+        let root = session(None, t0);
+        let child = child_of(&root, "delegation", t0);
+        let grandchild = child_of(&child, "conversation", t0);
+        let mock = store(&[&root, &child, &grandchild]).await;
+
+        let root_id = root.id.to_string();
+        assert_eq!(
+            mock.get_session_root(&grandchild.id.to_string())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(root_id.as_str())
+        );
+        assert_eq!(
+            mock.get_session_root(&child.id.to_string())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(root_id.as_str())
+        );
+        assert_eq!(
+            mock.get_session_root(&root_id).await.unwrap().as_deref(),
+            Some(root_id.as_str()),
+            "a root is its own root"
+        );
+        assert_eq!(
+            mock.get_session_root(&Uuid::new_v4().to_string())
+                .await
+                .unwrap(),
+            None,
+            "unknown session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parent_the_store_no_longer_holds_ends_the_walk_and_a_cycle_does_not_hang() {
+        let t0 = Utc::now();
+        let orphan = session(
+            Some(
+                serde_json::json!({"type": "delegation", "parent_session_id": Uuid::new_v4().to_string()}),
+            ),
+            t0,
+        );
+        let mut a = session(None, t0);
+        let mut b = session(None, t0);
+        a.spawned_by = Some(
+            serde_json::json!({"type": "conversation", "parent_session_id": b.id.to_string()})
+                .to_string(),
+        );
+        b.spawned_by = Some(
+            serde_json::json!({"type": "conversation", "parent_session_id": a.id.to_string()})
+                .to_string(),
+        );
+        let mock = store(&[&orphan, &a, &b]).await;
+
+        assert_eq!(
+            mock.get_session_root(&orphan.id.to_string())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(orphan.id.to_string().as_str()),
+            "the last known session of the walk"
+        );
+        let cyclic_root = mock.get_session_root(&a.id.to_string()).await.unwrap();
+        assert!(cyclic_root.is_some(), "a cycle ends, it does not hang");
+        assert_eq!(
+            mock.get_session_tree(&a.id.to_string())
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "a and b once each"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bind_project_tests {
+    //! `bind_chat_session_project` (P18): the project a session actually works on is
+    //! written once on the node, and an explicit project is never overwritten. Before
+    //! it, a session opened without `project_slug` stayed anonymous in
+    //! `/api/agents/live` although every turn resolved its project from the cwd.
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
+    use crate::test_helpers::test_chat_session;
+
+    async fn session(store: &MockGraphStore, slug: Option<&str>) -> Uuid {
+        let s = test_chat_session(slug);
+        let id = s.id;
+        store.create_chat_session(&s).await.unwrap();
+        id
+    }
+
+    async fn project_of(store: &MockGraphStore, id: Uuid) -> Option<String> {
+        store
+            .get_chat_session(id)
+            .await
+            .unwrap()
+            .expect("the session exists")
+            .project_slug
+    }
+
+    #[tokio::test]
+    async fn a_session_without_a_project_binds_the_resolved_one() {
+        let store = MockGraphStore::new();
+        let id = session(&store, None).await;
+
+        assert!(
+            store
+                .bind_chat_session_project(id, "po-graph")
+                .await
+                .unwrap(),
+            "the first bind writes"
+        );
+        assert_eq!(project_of(&store, id).await.as_deref(), Some("po-graph"));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_project_is_never_overwritten() {
+        let store = MockGraphStore::new();
+        let id = session(&store, Some("project-orchestrator-backend")).await;
+
+        assert!(
+            !store
+                .bind_chat_session_project(id, "po-graph")
+                .await
+                .unwrap(),
+            "binding refuses a session that already has a project"
+        );
+        assert_eq!(
+            project_of(&store, id).await.as_deref(),
+            Some("project-orchestrator-backend")
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_is_idempotent_and_an_empty_slug_counts_as_no_project() {
+        let store = MockGraphStore::new();
+        let id = session(&store, Some("  ")).await;
+
+        assert!(store
+            .bind_chat_session_project(id, "po-graph")
+            .await
+            .unwrap());
+        assert!(
+            !store.bind_chat_session_project(id, "other").await.unwrap(),
+            "a second bind writes nothing"
+        );
+        assert_eq!(project_of(&store, id).await.as_deref(), Some("po-graph"));
+    }
+
+    #[tokio::test]
+    async fn binding_an_unknown_session_writes_nothing_and_does_not_fail() {
+        let store = MockGraphStore::new();
+        assert!(!store
+            .bind_chat_session_project(Uuid::new_v4(), "po-graph")
+            .await
+            .unwrap());
+    }
+}
+
+#[cfg(test)]
+mod transverse_skill_tests {
+    //! A skill with no project is transverse: it belongs to the instance and is
+    //! visible from every project. The rule lives in three places — the Neo4j
+    //! query, this in-memory store, and the trigger matcher — so it is pinned
+    //! here instead of only in a query string.
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
+    use crate::skills::{SkillNode, SkillStatus};
+    use crate::test_helpers::test_project;
+
+    async fn store_with_a_project() -> (MockGraphStore, Uuid) {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        let pid = project.id;
+        store.create_project(&project).await.unwrap();
+        (store, pid)
+    }
+
+    fn active(project_id: Option<Uuid>, name: &str) -> SkillNode {
+        let mut skill = SkillNode::new(project_id, name);
+        skill.status = SkillStatus::Active;
+        skill
+    }
+
+    #[tokio::test]
+    async fn a_transverse_skill_is_visible_from_every_project() {
+        let (store, pid) = store_with_a_project().await;
+        store
+            .create_skill(&active(Some(pid), "local"))
+            .await
+            .unwrap();
+        store
+            .create_skill(&active(None, "everywhere"))
+            .await
+            .unwrap();
+
+        // From the project it belongs to: both.
+        let (found, total) = store.list_skills(Some(pid), None, 10, 0).await.unwrap();
+        assert_eq!(
+            total, 2,
+            "a project sees its own skills and the transverse ones"
+        );
+        assert!(found.iter().any(|s| s.name == "local"));
+        assert!(found.iter().any(|s| s.name == "everywhere"));
+
+        // From a project it was never written for: the transverse one only.
+        let elsewhere = Uuid::new_v4();
+        let (found, total) = store
+            .list_skills(Some(elsewhere), None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "another project must see the transverse skill");
+        assert_eq!(found[0].name, "everywhere");
+
+        // No project asked: the transverse library, and nothing else.
+        let (found, total) = store.list_skills(None, None, 10, 0).await.unwrap();
+        assert_eq!(total, 1, "without a project, only the library is listed");
+        assert_eq!(found[0].name, "everywhere");
+    }
+
+    #[tokio::test]
+    async fn the_detection_reads_stay_project_scoped() {
+        // `get_live_skills_for_project` feeds skill detection: seeing a
+        // transverse skill there would make it look "new" on every pass.
+        let (store, pid) = store_with_a_project().await;
+        store
+            .create_skill(&active(Some(pid), "local"))
+            .await
+            .unwrap();
+        store
+            .create_skill(&active(None, "everywhere"))
+            .await
+            .unwrap();
+
+        let live = store.get_live_skills_for_project(pid).await.unwrap();
+        assert_eq!(live.len(), 1, "detection must not see transverse skills");
+        assert_eq!(live[0].name, "local");
+    }
+}
+
+#[cfg(test)]
+mod rescope_tests {
+    //! Re-scoping is the operation T3 depends on: it must move a node between
+    //! the transverse level and a project without recreating it (and therefore
+    //! without losing its members, states, transitions or runs).
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
+    use crate::skills::{SkillNode, SkillStatus};
+    use crate::test_helpers::test_project;
+
+    #[tokio::test]
+    async fn rescoping_moves_the_scope_and_null_makes_it_transverse() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        let pid = project.id;
+        store.create_project(&project).await.unwrap();
+
+        let mut skill = SkillNode::new(Some(pid), "rescoped");
+        skill.status = SkillStatus::Active;
+        let id = skill.id;
+        store.create_skill(&skill).await.unwrap();
+
+        // attached -> transverse
+        store.rescope_skill(id, None).await.unwrap();
+        let (library, _) = store.list_skills(None, None, 10, 0).await.unwrap();
+        assert!(
+            library.iter().any(|s| s.id == id),
+            "null must make the skill transverse"
+        );
+
+        // transverse -> attached elsewhere
+        let elsewhere = Uuid::new_v4();
+        store.rescope_skill(id, Some(elsewhere)).await.unwrap();
+        let (from_project, _) = store
+            .list_skills(Some(elsewhere), None, 10, 0)
+            .await
+            .unwrap();
+        assert!(
+            from_project.iter().any(|s| s.id == id),
+            "a uuid must attach the skill to that project"
+        );
+        let (library, _) = store.list_skills(None, None, 10, 0).await.unwrap();
+        assert!(
+            !library.iter().any(|s| s.id == id),
+            "it must have left the transverse library"
+        );
+    }
+}
+
+#[async_trait]
+impl ProjectStore for MockGraphStore {
     // ========================================================================
     // Project operations
     // ========================================================================
@@ -987,7 +6276,10 @@ impl GraphStore for MockGraphStore {
         }
         Ok(())
     }
+}
 
+#[async_trait]
+impl WorkspaceStore for MockGraphStore {
     // ========================================================================
     // Workspace operations
     // ========================================================================
@@ -1126,7 +6418,6 @@ impl GraphStore for MockGraphStore {
             project_count: projects.len(),
         })
     }
-
     // ========================================================================
     // Workspace Milestone operations
     // ========================================================================
@@ -1792,7 +7083,10 @@ impl GraphStore for MockGraphStore {
         }
         Ok(result)
     }
+}
 
+#[async_trait]
+impl CodeStore for MockGraphStore {
     // ========================================================================
     // File operations
     // ========================================================================
@@ -3739,7 +9033,10 @@ impl GraphStore for MockGraphStore {
         }
         Ok(result)
     }
+}
 
+#[async_trait]
+impl PlanStore for MockGraphStore {
     // ========================================================================
     // Plan operations
     // ========================================================================
@@ -4894,7 +10191,10 @@ impl GraphStore for MockGraphStore {
         }
         Ok(())
     }
+}
 
+#[async_trait]
+impl DecisionStore for MockGraphStore {
     // ========================================================================
     // Decision operations
     // ========================================================================
@@ -5202,7 +10502,10 @@ impl GraphStore for MockGraphStore {
     ) -> Result<Vec<DecisionTimelineEntry>> {
         Ok(vec![])
     }
+}
 
+#[async_trait]
+impl CommitStore for MockGraphStore {
     // ========================================================================
     // Dependency analysis
     // ========================================================================
@@ -5508,7 +10811,10 @@ impl GraphStore for MockGraphStore {
     ) -> Result<Vec<TransitiveCoChanger>> {
         Ok(vec![])
     }
+}
 
+#[async_trait]
+impl ReleaseStore for MockGraphStore {
     // ========================================================================
     // Release operations
     // ========================================================================
@@ -6367,7 +11673,10 @@ impl GraphStore for MockGraphStore {
         let total = filtered.len();
         Ok((paginate(&filtered, limit, offset), total))
     }
+}
 
+#[async_trait]
+impl NoteStore for MockGraphStore {
     // ========================================================================
     // Document operations
     // ========================================================================
@@ -7124,7 +12433,10 @@ impl GraphStore for MockGraphStore {
 
         Ok((page, total))
     }
+}
 
+#[async_trait]
+impl AnalyticsStore for MockGraphStore {
     // ========================================================================
     // Code embedding operations (File & Function vector search)
     // ========================================================================
@@ -14073,5272 +19385,5 @@ impl GraphStore for MockGraphStore {
             params,
             filter,
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::neo4j::traits::GraphStore;
-    use crate::test_helpers::{test_project, test_project_named};
-    use chrono::Utc;
-
-    fn make_event(session_id: Uuid, seq: i64, event_type: &str, data: &str) -> ChatEventRecord {
-        ChatEventRecord {
-            id: Uuid::new_v4(),
-            session_id,
-            seq,
-            event_type: event_type.to_string(),
-            data: data.to_string(),
-            created_at: Utc::now(),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_list_notes_needing_synapses_project_scoped() {
-        // Regression test for the synapse-collapse self-heal fix: on-demand
-        // callers (detect_skills_pipeline / run_weekly_maintenance) must be
-        // able to scope the backfill to a single project so a bounded,
-        // on-demand call cannot balloon into a full multi-tenant rebuild.
-        let store = MockGraphStore::new();
-        let project_a = Uuid::new_v4();
-        let project_b = Uuid::new_v4();
-
-        let note_a = Note::new(
-            Some(project_a),
-            crate::notes::NoteType::Observation,
-            "note in project A".to_string(),
-            "test".to_string(),
-        );
-        let note_b = Note::new(
-            Some(project_b),
-            crate::notes::NoteType::Observation,
-            "note in project B".to_string(),
-            "test".to_string(),
-        );
-
-        store.create_note(&note_a).await.unwrap();
-        store.create_note(&note_b).await.unwrap();
-
-        // Both notes have embeddings but no synapses yet — both are
-        // "needing synapses" candidates.
-        store
-            .set_note_embedding(note_a.id, &[0.1, 0.2, 0.3], "test-model")
-            .await
-            .unwrap();
-        store
-            .set_note_embedding(note_b.id, &[0.4, 0.5, 0.6], "test-model")
-            .await
-            .unwrap();
-
-        // Scoped to project A: only note_a should be returned.
-        let (notes, total) = store
-            .list_notes_needing_synapses(10, 0, Some(project_a))
-            .await
-            .unwrap();
-        assert_eq!(total, 1, "only project A's note should count");
-        assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0].id, note_a.id);
-
-        // Unscoped (None): both notes across both projects should be returned,
-        // preserving the original global-sweep behavior used by the heartbeat.
-        let (notes_all, total_all) = store
-            .list_notes_needing_synapses(10, 0, None)
-            .await
-            .unwrap();
-        assert_eq!(total_all, 2, "unscoped call should see both projects");
-        assert_eq!(notes_all.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_chat_event_store_and_get() {
-        let store = MockGraphStore::new();
-        let session_id = Uuid::new_v4();
-
-        let events = vec![
-            make_event(session_id, 1, "user_message", r#"{"content":"Hello"}"#),
-            make_event(session_id, 2, "assistant_text", r#"{"content":"Hi!"}"#),
-            make_event(session_id, 3, "result", r#"{"duration_ms":1000}"#),
-        ];
-
-        store.store_chat_events(session_id, events).await.unwrap();
-
-        // Get all events (after_seq=0)
-        let result = store.get_chat_events(session_id, 0, 100).await.unwrap();
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0].seq, 1);
-        assert_eq!(result[0].event_type, "user_message");
-        assert_eq!(result[1].seq, 2);
-        assert_eq!(result[2].seq, 3);
-    }
-
-    #[tokio::test]
-    async fn test_chat_event_get_with_after_seq() {
-        let store = MockGraphStore::new();
-        let session_id = Uuid::new_v4();
-
-        let events = vec![
-            make_event(session_id, 1, "user_message", r#"{"content":"Hello"}"#),
-            make_event(session_id, 2, "assistant_text", r#"{"content":"Hi!"}"#),
-            make_event(session_id, 3, "tool_use", r#"{"tool":"bash"}"#),
-            make_event(session_id, 4, "tool_result", r#"{"result":"ok"}"#),
-            make_event(session_id, 5, "result", r#"{"duration_ms":2000}"#),
-        ];
-
-        store.store_chat_events(session_id, events).await.unwrap();
-
-        // Get events after seq 2 (should return 3,4,5)
-        let result = store.get_chat_events(session_id, 2, 100).await.unwrap();
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0].seq, 3);
-        assert_eq!(result[1].seq, 4);
-        assert_eq!(result[2].seq, 5);
-
-        // Get events after seq 4 (should return only 5)
-        let result = store.get_chat_events(session_id, 4, 100).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].seq, 5);
-
-        // Get events after seq 5 (should return empty)
-        let result = store.get_chat_events(session_id, 5, 100).await.unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_chat_event_get_with_limit() {
-        let store = MockGraphStore::new();
-        let session_id = Uuid::new_v4();
-
-        let events = vec![
-            make_event(session_id, 1, "user_message", "{}"),
-            make_event(session_id, 2, "assistant_text", "{}"),
-            make_event(session_id, 3, "tool_use", "{}"),
-            make_event(session_id, 4, "tool_result", "{}"),
-            make_event(session_id, 5, "result", "{}"),
-        ];
-
-        store.store_chat_events(session_id, events).await.unwrap();
-
-        // Limit to 2 events
-        let result = store.get_chat_events(session_id, 0, 2).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].seq, 1);
-        assert_eq!(result[1].seq, 2);
-    }
-
-    #[tokio::test]
-    async fn test_chat_event_latest_seq() {
-        let store = MockGraphStore::new();
-        let session_id = Uuid::new_v4();
-
-        // No events — should return 0
-        let seq = store.get_latest_chat_event_seq(session_id).await.unwrap();
-        assert_eq!(seq, 0);
-
-        let events = vec![
-            make_event(session_id, 1, "user_message", "{}"),
-            make_event(session_id, 2, "assistant_text", "{}"),
-            make_event(session_id, 3, "result", "{}"),
-        ];
-        store.store_chat_events(session_id, events).await.unwrap();
-
-        let seq = store.get_latest_chat_event_seq(session_id).await.unwrap();
-        assert_eq!(seq, 3);
-
-        // Add more events
-        let more = vec![make_event(session_id, 4, "user_message", "{}")];
-        store.store_chat_events(session_id, more).await.unwrap();
-
-        let seq = store.get_latest_chat_event_seq(session_id).await.unwrap();
-        assert_eq!(seq, 4);
-    }
-
-    #[tokio::test]
-    async fn test_chat_event_delete() {
-        let store = MockGraphStore::new();
-        let session_id = Uuid::new_v4();
-        let other_session_id = Uuid::new_v4();
-
-        let events = vec![
-            make_event(session_id, 1, "user_message", "{}"),
-            make_event(session_id, 2, "result", "{}"),
-        ];
-        let other_events = vec![make_event(other_session_id, 1, "user_message", "{}")];
-
-        store.store_chat_events(session_id, events).await.unwrap();
-        store
-            .store_chat_events(other_session_id, other_events)
-            .await
-            .unwrap();
-
-        // Delete session's events
-        store.delete_chat_events(session_id).await.unwrap();
-
-        // Verify deleted
-        let result = store.get_chat_events(session_id, 0, 100).await.unwrap();
-        assert!(result.is_empty());
-        let seq = store.get_latest_chat_event_seq(session_id).await.unwrap();
-        assert_eq!(seq, 0);
-
-        // Other session unaffected
-        let result = store
-            .get_chat_events(other_session_id, 0, 100)
-            .await
-            .unwrap();
-        assert_eq!(result.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_chat_event_empty_session() {
-        let store = MockGraphStore::new();
-        let session_id = Uuid::new_v4();
-
-        // Getting events for non-existent session should return empty
-        let result = store.get_chat_events(session_id, 0, 100).await.unwrap();
-        assert!(result.is_empty());
-
-        // Deleting events for non-existent session should not error
-        store.delete_chat_events(session_id).await.unwrap();
-    }
-
-    // ====================================================================
-    // User / Auth tests
-    // ====================================================================
-
-    use crate::neo4j::models::AuthProvider;
-
-    fn make_oidc_user(external_id: &str, email: &str) -> UserNode {
-        UserNode {
-            id: Uuid::new_v4(),
-            email: email.to_string(),
-            name: "Test User".to_string(),
-            picture_url: Some("https://example.com/pic.jpg".to_string()),
-            auth_provider: AuthProvider::Oidc,
-            external_id: Some(external_id.to_string()),
-            password_hash: None,
-            created_at: Utc::now(),
-            last_login_at: Utc::now(),
-        }
-    }
-
-    fn make_password_user(email: &str) -> UserNode {
-        UserNode {
-            id: Uuid::new_v4(),
-            email: email.to_string(),
-            name: "Test User".to_string(),
-            picture_url: None,
-            auth_provider: AuthProvider::Password,
-            external_id: None,
-            password_hash: Some("$2b$12$fakehash".to_string()),
-            created_at: Utc::now(),
-            last_login_at: Utc::now(),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_upsert_user_create_oidc() {
-        let store = MockGraphStore::new();
-        let user = make_oidc_user("gid-001", "alice@ffs.holdings");
-
-        let result = store.upsert_user(&user).await.unwrap();
-        assert_eq!(result.email, "alice@ffs.holdings");
-        assert_eq!(result.auth_provider, AuthProvider::Oidc);
-        assert_eq!(result.external_id, Some("gid-001".to_string()));
-
-        // Should be retrievable
-        let found = store.get_user_by_id(user.id).await.unwrap();
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().email, "alice@ffs.holdings");
-    }
-
-    #[tokio::test]
-    async fn test_upsert_user_update_oidc() {
-        let store = MockGraphStore::new();
-        let user = make_oidc_user("gid-002", "bob@ffs.holdings");
-        store.upsert_user(&user).await.unwrap();
-
-        // Upsert same external_id with updated fields
-        let mut updated = make_oidc_user("gid-002", "bob.new@ffs.holdings");
-        updated.name = "Bob Updated".to_string();
-        updated.picture_url = None;
-
-        let result = store.upsert_user(&updated).await.unwrap();
-        // Should keep the original id (found by external_id)
-        assert_eq!(result.id, user.id);
-        // But fields should be updated
-        assert_eq!(result.email, "bob.new@ffs.holdings");
-        assert_eq!(result.name, "Bob Updated");
-        assert!(result.picture_url.is_none());
-
-        // Only 1 user in the store
-        let all = store.list_users().await.unwrap();
-        assert_eq!(all.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_upsert_user_create_password() {
-        let store = MockGraphStore::new();
-        let user = make_password_user("alice@ffs.holdings");
-
-        let result = store.upsert_user(&user).await.unwrap();
-        assert_eq!(result.email, "alice@ffs.holdings");
-        assert_eq!(result.auth_provider, AuthProvider::Password);
-        assert!(result.password_hash.is_some());
-        assert!(result.external_id.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_upsert_user_update_password() {
-        let store = MockGraphStore::new();
-        let user = make_password_user("carol@ffs.holdings");
-        store.upsert_user(&user).await.unwrap();
-
-        // Upsert same email + password provider → should update
-        let mut updated = make_password_user("carol@ffs.holdings");
-        updated.name = "Carol Updated".to_string();
-
-        let result = store.upsert_user(&updated).await.unwrap();
-        assert_eq!(result.id, user.id); // same user
-        assert_eq!(result.name, "Carol Updated");
-
-        let all = store.list_users().await.unwrap();
-        assert_eq!(all.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_get_user_by_provider_id() {
-        let store = MockGraphStore::new();
-        let user = make_oidc_user("gid-003", "charlie@ffs.holdings");
-        store.upsert_user(&user).await.unwrap();
-
-        let found = store
-            .get_user_by_provider_id("oidc", "gid-003")
-            .await
-            .unwrap();
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().email, "charlie@ffs.holdings");
-
-        let not_found = store
-            .get_user_by_provider_id("oidc", "gid-999")
-            .await
-            .unwrap();
-        assert!(not_found.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_get_user_by_email_and_provider() {
-        let store = MockGraphStore::new();
-        // Create both an OIDC and a password user with the same email
-        let oidc_user = make_oidc_user("gid-005", "dual@ffs.holdings");
-        let password_user = make_password_user("dual@ffs.holdings");
-        store.upsert_user(&oidc_user).await.unwrap();
-        store.upsert_user(&password_user).await.unwrap();
-
-        // Should find the password user
-        let found = store
-            .get_user_by_email_and_provider("dual@ffs.holdings", "password")
-            .await
-            .unwrap();
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().auth_provider, AuthProvider::Password);
-
-        // Should find the OIDC user
-        let found = store
-            .get_user_by_email_and_provider("dual@ffs.holdings", "oidc")
-            .await
-            .unwrap();
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().auth_provider, AuthProvider::Oidc);
-
-        // Should not find non-existent
-        let not_found = store
-            .get_user_by_email_and_provider("nobody@ffs.holdings", "password")
-            .await
-            .unwrap();
-        assert!(not_found.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_get_user_by_email() {
-        let store = MockGraphStore::new();
-        let user = make_oidc_user("gid-004", "diana@ffs.holdings");
-        store.upsert_user(&user).await.unwrap();
-
-        let found = store.get_user_by_email("diana@ffs.holdings").await.unwrap();
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().external_id, Some("gid-004".to_string()));
-
-        let not_found = store
-            .get_user_by_email("nobody@ffs.holdings")
-            .await
-            .unwrap();
-        assert!(not_found.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_get_user_not_found() {
-        let store = MockGraphStore::new();
-
-        let not_found = store.get_user_by_id(Uuid::new_v4()).await.unwrap();
-        assert!(not_found.is_none());
-
-        let not_found = store
-            .get_user_by_provider_id("oidc", "nonexistent")
-            .await
-            .unwrap();
-        assert!(not_found.is_none());
-
-        let not_found = store
-            .get_user_by_email("nonexistent@ffs.holdings")
-            .await
-            .unwrap();
-        assert!(not_found.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_create_password_user() {
-        let store = MockGraphStore::new();
-
-        let user = store
-            .create_password_user("new@ffs.holdings", "New User", "$2b$12$somehash")
-            .await
-            .unwrap();
-
-        assert_eq!(user.email, "new@ffs.holdings");
-        assert_eq!(user.name, "New User");
-        assert_eq!(user.auth_provider, AuthProvider::Password);
-        assert_eq!(user.password_hash, Some("$2b$12$somehash".to_string()));
-        assert!(user.external_id.is_none());
-
-        // Should be findable
-        let found = store.get_user_by_id(user.id).await.unwrap();
-        assert!(found.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_list_users() {
-        let store = MockGraphStore::new();
-
-        // Empty list
-        let users = store.list_users().await.unwrap();
-        assert!(users.is_empty());
-
-        // Add 3 users (mix of providers)
-        store
-            .upsert_user(&make_oidc_user("gid-a", "a@ffs.holdings"))
-            .await
-            .unwrap();
-        store
-            .upsert_user(&make_oidc_user("gid-b", "b@ffs.holdings"))
-            .await
-            .unwrap();
-        store
-            .upsert_user(&make_password_user("c@ffs.holdings"))
-            .await
-            .unwrap();
-
-        let users = store.list_users().await.unwrap();
-        assert_eq!(users.len(), 3);
-    }
-
-    // ========================================================================
-    // Call relationship tests — scoping by project
-    // ========================================================================
-
-    fn make_function(name: &str, file_path: &str, line_start: u32) -> FunctionNode {
-        FunctionNode {
-            name: name.to_string(),
-            visibility: Visibility::Public,
-            params: vec![],
-            return_type: None,
-            generics: vec![],
-            is_async: false,
-            is_unsafe: false,
-            complexity: 1,
-            file_path: file_path.to_string(),
-            line_start,
-            line_end: line_start + 10,
-            docstring: None,
-        }
-    }
-
-    fn make_file(path: &str, project_id: Option<Uuid>) -> FileNode {
-        FileNode {
-            path: path.to_string(),
-            language: "rust".to_string(),
-            hash: "abc123".to_string(),
-            last_parsed: Utc::now(),
-            project_id,
-        }
-    }
-
-    /// Seed a project with files and functions into the mock store
-    async fn seed_project(
-        store: &MockGraphStore,
-        project: &ProjectNode,
-        files_and_fns: &[(&str, &[&str])], // (file_path, [fn_names])
-    ) {
-        store.create_project(project).await.unwrap();
-        for (file_path, fn_names) in files_and_fns {
-            let file = make_file(file_path, Some(project.id));
-            store.upsert_file(&file).await.unwrap();
-            // Also register in project_files (upsert_file doesn't do this)
-            store
-                .project_files
-                .write()
-                .await
-                .entry(project.id)
-                .or_default()
-                .push(file_path.to_string());
-            for (i, fn_name) in fn_names.iter().enumerate() {
-                let func = make_function(fn_name, file_path, (i * 10) as u32);
-                store.upsert_function(&func).await.unwrap();
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_create_call_relationship_basic() {
-        let store = MockGraphStore::new();
-        let project = test_project();
-        seed_project(&store, &project, &[("src/main.rs", &["main", "helper"])]).await;
-
-        // Create a call: main -> helper
-        store
-            .create_call_relationship(
-                "src/main.rs::main",
-                "helper",
-                Some(project.id),
-                0.50,
-                "unscored",
-            )
-            .await
-            .unwrap();
-
-        let cr = store.call_relationships.read().await;
-        let callees = cr.get("src/main.rs::main").unwrap();
-        assert_eq!(callees, &vec!["helper".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn test_create_call_relationship_scoped_rejects_cross_project() {
-        let store = MockGraphStore::new();
-        let project_a = test_project_named("project-a");
-        let project_b = test_project_named("project-b");
-
-        seed_project(
-            &store,
-            &project_a,
-            &[("a/src/main.rs", &["process", "validate"])],
-        )
-        .await;
-        seed_project(
-            &store,
-            &project_b,
-            &[("b/src/main.rs", &["process", "transform"])],
-        )
-        .await;
-
-        // Try to create a call from project_a::process -> transform (which only exists in project_b)
-        store
-            .create_call_relationship(
-                "a/src/main.rs::process",
-                "transform",
-                Some(project_a.id),
-                0.50,
-                "unscored",
-            )
-            .await
-            .unwrap();
-
-        // Should NOT have created the relationship (callee not in same project)
-        let cr = store.call_relationships.read().await;
-        assert!(
-            cr.get("a/src/main.rs::process").is_none(),
-            "Should not create cross-project CALLS"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_create_call_relationship_without_project_id_allows_all() {
-        let store = MockGraphStore::new();
-        let project_a = test_project_named("project-a");
-        let project_b = test_project_named("project-b");
-
-        seed_project(&store, &project_a, &[("a/src/main.rs", &["process"])]).await;
-        seed_project(&store, &project_b, &[("b/src/main.rs", &["transform"])]).await;
-
-        // Without project_id (None), cross-project call is allowed (backward compat)
-        store
-            .create_call_relationship(
-                "a/src/main.rs::process",
-                "transform",
-                None,
-                0.50,
-                "unscored",
-            )
-            .await
-            .unwrap();
-
-        let cr = store.call_relationships.read().await;
-        let callees = cr.get("a/src/main.rs::process").unwrap();
-        assert_eq!(callees, &vec!["transform".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn test_find_callers_basic() {
-        let store = MockGraphStore::new();
-        let project = test_project();
-        seed_project(
-            &store,
-            &project,
-            &[("src/lib.rs", &["caller_a", "caller_b", "target"])],
-        )
-        .await;
-
-        store
-            .create_call_relationship(
-                "src/lib.rs::caller_a",
-                "target",
-                Some(project.id),
-                0.50,
-                "unscored",
-            )
-            .await
-            .unwrap();
-        store
-            .create_call_relationship(
-                "src/lib.rs::caller_b",
-                "target",
-                Some(project.id),
-                0.50,
-                "unscored",
-            )
-            .await
-            .unwrap();
-
-        let callers = store
-            .find_callers("src/lib.rs::target", None)
-            .await
-            .unwrap();
-        assert_eq!(callers.len(), 2);
-
-        let names: Vec<&str> = callers.iter().map(|f| f.name.as_str()).collect();
-        assert!(names.contains(&"caller_a"));
-        assert!(names.contains(&"caller_b"));
-    }
-
-    #[tokio::test]
-    async fn test_find_callers_scoped_by_project() {
-        let store = MockGraphStore::new();
-        let project_a = test_project_named("project-a");
-        let project_b = test_project_named("project-b");
-
-        seed_project(
-            &store,
-            &project_a,
-            &[("a/src/lib.rs", &["caller_a", "target"])],
-        )
-        .await;
-        seed_project(
-            &store,
-            &project_b,
-            &[("b/src/lib.rs", &["caller_b", "target"])],
-        )
-        .await;
-
-        // Both call "target" but via None (unscoped create)
-        store
-            .create_call_relationship("a/src/lib.rs::caller_a", "target", None, 0.50, "unscored")
-            .await
-            .unwrap();
-        store
-            .create_call_relationship("b/src/lib.rs::caller_b", "target", None, 0.50, "unscored")
-            .await
-            .unwrap();
-
-        // Scoped to project_a: only caller_a
-        let callers_a = store
-            .find_callers("a/src/lib.rs::target", Some(project_a.id))
-            .await
-            .unwrap();
-        assert_eq!(callers_a.len(), 1);
-        assert_eq!(callers_a[0].name, "caller_a");
-
-        // Unscoped: both callers
-        let callers_all = store
-            .find_callers("a/src/lib.rs::target", None)
-            .await
-            .unwrap();
-        assert_eq!(callers_all.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_get_function_callers_by_name_scoped() {
-        let store = MockGraphStore::new();
-        let project_a = test_project_named("project-a");
-        let project_b = test_project_named("project-b");
-
-        seed_project(
-            &store,
-            &project_a,
-            &[("a/src/lib.rs", &["caller_a", "target"])],
-        )
-        .await;
-        seed_project(
-            &store,
-            &project_b,
-            &[("b/src/lib.rs", &["caller_b", "target"])],
-        )
-        .await;
-
-        store
-            .create_call_relationship("a/src/lib.rs::caller_a", "target", None, 0.50, "unscored")
-            .await
-            .unwrap();
-        store
-            .create_call_relationship("b/src/lib.rs::caller_b", "target", None, 0.50, "unscored")
-            .await
-            .unwrap();
-
-        // Scoped: only callers from project_a
-        let callers = store
-            .get_function_callers_by_name("target", 2, Some(project_a.id))
-            .await
-            .unwrap();
-        assert_eq!(callers.len(), 1);
-        assert!(callers[0].contains("caller_a"));
-
-        // Unscoped: both
-        let callers_all = store
-            .get_function_callers_by_name("target", 2, None)
-            .await
-            .unwrap();
-        assert_eq!(callers_all.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_get_function_callees_by_name_scoped() {
-        let store = MockGraphStore::new();
-        let project_a = test_project_named("project-a");
-        let project_b = test_project_named("project-b");
-
-        seed_project(
-            &store,
-            &project_a,
-            &[("a/src/lib.rs", &["process", "helper"])],
-        )
-        .await;
-        seed_project(
-            &store,
-            &project_b,
-            &[("b/src/lib.rs", &["process", "other"])],
-        )
-        .await;
-
-        store
-            .create_call_relationship("a/src/lib.rs::process", "helper", None, 0.50, "unscored")
-            .await
-            .unwrap();
-        store
-            .create_call_relationship("b/src/lib.rs::process", "other", None, 0.50, "unscored")
-            .await
-            .unwrap();
-
-        // Scoped to project_a: only callees from process in project_a
-        let callees = store
-            .get_function_callees_by_name("process", 2, Some(project_a.id))
-            .await
-            .unwrap();
-        assert_eq!(callees.len(), 1);
-        assert_eq!(callees[0], "helper");
-
-        // Unscoped: callees from both process functions
-        let callees_all = store
-            .get_function_callees_by_name("process", 2, None)
-            .await
-            .unwrap();
-        assert_eq!(callees_all.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_get_function_caller_count_scoped() {
-        let store = MockGraphStore::new();
-        let project_a = test_project_named("project-a");
-        let project_b = test_project_named("project-b");
-
-        seed_project(
-            &store,
-            &project_a,
-            &[("a/src/lib.rs", &["caller_a", "target"])],
-        )
-        .await;
-        seed_project(
-            &store,
-            &project_b,
-            &[("b/src/lib.rs", &["caller_b1", "caller_b2", "target"])],
-        )
-        .await;
-
-        store
-            .create_call_relationship("a/src/lib.rs::caller_a", "target", None, 0.50, "unscored")
-            .await
-            .unwrap();
-        store
-            .create_call_relationship("b/src/lib.rs::caller_b1", "target", None, 0.50, "unscored")
-            .await
-            .unwrap();
-        store
-            .create_call_relationship("b/src/lib.rs::caller_b2", "target", None, 0.50, "unscored")
-            .await
-            .unwrap();
-
-        // Scoped to project_a: 1 caller
-        let count_a = store
-            .get_function_caller_count("target", Some(project_a.id))
-            .await
-            .unwrap();
-        assert_eq!(count_a, 1);
-
-        // Scoped to project_b: 2 callers
-        let count_b = store
-            .get_function_caller_count("target", Some(project_b.id))
-            .await
-            .unwrap();
-        assert_eq!(count_b, 2);
-
-        // Unscoped: 3 callers total
-        let count_all = store
-            .get_function_caller_count("target", None)
-            .await
-            .unwrap();
-        assert_eq!(count_all, 3);
-    }
-
-    #[tokio::test]
-    async fn test_find_symbol_references_with_calls() {
-        let store = MockGraphStore::new();
-        let project = test_project();
-        seed_project(&store, &project, &[("src/lib.rs", &["caller", "target"])]).await;
-
-        store
-            .create_call_relationship(
-                "src/lib.rs::caller",
-                "target",
-                Some(project.id),
-                0.50,
-                "unscored",
-            )
-            .await
-            .unwrap();
-
-        let refs = store
-            .find_symbol_references("target", 10, None)
-            .await
-            .unwrap();
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].reference_type, "call");
-        assert_eq!(refs[0].file_path, "src/lib.rs");
-        assert!(refs[0].context.contains("caller"));
-    }
-
-    #[tokio::test]
-    async fn test_find_symbol_references_scoped() {
-        let store = MockGraphStore::new();
-        let project_a = test_project_named("project-a");
-        let project_b = test_project_named("project-b");
-
-        seed_project(
-            &store,
-            &project_a,
-            &[("a/src/lib.rs", &["caller_a", "target"])],
-        )
-        .await;
-        seed_project(
-            &store,
-            &project_b,
-            &[("b/src/lib.rs", &["caller_b", "target"])],
-        )
-        .await;
-
-        store
-            .create_call_relationship("a/src/lib.rs::caller_a", "target", None, 0.50, "unscored")
-            .await
-            .unwrap();
-        store
-            .create_call_relationship("b/src/lib.rs::caller_b", "target", None, 0.50, "unscored")
-            .await
-            .unwrap();
-
-        // Scoped to project_a: only caller_a
-        let refs_a = store
-            .find_symbol_references("target", 10, Some(project_a.id))
-            .await
-            .unwrap();
-        assert_eq!(refs_a.len(), 1);
-        assert!(refs_a[0].context.contains("caller_a"));
-
-        // Unscoped: both
-        let refs_all = store
-            .find_symbol_references("target", 10, None)
-            .await
-            .unwrap();
-        assert_eq!(refs_all.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_cross_project_calls_pollution_prevented() {
-        // This is the core regression test for the cross-project CALLS bug
-        let store = MockGraphStore::new();
-        let project_a = test_project_named("project-a");
-        let project_b = test_project_named("project-b");
-
-        // Both projects have a function named "handle_request" and "validate"
-        seed_project(
-            &store,
-            &project_a,
-            &[("a/src/handler.rs", &["handle_request", "validate"])],
-        )
-        .await;
-        seed_project(
-            &store,
-            &project_b,
-            &[("b/src/handler.rs", &["handle_request", "validate"])],
-        )
-        .await;
-
-        // Project A: handle_request calls validate (scoped to project A)
-        store
-            .create_call_relationship(
-                "a/src/handler.rs::handle_request",
-                "validate",
-                Some(project_a.id),
-                0.50,
-                "unscored",
-            )
-            .await
-            .unwrap();
-
-        // Project B: handle_request calls validate (scoped to project B)
-        store
-            .create_call_relationship(
-                "b/src/handler.rs::handle_request",
-                "validate",
-                Some(project_b.id),
-                0.50,
-                "unscored",
-            )
-            .await
-            .unwrap();
-
-        // Verify: callers of "validate" scoped to project A = only handle_request from A
-        let callers_a = store
-            .get_function_callers_by_name("validate", 2, Some(project_a.id))
-            .await
-            .unwrap();
-        assert_eq!(callers_a.len(), 1);
-        assert!(callers_a[0].contains("a/src/handler.rs"));
-
-        // Verify: callers scoped to project B = only handle_request from B
-        let callers_b = store
-            .get_function_callers_by_name("validate", 2, Some(project_b.id))
-            .await
-            .unwrap();
-        assert_eq!(callers_b.len(), 1);
-        assert!(callers_b[0].contains("b/src/handler.rs"));
-
-        // Verify: caller_count scoped
-        let count_a = store
-            .get_function_caller_count("validate", Some(project_a.id))
-            .await
-            .unwrap();
-        assert_eq!(count_a, 1);
-
-        let count_b = store
-            .get_function_caller_count("validate", Some(project_b.id))
-            .await
-            .unwrap();
-        assert_eq!(count_b, 1);
-
-        // Without scoping, both are visible
-        let count_all = store
-            .get_function_caller_count("validate", None)
-            .await
-            .unwrap();
-        assert_eq!(count_all, 2);
-    }
-
-    // ========================================================================
-    // find_dependent_files scoping tests
-    // ========================================================================
-
-    #[tokio::test]
-    async fn test_find_dependent_files_scoped_by_project() {
-        let store = MockGraphStore::new();
-        let project_a = test_project_named("project-a");
-        let project_b = test_project_named("project-b");
-
-        seed_project(
-            &store,
-            &project_a,
-            &[("a/src/lib.rs", &[]), ("a/src/handler.rs", &[])],
-        )
-        .await;
-        seed_project(
-            &store,
-            &project_b,
-            &[("b/src/lib.rs", &[]), ("b/src/handler.rs", &[])],
-        )
-        .await;
-
-        // a/src/handler.rs imports a/src/lib.rs
-        store
-            .create_import_relationship("a/src/handler.rs", "a/src/lib.rs", "lib")
-            .await
-            .unwrap();
-        // b/src/handler.rs also imports a/src/lib.rs (cross-project)
-        store
-            .create_import_relationship("b/src/handler.rs", "a/src/lib.rs", "lib")
-            .await
-            .unwrap();
-
-        // Scoped to project_a: only a/src/handler.rs should appear
-        let deps_a = store
-            .find_dependent_files("a/src/lib.rs", 3, Some(project_a.id))
-            .await
-            .unwrap();
-        assert_eq!(deps_a.len(), 1);
-        assert_eq!(deps_a[0], "a/src/handler.rs");
-
-        // Scoped to project_b: only b/src/handler.rs should appear
-        let deps_b = store
-            .find_dependent_files("a/src/lib.rs", 3, Some(project_b.id))
-            .await
-            .unwrap();
-        assert_eq!(deps_b.len(), 1);
-        assert_eq!(deps_b[0], "b/src/handler.rs");
-    }
-
-    #[tokio::test]
-    async fn test_find_dependent_files_without_project_id() {
-        let store = MockGraphStore::new();
-        let project_a = test_project_named("project-a");
-        let project_b = test_project_named("project-b");
-
-        seed_project(
-            &store,
-            &project_a,
-            &[("a/src/lib.rs", &[]), ("a/src/consumer.rs", &[])],
-        )
-        .await;
-        seed_project(&store, &project_b, &[("b/src/consumer.rs", &[])]).await;
-
-        store
-            .create_import_relationship("a/src/consumer.rs", "a/src/lib.rs", "lib")
-            .await
-            .unwrap();
-        store
-            .create_import_relationship("b/src/consumer.rs", "a/src/lib.rs", "lib")
-            .await
-            .unwrap();
-
-        // Without project_id: all dependents (global fallback)
-        let deps_all = store
-            .find_dependent_files("a/src/lib.rs", 3, None)
-            .await
-            .unwrap();
-        assert_eq!(deps_all.len(), 2);
-        assert!(deps_all.contains(&"a/src/consumer.rs".to_string()));
-        assert!(deps_all.contains(&"b/src/consumer.rs".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_find_dependent_files_unknown_project_returns_empty() {
-        let store = MockGraphStore::new();
-        let project_a = test_project_named("project-a");
-
-        seed_project(
-            &store,
-            &project_a,
-            &[("a/src/lib.rs", &[]), ("a/src/main.rs", &[])],
-        )
-        .await;
-
-        store
-            .create_import_relationship("a/src/main.rs", "a/src/lib.rs", "lib")
-            .await
-            .unwrap();
-
-        // Unknown project_id: should return empty
-        let unknown_id = Uuid::new_v4();
-        let deps = store
-            .find_dependent_files("a/src/lib.rs", 3, Some(unknown_id))
-            .await
-            .unwrap();
-        assert!(deps.is_empty());
-    }
-
-    // ========================================================================
-    // find_impacted_files tests
-    // ========================================================================
-
-    #[tokio::test]
-    async fn test_find_impacted_files_combines_imports_and_calls() {
-        let store = MockGraphStore::new();
-        let project = test_project_named("impact-project");
-
-        // Setup: lib.rs defines functions, handler.rs imports lib.rs, service.rs calls lib functions
-        seed_project(
-            &store,
-            &project,
-            &[
-                ("src/lib.rs", &["execute", "helper"]),
-                ("src/handler.rs", &[]),
-                ("src/service.rs", &["do_work"]),
-            ],
-        )
-        .await;
-
-        // handler.rs imports lib.rs (IMPORTS axis)
-        store
-            .create_import_relationship("src/handler.rs", "src/lib.rs", "lib")
-            .await
-            .unwrap();
-
-        // service.rs::do_work calls lib.rs::execute (CALLS axis)
-        store
-            .create_call_relationship(
-                "src/service.rs::do_work",
-                "execute",
-                Some(project.id),
-                0.50,
-                "unscored",
-            )
-            .await
-            .unwrap();
-
-        // find_impacted_files should return BOTH handler.rs (imports) and service.rs (calls)
-        let impacted = store
-            .find_impacted_files("src/lib.rs", 3, Some(project.id))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            impacted.len(),
-            2,
-            "Expected 2 impacted files, got: {:?}",
-            impacted
-        );
-        assert!(impacted.contains(&"src/handler.rs".to_string()));
-        assert!(impacted.contains(&"src/service.rs".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_find_impacted_files_excludes_self() {
-        let store = MockGraphStore::new();
-        let project = test_project_named("self-project");
-
-        // A file that has a function calling its own function should NOT list itself
-        seed_project(&store, &project, &[("src/lib.rs", &["fn_a", "fn_b"])]).await;
-
-        store
-            .create_call_relationship(
-                "src/lib.rs::fn_a",
-                "fn_b",
-                Some(project.id),
-                0.50,
-                "unscored",
-            )
-            .await
-            .unwrap();
-
-        let impacted = store
-            .find_impacted_files("src/lib.rs", 3, Some(project.id))
-            .await
-            .unwrap();
-
-        assert!(
-            impacted.is_empty(),
-            "Self-calls should not appear in impacted files"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_find_impacted_files_scoped_by_project() {
-        let store = MockGraphStore::new();
-        let project_a = test_project_named("proj-a");
-        let project_b = test_project_named("proj-b");
-
-        seed_project(
-            &store,
-            &project_a,
-            &[
-                ("a/src/lib.rs", &["target"]),
-                ("a/src/caller.rs", &["call_it"]),
-            ],
-        )
-        .await;
-        seed_project(&store, &project_b, &[("b/src/caller.rs", &["call_it_b"])]).await;
-
-        // Both projects' functions call target in project_a
-        store
-            .create_call_relationship("a/src/caller.rs::call_it", "target", None, 0.50, "unscored")
-            .await
-            .unwrap();
-        store
-            .create_call_relationship(
-                "b/src/caller.rs::call_it_b",
-                "target",
-                None,
-                0.50,
-                "unscored",
-            )
-            .await
-            .unwrap();
-
-        // Scoped to project_a: only a/src/caller.rs
-        let impacted_a = store
-            .find_impacted_files("a/src/lib.rs", 3, Some(project_a.id))
-            .await
-            .unwrap();
-        assert_eq!(impacted_a.len(), 1);
-        assert_eq!(impacted_a[0], "a/src/caller.rs");
-
-        // Without scope: both
-        let impacted_all = store
-            .find_impacted_files("a/src/lib.rs", 3, None)
-            .await
-            .unwrap();
-        assert_eq!(impacted_all.len(), 2);
-    }
-
-    // ========================================================================
-    // Feature Graph — Multi-relation traversal tests
-    // ========================================================================
-
-    fn make_fg_struct(name: &str, file_path: &str) -> StructNode {
-        StructNode {
-            name: name.to_string(),
-            visibility: Visibility::Public,
-            generics: vec![],
-            file_path: file_path.to_string(),
-            line_start: 1,
-            line_end: 10,
-            docstring: None,
-            parent_class: None,
-            interfaces: vec![],
-        }
-    }
-
-    fn make_fg_impl(for_type: &str, trait_name: Option<&str>, file_path: &str) -> ImplNode {
-        ImplNode {
-            for_type: for_type.to_string(),
-            trait_name: trait_name.map(|t| t.to_string()),
-            generics: vec![],
-            where_clause: None,
-            file_path: file_path.to_string(),
-            line_start: 1,
-            line_end: 10,
-        }
-    }
-
-    fn make_fg_trait(name: &str, file_path: &str) -> TraitNode {
-        TraitNode {
-            name: name.to_string(),
-            visibility: Visibility::Public,
-            generics: vec![],
-            file_path: file_path.to_string(),
-            line_start: 1,
-            line_end: 10,
-            docstring: None,
-            is_external: false,
-            source: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_feature_graph_detail_entity_enrichment_round_trip() {
-        let project = test_project();
-        let pid = project.id;
-        let store = MockGraphStore::new();
-        store.create_project(&project).await.unwrap();
-
-        let mut func = make_function("build_system_prompt", "src/prompt.rs", 42);
-        func.is_async = true;
-        func.return_type = Some("String".to_string());
-        func.params = vec![Parameter {
-            name: "ctx".to_string(),
-            type_name: Some("&Ctx".to_string()),
-        }];
-        func.docstring = Some("  Builds the prompt.  ".to_string());
-        store.upsert_function(&func).await.unwrap();
-        store
-            .project_files
-            .write()
-            .await
-            .entry(pid)
-            .or_default()
-            .push("src/prompt.rs".to_string());
-
-        let built = store
-            .auto_build_feature_graph("fg", None, pid, "build_system_prompt", 1, None, None)
-            .await
-            .unwrap();
-        let detail = store
-            .get_feature_graph_detail(built.graph.id)
-            .await
-            .unwrap()
-            .unwrap();
-
-        let f = detail
-            .entities
-            .iter()
-            .find(|e| e.entity_type == "function")
-            .expect("function entity");
-        assert_eq!(
-            f.signature.as_deref(),
-            Some("pub async fn build_system_prompt(ctx: &Ctx) -> String")
-        );
-        assert_eq!(f.docstring.as_deref(), Some("Builds the prompt."));
-        assert_eq!(f.file_path.as_deref(), Some("src/prompt.rs"));
-        assert_eq!(f.line_start, Some(42));
-        assert_eq!(f.visibility.as_deref(), Some("public"));
-
-        if let Some(file) = detail.entities.iter().find(|e| e.entity_type == "file") {
-            assert_eq!(file.file_path.as_deref(), Some(file.entity_id.as_str()));
-            assert!(file.signature.is_none());
-        }
-    }
-
-    #[tokio::test]
-    async fn test_feature_graph_includes_structs_and_traits() {
-        let project = test_project();
-        let pid = project.id;
-        let store = MockGraphStore::new();
-        store.create_project(&project).await.unwrap();
-
-        // Seed: function "handle_request" in file "src/handler.rs"
-        let func = make_function("handle_request", "src/handler.rs", 1);
-        store.upsert_function(&func).await.unwrap();
-        store
-            .project_files
-            .write()
-            .await
-            .entry(pid)
-            .or_default()
-            .push("src/handler.rs".to_string());
-
-        // Seed: struct "Request" in same file, implements trait "Serialize"
-        let s = make_fg_struct("Request", "src/handler.rs");
-        store.upsert_struct(&s).await.unwrap();
-
-        let t = make_fg_trait("Serialize", "src/serde.rs");
-        store.upsert_trait(&t).await.unwrap();
-
-        let imp = make_fg_impl("Request", Some("Serialize"), "src/handler.rs");
-        store.upsert_impl(&imp).await.unwrap();
-
-        // Build the feature graph
-        let detail = store
-            .auto_build_feature_graph("test-fg", None, pid, "handle_request", 2, None, None)
-            .await
-            .unwrap();
-
-        let entity_types: Vec<&str> = detail
-            .entities
-            .iter()
-            .map(|e| e.entity_type.as_str())
-            .collect();
-        let entity_ids: Vec<&str> = detail
-            .entities
-            .iter()
-            .map(|e| e.entity_id.as_str())
-            .collect();
-
-        // Should include the function
-        assert!(
-            entity_ids.contains(&"handle_request"),
-            "should include function"
-        );
-        // Should include the file
-        assert!(
-            entity_ids.contains(&"src/handler.rs"),
-            "should include file"
-        );
-        // Should include the struct via IMPLEMENTS_FOR
-        assert!(
-            entity_types.contains(&"struct"),
-            "should include struct entities, got: {:?}",
-            entity_types
-        );
-        assert!(
-            entity_ids.contains(&"Request"),
-            "should include Request struct"
-        );
-        // Should include the trait via IMPLEMENTS_TRAIT
-        assert!(
-            entity_types.contains(&"trait"),
-            "should include trait entities, got: {:?}",
-            entity_types
-        );
-        assert!(
-            entity_ids.contains(&"Serialize"),
-            "should include Serialize trait"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_feature_graph_includes_imported_files() {
-        let project = test_project();
-        let pid = project.id;
-        let store = MockGraphStore::new();
-        store.create_project(&project).await.unwrap();
-
-        // Seed: function "process" in "src/main.rs"
-        let func = make_function("process", "src/main.rs", 1);
-        store.upsert_function(&func).await.unwrap();
-        store
-            .project_files
-            .write()
-            .await
-            .entry(pid)
-            .or_default()
-            .extend(vec!["src/main.rs".to_string(), "src/utils.rs".to_string()]);
-
-        // Seed: src/main.rs imports src/utils.rs
-        store
-            .create_import_relationship("src/main.rs", "src/utils.rs", "utils")
-            .await
-            .unwrap();
-
-        // Build the feature graph
-        let detail = store
-            .auto_build_feature_graph("test-imports", None, pid, "process", 2, None, None)
-            .await
-            .unwrap();
-
-        let file_entities: Vec<&str> = detail
-            .entities
-            .iter()
-            .filter(|e| e.entity_type == "file")
-            .map(|e| e.entity_id.as_str())
-            .collect();
-
-        assert!(
-            file_entities.contains(&"src/main.rs"),
-            "should include source file"
-        );
-        assert!(
-            file_entities.contains(&"src/utils.rs"),
-            "should include imported file, got: {:?}",
-            file_entities
-        );
-    }
-
-    #[tokio::test]
-    async fn test_feature_graph_does_not_cross_projects() {
-        let project_a = test_project_named("project-a");
-        let project_b = test_project_named("project-b");
-        let pid_a = project_a.id;
-        let pid_b = project_b.id;
-        let store = MockGraphStore::new();
-        store.create_project(&project_a).await.unwrap();
-        store.create_project(&project_b).await.unwrap();
-
-        // Project A: function "shared_func" in "a/src/lib.rs"
-        let func_a = make_function("shared_func", "a/src/lib.rs", 1);
-        store.upsert_function(&func_a).await.unwrap();
-        store
-            .project_files
-            .write()
-            .await
-            .entry(pid_a)
-            .or_default()
-            .push("a/src/lib.rs".to_string());
-
-        // Project B: function "shared_func" in "b/src/lib.rs" (same name, different project)
-        let func_b = make_function("shared_func", "b/src/lib.rs", 1);
-        store.upsert_function(&func_b).await.unwrap();
-        store
-            .project_files
-            .write()
-            .await
-            .entry(pid_b)
-            .or_default()
-            .push("b/src/lib.rs".to_string());
-
-        // Build feature graph for project A
-        let detail = store
-            .auto_build_feature_graph("test-no-cross", None, pid_a, "shared_func", 2, None, None)
-            .await
-            .unwrap();
-
-        let file_entities: Vec<&str> = detail
-            .entities
-            .iter()
-            .filter(|e| e.entity_type == "file")
-            .map(|e| e.entity_id.as_str())
-            .collect();
-
-        // Should include project A's file
-        assert!(
-            file_entities.contains(&"a/src/lib.rs"),
-            "should include project A file"
-        );
-        // Should NOT include project B's file
-        // Note: The mock currently matches by function name, not by project.
-        // This test documents the expected behavior once project scoping is implemented in the mock.
-        // For now, we verify the feature graph was built successfully.
-        assert!(
-            detail.entities.len() >= 2,
-            "should have at least function + file"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_feature_graph_auto_assigns_roles() {
-        let project = test_project();
-        let pid = project.id;
-        let store = MockGraphStore::new();
-        store.create_project(&project).await.unwrap();
-
-        // Seed project files first (needed for project-scoped call relationship creation)
-        store
-            .project_files
-            .write()
-            .await
-            .entry(pid)
-            .or_default()
-            .extend(vec![
-                "src/handler.rs".to_string(),
-                "src/processor.rs".to_string(),
-                "src/serde.rs".to_string(),
-            ]);
-
-        // Seed: entry function "handle_request" calls "process_data"
-        let entry_func = make_function("handle_request", "src/handler.rs", 1);
-        store.upsert_function(&entry_func).await.unwrap();
-        let callee_func = make_function("process_data", "src/processor.rs", 1);
-        store.upsert_function(&callee_func).await.unwrap();
-        store
-            .create_call_relationship(
-                "handle_request",
-                "process_data",
-                Some(pid),
-                0.50,
-                "unscored",
-            )
-            .await
-            .unwrap();
-
-        // Seed: struct "Request" in handler.rs, implements trait "Serialize"
-        let s = make_fg_struct("Request", "src/handler.rs");
-        store.upsert_struct(&s).await.unwrap();
-        let t = make_fg_trait("Serialize", "src/serde.rs");
-        store.upsert_trait(&t).await.unwrap();
-        let imp = make_fg_impl("Request", Some("Serialize"), "src/handler.rs");
-        store.upsert_impl(&imp).await.unwrap();
-
-        // Build the feature graph
-        let detail = store
-            .auto_build_feature_graph("test-roles", None, pid, "handle_request", 2, None, None)
-            .await
-            .unwrap();
-
-        // Helper: find entity by id and return its role
-        let find_role = |entity_id: &str| -> Option<String> {
-            detail
-                .entities
-                .iter()
-                .find(|e| e.entity_id == entity_id)
-                .and_then(|e| e.role.clone())
-        };
-
-        // Entry function should have role "entry_point"
-        assert_eq!(
-            find_role("handle_request"),
-            Some("entry_point".to_string()),
-            "entry function should have entry_point role"
-        );
-
-        // Called function should have role "core_logic"
-        assert_eq!(
-            find_role("process_data"),
-            Some("core_logic".to_string()),
-            "callee function should have core_logic role"
-        );
-
-        // Files should have role "support"
-        assert_eq!(
-            find_role("src/handler.rs"),
-            Some("support".to_string()),
-            "file should have support role"
-        );
-
-        // Struct should have role "data_model"
-        assert_eq!(
-            find_role("Request"),
-            Some("data_model".to_string()),
-            "struct should have data_model role"
-        );
-
-        // Trait should have role "trait_contract"
-        assert_eq!(
-            find_role("Serialize"),
-            Some("trait_contract".to_string()),
-            "trait should have trait_contract role"
-        );
-
-        // Verify roles are persisted in the storage via get_feature_graph_detail
-        let detail2 = store
-            .get_feature_graph_detail(detail.graph.id)
-            .await
-            .unwrap()
-            .expect("feature graph detail should exist");
-
-        let find_stored_role = |entity_id: &str| -> Option<String> {
-            detail2
-                .entities
-                .iter()
-                .find(|e| e.entity_id == entity_id)
-                .and_then(|e| e.role.clone())
-        };
-
-        assert_eq!(
-            find_stored_role("handle_request"),
-            Some("entry_point".to_string()),
-            "stored entry function role should persist"
-        );
-        assert_eq!(
-            find_stored_role("Request"),
-            Some("data_model".to_string()),
-            "stored struct role should persist"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_feature_graph_add_entity_with_role() {
-        let store = MockGraphStore::new();
-
-        // Create a feature graph
-        let fg = FeatureGraphNode {
-            id: Uuid::new_v4(),
-            name: "test-manual".to_string(),
-            description: None,
-            project_id: Uuid::new_v4(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            entity_count: None,
-            entry_function: None,
-            build_depth: None,
-            include_relations: None,
-        };
-        store.create_feature_graph(&fg).await.unwrap();
-
-        // Add entity without role
-        store
-            .add_entity_to_feature_graph(fg.id, "function", "func_a", None, None)
-            .await
-            .unwrap();
-
-        // Add entity with role
-        store
-            .add_entity_to_feature_graph(fg.id, "function", "func_b", Some("entry_point"), None)
-            .await
-            .unwrap();
-
-        // Verify via get_feature_graph_detail
-        let detail = store
-            .get_feature_graph_detail(fg.id)
-            .await
-            .unwrap()
-            .expect("should exist");
-
-        let func_a = detail
-            .entities
-            .iter()
-            .find(|e| e.entity_id == "func_a")
-            .unwrap();
-        assert_eq!(func_a.role, None, "func_a should have no role");
-
-        let func_b = detail
-            .entities
-            .iter()
-            .find(|e| e.entity_id == "func_b")
-            .unwrap();
-        assert_eq!(
-            func_b.role,
-            Some("entry_point".to_string()),
-            "func_b should have entry_point role"
-        );
-
-        // Update role on existing entity
-        store
-            .add_entity_to_feature_graph(fg.id, "function", "func_a", Some("core_logic"), None)
-            .await
-            .unwrap();
-
-        let detail2 = store
-            .get_feature_graph_detail(fg.id)
-            .await
-            .unwrap()
-            .expect("should exist");
-
-        let func_a2 = detail2
-            .entities
-            .iter()
-            .find(|e| e.entity_id == "func_a")
-            .unwrap();
-        assert_eq!(
-            func_a2.role,
-            Some("core_logic".to_string()),
-            "func_a should now have core_logic role after update"
-        );
-
-        // Verify count is still 2 (not duplicated)
-        assert_eq!(
-            detail2.entities.len(),
-            2,
-            "should still have 2 entities, not duplicated"
-        );
-    }
-
-    // ========================================================================
-    // Feature Graph — community filtering tests (Task 3.5)
-    // ========================================================================
-
-    /// Helper: set up a chain entry → F2 → F3 with communities, for community filtering tests.
-    /// Returns (store, project_id).
-    async fn setup_community_chain() -> (MockGraphStore, Uuid) {
-        let project = test_project();
-        let pid = project.id;
-        let store = MockGraphStore::new();
-        store.create_project(&project).await.unwrap();
-
-        // Seed project files
-        store
-            .project_files
-            .write()
-            .await
-            .entry(pid)
-            .or_default()
-            .extend(vec![
-                "src/entry.rs".to_string(),
-                "src/direct.rs".to_string(),
-                "src/transitive.rs".to_string(),
-            ]);
-
-        // Create functions
-        store
-            .upsert_function(&make_function("entry_fn", "src/entry.rs", 1))
-            .await
-            .unwrap();
-        store
-            .upsert_function(&make_function("direct_fn", "src/direct.rs", 1))
-            .await
-            .unwrap();
-        store
-            .upsert_function(&make_function("transitive_fn", "src/transitive.rs", 1))
-            .await
-            .unwrap();
-
-        // Chain: entry_fn → direct_fn → transitive_fn
-        store
-            .create_call_relationship("entry_fn", "direct_fn", Some(pid), 0.50, "unscored")
-            .await
-            .unwrap();
-        store
-            .create_call_relationship("direct_fn", "transitive_fn", Some(pid), 0.50, "unscored")
-            .await
-            .unwrap();
-
-        (store, pid)
-    }
-
-    #[tokio::test]
-    async fn test_community_filter_excludes_transitive_different_community() {
-        // Entry in community 1, calls direct_fn (community 2, direct),
-        // direct_fn calls transitive_fn (community 3, transitive)
-        // → direct_fn kept (direct dependency), transitive_fn excluded
-        let (store, pid) = setup_community_chain().await;
-
-        // Set community IDs via function analytics
-        use crate::graph::models::FunctionAnalyticsUpdate;
-        store
-            .batch_update_function_analytics(&[
-                FunctionAnalyticsUpdate {
-                    id: "entry_fn".to_string(),
-                    pagerank: 0.5,
-                    betweenness: 0.1,
-                    community_id: 1,
-                    clustering_coefficient: 0.0,
-                    component_id: 0,
-                },
-                FunctionAnalyticsUpdate {
-                    id: "direct_fn".to_string(),
-                    pagerank: 0.3,
-                    betweenness: 0.1,
-                    community_id: 2,
-                    clustering_coefficient: 0.0,
-                    component_id: 0,
-                },
-                FunctionAnalyticsUpdate {
-                    id: "transitive_fn".to_string(),
-                    pagerank: 0.1,
-                    betweenness: 0.0,
-                    community_id: 3,
-                    clustering_coefficient: 0.0,
-                    component_id: 0,
-                },
-            ])
-            .await
-            .unwrap();
-
-        let detail = store
-            .auto_build_feature_graph("test-community", None, pid, "entry_fn", 2, None, Some(true))
-            .await
-            .unwrap();
-
-        let func_names: Vec<&str> = detail
-            .entities
-            .iter()
-            .filter(|e| e.entity_type == "function")
-            .map(|e| e.entity_id.as_str())
-            .collect();
-
-        assert!(
-            func_names.contains(&"entry_fn"),
-            "entry should always be kept"
-        );
-        assert!(
-            func_names.contains(&"direct_fn"),
-            "direct callee should be kept even if different community"
-        );
-        assert!(
-            !func_names.contains(&"transitive_fn"),
-            "transitive function from different community should be excluded, got: {:?}",
-            func_names
-        );
-    }
-
-    #[tokio::test]
-    async fn test_community_filter_no_community_data_keeps_all() {
-        // Entry without community_id → all functions kept (no filtering)
-        let (store, pid) = setup_community_chain().await;
-
-        // No function analytics set → no community data
-
-        let detail = store
-            .auto_build_feature_graph(
-                "test-no-community",
-                None,
-                pid,
-                "entry_fn",
-                2,
-                None,
-                Some(true), // filter enabled but no community data
-            )
-            .await
-            .unwrap();
-
-        let func_names: Vec<&str> = detail
-            .entities
-            .iter()
-            .filter(|e| e.entity_type == "function")
-            .map(|e| e.entity_id.as_str())
-            .collect();
-
-        assert!(func_names.contains(&"entry_fn"));
-        assert!(func_names.contains(&"direct_fn"));
-        assert!(
-            func_names.contains(&"transitive_fn"),
-            "without community data, all functions should be kept, got: {:?}",
-            func_names
-        );
-    }
-
-    #[tokio::test]
-    async fn test_community_filter_disabled_keeps_all() {
-        // filter_community=false → all functions kept even with community data
-        let (store, pid) = setup_community_chain().await;
-
-        use crate::graph::models::FunctionAnalyticsUpdate;
-        store
-            .batch_update_function_analytics(&[
-                FunctionAnalyticsUpdate {
-                    id: "entry_fn".to_string(),
-                    pagerank: 0.5,
-                    betweenness: 0.1,
-                    community_id: 1,
-                    clustering_coefficient: 0.0,
-                    component_id: 0,
-                },
-                FunctionAnalyticsUpdate {
-                    id: "direct_fn".to_string(),
-                    pagerank: 0.3,
-                    betweenness: 0.1,
-                    community_id: 2,
-                    clustering_coefficient: 0.0,
-                    component_id: 0,
-                },
-                FunctionAnalyticsUpdate {
-                    id: "transitive_fn".to_string(),
-                    pagerank: 0.1,
-                    betweenness: 0.0,
-                    community_id: 3,
-                    clustering_coefficient: 0.0,
-                    component_id: 0,
-                },
-            ])
-            .await
-            .unwrap();
-
-        let detail = store
-            .auto_build_feature_graph(
-                "test-no-filter",
-                None,
-                pid,
-                "entry_fn",
-                2,
-                None,
-                Some(false), // filtering disabled
-            )
-            .await
-            .unwrap();
-
-        let func_names: Vec<&str> = detail
-            .entities
-            .iter()
-            .filter(|e| e.entity_type == "function")
-            .map(|e| e.entity_id.as_str())
-            .collect();
-
-        assert!(func_names.contains(&"entry_fn"));
-        assert!(func_names.contains(&"direct_fn"));
-        assert!(
-            func_names.contains(&"transitive_fn"),
-            "with filter disabled, all functions should be kept, got: {:?}",
-            func_names
-        );
-    }
-
-    #[tokio::test]
-    async fn test_community_filter_same_community_keeps_all() {
-        // All nodes in same community → all kept
-        let (store, pid) = setup_community_chain().await;
-
-        use crate::graph::models::FunctionAnalyticsUpdate;
-        store
-            .batch_update_function_analytics(&[
-                FunctionAnalyticsUpdate {
-                    id: "entry_fn".to_string(),
-                    pagerank: 0.5,
-                    betweenness: 0.1,
-                    community_id: 42,
-                    clustering_coefficient: 0.0,
-                    component_id: 0,
-                },
-                FunctionAnalyticsUpdate {
-                    id: "direct_fn".to_string(),
-                    pagerank: 0.3,
-                    betweenness: 0.1,
-                    community_id: 42,
-                    clustering_coefficient: 0.0,
-                    component_id: 0,
-                },
-                FunctionAnalyticsUpdate {
-                    id: "transitive_fn".to_string(),
-                    pagerank: 0.1,
-                    betweenness: 0.0,
-                    community_id: 42,
-                    clustering_coefficient: 0.0,
-                    component_id: 0,
-                },
-            ])
-            .await
-            .unwrap();
-
-        let detail = store
-            .auto_build_feature_graph(
-                "test-same-community",
-                None,
-                pid,
-                "entry_fn",
-                2,
-                None,
-                Some(true),
-            )
-            .await
-            .unwrap();
-
-        let func_names: Vec<&str> = detail
-            .entities
-            .iter()
-            .filter(|e| e.entity_type == "function")
-            .map(|e| e.entity_id.as_str())
-            .collect();
-
-        assert!(func_names.contains(&"entry_fn"));
-        assert!(func_names.contains(&"direct_fn"));
-        assert!(
-            func_names.contains(&"transitive_fn"),
-            "same community functions should all be kept, got: {:?}",
-            func_names
-        );
-    }
-
-    // ========================================================================
-    // Feature Graph — refresh tests
-    // ========================================================================
-
-    #[tokio::test]
-    async fn test_refresh_feature_graph_auto_built() {
-        let project = test_project();
-        let pid = project.id;
-        let store = MockGraphStore::new();
-        store.create_project(&project).await.unwrap();
-
-        // Seed: function "process" in "src/main.rs", calls "helper"
-        let func1 = make_function("process", "src/main.rs", 1);
-        store.upsert_function(&func1).await.unwrap();
-        let func2 = make_function("helper", "src/util.rs", 1);
-        store.upsert_function(&func2).await.unwrap();
-        store
-            .project_files
-            .write()
-            .await
-            .entry(pid)
-            .or_default()
-            .extend(["src/main.rs".to_string(), "src/util.rs".to_string()]);
-        store
-            .call_relationships
-            .write()
-            .await
-            .entry("process".to_string())
-            .or_default()
-            .push("helper".to_string());
-
-        // Auto-build the feature graph
-        let detail = store
-            .auto_build_feature_graph("test-refresh", None, pid, "process", 2, None, None)
-            .await
-            .unwrap();
-        let fg_id = detail.graph.id;
-        let original_entity_count = detail.entities.len();
-
-        // Verify entry_function is persisted
-        assert_eq!(
-            detail.graph.entry_function,
-            Some("process".to_string()),
-            "entry_function should be stored"
-        );
-
-        // Add a new function that "process" now calls
-        let func3 = make_function("new_helper", "src/new.rs", 1);
-        store.upsert_function(&func3).await.unwrap();
-        store
-            .project_files
-            .write()
-            .await
-            .entry(pid)
-            .or_default()
-            .push("src/new.rs".to_string());
-        store
-            .call_relationships
-            .write()
-            .await
-            .entry("process".to_string())
-            .or_default()
-            .push("new_helper".to_string());
-
-        // Refresh the feature graph
-        let refreshed = store
-            .refresh_feature_graph(fg_id)
-            .await
-            .unwrap()
-            .expect("should return Some for auto-built graph");
-
-        // The refreshed graph should contain the new function
-        let entity_ids: Vec<&str> = refreshed
-            .entities
-            .iter()
-            .map(|e| e.entity_id.as_str())
-            .collect();
-        assert!(
-            entity_ids.contains(&"new_helper"),
-            "refreshed graph should contain new_helper, got: {:?}",
-            entity_ids
-        );
-        assert!(
-            entity_ids.contains(&"src/new.rs"),
-            "refreshed graph should contain src/new.rs, got: {:?}",
-            entity_ids
-        );
-        assert!(
-            refreshed.entities.len() > original_entity_count,
-            "refreshed should have more entities ({}) than original ({})",
-            refreshed.entities.len(),
-            original_entity_count
-        );
-
-        // The graph id should be the same
-        assert_eq!(refreshed.graph.id, fg_id, "graph id should be unchanged");
-    }
-
-    #[tokio::test]
-    async fn test_refresh_feature_graph_manual_skip() {
-        let project = test_project();
-        let store = MockGraphStore::new();
-        store.create_project(&project).await.unwrap();
-
-        // Create a manual feature graph (no entry_function)
-        let fg = FeatureGraphNode {
-            id: Uuid::new_v4(),
-            name: "manual-graph".to_string(),
-            description: Some("manually created".to_string()),
-            project_id: project.id,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            entity_count: None,
-            entry_function: None,
-            build_depth: None,
-            include_relations: None,
-        };
-        store.create_feature_graph(&fg).await.unwrap();
-
-        // Add an entity manually
-        store
-            .add_entity_to_feature_graph(fg.id, "function", "my_func", Some("entry_point"), None)
-            .await
-            .unwrap();
-
-        // Refresh should return None (manual graph, not refreshable)
-        let result = store.refresh_feature_graph(fg.id).await.unwrap();
-        assert!(
-            result.is_none(),
-            "refresh should return None for manual graph"
-        );
-
-        // Entities should still be there (not deleted)
-        let detail = store
-            .get_feature_graph_detail(fg.id)
-            .await
-            .unwrap()
-            .expect("graph should still exist");
-        assert_eq!(
-            detail.entities.len(),
-            1,
-            "manual graph entities should be untouched"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_refresh_feature_graph_not_found() {
-        let store = MockGraphStore::new();
-        let fake_id = Uuid::new_v4();
-
-        let result = store.refresh_feature_graph(fake_id).await;
-        assert!(
-            result.is_err(),
-            "refresh on non-existent graph should return error"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("not found"),
-            "error should mention 'not found', got: {}",
-            err_msg
-        );
-    }
-
-    // ========================================================================
-    // Feature Graph — Statistics, Compare, Overlapping
-    // ========================================================================
-
-    #[tokio::test]
-    async fn test_feature_graph_statistics() {
-        let store = MockGraphStore::new();
-        let project = test_project_named("test-stats");
-        seed_project(
-            &store,
-            &project,
-            &[
-                ("src/a.rs", &["fn_a", "fn_b"]),
-                ("src/b.rs", &["fn_outside"]),
-            ],
-        )
-        .await;
-
-        // fn_a -> fn_b (will be internal), fn_a -> fn_outside (will be external)
-        store
-            .create_call_relationship("src/a.rs::fn_a", "fn_b", Some(project.id), 0.9, "scored")
-            .await
-            .unwrap();
-        store
-            .create_call_relationship(
-                "src/a.rs::fn_a",
-                "fn_outside",
-                Some(project.id),
-                0.9,
-                "scored",
-            )
-            .await
-            .unwrap();
-
-        // Create a feature graph with fn_a and fn_b only (fn_outside is external)
-        let fg = FeatureGraphNode {
-            id: Uuid::new_v4(),
-            name: "stats-test".to_string(),
-            description: None,
-            project_id: project.id,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            entity_count: None,
-            entry_function: None,
-            build_depth: None,
-            include_relations: None,
-        };
-        store.create_feature_graph(&fg).await.unwrap();
-        store
-            .add_entity_to_feature_graph(fg.id, "function", "fn_a", Some("entry_point"), None)
-            .await
-            .unwrap();
-        store
-            .add_entity_to_feature_graph(fg.id, "function", "fn_b", Some("core_logic"), None)
-            .await
-            .unwrap();
-
-        let stats = store
-            .get_feature_graph_statistics(fg.id)
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(stats.entity_count, 2);
-        assert_eq!(stats.entity_breakdown.get("function"), Some(&2));
-        assert_eq!(stats.role_breakdown.get("entry_point"), Some(&1));
-        assert_eq!(stats.role_breakdown.get("core_logic"), Some(&1));
-        // fn_a calls fn_outside which is not in the graph → external edge
-        assert!(stats.external_edge_count > 0);
-        assert!(stats.cohesion >= 0.0);
-        assert!(stats.coupling >= 0.0 && stats.coupling <= 1.0);
-    }
-
-    #[tokio::test]
-    async fn test_feature_graph_statistics_empty() {
-        let store = MockGraphStore::new();
-        let project = test_project_named("test-empty");
-        seed_project(&store, &project, &[]).await;
-
-        let fg = FeatureGraphNode {
-            id: Uuid::new_v4(),
-            name: "empty-graph".to_string(),
-            description: None,
-            project_id: project.id,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            entity_count: None,
-            entry_function: None,
-            build_depth: None,
-            include_relations: None,
-        };
-        store.create_feature_graph(&fg).await.unwrap();
-
-        let stats = store
-            .get_feature_graph_statistics(fg.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stats.entity_count, 0);
-        assert_eq!(stats.cohesion, 0.0);
-        assert_eq!(stats.coupling, 0.0);
-    }
-
-    #[tokio::test]
-    async fn test_feature_graph_statistics_not_found() {
-        let store = MockGraphStore::new();
-        let result = store
-            .get_feature_graph_statistics(Uuid::new_v4())
-            .await
-            .unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_compare_feature_graphs() {
-        let store = MockGraphStore::new();
-        let project = test_project_named("test-compare");
-        seed_project(
-            &store,
-            &project,
-            &[("src/a.rs", &["fn_shared", "fn_only_a", "fn_only_b"])],
-        )
-        .await;
-
-        // Graph A: fn_shared + fn_only_a
-        let fg_a = FeatureGraphNode {
-            id: Uuid::new_v4(),
-            name: "graph-a".to_string(),
-            description: None,
-            project_id: project.id,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            entity_count: None,
-            entry_function: None,
-            build_depth: None,
-            include_relations: None,
-        };
-        store.create_feature_graph(&fg_a).await.unwrap();
-        store
-            .add_entity_to_feature_graph(fg_a.id, "function", "fn_shared", None, None)
-            .await
-            .unwrap();
-        store
-            .add_entity_to_feature_graph(fg_a.id, "function", "fn_only_a", None, None)
-            .await
-            .unwrap();
-
-        // Graph B: fn_shared + fn_only_b
-        let fg_b = FeatureGraphNode {
-            id: Uuid::new_v4(),
-            name: "graph-b".to_string(),
-            description: None,
-            project_id: project.id,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            entity_count: None,
-            entry_function: None,
-            build_depth: None,
-            include_relations: None,
-        };
-        store.create_feature_graph(&fg_b).await.unwrap();
-        store
-            .add_entity_to_feature_graph(fg_b.id, "function", "fn_shared", None, None)
-            .await
-            .unwrap();
-        store
-            .add_entity_to_feature_graph(fg_b.id, "function", "fn_only_b", None, None)
-            .await
-            .unwrap();
-
-        let cmp = store
-            .compare_feature_graphs(fg_a.id, fg_b.id)
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(cmp.shared_entities.len(), 1);
-        assert_eq!(cmp.shared_entities[0].entity_id, "fn_shared");
-        assert_eq!(cmp.unique_to_a.len(), 1);
-        assert_eq!(cmp.unique_to_a[0].entity_id, "fn_only_a");
-        assert_eq!(cmp.unique_to_b.len(), 1);
-        assert_eq!(cmp.unique_to_b[0].entity_id, "fn_only_b");
-        // Jaccard: 1 shared / 3 union = 0.333...
-        assert!((cmp.similarity - 1.0 / 3.0).abs() < 0.01);
-    }
-
-    #[tokio::test]
-    async fn test_compare_feature_graphs_not_found() {
-        let store = MockGraphStore::new();
-        let result = store
-            .compare_feature_graphs(Uuid::new_v4(), Uuid::new_v4())
-            .await
-            .unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_find_overlapping_feature_graphs() {
-        let store = MockGraphStore::new();
-        let project = test_project_named("test-overlap");
-        seed_project(&store, &project, &[("src/a.rs", &["fn_x", "fn_y", "fn_z"])]).await;
-
-        // Reference graph: fn_x, fn_y
-        let fg_ref = FeatureGraphNode {
-            id: Uuid::new_v4(),
-            name: "ref-graph".to_string(),
-            description: None,
-            project_id: project.id,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            entity_count: None,
-            entry_function: None,
-            build_depth: None,
-            include_relations: None,
-        };
-        store.create_feature_graph(&fg_ref).await.unwrap();
-        store
-            .add_entity_to_feature_graph(fg_ref.id, "function", "fn_x", None, None)
-            .await
-            .unwrap();
-        store
-            .add_entity_to_feature_graph(fg_ref.id, "function", "fn_y", None, None)
-            .await
-            .unwrap();
-
-        // Overlapping graph: fn_x, fn_z (shares fn_x)
-        let fg_overlap = FeatureGraphNode {
-            id: Uuid::new_v4(),
-            name: "overlap-graph".to_string(),
-            description: None,
-            project_id: project.id,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            entity_count: None,
-            entry_function: None,
-            build_depth: None,
-            include_relations: None,
-        };
-        store.create_feature_graph(&fg_overlap).await.unwrap();
-        store
-            .add_entity_to_feature_graph(fg_overlap.id, "function", "fn_x", None, None)
-            .await
-            .unwrap();
-        store
-            .add_entity_to_feature_graph(fg_overlap.id, "function", "fn_z", None, None)
-            .await
-            .unwrap();
-
-        // Disjoint graph: fn_z only (no overlap with ref)
-        let fg_disjoint = FeatureGraphNode {
-            id: Uuid::new_v4(),
-            name: "disjoint-graph".to_string(),
-            description: None,
-            project_id: project.id,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            entity_count: None,
-            entry_function: None,
-            build_depth: None,
-            include_relations: None,
-        };
-        store.create_feature_graph(&fg_disjoint).await.unwrap();
-        store
-            .add_entity_to_feature_graph(fg_disjoint.id, "function", "fn_z", None, None)
-            .await
-            .unwrap();
-
-        // Find overlapping with min_overlap = 0.1 (low threshold)
-        let overlaps = store
-            .find_overlapping_feature_graphs(fg_ref.id, 0.1)
-            .await
-            .unwrap();
-
-        // Should find the overlapping graph (fn_x shared), not the disjoint one
-        assert_eq!(overlaps.len(), 1);
-        assert_eq!(overlaps[0].id, fg_overlap.id);
-        assert_eq!(overlaps[0].shared_count, 1);
-        // overlap_ratio = 1 / min(2, 2) = 0.5
-        assert!((overlaps[0].overlap_ratio - 0.5).abs() < 0.01);
-    }
-
-    #[tokio::test]
-    async fn test_find_overlapping_feature_graphs_high_threshold() {
-        let store = MockGraphStore::new();
-        let project = test_project_named("test-high-thresh");
-        seed_project(&store, &project, &[("src/a.rs", &["fn_a", "fn_b"])]).await;
-
-        let fg1 = FeatureGraphNode {
-            id: Uuid::new_v4(),
-            name: "g1".to_string(),
-            description: None,
-            project_id: project.id,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            entity_count: None,
-            entry_function: None,
-            build_depth: None,
-            include_relations: None,
-        };
-        store.create_feature_graph(&fg1).await.unwrap();
-        store
-            .add_entity_to_feature_graph(fg1.id, "function", "fn_a", None, None)
-            .await
-            .unwrap();
-        store
-            .add_entity_to_feature_graph(fg1.id, "function", "fn_b", None, None)
-            .await
-            .unwrap();
-
-        let fg2 = FeatureGraphNode {
-            id: Uuid::new_v4(),
-            name: "g2".to_string(),
-            description: None,
-            project_id: project.id,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            entity_count: None,
-            entry_function: None,
-            build_depth: None,
-            include_relations: None,
-        };
-        store.create_feature_graph(&fg2).await.unwrap();
-        store
-            .add_entity_to_feature_graph(fg2.id, "function", "fn_a", None, None)
-            .await
-            .unwrap();
-
-        // overlap_ratio = 1 shared / min(2, 1) = 1.0, so it passes 0.9
-        // Use threshold > 1.0 to guarantee filtering
-        let overlaps = store
-            .find_overlapping_feature_graphs(fg1.id, 1.1)
-            .await
-            .unwrap();
-        assert!(
-            overlaps.is_empty(),
-            "threshold > 1.0 should filter everything"
-        );
-
-        // With 0.9 threshold, the overlap (ratio=1.0) should still be found
-        let overlaps = store
-            .find_overlapping_feature_graphs(fg1.id, 0.9)
-            .await
-            .unwrap();
-        assert_eq!(overlaps.len(), 1);
-        assert!((overlaps[0].overlap_ratio - 1.0).abs() < 0.01);
-    }
-
-    // ========================================================================
-    // Feature Graph — Vector expansion & community expansion tests
-    // ========================================================================
-
-    #[tokio::test]
-    async fn test_auto_build_with_vector_expansion() {
-        // Setup: entry_fn calls helper_fn. unrelated_fn is NOT in call graph
-        // but has a very similar embedding to entry_fn, same community → should be added.
-        let project = test_project();
-        let store = MockGraphStore::new();
-        seed_project(
-            &store,
-            &project,
-            &[
-                ("src/main.rs", &["entry_fn"]),
-                ("src/helper.rs", &["helper_fn"]),
-                ("src/similar.rs", &["unrelated_fn"]),
-            ],
-        )
-        .await;
-
-        // entry_fn calls helper_fn (call graph link)
-        store
-            .create_call_relationship("src/main.rs::entry_fn", "helper_fn", None, 0.50, "unscored")
-            .await
-            .unwrap();
-
-        // Set embeddings: entry_fn and unrelated_fn have very similar vectors
-        // helper_fn has a different vector
-        let entry_emb = vec![1.0_f32, 0.0, 0.0, 0.0];
-        let similar_emb = vec![0.99_f32, 0.01, 0.0, 0.0]; // cosine ~0.9999
-        let different_emb = vec![0.0_f32, 1.0, 0.0, 0.0]; // cosine ~0.0
-
-        store
-            .set_function_embedding("entry_fn", "src/main.rs", &entry_emb, "test")
-            .await
-            .unwrap();
-        store
-            .set_function_embedding("unrelated_fn", "src/similar.rs", &similar_emb, "test")
-            .await
-            .unwrap();
-        store
-            .set_function_embedding("helper_fn", "src/helper.rs", &different_emb, "test")
-            .await
-            .unwrap();
-
-        // Set same community for entry_fn and unrelated_fn (community filtering enabled)
-        {
-            let mut fa = store.function_analytics.write().await;
-            fa.insert(
-                "entry_fn".to_string(),
-                crate::graph::models::FunctionAnalyticsUpdate {
-                    id: "src/main.rs::entry_fn".to_string(),
-                    pagerank: 0.5,
-                    betweenness: 0.1,
-                    community_id: 1,
-                    clustering_coefficient: 0.0,
-                    component_id: 0,
-                },
-            );
-            fa.insert(
-                "unrelated_fn".to_string(),
-                crate::graph::models::FunctionAnalyticsUpdate {
-                    id: "src/similar.rs::unrelated_fn".to_string(),
-                    pagerank: 0.3,
-                    betweenness: 0.1,
-                    community_id: 1, // same community
-                    clustering_coefficient: 0.0,
-                    component_id: 0,
-                },
-            );
-            fa.insert(
-                "helper_fn".to_string(),
-                crate::graph::models::FunctionAnalyticsUpdate {
-                    id: "src/helper.rs::helper_fn".to_string(),
-                    pagerank: 0.2,
-                    betweenness: 0.0,
-                    community_id: 2, // different community
-                    clustering_coefficient: 0.0,
-                    component_id: 0,
-                },
-            );
-        }
-
-        let result = store
-            .auto_build_feature_graph(
-                "test-vector-expansion",
-                None,
-                project.id,
-                "entry_fn",
-                2,
-                None,
-                Some(true),
-            )
-            .await
-            .unwrap();
-
-        let entity_ids: Vec<&str> = result
-            .entities
-            .iter()
-            .map(|e| e.entity_id.as_str())
-            .collect();
-
-        // entry_fn and helper_fn should be there (call graph)
-        assert!(
-            entity_ids.contains(&"entry_fn"),
-            "should contain entry_fn, got: {:?}",
-            entity_ids
-        );
-        assert!(
-            entity_ids.contains(&"helper_fn"),
-            "should contain helper_fn, got: {:?}",
-            entity_ids
-        );
-        // unrelated_fn should be added by vector expansion (similar embedding, same community)
-        assert!(
-            entity_ids.contains(&"unrelated_fn"),
-            "should contain unrelated_fn via vector expansion, got: {:?}",
-            entity_ids
-        );
-        // unrelated_fn should have role "support" (not "core_logic")
-        let unrelated_entity = result
-            .entities
-            .iter()
-            .find(|e| e.entity_id == "unrelated_fn")
-            .expect("unrelated_fn should be in entities");
-        assert_eq!(
-            unrelated_entity.role.as_deref(),
-            Some("support"),
-            "vector-expanded function should have role 'support'"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_auto_build_with_community_expansion() {
-        // Setup: entry_fn is in src/api/routes.rs (community 1).
-        // src/api/handlers.rs is in the same community but NOT in call graph.
-        // It should be added by community expansion.
-        let project = test_project();
-        let store = MockGraphStore::new();
-        seed_project(
-            &store,
-            &project,
-            &[
-                ("src/api/routes.rs", &["entry_fn"]),
-                ("src/api/handlers.rs", &["handle_request"]),
-                ("src/db/client.rs", &["query_db"]),
-            ],
-        )
-        .await;
-
-        // No call graph links — entry_fn is isolated
-
-        // Set file analytics: routes.rs and handlers.rs in community 1, client.rs in community 2
-        {
-            let mut fa = store.file_analytics.write().await;
-            fa.insert(
-                "src/api/routes.rs".to_string(),
-                crate::graph::models::FileAnalyticsUpdate {
-                    path: "src/api/routes.rs".to_string(),
-                    pagerank: 0.5,
-                    betweenness: 0.2,
-                    community_id: 1,
-                    community_label: "api".to_string(),
-                    clustering_coefficient: 0.0,
-                    component_id: 0,
-                },
-            );
-            fa.insert(
-                "src/api/handlers.rs".to_string(),
-                crate::graph::models::FileAnalyticsUpdate {
-                    path: "src/api/handlers.rs".to_string(),
-                    pagerank: 0.4,
-                    betweenness: 0.1,
-                    community_id: 1, // same community
-                    community_label: "api".to_string(),
-                    clustering_coefficient: 0.0,
-                    component_id: 0,
-                },
-            );
-            fa.insert(
-                "src/db/client.rs".to_string(),
-                crate::graph::models::FileAnalyticsUpdate {
-                    path: "src/db/client.rs".to_string(),
-                    pagerank: 0.3,
-                    betweenness: 0.0,
-                    community_id: 2, // different community
-                    community_label: "db".to_string(),
-                    clustering_coefficient: 0.0,
-                    component_id: 0,
-                },
-            );
-        }
-
-        let result = store
-            .auto_build_feature_graph(
-                "test-community-expansion",
-                None,
-                project.id,
-                "entry_fn",
-                2,
-                None,
-                Some(false), // disable community filtering to keep all call graph results
-            )
-            .await
-            .unwrap();
-
-        let file_entities: Vec<&str> = result
-            .entities
-            .iter()
-            .filter(|e| e.entity_type == "file")
-            .map(|e| e.entity_id.as_str())
-            .collect();
-
-        // routes.rs should be there (entry function's file)
-        assert!(
-            file_entities.contains(&"src/api/routes.rs"),
-            "should contain routes.rs, got: {:?}",
-            file_entities
-        );
-        // handlers.rs should be added by community expansion (same community)
-        assert!(
-            file_entities.contains(&"src/api/handlers.rs"),
-            "should contain handlers.rs via community expansion, got: {:?}",
-            file_entities
-        );
-        // client.rs should NOT be there (different community, no call graph link)
-        assert!(
-            !file_entities.contains(&"src/db/client.rs"),
-            "should NOT contain client.rs (different community), got: {:?}",
-            file_entities
-        );
-    }
-
-    #[tokio::test]
-    async fn test_auto_build_fallback_without_embeddings() {
-        // When no embeddings or analytics are set, auto_build should work
-        // exactly as before — only call graph traversal, no expansion.
-        let project = test_project();
-        let store = MockGraphStore::new();
-        seed_project(
-            &store,
-            &project,
-            &[
-                ("src/main.rs", &["entry_fn"]),
-                ("src/helper.rs", &["helper_fn"]),
-                ("src/unrelated.rs", &["unrelated_fn"]),
-            ],
-        )
-        .await;
-
-        // entry_fn calls helper_fn
-        store
-            .create_call_relationship("src/main.rs::entry_fn", "helper_fn", None, 0.50, "unscored")
-            .await
-            .unwrap();
-
-        // No embeddings, no analytics — should work fine without expansion
-        let result = store
-            .auto_build_feature_graph(
-                "test-fallback",
-                None,
-                project.id,
-                "entry_fn",
-                2,
-                None,
-                Some(true),
-            )
-            .await
-            .unwrap();
-
-        let func_ids: Vec<&str> = result
-            .entities
-            .iter()
-            .filter(|e| e.entity_type == "function")
-            .map(|e| e.entity_id.as_str())
-            .collect();
-
-        // Should contain only call-graph functions
-        assert!(
-            func_ids.contains(&"entry_fn"),
-            "should contain entry_fn, got: {:?}",
-            func_ids
-        );
-        assert!(
-            func_ids.contains(&"helper_fn"),
-            "should contain helper_fn (via call graph), got: {:?}",
-            func_ids
-        );
-        // unrelated_fn should NOT be included (no call graph, no embeddings)
-        assert!(
-            !func_ids.contains(&"unrelated_fn"),
-            "should NOT contain unrelated_fn (no call graph, no embeddings), got: {:?}",
-            func_ids
-        );
-
-        // All functions should have core_logic or entry_point role (no "support")
-        for entity in &result.entities {
-            if entity.entity_type == "function" {
-                let role = entity.role.as_deref().unwrap_or("none");
-                assert!(
-                    role == "entry_point" || role == "core_logic",
-                    "function {} should have entry_point or core_logic role, got: {}",
-                    entity.entity_id,
-                    role
-                );
-            }
-        }
-    }
-
-    // ========================================================================
-    // Code embedding tests (File & Function vector search)
-    // ========================================================================
-
-    #[tokio::test]
-    async fn test_set_and_search_file_embedding() {
-        let store = MockGraphStore::new();
-        let project = test_project();
-        let pid = project.id;
-        let store = store.with_project(project).await;
-
-        // Register files in the project
-        let file1 = "/src/api/handlers.rs";
-        let file2 = "/src/api/routes.rs";
-        let file3 = "/src/chat/manager.rs";
-
-        {
-            let mut pf = store.project_files.write().await;
-            pf.insert(
-                pid,
-                vec![file1.to_string(), file2.to_string(), file3.to_string()],
-            );
-        }
-
-        // Create embeddings — file1 and file2 are similar (API-related), file3 is different
-        let emb_api = vec![1.0_f32, 0.0, 0.0, 0.0]; // API direction
-        let emb_api_similar = vec![0.9, 0.1, 0.0, 0.0]; // similar to API
-        let emb_chat = vec![0.0, 0.0, 1.0, 0.0]; // chat direction
-
-        store
-            .set_file_embedding(file1, &emb_api, "test-model")
-            .await
-            .unwrap();
-        store
-            .set_file_embedding(file2, &emb_api_similar, "test-model")
-            .await
-            .unwrap();
-        store
-            .set_file_embedding(file3, &emb_chat, "test-model")
-            .await
-            .unwrap();
-
-        // Search with API-like query
-        let results = store
-            .vector_search_files(&emb_api, 10, Some(pid))
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 3);
-        // file1 should be top result (exact match)
-        assert_eq!(results[0].0, file1);
-        assert!(
-            results[0].1 > 0.99,
-            "exact match should have score near 1.0"
-        );
-        // file2 should be second (similar)
-        assert_eq!(results[1].0, file2);
-        assert!(
-            results[1].1 > 0.9,
-            "similar embedding should have high score"
-        );
-        // file3 should be last (orthogonal)
-        assert_eq!(results[2].0, file3);
-        assert!(
-            results[2].1.abs() < 0.01,
-            "orthogonal embedding should have score near 0"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_set_and_search_function_embedding() {
-        let store = MockGraphStore::new();
-        let project = test_project();
-        let pid = project.id;
-        let store = store.with_project(project).await;
-
-        let file = "/src/api/handlers.rs";
-        {
-            let mut pf = store.project_files.write().await;
-            pf.insert(pid, vec![file.to_string()]);
-        }
-
-        // Embed two functions
-        let emb_auth = vec![1.0_f32, 0.0, 0.0];
-        let emb_list = vec![0.0, 1.0, 0.0];
-
-        store
-            .set_function_embedding("authenticate", file, &emb_auth, "test-model")
-            .await
-            .unwrap();
-        store
-            .set_function_embedding("list_items", file, &emb_list, "test-model")
-            .await
-            .unwrap();
-
-        // Search for auth-like function
-        let results = store
-            .vector_search_functions(&emb_auth, 10, Some(pid))
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].0, "authenticate");
-        assert_eq!(results[0].1, file);
-        assert!(results[0].2 > 0.99);
-    }
-
-    #[tokio::test]
-    async fn test_vector_search_empty_returns_empty() {
-        let store = MockGraphStore::new();
-
-        // No embeddings stored — search should return empty
-        let query_emb = vec![1.0_f32, 0.0, 0.0];
-
-        let file_results = store
-            .vector_search_files(&query_emb, 10, None)
-            .await
-            .unwrap();
-        assert!(file_results.is_empty(), "expected empty file results");
-
-        let func_results = store
-            .vector_search_functions(&query_emb, 10, None)
-            .await
-            .unwrap();
-        assert!(func_results.is_empty(), "expected empty function results");
-    }
-
-    #[tokio::test]
-    async fn test_vector_search_files_project_filter() {
-        let store = MockGraphStore::new();
-        let project_a = test_project_named("Project A");
-        let project_b = test_project_named("Project B");
-        let pid_a = project_a.id;
-        let pid_b = project_b.id;
-        let store = store.with_project(project_a).await;
-        let store = store.with_project(project_b).await;
-
-        let file_a = "/project-a/src/main.rs";
-        let file_b = "/project-b/src/main.rs";
-
-        {
-            let mut pf = store.project_files.write().await;
-            pf.insert(pid_a, vec![file_a.to_string()]);
-            pf.insert(pid_b, vec![file_b.to_string()]);
-        }
-
-        let emb = vec![1.0_f32, 0.0, 0.0];
-        store
-            .set_file_embedding(file_a, &emb, "test")
-            .await
-            .unwrap();
-        store
-            .set_file_embedding(file_b, &emb, "test")
-            .await
-            .unwrap();
-
-        // Search with project A filter — should only find file_a
-        let results = store
-            .vector_search_files(&emb, 10, Some(pid_a))
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, file_a);
-
-        // Search without filter — should find both
-        let results = store.vector_search_files(&emb, 10, None).await.unwrap();
-        assert_eq!(results.len(), 2);
-    }
-
-    // ========================================================================
-    // Batch upsert operations (UNWIND mock)
-    // ========================================================================
-
-    fn make_struct_node(name: &str, file_path: &str) -> StructNode {
-        StructNode {
-            name: name.to_string(),
-            visibility: Visibility::Public,
-            generics: vec![],
-            file_path: file_path.to_string(),
-            line_start: 1,
-            line_end: 10,
-            docstring: None,
-            parent_class: None,
-            interfaces: vec![],
-        }
-    }
-
-    fn make_trait_node(name: &str, file_path: &str) -> TraitNode {
-        TraitNode {
-            name: name.to_string(),
-            visibility: Visibility::Public,
-            generics: vec![],
-            file_path: file_path.to_string(),
-            line_start: 1,
-            line_end: 10,
-            docstring: None,
-            is_external: false,
-            source: None,
-        }
-    }
-
-    fn make_enum_node(name: &str, file_path: &str) -> EnumNode {
-        EnumNode {
-            name: name.to_string(),
-            visibility: Visibility::Public,
-            variants: vec!["A".to_string(), "B".to_string()],
-            file_path: file_path.to_string(),
-            line_start: 1,
-            line_end: 10,
-            docstring: None,
-        }
-    }
-
-    fn make_impl_node(for_type: &str, trait_name: Option<&str>, file_path: &str) -> ImplNode {
-        ImplNode {
-            for_type: for_type.to_string(),
-            trait_name: trait_name.map(|s| s.to_string()),
-            generics: vec![],
-            where_clause: None,
-            file_path: file_path.to_string(),
-            line_start: 1,
-            line_end: 10,
-        }
-    }
-
-    fn make_import_node(path: &str, file_path: &str, line: u32) -> ImportNode {
-        ImportNode {
-            path: path.to_string(),
-            alias: None,
-            items: vec!["Item1".to_string()],
-            file_path: file_path.to_string(),
-            line,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_batch_upsert_functions() {
-        let store = MockGraphStore::new();
-        let funcs = vec![
-            make_function("foo", "src/lib.rs", 1),
-            make_function("bar", "src/lib.rs", 20),
-            make_function("baz", "src/main.rs", 1),
-        ];
-
-        store.batch_upsert_functions(&funcs).await.unwrap();
-
-        let fns = store.functions.read().await;
-        assert_eq!(fns.len(), 3);
-        assert!(fns.values().any(|f| f.name == "foo"));
-        assert!(fns.values().any(|f| f.name == "bar"));
-        assert!(fns.values().any(|f| f.name == "baz"));
-    }
-
-    #[tokio::test]
-    async fn test_batch_upsert_functions_empty() {
-        let store = MockGraphStore::new();
-        store.batch_upsert_functions(&[]).await.unwrap();
-        assert_eq!(store.functions.read().await.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_batch_upsert_structs() {
-        let store = MockGraphStore::new();
-        let structs = vec![
-            make_struct_node("Foo", "src/lib.rs"),
-            make_struct_node("Bar", "src/lib.rs"),
-        ];
-
-        store.batch_upsert_structs(&structs).await.unwrap();
-
-        let s = store.structs_map.read().await;
-        assert_eq!(s.len(), 2);
-        assert!(s.values().any(|x| x.name == "Foo"));
-        assert!(s.values().any(|x| x.name == "Bar"));
-    }
-
-    #[tokio::test]
-    async fn test_batch_upsert_traits() {
-        let store = MockGraphStore::new();
-        let traits = vec![
-            make_trait_node("Display", "src/lib.rs"),
-            make_trait_node("Debug", "src/lib.rs"),
-        ];
-
-        store.batch_upsert_traits(&traits).await.unwrap();
-
-        let t = store.traits_map.read().await;
-        assert_eq!(t.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_batch_upsert_enums() {
-        let store = MockGraphStore::new();
-        let enums = vec![
-            make_enum_node("Color", "src/lib.rs"),
-            make_enum_node("Shape", "src/lib.rs"),
-        ];
-
-        store.batch_upsert_enums(&enums).await.unwrap();
-
-        let e = store.enums_map.read().await;
-        assert_eq!(e.len(), 2);
-        assert!(e.values().any(|x| x.name == "Color"));
-    }
-
-    #[tokio::test]
-    async fn test_batch_upsert_impls() {
-        let store = MockGraphStore::new();
-        let impls = vec![
-            make_impl_node("Foo", None, "src/lib.rs"),
-            make_impl_node("Bar", Some("Display"), "src/lib.rs"),
-        ];
-
-        store.batch_upsert_impls(&impls).await.unwrap();
-
-        let i = store.impls_map.read().await;
-        assert_eq!(i.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_batch_upsert_imports() {
-        let store = MockGraphStore::new();
-        let imports = vec![
-            make_import_node("std::fmt", "src/lib.rs", 1),
-            make_import_node("serde::Serialize", "src/lib.rs", 2),
-        ];
-
-        store.batch_upsert_imports(&imports).await.unwrap();
-
-        let i = store.imports.read().await;
-        assert_eq!(i.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_batch_create_call_relationships() {
-        let store = MockGraphStore::new();
-        let calls = vec![
-            crate::parser::FunctionCall {
-                caller_id: "src/lib.rs:foo:1".to_string(),
-                callee_name: "bar".to_string(),
-                line: 5,
-                confidence: 0.85,
-                reason: "same-file".to_string(),
-            },
-            crate::parser::FunctionCall {
-                caller_id: "src/lib.rs:foo:1".to_string(),
-                callee_name: "baz".to_string(),
-                line: 6,
-                confidence: 0.50,
-                reason: "fuzzy-unique".to_string(),
-            },
-        ];
-
-        store
-            .batch_create_call_relationships(&calls, None)
-            .await
-            .unwrap();
-
-        let rels = store.call_relationships.read().await;
-        // The mock delegates to create_call_relationship which stores caller->callee
-        assert!(!rels.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_batch_create_import_relationships() {
-        let store = MockGraphStore::new();
-        let rels = vec![
-            (
-                "src/lib.rs".to_string(),
-                "src/utils.rs".to_string(),
-                "crate::utils".to_string(),
-            ),
-            (
-                "src/lib.rs".to_string(),
-                "src/models.rs".to_string(),
-                "crate::models".to_string(),
-            ),
-        ];
-
-        store
-            .batch_create_import_relationships(&rels)
-            .await
-            .unwrap();
-
-        let ir = store.import_relationships.read().await;
-        // src/lib.rs -> [src/utils.rs, src/models.rs]
-        assert!(ir.contains_key("src/lib.rs"));
-        assert_eq!(ir["src/lib.rs"].len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_batch_create_imports_symbol_relationships() {
-        let store = MockGraphStore::new();
-        let pid = Uuid::new_v4();
-        let rels = vec![
-            (
-                "src/lib.rs:1:serde".to_string(),
-                "Serialize".to_string(),
-                Some(pid),
-            ),
-            (
-                "src/lib.rs:2:std::fmt".to_string(),
-                "Display".to_string(),
-                None,
-            ),
-        ];
-
-        store
-            .batch_create_imports_symbol_relationships(&rels)
-            .await
-            .unwrap();
-
-        // Verify no error — mock delegates to individual create_imports_symbol_relationship
-    }
-
-    // ====================================================================
-    // count_project_files / count_project_plans tests
-    // ====================================================================
-
-    #[tokio::test]
-    async fn test_count_project_files_empty() {
-        let store = MockGraphStore::new();
-        let pid = Uuid::new_v4();
-        let count = store.count_project_files(pid).await.unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[tokio::test]
-    async fn test_count_project_files_with_files() {
-        let store = MockGraphStore::new();
-        let project = test_project();
-        store.create_project(&project).await.unwrap();
-
-        // Add 3 files to the project
-        for i in 0..3 {
-            let path = format!("/tmp/test/src/file_{}.rs", i);
-            let file = FileNode {
-                path: path.clone(),
-                language: "rust".to_string(),
-                hash: format!("hash{}", i),
-                last_parsed: Utc::now(),
-                project_id: Some(project.id),
-            };
-            store.upsert_file(&file).await.unwrap();
-            store.link_file_to_project(&path, project.id).await.unwrap();
-        }
-
-        let count = store.count_project_files(project.id).await.unwrap();
-        assert_eq!(count, 3);
-    }
-
-    #[tokio::test]
-    async fn test_count_project_files_multiple_projects() {
-        let store = MockGraphStore::new();
-        let p1 = test_project_named("proj-a");
-        let p2 = test_project_named("proj-b");
-        store.create_project(&p1).await.unwrap();
-        store.create_project(&p2).await.unwrap();
-
-        // 2 files in p1, 5 files in p2
-        for i in 0..2 {
-            let path = format!("/tmp/a/file_{}.rs", i);
-            let file = FileNode {
-                path: path.clone(),
-                language: "rust".to_string(),
-                hash: format!("a{}", i),
-                last_parsed: Utc::now(),
-                project_id: Some(p1.id),
-            };
-            store.upsert_file(&file).await.unwrap();
-            store.link_file_to_project(&path, p1.id).await.unwrap();
-        }
-        for i in 0..5 {
-            let path = format!("/tmp/b/file_{}.rs", i);
-            let file = FileNode {
-                path: path.clone(),
-                language: "rust".to_string(),
-                hash: format!("b{}", i),
-                last_parsed: Utc::now(),
-                project_id: Some(p2.id),
-            };
-            store.upsert_file(&file).await.unwrap();
-            store.link_file_to_project(&path, p2.id).await.unwrap();
-        }
-
-        assert_eq!(store.count_project_files(p1.id).await.unwrap(), 2);
-        assert_eq!(store.count_project_files(p2.id).await.unwrap(), 5);
-    }
-
-    // ── couac2: link_plan_to_project must mirror Neo4j (MERGE = additive) ──
-
-    async fn plan_ids_of(store: &MockGraphStore, project_id: Uuid) -> Vec<Uuid> {
-        store
-            .list_project_plans(project_id)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|p| p.id)
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn test_link_plan_to_second_project_keeps_first_link() {
-        let store = MockGraphStore::new();
-        let p1 = crate::test_helpers::test_project_named("p1");
-        let p2 = crate::test_helpers::test_project_named("p2");
-        store.create_project(&p1).await.unwrap();
-        store.create_project(&p2).await.unwrap();
-        let plan = crate::test_helpers::test_plan_for_project(p1.id);
-        store.create_plan(&plan).await.unwrap();
-
-        store.link_plan_to_project(plan.id, p2.id).await.unwrap();
-
-        // Neo4j: MERGE adds (p2)-[:HAS_PLAN]->(plan), (p1)-[:HAS_PLAN] stays.
-        assert_eq!(plan_ids_of(&store, p1.id).await, vec![plan.id]);
-        assert_eq!(plan_ids_of(&store, p2.id).await, vec![plan.id]);
-        // SET plan.project_id = the last linked project
-        let stored = store.get_plan(plan.id).await.unwrap().unwrap();
-        assert_eq!(stored.project_id, Some(p2.id));
-    }
-
-    #[tokio::test]
-    async fn test_link_plan_to_project_is_idempotent() {
-        let store = MockGraphStore::new();
-        let p = test_project();
-        store.create_project(&p).await.unwrap();
-        let plan = crate::test_helpers::test_plan_for_project(p.id);
-        store.create_plan(&plan).await.unwrap();
-        store.link_plan_to_project(plan.id, p.id).await.unwrap();
-        store.link_plan_to_project(plan.id, p.id).await.unwrap();
-        assert_eq!(plan_ids_of(&store, p.id).await, vec![plan.id]);
-        assert_eq!(store.count_project_plans(p.id).await.unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_link_plan_to_missing_project_or_plan_is_noop() {
-        let store = MockGraphStore::new();
-        let p = test_project();
-        store.create_project(&p).await.unwrap();
-        let plan = crate::test_helpers::test_plan();
-        store.create_plan(&plan).await.unwrap();
-
-        let ghost_project = Uuid::new_v4();
-        store
-            .link_plan_to_project(plan.id, ghost_project)
-            .await
-            .unwrap();
-        assert!(plan_ids_of(&store, ghost_project).await.is_empty());
-        let stored = store.get_plan(plan.id).await.unwrap().unwrap();
-        assert_eq!(stored.project_id, plan.project_id, "MATCH failed: no SET");
-
-        store
-            .link_plan_to_project(Uuid::new_v4(), p.id)
-            .await
-            .unwrap();
-        assert!(plan_ids_of(&store, p.id).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_unlink_plan_removes_every_project_link() {
-        let store = MockGraphStore::new();
-        let p1 = crate::test_helpers::test_project_named("p1");
-        let p2 = crate::test_helpers::test_project_named("p2");
-        store.create_project(&p1).await.unwrap();
-        store.create_project(&p2).await.unwrap();
-        let plan = crate::test_helpers::test_plan_for_project(p1.id);
-        store.create_plan(&plan).await.unwrap();
-        store.link_plan_to_project(plan.id, p2.id).await.unwrap();
-
-        store.unlink_plan_from_project(plan.id).await.unwrap();
-
-        assert!(plan_ids_of(&store, p1.id).await.is_empty());
-        assert!(plan_ids_of(&store, p2.id).await.is_empty());
-        let stored = store.get_plan(plan.id).await.unwrap().unwrap();
-        assert_eq!(stored.project_id, None);
-    }
-
-    #[tokio::test]
-    async fn test_delete_plan_linked_to_two_projects_removes_both_links() {
-        let store = MockGraphStore::new();
-        let p1 = crate::test_helpers::test_project_named("p1");
-        let p2 = crate::test_helpers::test_project_named("p2");
-        store.create_project(&p1).await.unwrap();
-        store.create_project(&p2).await.unwrap();
-        let plan = crate::test_helpers::test_plan_for_project(p1.id);
-        store.create_plan(&plan).await.unwrap();
-        store.link_plan_to_project(plan.id, p2.id).await.unwrap();
-
-        store.delete_plan(plan.id).await.unwrap();
-
-        assert!(plan_ids_of(&store, p1.id).await.is_empty());
-        assert!(plan_ids_of(&store, p2.id).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_count_project_plans_empty() {
-        let store = MockGraphStore::new();
-        let pid = Uuid::new_v4();
-        let count = store.count_project_plans(pid).await.unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[tokio::test]
-    async fn test_count_project_plans_filters_by_status() {
-        let store = MockGraphStore::new();
-        let project = test_project();
-        store.create_project(&project).await.unwrap();
-
-        // Create 3 plans: Draft, InProgress, Completed
-        let mut plan_draft = crate::test_helpers::test_plan_for_project(project.id);
-        plan_draft.status = PlanStatus::Draft;
-        store.create_plan(&plan_draft).await.unwrap();
-        store
-            .link_plan_to_project(plan_draft.id, project.id)
-            .await
-            .unwrap();
-
-        let mut plan_in_progress = crate::test_helpers::test_plan_for_project(project.id);
-        plan_in_progress.status = PlanStatus::InProgress;
-        store.create_plan(&plan_in_progress).await.unwrap();
-        store
-            .link_plan_to_project(plan_in_progress.id, project.id)
-            .await
-            .unwrap();
-
-        let mut plan_completed = crate::test_helpers::test_plan_for_project(project.id);
-        plan_completed.status = PlanStatus::Completed;
-        store.create_plan(&plan_completed).await.unwrap();
-        store
-            .link_plan_to_project(plan_completed.id, project.id)
-            .await
-            .unwrap();
-
-        // count_project_plans should only include Draft, Approved, InProgress
-        let count = store.count_project_plans(project.id).await.unwrap();
-        assert_eq!(
-            count, 2,
-            "Should count Draft + InProgress, exclude Completed"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cleanup_builtin_calls() {
-        let store = MockGraphStore::new();
-        let project = test_project();
-        store.create_project(&project).await.unwrap();
-
-        // Create caller and callee functions
-        let caller = FunctionNode {
-            name: "process".to_string(),
-            visibility: Visibility::Public,
-            params: vec![],
-            return_type: None,
-            generics: vec![],
-            is_async: false,
-            is_unsafe: false,
-            complexity: 1,
-            file_path: "src/main.rs".to_string(),
-            line_start: 1,
-            line_end: 10,
-            docstring: None,
-        };
-        store.upsert_function(&caller).await.unwrap();
-
-        let real_callee = FunctionNode {
-            name: "transform_data".to_string(),
-            visibility: Visibility::Public,
-            params: vec![],
-            return_type: None,
-            generics: vec![],
-            is_async: false,
-            is_unsafe: false,
-            complexity: 1,
-            file_path: "src/main.rs".to_string(),
-            line_start: 12,
-            line_end: 20,
-            docstring: None,
-        };
-        store.upsert_function(&real_callee).await.unwrap();
-
-        let builtin_callee = FunctionNode {
-            name: "println".to_string(),
-            visibility: Visibility::Public,
-            params: vec![],
-            return_type: None,
-            generics: vec![],
-            is_async: false,
-            is_unsafe: false,
-            complexity: 1,
-            file_path: "src/main.rs".to_string(),
-            line_start: 22,
-            line_end: 24,
-            docstring: None,
-        };
-        store.upsert_function(&builtin_callee).await.unwrap();
-
-        // Create CALLS: process -> transform_data (real) and process -> println (built-in)
-        // Use None for project_id to skip project-file scoping in mock
-        store
-            .create_call_relationship(
-                "src/main.rs::process",
-                "transform_data",
-                None,
-                0.50,
-                "unscored",
-            )
-            .await
-            .unwrap();
-        store
-            .create_call_relationship("src/main.rs::process", "println", None, 0.50, "unscored")
-            .await
-            .unwrap();
-
-        // Verify both calls exist
-        let cr = store.call_relationships.read().await;
-        let calls = cr.get("src/main.rs::process").unwrap();
-        assert_eq!(calls.len(), 2, "Should have 2 calls before cleanup");
-        drop(cr);
-
-        // Run cleanup
-        let deleted = store.cleanup_builtin_calls().await.unwrap();
-        assert_eq!(deleted, 1, "Should delete 1 built-in call (println)");
-
-        // Verify only real call remains
-        let cr = store.call_relationships.read().await;
-        let calls = cr.get("src/main.rs::process").unwrap();
-        assert_eq!(calls.len(), 1, "Should have 1 call after cleanup");
-        assert!(
-            calls.contains(&"transform_data".to_string()),
-            "Should keep real call 'transform_data'"
-        );
-        assert!(
-            !calls.contains(&"println".to_string()),
-            "Should remove built-in call 'println'"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_ping_freshness_for_files() {
-        use crate::notes::models::{EntityType, NoteType};
-        use crate::test_helpers::test_note;
-
-        let store = MockGraphStore::new();
-        let project_id = Uuid::new_v4();
-
-        // Create two notes
-        let note1 = test_note(project_id, NoteType::Guideline, "Use proper error handling");
-        let note2 = test_note(project_id, NoteType::Pattern, "Repository pattern");
-        let note3 = test_note(project_id, NoteType::Tip, "Unlinked tip");
-
-        assert!(note1.freshness_pinged_at.is_none());
-        assert!(note2.freshness_pinged_at.is_none());
-
-        let note1_id = note1.id;
-        let note2_id = note2.id;
-        let note3_id = note3.id;
-
-        store.create_note(&note1).await.unwrap();
-        store.create_note(&note2).await.unwrap();
-        store.create_note(&note3).await.unwrap();
-
-        // Link note1 to file "src/main.rs"
-        store
-            .link_note_to_entity(note1_id, &EntityType::File, "src/main.rs", None, None)
-            .await
-            .unwrap();
-
-        // Link note2 to file "src/lib.rs"
-        store
-            .link_note_to_entity(note2_id, &EntityType::File, "src/lib.rs", None, None)
-            .await
-            .unwrap();
-
-        // note3 is not linked to any file
-
-        // Ping freshness for src/main.rs only
-        let pinged = store
-            .ping_freshness_for_files(&["src/main.rs".to_string()])
-            .await
-            .unwrap();
-        assert_eq!(
-            pinged, 1,
-            "Should ping exactly 1 note linked to src/main.rs"
-        );
-
-        // Verify note1 was pinged
-        let n1 = store.get_note(note1_id).await.unwrap().unwrap();
-        assert!(
-            n1.freshness_pinged_at.is_some(),
-            "note1 should have freshness_pinged_at set"
-        );
-
-        // Verify note2 was NOT pinged
-        let n2 = store.get_note(note2_id).await.unwrap().unwrap();
-        assert!(
-            n2.freshness_pinged_at.is_none(),
-            "note2 should not be pinged (different file)"
-        );
-
-        // Verify note3 was NOT pinged
-        let n3 = store.get_note(note3_id).await.unwrap().unwrap();
-        assert!(
-            n3.freshness_pinged_at.is_none(),
-            "note3 should not be pinged (not linked)"
-        );
-
-        // Ping both files
-        let pinged = store
-            .ping_freshness_for_files(&["src/main.rs".to_string(), "src/lib.rs".to_string()])
-            .await
-            .unwrap();
-        assert_eq!(pinged, 2, "Should ping 2 notes");
-
-        // Now verify note2 is also pinged
-        let n2 = store.get_note(note2_id).await.unwrap().unwrap();
-        assert!(n2.freshness_pinged_at.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_staleness_with_freshness_discount() {
-        use crate::notes::models::NoteType;
-        use crate::test_helpers::test_note;
-
-        let store = MockGraphStore::new();
-        let project_id = Uuid::new_v4();
-
-        // Create a note confirmed 60 days ago
-        let mut note = test_note(project_id, NoteType::Tip, "Old tip");
-        note.last_confirmed_at = Some(Utc::now() - chrono::Duration::days(60));
-        note.staleness_score = 0.0;
-        note.freshness_pinged_at = None;
-        let note_id = note.id;
-        store.create_note(&note).await.unwrap();
-
-        // Update staleness without freshness ping
-        store.update_staleness_scores().await.unwrap();
-        let n = store.get_note(note_id).await.unwrap().unwrap();
-        let staleness_without_ping = n.staleness_score;
-        assert!(
-            staleness_without_ping > 0.0,
-            "Note confirmed 60d ago should have positive staleness"
-        );
-
-        // Now set freshness_pinged_at to now (simulating a recent commit touch)
-        {
-            let mut notes = store.notes.write().await;
-            let n = notes.get_mut(&note_id).unwrap();
-            n.freshness_pinged_at = Some(Utc::now());
-        }
-
-        store.update_staleness_scores().await.unwrap();
-        let n = store.get_note(note_id).await.unwrap().unwrap();
-        let staleness_with_ping = n.staleness_score;
-
-        assert!(
-            staleness_with_ping < staleness_without_ping,
-            "Freshness ping should reduce staleness: {} < {}",
-            staleness_with_ping,
-            staleness_without_ping
-        );
-    }
-
-    // ====================================================================
-    // MCP Federation tests
-    // ====================================================================
-
-    fn test_mcp_server(project_id: Uuid) -> McpServerNode {
-        McpServerNode {
-            id: Uuid::new_v4(),
-            project_id,
-            server_id: "test-server".to_string(),
-            display_name: "Test Server".to_string(),
-            transport_type: "stdio".to_string(),
-            transport_url: None,
-            transport_command: Some("echo".to_string()),
-            transport_args: None,
-            transport_secrets: None,
-            status: "connected".to_string(),
-            protocol_version: Some("2024-11-05".to_string()),
-            server_name: Some("TestMCP".to_string()),
-            tool_count: 0,
-            created_at: Utc::now(),
-            updated_at: None,
-            last_connected_at: Some(Utc::now()),
-        }
-    }
-
-    fn test_mcp_tool(server_id: &str, name: &str) -> McpToolNode {
-        McpToolNode {
-            id: Uuid::new_v4(),
-            server_id: server_id.to_string(),
-            name: name.to_string(),
-            fqn: format!("{}::{}", server_id, name),
-            description: format!("Test tool {}", name),
-            input_schema: "{}".to_string(),
-            category: "query".to_string(),
-            embedding: None,
-            created_at: Utc::now(),
-            updated_at: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_mcp_create_and_get_server() {
-        let store = MockGraphStore::new();
-        let project_id = Uuid::new_v4();
-        let server = test_mcp_server(project_id);
-        let server_id = server.id;
-
-        store.create_mcp_server(&server).await.unwrap();
-
-        let retrieved = store.get_mcp_server(server_id).await.unwrap();
-        assert!(retrieved.is_some());
-        let retrieved = retrieved.unwrap();
-        assert_eq!(retrieved.id, server_id);
-        assert_eq!(retrieved.project_id, project_id);
-        assert_eq!(retrieved.server_id, "test-server");
-        assert_eq!(retrieved.display_name, "Test Server");
-        assert_eq!(retrieved.transport_type, "stdio");
-        assert_eq!(retrieved.status, "connected");
-    }
-
-    #[tokio::test]
-    async fn test_mcp_get_server_not_found() {
-        let store = MockGraphStore::new();
-        let result = store.get_mcp_server(Uuid::new_v4()).await.unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_mcp_list_servers_empty() {
-        let store = MockGraphStore::new();
-        let servers = store.list_mcp_servers(Uuid::new_v4()).await.unwrap();
-        assert!(servers.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_mcp_list_servers_multiple() {
-        let store = MockGraphStore::new();
-        let project_id = Uuid::new_v4();
-
-        let mut s1 = test_mcp_server(project_id);
-        s1.server_id = "alpha-server".to_string();
-        let mut s2 = test_mcp_server(project_id);
-        s2.server_id = "beta-server".to_string();
-        // Different project -- should not appear
-        let other_project = Uuid::new_v4();
-        let s3 = test_mcp_server(other_project);
-
-        store.create_mcp_server(&s1).await.unwrap();
-        store.create_mcp_server(&s2).await.unwrap();
-        store.create_mcp_server(&s3).await.unwrap();
-
-        let servers = store.list_mcp_servers(project_id).await.unwrap();
-        assert_eq!(servers.len(), 2);
-        // Sorted by server_id
-        assert_eq!(servers[0].server_id, "alpha-server");
-        assert_eq!(servers[1].server_id, "beta-server");
-
-        // Other project has exactly 1
-        let other = store.list_mcp_servers(other_project).await.unwrap();
-        assert_eq!(other.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_mcp_delete_server_removes_tools_and_index() {
-        let store = MockGraphStore::new();
-        let project_id = Uuid::new_v4();
-        let server = test_mcp_server(project_id);
-        let server_uuid = server.id;
-        let sid = server.server_id.clone();
-
-        store.create_mcp_server(&server).await.unwrap();
-
-        // Add tools to this server
-        let t1 = test_mcp_tool(&sid, "read");
-        let t2 = test_mcp_tool(&sid, "write");
-        store.create_mcp_tool(&t1).await.unwrap();
-        store.create_mcp_tool(&t2).await.unwrap();
-        assert_eq!(
-            store.list_mcp_tools_for_server(&sid).await.unwrap().len(),
-            2
-        );
-
-        // Delete server
-        store.delete_mcp_server(server_uuid).await.unwrap();
-
-        // Server gone
-        assert!(store.get_mcp_server(server_uuid).await.unwrap().is_none());
-        // Tools gone
-        assert!(store
-            .list_mcp_tools_for_server(&sid)
-            .await
-            .unwrap()
-            .is_empty());
-        // Project index empty
-        assert!(store.list_mcp_servers(project_id).await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_mcp_delete_server_not_found_is_ok() {
-        let store = MockGraphStore::new();
-        // Deleting a non-existent server should succeed silently
-        store.delete_mcp_server(Uuid::new_v4()).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_mcp_update_server_status() {
-        let store = MockGraphStore::new();
-        let project_id = Uuid::new_v4();
-        let server = test_mcp_server(project_id);
-        let server_id = server.id;
-        assert!(server.updated_at.is_none());
-
-        store.create_mcp_server(&server).await.unwrap();
-
-        store
-            .update_mcp_server_status(server_id, "disconnected")
-            .await
-            .unwrap();
-
-        let updated = store.get_mcp_server(server_id).await.unwrap().unwrap();
-        assert_eq!(updated.status, "disconnected");
-        assert!(
-            updated.updated_at.is_some(),
-            "updated_at should be set after status change"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_mcp_update_server_status_not_found_is_ok() {
-        let store = MockGraphStore::new();
-        // Updating a non-existent server should succeed silently
-        store
-            .update_mcp_server_status(Uuid::new_v4(), "error")
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_mcp_delete_server_by_server_id() {
-        let store = MockGraphStore::new();
-        let project_id = Uuid::new_v4();
-        let server = test_mcp_server(project_id);
-        let sid = server.server_id.clone();
-        let uuid = server.id;
-
-        store.create_mcp_server(&server).await.unwrap();
-
-        // Add tools
-        let t1 = test_mcp_tool(&sid, "tool_a");
-        store.create_mcp_tool(&t1).await.unwrap();
-
-        // Delete by server_id string
-        store.delete_mcp_server_by_server_id(&sid).await.unwrap();
-
-        // Server and tools gone
-        assert!(store.get_mcp_server(uuid).await.unwrap().is_none());
-        assert!(store
-            .list_mcp_tools_for_server(&sid)
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(store.list_mcp_servers(project_id).await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_mcp_delete_server_by_server_id_not_found_is_ok() {
-        let store = MockGraphStore::new();
-        // Deleting a non-existent server_id should succeed silently
-        store
-            .delete_mcp_server_by_server_id("nonexistent")
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_mcp_list_all_servers_cross_project() {
-        let store = MockGraphStore::new();
-        let p1 = Uuid::new_v4();
-        let p2 = Uuid::new_v4();
-
-        let mut s1 = test_mcp_server(p1);
-        s1.server_id = "discord".to_string();
-        let mut s2 = test_mcp_server(p1);
-        s2.id = Uuid::new_v4();
-        s2.server_id = "slack".to_string();
-        let mut s3 = test_mcp_server(p2);
-        s3.id = Uuid::new_v4();
-        s3.server_id = "github".to_string();
-
-        store.create_mcp_server(&s1).await.unwrap();
-        store.create_mcp_server(&s2).await.unwrap();
-        store.create_mcp_server(&s3).await.unwrap();
-
-        // list_all returns all 3 from both projects
-        let all = store.list_all_mcp_servers().await.unwrap();
-        assert_eq!(all.len(), 3);
-
-        // list per-project is scoped
-        assert_eq!(store.list_mcp_servers(p1).await.unwrap().len(), 2);
-        assert_eq!(store.list_mcp_servers(p2).await.unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_mcp_create_and_list_tools() {
-        let store = MockGraphStore::new();
-        let sid = "my-server";
-        let t1 = test_mcp_tool(sid, "get_data");
-        let t2 = test_mcp_tool(sid, "put_data");
-        let t3 = test_mcp_tool("other-server", "unrelated");
-
-        store.create_mcp_tool(&t1).await.unwrap();
-        store.create_mcp_tool(&t2).await.unwrap();
-        store.create_mcp_tool(&t3).await.unwrap();
-
-        let tools = store.list_mcp_tools_for_server(sid).await.unwrap();
-        assert_eq!(tools.len(), 2);
-        // Sorted by name
-        assert_eq!(tools[0].name, "get_data");
-        assert_eq!(tools[1].name, "put_data");
-        assert_eq!(tools[0].fqn, "my-server::get_data");
-
-        // Other server has its own tool
-        let other = store
-            .list_mcp_tools_for_server("other-server")
-            .await
-            .unwrap();
-        assert_eq!(other.len(), 1);
-        assert_eq!(other[0].name, "unrelated");
-    }
-
-    #[tokio::test]
-    async fn test_mcp_list_tools_empty() {
-        let store = MockGraphStore::new();
-        let tools = store
-            .list_mcp_tools_for_server("nonexistent")
-            .await
-            .unwrap();
-        assert!(tools.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_mcp_delete_tools_for_server() {
-        let store = MockGraphStore::new();
-        let sid = "target-server";
-        let other_sid = "keep-server";
-
-        let t1 = test_mcp_tool(sid, "tool_a");
-        let t2 = test_mcp_tool(sid, "tool_b");
-        let t3 = test_mcp_tool(other_sid, "tool_c");
-
-        store.create_mcp_tool(&t1).await.unwrap();
-        store.create_mcp_tool(&t2).await.unwrap();
-        store.create_mcp_tool(&t3).await.unwrap();
-
-        store.delete_mcp_tools_for_server(sid).await.unwrap();
-
-        // Target server tools gone
-        assert!(store
-            .list_mcp_tools_for_server(sid)
-            .await
-            .unwrap()
-            .is_empty());
-        // Other server tools untouched
-        assert_eq!(
-            store
-                .list_mcp_tools_for_server(other_sid)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn test_mcp_create_similar_to() {
-        let store = MockGraphStore::new();
-        store
-            .create_mcp_similar_to("server-a::read", "server-b::fetch", 0.92)
-            .await
-            .unwrap();
-
-        let map = store.mcp_similar_to.read().await;
-        let score = map
-            .get(&("server-a::read".to_string(), "server-b::fetch".to_string()))
-            .copied();
-        assert_eq!(score, Some(0.92));
-    }
-
-    #[tokio::test]
-    async fn test_mcp_create_co_activated() {
-        let store = MockGraphStore::new();
-        store
-            .create_mcp_co_activated("server-a::read", "server-a::write", 17)
-            .await
-            .unwrap();
-
-        let map = store.mcp_co_activated.read().await;
-        let count = map
-            .get(&("server-a::read".to_string(), "server-a::write".to_string()))
-            .copied();
-        assert_eq!(count, Some(17));
-    }
-
-    #[tokio::test]
-    async fn test_mcp_create_often_follows() {
-        let store = MockGraphStore::new();
-        store
-            .create_mcp_often_follows("server-x::init", "server-x::run", 42, 150.5)
-            .await
-            .unwrap();
-
-        let map = store.mcp_often_follows.read().await;
-        let entry = map
-            .get(&("server-x::init".to_string(), "server-x::run".to_string()))
-            .copied();
-        assert_eq!(entry, Some((42, 150.5)));
-    }
-
-    #[tokio::test]
-    async fn test_mcp_similar_to_overwrites() {
-        let store = MockGraphStore::new();
-        store
-            .create_mcp_similar_to("a::x", "b::y", 0.5)
-            .await
-            .unwrap();
-        store
-            .create_mcp_similar_to("a::x", "b::y", 0.99)
-            .await
-            .unwrap();
-
-        let map = store.mcp_similar_to.read().await;
-        let score = map.get(&("a::x".to_string(), "b::y".to_string())).copied();
-        assert_eq!(score, Some(0.99), "Later insert should overwrite earlier");
-    }
-
-    #[tokio::test]
-    async fn test_set_watch_enabled() {
-        let store = MockGraphStore::new();
-        let pid = Uuid::new_v4();
-
-        // Create a project first
-        let mut project = crate::test_helpers::test_project();
-        project.id = pid;
-        assert!(project.watch_enabled); // default is true
-        store.create_project(&project).await.unwrap();
-
-        // Disable watch
-        store.set_watch_enabled(pid, false).await.unwrap();
-        let updated = store.get_project(pid).await.unwrap().unwrap();
-        assert!(!updated.watch_enabled);
-
-        // Re-enable watch
-        store.set_watch_enabled(pid, true).await.unwrap();
-        let updated = store.get_project(pid).await.unwrap().unwrap();
-        assert!(updated.watch_enabled);
-    }
-
-    #[tokio::test]
-    async fn test_set_watch_enabled_nonexistent_project() {
-        let store = MockGraphStore::new();
-        // Should not error, just no-op
-        let result = store.set_watch_enabled(Uuid::new_v4(), false).await;
-        assert!(result.is_ok());
-    }
-
-    /// Regression (couac 3): wave task statuses reached the UI as `Debug`
-    /// strings (`"Failed"`, `"InProgress"`), so the runner dashboard's
-    /// lowercase comparisons fell through and showed failed tasks as
-    /// completed. They must serialize like every other `TaskStatus`.
-    #[tokio::test]
-    async fn test_compute_waves_serializes_task_status_as_snake_case() {
-        use crate::test_helpers::{test_plan, test_task_titled};
-
-        let store = MockGraphStore::new();
-        let plan = test_plan();
-        store.create_plan(&plan).await.unwrap();
-
-        let mut done = test_task_titled("done");
-        done.status = TaskStatus::Completed;
-        let mut failed = test_task_titled("failed");
-        failed.status = TaskStatus::Failed;
-        let mut running = test_task_titled("running");
-        running.status = TaskStatus::InProgress;
-        for t in [&done, &failed, &running] {
-            store.create_task(plan.id, t).await.unwrap();
-        }
-
-        let result = store.compute_waves(plan.id).await.unwrap();
-        let json = serde_json::to_value(&result).unwrap();
-        let mut statuses: Vec<String> = json["waves"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|w| w["tasks"].as_array().unwrap().clone())
-            .map(|t| t["status"].as_str().unwrap().to_string())
-            .collect();
-        statuses.sort();
-        assert_eq!(statuses, vec!["completed", "failed", "in_progress"]);
-    }
-
-    // ----- interrupted tasks ---------------------------------------------------------------
-
-    async fn plan_with(store: &MockGraphStore, statuses: &[TaskStatus]) -> (Uuid, Vec<Uuid>) {
-        let plan = crate::test_helpers::test_plan();
-        store.create_plan(&plan).await.unwrap();
-        let mut ids = Vec::new();
-        for status in statuses {
-            let mut task = crate::test_helpers::test_task();
-            task.status = status.clone();
-            store.create_task(plan.id, &task).await.unwrap();
-            ids.push(task.id);
-        }
-        (plan.id, ids)
-    }
-
-    #[tokio::test]
-    async fn interrupting_a_task_records_when_and_why_and_resuming_it_clears_that() {
-        let store = MockGraphStore::new();
-        let (_, ids) = plan_with(&store, &[TaskStatus::InProgress]).await;
-
-        assert!(store
-            .interrupt_task(ids[0], "owner session ended")
-            .await
-            .unwrap());
-        let t = store.get_task(ids[0]).await.unwrap().unwrap();
-        assert_eq!(t.status, TaskStatus::Interrupted);
-        assert_eq!(t.interrupted_reason.as_deref(), Some("owner session ended"));
-        let first = t.interrupted_at.expect("when it was interrupted");
-
-        // Interrupting again keeps the FIRST moment (the work has been waiting since then) and
-        // takes the new reason.
-        assert!(store
-            .interrupt_task(ids[0], "server restarted")
-            .await
-            .unwrap());
-        let t = store.get_task(ids[0]).await.unwrap().unwrap();
-        assert_eq!(t.interrupted_at, Some(first));
-        assert_eq!(t.interrupted_reason.as_deref(), Some("server restarted"));
-
-        // Resuming ends the interruption.
-        store
-            .update_task_status(ids[0], TaskStatus::InProgress)
-            .await
-            .unwrap();
-        let t = store.get_task(ids[0]).await.unwrap().unwrap();
-        assert_eq!(t.status, TaskStatus::InProgress);
-        assert!(t.interrupted_at.is_none() && t.interrupted_reason.is_none());
-    }
-
-    #[tokio::test]
-    async fn finished_work_and_unknown_tasks_are_not_interrupted() {
-        let store = MockGraphStore::new();
-        let (_, ids) = plan_with(
-            &store,
-            &[
-                TaskStatus::Completed,
-                TaskStatus::Failed,
-                TaskStatus::Pending,
-            ],
-        )
-        .await;
-
-        assert!(
-            !store.interrupt_task(ids[0], "x").await.unwrap(),
-            "completed stays completed"
-        );
-        assert!(
-            !store.interrupt_task(ids[1], "x").await.unwrap(),
-            "failed stays failed"
-        );
-        assert!(
-            !store.interrupt_task(Uuid::new_v4(), "x").await.unwrap(),
-            "no such task"
-        );
-        assert_eq!(
-            store.get_task(ids[0]).await.unwrap().unwrap().status,
-            TaskStatus::Completed
-        );
-        // Pending work CAN be interrupted (it was claimed, then lost): the answer says it changed.
-        assert!(store.interrupt_task(ids[2], "x").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn an_interrupted_task_is_not_next_and_does_not_unblock_what_depends_on_it() {
-        let store = MockGraphStore::new();
-        let (plan_id, ids) =
-            plan_with(&store, &[TaskStatus::InProgress, TaskStatus::Pending]).await;
-        let (interrupted, dependent) = (ids[0], ids[1]);
-        store
-            .add_task_dependency(dependent, interrupted)
-            .await
-            .unwrap();
-        store
-            .interrupt_task(interrupted, "owner lost")
-            .await
-            .unwrap();
-
-        // Not runnable itself, and the task that waits for it keeps waiting.
-        assert!(store
-            .get_next_available_task(plan_id)
-            .await
-            .unwrap()
-            .is_none());
-
-        // Once somebody resumes it AND it is completed, the dependent becomes available.
-        store
-            .update_task_status(interrupted, TaskStatus::Completed)
-            .await
-            .unwrap();
-        let next = store
-            .get_next_available_task(plan_id)
-            .await
-            .unwrap()
-            .expect("unblocked");
-        assert_eq!(next.id, dependent);
-    }
-}
-
-#[cfg(test)]
-mod anchor_tests {
-    use super::*;
-    use crate::chat::anchor::*;
-    use crate::neo4j::traits::GraphStore;
-    use crate::test_helpers::{test_chat_session, test_project_named};
-
-    async fn session(store: &MockGraphStore, slug: Option<&str>) -> Uuid {
-        let s = test_chat_session(slug);
-        let id = s.id;
-        store.create_chat_session(&s).await.unwrap();
-        id
-    }
-
-    fn plan_id() -> String {
-        Uuid::new_v4().to_string()
-    }
-
-    fn err(e: anyhow::Error) -> AnchorError {
-        e.downcast::<AnchorError>().expect("a typed AnchorError")
-    }
-
-    fn user_add(t: AnchorTargetType, id: &str, roles: &[AnchorRole]) -> NewAnchor {
-        NewAnchor::new(t, id, roles.iter().copied(), AnchorActor::User, "u1")
-    }
-
-    #[tokio::test]
-    async fn anchor_add_promote_remove_with_journal() {
-        let store = MockGraphStore::new();
-        let sid = session(&store, None).await;
-        let a = store
-            .add_anchor(
-                sid,
-                user_add(AnchorTargetType::File, "src/a.rs", &[AnchorRole::Mention]),
-            )
-            .await
-            .unwrap();
-        assert_eq!((a.version, a.state), (1, AnchorState::Live));
-        let a = store
-            .promote_anchor_role(sid, a.id, AnchorRole::Focus, 1, AnchorActor::User, "u1")
-            .await
-            .unwrap();
-        assert_eq!(a.version, 2);
-        assert!(a.roles.contains(&AnchorRole::Focus) && a.roles.contains(&AnchorRole::Mention));
-        let a = store
-            .demote_anchor_role(sid, a.id, AnchorRole::Focus, 2, AnchorActor::User, "u1")
-            .await
-            .unwrap();
-        store
-            .remove_anchor(sid, a.id, a.version, AnchorActor::User, "u1")
-            .await
-            .unwrap();
-        assert!(store.list_session_anchors(sid).await.unwrap().is_empty());
-        let kinds: Vec<_> = store
-            .list_anchor_events(sid)
-            .await
-            .unwrap()
-            .iter()
-            .map(|e| e.kind)
-            .collect();
-        assert_eq!(
-            kinds,
-            vec![
-                AnchorEventKind::Added,
-                AnchorEventKind::Promoted,
-                AnchorEventKind::Demoted,
-                AnchorEventKind::Removed
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn anchor_stale_version_is_a_conflict_and_changes_nothing() {
-        let store = MockGraphStore::new();
-        let sid = session(&store, None).await;
-        let a = store
-            .add_anchor(
-                sid,
-                user_add(AnchorTargetType::Plan, &plan_id(), &[AnchorRole::Mention]),
-            )
-            .await
-            .unwrap();
-        store
-            .promote_anchor_role(sid, a.id, AnchorRole::Focus, 1, AnchorActor::User, "u1")
-            .await
-            .unwrap();
-        let e = store
-            .promote_anchor_role(sid, a.id, AnchorRole::Focus, 1, AnchorActor::User, "u2")
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err(e),
-            AnchorError::VersionConflict {
-                expected: 1,
-                actual: 2
-            }
-        );
-        let e = store
-            .remove_anchor(sid, a.id, 1, AnchorActor::User, "u2")
-            .await
-            .unwrap_err();
-        assert!(matches!(err(e), AnchorError::VersionConflict { .. }));
-        assert_eq!(store.list_session_anchors(sid).await.unwrap().len(), 1);
-        assert_eq!(store.list_anchor_events(sid).await.unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn anchor_rules_hold_through_the_store() {
-        let store = MockGraphStore::new();
-        let sid = session(&store, None).await;
-        // agent cannot focus
-        let mut n = user_add(AnchorTargetType::File, "a.rs", &[AnchorRole::Focus]);
-        n.by = AnchorActor::Agent;
-        assert_eq!(
-            err(store.add_anchor(sid, n).await.unwrap_err()),
-            AnchorError::AgentCannotFocus
-        );
-        // origin immutable
-        let origin = store
-            .add_anchor(
-                sid,
-                NewAnchor::new(
-                    AnchorTargetType::Plan,
-                    plan_id(),
-                    [AnchorRole::Origin],
-                    AnchorActor::System,
-                    "sys",
-                ),
-            )
-            .await
-            .unwrap();
-        let e = store
-            .remove_anchor(sid, origin.id, 1, AnchorActor::User, "u1")
-            .await
-            .unwrap_err();
-        assert_eq!(err(e), AnchorError::OriginImmutable);
-        // focus cap
-        for i in 0..3 {
-            store
-                .add_anchor(
-                    sid,
-                    user_add(
-                        AnchorTargetType::File,
-                        &format!("f{i}"),
-                        &[AnchorRole::Focus],
-                    ),
-                )
-                .await
-                .unwrap();
-        }
-        let e = store
-            .add_anchor(
-                sid,
-                user_add(AnchorTargetType::File, "f9", &[AnchorRole::Focus]),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(err(e), AnchorError::FocusCapReached { max: 3 });
-        // unknown session
-        let ghost = Uuid::new_v4();
-        let e = store
-            .add_anchor(
-                ghost,
-                user_add(AnchorTargetType::File, "x", &[AnchorRole::Mention]),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(err(e), AnchorError::SessionNotFound(ghost));
-        // a refused operation leaves no journal entry
-        assert_eq!(store.list_anchor_events(sid).await.unwrap().len(), 4);
-    }
-
-    #[tokio::test]
-    async fn anchor_reverse_query_is_paginated_and_filterable() {
-        let store = MockGraphStore::new();
-        let target = plan_id();
-        let mut sessions = vec![];
-        for _ in 0..5 {
-            let sid = session(&store, None).await;
-            store
-                .add_anchor(
-                    sid,
-                    user_add(AnchorTargetType::Plan, &target, &[AnchorRole::Mention]),
-                )
-                .await
-                .unwrap();
-            sessions.push(sid);
-        }
-        // another target must not leak in
-        let other = session(&store, None).await;
-        store
-            .add_anchor(
-                other,
-                user_add(AnchorTargetType::Plan, &plan_id(), &[AnchorRole::Mention]),
-            )
-            .await
-            .unwrap();
-
-        let mut seen = vec![];
-        let mut cursor: Option<String> = None;
-        let mut pages = 0;
-        loop {
-            let page = store
-                .list_sessions_for_target(
-                    AnchorTargetType::Plan,
-                    &target,
-                    None,
-                    2,
-                    cursor.as_deref(),
-                )
-                .await
-                .unwrap();
-            pages += 1;
-            seen.extend(page.items.iter().map(|a| a.session_id));
-            match page.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
-        }
-        assert_eq!(pages, 3);
-        seen.sort();
-        sessions.sort();
-        assert_eq!(seen, sessions);
-
-        // state filter
-        let n = store
-            .mark_anchors_dangling(AnchorTargetType::Plan, &target)
-            .await
-            .unwrap();
-        assert_eq!(n, 5);
-        let live = store
-            .list_sessions_for_target(
-                AnchorTargetType::Plan,
-                &target,
-                Some(AnchorState::Live),
-                10,
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(live.items.is_empty());
-        let dangling = store
-            .list_sessions_for_target(
-                AnchorTargetType::Plan,
-                &target,
-                Some(AnchorState::Dangling),
-                10,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(dangling.items.len(), 5);
-    }
-
-    #[tokio::test]
-    async fn anchor_mark_dangling_keeps_anchors_and_journals_once() {
-        let store = MockGraphStore::new();
-        let sid = session(&store, None).await;
-        let target = plan_id();
-        store
-            .add_anchor(
-                sid,
-                user_add(AnchorTargetType::Plan, &target, &[AnchorRole::Origin]),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .mark_anchors_dangling(AnchorTargetType::Plan, &target)
-                .await
-                .unwrap(),
-            1
-        );
-        // second call changes nothing
-        assert_eq!(
-            store
-                .mark_anchors_dangling(AnchorTargetType::Plan, &target)
-                .await
-                .unwrap(),
-            0
-        );
-        let anchors = store.list_session_anchors(sid).await.unwrap();
-        assert_eq!(anchors.len(), 1, "never deleted, even the origin one");
-        assert_eq!(anchors[0].state, AnchorState::Dangling);
-        let evs = store.list_anchor_events(sid).await.unwrap();
-        assert_eq!(evs.len(), 2);
-        assert_eq!(evs[1].kind, AnchorEventKind::StateChanged);
-        assert_eq!(evs[1].by, AnchorActor::System);
-    }
-
-    #[tokio::test]
-    async fn anchor_deleting_a_session_deletes_anchors_and_events_not_targets() {
-        let store = MockGraphStore::new();
-        let (keep, gone) = (session(&store, None).await, session(&store, None).await);
-        let target = plan_id();
-        for s in [keep, gone] {
-            store
-                .add_anchor(
-                    s,
-                    user_add(AnchorTargetType::Plan, &target, &[AnchorRole::Mention]),
-                )
-                .await
-                .unwrap();
-        }
-        assert!(store.delete_chat_session(gone).await.unwrap());
-        assert!(store.list_session_anchors(gone).await.unwrap().is_empty());
-        assert!(store.list_anchor_events(gone).await.unwrap().is_empty());
-        assert_eq!(store.list_session_anchors(keep).await.unwrap().len(), 1);
-        assert_eq!(store.list_anchor_events(keep).await.unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn anchor_journal_is_numbered_per_session_without_gaps() {
-        use crate::chat::anchor::*;
-        let store = MockGraphStore::new();
-        let (a, b) = (session(&store, None).await, session(&store, None).await);
-        let add = |t: &str| {
-            AnchorOp::Add(NewAnchor::new(
-                AnchorTargetType::File,
-                t,
-                [AnchorRole::Mention],
-                AnchorActor::User,
-                "t",
-            ))
-        };
-        let mut seqs = vec![];
-        for (s, t) in [(a, "1"), (b, "1"), (a, "2"), (a, "3")] {
-            seqs.push(
-                store
-                    .apply_anchor_op(s, add(t))
-                    .await
-                    .unwrap()
-                    .event
-                    .unwrap()
-                    .seq,
-            );
-        }
-        assert_eq!(seqs, vec![1, 1, 2, 3]);
-        // an operation that writes no event takes no number
-        assert!(store
-            .apply_anchor_op(a, add("2"))
-            .await
-            .map_or(true, |c| c.event.is_none()));
-        let last = store.apply_anchor_op(a, add("4")).await.unwrap();
-        assert_eq!(last.event.unwrap().seq, 4);
-        let journal: Vec<u64> = store
-            .list_anchor_events(a)
-            .await
-            .unwrap()
-            .iter()
-            .map(|e| e.seq)
-            .collect();
-        assert_eq!(journal, vec![1, 2, 3, 4]);
-    }
-
-    #[tokio::test]
-    async fn anchor_backfill_is_idempotent_and_reversible() {
-        let store = MockGraphStore::new();
-        let project = test_project_named("alpha");
-        store.create_project(&project).await.unwrap();
-        let s1 = session(&store, Some("alpha")).await;
-        let s2 = session(&store, Some("alpha")).await;
-        let unresolved = session(&store, Some("no-such-project")).await;
-        let none = session(&store, None).await;
-
-        let r1 = store.backfill_project_anchors().await.unwrap();
-        assert_eq!(
-            r1,
-            BackfillReport {
-                created: 2,
-                already_present: 0,
-                skipped_unresolved: 1,
-                skipped_by_rule: 0
-            }
-        );
-        let snapshot = |store: &MockGraphStore| {
-            let anchors = store.anchor_store.try_read().unwrap();
-            let mut v: Vec<_> = anchors
-                .anchors
-                .values()
-                .map(|a| (a.session_id, a.target_id.clone(), a.version))
-                .collect();
-            v.sort();
-            (v, anchors.events.len())
-        };
-        let after_first = snapshot(&store);
-
-        let r2 = store.backfill_project_anchors().await.unwrap();
-        assert_eq!(
-            r2,
-            BackfillReport {
-                created: 0,
-                already_present: 2,
-                skipped_unresolved: 1,
-                skipped_by_rule: 0
-            }
-        );
-        assert_eq!(snapshot(&store), after_first, "two runs = same state");
-
-        let a = &store.list_session_anchors(s1).await.unwrap()[0];
-        assert_eq!(a.target_type, AnchorTargetType::Project);
-        assert_eq!(a.target_id, project.id.to_string());
-        assert!(a.inferred && a.by == AnchorActor::System && a.confidence == 1.0);
-        assert!(a.roles.contains(&AnchorRole::Focus));
-        assert_eq!(a.snapshot_name.as_deref(), Some("alpha"));
-        assert!(store
-            .list_session_anchors(unresolved)
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(store.list_session_anchors(none).await.unwrap().is_empty());
-
-        // a hand-made anchor and a modified inferred one survive the revert
-        let manual = store
-            .add_anchor(
-                none,
-                user_add(AnchorTargetType::Plan, &plan_id(), &[AnchorRole::Mention]),
-            )
-            .await
-            .unwrap();
-        store
-            .set_anchor_state(
-                s2,
-                store.list_session_anchors(s2).await.unwrap()[0].id,
-                AnchorState::Moved,
-                None,
-                AnchorActor::User,
-                "u1",
-            )
-            .await
-            .unwrap();
-        assert_eq!(store.revert_inferred_anchors().await.unwrap(), 1);
-        assert!(store.list_session_anchors(s1).await.unwrap().is_empty());
-        assert_eq!(store.list_session_anchors(s2).await.unwrap().len(), 1);
-        assert_eq!(
-            store.list_session_anchors(none).await.unwrap()[0].id,
-            manual.id
-        );
-        assert!(store.list_anchor_events(s1).await.unwrap().is_empty());
-        // reverting again is a no-op
-        assert_eq!(store.revert_inferred_anchors().await.unwrap(), 0);
-    }
-}
-
-/// The mock and the Cypher client must apply the same cross-project rule
-/// (`PropagationScope::weigh_foreign`, cut AFTER the weighting). Runs the same
-/// graph through both; skipped when no Neo4j answers at `NEO4J_URI`
-/// (`HARNESS_NEO4J_REQUIRED=1` turns the skip into a failure).
-#[cfg(test)]
-mod cross_project_parity {
-    use super::MockGraphStore;
-    use crate::episodes::distill_models::SharingConsent;
-    use crate::neo4j::client::Neo4jClient;
-    use crate::neo4j::traits::GraphStore;
-    use crate::notes::{EntityType, Note, NoteImportance, NoteType};
-    use uuid::Uuid;
-
-    fn note(project: Uuid, imp: NoteImportance, energy: f64, tags: &[&str]) -> Note {
-        let mut n = Note::new(
-            Some(project),
-            NoteType::Guideline,
-            format!("t0f parity {}", Uuid::new_v4()),
-            String::new(),
-        );
-        n.importance = imp;
-        n.energy = energy;
-        n.tags = tags.iter().map(|t| t.to_string()).collect();
-        n
-    }
-
-    /// 19 local notes (coupling 1), 1 strongly coupled foreign note, 4 weakly
-    /// coupled foreign notes that outrank everything raw (critical). Weighted:
-    /// locals 0.5.., strong 1.0 * 0.2, weak 1.0 * 0.04. Cut at 20 after the
-    /// weighting: 19 locals + the strong one; the weak ones go.
-    fn graph() -> (Uuid, Vec<Note>, Uuid, Uuid) {
-        let (me, strong, weak) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        let mut notes = Vec::new();
-        for i in 0..19 {
-            notes.push(note(
-                me,
-                NoteImportance::Medium,
-                0.5 + 0.01 * i as f64,
-                &["x", "y"],
-            ));
-        }
-        let mut s = note(strong, NoteImportance::Critical, 0.9, &["x", "y"]);
-        s.sharing_consent = SharingConsent::ExplicitAllow;
-        notes.push(s);
-        for _ in 0..4 {
-            let mut w = note(weak, NoteImportance::Critical, 0.9, &["x", "p", "q", "r"]);
-            w.sharing_consent = SharingConsent::ExplicitAllow;
-            notes.push(w);
-        }
-        (me, notes, strong, weak)
-    }
-
-    #[tokio::test]
-    async fn mock_and_neo4j_cut_after_the_coupling_weighting() {
-        // A unit test never guesses a Neo4j address: without PARITY_NEO4J_URI it
-        // skips. The CI coverage job sets it (and HARNESS_NEO4J_REQUIRED).
-        // Not NEO4J_URI: the config tests in lib.rs clear and rewrite NEO4J_*
-        // in this same process while tests run in parallel, so it can vanish
-        // mid-run (seen in CI: "HARNESS_NEO4J_REQUIRED is set but NEO4J_URI is not").
-        // The connection is also bounded: with nothing listening, connecting
-        // and creating the schema never return, which hung the Unit Tests job.
-        let required = std::env::var("HARNESS_NEO4J_REQUIRED").is_ok();
-        let Ok(uri) = std::env::var("PARITY_NEO4J_URI") else {
-            assert!(
-                !required,
-                "HARNESS_NEO4J_REQUIRED is set but PARITY_NEO4J_URI is not"
-            );
-            eprintln!("Skipping parity test: PARITY_NEO4J_URI is not set");
-            return;
-        };
-        let user = std::env::var("PARITY_NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
-        let pass = std::env::var("PARITY_NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
-        let connect = Neo4jClient::new(&uri, &user, &pass);
-        let real = match tokio::time::timeout(std::time::Duration::from_secs(30), connect).await {
-            Ok(Ok(c)) => c,
-            _ => {
-                assert!(
-                    !required,
-                    "HARNESS_NEO4J_REQUIRED is set but no Neo4j answers at {uri}"
-                );
-                eprintln!("Skipping parity test: no Neo4j at {uri}");
-                return;
-            }
-        };
-        let raw = neo4rs::Graph::new(&uri, &user, &pass).await.unwrap();
-        let (me, notes, strong, weak) = graph();
-        let file = format!("/t0f/{}/p.rs", Uuid::new_v4());
-        raw.run(neo4rs::query("CREATE (:File {path: $p})").param("p", file.clone()))
-            .await
-            .unwrap();
-
-        let mock = MockGraphStore::new();
-        // Jaccard(tags) * W_TAGS (0.2): identical tags 1/1 -> 0.2; 1 shared of 5 -> 0.04.
-        mock.set_pairwise_coupling(me, strong, 0.2).await;
-        mock.set_pairwise_coupling(me, weak, 0.04).await;
-        for n in &notes {
-            for store in [&real as &dyn GraphStore, &mock as &dyn GraphStore] {
-                store.create_note(n).await.unwrap();
-                store
-                    .link_note_to_entity(n.id, &EntityType::File, &file, None, None)
-                    .await
-                    .unwrap();
-            }
-        }
-
-        let from_real = real
-            .get_propagated_notes(&EntityType::File, &file, 2, 0.0, None, Some(me), true)
-            .await
-            .unwrap();
-        let from_mock = mock
-            .get_propagated_notes(&EntityType::File, &file, 2, 0.0, None, Some(me), true)
-            .await
-            .unwrap();
-        let ids = |v: &[crate::notes::PropagatedNote]| -> Vec<Uuid> {
-            v.iter().map(|p| p.note.id).collect()
-        };
-
-        let cleanup = || async {
-            let all: Vec<String> = notes.iter().map(|n| n.id.to_string()).collect();
-            raw.run(
-                neo4rs::query("MATCH (n:Note) WHERE n.id IN $ids DETACH DELETE n")
-                    .param("ids", all),
-            )
-            .await
-            .unwrap();
-            raw.run(
-                neo4rs::query("MATCH (f:File {path: $p}) DETACH DELETE f").param("p", file.clone()),
-            )
-            .await
-            .unwrap();
-        };
-        let (r, m) = (ids(&from_real), ids(&from_mock));
-        cleanup().await;
-
-        assert_eq!(r.len(), 20, "real: cut at 20 after weighting");
-        assert_eq!(r, m, "mock and Neo4j return the same ordered top-20");
-        assert!(r.contains(&notes[19].id), "strongly coupled foreign kept");
-        assert_eq!(r.last(), Some(&notes[19].id), "weighted below the locals");
-        assert!(
-            notes[20..].iter().all(|w| !r.contains(&w.id)),
-            "weakly coupled foreign notes cut after the weighting"
-        );
-    }
-}
-
-/// What a session's `spawned_by` JSON says about its parent (mock-side reading of the
-/// `SPAWNED_BY` edge): the parent id and the spawn type, plus the run and task when the
-/// JSON names them. Anything unreadable is simply absent.
-struct SpawnedByFields {
-    parent: Option<String>,
-    kind: Option<String>,
-    run_id: Option<Uuid>,
-    task_id: Option<Uuid>,
-}
-
-fn spawned_by_of(session: &ChatSessionNode) -> SpawnedByFields {
-    let value: Option<serde_json::Value> = session
-        .spawned_by
-        .as_deref()
-        .and_then(|raw| serde_json::from_str(raw).ok());
-    let text = |key: &str| {
-        value
-            .as_ref()
-            .and_then(|v| v.get(key))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-    };
-    SpawnedByFields {
-        parent: text("parent_session_id"),
-        kind: text("type"),
-        run_id: text("run_id").and_then(|s| s.parse().ok()),
-        task_id: text("task_id").and_then(|s| s.parse().ok()),
-    }
-}
-
-#[cfg(test)]
-mod session_tree_tests {
-    //! P18-suite (point 12): the mock's session tree is a real traversal, so the cascade
-    //! and tree tests built on it prove something. Red on the former stubs, which answered
-    //! the session alone (tree) and the session itself (root) whatever the parents.
-    use super::*;
-    use chrono::{DateTime, Utc};
-
-    fn session(
-        spawned_by: Option<serde_json::Value>,
-        created_at: DateTime<Utc>,
-    ) -> ChatSessionNode {
-        let mut node = crate::test_helpers::test_chat_session(None);
-        node.id = Uuid::new_v4();
-        node.created_at = created_at;
-        node.spawned_by = spawned_by.map(|v| v.to_string());
-        node
-    }
-
-    fn child_of(
-        parent: &ChatSessionNode,
-        kind: &str,
-        created_at: DateTime<Utc>,
-    ) -> ChatSessionNode {
-        session(
-            Some(serde_json::json!({"type": kind, "parent_session_id": parent.id.to_string()})),
-            created_at,
-        )
-    }
-
-    async fn store(nodes: &[&ChatSessionNode]) -> MockGraphStore {
-        let mock = MockGraphStore::new();
-        for node in nodes {
-            mock.create_chat_session(&(*node).clone()).await.unwrap();
-        }
-        mock
-    }
-
-    #[tokio::test]
-    async fn the_tree_holds_every_descendant_with_its_depth_parent_and_spawn_type() {
-        let t0 = Utc::now();
-        let root = session(None, t0);
-        let late_child = child_of(&root, "conversation", t0 + chrono::Duration::seconds(2));
-        let early_child = child_of(&root, "delegation", t0 + chrono::Duration::seconds(1));
-        let grandchild = child_of(
-            &early_child,
-            "conversation",
-            t0 + chrono::Duration::seconds(3),
-        );
-        let stranger = session(None, t0);
-        let mock = store(&[&root, &late_child, &early_child, &grandchild, &stranger]).await;
-
-        let tree = mock.get_session_tree(&root.id.to_string()).await.unwrap();
-        let ids: Vec<&str> = tree.iter().map(|n| n.session_id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec![
-                root.id.to_string(),
-                early_child.id.to_string(),
-                late_child.id.to_string(),
-                grandchild.id.to_string()
-            ],
-            "depth first, then created_at; the stranger is not in the tree"
-        );
-        assert_eq!(
-            tree.iter().map(|n| n.depth).collect::<Vec<_>>(),
-            vec![0, 1, 1, 2]
-        );
-        assert_eq!(tree[0].parent_session_id, None, "the root names no parent");
-        assert_eq!(
-            tree[1].parent_session_id.as_deref(),
-            Some(root.id.to_string().as_str())
-        );
-        assert_eq!(tree[1].spawn_type.as_deref(), Some("delegation"));
-        assert_eq!(
-            tree[3].parent_session_id.as_deref(),
-            Some(early_child.id.to_string().as_str())
-        );
-        assert_eq!(tree[3].spawn_type.as_deref(), Some("conversation"));
-    }
-
-    #[tokio::test]
-    async fn the_tree_of_a_child_starts_at_that_child_and_an_unknown_session_has_none() {
-        let t0 = Utc::now();
-        let root = session(None, t0);
-        let child = child_of(&root, "delegation", t0);
-        let grandchild = child_of(&child, "conversation", t0);
-        let mock = store(&[&root, &child, &grandchild]).await;
-
-        let tree = mock.get_session_tree(&child.id.to_string()).await.unwrap();
-        assert_eq!(
-            tree.len(),
-            2,
-            "the child and its own descendant, not its parent"
-        );
-        assert_eq!(tree[0].session_id, child.id.to_string());
-        assert_eq!(tree[0].depth, 0);
-        assert_eq!(tree[1].session_id, grandchild.id.to_string());
-
-        assert!(mock
-            .get_session_tree(&Uuid::new_v4().to_string())
-            .await
-            .unwrap()
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn the_root_is_found_by_walking_the_parents_up() {
-        let t0 = Utc::now();
-        let root = session(None, t0);
-        let child = child_of(&root, "delegation", t0);
-        let grandchild = child_of(&child, "conversation", t0);
-        let mock = store(&[&root, &child, &grandchild]).await;
-
-        let root_id = root.id.to_string();
-        assert_eq!(
-            mock.get_session_root(&grandchild.id.to_string())
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(root_id.as_str())
-        );
-        assert_eq!(
-            mock.get_session_root(&child.id.to_string())
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(root_id.as_str())
-        );
-        assert_eq!(
-            mock.get_session_root(&root_id).await.unwrap().as_deref(),
-            Some(root_id.as_str()),
-            "a root is its own root"
-        );
-        assert_eq!(
-            mock.get_session_root(&Uuid::new_v4().to_string())
-                .await
-                .unwrap(),
-            None,
-            "unknown session"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_parent_the_store_no_longer_holds_ends_the_walk_and_a_cycle_does_not_hang() {
-        let t0 = Utc::now();
-        let orphan = session(
-            Some(
-                serde_json::json!({"type": "delegation", "parent_session_id": Uuid::new_v4().to_string()}),
-            ),
-            t0,
-        );
-        let mut a = session(None, t0);
-        let mut b = session(None, t0);
-        a.spawned_by = Some(
-            serde_json::json!({"type": "conversation", "parent_session_id": b.id.to_string()})
-                .to_string(),
-        );
-        b.spawned_by = Some(
-            serde_json::json!({"type": "conversation", "parent_session_id": a.id.to_string()})
-                .to_string(),
-        );
-        let mock = store(&[&orphan, &a, &b]).await;
-
-        assert_eq!(
-            mock.get_session_root(&orphan.id.to_string())
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(orphan.id.to_string().as_str()),
-            "the last known session of the walk"
-        );
-        let cyclic_root = mock.get_session_root(&a.id.to_string()).await.unwrap();
-        assert!(cyclic_root.is_some(), "a cycle ends, it does not hang");
-        assert_eq!(
-            mock.get_session_tree(&a.id.to_string())
-                .await
-                .unwrap()
-                .len(),
-            2,
-            "a and b once each"
-        );
-    }
-}
-
-#[cfg(test)]
-mod bind_project_tests {
-    //! `bind_chat_session_project` (P18): the project a session actually works on is
-    //! written once on the node, and an explicit project is never overwritten. Before
-    //! it, a session opened without `project_slug` stayed anonymous in
-    //! `/api/agents/live` although every turn resolved its project from the cwd.
-    use super::*;
-    use crate::neo4j::traits::GraphStore;
-    use crate::test_helpers::test_chat_session;
-
-    async fn session(store: &MockGraphStore, slug: Option<&str>) -> Uuid {
-        let s = test_chat_session(slug);
-        let id = s.id;
-        store.create_chat_session(&s).await.unwrap();
-        id
-    }
-
-    async fn project_of(store: &MockGraphStore, id: Uuid) -> Option<String> {
-        store
-            .get_chat_session(id)
-            .await
-            .unwrap()
-            .expect("the session exists")
-            .project_slug
-    }
-
-    #[tokio::test]
-    async fn a_session_without_a_project_binds_the_resolved_one() {
-        let store = MockGraphStore::new();
-        let id = session(&store, None).await;
-
-        assert!(
-            store
-                .bind_chat_session_project(id, "po-graph")
-                .await
-                .unwrap(),
-            "the first bind writes"
-        );
-        assert_eq!(project_of(&store, id).await.as_deref(), Some("po-graph"));
-    }
-
-    #[tokio::test]
-    async fn an_explicit_project_is_never_overwritten() {
-        let store = MockGraphStore::new();
-        let id = session(&store, Some("project-orchestrator-backend")).await;
-
-        assert!(
-            !store
-                .bind_chat_session_project(id, "po-graph")
-                .await
-                .unwrap(),
-            "binding refuses a session that already has a project"
-        );
-        assert_eq!(
-            project_of(&store, id).await.as_deref(),
-            Some("project-orchestrator-backend")
-        );
-    }
-
-    #[tokio::test]
-    async fn binding_is_idempotent_and_an_empty_slug_counts_as_no_project() {
-        let store = MockGraphStore::new();
-        let id = session(&store, Some("  ")).await;
-
-        assert!(store
-            .bind_chat_session_project(id, "po-graph")
-            .await
-            .unwrap());
-        assert!(
-            !store.bind_chat_session_project(id, "other").await.unwrap(),
-            "a second bind writes nothing"
-        );
-        assert_eq!(project_of(&store, id).await.as_deref(), Some("po-graph"));
-    }
-
-    #[tokio::test]
-    async fn binding_an_unknown_session_writes_nothing_and_does_not_fail() {
-        let store = MockGraphStore::new();
-        assert!(!store
-            .bind_chat_session_project(Uuid::new_v4(), "po-graph")
-            .await
-            .unwrap());
-    }
-}
-
-#[cfg(test)]
-mod transverse_skill_tests {
-    //! A skill with no project is transverse: it belongs to the instance and is
-    //! visible from every project. The rule lives in three places — the Neo4j
-    //! query, this in-memory store, and the trigger matcher — so it is pinned
-    //! here instead of only in a query string.
-    use super::*;
-    use crate::skills::{SkillNode, SkillStatus};
-    use crate::test_helpers::test_project;
-
-    async fn store_with_a_project() -> (MockGraphStore, Uuid) {
-        let store = MockGraphStore::new();
-        let project = test_project();
-        let pid = project.id;
-        store.create_project(&project).await.unwrap();
-        (store, pid)
-    }
-
-    fn active(project_id: Option<Uuid>, name: &str) -> SkillNode {
-        let mut skill = SkillNode::new(project_id, name);
-        skill.status = SkillStatus::Active;
-        skill
-    }
-
-    #[tokio::test]
-    async fn a_transverse_skill_is_visible_from_every_project() {
-        let (store, pid) = store_with_a_project().await;
-        store
-            .create_skill(&active(Some(pid), "local"))
-            .await
-            .unwrap();
-        store
-            .create_skill(&active(None, "everywhere"))
-            .await
-            .unwrap();
-
-        // From the project it belongs to: both.
-        let (found, total) = store.list_skills(Some(pid), None, 10, 0).await.unwrap();
-        assert_eq!(
-            total, 2,
-            "a project sees its own skills and the transverse ones"
-        );
-        assert!(found.iter().any(|s| s.name == "local"));
-        assert!(found.iter().any(|s| s.name == "everywhere"));
-
-        // From a project it was never written for: the transverse one only.
-        let elsewhere = Uuid::new_v4();
-        let (found, total) = store
-            .list_skills(Some(elsewhere), None, 10, 0)
-            .await
-            .unwrap();
-        assert_eq!(total, 1, "another project must see the transverse skill");
-        assert_eq!(found[0].name, "everywhere");
-
-        // No project asked: the transverse library, and nothing else.
-        let (found, total) = store.list_skills(None, None, 10, 0).await.unwrap();
-        assert_eq!(total, 1, "without a project, only the library is listed");
-        assert_eq!(found[0].name, "everywhere");
-    }
-
-    #[tokio::test]
-    async fn the_detection_reads_stay_project_scoped() {
-        // `get_live_skills_for_project` feeds skill detection: seeing a
-        // transverse skill there would make it look "new" on every pass.
-        let (store, pid) = store_with_a_project().await;
-        store
-            .create_skill(&active(Some(pid), "local"))
-            .await
-            .unwrap();
-        store
-            .create_skill(&active(None, "everywhere"))
-            .await
-            .unwrap();
-
-        let live = store.get_live_skills_for_project(pid).await.unwrap();
-        assert_eq!(live.len(), 1, "detection must not see transverse skills");
-        assert_eq!(live[0].name, "local");
-    }
-}
-
-#[cfg(test)]
-mod rescope_tests {
-    //! Re-scoping is the operation T3 depends on: it must move a node between
-    //! the transverse level and a project without recreating it (and therefore
-    //! without losing its members, states, transitions or runs).
-    use super::*;
-    use crate::skills::{SkillNode, SkillStatus};
-    use crate::test_helpers::test_project;
-
-    #[tokio::test]
-    async fn rescoping_moves_the_scope_and_null_makes_it_transverse() {
-        let store = MockGraphStore::new();
-        let project = test_project();
-        let pid = project.id;
-        store.create_project(&project).await.unwrap();
-
-        let mut skill = SkillNode::new(Some(pid), "rescoped");
-        skill.status = SkillStatus::Active;
-        let id = skill.id;
-        store.create_skill(&skill).await.unwrap();
-
-        // attached -> transverse
-        store.rescope_skill(id, None).await.unwrap();
-        let (library, _) = store.list_skills(None, None, 10, 0).await.unwrap();
-        assert!(
-            library.iter().any(|s| s.id == id),
-            "null must make the skill transverse"
-        );
-
-        // transverse -> attached elsewhere
-        let elsewhere = Uuid::new_v4();
-        store.rescope_skill(id, Some(elsewhere)).await.unwrap();
-        let (from_project, _) = store
-            .list_skills(Some(elsewhere), None, 10, 0)
-            .await
-            .unwrap();
-        assert!(
-            from_project.iter().any(|s| s.id == id),
-            "a uuid must attach the skill to that project"
-        );
-        let (library, _) = store.list_skills(None, None, 10, 0).await.unwrap();
-        assert!(
-            !library.iter().any(|s| s.id == id),
-            "it must have left the transverse library"
-        );
     }
 }

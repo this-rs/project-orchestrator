@@ -18,6 +18,8 @@
 //! appear in output, and keeping every decrypted value in memory "just in case"
 //! would defeat the point of locking the vault. The set is kept after the vault
 //! locks — an agent may still print a value it received while it was open.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -183,6 +185,8 @@ impl SharedMasker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn a_known_value_is_replaced_by_its_label() {

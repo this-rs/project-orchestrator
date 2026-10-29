@@ -10,6 +10,8 @@
 //! Both checks run in parallel with a 300ms timeout. Failures are gracefully skipped.
 //!
 //! Controlled by `ENRICHMENT_BIOMIMICRY=true` (disabled by default).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 use std::time::Duration;

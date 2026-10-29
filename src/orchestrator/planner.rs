@@ -1,9 +1,13 @@
 //! Implementation Flow Planner — analyzes the knowledge graph to produce
 //! a DAG of implementation phases (sequential + parallel branches).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::{StepNode as StepNodeModel, StepStatus};
 use crate::neo4j::GraphStore;
+
+#[allow(unused_imports)]
 use crate::notes::models::EntityType;
 use crate::notes::NoteManager;
 use crate::plan::models::CreatePlanRequest;
@@ -1786,6 +1790,8 @@ impl ImplementationPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_plan_request_serde_roundtrip() {

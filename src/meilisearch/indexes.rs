@@ -1,4 +1,6 @@
 //! Index definitions for Meilisearch
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +101,8 @@ pub mod index_names {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_code_document_serialization() {

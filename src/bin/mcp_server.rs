@@ -33,6 +33,8 @@
 //!   }
 //! }
 //! ```
+#[allow(unused_imports)]
+use project_orchestrator::neo4j::traits::*;
 
 use anyhow::{anyhow, Result};
 use project_orchestrator::mcp::{McpHttpClient, McpServer};

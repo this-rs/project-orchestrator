@@ -33,6 +33,8 @@
 //! [`EndpointRefusal::message_for`] prefixes the normalised origin (scheme,
 //! host, non-default port — never the path or the query), the same origin the
 //! user consent is tied to (decision A28, [`origin_of`]).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::fmt;
 use std::io;
@@ -647,6 +649,8 @@ pub fn redact_error_body(body: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(a, b, c, d))

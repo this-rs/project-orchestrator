@@ -10,6 +10,8 @@
 //! deadline, and every operation checks it first — an expired vault locks itself
 //! on the next access, wiping the key, rather than waiting for a timer that
 //! might not fire.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -408,6 +410,8 @@ pub enum VaultError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     const PASS: &str = "correct horse battery staple";
 

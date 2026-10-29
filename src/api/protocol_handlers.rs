@@ -1,8 +1,11 @@
 //! API handlers for Protocol (Pattern Federation)
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams};
 use crate::events::EventEmitter;
+#[allow(unused_imports)]
 use crate::protocol::{
     self, validate_protocol_structure, Protocol, ProtocolCategory, ProtocolRun, ProtocolState,
     ProtocolTransition, RunStatus, TransitionResult, ValidatableState, ValidatableTransition,
@@ -2205,6 +2208,8 @@ pub async fn validate_all_protocols(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::protocol::StateType;
 
     /// Helper: build a minimal ProtocolState for testing.
@@ -2825,8 +2830,6 @@ mod tests {
     // ----------------------------------------------------------------
     // schedule validation (REST)
     // ----------------------------------------------------------------
-
-    use crate::neo4j::GraphStore;
 
     async fn send(
         app: &axum::Router,

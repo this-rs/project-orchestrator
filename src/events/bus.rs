@@ -1,4 +1,6 @@
 //! Event bus for broadcasting CRUD events to WebSocket clients
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::{CrudEvent, EventEmitter};
 use tokio::sync::broadcast;
@@ -64,6 +66,8 @@ impl Default for EventBus {
 mod tests {
     use super::*;
     use crate::events::{CrudAction, EntityType};
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_emit_without_subscriber_no_panic() {

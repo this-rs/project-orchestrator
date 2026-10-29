@@ -30,9 +30,11 @@
 //!
 //! `input_request` is a dead type (never emitted in production): it is
 //! ignored on purpose, counting it would invent phantom requests. The grouped
-//! read ([`GraphStore::get_attention_events`]) does not even fetch it.
+//! read ([`AnalyticsStore::get_attention_events`]) does not even fetch it.
 //!
-//! [`GraphStore::get_attention_events`]: crate::neo4j::traits::GraphStore::get_attention_events
+//! [`AnalyticsStore::get_attention_events`]: crate::neo4j::traits::AnalyticsStore::get_attention_events
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, HashSet};
 
@@ -42,7 +44,6 @@ use uuid::Uuid;
 use crate::api::attention::{OrphanRequest, QuestionOption, RequestKind, WaitingRequest};
 use crate::chat::types::ChatEvent;
 use crate::neo4j::models::ChatEventRecord;
-
 /// Everything the derivation needs to know about one session, except its
 /// events (passed separately so the grouped read can be split per session).
 #[derive(Debug, Clone)]
@@ -367,6 +368,8 @@ fn question_text_and_options(questions: &serde_json::Value) -> (String, Vec<Ques
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use chrono::TimeZone;
     use serde_json::json;
 
@@ -665,7 +668,6 @@ mod tests {
     async fn grouped_store_read_returns_all_sessions_without_non_attention_events_and_blank_user_data(
     ) {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
         let store = MockGraphStore::new();
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
         store

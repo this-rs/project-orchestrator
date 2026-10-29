@@ -8,6 +8,8 @@
 //! The identity is persisted to the platform config directory
 //! (e.g. `~/Library/Application Support/project-orchestrator/identity.key` on macOS)
 //! and loaded on startup.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 pub mod did;
 pub mod rotation;
@@ -277,6 +279,8 @@ fn default_storage_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use tempfile::TempDir;
 
     #[test]

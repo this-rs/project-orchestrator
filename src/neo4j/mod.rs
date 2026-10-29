@@ -1,4 +1,6 @@
 //! Neo4j client and models for the knowledge graph
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 pub(crate) mod agent_execution;
 mod alert;
@@ -56,7 +58,10 @@ pub use client::Neo4jClient;
 pub use document::{Document, DocumentChunk, DocumentChunkHit};
 pub use models::*;
 pub use segment::Neo4jSegmentStore;
-pub use traits::{GraphStore, StoreCapabilities};
+pub use traits::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, GraphStore, NoteStore, PlanStore,
+    ProjectStore, ReleaseStore, StoreCapabilities, WorkspaceStore,
+};
 
 // The in-memory store. Unit tests get it through `cfg(test)`; the integration
 // test targets (tests/store_conformance.rs runs the same checks against it and

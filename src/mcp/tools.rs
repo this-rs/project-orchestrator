@@ -5,6 +5,8 @@
 //! The `action` parameter selects the specific operation; additional parameters vary by action.
 //!
 //! This reduces the tool count from 160 to 18, cutting LLM token overhead by ~60%.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::protocol::{InputSchema, ToolDefinition};
 use serde_json::json;
@@ -1634,6 +1636,8 @@ fn mcp_federation_tool() -> ToolDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_all_tools_count() {

@@ -1,4 +1,6 @@
 //! Meilisearch client for search operations
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::indexes::*;
 use anyhow::{Context, Result};
@@ -639,6 +641,8 @@ impl MeiliClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn meili_quote_escapes_quotes_and_backslashes() {

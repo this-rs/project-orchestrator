@@ -11,9 +11,13 @@
 //! 4. Message with task in_progress → status injection
 //! 5. Benchmark: full pipeline < 500ms
 //! 6. Graceful degradation: one stage error doesn't block others
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -830,7 +834,6 @@ mod tests {
         let _env = crate::chat::stages::intent_weights::lock_env();
         use crate::chat::stages::PersonaStage;
         use crate::neo4j::models::{PersonaNode, PersonaStatus};
-        use crate::neo4j::traits::GraphStore;
 
         let graph = Arc::new(MockGraphStore::new());
         let search = Arc::new(MockSearchStore::new());

@@ -10,6 +10,8 @@
 //! - `<1.0` = dampen (this note type is less relevant for this intent)
 //!
 //! Unknown note types always get weight `1.0` (no penalty).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 
@@ -132,6 +134,8 @@ pub(crate) fn lock_env() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     /// RAII guard that always clears the env var on drop, even on panic.
     /// Prevents a failing `env_override` test from leaking the override

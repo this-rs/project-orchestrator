@@ -4,6 +4,8 @@
 //! by an incoming [`CrudEvent`], can automatically activate a Protocol.
 //! This is the persistent counterpart to the in-memory [`ReactionRule`](super::reactor::ReactionRule)
 //! used by the EventReactor.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -137,6 +139,8 @@ fn scalar_eq(a: &serde_json::Value, b: &serde_json::Value) -> bool {
 mod tests {
     use super::super::types::{CrudAction, EntityType};
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use serde_json::json;
 
     fn make_trigger(

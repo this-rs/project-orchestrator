@@ -25,6 +25,8 @@
 //! stdio binary. The handler is constructed per request with a loopback
 //! [`McpHttpClient`] carrying the *caller's* bearer token, so REST-side
 //! authentication, authorization and audit apply unchanged per user.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::formatter::json_to_compact;
 use super::handlers::ToolHandler;
@@ -451,6 +453,8 @@ impl PipeInto for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn unique_email() -> String {
         format!("{}@test.local", Uuid::new_v4())

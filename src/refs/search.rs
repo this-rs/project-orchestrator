@@ -2,6 +2,8 @@
 //! for candidates, keep what is in the requested scope **and** that the access
 //! policy lets this principal see, and shape the answer the golden fixture
 //! `tests/fixtures/refs/search_response.json` pins.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -321,7 +323,8 @@ where
 mod tests {
     use super::*;
     use crate::neo4j::models::PlanNode;
-    use crate::neo4j::GraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::refs::access::Disclosure;
     use crate::refs::test_support::{task_titled, user, world, Spy, World};
     use crate::refs::wire::ScopeLabel;
@@ -827,6 +830,7 @@ mod tests {
 #[cfg(test)]
 mod fan_out_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::refs::resolvers::Candidates;
     use crate::refs::test_support::{user, world};
     use crate::refs::types::RefId;
@@ -970,6 +974,7 @@ mod fan_out_tests {
 #[cfg(test)]
 mod pushdown_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::refs::test_support::{note_with, user, world};
 
     /// The mock honours `workspace_slug` for notes (not for plans or tasks),

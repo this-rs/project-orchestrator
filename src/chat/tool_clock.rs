@@ -53,6 +53,8 @@
 //! sub-agent (`parent_tool_use_id`): a background `Task` outlives the turn that
 //! launched it, its calls are timed when they end. A sub-agent call that never
 //! ends is kept until the session's clock goes.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -395,6 +397,8 @@ impl nexus_claude::HookCallback for ToolClockHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use serde_json::{json, Value};
     use uuid::Uuid;
 

@@ -8,6 +8,8 @@
 //! This table is the one piece of hand-maintained data in the derivation, and it
 //! is deliberately generic: it describes ecosystems, not this workspace. Adding a
 //! row benefits every project ever analysed.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::manifest::Ecosystem;
 use crate::neo4j::models::ComponentType;
@@ -168,6 +170,8 @@ pub fn is_frontend_framework(package: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn maps_client_crates_to_the_service_they_reach() {

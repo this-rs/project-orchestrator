@@ -1,5 +1,7 @@
 //! Journal des événements externes (`:ExternalEvent`) et réservation des livraisons
 //! (`:ExternalDelivery`), sur le même modèle que les firings de déclencheurs.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use crate::ingress::{ExternalEvent, IngressOutcome};

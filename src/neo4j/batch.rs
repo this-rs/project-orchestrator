@@ -28,6 +28,8 @@
 //!     RETURN count(r) AS cnt
 //! "#).await?;
 //! ```
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use anyhow::{Context, Result};
 use neo4rs::query;
@@ -260,6 +262,8 @@ pub fn bolt_map(pairs: &[(&str, neo4rs::BoltType)]) -> BoltMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_batch_size_is_10k() {

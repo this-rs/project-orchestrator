@@ -1,4 +1,6 @@
 //! Shared fixtures for the tests of the resolvers, the search and the handler.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

@@ -1,4 +1,6 @@
 //! Neo4j implementation of TrajectoryStore.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use async_trait::async_trait;
 use neo4rs::{query, Graph};

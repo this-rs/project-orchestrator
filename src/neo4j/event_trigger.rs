@@ -1,6 +1,8 @@
 //! Neo4j EventTrigger operations — persistent event-to-protocol triggers
 //!
 //! CRUD for [`EventTrigger`] nodes and their `:TRIGGERS` relationship to Protocol nodes.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use crate::events::trigger::EventTrigger;

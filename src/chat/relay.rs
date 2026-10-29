@@ -11,6 +11,8 @@
 //! is kept, tool calls are reduced to one line each with a bounded result, and when
 //! the budget is exceeded the OLDEST turns are dropped and the omission is stated in
 //! the relay itself. A relay never truncates in silence.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::provider::cognitive::segment::SegmentsSnapshot;
 use super::types::ChatEvent;
@@ -305,6 +307,8 @@ pub fn prefixed(relay: Option<&str>, message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use serde_json::json;
 
     fn user(text: &str) -> ChatEvent {

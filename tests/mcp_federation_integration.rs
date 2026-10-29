@@ -8,6 +8,8 @@
 //!
 //! For GitHub (requires a PAT with Copilot scope):
 //!   GITHUB_PAT=ghp_xxx cargo test --test mcp_federation_integration -- --ignored test_github
+#[allow(unused_imports)]
+use project_orchestrator::neo4j::traits::*;
 
 use project_orchestrator::mcp_federation::client::{
     create_client, McpClient, StreamableHttpMcpClient,

@@ -33,6 +33,8 @@
 //! `code` and never echoes the value that was sent.
 //!
 //! [`GraphConsents`]: crate::chat::provider::nexus_tools::GraphConsents
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use axum::{
     extract::{Path, Query, State},

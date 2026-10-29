@@ -5,6 +5,8 @@
 //! - `WebhookProvider` — external HTTP webhook receiver (GitHub, etc.)
 //! - `EventProvider` — internal event bus subscriber (plan chaining)
 //! - Chat — inline in the MCP handler (no dedicated provider)
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 pub mod event;
 pub mod schedule;

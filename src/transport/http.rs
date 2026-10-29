@@ -7,6 +7,8 @@
 //! - `POST /api/p2p/message` — receive a single Message
 //! - `POST /api/p2p/sync`    — HAVE/WANT/DATA delta sync exchange
 //! - `GET  /api/p2p/identity` — returns this peer's PeerInfo (for handshake)
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -263,6 +265,8 @@ pub struct IdentityResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use chrono::Utc;
 
     fn make_config() -> HttpTransportConfig {

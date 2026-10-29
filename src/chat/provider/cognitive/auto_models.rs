@@ -14,6 +14,8 @@
 //! the effective pool. When nothing listed is usable any more, the restriction is dropped for
 //! that decision and its reason says so (`narrowed: auto_models_unavailable`): Auto never
 //! blocks a chat because of this setting.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -114,6 +116,8 @@ pub fn restrict(
 mod tests {
     use super::*;
     use crate::chat::provider::cognitive::signature::ContextHints;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn facts(provider: &str, model: &str, allowed: bool, healthy: bool) -> ModelFacts {
         ModelFacts {

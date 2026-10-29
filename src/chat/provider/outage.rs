@@ -81,6 +81,8 @@
 //!   `hold_on` exactly as the agent engine does, and re-sends the turn only where the
 //!   ordinary retry already would (a turn that showed nothing, or text but no tool):
 //!   an executed tool is never replayed.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::time::{Duration, Instant};
 
@@ -597,6 +599,8 @@ const LEGACY_UNKNOWN: &str = "provider_error";
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn at(base: Instant, secs: u64) -> Instant {
         base + Duration::from_secs(secs)

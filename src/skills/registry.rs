@@ -8,6 +8,8 @@
 //!
 //! - **Local registry**: stored in Neo4j, same instance
 //! - **Remote registry**: another PO instance accessed via HTTP (see `registry_handlers`)
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -318,6 +320,8 @@ pub fn merge_search_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::skills::models::SkillNode;
     use crate::skills::package::*;
 

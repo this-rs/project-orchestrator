@@ -8,6 +8,8 @@
 //! 3. **Gap-Closing Precision** — Ratio of episodes that wire to local entities.
 //!
 //! Plus a composite score with configurable weights.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::episodes::{PortableEpisode, PortableLesson};
 use serde::{Deserialize, Serialize};
@@ -586,6 +588,8 @@ pub fn produce_m2_report(
 mod tests {
     use super::*;
     use crate::episodes::artifact_comparison::generate_fake_enriched;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_heuristic_comprehensibility_scorer() {

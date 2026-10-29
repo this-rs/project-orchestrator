@@ -7,6 +7,8 @@
 //! - Provider blocks → symbols
 //! - Inter-resource references → FunctionCall
 //! - Implicit same-directory scope → ImportNode("__same_dir__")
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::neo4j::models::*;
 use crate::parser::helpers::*;

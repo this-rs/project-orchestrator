@@ -2,6 +2,8 @@
 //!
 //! Implements the broadcast-and-acknowledge protocol for revoking
 //! shared knowledge artifacts across peers.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -163,6 +165,8 @@ pub fn handle_incoming_tombstone(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn make_tombstone_payload() -> TombstonePayload {
         let id = crate::identity::InstanceIdentity::generate();

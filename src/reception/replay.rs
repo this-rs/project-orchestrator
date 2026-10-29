@@ -2,6 +2,8 @@
 //!
 //! Converts verified distillation envelopes into local note representations,
 //! prefixed with `[P2P Import]` to distinguish them from locally-created notes.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +59,8 @@ mod tests {
         DistillationEnvelope, DistillationMeta, DistilledLesson, PortabilityLayer,
         SensitivityLevel, TrustProof,
     };
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use chrono::Utc;
     use std::collections::HashMap;
 

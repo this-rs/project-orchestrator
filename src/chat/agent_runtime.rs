@@ -11,6 +11,8 @@
 //!
 //! The legacy path stays as it was; the manager decides which one serves a
 //! session and a session never changes engine.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -42,6 +44,7 @@ use super::types::{
     BackgroundTaskInfo, ChatEvent, PendingMessage, PendingMessageKind, PermissionAnswerScope,
 };
 use crate::neo4j::models::ChatEventRecord;
+#[allow(unused_imports)]
 use crate::neo4j::GraphStore;
 
 const BROADCAST_BUFFER: usize = 1024;
@@ -3489,6 +3492,8 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod mask_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::vault::mask::Masker;
     use nexus_claude::agent::ToolOutput;
 
@@ -3918,6 +3923,7 @@ mod mask_tests {
 mod turn_race_tests {
     use super::fake::FakeProvider;
     use super::*;
+    #[allow(unused_imports)]
     use std::sync::atomic::AtomicBool as StdAtomicBool;
     use tokio::sync::Notify;
 
@@ -4039,7 +4045,6 @@ mod turn_race_tests {
 mod adopt_tests {
     use super::fake::FakeProvider;
     use super::*;
-
     /// The handle replaced is ended: its listeners (NATS) stop, its provider
     /// session is closed. Otherwise both handles answer the same NATS subjects and
     /// a message from another instance is played twice.
@@ -4942,7 +4947,6 @@ mod adopt_tests {
 #[cfg(test)]
 mod image_tests {
     use super::*;
-
     #[test]
     fn the_turn_input_is_the_text_then_the_images_in_order() {
         let images = [
@@ -5153,6 +5157,7 @@ mod session_record_tests {
     use super::fake::FakeProvider;
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use nexus_claude::agent::{Cost, CostBasis};
 
     fn done(usd: Option<f64>) -> AgentEvent {
@@ -5493,7 +5498,6 @@ mod session_record_tests {
 mod retry_config_tests {
     use super::fake::FakeProvider;
     use super::*;
-
     fn overloaded() -> AgentEvent {
         AgentEvent::Done {
             stop_reason: nexus_claude::agent::StopReason::Error,
@@ -5576,7 +5580,6 @@ mod retry_config_tests {
 mod outage_hold_tests {
     use super::fake::FakeProvider;
     use super::*;
-
     fn unreachable() -> ProviderError {
         ProviderError::EndpointUnreachable {
             detail: "connection failed: Connection refused (os error 61)".to_string(),
@@ -5768,6 +5771,7 @@ mod outage_hold_tests {
 mod after_turn_tests {
     use super::fake::FakeProvider;
     use super::*;
+    #[allow(unused_imports)]
     use std::sync::Mutex as StdMutex;
 
     fn done() -> AgentEvent {
@@ -6130,7 +6134,6 @@ mod after_turn_tests {
 mod retry_stop_tests {
     use super::fake::FakeProvider;
     use super::*;
-
     /// A Stop during the pause before a retry ends the turn at once: no ten-second
     /// wait, no retry sent after the Stop.
     #[tokio::test]
@@ -6207,7 +6210,6 @@ mod retry_stop_tests {
 mod process_exit_tests {
     use super::fake::FakeProvider;
     use super::*;
-
     /// A `ProcessExited` terminal event ends the turn, is said as a session error,
     /// and removes the handle from the runtime: the next message takes the resume
     /// path rather than re-failing on the dead process.
@@ -6268,6 +6270,7 @@ mod process_exit_tests {
 mod answered_tests {
     use super::fake::FakeProvider;
     use super::*;
+    #[allow(unused_imports)]
     use std::sync::Mutex as StdMutex;
 
     /// The terminal-result fields of one turn, captured for assertions.
@@ -6820,7 +6823,7 @@ mod answered_tests {
 mod tool_timing_tests {
     use super::fake::FakeProvider;
     use super::*;
-    use crate::neo4j::traits::GraphStore as _;
+    #[allow(unused_imports)]
     use serde_json::json;
 
     /// The provider is slow to take the answer and the tool is fast: its result is
@@ -7185,7 +7188,6 @@ mod stored_interrupted_result_tests {
     use super::fake::FakeProvider;
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-
     #[tokio::test]
     async fn a_stopped_turn_is_stored_neutral_and_broadcast_as_the_provider_said() {
         let graph = Arc::new(MockGraphStore::new());

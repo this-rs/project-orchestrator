@@ -10,6 +10,8 @@
 //!   binary and marks the update as *staged*. It never restarts on its own:
 //!   running chat sessions are only interrupted by an explicit user action
 //!   (`POST /api/update/restart`), or by the next natural restart.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::deployment::{DeploymentMode, Supervisor};
 use super::version::BuildVersion;
@@ -424,6 +426,8 @@ pub fn schedule_restart(delay: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::update::version::resolve_build_version;
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;

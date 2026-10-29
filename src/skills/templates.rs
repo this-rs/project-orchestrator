@@ -3,6 +3,8 @@
 //! Generates a `context_template` for a skill by grouping member notes by type,
 //! sorting by importance, and assembling into a Markdown document with placeholders
 //! for dynamic content injected at activation time.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::notes::{Note, NoteImportance, NoteType};
 
@@ -278,6 +280,8 @@ fn apply_token_budget(template: String, notes: &[Note]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::notes::{NoteScope, NoteStatus};
     use chrono::Utc;
 

@@ -2,6 +2,8 @@
 //!
 //! An adapter calls the production code path as it is wired today, with no
 //! parameter of its own, so the bench measures what the backend does.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 

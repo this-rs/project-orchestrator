@@ -5,6 +5,8 @@
 //!
 //! Also provides [`PromptBuilder`] — a composable builder for assembling
 //! multi-section agent prompts with deterministic section ordering.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -524,6 +526,8 @@ fn build_tag_constraints(tags: &[String], out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     // ========================================================================
     // PromptBuilder tests

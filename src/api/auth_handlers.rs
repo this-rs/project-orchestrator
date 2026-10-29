@@ -7,6 +7,8 @@
 //! - `GET  /auth/me`              — Returns the authenticated user (protected)
 //! - `POST /auth/refresh`         — Issues a new access JWT from a valid refresh cookie
 //! - `POST /auth/logout`          — Revokes the refresh token and clears the cookie
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::api::handlers::{AppError, OrchestratorState};
 use crate::auth::extractor::AuthUser;
@@ -1143,6 +1145,8 @@ mod tests {
     use crate::auth::jwt::encode_jwt;
     use crate::auth::middleware::require_auth;
     use crate::events::EventBus;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::mock_app_state;
     use crate::AuthConfig;

@@ -6,6 +6,8 @@
 //! subquery), the frontier itself is capped at `frontier_cap` nodes, and the
 //! traversal never uses variable-length patterns. Nodes are carried between
 //! hops by `elementId`, which Neo4j resolves with a direct seek.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use crate::graph::neighborhood::{
@@ -296,6 +298,8 @@ mod bench {
     //!  cargo test --lib neighborhood_bench -- --ignored --nocapture`
     use super::*;
     use crate::graph::neighborhood::{select_neighborhood, Layer};
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[tokio::test]
     #[ignore]

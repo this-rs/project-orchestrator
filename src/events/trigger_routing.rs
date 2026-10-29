@@ -2,6 +2,8 @@
 //!
 //! When multiple EventTriggers match an event, the router evaluates
 //! context (phase, structure, domain) and selects the best protocol.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -297,6 +299,8 @@ impl TriggerRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use chrono::Utc;
     use serde_json::json;
 

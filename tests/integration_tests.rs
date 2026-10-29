@@ -2,6 +2,8 @@
 //!
 //! These tests require Neo4j and Meilisearch to be running.
 //! Run with: cargo test --test integration_tests
+#[allow(unused_imports)]
+use project_orchestrator::neo4j::traits::*;
 
 use project_orchestrator::neo4j::models::*;
 use project_orchestrator::{AppState, Config};

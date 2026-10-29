@@ -4,6 +4,8 @@
 //! - Same text → same embedding (reproducible tests)
 //! - Different texts → different embeddings (similarity tests work)
 //! - Configurable dimensions (match the real provider's config)
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::traits::EmbeddingProvider;
 use anyhow::Result;
@@ -111,6 +113,8 @@ impl EmbeddingProvider for MockEmbeddingProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[tokio::test]
     async fn test_deterministic_embeddings() {

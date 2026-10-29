@@ -7,6 +7,8 @@
 //! The content field of an RFC note stores JSON: `{ "title": "...", "sections": [...] }`.
 //! The RFC status is stored as a tag `rfc-status:<status>` on the note.
 //! The protocol run link is stored as a tag `rfc-run:<uuid>` on the note.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
 use super::PaginatedResponse;
@@ -870,6 +872,8 @@ mod tests {
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::notes::{CreateNoteRequest, NoteImportance, NoteScope, NoteType};
     use crate::orchestrator::watcher::FileWatcher;
     use crate::orchestrator::Orchestrator;

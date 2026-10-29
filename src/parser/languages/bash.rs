@@ -5,6 +5,8 @@
 //! - Variables (exported and local)
 //! - Source/include statements
 //! - Aliases
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::neo4j::models::*;
 use crate::parser::helpers::*;

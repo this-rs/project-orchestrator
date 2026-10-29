@@ -13,6 +13,8 @@
 //!  - `lang`  — a message and its translation must select the same tool groups.
 //!  - `noise` — appending a semantically empty sentence must change nothing.
 //!  - `level` — raising the scaffolding level may only shrink the selection.
+#[allow(unused_imports)]
+use project_orchestrator::neo4j::traits::*;
 
 mod common;
 

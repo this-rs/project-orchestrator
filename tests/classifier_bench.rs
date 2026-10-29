@@ -6,6 +6,8 @@
 //!
 //! Run it alone with `cargo test --test classifier_bench -- --nocapture` to see
 //! the table.
+#[allow(unused_imports)]
+use project_orchestrator::neo4j::traits::*;
 
 use std::collections::BTreeSet;
 use std::path::Path;

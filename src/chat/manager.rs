@@ -8,6 +8,8 @@
 //! - Structured events are persisted in Neo4j with sequence numbers for replay
 //! - Inactive sessions are persisted in Neo4j with `cli_session_id` for resume
 //! - A cleanup task periodically closes timed-out sessions
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::config::ChatConfig;
 use super::post_tool_hook;
@@ -43,7 +45,6 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::expand_tilde;
-
 mod recovery;
 pub use recovery::{RecoveryReport, ScanReport};
 
@@ -19229,6 +19230,8 @@ pub(crate) fn session_is_expired(
 #[cfg(test)]
 mod idle_expiry_tests {
     use super::{background_task_is_idle_dead, process_alive, session_is_expired};
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use std::time::Duration;
 
     const T: Duration = Duration::from_secs(1800);
@@ -19680,7 +19683,6 @@ pub(crate) fn is_runner_spawned(spawned_by: Option<&str>) -> bool {
 #[cfg(test)]
 mod runner_spawn_tests {
     use super::is_runner_spawned;
-
     #[test]
     fn detects_runner_sessions() {
         assert!(is_runner_spawned(Some(
@@ -19702,7 +19704,6 @@ mod runner_spawn_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     /// The review of #688 at 60a277e7 (finding D): a provider kind that does not
     /// serialize to a name falls back to `unknown` (no session grant), never to a
     /// permissive kind.
@@ -29295,6 +29296,8 @@ mod tests {
     mod activity {
         use super::super::{count_background_tasks, LiveSessionSnapshot};
         use crate::chat::types::{BackgroundTaskInfo, BackgroundTaskKind};
+        #[allow(unused_imports)]
+        use crate::neo4j::traits::*;
         use uuid::Uuid;
 
         fn task(kind: BackgroundTaskKind, dying: bool) -> BackgroundTaskInfo {
@@ -36842,7 +36845,6 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod agent_env_tests {
     use super::server_secrets_to_hide;
-
     #[test]
     fn only_the_server_secrets_that_exist_are_hidden() {
         let present = |k: &str| k == "NEO4J_PASSWORD" || k == "PO_JWT_SECRET";
@@ -36891,6 +36893,7 @@ mod refs_turn_services_tests {
         EnrichmentConfig, EnrichmentInput, EnrichmentPipeline, EnrichmentSource,
         ParallelEnrichmentStage, StageOutput,
     };
+    #[allow(unused_imports)]
     use crate::refs::types::{EntityRef, RefKind};
     use std::sync::Mutex as StdMutex;
 
@@ -36984,7 +36987,6 @@ mod auto_open_bounds_tests {
     use crate::chat::provider::resolver::REMOTE_PREFIX;
     use crate::chat::provider::settings::InstanceRecord;
     use crate::chat::types::RoutingPoolEntry;
-
     fn instance(id: &str, credential_ref: &str) -> InstanceRecord {
         InstanceRecord {
             id: id.to_string(),
@@ -37325,7 +37327,6 @@ mod auto_open_bounds_tests {
 #[cfg(test)]
 mod agent_step_budget_tests {
     use super::*;
-
     #[tokio::test]
     async fn a_step_past_its_budget_is_said_and_the_next_one_still_runs() {
         let mut after = super::super::agent_runtime::AfterTurn::default();
@@ -37361,7 +37362,6 @@ mod agent_step_budget_tests {
 mod held_context_tests {
     use super::*;
     use crate::chat::agent_runtime::{TurnOutcome, TurnServices};
-
     fn test_config() -> ChatConfig {
         ChatConfig {
             max_sessions: 10,
@@ -37889,7 +37889,6 @@ mod image_turn_services_tests {
     use crate::chat::provider::cognitive::decision::{CognitiveDecision, DecideRequest, Decider};
     use crate::chat::provider::cognitive::scorer::PriorHints;
     use crate::chat::provider::cognitive::{LearningStage, ProviderRoutingMode, RoutingSettings};
-
     struct Real;
 
     #[async_trait::async_trait]
@@ -38097,7 +38096,6 @@ mod grant_before_the_cli_tests {
     use super::super::session_grants::{cover, AskedCall, Asker, Cover, SessionGrants};
     use super::super::types::PermissionAnswerScope;
     use super::*;
-
     /// The call the session's pending `req-1` asks (`test_support`).
     fn ls() -> AskedCall {
         AskedCall {
@@ -38301,6 +38299,7 @@ mod granted_answer_clock_tests {
     use super::super::session_grants::{AskedCall, Asker, SessionGrants};
     use super::super::tool_clock::ToolClock;
     use super::*;
+    #[allow(unused_imports)]
     use serde_json::json;
 
     fn granted() -> std::sync::Mutex<SessionGrants> {

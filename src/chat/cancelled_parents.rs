@@ -42,6 +42,8 @@
 //! ([`as_delegation`]); every other resume (the chat, the API, the NATS RPC) is a person's,
 //! and passes. The marker is a task-local, so it travels down the awaited resume to the
 //! `admit` under the live map's lock without threading a flag through every reopen path.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -199,6 +201,8 @@ pub(crate) fn parent_of(spawned_by: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     /// B36-RACE-RESUME: the resume's parent is checked only inside a delegation, and the
     /// marker reaches nested awaits (the reopen paths between the caller and `admit`).

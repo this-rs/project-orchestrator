@@ -1,4 +1,6 @@
 //! Chat configuration
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use nexus_claude::PermissionMode;
 use serde::{Deserialize, Serialize};
@@ -569,6 +571,8 @@ pub(crate) fn auto_continue_from_env(value: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     /// OBS-R (review of #751): Obscura ships inside nexus-tools, so the engine embedded there is
     /// the default; `dsh-obscura-nav` on the PATH is only the fallback of a nexus-tools without

@@ -2,6 +2,8 @@
 //! [`super::resolvers`] for the rules every resolver follows): conversation,
 //! project, milestone, release, workspace, commit, protocol, persona, skill,
 //! file and link. The table of kinds points at the constructors below.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 
@@ -879,6 +881,8 @@ pub fn link(_graph: Arc<dyn GraphStore>) -> Box<dyn KindResolver> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
     use crate::refs::resolvers::GraphRefSource;
     use crate::refs::test_support::{user, world};

@@ -4,6 +4,8 @@
 //! behind them: [`Subject`] is a reply inbox, [`Message`] an inbound request,
 //! [`Subscriber`] a stream of such requests. The concrete transport owns the
 //! conversion in and out (`nats.rs`).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use futures::Stream;
 use std::pin::Pin;

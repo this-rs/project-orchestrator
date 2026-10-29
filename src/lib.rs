@@ -9,6 +9,8 @@
 //! - Tree-sitter for precise code parsing
 //! - Plan management for coordinated multi-agent development
 //! - MCP server for Claude Code integration
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 pub mod analytics;
 pub mod api;
@@ -95,6 +97,8 @@ pub mod runtime {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[allow(unused_imports)]
+        use crate::neo4j::traits::*;
 
         /// Touches `bytes` of stack. Not inlined, and `black_box` keeps the array.
         #[inline(never)]
@@ -2719,6 +2723,8 @@ fn anonymous_mode_warning(auth_configured: bool, addr: &std::net::SocketAddr) ->
 #[cfg(test)]
 mod anonymous_warning_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn warns_only_when_auth_is_not_configured() {
@@ -2732,6 +2738,7 @@ mod anonymous_warning_tests {
 #[cfg(test)]
 mod config_tests {
     use super::*;
+    #[allow(unused_imports)]
     use std::io::Write;
 
     /// Serialises the tests below that read or write process-global environment

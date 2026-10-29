@@ -7,6 +7,8 @@
 //! - Lightweight: regex/string matching only, no LLM calls
 //! - Non-blocking: designed to run in `tokio::spawn` background tasks
 //! - Security: only extracts structured metadata, never stores raw message content
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashSet;
 
@@ -666,6 +668,8 @@ fn resolve_node_type(ref_type: &str, identifier: &str) -> (EntityType, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     // ── File path extraction ────────────────────────────────────────────
 

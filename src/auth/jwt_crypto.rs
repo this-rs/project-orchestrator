@@ -12,6 +12,8 @@
 //!
 //! `jsonwebtoken` panics if no provider is installed, so the backend calls [`encode`] and
 //! [`decode`] of this module (which install it first) rather than the crate's own.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::sync::Once;
 
@@ -156,6 +158,8 @@ pub fn decode<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use serde::Deserialize;
 
     #[derive(Serialize, Deserialize, Debug, PartialEq)]

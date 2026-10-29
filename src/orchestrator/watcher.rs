@@ -9,6 +9,8 @@
 //! to resolve which project a changed file belongs to. When a file change is
 //! detected, the watcher finds the longest matching root_path prefix to
 //! determine the correct project context for syncing.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use anyhow::{Context, Result};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -1203,6 +1205,8 @@ async fn handle_project_updated(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     // ── route_watch_event regression tests ────────────────────────────
 

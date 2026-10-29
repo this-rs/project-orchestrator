@@ -1,4 +1,6 @@
 //! Main orchestrator runner
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 #[cfg(feature = "local-embeddings")]
 use crate::embeddings::FastEmbedProvider;
@@ -27,7 +29,6 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use super::context::ContextBuilder;
-
 /// Normalize a file path to an absolute canonical form.
 /// - Resolves `~` to home directory
 /// - Resolves `.` and `..`
@@ -5894,6 +5895,8 @@ pub struct SyncResult {
 mod tests {
     use super::*;
     use crate::events::{CrudAction, EntityType as EventEntityType, EventBus, HybridEmitter};
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::parser::FunctionCall;
     use crate::test_helpers::*;
 
@@ -7185,7 +7188,6 @@ mod tests {
     #[tokio::test]
     async fn test_analyze_project_safe_computes_and_emits() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::GraphStore;
 
         // Build custom state with a shared MockGraphStore reference
         let mock_store = Arc::new(MockGraphStore::new());
@@ -7209,7 +7211,7 @@ mod tests {
                 last_parsed: chrono::Utc::now(),
                 project_id: Some(project.id),
             };
-            GraphStore::upsert_file(&*mock_store, &file).await.unwrap();
+            CodeStore::upsert_file(&*mock_store, &file).await.unwrap();
         }
         // Register files as project files and add imports
         {
@@ -10138,7 +10140,6 @@ mod tests {
     #[tokio::test]
     async fn test_sync_add_file_creates_all_entities() {
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
@@ -10222,7 +10223,6 @@ mod tests {
     #[tokio::test]
     async fn test_sync_delete_file_cleans_all() {
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
@@ -10274,7 +10274,7 @@ mod tests {
         assert_eq!(meili.code_documents.read().await.len(), 1);
 
         // Step 2: Delete the file (simulating what watcher does)
-        GraphStore::delete_file(neo4j.as_ref(), &file_path)
+        CodeStore::delete_file(neo4j.as_ref(), &file_path)
             .await
             .unwrap();
         orch.meili().delete_code(&file_path).await.unwrap();
@@ -10301,7 +10301,6 @@ mod tests {
     #[tokio::test]
     async fn test_sync_rename_file_old_deleted_new_created() {
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
@@ -10350,7 +10349,7 @@ mod tests {
         orch.meili().index_code(&doc).await.unwrap();
 
         // Step 2: Simulate rename = delete old + create new
-        GraphStore::delete_file(neo4j.as_ref(), &old_path)
+        CodeStore::delete_file(neo4j.as_ref(), &old_path)
             .await
             .unwrap();
         orch.meili().delete_code(&old_path).await.unwrap();
@@ -10420,7 +10419,6 @@ mod tests {
         // EXTENDS/IMPLEMENTS don't exist yet (Plans 5/6).
         // This test validates that the cleanup_sync_data handles them as no-ops
         // and that the pattern documentation exists for future implementation.
-        use crate::neo4j::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with_stores;
 
         let (state, neo4j, _meili) = mock_app_state_with_stores();
@@ -10428,7 +10426,7 @@ mod tests {
 
         // cleanup_sync_data should handle EXTENDS/IMPLEMENTS without error
         // (forward-compatible no-ops)
-        let deleted = GraphStore::cleanup_sync_data(neo4j.as_ref()).await.unwrap();
+        let deleted = CodeStore::cleanup_sync_data(neo4j.as_ref()).await.unwrap();
         assert_eq!(deleted, 0, "Empty store cleanup should delete 0 entities");
 
         // Verify the Plans 5/6 cleanup pattern documentation exists
@@ -10444,7 +10442,6 @@ mod tests {
     async fn test_sync_bulk_delete_triggers_full_sync_path() {
         use crate::meilisearch::traits::SearchStore;
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with_stores;
 
         let (state, neo4j, meili) = mock_app_state_with_stores();
@@ -10454,7 +10451,7 @@ mod tests {
         // Create 60 files (> BULK_SYNC_THRESHOLD = 50)
         for i in 0..60 {
             let path = format!("/tmp/bulk-test/src/file_{}.rs", i);
-            GraphStore::upsert_file(
+            CodeStore::upsert_file(
                 neo4j.as_ref(),
                 &FileNode {
                     path: path.clone(),
@@ -10467,7 +10464,7 @@ mod tests {
             .await
             .unwrap();
             // Link to project (mock uses project_files for delete_stale_files)
-            GraphStore::link_file_to_project(neo4j.as_ref(), &path, project_id)
+            CodeStore::link_file_to_project(neo4j.as_ref(), &path, project_id)
                 .await
                 .unwrap();
         }
@@ -10480,7 +10477,7 @@ mod tests {
             .collect();
 
         let (files_deleted, _symbols_deleted, stale_paths) =
-            GraphStore::delete_stale_files(neo4j.as_ref(), project_id, &valid_paths)
+            CodeStore::delete_stale_files(neo4j.as_ref(), project_id, &valid_paths)
                 .await
                 .unwrap();
 
@@ -10499,14 +10496,13 @@ mod tests {
     #[tokio::test]
     async fn test_sync_empty_scan_does_not_purge_project() {
         use crate::neo4j::models::FileNode;
-        use crate::neo4j::GraphStore;
         use crate::test_helpers::mock_app_state_with_stores;
 
         let (state, neo4j, _meili) = mock_app_state_with_stores();
         let project_id = Uuid::new_v4();
         for i in 0..3 {
             let path = format!("/tmp/empty-scan-test/src/file_{}.rs", i);
-            GraphStore::upsert_file(
+            CodeStore::upsert_file(
                 neo4j.as_ref(),
                 &FileNode {
                     path: path.clone(),
@@ -10518,7 +10514,7 @@ mod tests {
             )
             .await
             .unwrap();
-            GraphStore::link_file_to_project(neo4j.as_ref(), &path, project_id)
+            CodeStore::link_file_to_project(neo4j.as_ref(), &path, project_id)
                 .await
                 .unwrap();
         }
@@ -10538,7 +10534,6 @@ mod tests {
     #[tokio::test]
     async fn test_sync_add_delete_same_window_consistent() {
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
@@ -10592,7 +10587,7 @@ mod tests {
         assert_eq!(meili.code_documents.read().await.len(), 2);
 
         // Simulate: delete file_a + modify file_b in same window
-        GraphStore::delete_file(neo4j.as_ref(), &file_a)
+        CodeStore::delete_file(neo4j.as_ref(), &file_a)
             .await
             .unwrap();
         orch.meili().delete_code(&file_a).await.unwrap();
@@ -10665,7 +10660,6 @@ mod tests {
     #[tokio::test]
     async fn test_sync_delete_import_source_cleans_relations() {
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
@@ -10747,7 +10741,7 @@ mod tests {
         assert_eq!(neo4j.imports.read().await.len(), 1);
 
         // Delete the imported file — DETACH DELETE should clean relations
-        GraphStore::delete_file(neo4j.as_ref(), &imported)
+        CodeStore::delete_file(neo4j.as_ref(), &imported)
             .await
             .unwrap();
 
@@ -10765,7 +10759,6 @@ mod tests {
     #[tokio::test]
     async fn test_sync_meilisearch_no_phantom_after_deletion() {
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
@@ -10856,7 +10849,6 @@ mod tests {
         // chunking logic). The actual Neo4j UNWIND is tested via integration tests.
         use crate::neo4j::batch::{BoltMap, BATCH_SIZE};
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
         use crate::parser::FunctionCall;
 
         let start = std::time::Instant::now();
@@ -10888,7 +10880,7 @@ mod tests {
                 })
                 .collect();
 
-            GraphStore::batch_upsert_functions(mock_store.as_ref(), &functions)
+            CodeStore::batch_upsert_functions(mock_store.as_ref(), &functions)
                 .await
                 .unwrap();
         }
@@ -10925,7 +10917,7 @@ mod tests {
                 })
                 .collect();
 
-            GraphStore::batch_create_call_relationships(mock_store.as_ref(), &calls, None)
+            CodeStore::batch_create_call_relationships(mock_store.as_ref(), &calls, None)
                 .await
                 .unwrap();
         }
@@ -10954,7 +10946,7 @@ mod tests {
                 })
                 .collect();
 
-            GraphStore::batch_create_import_relationships(mock_store.as_ref(), &rels)
+            CodeStore::batch_create_import_relationships(mock_store.as_ref(), &rels)
                 .await
                 .unwrap();
         }
@@ -11006,7 +10998,6 @@ mod tests {
         // Validates that the cleanup LIMIT loop pattern scales correctly
         // with the mock store's cleanup_sync_data implementation.
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
 
         let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
 
@@ -11017,7 +11008,7 @@ mod tests {
             let file_path = format!("{}/file_{}.rs", file_base, file_idx);
 
             // First create the file node
-            GraphStore::upsert_file(
+            CodeStore::upsert_file(
                 mock_store.as_ref(),
                 &FileNode {
                     path: file_path.clone(),
@@ -11047,7 +11038,7 @@ mod tests {
                 })
                 .collect();
 
-            GraphStore::batch_upsert_functions(mock_store.as_ref(), &functions)
+            CodeStore::batch_upsert_functions(mock_store.as_ref(), &functions)
                 .await
                 .unwrap();
         }
@@ -11056,7 +11047,7 @@ mod tests {
         assert_eq!(mock_store.files.read().await.len(), 10);
 
         // cleanup_sync_data should remove everything
-        let deleted = GraphStore::cleanup_sync_data(mock_store.as_ref())
+        let deleted = CodeStore::cleanup_sync_data(mock_store.as_ref())
             .await
             .unwrap();
         assert!(deleted > 0, "Should have deleted entities");
@@ -11323,7 +11314,6 @@ mod tests {
     async fn the_feature_graph_proposal_opens_its_one_shot_through_the_provider_registry() {
         use nexus_claude::agent::{AgentEvent, Cost, CostBasis, PolicyMode, StopReason};
         let graph = crate::neo4j::mock::MockGraphStore::new();
-        use crate::neo4j::GraphStore as _;
         let project = crate::test_helpers::test_project();
         graph.create_project(&project).await.unwrap();
         let fake = crate::chat::agent_runtime::fake::FakeProvider::new();

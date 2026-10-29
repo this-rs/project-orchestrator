@@ -31,6 +31,8 @@
 //! enrichment — and that loss is written here ([`HookLedger::record_lost`]), per
 //! hook point and tool, never silent. A reset does not forget it: it says what the
 //! session MISSED, not what it has in context.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -203,6 +205,8 @@ impl nexus_claude::HookCallback for HookLedgerReset {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn key() -> InjectionKey {
         InjectionKey::Persona(Uuid::from_u128(1))

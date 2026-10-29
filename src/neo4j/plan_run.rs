@@ -1,4 +1,6 @@
 //! Neo4j PlanRun operations — runner execution state persistence
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use crate::runner::{PlanRunStatus, RunnerState, TriggerSource};
@@ -358,6 +360,8 @@ impl Neo4jClient {
 #[cfg(test)]
 mod injection_tests {
     use super::list_all_plan_runs_cypher;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn plan_runs_query_binds_workspace_slug_and_status() {

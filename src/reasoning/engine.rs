@@ -7,6 +7,8 @@
 //!
 //! The engine reuses the existing embedding infrastructure (`EmbeddingProvider`)
 //! and graph store (`GraphStore`) via dependency injection.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -873,6 +875,8 @@ mod tests {
     use super::*;
     use crate::embeddings::MockEmbeddingProvider;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use std::time::Duration;
 
     fn make_engine() -> ReasoningTreeEngine {

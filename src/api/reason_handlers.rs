@@ -5,6 +5,8 @@
 //! - `POST /api/reason/{tree_id}/feedback` — Provide feedback on a reasoning tree
 
 use crate::api::handlers::{AppError, OrchestratorState};
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 use crate::reasoning::models::ReasoningTreeConfig;
 use axum::{
     extract::{Path, State},
@@ -391,6 +393,8 @@ pub async fn reason_feedback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use serde_json::json;
 
     #[test]
@@ -627,7 +631,6 @@ mod tests {
     #[tokio::test]
     async fn test_feedback_success_links_tree_to_run() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
         use std::sync::Arc;
 
         let graph = Arc::new(MockGraphStore::new());
@@ -688,7 +691,6 @@ mod tests {
     #[tokio::test]
     async fn test_feedback_refuses_nodes_of_another_project() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
         use std::sync::Arc;
 
         let graph = Arc::new(MockGraphStore::new());
@@ -732,7 +734,6 @@ mod tests {
     #[tokio::test]
     async fn test_feedback_checks_the_project_of_followed_decisions() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
         use std::sync::Arc;
 
         let graph = Arc::new(MockGraphStore::new());
@@ -802,7 +803,6 @@ mod tests {
     #[tokio::test]
     async fn test_feedback_same_project_nodes_are_reinforced() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
         use std::sync::Arc;
 
         let graph = Arc::new(MockGraphStore::new());

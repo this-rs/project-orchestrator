@@ -9,6 +9,8 @@
 //! and injected into the system prompt or enrichment context.
 //!
 //! **Performance target:** < 300ms total for all queries (parallel execution).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::sync::Arc;
 
@@ -469,6 +471,8 @@ fn format_time_ago(dt: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_empty_resume_has_no_content() {

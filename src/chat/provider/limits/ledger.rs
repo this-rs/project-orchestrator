@@ -39,6 +39,8 @@
 //! [`Clock`] is injected: no test sleeps, and no rule depends on the machine's
 //! wall clock. [`ManualClock`] is what the tests drive; [`SystemClock`] is what
 //! production uses.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -1049,6 +1051,8 @@ mod tests {
     use crate::chat::provider::settings::{
         CredentialScope, InstanceScope, ModelScope, RateLimitWindow,
     };
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const T0: &str = "2026-10-08T12:00:00Z";

@@ -36,6 +36,8 @@
 //!   omis", which only counts readable nodes cut by the budget. Refused nodes
 //!   are kept as opaque ids in [`AnchorExpansion::denied`] for audit and are
 //!   never rendered, so the number of refused nodes cannot leak.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::chat::anchor::{Anchor, AnchorRole, AnchorState, AnchorTargetType};
 use crate::chat::untrusted::{self, Origin};
@@ -45,6 +47,8 @@ use crate::graph::neighborhood::{
 };
 use crate::neo4j::models::ExecutionPlace;
 use crate::neo4j::GraphStore;
+
+#[allow(unused_imports)]
 use crate::sharing::consent_gate::{ConsentReader, ReadDenial, ReadVerdict};
 use anyhow::Result;
 use hmac::{digest::KeyInit, Hmac, Mac};
@@ -1679,6 +1683,9 @@ mod tests {
     use crate::episodes::distill_models::{SharingConsent, SharingMode, SharingPolicy};
     use crate::graph::neighborhood::{RawNode, ScopedNode};
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    #[allow(unused_imports)]
     use crate::test_helpers::{test_chat_session, test_project_named};
 
     const SECRET: &[u8] = b"session-secret";

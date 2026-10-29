@@ -2,6 +2,8 @@
 //!
 //! These handlers back the MCP `neural_routing` mega-tool and provide
 //! the REST surface for neural route learning status and configuration.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
 use axum::{extract::State, Json};
@@ -281,6 +283,8 @@ mod tests {
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::events::EventBus;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, mock_neural_router};
     use std::sync::Arc;

@@ -2,6 +2,8 @@
 //!
 //! Tracks which peers have acknowledged a tombstone and provides
 //! a list of pending tombstones that need re-broadcast.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -109,6 +111,8 @@ impl TombstoneScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[tokio::test]
     async fn track_and_get_pending() {

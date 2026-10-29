@@ -10,6 +10,8 @@
 //! - **Skip**: abort import, return conflict info
 //! - **Merge**: add new notes/decisions to the existing skill
 //! - **Replace**: delete the existing skill, create a fresh one
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -19,6 +21,7 @@ use uuid::Uuid;
 
 use crate::episodes::PortableEpisode;
 use crate::neo4j::traits::GraphStore;
+#[allow(unused_imports)]
 use crate::notes::models::{MemoryHorizon, Note, NoteImportance, NoteScope, NoteStatus, NoteType};
 use crate::protocol::models::{
     Protocol, ProtocolCategory, ProtocolState, ProtocolTransition, StateType,
@@ -815,6 +818,8 @@ mod tests {
     use super::*;
     use crate::identity::InstanceIdentity;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::skills::models::SkillTrigger;
     use crate::skills::package::*;
 

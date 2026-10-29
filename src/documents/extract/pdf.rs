@@ -29,6 +29,8 @@
 //! [`ExtractError::Malformed`] rather than an empty [`ExtractedText`], because
 //! downstream nothing can tell an empty extraction from a document that is
 //! genuinely blank: it chunks into nothing and aligns to nothing, silently.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -230,6 +232,8 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     /// Build a syntactically valid PDF in memory.
     ///

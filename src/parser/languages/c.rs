@@ -6,6 +6,8 @@
 //! - Typedefs
 //! - Macros/defines
 //! - Header includes
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::neo4j::models::*;
 use crate::parser::helpers::*;

@@ -4,6 +4,8 @@
 //! 1. Hardcoded base prompt (~2500 words) — protocols, data model, git workflow, statuses, best practices
 //! 2. Dynamic context — oneshot Opus via send_and_receive() analyzes user request + Neo4j data
 //!    to build a tailored contextual section (<500 words). Programmatic fallback if oneshot fails.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 /// Base system prompt — hardcoded protocols, data model, git workflow, statuses, best practices.
 /// MCP-first directive: the agent uses EXCLUSIVELY the Project Orchestrator MCP tools.
@@ -1833,6 +1835,8 @@ use crate::neo4j::models::{
     PlanNode, ProjectNode, ReleaseNode, WorkspaceNode,
 };
 use crate::neo4j::GraphStore;
+
+#[allow(unused_imports)]
 use crate::notes::models::{Note, NoteFilters, NoteImportance, NoteStatus, NoteType};
 
 // ============================================================================
@@ -2662,6 +2666,8 @@ pub fn truncate_dynamic_context_default(dynamic_context: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_base_system_prompt_contains_key_sections() {

@@ -5,6 +5,8 @@
 //! - All steps are completed or skipped
 //! - Git diff is clean (no sensitive files, reasonable size)
 //! - Tests pass (optional, if configured)
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use crate::neo4j::models::StepStatus;
 use crate::neo4j::traits::GraphStore;
@@ -781,6 +783,8 @@ fn extract_stat_number(line: &str, keyword: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::neo4j::StepNode;
 
     /// The per-check helpers now report a [`CheckOutcome`]. The historical tests

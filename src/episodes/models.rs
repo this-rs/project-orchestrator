@@ -12,6 +12,8 @@
 //! 3. **Outcome**: What it produced (notes, decisions, commits)
 //! 4. **Validation**: How the outcome was evaluated (feedback, evidence)
 //! 5. **Lesson**: The abstract, portable pattern extracted (optional)
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -433,6 +435,8 @@ impl Episode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn sample_episode() -> Episode {
         Episode {

@@ -9,6 +9,8 @@
 //! This module is the storage adapter's half of the GNN sampling: it drives the
 //! graph to build the [`neural_routing_gnn::sampler::SubGraph`] records that the
 //! models consume. The record shapes themselves live in `neural-routing-gnn`.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -365,6 +367,8 @@ pub enum SamplerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_sampler_config_default() {

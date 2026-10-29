@@ -26,6 +26,8 @@
 //! Nothing here takes a routing decision: the settings are stored and shown
 //! (also summarised in `GET /api/chat/providers`), the resolver ignores them
 //! until the cognitive router lands.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::sync::{Arc, RwLock};
 
@@ -627,6 +629,8 @@ fn require_human_reader(state: &OrchestratorState, claims: &Claims) -> Result<()
 mod tests {
     use crate::api::handlers::{OrchestratorState, ServerState};
     use crate::api::routes::create_router;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_bearer_token};
     use axum::body::Body;

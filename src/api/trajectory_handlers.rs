@@ -5,6 +5,8 @@
 //! - GET  /api/trajectories/stats    — statistics
 //! - GET  /api/trajectories/:id      — get by ID with nodes
 //! - POST /api/trajectories/similar  — vector similarity search
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::handlers::{AppError, OrchestratorState};
 use axum::{
@@ -211,6 +213,8 @@ mod tests {
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::events::EventBus;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, mock_neural_router, mock_trajectory_store};
     use std::sync::Arc;

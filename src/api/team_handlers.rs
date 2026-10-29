@@ -6,6 +6,8 @@
 //! another session, nor reach a session outside its own team (its parent and its
 //! children, `chat::team::team_of`). A person has the chat itself: these routes answer
 //! an agent only.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
@@ -195,6 +197,8 @@ pub async fn get_team(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn req(kind: Option<&str>) -> TeamMessageRequest {
         TeamMessageRequest {
@@ -225,7 +229,6 @@ mod tests {
         crate::neo4j::models::ChatSessionNode,
         crate::neo4j::models::ChatSessionNode,
     ) {
-        use crate::neo4j::GraphStore;
         use std::sync::Arc;
 
         let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());

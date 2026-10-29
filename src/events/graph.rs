@@ -7,6 +7,8 @@
 //!
 //! Each event carries a `kind: "graph"` field so the frontend can distinguish
 //! them from CRUD events in the same WebSocket connection.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -324,6 +326,8 @@ pub struct PropagatedNote {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_graph_layer_serde_roundtrip() {

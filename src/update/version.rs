@@ -8,6 +8,8 @@
 //! update. For those builds we use `git describe --tags` (captured by
 //! `build.rs` as `PO_GIT_DESCRIBE`) to find the release the checkout is based
 //! on, e.g. `v0.0.15-17-ge15ceda` → base `0.0.15`, 17 commits ahead.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use semver::Version;
 use serde::Serialize;
@@ -122,6 +124,8 @@ pub fn current_build() -> BuildVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn v(s: &str) -> Version {
         parse_version(s).unwrap()

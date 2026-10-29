@@ -9,6 +9,8 @@
 //! - **Shrink**: Notes left the cluster (synapses broken) → remove members
 //!
 //! Evolutions are traced as observation Notes for auditability.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, HashSet};
 
@@ -18,6 +20,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
+#[allow(unused_imports)]
 use crate::notes::{MemoryHorizon, Note, NoteImportance, NoteScope, NoteStatus, NoteType};
 use crate::skills::detection::{jaccard_similarity, SkillCandidate};
 use crate::skills::models::SkillNode;
@@ -915,6 +918,8 @@ pub async fn execute_evolution(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn make_candidate(id: u32, members: Vec<&str>) -> SkillCandidate {
         SkillCandidate {

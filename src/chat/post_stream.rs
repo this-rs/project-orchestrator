@@ -8,6 +8,8 @@
 //! - Streaming status updates
 //! - Event persistence to Neo4j
 //! - Memory/feedback/RFC recording
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::manager::ActiveSession;
 use super::provider::cognitive::segment::{Boundary, Segment};
@@ -31,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+#[allow(unused_imports)]
 use std::collections::VecDeque;
 
 /// Longest a single post-stream step may hold the turn.
@@ -1365,6 +1368,8 @@ pub(crate) async fn continuation_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn base_input() -> ObjectiveCheckInput {
         ObjectiveCheckInput {
@@ -1653,6 +1658,7 @@ mod integration_tests {
     use crate::chat::types::PendingMessageKind;
     use crate::meilisearch::mock::MockSearchStore;
     use crate::neo4j::mock::MockGraphStore;
+    #[allow(unused_imports)]
     use crate::neo4j::GraphStore;
     use crate::test_helpers::{test_project_named, test_task_titled};
     use std::collections::HashMap;
@@ -2375,6 +2381,7 @@ mod integration_tests {
 #[cfg(test)]
 mod bounded_step_tests {
     use super::bounded;
+    #[allow(unused_imports)]
     use std::time::Duration;
 
     #[tokio::test]

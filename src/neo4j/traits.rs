@@ -90,7 +90,19 @@ impl Default for StoreCapabilities {
 /// Every public async method of `Neo4jClient` (excluding `new`, `init_schema`,
 /// `execute`, `execute_with_params`, and private helpers) is represented here.
 #[async_trait]
-pub trait GraphStore: Send + Sync {
+pub trait GraphStore:
+    ProjectStore
+    + WorkspaceStore
+    + CodeStore
+    + PlanStore
+    + DecisionStore
+    + CommitStore
+    + ReleaseStore
+    + NoteStore
+    + AnalyticsStore
+    + Send
+    + Sync
+{
     /// Manifest of what this store actually supports.
     ///
     /// Every adapter states it explicitly, with the values its own code proves;
@@ -98,6 +110,39 @@ pub trait GraphStore: Send + Sync {
     /// flattering manifest by accident.
     fn capabilities(&self) -> StoreCapabilities;
 
+    /// Task counters for many entities at once (one round trip for list cards).
+    ///
+    /// The default implementation loops over the per-entity task getters so
+    /// every store (including mocks) supports it; `Neo4jClient` overrides it
+    /// with a single aggregated query.
+    async fn get_progress_batch(
+        &self,
+        kind: ProgressKind,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, TaskCounts>> {
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        for id in ids {
+            let tasks = match kind {
+                ProgressKind::Plan => self.get_plan_tasks(*id).await?,
+                ProgressKind::Project => self.get_project_tasks(*id).await?,
+                ProgressKind::Milestone => self.get_milestone_tasks(*id).await?,
+            };
+            out.insert(*id, TaskCounts::from_tasks(&tasks));
+        }
+        Ok(out)
+    }
+}
+
+// ============================================================================
+// Project management domain
+// ============================================================================
+
+/// The project-management domain: the project entity and its lifecycle.
+///
+/// `GraphStore` is its supertrait, so a consumer keeps calling these methods
+/// on a `dyn GraphStore` without knowing the domain exists.
+#[async_trait]
+pub trait ProjectStore: Send + Sync {
     // ========================================================================
     // Project operations
     // ========================================================================
@@ -133,7 +178,18 @@ pub trait GraphStore: Send + Sync {
     /// Delete a project and all its data.
     /// `project_name` is used to tag archived notes/decisions with the source project.
     async fn delete_project(&self, id: Uuid, project_name: &str) -> Result<()>;
+}
 
+// ============================================================================
+// Workspace domain
+// ============================================================================
+
+/// The workspace domain: workspaces, their milestones, resources and components.
+///
+/// `GraphStore` is its supertrait: a consumer keeps calling these methods on a
+/// `dyn GraphStore` without knowing the domain exists.
+#[async_trait]
+pub trait WorkspaceStore: Send + Sync {
     // ========================================================================
     // Workspace operations
     // ========================================================================
@@ -184,7 +240,6 @@ pub trait GraphStore: Send + Sync {
         &self,
         workspace_id: Uuid,
     ) -> Result<crate::neo4j::models::CouplingMatrix>;
-
     // ========================================================================
     // Workspace Milestone operations
     // ========================================================================
@@ -383,7 +438,19 @@ pub trait GraphStore: Send + Sync {
         &self,
         workspace_id: Uuid,
     ) -> Result<Vec<(ComponentNode, Option<String>, Vec<ComponentDependency>)>>;
+}
 
+// ============================================================================
+// Code domain
+// ============================================================================
+
+/// The code domain: files, symbols, their batch ingestion, heritage, processes
+/// and the exploration queries built on top of them.
+///
+/// `GraphStore` is its supertrait: a consumer keeps calling these methods on a
+/// `dyn GraphStore` without knowing the domain exists.
+#[async_trait]
+pub trait CodeStore: Send + Sync {
     // ========================================================================
     // File operations
     // ========================================================================
@@ -824,7 +891,18 @@ pub trait GraphStore: Send + Sync {
         &self,
         type_name: &str,
     ) -> Result<Vec<ImplBlockDetailNode>>;
+}
 
+// ============================================================================
+// Plan domain
+// ============================================================================
+
+/// The planning domain: plans and their tasks, steps, day plan and constraints.
+///
+/// `GraphStore` is its supertrait: a consumer keeps calling these methods on a
+/// `dyn GraphStore` without knowing the domain exists.
+#[async_trait]
+pub trait PlanStore: Send + Sync {
     // ========================================================================
     // Plan operations
     // ========================================================================
@@ -1044,7 +1122,15 @@ pub trait GraphStore: Send + Sync {
 
     /// Delete a constraint
     async fn delete_constraint(&self, constraint_id: Uuid) -> Result<()>;
+}
 
+// ============================================================================
+// Decision domain
+// ============================================================================
+
+/// The decision domain: architectural decisions and their links to the graph.
+#[async_trait]
+pub trait DecisionStore: Send + Sync {
     // ========================================================================
     // Decision operations
     // ========================================================================
@@ -1162,7 +1248,15 @@ pub trait GraphStore: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<DecisionListItem>, usize)>;
+}
 
+// ============================================================================
+// Commit domain
+// ============================================================================
+
+/// The commit domain: commits, what they touched and what changed together.
+#[async_trait]
+pub trait CommitStore: Send + Sync {
     // ========================================================================
     // Dependency analysis
     // ========================================================================
@@ -1307,7 +1401,15 @@ pub trait GraphStore: Send + Sync {
         min_score: f64,
         limit: i64,
     ) -> Result<Vec<TransitiveCoChanger>>;
+}
 
+// ============================================================================
+// Release domain
+// ============================================================================
+
+/// The release domain: releases, environments and their deployments.
+#[async_trait]
+pub trait ReleaseStore: Send + Sync {
     // ========================================================================
     // Release operations
     // ========================================================================
@@ -1473,28 +1575,6 @@ pub trait GraphStore: Send + Sync {
     /// Get project progress stats
     async fn get_project_progress(&self, project_id: Uuid) -> Result<(u32, u32, u32, u32)>;
 
-    /// Task counters for many entities at once (one round trip for list cards).
-    ///
-    /// The default implementation loops over the per-entity task getters so
-    /// every store (including mocks) supports it; `Neo4jClient` overrides it
-    /// with a single aggregated query.
-    async fn get_progress_batch(
-        &self,
-        kind: ProgressKind,
-        ids: &[Uuid],
-    ) -> Result<std::collections::HashMap<Uuid, TaskCounts>> {
-        let mut out = std::collections::HashMap::with_capacity(ids.len());
-        for id in ids {
-            let tasks = match kind {
-                ProgressKind::Plan => self.get_plan_tasks(*id).await?,
-                ProgressKind::Project => self.get_project_tasks(*id).await?,
-                ProgressKind::Milestone => self.get_milestone_tasks(*id).await?,
-            };
-            out.insert(*id, TaskCounts::from_tasks(&tasks));
-        }
-        Ok(out)
-    }
-
     /// Get all task dependencies for a project (across all plans)
     async fn get_project_task_dependencies(&self, project_id: Uuid) -> Result<Vec<(Uuid, Uuid)>>;
 
@@ -1574,7 +1654,15 @@ pub trait GraphStore: Send + Sync {
         sort_by: Option<&str>,
         sort_order: &str,
     ) -> Result<(Vec<ProjectNode>, usize)>;
+}
 
+// ============================================================================
+// Note domain
+// ============================================================================
+
+/// The note domain: documents, knowledge notes and what links them.
+#[async_trait]
+pub trait NoteStore: Send + Sync {
     // ========================================================================
     // Document operations
     // ========================================================================
@@ -1853,7 +1941,16 @@ pub trait GraphStore: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<Note>, usize)>;
+}
 
+// ============================================================================
+// Analytics and neural domain
+// ============================================================================
+
+/// The analytics domain: embeddings, synapses, energy and the visualisation
+/// batches built on top of them.
+#[async_trait]
+pub trait AnalyticsStore: Send + Sync {
     // ========================================================================
     // Code embedding operations (File & Function vector search)
     // ========================================================================
@@ -4556,7 +4653,8 @@ pub trait GraphStore: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::StoreCapabilities;
-
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     /// The ten capabilities the manifest exposes, in declaration order. A field
     /// added to `StoreCapabilities` without updating this list (or a field
     /// renamed) is caught by `capabilities_manifest_serializes_all_keys`.

@@ -17,6 +17,8 @@
 //! The decision carries no price: the caller supplies a [`PriceLookup`] (the
 //! nexus model prices, decision A1). [`build_report`] uses none, so its cost
 //! figure is `None` until a lookup is wired through [`build_report_with`].
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::BTreeMap;
 
@@ -420,6 +422,8 @@ mod tests {
     use crate::chat::provider::cognitive::mode::{LearningStage, ProviderRoutingMode};
     use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
     use crate::chat::provider::cognitive::store::InMemoryRoutingStore;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use std::collections::HashMap;
     use uuid::Uuid;
 

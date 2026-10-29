@@ -7,6 +7,8 @@
 //!
 //! The filter applies to automatic slots only. A choice the caller named
 //! (request, task, persona) is never filtered nor substituted (A16, A20).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -439,6 +441,8 @@ mod tests {
     use super::*;
     use crate::chat::provider::cognitive::signature::{ContextHints, TaskClass};
     use crate::chat::provider::resolver::CLAUDE_CODE;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     fn good() -> ModelFacts {
         ModelFacts {
@@ -649,6 +653,8 @@ mod tests {
     mod claude_code_window {
         use super::*;
         use crate::chat::model_catalog::{live_snapshot_from_listing, ModelCatalogCache};
+        #[allow(unused_imports)]
+        use crate::neo4j::traits::*;
         use nexus_claude::providers::claude_code::ClaudeCodeConfig;
 
         fn caps(model: &str) -> Capabilities {

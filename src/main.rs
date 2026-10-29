@@ -1,6 +1,8 @@
 //! Project Orchestrator - Main Server
 //!
 //! An AI agent orchestrator with Neo4j, Meilisearch, and Tree-sitter.
+#[allow(unused_imports)]
+use project_orchestrator::neo4j::traits::*;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

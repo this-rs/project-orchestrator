@@ -18,6 +18,8 @@
 //! No response except `agent/read` ever contains a value, and no request body
 //! is logged: the handlers take bodies as typed structs whose secret fields are
 //! wiped on drop and never formatted.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use axum::{
     extract::{Path, State},
@@ -600,6 +602,8 @@ mod tests {
     use crate::api::routes::create_router;
     use crate::auth::jwt::{decode_jwt, encode_jwt, generate_session_token, generate_vault_token};
     use crate::events::EventBus;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::mock_app_state;
     use crate::AuthConfig;

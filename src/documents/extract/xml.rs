@@ -1,4 +1,6 @@
 //! Helpers shared by the XML-in-a-ZIP extractors (`.docx`, `.pptx`).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 /// Resolve one entity reference to the text it stands for.
 ///

@@ -3,6 +3,8 @@
 //! Runs `decay_synapses` to weaken unused neural links,
 //! then `update_energy_scores` to decay note energy based on
 //! time since last activation (exponential half-life model).
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::time::Duration;
 
@@ -100,6 +102,8 @@ impl HeartbeatCheck for SynapseDecayCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_synapse_decay_check_name() {
@@ -115,7 +119,6 @@ mod tests {
 
     #[tokio::test]
     async fn the_shadow_pass_runs_only_when_the_layer_is_on_for_a_project() {
-        use crate::neo4j::traits::GraphStore;
         let graph = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let project = uuid::Uuid::new_v4();
         let mut ids = Vec::new();

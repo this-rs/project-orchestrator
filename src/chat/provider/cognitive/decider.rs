@@ -5,6 +5,8 @@
 //! the same decision, which is what makes a decision replayable.
 //! [`CognitiveDecider`] only loads the arms, calls it, and PERSISTS the result
 //! before returning it, applied or not.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use std::sync::{Arc, RwLock};
 
@@ -892,6 +894,8 @@ impl CognitiveRouting {
 #[cfg(test)]
 mod utility_core_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn the_utility_is_the_posterior_mean_minus_the_weighted_penalties() {
@@ -925,6 +929,7 @@ mod tests {
     use crate::chat::provider::cognitive::mode::RoutingSettings;
     use crate::chat::provider::cognitive::signature::{ContextHints, TaskClass};
     use crate::chat::provider::cognitive::store::{ArmKey, InMemoryRoutingStore};
+    #[allow(unused_imports)]
     use nexus_claude::agent::{CostBasis, ModelPrice};
 
     fn facts(provider: &str, model: &str, price: f64) -> ModelFacts {

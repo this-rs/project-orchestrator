@@ -2,6 +2,8 @@
 //!
 //! Spawns `claude auth status` (which outputs JSON) and parses the result
 //! to determine authentication state.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use nexus_claude::find_claude_cli;
 use serde::{Deserialize, Serialize};
@@ -129,6 +131,8 @@ async fn auth_status_of(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_cli_auth_status_serialization() {

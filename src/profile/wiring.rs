@@ -5,6 +5,8 @@
 //! to the SignalCollector without modifying existing function signatures.
 //!
 //! Each function is non-blocking (< 1ms) — it just sends on the channel.
+#[allow(unused_imports)]
+use crate::neo4j::traits::*;
 
 use super::collector::{is_follow_up_question, is_response_truncated, SignalCollector};
 use super::signals::BehaviorSignal;
@@ -104,6 +106,8 @@ pub fn emit_language_detected(collector: &SignalCollector, session_id: Uuid, lan
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
     use crate::profile::collector::create_signal_channel;
 
     #[tokio::test]
