@@ -298,16 +298,11 @@ fn build_definition(
 
 fn curated_lookup(id: &str) -> Option<ModelDefinition> {
     CURATED_ORDER.iter().find(|(cid, ..)| *cid == id).map(
-        |(id, family, version, tier, description, max_input_tokens)| {
-            build_definition(
-                id,
-                family,
-                version,
-                tier,
-                description,
-                None,
-                *max_input_tokens,
-            )
+        |(id, family, version, tier, description, _max_input_tokens)| {
+            // The curated window is applied only in `static_fallback_models`;
+            // `merge_catalog` relies on the API for limits, so curated_lookup
+            // must not inject a guess that the live merge would carry forward.
+            build_definition(id, family, version, tier, description, None, None)
         },
     )
 }
@@ -392,7 +387,11 @@ fn resolve_model(id: &str, api_display_name: Option<&str>) -> ModelDefinition {
 fn static_fallback_models() -> Vec<ModelDefinition> {
     CURATED_ORDER
         .iter()
-        .map(|(id, ..)| curated_lookup(id).expect("id comes from CURATED_ORDER itself"))
+        .map(|(id, _, _, _, _, max_input_tokens)| {
+            let mut def = curated_lookup(id).expect("id comes from CURATED_ORDER itself");
+            def.max_input_tokens = *max_input_tokens;
+            def
+        })
         .collect()
 }
 
@@ -1949,18 +1948,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_offline_catalog_is_not_live_and_knows_no_window() {
+    async fn test_offline_catalog_is_not_live_but_carries_curated_windows() {
         let snapshot = ModelCatalogCache::new(None).snapshot().await;
         assert!(!snapshot.live);
         assert!(!snapshot.models.is_empty());
-        assert!(snapshot.models.iter().all(|m| m.max_input_tokens.is_none()));
+        // The static fallback carries 200K windows so the cognitive router
+        // does not reject every model as WindowUnknown(CatalogOffline).
+        assert!(snapshot
+            .models
+            .iter()
+            .all(|m| m.max_input_tokens == Some(200_000)));
     }
 
     #[test]
     fn test_window_is_additive_on_the_wire() {
-        // Unknown: absent from the JSON the frontend reads (no new null field).
+        // Static fallback carries the curated 200K window for offline resilience.
         let json = serde_json::to_value(static_fallback_models()[0].clone()).unwrap();
-        assert!(json.get("maxInputTokens").is_none());
+        assert_eq!(json["maxInputTokens"], 200_000);
+        // Live catalog carries the API-reported window (1M for opus-5-5).
         let live = live_snapshot_from_listing(listing_with_windows());
         let json = serde_json::to_value(&live.models[0]).unwrap();
         assert_eq!(json["maxInputTokens"], 1_000_000);

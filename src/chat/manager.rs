@@ -20885,15 +20885,15 @@ mod tests {
         use crate::chat::provider::cognitive::decider::CognitiveRouting;
         use crate::chat::provider::cognitive::store::InMemoryRoutingStore;
         let state = mock_app_state();
-        // No key: the catalog never fetches and serves the static fallback, which
-        // knows no window.
+        // No key: the catalog never fetches and serves the static fallback,
+        // which carries the curated 200K window for offline resilience.
         let offline = ModelCatalogCache::new(None);
         assert!(offline
             .snapshot()
             .await
             .models
             .iter()
-            .all(|m| m.max_input_tokens.is_none()));
+            .all(|m| m.max_input_tokens == Some(200_000)));
         let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
             .with_cognitive_routing(
                 CognitiveRouting::new(Arc::new(InMemoryRoutingStore::new()))
@@ -20903,8 +20903,8 @@ mod tests {
             manager
                 .known_context_window(CLAUDE_CODE, "claude-sonnet-4-6")
                 .await,
-            None,
-            "the window is really unknown here"
+            Some(200_000),
+            "the static fallback now carries 200K"
         );
 
         // Creation (no snapshot yet) and a reopen whose snapshot states no window.
