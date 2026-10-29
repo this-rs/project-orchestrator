@@ -39,10 +39,6 @@ use uuid::Uuid;
 use super::trigger::EventTrigger;
 use super::types::{CrudAction, CrudEvent, EntityType, EventEmitter};
 use crate::neo4j::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 
 /// Type alias for async reaction handler functions.
 ///

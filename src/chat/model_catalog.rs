@@ -39,10 +39,6 @@ use crate::chat::provider::store as provider_store;
 use crate::events::{EntityType, EventEmitter};
 use crate::neo4j::models::{AlertNode, AlertSeverity};
 use crate::neo4j::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 use crate::vault::VaultService;
 
 /// `alert_type` under which a newly released model is recorded. Doubles as

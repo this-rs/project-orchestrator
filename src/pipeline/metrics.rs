@@ -26,7 +26,6 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::{AnalyticsStore, NoteStore};
 use crate::notes::models::{MemoryHorizon, NoteFilters, NoteStatus};
 
 // ─── Constants ──────────────────────────────────────────────────────────────

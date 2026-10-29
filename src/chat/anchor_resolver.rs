@@ -46,10 +46,6 @@ use crate::graph::neighborhood::{
 use crate::neo4j::models::ExecutionPlace;
 use crate::neo4j::GraphStore;
 
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 use crate::sharing::consent_gate::{ConsentReader, ReadDenial, ReadVerdict};
 use anyhow::Result;
 use hmac::{digest::KeyInit, Hmac, Mac};

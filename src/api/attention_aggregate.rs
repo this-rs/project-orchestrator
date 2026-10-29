@@ -46,10 +46,6 @@ use crate::neo4j::models::{
 };
 use crate::neo4j::traits::GraphStore;
 
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 use crate::notes::{Note, NoteFilters, NoteStatus, NoteType};
 use crate::runner::eligibility::{resume_breakdown, runner_occupancy};
 use crate::runner::models::PlanRunStatus;

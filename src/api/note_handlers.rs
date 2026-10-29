@@ -5,7 +5,6 @@ use super::{PaginatedResponse, PaginationParams, SearchFilter};
 use crate::events::graph::GraphEvent;
 use crate::graph::algorithms::add_thermal_noise;
 
-use crate::neo4j::{AnalyticsStore, NoteStore, ProjectStore};
 use crate::notes::{
     BackfillProgress, CreateAnchorRequest, CreateNoteRequest, EntityType, LinkNoteRequest, Note,
     NoteContextResponse, NoteFilters, NoteImportance, NoteScope, NoteSearchHit, NoteStatus,

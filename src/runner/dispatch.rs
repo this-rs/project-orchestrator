@@ -17,10 +17,6 @@ use crate::chat::manager::ChatManager;
 use crate::events::EventEmitter;
 use crate::neo4j::traits::GraphStore;
 
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 use crate::orchestrator::context::ContextBuilder;
 use crate::runner::models::{
     RunnerConfig, SignalReservation, Trigger, TriggerFiring, TriggerSource,

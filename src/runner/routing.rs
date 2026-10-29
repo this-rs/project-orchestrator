@@ -24,10 +24,6 @@ use crate::chat::provider::cognitive::signature::TaskSignature;
 use crate::chat::provider::cognitive::store::RoutingArmStore;
 use crate::neo4j::agent_execution::{AgentExecutionNode, AgentExecutionStatus};
 use crate::neo4j::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 
 /// Every (instance, model) a project could use, with its facts. The scorer's
 /// wiring supplies the real one; tests supply a fixed list.

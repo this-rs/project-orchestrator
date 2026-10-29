@@ -45,10 +45,6 @@ use crate::api::attention::{
 use crate::chat::attention::{derive_attention, SessionAttentionInput};
 use crate::neo4j::models::{ChatEventRecord, ChatSessionNode, SessionLinkKind, SessionLinkRow};
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 
 /// `spawned_by` types that denote a PLAN run (the `run_id` is a plan run's).
 /// `protocol_runner` carries a PROTOCOL run id and must not be read as one.

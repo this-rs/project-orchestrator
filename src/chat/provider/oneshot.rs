@@ -20,10 +20,6 @@ use super::resolver::{self, Candidate, ResolveError, ResolveInput, Role, RoutedB
 use super::{catalog, native_factory, settings, store};
 use crate::chat::agent_runtime::ProviderSource;
 use crate::neo4j::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 
 /// How long the health preflight of a one-shot may take.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(10);

@@ -26,10 +26,6 @@ use std::sync::Arc;
 use crate::neo4j::models::DecisionNode;
 use crate::neo4j::traits::GraphStore;
 
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 use crate::neurons::AutoReinforcementConfig;
 use crate::notes::models::Note;
 use crate::skills::cache::{evaluate_cached_skill, SkillCache};

@@ -25,10 +25,6 @@ use crate::chat::manager::ChatManager;
 use crate::chat::types::{ChatRequest, SpawnedBy};
 use crate::neo4j::traits::GraphStore;
 
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 

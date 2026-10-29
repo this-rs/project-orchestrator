@@ -32,7 +32,6 @@ use crate::chat::enrichment::{
 use crate::neo4j::models::TaskStatus;
 use crate::neo4j::traits::GraphStore;
 
-use crate::neo4j::{AnalyticsStore, PlanStore, ProjectStore};
 use crate::reasoning::{ReasoningTree, ReasoningTreeConfig, ReasoningTreeEngine};
 
 // ============================================================================

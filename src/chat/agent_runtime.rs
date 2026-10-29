@@ -43,10 +43,6 @@ use super::types::{
 };
 use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 
 const BROADCAST_BUFFER: usize = 1024;
 

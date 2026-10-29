@@ -43,10 +43,6 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::expand_tilde;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 
 mod recovery;
 pub use recovery::{RecoveryReport, ScanReport};

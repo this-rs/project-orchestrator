@@ -28,10 +28,6 @@ use crate::runner::state::{AttemptCost, BudgetBreach, RunBudget, RunnerState};
 use crate::runner::vector::VectorCollector;
 use crate::runner::verifier::TaskVerifier;
 
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};

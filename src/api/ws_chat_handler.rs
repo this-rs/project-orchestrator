@@ -13,7 +13,6 @@ use super::ws_auth::CookieAuthResult;
 use crate::auth::jwt::Claims;
 use crate::chat::manager::{DeliveryRoute, MessageDeliveryError};
 
-use crate::neo4j::{AnalyticsStore, NoteStore};
 use axum::{
     extract::{
         ws::{Message, WebSocket},

@@ -59,10 +59,6 @@ use crate::documents::{
 use crate::embeddings::EmbeddingProvider;
 use crate::neo4j::document::{Document, DocumentChunk};
 use crate::neo4j::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 use crate::notes::EntityType;
 use axum::{
     extract::{Multipart, Path, Query, State},

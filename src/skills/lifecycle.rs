@@ -12,7 +12,6 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::{AnalyticsStore, DecisionStore, NoteStore};
 use crate::skills::models::{SkillNode, SkillStatus};
 
 // ============================================================================

@@ -27,7 +27,6 @@ use crate::chat::enrichment::{
 };
 use crate::neo4j::traits::GraphStore;
 
-use crate::neo4j::{AnalyticsStore, ProjectStore};
 use crate::neurons::intent::{IntentDetector, QueryIntentMode};
 use crate::skills::activation::evaluate_skill_match;
 use crate::skills::models::SkillNode;

@@ -60,10 +60,6 @@ use sha2::Sha256;
 use super::endpoint_guard::{origin_of, validate_endpoint, EndpointPolicy};
 use super::settings::project_scope;
 use crate::neo4j::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 use crate::vault::grants::Denied;
 use crate::vault::service::ServiceError;
 use crate::vault::VaultService;

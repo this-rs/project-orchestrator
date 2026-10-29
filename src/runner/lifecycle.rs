@@ -14,7 +14,6 @@ use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
 
-use crate::neo4j::{AnalyticsStore, PlanStore};
 use crate::protocol::engine;
 use crate::protocol::routing::{rank_protocols, ContextVector, DimensionWeights};
 

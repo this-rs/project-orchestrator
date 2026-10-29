@@ -24,10 +24,6 @@ use uuid::Uuid;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
 
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 use crate::notes::manager::NoteManager;
 
 /// Maximum number of corrective actions per evaluation cycle.

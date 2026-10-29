@@ -33,10 +33,6 @@ use super::wire::{RefResolution, RefStatus};
 use crate::chat::message_attachments;
 use crate::chat::types::ChatEvent;
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 
 /// Time the whole turn may spend resolving its references. A reference still
 /// unresolved when it runs out reads as unavailable: a slow store delays a

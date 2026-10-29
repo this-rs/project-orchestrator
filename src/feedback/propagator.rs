@@ -15,7 +15,6 @@ use crate::neo4j::traits::GraphStore;
 use crate::notes::models::{Note, NoteImportance, NoteType};
 
 use super::models::{ExplicitFeedback, FeedbackTarget, ImplicitSignal};
-use crate::neo4j::{AnalyticsStore, NoteStore};
 
 // ============================================================================
 // Constants

@@ -128,10 +128,6 @@ use uuid::Uuid;
 use super::types::{ChatEvent, SpawnedBy};
 use crate::neo4j::models::{ChatEventRecord, ChatSessionNode};
 use crate::neo4j::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 
 /// The value of `mirror_of` on a mirror of a Claude Code sub-agent.
 pub const MIRROR_OF_CLAUDE_CODE: &str = "claude_code";
