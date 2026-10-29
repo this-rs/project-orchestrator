@@ -313,13 +313,83 @@ pub mod conformance {
         let proto = Protocol::new(Some(p.id), "merge protocol", Uuid::new_v4());
         store.upsert_protocol(&proto).await.unwrap();
         store.upsert_protocol(&proto).await.unwrap();
-        let (_, total) = store.list_protocols(Some(p.id), None, 10, 0).await.unwrap();
-        assert_eq!(total, 1, "one protocol after two upserts");
+        // A project's listing is its OWN protocols plus the instance's transverse ones
+        // (`project_id IS NULL`), and the instance seeds some of those: `total` counts
+        // both, so it is not this project's count. The check is about the upsert, so it
+        // is read on the rows of this project (the just-upserted one is the freshest, so
+        // the first page always holds it).
+        let (listed, _total) = store
+            .list_protocols(Some(p.id), None, 100, 0)
+            .await
+            .unwrap();
+        let mine: Vec<&Protocol> = listed
+            .iter()
+            .filter(|listed| listed.project_id == Some(p.id))
+            .collect();
+        assert_eq!(mine.len(), 1, "one protocol after two upserts");
+        assert_eq!(mine[0].id, proto.id, "the row left is the one upserted");
 
         assert!(store.delete_protocol(proto.id).await.unwrap());
         store.delete_project(p.id, &p.name).await.unwrap();
         store.delete_file(&f1).await.unwrap();
         store.delete_file(&f2).await.unwrap();
+    }
+
+    /// The scope rule of the transverse library, on protocols — the one skills follow:
+    /// a project's listing holds that project's protocols PLUS the instance's transverse
+    /// ones (`project_id IS NULL`), and never another project's; a listing with no
+    /// project is the transverse set alone.
+    ///
+    /// This is the rule [`check_merge_idempotence`] used to trip over: `total` counts the
+    /// transverse protocols, and an instance that seeded some reads more than the
+    /// project's own count. Nothing pinned the rule until this check.
+    pub async fn check_protocol_scope_rule(store: &dyn GraphStore) {
+        let a = a_project("scope-a");
+        let b = a_project("scope-b");
+        store.create_project(&a).await.unwrap();
+        store.create_project(&b).await.unwrap();
+
+        let shared = Protocol::new(None, "scope transverse", Uuid::new_v4());
+        let own_a = Protocol::new(Some(a.id), "scope own a", Uuid::new_v4());
+        let own_b = Protocol::new(Some(b.id), "scope own b", Uuid::new_v4());
+        for protocol in [&shared, &own_a, &own_b] {
+            store.upsert_protocol(protocol).await.unwrap();
+        }
+
+        let (listed_a, _) = store
+            .list_protocols(Some(a.id), None, 100, 0)
+            .await
+            .unwrap();
+        let seen_a = ids(&listed_a, |p| p.id);
+        assert!(
+            seen_a.contains(&own_a.id),
+            "a project sees its own protocol"
+        );
+        assert!(
+            seen_a.contains(&shared.id),
+            "a project sees the transverse protocol"
+        );
+        assert!(
+            !seen_a.contains(&own_b.id),
+            "a project never sees another project's protocol"
+        );
+
+        let (listed_none, _) = store.list_protocols(None, None, 100, 0).await.unwrap();
+        let seen_none = ids(&listed_none, |p| p.id);
+        assert!(
+            seen_none.contains(&shared.id),
+            "the transverse scope lists the transverse protocol"
+        );
+        assert!(
+            !seen_none.contains(&own_a.id),
+            "the transverse scope lists no project's protocol"
+        );
+
+        for protocol in [&shared, &own_a, &own_b] {
+            assert!(store.delete_protocol(protocol.id).await.unwrap());
+        }
+        store.delete_project(a.id, &a.name).await.unwrap();
+        store.delete_project(b.id, &b.name).await.unwrap();
     }
 
     // ------------------------------------------------------------------
@@ -2086,6 +2156,7 @@ macro_rules! all_checks {
             [
                 check_uniqueness,
                 check_merge_idempotence,
+                check_protocol_scope_rule,
                 check_cas_protocol_run,
                 check_concurrent_create_protocol_run,
                 check_external_event_journal,

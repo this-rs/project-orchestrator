@@ -3801,6 +3801,13 @@ pub trait GraphStore: Send + Sync {
 
     /// List protocols for a project with optional category filter and pagination.
     /// Returns (protocols, total_count).
+    ///
+    /// The scope rule is the one of the transverse library, the same skills follow: with
+    /// a project, the listing is that project's protocols PLUS the instance's transverse
+    /// ones (`project_id IS NULL`), and never another project's; with no project, the
+    /// transverse set alone. `total_count` counts what the listing covers, transverse
+    /// protocols included — it is NOT the size of one project's own set, so a caller that
+    /// wants that count filters on `project_id` itself.
     async fn list_protocols(
         &self,
         project_id: Option<Uuid>,

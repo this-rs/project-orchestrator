@@ -174,12 +174,21 @@ impl Neo4jClient {
     }
 
     /// Create or update a protocol node and link it to its project.
+    ///
+    /// A protocol with no project is one of the transverse library: it is written
+    /// without a `BELONGS_TO` edge, like a skill of the transverse set. The `MATCH` used
+    /// to be mandatory, so `project_id = None` matched no project and the whole write did
+    /// NOTHING — silently: the transverse protocol never existed, while the in-memory
+    /// store created it (measured 28/10/2026 by `check_protocol_scope_rule`, the
+    /// conformance check that pins this rule for both backends). A protocol naming a
+    /// project that does not exist still writes nothing, as before.
     pub async fn upsert_protocol(&self, protocol: &Protocol) -> Result<()> {
         let terminal_states_json = serde_json::to_string(&protocol.terminal_states)?;
 
         let q = query(
             r#"
-            MATCH (p:Project {id: $project_id})
+            OPTIONAL MATCH (p:Project {id: $project_id})
+            WITH p WHERE $project_id IS NULL OR p IS NOT NULL
             MERGE (proto:Protocol {id: $id})
             ON CREATE SET proto.created_at = $created_at
             SET proto.name = $name,
@@ -194,7 +203,9 @@ impl Neo4jClient {
                 proto.relevance_vector_json = $relevance_vector_json,
                 proto.last_triggered_at = $last_triggered_at,
                 proto.updated_at = $updated_at
-            MERGE (proto)-[:BELONGS_TO]->(p)
+            FOREACH (_ IN CASE WHEN p IS NULL THEN [] ELSE [1] END |
+                MERGE (proto)-[:BELONGS_TO]->(p)
+            )
             "#,
         )
         .param("id", protocol.id.to_string())
