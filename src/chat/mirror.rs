@@ -128,6 +128,10 @@ use uuid::Uuid;
 use super::types::{ChatEvent, SpawnedBy};
 use crate::neo4j::models::{ChatEventRecord, ChatSessionNode};
 use crate::neo4j::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 
 /// The value of `mirror_of` on a mirror of a Claude Code sub-agent.
 pub const MIRROR_OF_CLAUDE_CODE: &str = "claude_code";
@@ -1127,6 +1131,10 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
 
     #[test]
     fn the_text_of_a_result_is_its_string_or_its_text_blocks() {

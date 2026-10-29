@@ -57,8 +57,8 @@ pub use document::{Document, DocumentChunk, DocumentChunkHit};
 pub use models::*;
 pub use segment::Neo4jSegmentStore;
 pub use traits::{
-    CodeStore, CommitStore, DecisionStore, GraphStore, PlanStore, ProjectStore, ReleaseStore,
-    StoreCapabilities, WorkspaceStore,
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, GraphStore, NoteStore, PlanStore,
+    ProjectStore, ReleaseStore, StoreCapabilities, WorkspaceStore,
 };
 
 // The in-memory store. Unit tests get it through `cfg(test)`; the integration

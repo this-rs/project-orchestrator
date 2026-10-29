@@ -9,8 +9,8 @@ use super::client::Neo4jClient;
 use super::document::{Document, DocumentChunk, DocumentChunkHit};
 use super::models::*;
 use super::traits::{
-    CodeStore, CommitStore, DecisionStore, GraphStore, PlanStore, ProjectStore, ReleaseStore,
-    StoreCapabilities, WorkspaceStore,
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, GraphStore, NoteStore, PlanStore,
+    ProjectStore, ReleaseStore, StoreCapabilities, WorkspaceStore,
 };
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
 use crate::notes::{
@@ -24,6 +24,1898 @@ impl GraphStore for Neo4jClient {
         Neo4jClient::storage_capabilities()
     }
 
+    async fn get_progress_batch(
+        &self,
+        kind: ProgressKind,
+        ids: &[Uuid],
+    ) -> anyhow::Result<std::collections::HashMap<Uuid, TaskCounts>> {
+        self.get_progress_batch(kind, ids).await
+    }
+}
+
+#[async_trait]
+impl ProjectStore for Neo4jClient {
+    // ========================================================================
+    // Project operations
+    // ========================================================================
+
+    async fn create_project(&self, project: &ProjectNode) -> anyhow::Result<()> {
+        self.create_project(project).await
+    }
+
+    async fn get_project(&self, id: Uuid) -> anyhow::Result<Option<ProjectNode>> {
+        self.get_project(id).await
+    }
+
+    async fn get_project_by_slug(&self, slug: &str) -> anyhow::Result<Option<ProjectNode>> {
+        self.get_project_by_slug(slug).await
+    }
+
+    async fn list_projects(&self) -> anyhow::Result<Vec<ProjectNode>> {
+        self.list_projects().await
+    }
+
+    async fn update_project(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<Option<String>>,
+        root_path: Option<String>,
+        profile: Option<ProjectProfile>,
+    ) -> anyhow::Result<()> {
+        self.update_project(id, name, description, root_path, profile)
+            .await
+    }
+
+    async fn update_project_synced(&self, id: Uuid) -> anyhow::Result<()> {
+        self.update_project_synced(id).await
+    }
+
+    async fn update_project_analytics_timestamp(&self, id: Uuid) -> anyhow::Result<()> {
+        self.update_project_analytics_timestamp(id).await
+    }
+
+    async fn delete_project(&self, id: Uuid, project_name: &str) -> anyhow::Result<()> {
+        self.delete_project(id, project_name).await
+    }
+}
+
+#[async_trait]
+impl WorkspaceStore for Neo4jClient {
+    // ========================================================================
+    // Workspace operations
+    // ========================================================================
+
+    async fn create_workspace(&self, workspace: &WorkspaceNode) -> anyhow::Result<()> {
+        self.create_workspace(workspace).await
+    }
+
+    async fn get_workspace(&self, id: Uuid) -> anyhow::Result<Option<WorkspaceNode>> {
+        self.get_workspace(id).await
+    }
+
+    async fn get_workspace_by_slug(&self, slug: &str) -> anyhow::Result<Option<WorkspaceNode>> {
+        self.get_workspace_by_slug(slug).await
+    }
+
+    async fn list_workspaces(&self) -> anyhow::Result<Vec<WorkspaceNode>> {
+        self.list_workspaces().await
+    }
+
+    async fn update_workspace(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<String>,
+        metadata: Option<serde_json::Value>,
+        slug: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.update_workspace(id, name, description, metadata, slug)
+            .await
+    }
+
+    async fn delete_workspace(&self, id: Uuid) -> anyhow::Result<()> {
+        self.delete_workspace(id).await
+    }
+
+    async fn add_project_to_workspace(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.add_project_to_workspace(workspace_id, project_id)
+            .await
+    }
+
+    async fn remove_project_from_workspace(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.remove_project_from_workspace(workspace_id, project_id)
+            .await
+    }
+
+    async fn list_workspace_projects(
+        &self,
+        workspace_id: Uuid,
+    ) -> anyhow::Result<Vec<ProjectNode>> {
+        self.list_workspace_projects(workspace_id).await
+    }
+
+    async fn get_project_workspace(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Option<WorkspaceNode>> {
+        self.get_project_workspace(project_id).await
+    }
+
+    async fn compute_coupling_matrix(
+        &self,
+        workspace_id: Uuid,
+    ) -> anyhow::Result<crate::neo4j::models::CouplingMatrix> {
+        self.compute_coupling_matrix(workspace_id).await
+    }
+    // ========================================================================
+    // Workspace Milestone operations
+    // ========================================================================
+
+    async fn create_workspace_milestone(
+        &self,
+        milestone: &WorkspaceMilestoneNode,
+    ) -> anyhow::Result<()> {
+        self.create_workspace_milestone(milestone).await
+    }
+
+    async fn get_workspace_milestone(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<WorkspaceMilestoneNode>> {
+        self.get_workspace_milestone(id).await
+    }
+
+    async fn list_workspace_milestones(
+        &self,
+        workspace_id: Uuid,
+    ) -> anyhow::Result<Vec<WorkspaceMilestoneNode>> {
+        self.list_workspace_milestones(workspace_id).await
+    }
+
+    async fn list_workspace_milestones_filtered(
+        &self,
+        workspace_id: Uuid,
+        status: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<WorkspaceMilestoneNode>, usize)> {
+        self.list_workspace_milestones_filtered(workspace_id, status, limit, offset)
+            .await
+    }
+
+    async fn list_all_workspace_milestones_filtered(
+        &self,
+        workspace_id: Option<Uuid>,
+        status: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<(WorkspaceMilestoneNode, String, String, String)>> {
+        self.list_all_workspace_milestones_filtered(workspace_id, status, limit, offset)
+            .await
+    }
+
+    async fn count_all_workspace_milestones(
+        &self,
+        workspace_id: Option<Uuid>,
+        status: Option<&str>,
+    ) -> anyhow::Result<usize> {
+        self.count_all_workspace_milestones(workspace_id, status)
+            .await
+    }
+
+    async fn update_workspace_milestone(
+        &self,
+        id: Uuid,
+        title: Option<String>,
+        description: Option<String>,
+        status: Option<MilestoneStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> anyhow::Result<bool> {
+        self.update_workspace_milestone(id, title, description, status, target_date)
+            .await
+    }
+
+    async fn delete_workspace_milestone(&self, id: Uuid) -> anyhow::Result<()> {
+        self.delete_workspace_milestone(id).await
+    }
+
+    async fn add_task_to_workspace_milestone(
+        &self,
+        milestone_id: Uuid,
+        task_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.add_task_to_workspace_milestone(milestone_id, task_id)
+            .await
+    }
+
+    async fn remove_task_from_workspace_milestone(
+        &self,
+        milestone_id: Uuid,
+        task_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.remove_task_from_workspace_milestone(milestone_id, task_id)
+            .await
+    }
+
+    async fn link_plan_to_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.link_plan_to_workspace_milestone(plan_id, milestone_id)
+            .await
+    }
+
+    async fn unlink_plan_from_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.unlink_plan_from_workspace_milestone(plan_id, milestone_id)
+            .await
+    }
+
+    async fn get_workspace_milestone_progress(
+        &self,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<(u32, u32, u32, u32)> {
+        self.get_workspace_milestone_progress(milestone_id).await
+    }
+
+    async fn get_workspace_milestone_tasks(
+        &self,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<Vec<TaskWithPlan>> {
+        self.get_workspace_milestone_tasks(milestone_id).await
+    }
+
+    async fn get_workspace_milestone_steps(
+        &self,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<std::collections::HashMap<Uuid, Vec<StepNode>>> {
+        self.get_workspace_milestone_steps(milestone_id).await
+    }
+
+    // ========================================================================
+    // Resource operations
+    // ========================================================================
+
+    async fn create_resource(&self, resource: &ResourceNode) -> anyhow::Result<()> {
+        self.create_resource(resource).await
+    }
+
+    async fn get_resource(&self, id: Uuid) -> anyhow::Result<Option<ResourceNode>> {
+        self.get_resource(id).await
+    }
+
+    async fn list_workspace_resources(
+        &self,
+        workspace_id: Uuid,
+    ) -> anyhow::Result<Vec<ResourceNode>> {
+        self.list_workspace_resources(workspace_id).await
+    }
+
+    async fn update_resource(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        file_path: Option<String>,
+        url: Option<String>,
+        version: Option<String>,
+        description: Option<String>,
+    ) -> anyhow::Result<bool> {
+        self.update_resource(id, name, file_path, url, version, description)
+            .await
+    }
+
+    async fn delete_resource(&self, id: Uuid) -> anyhow::Result<()> {
+        self.delete_resource(id).await
+    }
+
+    async fn link_project_implements_resource(
+        &self,
+        project_id: Uuid,
+        resource_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.link_project_implements_resource(project_id, resource_id)
+            .await
+    }
+
+    async fn link_project_uses_resource(
+        &self,
+        project_id: Uuid,
+        resource_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.link_project_uses_resource(project_id, resource_id)
+            .await
+    }
+
+    async fn get_resource_implementers(
+        &self,
+        resource_id: Uuid,
+    ) -> anyhow::Result<Vec<ProjectNode>> {
+        self.get_resource_implementers(resource_id).await
+    }
+
+    async fn get_resource_consumers(&self, resource_id: Uuid) -> anyhow::Result<Vec<ProjectNode>> {
+        self.get_resource_consumers(resource_id).await
+    }
+
+    // ========================================================================
+    // Component operations (Topology)
+    // ========================================================================
+
+    async fn create_component(&self, component: &ComponentNode) -> anyhow::Result<()> {
+        self.create_component(component).await
+    }
+
+    async fn get_component(&self, id: Uuid) -> anyhow::Result<Option<ComponentNode>> {
+        self.get_component(id).await
+    }
+
+    async fn list_components(&self, workspace_id: Uuid) -> anyhow::Result<Vec<ComponentNode>> {
+        self.list_components(workspace_id).await
+    }
+
+    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> anyhow::Result<bool> {
+        self.update_component(id, patch).await
+    }
+
+    async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> anyhow::Result<Uuid> {
+        self.upsert_derived_component(write).await
+    }
+
+    async fn delete_component(&self, id: Uuid) -> anyhow::Result<()> {
+        self.delete_component(id).await
+    }
+
+    async fn add_component_dependency(
+        &self,
+        component_id: Uuid,
+        depends_on_id: Uuid,
+        protocol: Option<String>,
+        required: bool,
+    ) -> anyhow::Result<()> {
+        self.add_component_dependency(component_id, depends_on_id, protocol, required)
+            .await
+    }
+
+    async fn remove_component_dependency(
+        &self,
+        component_id: Uuid,
+        depends_on_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.remove_component_dependency(component_id, depends_on_id)
+            .await
+    }
+
+    async fn map_component_to_project(
+        &self,
+        component_id: Uuid,
+        project_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.map_component_to_project(component_id, project_id)
+            .await
+    }
+
+    async fn get_workspace_topology(
+        &self,
+        workspace_id: Uuid,
+    ) -> anyhow::Result<Vec<(ComponentNode, Option<String>, Vec<ComponentDependency>)>> {
+        self.get_workspace_topology(workspace_id).await
+    }
+}
+
+#[async_trait]
+impl CodeStore for Neo4jClient {
+    // ========================================================================
+    // File operations
+    // ========================================================================
+
+    async fn get_project_file_paths(&self, project_id: Uuid) -> anyhow::Result<Vec<String>> {
+        self.get_project_file_paths(project_id).await
+    }
+
+    async fn delete_file(&self, path: &str) -> anyhow::Result<()> {
+        self.delete_file(path).await
+    }
+
+    async fn delete_stale_files(
+        &self,
+        project_id: Uuid,
+        valid_paths: &[String],
+    ) -> anyhow::Result<(usize, usize, Vec<String>)> {
+        self.delete_stale_files(project_id, valid_paths).await
+    }
+
+    async fn link_file_to_project(&self, file_path: &str, project_id: Uuid) -> anyhow::Result<()> {
+        self.link_file_to_project(file_path, project_id).await
+    }
+
+    async fn upsert_file(&self, file: &FileNode) -> anyhow::Result<()> {
+        self.upsert_file(file).await
+    }
+
+    async fn batch_upsert_files(&self, files: &[FileNode]) -> anyhow::Result<()> {
+        self.batch_upsert_files(files).await
+    }
+
+    async fn get_file(&self, path: &str) -> anyhow::Result<Option<FileNode>> {
+        self.get_file(path).await
+    }
+
+    async fn find_files_by_path_suffix(
+        &self,
+        suffix: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, Option<Uuid>)>> {
+        self.find_files_by_path_suffix(suffix, limit).await
+    }
+
+    async fn list_project_files(&self, project_id: Uuid) -> anyhow::Result<Vec<FileNode>> {
+        self.list_project_files(project_id).await
+    }
+
+    async fn count_project_files(&self, project_id: Uuid) -> anyhow::Result<i64> {
+        self.count_project_files(project_id).await
+    }
+
+    async fn count_orphan_files(&self, project_id: Uuid) -> anyhow::Result<i64> {
+        self.count_orphan_files(project_id).await
+    }
+
+    async fn count_co_change_pairs(&self, project_id: Uuid, min_count: i64) -> anyhow::Result<i64> {
+        self.count_co_change_pairs(project_id, min_count).await
+    }
+
+    async fn count_protocol_states_transitions(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<(i64, i64)> {
+        self.count_protocol_states_transitions(project_id).await
+    }
+
+    async fn invalidate_computed_properties(
+        &self,
+        project_id: Uuid,
+        paths: &[String],
+    ) -> anyhow::Result<u64> {
+        self.invalidate_computed_properties(project_id, paths).await
+    }
+
+    // ========================================================================
+    // Symbol operations
+    // ========================================================================
+
+    async fn upsert_function(&self, func: &FunctionNode) -> anyhow::Result<()> {
+        self.upsert_function(func).await
+    }
+
+    async fn upsert_struct(&self, s: &StructNode) -> anyhow::Result<()> {
+        self.upsert_struct(s).await
+    }
+
+    async fn upsert_trait(&self, t: &TraitNode) -> anyhow::Result<()> {
+        self.upsert_trait(t).await
+    }
+
+    async fn find_trait_by_name(&self, name: &str) -> anyhow::Result<Option<String>> {
+        self.find_trait_by_name(name).await
+    }
+
+    async fn upsert_enum(&self, e: &EnumNode) -> anyhow::Result<()> {
+        self.upsert_enum(e).await
+    }
+
+    async fn upsert_impl(&self, impl_node: &ImplNode) -> anyhow::Result<()> {
+        self.upsert_impl(impl_node).await
+    }
+
+    async fn create_import_relationship(
+        &self,
+        from_file: &str,
+        to_file: &str,
+        import_path: &str,
+    ) -> anyhow::Result<()> {
+        self.create_import_relationship(from_file, to_file, import_path)
+            .await
+    }
+
+    async fn upsert_import(&self, import: &ImportNode) -> anyhow::Result<()> {
+        self.upsert_import(import).await
+    }
+
+    async fn create_imports_symbol_relationship(
+        &self,
+        import_id: &str,
+        symbol_name: &str,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<()> {
+        self.create_imports_symbol_relationship(import_id, symbol_name, project_id)
+            .await
+    }
+
+    async fn create_call_relationship(
+        &self,
+        caller_id: &str,
+        callee_name: &str,
+        project_id: Option<Uuid>,
+        confidence: f64,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        self.create_call_relationship(caller_id, callee_name, project_id, confidence, reason)
+            .await
+    }
+
+    // ========================================================================
+    // Batch upsert operations (UNWIND)
+    // ========================================================================
+
+    async fn batch_upsert_functions(&self, functions: &[FunctionNode]) -> anyhow::Result<()> {
+        self.batch_upsert_functions(functions).await
+    }
+
+    async fn batch_upsert_structs(&self, structs: &[StructNode]) -> anyhow::Result<()> {
+        self.batch_upsert_structs(structs).await
+    }
+
+    async fn batch_upsert_traits(&self, traits: &[TraitNode]) -> anyhow::Result<()> {
+        self.batch_upsert_traits(traits).await
+    }
+
+    async fn batch_upsert_enums(&self, enums: &[EnumNode]) -> anyhow::Result<()> {
+        self.batch_upsert_enums(enums).await
+    }
+
+    async fn batch_upsert_impls(&self, impls: &[ImplNode]) -> anyhow::Result<()> {
+        self.batch_upsert_impls(impls).await
+    }
+
+    async fn batch_upsert_imports(&self, imports: &[ImportNode]) -> anyhow::Result<()> {
+        self.batch_upsert_imports(imports).await
+    }
+
+    async fn batch_create_import_relationships(
+        &self,
+        relationships: &[(String, String, String)],
+    ) -> anyhow::Result<()> {
+        self.batch_create_import_relationships(relationships).await
+    }
+
+    async fn batch_create_imports_symbol_relationships(
+        &self,
+        relationships: &[(String, String, Option<uuid::Uuid>)],
+    ) -> anyhow::Result<()> {
+        self.batch_create_imports_symbol_relationships(relationships)
+            .await
+    }
+
+    async fn batch_create_call_relationships(
+        &self,
+        calls: &[crate::parser::FunctionCall],
+        project_id: Option<uuid::Uuid>,
+    ) -> anyhow::Result<()> {
+        self.batch_create_call_relationships(calls, project_id)
+            .await
+    }
+
+    async fn batch_create_extends_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> anyhow::Result<()> {
+        self.batch_create_extends_relationships(rels).await
+    }
+
+    async fn batch_create_implements_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> anyhow::Result<()> {
+        self.batch_create_implements_relationships(rels).await
+    }
+
+    async fn cleanup_cross_project_calls(&self) -> anyhow::Result<i64> {
+        self.cleanup_cross_project_calls().await
+    }
+
+    async fn cleanup_builtin_calls(&self) -> anyhow::Result<i64> {
+        self.cleanup_builtin_calls().await
+    }
+
+    async fn migrate_calls_confidence(&self) -> anyhow::Result<i64> {
+        self.migrate_calls_confidence().await
+    }
+
+    async fn cleanup_sync_data(&self) -> anyhow::Result<i64> {
+        self.cleanup_sync_data().await
+    }
+
+    async fn get_callees(
+        &self,
+        function_id: &str,
+        depth: u32,
+    ) -> anyhow::Result<Vec<FunctionNode>> {
+        self.get_callees(function_id, depth).await
+    }
+
+    async fn create_uses_type_relationship(
+        &self,
+        function_id: &str,
+        type_name: &str,
+    ) -> anyhow::Result<()> {
+        self.create_uses_type_relationship(function_id, type_name)
+            .await
+    }
+
+    async fn find_trait_implementors(&self, trait_name: &str) -> anyhow::Result<Vec<String>> {
+        self.find_trait_implementors(trait_name).await
+    }
+
+    async fn get_type_traits(&self, type_name: &str) -> anyhow::Result<Vec<String>> {
+        self.get_type_traits(type_name).await
+    }
+
+    async fn get_impl_blocks(&self, type_name: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.get_impl_blocks(type_name).await
+    }
+
+    // ========================================================================
+    // Heritage navigation queries
+    // ========================================================================
+
+    async fn get_class_hierarchy(
+        &self,
+        type_name: &str,
+        max_depth: u32,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.get_class_hierarchy(type_name, max_depth).await
+    }
+
+    async fn find_subclasses(&self, class_name: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.find_subclasses(class_name).await
+    }
+
+    async fn find_interface_implementors(
+        &self,
+        interface_name: &str,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.find_interface_implementors(interface_name).await
+    }
+
+    // ========================================================================
+    // Process queries
+    // ========================================================================
+
+    async fn list_processes(
+        &self,
+        project_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.list_processes(project_id).await
+    }
+
+    async fn get_process_detail(
+        &self,
+        process_id: &str,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        self.get_process_detail(process_id).await
+    }
+
+    async fn get_entry_points(
+        &self,
+        project_id: uuid::Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.get_entry_points(project_id, limit).await
+    }
+
+    // ========================================================================
+    // Code exploration queries
+    // ========================================================================
+
+    async fn get_file_language(&self, path: &str) -> anyhow::Result<Option<String>> {
+        self.get_file_language(path).await
+    }
+
+    async fn get_file_functions_summary(
+        &self,
+        path: &str,
+    ) -> anyhow::Result<Vec<FunctionSummaryNode>> {
+        self.get_file_functions_summary(path).await
+    }
+
+    async fn get_file_structs_summary(&self, path: &str) -> anyhow::Result<Vec<StructSummaryNode>> {
+        self.get_file_structs_summary(path).await
+    }
+
+    async fn get_file_import_paths_list(&self, path: &str) -> anyhow::Result<Vec<String>> {
+        self.get_file_import_paths_list(path).await
+    }
+
+    async fn find_symbol_references(
+        &self,
+        symbol: &str,
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<SymbolReferenceNode>> {
+        self.find_symbol_references(symbol, limit, project_id).await
+    }
+
+    async fn get_file_direct_imports(&self, path: &str) -> anyhow::Result<Vec<FileImportNode>> {
+        self.get_file_direct_imports(path).await
+    }
+
+    async fn get_function_callers_by_name(
+        &self,
+        function_name: &str,
+        depth: u32,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<String>> {
+        self.get_function_callers_by_name(function_name, depth, project_id)
+            .await
+    }
+
+    async fn get_function_callees_by_name(
+        &self,
+        function_name: &str,
+        depth: u32,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<String>> {
+        self.get_function_callees_by_name(function_name, depth, project_id)
+            .await
+    }
+
+    async fn get_callers_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<(String, String, f64, String)>> {
+        self.get_callers_with_confidence(function_name, project_id)
+            .await
+    }
+
+    async fn get_callees_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<(String, String, f64, String)>> {
+        self.get_callees_with_confidence(function_name, project_id)
+            .await
+    }
+
+    async fn get_language_stats(&self) -> anyhow::Result<Vec<LanguageStatsNode>> {
+        self.get_language_stats().await
+    }
+
+    async fn get_language_stats_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<LanguageStatsNode>> {
+        self.get_language_stats_for_project(project_id).await
+    }
+
+    async fn get_most_connected_files(&self, limit: usize) -> anyhow::Result<Vec<String>> {
+        self.get_most_connected_files(limit).await
+    }
+
+    async fn get_most_connected_files_detailed(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConnectedFileNode>> {
+        self.get_most_connected_files_detailed(limit).await
+    }
+
+    async fn get_most_connected_files_for_project(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ConnectedFileNode>> {
+        self.get_most_connected_files_for_project(project_id, limit)
+            .await
+    }
+
+    async fn get_project_communities(&self, project_id: Uuid) -> anyhow::Result<Vec<CommunityRow>> {
+        self.get_project_communities(project_id).await
+    }
+
+    async fn get_node_analytics(
+        &self,
+        identifier: &str,
+        node_type: &str,
+    ) -> anyhow::Result<Option<NodeAnalyticsRow>> {
+        self.get_node_analytics(identifier, node_type).await
+    }
+
+    async fn get_affected_communities(&self, file_paths: &[String]) -> anyhow::Result<Vec<String>> {
+        self.get_affected_communities(file_paths).await
+    }
+
+    async fn get_code_health_report(
+        &self,
+        project_id: Uuid,
+        god_function_threshold: usize,
+    ) -> anyhow::Result<crate::neo4j::models::CodeHealthReport> {
+        self.get_code_health_report(project_id, god_function_threshold)
+            .await
+    }
+
+    async fn compute_maintenance_snapshot(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<crate::neo4j::models::MaintenanceSnapshot> {
+        self.compute_maintenance_snapshot(project_id).await
+    }
+
+    async fn compute_scaffolding_level(
+        &self,
+        project_id: Uuid,
+        scaffolding_override: Option<u8>,
+    ) -> anyhow::Result<crate::neo4j::models::ScaffoldingLevel> {
+        self.compute_scaffolding_level(project_id, scaffolding_override)
+            .await
+    }
+
+    async fn set_scaffolding_override(
+        &self,
+        project_id: Uuid,
+        level: Option<u8>,
+    ) -> anyhow::Result<()> {
+        self.set_scaffolding_override(project_id, level).await
+    }
+
+    async fn set_watch_enabled(&self, project_id: Uuid, enabled: bool) -> anyhow::Result<()> {
+        self.set_watch_enabled(project_id, enabled).await
+    }
+
+    async fn set_default_note_energy(
+        &self,
+        project_id: Uuid,
+        energy: Option<f64>,
+    ) -> anyhow::Result<()> {
+        self.set_default_note_energy(project_id, energy).await
+    }
+
+    async fn detect_global_stagnation(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<crate::neo4j::models::StagnationReport> {
+        self.detect_global_stagnation(project_id).await
+    }
+
+    async fn get_circular_dependencies(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<Vec<String>>> {
+        self.get_circular_dependencies(project_id).await
+    }
+
+    async fn get_node_gds_metrics(
+        &self,
+        node_path: &str,
+        node_type: &str,
+        project_id: Uuid,
+    ) -> anyhow::Result<Option<NodeGdsMetrics>> {
+        self.get_node_gds_metrics(node_path, node_type, project_id)
+            .await
+    }
+
+    async fn get_project_percentiles(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<ProjectPercentiles> {
+        self.get_project_percentiles(project_id).await
+    }
+
+    async fn get_top_bridges_by_betweenness(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<BridgeFile>> {
+        self.get_top_bridges_by_betweenness(project_id, limit).await
+    }
+
+    async fn get_file_symbol_names(&self, path: &str) -> anyhow::Result<FileSymbolNamesNode> {
+        self.get_file_symbol_names(path).await
+    }
+
+    async fn get_function_caller_count(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<i64> {
+        self.get_function_caller_count(function_name, project_id)
+            .await
+    }
+
+    async fn get_trait_info(&self, trait_name: &str) -> anyhow::Result<Option<TraitInfoNode>> {
+        self.get_trait_info(trait_name).await
+    }
+
+    async fn get_trait_implementors_detailed(
+        &self,
+        trait_name: &str,
+    ) -> anyhow::Result<Vec<TraitImplementorNode>> {
+        self.get_trait_implementors_detailed(trait_name).await
+    }
+
+    async fn get_type_trait_implementations(
+        &self,
+        type_name: &str,
+    ) -> anyhow::Result<Vec<TypeTraitInfoNode>> {
+        self.get_type_trait_implementations(type_name).await
+    }
+
+    async fn get_type_impl_blocks_detailed(
+        &self,
+        type_name: &str,
+    ) -> anyhow::Result<Vec<ImplBlockDetailNode>> {
+        self.get_type_impl_blocks_detailed(type_name).await
+    }
+}
+
+#[async_trait]
+impl PlanStore for Neo4jClient {
+    // ========================================================================
+    // Plan operations
+    // ========================================================================
+
+    async fn create_plan(&self, plan: &PlanNode) -> anyhow::Result<()> {
+        self.create_plan(plan).await
+    }
+
+    async fn get_plan(&self, id: Uuid) -> anyhow::Result<Option<PlanNode>> {
+        self.get_plan(id).await
+    }
+
+    async fn list_active_plans(&self) -> anyhow::Result<Vec<PlanNode>> {
+        self.list_active_plans().await
+    }
+
+    async fn list_project_plans(&self, project_id: Uuid) -> anyhow::Result<Vec<PlanNode>> {
+        self.list_project_plans(project_id).await
+    }
+
+    async fn count_project_plans(&self, project_id: Uuid) -> anyhow::Result<i64> {
+        self.count_project_plans(project_id).await
+    }
+
+    async fn list_plans_for_project(
+        &self,
+        project_id: Uuid,
+        status_filter: Option<Vec<String>>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<PlanNode>, usize)> {
+        self.list_plans_for_project(project_id, status_filter, limit, offset)
+            .await
+    }
+
+    async fn update_plan(&self, id: Uuid, updates: &UpdatePlanRequest) -> anyhow::Result<()> {
+        self.update_plan(id, updates).await
+    }
+
+    async fn update_plan_status(&self, id: Uuid, status: PlanStatus) -> anyhow::Result<()> {
+        self.update_plan_status(id, status).await
+    }
+
+    async fn list_plan_project_slugs(&self, plan_id: Uuid) -> anyhow::Result<Vec<String>> {
+        self.list_plan_project_slugs(plan_id).await
+    }
+
+    async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> anyhow::Result<()> {
+        self.link_plan_to_project(plan_id, project_id).await
+    }
+
+    async fn unlink_plan_from_project(&self, plan_id: Uuid) -> anyhow::Result<()> {
+        self.unlink_plan_from_project(plan_id).await
+    }
+
+    async fn delete_plan(&self, plan_id: Uuid) -> anyhow::Result<()> {
+        self.delete_plan(plan_id).await
+    }
+
+    // ========================================================================
+    // Task operations
+    // ========================================================================
+
+    async fn create_task(&self, plan_id: Uuid, task: &TaskNode) -> anyhow::Result<()> {
+        self.create_task(plan_id, task).await
+    }
+
+    async fn get_plan_tasks(&self, plan_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
+        self.get_plan_tasks(plan_id).await
+    }
+
+    async fn get_task_with_full_details(
+        &self,
+        task_id: Uuid,
+    ) -> anyhow::Result<Option<TaskDetails>> {
+        self.get_task_with_full_details(task_id).await
+    }
+
+    async fn analyze_task_impact(&self, task_id: Uuid) -> anyhow::Result<Vec<String>> {
+        self.analyze_task_impact(task_id).await
+    }
+
+    async fn find_blocked_tasks(
+        &self,
+        plan_id: Uuid,
+    ) -> anyhow::Result<Vec<(TaskNode, Vec<TaskNode>)>> {
+        self.find_blocked_tasks(plan_id).await
+    }
+
+    async fn update_task_status(&self, task_id: Uuid, status: TaskStatus) -> anyhow::Result<()> {
+        self.update_task_status(task_id, status).await
+    }
+
+    async fn interrupt_task(&self, task_id: Uuid, reason: &str) -> anyhow::Result<bool> {
+        self.interrupt_task(task_id, reason).await
+    }
+
+    async fn assign_task(&self, task_id: Uuid, agent_id: &str) -> anyhow::Result<()> {
+        self.assign_task(task_id, agent_id).await
+    }
+
+    async fn add_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> anyhow::Result<()> {
+        self.add_task_dependency(task_id, depends_on_id).await
+    }
+
+    async fn remove_task_dependency(
+        &self,
+        task_id: Uuid,
+        depends_on_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.remove_task_dependency(task_id, depends_on_id).await
+    }
+
+    async fn get_task_blockers(&self, task_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
+        self.get_task_blockers(task_id).await
+    }
+
+    async fn get_tasks_blocked_by(&self, task_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
+        self.get_tasks_blocked_by(task_id).await
+    }
+
+    async fn get_task_dependencies(&self, task_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
+        self.get_task_dependencies(task_id).await
+    }
+
+    async fn get_plan_dependency_graph(
+        &self,
+        plan_id: Uuid,
+    ) -> anyhow::Result<(Vec<TaskNode>, Vec<(Uuid, Uuid)>)> {
+        self.get_plan_dependency_graph(plan_id).await
+    }
+
+    async fn get_task_enrichment_counts(
+        &self,
+        task_ids: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentCounts>>
+    {
+        self.get_task_enrichment_counts(task_ids).await
+    }
+
+    async fn get_task_enrichment_data(
+        &self,
+        task_ids: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentData>>
+    {
+        self.get_task_enrichment_data(task_ids).await
+    }
+
+    async fn get_plan_critical_path(&self, plan_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
+        self.get_plan_critical_path(plan_id).await
+    }
+
+    async fn compute_waves(
+        &self,
+        plan_id: Uuid,
+    ) -> anyhow::Result<crate::neo4j::plan::WaveComputationResult> {
+        self.compute_waves(plan_id).await
+    }
+
+    async fn get_next_available_task(&self, plan_id: Uuid) -> anyhow::Result<Option<TaskNode>> {
+        self.get_next_available_task(plan_id).await
+    }
+
+    async fn get_task(&self, task_id: Uuid) -> anyhow::Result<Option<TaskNode>> {
+        self.get_task(task_id).await
+    }
+
+    async fn update_task(&self, task_id: Uuid, updates: &UpdateTaskRequest) -> anyhow::Result<()> {
+        self.update_task(task_id, updates).await
+    }
+
+    async fn update_task_enrichment(
+        &self,
+        task_id: Uuid,
+        execution_context: Option<&str>,
+        persona: Option<&str>,
+        prompt_cache: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.update_task_enrichment(task_id, execution_context, persona, prompt_cache)
+            .await
+    }
+
+    async fn delete_task(&self, task_id: Uuid) -> anyhow::Result<()> {
+        self.delete_task(task_id).await
+    }
+
+    async fn get_project_for_task(&self, task_id: Uuid) -> anyhow::Result<Option<ProjectNode>> {
+        self.get_project_for_task(task_id).await
+    }
+
+    async fn get_plan_id_for_task(&self, task_id: Uuid) -> anyhow::Result<Option<Uuid>> {
+        self.get_plan_id_for_task(task_id).await
+    }
+
+    // ========================================================================
+    // Day plan operations
+    // ========================================================================
+
+    async fn get_day_plan(&self, user_id: Uuid, date: &str) -> anyhow::Result<Vec<(Uuid, u32)>> {
+        self.get_day_plan(user_id, date).await
+    }
+
+    async fn set_day_plan(&self, user_id: Uuid, date: &str, ids: &[Uuid]) -> anyhow::Result<()> {
+        self.set_day_plan(user_id, date, ids).await
+    }
+
+    async fn add_to_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> anyhow::Result<()> {
+        self.add_to_day(user_id, date, task_id).await
+    }
+
+    async fn remove_from_day(
+        &self,
+        user_id: Uuid,
+        date: &str,
+        task_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.remove_from_day(user_id, date, task_id).await
+    }
+
+    // ========================================================================
+    // Step operations
+    // ========================================================================
+
+    async fn create_step(&self, task_id: Uuid, step: &StepNode) -> anyhow::Result<()> {
+        self.create_step(task_id, step).await
+    }
+
+    async fn get_task_steps(&self, task_id: Uuid) -> anyhow::Result<Vec<StepNode>> {
+        self.get_task_steps(task_id).await
+    }
+
+    async fn update_step(&self, step_id: Uuid, updates: &UpdateStepRequest) -> anyhow::Result<()> {
+        self.update_step(step_id, updates).await
+    }
+
+    async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> anyhow::Result<()> {
+        self.update_step_status(step_id, status).await
+    }
+
+    async fn get_task_step_progress(&self, task_id: Uuid) -> anyhow::Result<(u32, u32)> {
+        self.get_task_step_progress(task_id).await
+    }
+
+    async fn get_step(&self, step_id: Uuid) -> anyhow::Result<Option<StepNode>> {
+        self.get_step(step_id).await
+    }
+
+    async fn delete_step(&self, step_id: Uuid) -> anyhow::Result<()> {
+        self.delete_step(step_id).await
+    }
+
+    async fn complete_pending_steps_for_task(&self, task_id: Uuid) -> anyhow::Result<u32> {
+        self.complete_pending_steps_for_task(task_id).await
+    }
+
+    // ========================================================================
+    // Constraint operations
+    // ========================================================================
+
+    async fn create_constraint(
+        &self,
+        plan_id: Uuid,
+        constraint: &ConstraintNode,
+    ) -> anyhow::Result<()> {
+        self.create_constraint(plan_id, constraint).await
+    }
+
+    async fn get_plan_constraints(&self, plan_id: Uuid) -> anyhow::Result<Vec<ConstraintNode>> {
+        self.get_plan_constraints(plan_id).await
+    }
+
+    async fn get_constraint(&self, constraint_id: Uuid) -> anyhow::Result<Option<ConstraintNode>> {
+        self.get_constraint(constraint_id).await
+    }
+
+    async fn update_constraint(
+        &self,
+        constraint_id: Uuid,
+        description: Option<String>,
+        constraint_type: Option<ConstraintType>,
+        enforced_by: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.update_constraint(constraint_id, description, constraint_type, enforced_by)
+            .await
+    }
+
+    async fn delete_constraint(&self, constraint_id: Uuid) -> anyhow::Result<()> {
+        self.delete_constraint(constraint_id).await
+    }
+}
+
+#[async_trait]
+impl DecisionStore for Neo4jClient {
+    // ========================================================================
+    // Decision operations
+    // ========================================================================
+
+    async fn create_decision(&self, task_id: Uuid, decision: &DecisionNode) -> anyhow::Result<()> {
+        self.create_decision(task_id, decision).await
+    }
+
+    async fn get_decision(&self, decision_id: Uuid) -> anyhow::Result<Option<DecisionNode>> {
+        self.get_decision(decision_id).await
+    }
+
+    async fn get_decision_project_id(&self, decision_id: Uuid) -> anyhow::Result<Option<String>> {
+        self.get_decision_project_id(decision_id).await
+    }
+
+    async fn get_decision_project_ids(
+        &self,
+        decision_ids: &[Uuid],
+    ) -> anyhow::Result<std::collections::HashMap<Uuid, Uuid>> {
+        self.get_decision_project_ids(decision_ids).await
+    }
+
+    async fn update_decision(
+        &self,
+        decision_id: Uuid,
+        description: Option<String>,
+        rationale: Option<String>,
+        chosen_option: Option<String>,
+        status: Option<DecisionStatus>,
+    ) -> anyhow::Result<()> {
+        self.update_decision(decision_id, description, rationale, chosen_option, status)
+            .await
+    }
+
+    async fn delete_decision(&self, decision_id: Uuid) -> anyhow::Result<()> {
+        self.delete_decision(decision_id).await
+    }
+
+    async fn get_decisions_for_entity(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<DecisionNode>> {
+        self.get_decisions_for_entity(entity_type, entity_id, limit)
+            .await
+    }
+
+    async fn set_decision_embedding(
+        &self,
+        decision_id: Uuid,
+        embedding: &[f32],
+        model: &str,
+    ) -> anyhow::Result<()> {
+        self.set_decision_embedding(decision_id, embedding, model)
+            .await
+    }
+
+    async fn get_decision_embedding(&self, decision_id: Uuid) -> anyhow::Result<Option<Vec<f32>>> {
+        self.get_decision_embedding(decision_id).await
+    }
+
+    async fn get_all_decisions_with_task_id(&self) -> anyhow::Result<Vec<(DecisionNode, Uuid)>> {
+        self.get_all_decisions_with_task_id().await
+    }
+
+    async fn get_decisions_without_embedding(&self) -> anyhow::Result<Vec<(Uuid, String, String)>> {
+        self.get_decisions_without_embedding().await
+    }
+
+    async fn search_decisions_by_vector(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        project_id: Option<&str>,
+    ) -> anyhow::Result<Vec<(DecisionNode, f64)>> {
+        self.search_decisions_by_vector(query_embedding, limit, project_id)
+            .await
+    }
+
+    async fn get_decisions_affecting(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        status_filter: Option<&str>,
+    ) -> anyhow::Result<Vec<DecisionNode>> {
+        self.get_decisions_affecting(entity_type, entity_id, status_filter)
+            .await
+    }
+
+    async fn add_decision_affects(
+        &self,
+        decision_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+        impact_description: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.add_decision_affects(decision_id, entity_type, entity_id, impact_description)
+            .await
+    }
+
+    async fn remove_decision_affects(
+        &self,
+        decision_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> anyhow::Result<()> {
+        self.remove_decision_affects(decision_id, entity_type, entity_id)
+            .await
+    }
+
+    async fn list_decision_affects(
+        &self,
+        decision_id: Uuid,
+    ) -> anyhow::Result<Vec<AffectsRelation>> {
+        self.list_decision_affects(decision_id).await
+    }
+
+    async fn supersede_decision(
+        &self,
+        new_decision_id: Uuid,
+        old_decision_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.supersede_decision(new_decision_id, old_decision_id)
+            .await
+    }
+
+    async fn get_decision_timeline(
+        &self,
+        task_id: Option<Uuid>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> anyhow::Result<Vec<DecisionTimelineEntry>> {
+        self.get_decision_timeline(task_id, from, to).await
+    }
+
+    async fn list_decisions_by_status(
+        &self,
+        status: DecisionStatus,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<DecisionListItem>, usize)> {
+        self.list_decisions_by_status(status, project_id, workspace_slug, limit, offset)
+            .await
+    }
+}
+
+#[async_trait]
+impl CommitStore for Neo4jClient {
+    // ========================================================================
+    // Dependency analysis
+    // ========================================================================
+
+    async fn find_dependent_files(
+        &self,
+        file_path: &str,
+        depth: u32,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<String>> {
+        self.find_dependent_files(file_path, depth, project_id)
+            .await
+    }
+
+    async fn find_impacted_files(
+        &self,
+        file_path: &str,
+        depth: u32,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<String>> {
+        self.find_impacted_files(file_path, depth, project_id).await
+    }
+
+    async fn find_callers(
+        &self,
+        function_id: &str,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<FunctionNode>> {
+        self.find_callers(function_id, project_id).await
+    }
+
+    // ========================================================================
+    // Task-file linking
+    // ========================================================================
+
+    async fn link_task_to_files(&self, task_id: Uuid, file_paths: &[String]) -> anyhow::Result<()> {
+        self.link_task_to_files(task_id, file_paths).await
+    }
+
+    // ========================================================================
+    // Commit operations
+    // ========================================================================
+
+    async fn create_commit(&self, commit: &CommitNode) -> anyhow::Result<()> {
+        self.create_commit(commit).await
+    }
+
+    async fn get_commit(&self, hash: &str) -> anyhow::Result<Option<CommitNode>> {
+        self.get_commit(hash).await
+    }
+
+    async fn link_commit_to_task(&self, commit_hash: &str, task_id: Uuid) -> anyhow::Result<()> {
+        self.link_commit_to_task(commit_hash, task_id).await
+    }
+
+    async fn link_commit_to_plan(&self, commit_hash: &str, plan_id: Uuid) -> anyhow::Result<()> {
+        self.link_commit_to_plan(commit_hash, plan_id).await
+    }
+
+    async fn get_task_commits(&self, task_id: Uuid) -> anyhow::Result<Vec<CommitNode>> {
+        self.get_task_commits(task_id).await
+    }
+
+    async fn get_plan_commits(&self, plan_id: Uuid) -> anyhow::Result<Vec<CommitNode>> {
+        self.get_plan_commits(plan_id).await
+    }
+
+    async fn delete_commit(&self, hash: &str) -> anyhow::Result<()> {
+        self.delete_commit(hash).await
+    }
+
+    // ========================================================================
+    // TOUCHES operations (Commit → File)
+    // ========================================================================
+
+    async fn create_commit_touches(
+        &self,
+        commit_hash: &str,
+        files: &[FileChangedInfo],
+    ) -> anyhow::Result<()> {
+        self.create_commit_touches(commit_hash, files).await
+    }
+
+    async fn get_commit_files(&self, commit_hash: &str) -> anyhow::Result<Vec<CommitFileInfo>> {
+        self.get_commit_files(commit_hash).await
+    }
+
+    async fn get_file_history(
+        &self,
+        file_path: &str,
+        limit: Option<i64>,
+    ) -> anyhow::Result<Vec<FileHistoryEntry>> {
+        self.get_file_history(file_path, limit).await
+    }
+
+    async fn ping_freshness_for_files(&self, file_paths: &[String]) -> anyhow::Result<usize> {
+        self.ping_freshness_for_files(file_paths).await
+    }
+
+    // ========================================================================
+    // CO_CHANGED operations (File ↔ File)
+    // ========================================================================
+
+    async fn compute_co_changed(
+        &self,
+        project_id: Uuid,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        min_count: i64,
+        max_relations: i64,
+    ) -> anyhow::Result<i64> {
+        self.compute_co_changed(project_id, since, min_count, max_relations)
+            .await
+    }
+
+    async fn update_project_co_change_timestamp(&self, id: Uuid) -> anyhow::Result<()> {
+        self.update_project_co_change_timestamp(id).await
+    }
+
+    async fn get_co_change_graph(
+        &self,
+        project_id: Uuid,
+        min_count: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<CoChangePair>> {
+        self.get_co_change_graph(project_id, min_count, limit).await
+    }
+
+    async fn get_file_co_changers(
+        &self,
+        file_path: &str,
+        min_count: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<CoChanger>> {
+        self.get_file_co_changers(file_path, min_count, limit).await
+    }
+
+    async fn compute_co_changed_transitive(
+        &self,
+        project_id: Uuid,
+        max_depth: i64,
+        min_score: f64,
+    ) -> anyhow::Result<i64> {
+        self.compute_co_changed_transitive(project_id, max_depth, min_score)
+            .await
+    }
+
+    async fn get_file_transitive_co_changers(
+        &self,
+        file_path: &str,
+        min_score: f64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<TransitiveCoChanger>> {
+        self.get_file_transitive_co_changers(file_path, min_score, limit)
+            .await
+    }
+}
+
+#[async_trait]
+impl ReleaseStore for Neo4jClient {
+    // ========================================================================
+    // Release operations
+    // ========================================================================
+
+    async fn create_release(&self, release: &ReleaseNode) -> anyhow::Result<()> {
+        self.create_release(release).await
+    }
+
+    async fn get_release(&self, id: Uuid) -> anyhow::Result<Option<ReleaseNode>> {
+        self.get_release(id).await
+    }
+
+    async fn list_project_releases(&self, project_id: Uuid) -> anyhow::Result<Vec<ReleaseNode>> {
+        self.list_project_releases(project_id).await
+    }
+
+    async fn update_release(
+        &self,
+        id: Uuid,
+        status: Option<ReleaseStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+        released_at: Option<chrono::DateTime<chrono::Utc>>,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.update_release(id, status, target_date, released_at, title, description)
+            .await
+    }
+
+    async fn add_task_to_release(&self, release_id: Uuid, task_id: Uuid) -> anyhow::Result<()> {
+        self.add_task_to_release(release_id, task_id).await
+    }
+
+    async fn add_commit_to_release(
+        &self,
+        release_id: Uuid,
+        commit_hash: &str,
+    ) -> anyhow::Result<()> {
+        self.add_commit_to_release(release_id, commit_hash).await
+    }
+
+    async fn remove_commit_from_release(
+        &self,
+        release_id: Uuid,
+        commit_hash: &str,
+    ) -> anyhow::Result<()> {
+        self.remove_commit_from_release(release_id, commit_hash)
+            .await
+    }
+
+    async fn get_release_details(
+        &self,
+        release_id: Uuid,
+    ) -> anyhow::Result<Option<(ReleaseNode, Vec<TaskNode>, Vec<CommitNode>)>> {
+        self.get_release_details(release_id).await
+    }
+
+    async fn delete_release(&self, release_id: Uuid) -> anyhow::Result<()> {
+        self.delete_release(release_id).await
+    }
+
+    // ========================================================================
+    // Environment & deployment operations
+    // ========================================================================
+
+    async fn create_environment(&self, env: &EnvironmentNode) -> anyhow::Result<()> {
+        self.create_environment(env).await
+    }
+
+    async fn get_environment(&self, id: Uuid) -> anyhow::Result<Option<EnvironmentNode>> {
+        self.get_environment(id).await
+    }
+
+    async fn list_project_environments(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<EnvironmentNode>> {
+        self.list_project_environments(project_id).await
+    }
+
+    async fn update_environment(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        kind: Option<EnvironmentKind>,
+        url: Option<String>,
+        description: Option<String>,
+        config: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.update_environment(id, name, kind, url, description, config)
+            .await
+    }
+
+    async fn delete_environment(&self, id: Uuid) -> anyhow::Result<()> {
+        self.delete_environment(id).await
+    }
+
+    async fn create_deployment(&self, deployment: &DeploymentNode) -> anyhow::Result<()> {
+        self.create_deployment(deployment).await
+    }
+
+    async fn get_deployment(&self, id: Uuid) -> anyhow::Result<Option<DeploymentNode>> {
+        self.get_deployment(id).await
+    }
+
+    async fn list_environment_deployments(
+        &self,
+        environment_id: Uuid,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<DeploymentNode>, usize)> {
+        self.list_environment_deployments(environment_id, limit, offset)
+            .await
+    }
+
+    async fn update_deployment(
+        &self,
+        id: Uuid,
+        status: Option<DeploymentStatus>,
+        finished_at: Option<chrono::DateTime<chrono::Utc>>,
+        notes: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.update_deployment(id, status, finished_at, notes).await
+    }
+
+    async fn get_deployment_matrix(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<DeploymentMatrixEntry>> {
+        self.get_deployment_matrix(project_id).await
+    }
+
+    // ========================================================================
+    // Milestone operations
+    // ========================================================================
+
+    async fn create_milestone(&self, milestone: &MilestoneNode) -> anyhow::Result<()> {
+        self.create_milestone(milestone).await
+    }
+
+    async fn get_milestone(&self, id: Uuid) -> anyhow::Result<Option<MilestoneNode>> {
+        self.get_milestone(id).await
+    }
+
+    async fn list_project_milestones(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<MilestoneNode>> {
+        self.list_project_milestones(project_id).await
+    }
+
+    async fn update_milestone(
+        &self,
+        id: Uuid,
+        status: Option<MilestoneStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+        closed_at: Option<chrono::DateTime<chrono::Utc>>,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.update_milestone(id, status, target_date, closed_at, title, description)
+            .await
+    }
+
+    async fn add_task_to_milestone(&self, milestone_id: Uuid, task_id: Uuid) -> anyhow::Result<()> {
+        self.add_task_to_milestone(milestone_id, task_id).await
+    }
+
+    async fn link_plan_to_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.link_plan_to_milestone(plan_id, milestone_id).await
+    }
+
+    async fn unlink_plan_from_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.unlink_plan_from_milestone(plan_id, milestone_id).await
+    }
+
+    async fn get_milestone_details(
+        &self,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<Option<(MilestoneNode, Vec<TaskNode>)>> {
+        self.get_milestone_details(milestone_id).await
+    }
+
+    async fn get_milestone_progress(
+        &self,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<(u32, u32, u32, u32)> {
+        self.get_milestone_progress(milestone_id).await
+    }
+
+    async fn get_milestone_tasks_with_plans(
+        &self,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<Vec<TaskWithPlan>> {
+        self.get_milestone_tasks_with_plans(milestone_id).await
+    }
+
+    async fn get_milestone_steps_batch(
+        &self,
+        milestone_id: Uuid,
+    ) -> anyhow::Result<std::collections::HashMap<Uuid, Vec<StepNode>>> {
+        self.get_milestone_steps_batch(milestone_id).await
+    }
+
+    async fn delete_milestone(&self, milestone_id: Uuid) -> anyhow::Result<()> {
+        self.delete_milestone(milestone_id).await
+    }
+
+    async fn get_milestone_tasks(&self, milestone_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
+        self.get_milestone_tasks(milestone_id).await
+    }
+
+    async fn get_release_tasks(&self, release_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
+        self.get_release_tasks(release_id).await
+    }
+
+    // ========================================================================
+    // Project stats
+    // ========================================================================
+
+    async fn get_project_progress(&self, project_id: Uuid) -> anyhow::Result<(u32, u32, u32, u32)> {
+        self.get_project_progress(project_id).await
+    }
+
+    async fn get_project_task_dependencies(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(Uuid, Uuid)>> {
+        self.get_project_task_dependencies(project_id).await
+    }
+
+    async fn get_project_tasks(&self, project_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
+        self.get_project_tasks(project_id).await
+    }
+
+    // ========================================================================
+    // Filtered list operations with pagination
+    // ========================================================================
+
+    #[allow(clippy::too_many_arguments)]
+    async fn list_plans_filtered(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        statuses: Option<Vec<String>>,
+        priority_min: Option<i32>,
+        priority_max: Option<i32>,
+        search: Option<&str>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> anyhow::Result<(Vec<PlanNode>, usize)> {
+        self.list_plans_filtered(
+            project_id,
+            workspace_slug,
+            statuses,
+            priority_min,
+            priority_max,
+            search,
+            limit,
+            offset,
+            sort_by,
+            sort_order,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn list_all_tasks_filtered(
+        &self,
+        plan_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        statuses: Option<Vec<String>>,
+        priority_min: Option<i32>,
+        priority_max: Option<i32>,
+        tags: Option<Vec<String>>,
+        assigned_to: Option<&str>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> anyhow::Result<(Vec<TaskWithPlan>, usize)> {
+        self.list_all_tasks_filtered(
+            plan_id,
+            project_id,
+            workspace_slug,
+            statuses,
+            priority_min,
+            priority_max,
+            tags,
+            assigned_to,
+            limit,
+            offset,
+            sort_by,
+            sort_order,
+        )
+        .await
+    }
+
+    async fn list_releases_filtered(
+        &self,
+        project_id: Uuid,
+        statuses: Option<Vec<String>>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> anyhow::Result<(Vec<ReleaseNode>, usize)> {
+        self.list_releases_filtered(project_id, statuses, limit, offset, sort_by, sort_order)
+            .await
+    }
+
+    async fn list_milestones_filtered(
+        &self,
+        project_id: Uuid,
+        statuses: Option<Vec<String>>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> anyhow::Result<(Vec<MilestoneNode>, usize)> {
+        self.list_milestones_filtered(project_id, statuses, limit, offset, sort_by, sort_order)
+            .await
+    }
+
+    async fn list_projects_filtered(
+        &self,
+        search: Option<&str>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> anyhow::Result<(Vec<ProjectNode>, usize)> {
+        self.list_projects_filtered(search, limit, offset, sort_by, sort_order)
+            .await
+    }
+}
+
+#[async_trait]
+impl NoteStore for Neo4jClient {
     // ========================================================================
     // Document operations
     // ========================================================================
@@ -339,7 +2231,10 @@ impl GraphStore for Neo4jClient {
     ) -> anyhow::Result<(Vec<Note>, usize)> {
         self.list_notes_without_embedding(limit, offset).await
     }
+}
 
+#[async_trait]
+impl AnalyticsStore for Neo4jClient {
     // ========================================================================
     // Code embedding operations (File & Function vector search)
     // ========================================================================
@@ -3076,1895 +4971,6 @@ impl GraphStore for Neo4jClient {
         filter: &crate::graph::neighborhood::ProjectFilter,
     ) -> anyhow::Result<Option<crate::graph::neighborhood::ScopedNeighborhood>> {
         self.get_scoped_entity_neighborhood(center_type, center_id, params, filter)
-            .await
-    }
-}
-
-#[async_trait]
-impl ProjectStore for Neo4jClient {
-    // ========================================================================
-    // Project operations
-    // ========================================================================
-
-    async fn create_project(&self, project: &ProjectNode) -> anyhow::Result<()> {
-        self.create_project(project).await
-    }
-
-    async fn get_project(&self, id: Uuid) -> anyhow::Result<Option<ProjectNode>> {
-        self.get_project(id).await
-    }
-
-    async fn get_project_by_slug(&self, slug: &str) -> anyhow::Result<Option<ProjectNode>> {
-        self.get_project_by_slug(slug).await
-    }
-
-    async fn list_projects(&self) -> anyhow::Result<Vec<ProjectNode>> {
-        self.list_projects().await
-    }
-
-    async fn update_project(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<Option<String>>,
-        root_path: Option<String>,
-        profile: Option<ProjectProfile>,
-    ) -> anyhow::Result<()> {
-        self.update_project(id, name, description, root_path, profile)
-            .await
-    }
-
-    async fn update_project_synced(&self, id: Uuid) -> anyhow::Result<()> {
-        self.update_project_synced(id).await
-    }
-
-    async fn update_project_analytics_timestamp(&self, id: Uuid) -> anyhow::Result<()> {
-        self.update_project_analytics_timestamp(id).await
-    }
-
-    async fn delete_project(&self, id: Uuid, project_name: &str) -> anyhow::Result<()> {
-        self.delete_project(id, project_name).await
-    }
-}
-
-#[async_trait]
-impl WorkspaceStore for Neo4jClient {
-    // ========================================================================
-    // Workspace operations
-    // ========================================================================
-
-    async fn create_workspace(&self, workspace: &WorkspaceNode) -> anyhow::Result<()> {
-        self.create_workspace(workspace).await
-    }
-
-    async fn get_workspace(&self, id: Uuid) -> anyhow::Result<Option<WorkspaceNode>> {
-        self.get_workspace(id).await
-    }
-
-    async fn get_workspace_by_slug(&self, slug: &str) -> anyhow::Result<Option<WorkspaceNode>> {
-        self.get_workspace_by_slug(slug).await
-    }
-
-    async fn list_workspaces(&self) -> anyhow::Result<Vec<WorkspaceNode>> {
-        self.list_workspaces().await
-    }
-
-    async fn update_workspace(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<String>,
-        metadata: Option<serde_json::Value>,
-        slug: Option<String>,
-    ) -> anyhow::Result<()> {
-        self.update_workspace(id, name, description, metadata, slug)
-            .await
-    }
-
-    async fn delete_workspace(&self, id: Uuid) -> anyhow::Result<()> {
-        self.delete_workspace(id).await
-    }
-
-    async fn add_project_to_workspace(
-        &self,
-        workspace_id: Uuid,
-        project_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.add_project_to_workspace(workspace_id, project_id)
-            .await
-    }
-
-    async fn remove_project_from_workspace(
-        &self,
-        workspace_id: Uuid,
-        project_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.remove_project_from_workspace(workspace_id, project_id)
-            .await
-    }
-
-    async fn list_workspace_projects(
-        &self,
-        workspace_id: Uuid,
-    ) -> anyhow::Result<Vec<ProjectNode>> {
-        self.list_workspace_projects(workspace_id).await
-    }
-
-    async fn get_project_workspace(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Option<WorkspaceNode>> {
-        self.get_project_workspace(project_id).await
-    }
-
-    async fn compute_coupling_matrix(
-        &self,
-        workspace_id: Uuid,
-    ) -> anyhow::Result<crate::neo4j::models::CouplingMatrix> {
-        self.compute_coupling_matrix(workspace_id).await
-    }
-    // ========================================================================
-    // Workspace Milestone operations
-    // ========================================================================
-
-    async fn create_workspace_milestone(
-        &self,
-        milestone: &WorkspaceMilestoneNode,
-    ) -> anyhow::Result<()> {
-        self.create_workspace_milestone(milestone).await
-    }
-
-    async fn get_workspace_milestone(
-        &self,
-        id: Uuid,
-    ) -> anyhow::Result<Option<WorkspaceMilestoneNode>> {
-        self.get_workspace_milestone(id).await
-    }
-
-    async fn list_workspace_milestones(
-        &self,
-        workspace_id: Uuid,
-    ) -> anyhow::Result<Vec<WorkspaceMilestoneNode>> {
-        self.list_workspace_milestones(workspace_id).await
-    }
-
-    async fn list_workspace_milestones_filtered(
-        &self,
-        workspace_id: Uuid,
-        status: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<(Vec<WorkspaceMilestoneNode>, usize)> {
-        self.list_workspace_milestones_filtered(workspace_id, status, limit, offset)
-            .await
-    }
-
-    async fn list_all_workspace_milestones_filtered(
-        &self,
-        workspace_id: Option<Uuid>,
-        status: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<Vec<(WorkspaceMilestoneNode, String, String, String)>> {
-        self.list_all_workspace_milestones_filtered(workspace_id, status, limit, offset)
-            .await
-    }
-
-    async fn count_all_workspace_milestones(
-        &self,
-        workspace_id: Option<Uuid>,
-        status: Option<&str>,
-    ) -> anyhow::Result<usize> {
-        self.count_all_workspace_milestones(workspace_id, status)
-            .await
-    }
-
-    async fn update_workspace_milestone(
-        &self,
-        id: Uuid,
-        title: Option<String>,
-        description: Option<String>,
-        status: Option<MilestoneStatus>,
-        target_date: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> anyhow::Result<bool> {
-        self.update_workspace_milestone(id, title, description, status, target_date)
-            .await
-    }
-
-    async fn delete_workspace_milestone(&self, id: Uuid) -> anyhow::Result<()> {
-        self.delete_workspace_milestone(id).await
-    }
-
-    async fn add_task_to_workspace_milestone(
-        &self,
-        milestone_id: Uuid,
-        task_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.add_task_to_workspace_milestone(milestone_id, task_id)
-            .await
-    }
-
-    async fn remove_task_from_workspace_milestone(
-        &self,
-        milestone_id: Uuid,
-        task_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.remove_task_from_workspace_milestone(milestone_id, task_id)
-            .await
-    }
-
-    async fn link_plan_to_workspace_milestone(
-        &self,
-        plan_id: Uuid,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.link_plan_to_workspace_milestone(plan_id, milestone_id)
-            .await
-    }
-
-    async fn unlink_plan_from_workspace_milestone(
-        &self,
-        plan_id: Uuid,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.unlink_plan_from_workspace_milestone(plan_id, milestone_id)
-            .await
-    }
-
-    async fn get_workspace_milestone_progress(
-        &self,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<(u32, u32, u32, u32)> {
-        self.get_workspace_milestone_progress(milestone_id).await
-    }
-
-    async fn get_workspace_milestone_tasks(
-        &self,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<Vec<TaskWithPlan>> {
-        self.get_workspace_milestone_tasks(milestone_id).await
-    }
-
-    async fn get_workspace_milestone_steps(
-        &self,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<std::collections::HashMap<Uuid, Vec<StepNode>>> {
-        self.get_workspace_milestone_steps(milestone_id).await
-    }
-
-    // ========================================================================
-    // Resource operations
-    // ========================================================================
-
-    async fn create_resource(&self, resource: &ResourceNode) -> anyhow::Result<()> {
-        self.create_resource(resource).await
-    }
-
-    async fn get_resource(&self, id: Uuid) -> anyhow::Result<Option<ResourceNode>> {
-        self.get_resource(id).await
-    }
-
-    async fn list_workspace_resources(
-        &self,
-        workspace_id: Uuid,
-    ) -> anyhow::Result<Vec<ResourceNode>> {
-        self.list_workspace_resources(workspace_id).await
-    }
-
-    async fn update_resource(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        file_path: Option<String>,
-        url: Option<String>,
-        version: Option<String>,
-        description: Option<String>,
-    ) -> anyhow::Result<bool> {
-        self.update_resource(id, name, file_path, url, version, description)
-            .await
-    }
-
-    async fn delete_resource(&self, id: Uuid) -> anyhow::Result<()> {
-        self.delete_resource(id).await
-    }
-
-    async fn link_project_implements_resource(
-        &self,
-        project_id: Uuid,
-        resource_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.link_project_implements_resource(project_id, resource_id)
-            .await
-    }
-
-    async fn link_project_uses_resource(
-        &self,
-        project_id: Uuid,
-        resource_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.link_project_uses_resource(project_id, resource_id)
-            .await
-    }
-
-    async fn get_resource_implementers(
-        &self,
-        resource_id: Uuid,
-    ) -> anyhow::Result<Vec<ProjectNode>> {
-        self.get_resource_implementers(resource_id).await
-    }
-
-    async fn get_resource_consumers(&self, resource_id: Uuid) -> anyhow::Result<Vec<ProjectNode>> {
-        self.get_resource_consumers(resource_id).await
-    }
-
-    // ========================================================================
-    // Component operations (Topology)
-    // ========================================================================
-
-    async fn create_component(&self, component: &ComponentNode) -> anyhow::Result<()> {
-        self.create_component(component).await
-    }
-
-    async fn get_component(&self, id: Uuid) -> anyhow::Result<Option<ComponentNode>> {
-        self.get_component(id).await
-    }
-
-    async fn list_components(&self, workspace_id: Uuid) -> anyhow::Result<Vec<ComponentNode>> {
-        self.list_components(workspace_id).await
-    }
-
-    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> anyhow::Result<bool> {
-        self.update_component(id, patch).await
-    }
-
-    async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> anyhow::Result<Uuid> {
-        self.upsert_derived_component(write).await
-    }
-
-    async fn delete_component(&self, id: Uuid) -> anyhow::Result<()> {
-        self.delete_component(id).await
-    }
-
-    async fn add_component_dependency(
-        &self,
-        component_id: Uuid,
-        depends_on_id: Uuid,
-        protocol: Option<String>,
-        required: bool,
-    ) -> anyhow::Result<()> {
-        self.add_component_dependency(component_id, depends_on_id, protocol, required)
-            .await
-    }
-
-    async fn remove_component_dependency(
-        &self,
-        component_id: Uuid,
-        depends_on_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.remove_component_dependency(component_id, depends_on_id)
-            .await
-    }
-
-    async fn map_component_to_project(
-        &self,
-        component_id: Uuid,
-        project_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.map_component_to_project(component_id, project_id)
-            .await
-    }
-
-    async fn get_workspace_topology(
-        &self,
-        workspace_id: Uuid,
-    ) -> anyhow::Result<Vec<(ComponentNode, Option<String>, Vec<ComponentDependency>)>> {
-        self.get_workspace_topology(workspace_id).await
-    }
-}
-
-#[async_trait]
-impl CodeStore for Neo4jClient {
-    // ========================================================================
-    // File operations
-    // ========================================================================
-
-    async fn get_project_file_paths(&self, project_id: Uuid) -> anyhow::Result<Vec<String>> {
-        self.get_project_file_paths(project_id).await
-    }
-
-    async fn delete_file(&self, path: &str) -> anyhow::Result<()> {
-        self.delete_file(path).await
-    }
-
-    async fn delete_stale_files(
-        &self,
-        project_id: Uuid,
-        valid_paths: &[String],
-    ) -> anyhow::Result<(usize, usize, Vec<String>)> {
-        self.delete_stale_files(project_id, valid_paths).await
-    }
-
-    async fn link_file_to_project(&self, file_path: &str, project_id: Uuid) -> anyhow::Result<()> {
-        self.link_file_to_project(file_path, project_id).await
-    }
-
-    async fn upsert_file(&self, file: &FileNode) -> anyhow::Result<()> {
-        self.upsert_file(file).await
-    }
-
-    async fn batch_upsert_files(&self, files: &[FileNode]) -> anyhow::Result<()> {
-        self.batch_upsert_files(files).await
-    }
-
-    async fn get_file(&self, path: &str) -> anyhow::Result<Option<FileNode>> {
-        self.get_file(path).await
-    }
-
-    async fn find_files_by_path_suffix(
-        &self,
-        suffix: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<(String, Option<Uuid>)>> {
-        self.find_files_by_path_suffix(suffix, limit).await
-    }
-
-    async fn list_project_files(&self, project_id: Uuid) -> anyhow::Result<Vec<FileNode>> {
-        self.list_project_files(project_id).await
-    }
-
-    async fn count_project_files(&self, project_id: Uuid) -> anyhow::Result<i64> {
-        self.count_project_files(project_id).await
-    }
-
-    async fn count_orphan_files(&self, project_id: Uuid) -> anyhow::Result<i64> {
-        self.count_orphan_files(project_id).await
-    }
-
-    async fn count_co_change_pairs(&self, project_id: Uuid, min_count: i64) -> anyhow::Result<i64> {
-        self.count_co_change_pairs(project_id, min_count).await
-    }
-
-    async fn count_protocol_states_transitions(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<(i64, i64)> {
-        self.count_protocol_states_transitions(project_id).await
-    }
-
-    async fn invalidate_computed_properties(
-        &self,
-        project_id: Uuid,
-        paths: &[String],
-    ) -> anyhow::Result<u64> {
-        self.invalidate_computed_properties(project_id, paths).await
-    }
-
-    // ========================================================================
-    // Symbol operations
-    // ========================================================================
-
-    async fn upsert_function(&self, func: &FunctionNode) -> anyhow::Result<()> {
-        self.upsert_function(func).await
-    }
-
-    async fn upsert_struct(&self, s: &StructNode) -> anyhow::Result<()> {
-        self.upsert_struct(s).await
-    }
-
-    async fn upsert_trait(&self, t: &TraitNode) -> anyhow::Result<()> {
-        self.upsert_trait(t).await
-    }
-
-    async fn find_trait_by_name(&self, name: &str) -> anyhow::Result<Option<String>> {
-        self.find_trait_by_name(name).await
-    }
-
-    async fn upsert_enum(&self, e: &EnumNode) -> anyhow::Result<()> {
-        self.upsert_enum(e).await
-    }
-
-    async fn upsert_impl(&self, impl_node: &ImplNode) -> anyhow::Result<()> {
-        self.upsert_impl(impl_node).await
-    }
-
-    async fn create_import_relationship(
-        &self,
-        from_file: &str,
-        to_file: &str,
-        import_path: &str,
-    ) -> anyhow::Result<()> {
-        self.create_import_relationship(from_file, to_file, import_path)
-            .await
-    }
-
-    async fn upsert_import(&self, import: &ImportNode) -> anyhow::Result<()> {
-        self.upsert_import(import).await
-    }
-
-    async fn create_imports_symbol_relationship(
-        &self,
-        import_id: &str,
-        symbol_name: &str,
-        project_id: Option<Uuid>,
-    ) -> anyhow::Result<()> {
-        self.create_imports_symbol_relationship(import_id, symbol_name, project_id)
-            .await
-    }
-
-    async fn create_call_relationship(
-        &self,
-        caller_id: &str,
-        callee_name: &str,
-        project_id: Option<Uuid>,
-        confidence: f64,
-        reason: &str,
-    ) -> anyhow::Result<()> {
-        self.create_call_relationship(caller_id, callee_name, project_id, confidence, reason)
-            .await
-    }
-
-    // ========================================================================
-    // Batch upsert operations (UNWIND)
-    // ========================================================================
-
-    async fn batch_upsert_functions(&self, functions: &[FunctionNode]) -> anyhow::Result<()> {
-        self.batch_upsert_functions(functions).await
-    }
-
-    async fn batch_upsert_structs(&self, structs: &[StructNode]) -> anyhow::Result<()> {
-        self.batch_upsert_structs(structs).await
-    }
-
-    async fn batch_upsert_traits(&self, traits: &[TraitNode]) -> anyhow::Result<()> {
-        self.batch_upsert_traits(traits).await
-    }
-
-    async fn batch_upsert_enums(&self, enums: &[EnumNode]) -> anyhow::Result<()> {
-        self.batch_upsert_enums(enums).await
-    }
-
-    async fn batch_upsert_impls(&self, impls: &[ImplNode]) -> anyhow::Result<()> {
-        self.batch_upsert_impls(impls).await
-    }
-
-    async fn batch_upsert_imports(&self, imports: &[ImportNode]) -> anyhow::Result<()> {
-        self.batch_upsert_imports(imports).await
-    }
-
-    async fn batch_create_import_relationships(
-        &self,
-        relationships: &[(String, String, String)],
-    ) -> anyhow::Result<()> {
-        self.batch_create_import_relationships(relationships).await
-    }
-
-    async fn batch_create_imports_symbol_relationships(
-        &self,
-        relationships: &[(String, String, Option<uuid::Uuid>)],
-    ) -> anyhow::Result<()> {
-        self.batch_create_imports_symbol_relationships(relationships)
-            .await
-    }
-
-    async fn batch_create_call_relationships(
-        &self,
-        calls: &[crate::parser::FunctionCall],
-        project_id: Option<uuid::Uuid>,
-    ) -> anyhow::Result<()> {
-        self.batch_create_call_relationships(calls, project_id)
-            .await
-    }
-
-    async fn batch_create_extends_relationships(
-        &self,
-        rels: &[(String, String, String, String)],
-    ) -> anyhow::Result<()> {
-        self.batch_create_extends_relationships(rels).await
-    }
-
-    async fn batch_create_implements_relationships(
-        &self,
-        rels: &[(String, String, String, String)],
-    ) -> anyhow::Result<()> {
-        self.batch_create_implements_relationships(rels).await
-    }
-
-    async fn cleanup_cross_project_calls(&self) -> anyhow::Result<i64> {
-        self.cleanup_cross_project_calls().await
-    }
-
-    async fn cleanup_builtin_calls(&self) -> anyhow::Result<i64> {
-        self.cleanup_builtin_calls().await
-    }
-
-    async fn migrate_calls_confidence(&self) -> anyhow::Result<i64> {
-        self.migrate_calls_confidence().await
-    }
-
-    async fn cleanup_sync_data(&self) -> anyhow::Result<i64> {
-        self.cleanup_sync_data().await
-    }
-
-    async fn get_callees(
-        &self,
-        function_id: &str,
-        depth: u32,
-    ) -> anyhow::Result<Vec<FunctionNode>> {
-        self.get_callees(function_id, depth).await
-    }
-
-    async fn create_uses_type_relationship(
-        &self,
-        function_id: &str,
-        type_name: &str,
-    ) -> anyhow::Result<()> {
-        self.create_uses_type_relationship(function_id, type_name)
-            .await
-    }
-
-    async fn find_trait_implementors(&self, trait_name: &str) -> anyhow::Result<Vec<String>> {
-        self.find_trait_implementors(trait_name).await
-    }
-
-    async fn get_type_traits(&self, type_name: &str) -> anyhow::Result<Vec<String>> {
-        self.get_type_traits(type_name).await
-    }
-
-    async fn get_impl_blocks(&self, type_name: &str) -> anyhow::Result<Vec<serde_json::Value>> {
-        self.get_impl_blocks(type_name).await
-    }
-
-    // ========================================================================
-    // Heritage navigation queries
-    // ========================================================================
-
-    async fn get_class_hierarchy(
-        &self,
-        type_name: &str,
-        max_depth: u32,
-    ) -> anyhow::Result<serde_json::Value> {
-        self.get_class_hierarchy(type_name, max_depth).await
-    }
-
-    async fn find_subclasses(&self, class_name: &str) -> anyhow::Result<Vec<serde_json::Value>> {
-        self.find_subclasses(class_name).await
-    }
-
-    async fn find_interface_implementors(
-        &self,
-        interface_name: &str,
-    ) -> anyhow::Result<Vec<serde_json::Value>> {
-        self.find_interface_implementors(interface_name).await
-    }
-
-    // ========================================================================
-    // Process queries
-    // ========================================================================
-
-    async fn list_processes(
-        &self,
-        project_id: uuid::Uuid,
-    ) -> anyhow::Result<Vec<serde_json::Value>> {
-        self.list_processes(project_id).await
-    }
-
-    async fn get_process_detail(
-        &self,
-        process_id: &str,
-    ) -> anyhow::Result<Option<serde_json::Value>> {
-        self.get_process_detail(process_id).await
-    }
-
-    async fn get_entry_points(
-        &self,
-        project_id: uuid::Uuid,
-        limit: usize,
-    ) -> anyhow::Result<Vec<serde_json::Value>> {
-        self.get_entry_points(project_id, limit).await
-    }
-
-    // ========================================================================
-    // Code exploration queries
-    // ========================================================================
-
-    async fn get_file_language(&self, path: &str) -> anyhow::Result<Option<String>> {
-        self.get_file_language(path).await
-    }
-
-    async fn get_file_functions_summary(
-        &self,
-        path: &str,
-    ) -> anyhow::Result<Vec<FunctionSummaryNode>> {
-        self.get_file_functions_summary(path).await
-    }
-
-    async fn get_file_structs_summary(&self, path: &str) -> anyhow::Result<Vec<StructSummaryNode>> {
-        self.get_file_structs_summary(path).await
-    }
-
-    async fn get_file_import_paths_list(&self, path: &str) -> anyhow::Result<Vec<String>> {
-        self.get_file_import_paths_list(path).await
-    }
-
-    async fn find_symbol_references(
-        &self,
-        symbol: &str,
-        limit: usize,
-        project_id: Option<Uuid>,
-    ) -> anyhow::Result<Vec<SymbolReferenceNode>> {
-        self.find_symbol_references(symbol, limit, project_id).await
-    }
-
-    async fn get_file_direct_imports(&self, path: &str) -> anyhow::Result<Vec<FileImportNode>> {
-        self.get_file_direct_imports(path).await
-    }
-
-    async fn get_function_callers_by_name(
-        &self,
-        function_name: &str,
-        depth: u32,
-        project_id: Option<Uuid>,
-    ) -> anyhow::Result<Vec<String>> {
-        self.get_function_callers_by_name(function_name, depth, project_id)
-            .await
-    }
-
-    async fn get_function_callees_by_name(
-        &self,
-        function_name: &str,
-        depth: u32,
-        project_id: Option<Uuid>,
-    ) -> anyhow::Result<Vec<String>> {
-        self.get_function_callees_by_name(function_name, depth, project_id)
-            .await
-    }
-
-    async fn get_callers_with_confidence(
-        &self,
-        function_name: &str,
-        project_id: Option<Uuid>,
-    ) -> anyhow::Result<Vec<(String, String, f64, String)>> {
-        self.get_callers_with_confidence(function_name, project_id)
-            .await
-    }
-
-    async fn get_callees_with_confidence(
-        &self,
-        function_name: &str,
-        project_id: Option<Uuid>,
-    ) -> anyhow::Result<Vec<(String, String, f64, String)>> {
-        self.get_callees_with_confidence(function_name, project_id)
-            .await
-    }
-
-    async fn get_language_stats(&self) -> anyhow::Result<Vec<LanguageStatsNode>> {
-        self.get_language_stats().await
-    }
-
-    async fn get_language_stats_for_project(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<LanguageStatsNode>> {
-        self.get_language_stats_for_project(project_id).await
-    }
-
-    async fn get_most_connected_files(&self, limit: usize) -> anyhow::Result<Vec<String>> {
-        self.get_most_connected_files(limit).await
-    }
-
-    async fn get_most_connected_files_detailed(
-        &self,
-        limit: usize,
-    ) -> anyhow::Result<Vec<ConnectedFileNode>> {
-        self.get_most_connected_files_detailed(limit).await
-    }
-
-    async fn get_most_connected_files_for_project(
-        &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> anyhow::Result<Vec<ConnectedFileNode>> {
-        self.get_most_connected_files_for_project(project_id, limit)
-            .await
-    }
-
-    async fn get_project_communities(&self, project_id: Uuid) -> anyhow::Result<Vec<CommunityRow>> {
-        self.get_project_communities(project_id).await
-    }
-
-    async fn get_node_analytics(
-        &self,
-        identifier: &str,
-        node_type: &str,
-    ) -> anyhow::Result<Option<NodeAnalyticsRow>> {
-        self.get_node_analytics(identifier, node_type).await
-    }
-
-    async fn get_affected_communities(&self, file_paths: &[String]) -> anyhow::Result<Vec<String>> {
-        self.get_affected_communities(file_paths).await
-    }
-
-    async fn get_code_health_report(
-        &self,
-        project_id: Uuid,
-        god_function_threshold: usize,
-    ) -> anyhow::Result<crate::neo4j::models::CodeHealthReport> {
-        self.get_code_health_report(project_id, god_function_threshold)
-            .await
-    }
-
-    async fn compute_maintenance_snapshot(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<crate::neo4j::models::MaintenanceSnapshot> {
-        self.compute_maintenance_snapshot(project_id).await
-    }
-
-    async fn compute_scaffolding_level(
-        &self,
-        project_id: Uuid,
-        scaffolding_override: Option<u8>,
-    ) -> anyhow::Result<crate::neo4j::models::ScaffoldingLevel> {
-        self.compute_scaffolding_level(project_id, scaffolding_override)
-            .await
-    }
-
-    async fn set_scaffolding_override(
-        &self,
-        project_id: Uuid,
-        level: Option<u8>,
-    ) -> anyhow::Result<()> {
-        self.set_scaffolding_override(project_id, level).await
-    }
-
-    async fn set_watch_enabled(&self, project_id: Uuid, enabled: bool) -> anyhow::Result<()> {
-        self.set_watch_enabled(project_id, enabled).await
-    }
-
-    async fn set_default_note_energy(
-        &self,
-        project_id: Uuid,
-        energy: Option<f64>,
-    ) -> anyhow::Result<()> {
-        self.set_default_note_energy(project_id, energy).await
-    }
-
-    async fn detect_global_stagnation(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<crate::neo4j::models::StagnationReport> {
-        self.detect_global_stagnation(project_id).await
-    }
-
-    async fn get_circular_dependencies(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<Vec<String>>> {
-        self.get_circular_dependencies(project_id).await
-    }
-
-    async fn get_node_gds_metrics(
-        &self,
-        node_path: &str,
-        node_type: &str,
-        project_id: Uuid,
-    ) -> anyhow::Result<Option<NodeGdsMetrics>> {
-        self.get_node_gds_metrics(node_path, node_type, project_id)
-            .await
-    }
-
-    async fn get_project_percentiles(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<ProjectPercentiles> {
-        self.get_project_percentiles(project_id).await
-    }
-
-    async fn get_top_bridges_by_betweenness(
-        &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> anyhow::Result<Vec<BridgeFile>> {
-        self.get_top_bridges_by_betweenness(project_id, limit).await
-    }
-
-    async fn get_file_symbol_names(&self, path: &str) -> anyhow::Result<FileSymbolNamesNode> {
-        self.get_file_symbol_names(path).await
-    }
-
-    async fn get_function_caller_count(
-        &self,
-        function_name: &str,
-        project_id: Option<Uuid>,
-    ) -> anyhow::Result<i64> {
-        self.get_function_caller_count(function_name, project_id)
-            .await
-    }
-
-    async fn get_trait_info(&self, trait_name: &str) -> anyhow::Result<Option<TraitInfoNode>> {
-        self.get_trait_info(trait_name).await
-    }
-
-    async fn get_trait_implementors_detailed(
-        &self,
-        trait_name: &str,
-    ) -> anyhow::Result<Vec<TraitImplementorNode>> {
-        self.get_trait_implementors_detailed(trait_name).await
-    }
-
-    async fn get_type_trait_implementations(
-        &self,
-        type_name: &str,
-    ) -> anyhow::Result<Vec<TypeTraitInfoNode>> {
-        self.get_type_trait_implementations(type_name).await
-    }
-
-    async fn get_type_impl_blocks_detailed(
-        &self,
-        type_name: &str,
-    ) -> anyhow::Result<Vec<ImplBlockDetailNode>> {
-        self.get_type_impl_blocks_detailed(type_name).await
-    }
-}
-
-#[async_trait]
-impl PlanStore for Neo4jClient {
-    // ========================================================================
-    // Plan operations
-    // ========================================================================
-
-    async fn create_plan(&self, plan: &PlanNode) -> anyhow::Result<()> {
-        self.create_plan(plan).await
-    }
-
-    async fn get_plan(&self, id: Uuid) -> anyhow::Result<Option<PlanNode>> {
-        self.get_plan(id).await
-    }
-
-    async fn list_active_plans(&self) -> anyhow::Result<Vec<PlanNode>> {
-        self.list_active_plans().await
-    }
-
-    async fn list_project_plans(&self, project_id: Uuid) -> anyhow::Result<Vec<PlanNode>> {
-        self.list_project_plans(project_id).await
-    }
-
-    async fn count_project_plans(&self, project_id: Uuid) -> anyhow::Result<i64> {
-        self.count_project_plans(project_id).await
-    }
-
-    async fn list_plans_for_project(
-        &self,
-        project_id: Uuid,
-        status_filter: Option<Vec<String>>,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<(Vec<PlanNode>, usize)> {
-        self.list_plans_for_project(project_id, status_filter, limit, offset)
-            .await
-    }
-
-    async fn update_plan(&self, id: Uuid, updates: &UpdatePlanRequest) -> anyhow::Result<()> {
-        self.update_plan(id, updates).await
-    }
-
-    async fn update_plan_status(&self, id: Uuid, status: PlanStatus) -> anyhow::Result<()> {
-        self.update_plan_status(id, status).await
-    }
-
-    async fn list_plan_project_slugs(&self, plan_id: Uuid) -> anyhow::Result<Vec<String>> {
-        self.list_plan_project_slugs(plan_id).await
-    }
-
-    async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> anyhow::Result<()> {
-        self.link_plan_to_project(plan_id, project_id).await
-    }
-
-    async fn unlink_plan_from_project(&self, plan_id: Uuid) -> anyhow::Result<()> {
-        self.unlink_plan_from_project(plan_id).await
-    }
-
-    async fn delete_plan(&self, plan_id: Uuid) -> anyhow::Result<()> {
-        self.delete_plan(plan_id).await
-    }
-
-    // ========================================================================
-    // Task operations
-    // ========================================================================
-
-    async fn create_task(&self, plan_id: Uuid, task: &TaskNode) -> anyhow::Result<()> {
-        self.create_task(plan_id, task).await
-    }
-
-    async fn get_plan_tasks(&self, plan_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
-        self.get_plan_tasks(plan_id).await
-    }
-
-    async fn get_task_with_full_details(
-        &self,
-        task_id: Uuid,
-    ) -> anyhow::Result<Option<TaskDetails>> {
-        self.get_task_with_full_details(task_id).await
-    }
-
-    async fn analyze_task_impact(&self, task_id: Uuid) -> anyhow::Result<Vec<String>> {
-        self.analyze_task_impact(task_id).await
-    }
-
-    async fn find_blocked_tasks(
-        &self,
-        plan_id: Uuid,
-    ) -> anyhow::Result<Vec<(TaskNode, Vec<TaskNode>)>> {
-        self.find_blocked_tasks(plan_id).await
-    }
-
-    async fn update_task_status(&self, task_id: Uuid, status: TaskStatus) -> anyhow::Result<()> {
-        self.update_task_status(task_id, status).await
-    }
-
-    async fn interrupt_task(&self, task_id: Uuid, reason: &str) -> anyhow::Result<bool> {
-        self.interrupt_task(task_id, reason).await
-    }
-
-    async fn assign_task(&self, task_id: Uuid, agent_id: &str) -> anyhow::Result<()> {
-        self.assign_task(task_id, agent_id).await
-    }
-
-    async fn add_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> anyhow::Result<()> {
-        self.add_task_dependency(task_id, depends_on_id).await
-    }
-
-    async fn remove_task_dependency(
-        &self,
-        task_id: Uuid,
-        depends_on_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.remove_task_dependency(task_id, depends_on_id).await
-    }
-
-    async fn get_task_blockers(&self, task_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
-        self.get_task_blockers(task_id).await
-    }
-
-    async fn get_tasks_blocked_by(&self, task_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
-        self.get_tasks_blocked_by(task_id).await
-    }
-
-    async fn get_task_dependencies(&self, task_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
-        self.get_task_dependencies(task_id).await
-    }
-
-    async fn get_plan_dependency_graph(
-        &self,
-        plan_id: Uuid,
-    ) -> anyhow::Result<(Vec<TaskNode>, Vec<(Uuid, Uuid)>)> {
-        self.get_plan_dependency_graph(plan_id).await
-    }
-
-    async fn get_task_enrichment_counts(
-        &self,
-        task_ids: &[String],
-    ) -> anyhow::Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentCounts>>
-    {
-        self.get_task_enrichment_counts(task_ids).await
-    }
-
-    async fn get_task_enrichment_data(
-        &self,
-        task_ids: &[String],
-    ) -> anyhow::Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentData>>
-    {
-        self.get_task_enrichment_data(task_ids).await
-    }
-
-    async fn get_plan_critical_path(&self, plan_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
-        self.get_plan_critical_path(plan_id).await
-    }
-
-    async fn compute_waves(
-        &self,
-        plan_id: Uuid,
-    ) -> anyhow::Result<crate::neo4j::plan::WaveComputationResult> {
-        self.compute_waves(plan_id).await
-    }
-
-    async fn get_next_available_task(&self, plan_id: Uuid) -> anyhow::Result<Option<TaskNode>> {
-        self.get_next_available_task(plan_id).await
-    }
-
-    async fn get_task(&self, task_id: Uuid) -> anyhow::Result<Option<TaskNode>> {
-        self.get_task(task_id).await
-    }
-
-    async fn update_task(&self, task_id: Uuid, updates: &UpdateTaskRequest) -> anyhow::Result<()> {
-        self.update_task(task_id, updates).await
-    }
-
-    async fn update_task_enrichment(
-        &self,
-        task_id: Uuid,
-        execution_context: Option<&str>,
-        persona: Option<&str>,
-        prompt_cache: Option<&str>,
-    ) -> anyhow::Result<()> {
-        self.update_task_enrichment(task_id, execution_context, persona, prompt_cache)
-            .await
-    }
-
-    async fn delete_task(&self, task_id: Uuid) -> anyhow::Result<()> {
-        self.delete_task(task_id).await
-    }
-
-    async fn get_project_for_task(&self, task_id: Uuid) -> anyhow::Result<Option<ProjectNode>> {
-        self.get_project_for_task(task_id).await
-    }
-
-    async fn get_plan_id_for_task(&self, task_id: Uuid) -> anyhow::Result<Option<Uuid>> {
-        self.get_plan_id_for_task(task_id).await
-    }
-
-    // ========================================================================
-    // Day plan operations
-    // ========================================================================
-
-    async fn get_day_plan(&self, user_id: Uuid, date: &str) -> anyhow::Result<Vec<(Uuid, u32)>> {
-        self.get_day_plan(user_id, date).await
-    }
-
-    async fn set_day_plan(&self, user_id: Uuid, date: &str, ids: &[Uuid]) -> anyhow::Result<()> {
-        self.set_day_plan(user_id, date, ids).await
-    }
-
-    async fn add_to_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> anyhow::Result<()> {
-        self.add_to_day(user_id, date, task_id).await
-    }
-
-    async fn remove_from_day(
-        &self,
-        user_id: Uuid,
-        date: &str,
-        task_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.remove_from_day(user_id, date, task_id).await
-    }
-
-    // ========================================================================
-    // Step operations
-    // ========================================================================
-
-    async fn create_step(&self, task_id: Uuid, step: &StepNode) -> anyhow::Result<()> {
-        self.create_step(task_id, step).await
-    }
-
-    async fn get_task_steps(&self, task_id: Uuid) -> anyhow::Result<Vec<StepNode>> {
-        self.get_task_steps(task_id).await
-    }
-
-    async fn update_step(&self, step_id: Uuid, updates: &UpdateStepRequest) -> anyhow::Result<()> {
-        self.update_step(step_id, updates).await
-    }
-
-    async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> anyhow::Result<()> {
-        self.update_step_status(step_id, status).await
-    }
-
-    async fn get_task_step_progress(&self, task_id: Uuid) -> anyhow::Result<(u32, u32)> {
-        self.get_task_step_progress(task_id).await
-    }
-
-    async fn get_step(&self, step_id: Uuid) -> anyhow::Result<Option<StepNode>> {
-        self.get_step(step_id).await
-    }
-
-    async fn delete_step(&self, step_id: Uuid) -> anyhow::Result<()> {
-        self.delete_step(step_id).await
-    }
-
-    async fn complete_pending_steps_for_task(&self, task_id: Uuid) -> anyhow::Result<u32> {
-        self.complete_pending_steps_for_task(task_id).await
-    }
-
-    // ========================================================================
-    // Constraint operations
-    // ========================================================================
-
-    async fn create_constraint(
-        &self,
-        plan_id: Uuid,
-        constraint: &ConstraintNode,
-    ) -> anyhow::Result<()> {
-        self.create_constraint(plan_id, constraint).await
-    }
-
-    async fn get_plan_constraints(&self, plan_id: Uuid) -> anyhow::Result<Vec<ConstraintNode>> {
-        self.get_plan_constraints(plan_id).await
-    }
-
-    async fn get_constraint(&self, constraint_id: Uuid) -> anyhow::Result<Option<ConstraintNode>> {
-        self.get_constraint(constraint_id).await
-    }
-
-    async fn update_constraint(
-        &self,
-        constraint_id: Uuid,
-        description: Option<String>,
-        constraint_type: Option<ConstraintType>,
-        enforced_by: Option<String>,
-    ) -> anyhow::Result<()> {
-        self.update_constraint(constraint_id, description, constraint_type, enforced_by)
-            .await
-    }
-
-    async fn delete_constraint(&self, constraint_id: Uuid) -> anyhow::Result<()> {
-        self.delete_constraint(constraint_id).await
-    }
-}
-
-#[async_trait]
-impl DecisionStore for Neo4jClient {
-    // ========================================================================
-    // Decision operations
-    // ========================================================================
-
-    async fn create_decision(&self, task_id: Uuid, decision: &DecisionNode) -> anyhow::Result<()> {
-        self.create_decision(task_id, decision).await
-    }
-
-    async fn get_decision(&self, decision_id: Uuid) -> anyhow::Result<Option<DecisionNode>> {
-        self.get_decision(decision_id).await
-    }
-
-    async fn get_decision_project_id(&self, decision_id: Uuid) -> anyhow::Result<Option<String>> {
-        self.get_decision_project_id(decision_id).await
-    }
-
-    async fn get_decision_project_ids(
-        &self,
-        decision_ids: &[Uuid],
-    ) -> anyhow::Result<std::collections::HashMap<Uuid, Uuid>> {
-        self.get_decision_project_ids(decision_ids).await
-    }
-
-    async fn update_decision(
-        &self,
-        decision_id: Uuid,
-        description: Option<String>,
-        rationale: Option<String>,
-        chosen_option: Option<String>,
-        status: Option<DecisionStatus>,
-    ) -> anyhow::Result<()> {
-        self.update_decision(decision_id, description, rationale, chosen_option, status)
-            .await
-    }
-
-    async fn delete_decision(&self, decision_id: Uuid) -> anyhow::Result<()> {
-        self.delete_decision(decision_id).await
-    }
-
-    async fn get_decisions_for_entity(
-        &self,
-        entity_type: &str,
-        entity_id: &str,
-        limit: u32,
-    ) -> anyhow::Result<Vec<DecisionNode>> {
-        self.get_decisions_for_entity(entity_type, entity_id, limit)
-            .await
-    }
-
-    async fn set_decision_embedding(
-        &self,
-        decision_id: Uuid,
-        embedding: &[f32],
-        model: &str,
-    ) -> anyhow::Result<()> {
-        self.set_decision_embedding(decision_id, embedding, model)
-            .await
-    }
-
-    async fn get_decision_embedding(&self, decision_id: Uuid) -> anyhow::Result<Option<Vec<f32>>> {
-        self.get_decision_embedding(decision_id).await
-    }
-
-    async fn get_all_decisions_with_task_id(&self) -> anyhow::Result<Vec<(DecisionNode, Uuid)>> {
-        self.get_all_decisions_with_task_id().await
-    }
-
-    async fn get_decisions_without_embedding(&self) -> anyhow::Result<Vec<(Uuid, String, String)>> {
-        self.get_decisions_without_embedding().await
-    }
-
-    async fn search_decisions_by_vector(
-        &self,
-        query_embedding: &[f32],
-        limit: usize,
-        project_id: Option<&str>,
-    ) -> anyhow::Result<Vec<(DecisionNode, f64)>> {
-        self.search_decisions_by_vector(query_embedding, limit, project_id)
-            .await
-    }
-
-    async fn get_decisions_affecting(
-        &self,
-        entity_type: &str,
-        entity_id: &str,
-        status_filter: Option<&str>,
-    ) -> anyhow::Result<Vec<DecisionNode>> {
-        self.get_decisions_affecting(entity_type, entity_id, status_filter)
-            .await
-    }
-
-    async fn add_decision_affects(
-        &self,
-        decision_id: Uuid,
-        entity_type: &str,
-        entity_id: &str,
-        impact_description: Option<&str>,
-    ) -> anyhow::Result<()> {
-        self.add_decision_affects(decision_id, entity_type, entity_id, impact_description)
-            .await
-    }
-
-    async fn remove_decision_affects(
-        &self,
-        decision_id: Uuid,
-        entity_type: &str,
-        entity_id: &str,
-    ) -> anyhow::Result<()> {
-        self.remove_decision_affects(decision_id, entity_type, entity_id)
-            .await
-    }
-
-    async fn list_decision_affects(
-        &self,
-        decision_id: Uuid,
-    ) -> anyhow::Result<Vec<AffectsRelation>> {
-        self.list_decision_affects(decision_id).await
-    }
-
-    async fn supersede_decision(
-        &self,
-        new_decision_id: Uuid,
-        old_decision_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.supersede_decision(new_decision_id, old_decision_id)
-            .await
-    }
-
-    async fn get_decision_timeline(
-        &self,
-        task_id: Option<Uuid>,
-        from: Option<&str>,
-        to: Option<&str>,
-    ) -> anyhow::Result<Vec<DecisionTimelineEntry>> {
-        self.get_decision_timeline(task_id, from, to).await
-    }
-
-    async fn list_decisions_by_status(
-        &self,
-        status: DecisionStatus,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<(Vec<DecisionListItem>, usize)> {
-        self.list_decisions_by_status(status, project_id, workspace_slug, limit, offset)
-            .await
-    }
-}
-
-#[async_trait]
-impl CommitStore for Neo4jClient {
-    // ========================================================================
-    // Dependency analysis
-    // ========================================================================
-
-    async fn find_dependent_files(
-        &self,
-        file_path: &str,
-        depth: u32,
-        project_id: Option<Uuid>,
-    ) -> anyhow::Result<Vec<String>> {
-        self.find_dependent_files(file_path, depth, project_id)
-            .await
-    }
-
-    async fn find_impacted_files(
-        &self,
-        file_path: &str,
-        depth: u32,
-        project_id: Option<Uuid>,
-    ) -> anyhow::Result<Vec<String>> {
-        self.find_impacted_files(file_path, depth, project_id).await
-    }
-
-    async fn find_callers(
-        &self,
-        function_id: &str,
-        project_id: Option<Uuid>,
-    ) -> anyhow::Result<Vec<FunctionNode>> {
-        self.find_callers(function_id, project_id).await
-    }
-
-    // ========================================================================
-    // Task-file linking
-    // ========================================================================
-
-    async fn link_task_to_files(&self, task_id: Uuid, file_paths: &[String]) -> anyhow::Result<()> {
-        self.link_task_to_files(task_id, file_paths).await
-    }
-
-    // ========================================================================
-    // Commit operations
-    // ========================================================================
-
-    async fn create_commit(&self, commit: &CommitNode) -> anyhow::Result<()> {
-        self.create_commit(commit).await
-    }
-
-    async fn get_commit(&self, hash: &str) -> anyhow::Result<Option<CommitNode>> {
-        self.get_commit(hash).await
-    }
-
-    async fn link_commit_to_task(&self, commit_hash: &str, task_id: Uuid) -> anyhow::Result<()> {
-        self.link_commit_to_task(commit_hash, task_id).await
-    }
-
-    async fn link_commit_to_plan(&self, commit_hash: &str, plan_id: Uuid) -> anyhow::Result<()> {
-        self.link_commit_to_plan(commit_hash, plan_id).await
-    }
-
-    async fn get_task_commits(&self, task_id: Uuid) -> anyhow::Result<Vec<CommitNode>> {
-        self.get_task_commits(task_id).await
-    }
-
-    async fn get_plan_commits(&self, plan_id: Uuid) -> anyhow::Result<Vec<CommitNode>> {
-        self.get_plan_commits(plan_id).await
-    }
-
-    async fn delete_commit(&self, hash: &str) -> anyhow::Result<()> {
-        self.delete_commit(hash).await
-    }
-
-    // ========================================================================
-    // TOUCHES operations (Commit → File)
-    // ========================================================================
-
-    async fn create_commit_touches(
-        &self,
-        commit_hash: &str,
-        files: &[FileChangedInfo],
-    ) -> anyhow::Result<()> {
-        self.create_commit_touches(commit_hash, files).await
-    }
-
-    async fn get_commit_files(&self, commit_hash: &str) -> anyhow::Result<Vec<CommitFileInfo>> {
-        self.get_commit_files(commit_hash).await
-    }
-
-    async fn get_file_history(
-        &self,
-        file_path: &str,
-        limit: Option<i64>,
-    ) -> anyhow::Result<Vec<FileHistoryEntry>> {
-        self.get_file_history(file_path, limit).await
-    }
-
-    async fn ping_freshness_for_files(&self, file_paths: &[String]) -> anyhow::Result<usize> {
-        self.ping_freshness_for_files(file_paths).await
-    }
-
-    // ========================================================================
-    // CO_CHANGED operations (File ↔ File)
-    // ========================================================================
-
-    async fn compute_co_changed(
-        &self,
-        project_id: Uuid,
-        since: Option<chrono::DateTime<chrono::Utc>>,
-        min_count: i64,
-        max_relations: i64,
-    ) -> anyhow::Result<i64> {
-        self.compute_co_changed(project_id, since, min_count, max_relations)
-            .await
-    }
-
-    async fn update_project_co_change_timestamp(&self, id: Uuid) -> anyhow::Result<()> {
-        self.update_project_co_change_timestamp(id).await
-    }
-
-    async fn get_co_change_graph(
-        &self,
-        project_id: Uuid,
-        min_count: i64,
-        limit: i64,
-    ) -> anyhow::Result<Vec<CoChangePair>> {
-        self.get_co_change_graph(project_id, min_count, limit).await
-    }
-
-    async fn get_file_co_changers(
-        &self,
-        file_path: &str,
-        min_count: i64,
-        limit: i64,
-    ) -> anyhow::Result<Vec<CoChanger>> {
-        self.get_file_co_changers(file_path, min_count, limit).await
-    }
-
-    async fn compute_co_changed_transitive(
-        &self,
-        project_id: Uuid,
-        max_depth: i64,
-        min_score: f64,
-    ) -> anyhow::Result<i64> {
-        self.compute_co_changed_transitive(project_id, max_depth, min_score)
-            .await
-    }
-
-    async fn get_file_transitive_co_changers(
-        &self,
-        file_path: &str,
-        min_score: f64,
-        limit: i64,
-    ) -> anyhow::Result<Vec<TransitiveCoChanger>> {
-        self.get_file_transitive_co_changers(file_path, min_score, limit)
-            .await
-    }
-}
-
-#[async_trait]
-impl ReleaseStore for Neo4jClient {
-    // ========================================================================
-    // Release operations
-    // ========================================================================
-
-    async fn create_release(&self, release: &ReleaseNode) -> anyhow::Result<()> {
-        self.create_release(release).await
-    }
-
-    async fn get_release(&self, id: Uuid) -> anyhow::Result<Option<ReleaseNode>> {
-        self.get_release(id).await
-    }
-
-    async fn list_project_releases(&self, project_id: Uuid) -> anyhow::Result<Vec<ReleaseNode>> {
-        self.list_project_releases(project_id).await
-    }
-
-    async fn update_release(
-        &self,
-        id: Uuid,
-        status: Option<ReleaseStatus>,
-        target_date: Option<chrono::DateTime<chrono::Utc>>,
-        released_at: Option<chrono::DateTime<chrono::Utc>>,
-        title: Option<String>,
-        description: Option<String>,
-    ) -> anyhow::Result<()> {
-        self.update_release(id, status, target_date, released_at, title, description)
-            .await
-    }
-
-    async fn add_task_to_release(&self, release_id: Uuid, task_id: Uuid) -> anyhow::Result<()> {
-        self.add_task_to_release(release_id, task_id).await
-    }
-
-    async fn add_commit_to_release(
-        &self,
-        release_id: Uuid,
-        commit_hash: &str,
-    ) -> anyhow::Result<()> {
-        self.add_commit_to_release(release_id, commit_hash).await
-    }
-
-    async fn remove_commit_from_release(
-        &self,
-        release_id: Uuid,
-        commit_hash: &str,
-    ) -> anyhow::Result<()> {
-        self.remove_commit_from_release(release_id, commit_hash)
-            .await
-    }
-
-    async fn get_release_details(
-        &self,
-        release_id: Uuid,
-    ) -> anyhow::Result<Option<(ReleaseNode, Vec<TaskNode>, Vec<CommitNode>)>> {
-        self.get_release_details(release_id).await
-    }
-
-    async fn delete_release(&self, release_id: Uuid) -> anyhow::Result<()> {
-        self.delete_release(release_id).await
-    }
-
-    // ========================================================================
-    // Environment & deployment operations
-    // ========================================================================
-
-    async fn create_environment(&self, env: &EnvironmentNode) -> anyhow::Result<()> {
-        self.create_environment(env).await
-    }
-
-    async fn get_environment(&self, id: Uuid) -> anyhow::Result<Option<EnvironmentNode>> {
-        self.get_environment(id).await
-    }
-
-    async fn list_project_environments(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<EnvironmentNode>> {
-        self.list_project_environments(project_id).await
-    }
-
-    async fn update_environment(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        kind: Option<EnvironmentKind>,
-        url: Option<String>,
-        description: Option<String>,
-        config: Option<String>,
-    ) -> anyhow::Result<()> {
-        self.update_environment(id, name, kind, url, description, config)
-            .await
-    }
-
-    async fn delete_environment(&self, id: Uuid) -> anyhow::Result<()> {
-        self.delete_environment(id).await
-    }
-
-    async fn create_deployment(&self, deployment: &DeploymentNode) -> anyhow::Result<()> {
-        self.create_deployment(deployment).await
-    }
-
-    async fn get_deployment(&self, id: Uuid) -> anyhow::Result<Option<DeploymentNode>> {
-        self.get_deployment(id).await
-    }
-
-    async fn list_environment_deployments(
-        &self,
-        environment_id: Uuid,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<(Vec<DeploymentNode>, usize)> {
-        self.list_environment_deployments(environment_id, limit, offset)
-            .await
-    }
-
-    async fn update_deployment(
-        &self,
-        id: Uuid,
-        status: Option<DeploymentStatus>,
-        finished_at: Option<chrono::DateTime<chrono::Utc>>,
-        notes: Option<String>,
-    ) -> anyhow::Result<()> {
-        self.update_deployment(id, status, finished_at, notes).await
-    }
-
-    async fn get_deployment_matrix(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<DeploymentMatrixEntry>> {
-        self.get_deployment_matrix(project_id).await
-    }
-
-    // ========================================================================
-    // Milestone operations
-    // ========================================================================
-
-    async fn create_milestone(&self, milestone: &MilestoneNode) -> anyhow::Result<()> {
-        self.create_milestone(milestone).await
-    }
-
-    async fn get_milestone(&self, id: Uuid) -> anyhow::Result<Option<MilestoneNode>> {
-        self.get_milestone(id).await
-    }
-
-    async fn list_project_milestones(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<MilestoneNode>> {
-        self.list_project_milestones(project_id).await
-    }
-
-    async fn update_milestone(
-        &self,
-        id: Uuid,
-        status: Option<MilestoneStatus>,
-        target_date: Option<chrono::DateTime<chrono::Utc>>,
-        closed_at: Option<chrono::DateTime<chrono::Utc>>,
-        title: Option<String>,
-        description: Option<String>,
-    ) -> anyhow::Result<()> {
-        self.update_milestone(id, status, target_date, closed_at, title, description)
-            .await
-    }
-
-    async fn add_task_to_milestone(&self, milestone_id: Uuid, task_id: Uuid) -> anyhow::Result<()> {
-        self.add_task_to_milestone(milestone_id, task_id).await
-    }
-
-    async fn link_plan_to_milestone(
-        &self,
-        plan_id: Uuid,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.link_plan_to_milestone(plan_id, milestone_id).await
-    }
-
-    async fn unlink_plan_from_milestone(
-        &self,
-        plan_id: Uuid,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.unlink_plan_from_milestone(plan_id, milestone_id).await
-    }
-
-    async fn get_milestone_details(
-        &self,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<Option<(MilestoneNode, Vec<TaskNode>)>> {
-        self.get_milestone_details(milestone_id).await
-    }
-
-    async fn get_milestone_progress(
-        &self,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<(u32, u32, u32, u32)> {
-        self.get_milestone_progress(milestone_id).await
-    }
-
-    async fn get_milestone_tasks_with_plans(
-        &self,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<Vec<TaskWithPlan>> {
-        self.get_milestone_tasks_with_plans(milestone_id).await
-    }
-
-    async fn get_milestone_steps_batch(
-        &self,
-        milestone_id: Uuid,
-    ) -> anyhow::Result<std::collections::HashMap<Uuid, Vec<StepNode>>> {
-        self.get_milestone_steps_batch(milestone_id).await
-    }
-
-    async fn delete_milestone(&self, milestone_id: Uuid) -> anyhow::Result<()> {
-        self.delete_milestone(milestone_id).await
-    }
-
-    async fn get_milestone_tasks(&self, milestone_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
-        self.get_milestone_tasks(milestone_id).await
-    }
-
-    async fn get_release_tasks(&self, release_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
-        self.get_release_tasks(release_id).await
-    }
-
-    // ========================================================================
-    // Project stats
-    // ========================================================================
-
-    async fn get_project_progress(&self, project_id: Uuid) -> anyhow::Result<(u32, u32, u32, u32)> {
-        self.get_project_progress(project_id).await
-    }
-
-    async fn get_progress_batch(
-        &self,
-        kind: ProgressKind,
-        ids: &[Uuid],
-    ) -> anyhow::Result<std::collections::HashMap<Uuid, TaskCounts>> {
-        self.get_progress_batch(kind, ids).await
-    }
-
-    async fn get_project_task_dependencies(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<(Uuid, Uuid)>> {
-        self.get_project_task_dependencies(project_id).await
-    }
-
-    async fn get_project_tasks(&self, project_id: Uuid) -> anyhow::Result<Vec<TaskNode>> {
-        self.get_project_tasks(project_id).await
-    }
-
-    // ========================================================================
-    // Filtered list operations with pagination
-    // ========================================================================
-
-    #[allow(clippy::too_many_arguments)]
-    async fn list_plans_filtered(
-        &self,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        statuses: Option<Vec<String>>,
-        priority_min: Option<i32>,
-        priority_max: Option<i32>,
-        search: Option<&str>,
-        limit: usize,
-        offset: usize,
-        sort_by: Option<&str>,
-        sort_order: &str,
-    ) -> anyhow::Result<(Vec<PlanNode>, usize)> {
-        self.list_plans_filtered(
-            project_id,
-            workspace_slug,
-            statuses,
-            priority_min,
-            priority_max,
-            search,
-            limit,
-            offset,
-            sort_by,
-            sort_order,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn list_all_tasks_filtered(
-        &self,
-        plan_id: Option<Uuid>,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        statuses: Option<Vec<String>>,
-        priority_min: Option<i32>,
-        priority_max: Option<i32>,
-        tags: Option<Vec<String>>,
-        assigned_to: Option<&str>,
-        limit: usize,
-        offset: usize,
-        sort_by: Option<&str>,
-        sort_order: &str,
-    ) -> anyhow::Result<(Vec<TaskWithPlan>, usize)> {
-        self.list_all_tasks_filtered(
-            plan_id,
-            project_id,
-            workspace_slug,
-            statuses,
-            priority_min,
-            priority_max,
-            tags,
-            assigned_to,
-            limit,
-            offset,
-            sort_by,
-            sort_order,
-        )
-        .await
-    }
-
-    async fn list_releases_filtered(
-        &self,
-        project_id: Uuid,
-        statuses: Option<Vec<String>>,
-        limit: usize,
-        offset: usize,
-        sort_by: Option<&str>,
-        sort_order: &str,
-    ) -> anyhow::Result<(Vec<ReleaseNode>, usize)> {
-        self.list_releases_filtered(project_id, statuses, limit, offset, sort_by, sort_order)
-            .await
-    }
-
-    async fn list_milestones_filtered(
-        &self,
-        project_id: Uuid,
-        statuses: Option<Vec<String>>,
-        limit: usize,
-        offset: usize,
-        sort_by: Option<&str>,
-        sort_order: &str,
-    ) -> anyhow::Result<(Vec<MilestoneNode>, usize)> {
-        self.list_milestones_filtered(project_id, statuses, limit, offset, sort_by, sort_order)
-            .await
-    }
-
-    async fn list_projects_filtered(
-        &self,
-        search: Option<&str>,
-        limit: usize,
-        offset: usize,
-        sort_by: Option<&str>,
-        sort_order: &str,
-    ) -> anyhow::Result<(Vec<ProjectNode>, usize)> {
-        self.list_projects_filtered(search, limit, offset, sort_by, sort_order)
             .await
     }
 }

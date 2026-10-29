@@ -878,7 +878,7 @@ impl Neo4jClient {
         Ok(out)
     }
 
-    /// See [`crate::neo4j::GraphStore::agent_identity_namespace`]. One MERGE on a key
+    /// See [`crate::neo4j::AnalyticsStore::agent_identity_namespace`]. One MERGE on a key
     /// the `agent_identity_root_key` constraint makes unique: a concurrent first call
     /// matches the node the other created, and reads its namespace.
     pub async fn agent_identity_namespace(&self) -> Result<Uuid> {
@@ -2979,7 +2979,7 @@ impl Neo4jClient {
         Ok(changed)
     }
 
-    /// See `GraphStore::backfill_project_anchors`.
+    /// See `AnalyticsStore::backfill_project_anchors`.
     pub async fn backfill_project_anchors(&self) -> Result<crate::chat::anchor::BackfillReport> {
         use crate::chat::anchor::*;
         let mut result = self
@@ -3041,7 +3041,7 @@ impl Neo4jClient {
         Ok(report)
     }
 
-    /// See `GraphStore::backfill_spawned_by_edges`.
+    /// See `AnalyticsStore::backfill_spawned_by_edges`.
     pub async fn backfill_spawned_by_edges(&self) -> Result<usize> {
         let mut result = self
             .graph

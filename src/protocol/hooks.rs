@@ -21,13 +21,15 @@
 //!
 //! Each protocol has a `last_triggered_at` timestamp. Auto-triggers are skipped
 //! if the protocol was triggered less than [`MIN_TRIGGER_INTERVAL_SECS`] seconds ago.
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 use crate::chat::manager::ChatManager;
 use crate::events::EventEmitter;
 use crate::neo4j::traits::GraphStore;
 
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::protocol::engine;
 use dashmap::DashMap;
 use std::sync::{Arc, LazyLock};
@@ -712,6 +714,10 @@ async fn run_scheduled_protocols(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use crate::protocol::{
         Protocol, ProtocolCategory, ProtocolState, ProtocolTransition, TriggerConfig, TriggerMode,
     };

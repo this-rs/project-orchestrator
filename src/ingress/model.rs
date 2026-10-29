@@ -1,5 +1,9 @@
 //! Modèle du journal d'événements externes.
 
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -44,6 +48,10 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::GraphStore;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use chrono::TimeZone;
 
     fn event(trigger_id: Uuid, outcome: IngressOutcome, secs: i64) -> ExternalEvent {

@@ -72,6 +72,10 @@ use super::types::{ChatEvent, PendingMessage};
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 
 /// Dependencies needed to trigger a fresh `stream_response` from an
 /// idle session when an OOB event arrives. These are all
@@ -1065,6 +1069,10 @@ fn user_message_source(m: &UserMessage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use nexus_claude::{TextContent, ToolResultContent};
     use serde_json::json;
 

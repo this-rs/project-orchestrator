@@ -850,6 +850,10 @@ flag for human attention via a high-importance gotcha note.",
 // ============================================================================
 
 use super::seed::{ProtocolSeed, StateFragment};
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 
 pub(crate) fn seed_plan_runner_full() -> ProtocolSeed {
     ProtocolSeed {

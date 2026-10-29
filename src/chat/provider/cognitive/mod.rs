@@ -35,6 +35,10 @@ pub use mode::{
 
 use crate::chat::provider::settings::{project_scope, GLOBAL};
 use crate::neo4j::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 
 /// The routing document stored for one scope, `None` when there is none. A
 /// document that no longer parses is logged and read as absent: a setting is
@@ -74,6 +78,10 @@ pub async fn load_routing(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
 
     #[tokio::test]
     async fn load_routing_reads_project_over_global_over_default() {

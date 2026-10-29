@@ -1,6 +1,4 @@
 //! API request handlers
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 use crate::api::{
     workspace_handlers::{MilestonePlanSummary, MilestoneStepSummary, MilestoneTaskSummary},
@@ -20,6 +18,10 @@ use crate::neo4j::plan::{compute_file_conflicts, WaveComputationResult};
 
 use crate::neo4j::StoreCapabilities;
 
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::plan::models::*;
 use crate::AuthConfig;
@@ -12747,6 +12749,10 @@ mod retry_plan_task_tests {
     use super::*;
     use crate::neo4j::models::TaskStatus;
     use crate::neo4j::GraphStore;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_auth_config, test_bearer_token, test_task};
     use axum::body::Body;

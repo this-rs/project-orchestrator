@@ -19,6 +19,10 @@ use super::config::ChatConfig;
 use super::manager::{test_support, ChatManager};
 use super::types::{ChatEvent, PendingQueueEntry};
 use crate::neo4j::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::refs::compose::compose_user_message;
 use crate::refs::test_support::{world, World};
 use tokio::sync::broadcast;

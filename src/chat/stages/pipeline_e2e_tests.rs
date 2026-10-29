@@ -11,9 +11,17 @@
 //! 4. Message with task in_progress → status injection
 //! 5. Benchmark: full pipeline < 500ms
 //! 6. Graceful degradation: one stage error doesn't block others
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use std::sync::Arc;
     use std::time::Instant;
 

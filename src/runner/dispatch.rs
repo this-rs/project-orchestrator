@@ -11,14 +11,16 @@
 //!    `POST /api/plans/{id}/run` handler uses;
 //! 4. one [`TriggerFiring`] per firing, carrying the `plan_run_id` of the run
 //!    it started, or the `start_error` that kept it from starting.
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 use crate::auth::jwt::Claims;
 use crate::chat::manager::ChatManager;
 use crate::events::EventEmitter;
 use crate::neo4j::traits::GraphStore;
 
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::orchestrator::context::ContextBuilder;
 use crate::runner::models::{
     RunnerConfig, SignalReservation, Trigger, TriggerFiring, TriggerSource,

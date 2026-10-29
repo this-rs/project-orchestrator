@@ -26,6 +26,10 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::notes::models::{MemoryHorizon, NoteFilters, NoteStatus};
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -366,6 +370,10 @@ pub async fn promote_battle_tested_notes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
 
     #[test]
     fn metrics_defaults_to_zero() {

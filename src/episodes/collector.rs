@@ -8,8 +8,6 @@
 //!
 //! The resulting Episode can then be converted to a PortableEpisode for
 //! cross-instance exchange via SkillPackage v3.
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -17,6 +15,10 @@ use uuid::Uuid;
 
 use crate::episodes::models::*;
 use crate::neo4j::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 
 /// Collect a complete Episode from a completed ProtocolRun.
 ///
@@ -380,6 +382,10 @@ impl DistillationBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use chrono::Utc;
 
     fn sample_episode() -> Episode {
@@ -698,7 +704,7 @@ mod tests {
         let mut orphan = crate::test_helpers::test_chat_session(Some("gone"));
         orphan.preview = Some("hello".into());
         let orphan_id = orphan.id;
-        crate::neo4j::GraphStore::create_chat_session(&store, &orphan)
+        crate::neo4j::AnalyticsStore::create_chat_session(&store, &orphan)
             .await
             .unwrap();
         assert!(collect_session_episode(&store, orphan_id, "closed")

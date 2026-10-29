@@ -3,6 +3,10 @@
 use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams};
 use crate::events::EventEmitter;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::protocol::{
     self, validate_protocol_structure, Protocol, ProtocolCategory, ProtocolRun, ProtocolState,
     ProtocolTransition, RunStatus, TransitionResult, ValidatableState, ValidatableTransition,
@@ -2205,6 +2209,10 @@ pub async fn validate_all_protocols(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use crate::protocol::StateType;
 
     /// Helper: build a minimal ProtocolState for testing.

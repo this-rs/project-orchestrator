@@ -5,6 +5,10 @@
 //!
 //! Notes can be linked to code entities and automatically surfaced to agents
 //! based on relevance and graph propagation.
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 
 pub mod coactivation;
 pub mod hashing;
@@ -50,6 +54,10 @@ pub use witness::{CodeRef, ExternalRef, Witness, WitnessKind, WitnessValidationE
 #[cfg(test)]
 mod current_knowledge_tests {
     use super::*;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
 
     #[test]
     fn test_only_current_real_knowledge_reaches_the_agent() {
@@ -84,7 +92,7 @@ pub mod provenance {
     //! models are two agents. It is decoupled from projects (a model writes in many).
     //!
     //! The id is `uuid v5(root, model)`, the root a UUID the graph creates ONCE and keeps
-    //! ([`crate::neo4j::GraphStore::agent_identity_namespace`]): stable across sessions
+    //! ([`crate::neo4j::AnalyticsStore::agent_identity_namespace`]): stable across sessions
     //! and restarts, private to this store (another instance's agents are other agents),
     //! and computed, never stored per write.
     //!
@@ -182,6 +190,10 @@ pub mod provenance {
     mod tests {
         use super::*;
         use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::{
+            AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore,
+            ProjectStore, ReleaseStore, WorkspaceStore,
+        };
 
         async fn session_of(graph: &MockGraphStore, model: &str) -> Uuid {
             let mut s = crate::test_helpers::test_chat_session(Some("alpha"));

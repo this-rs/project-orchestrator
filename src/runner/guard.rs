@@ -11,6 +11,10 @@ use crate::chat::compaction_context::CompactionContextBuilder;
 use crate::chat::manager::ChatManager;
 use crate::chat::types::ChatEvent;
 use crate::neo4j::traits::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -480,6 +484,10 @@ fn hash_tool_call(tool: &str, input: &serde_json::Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
 
     #[test]
     fn test_guard_config_default() {

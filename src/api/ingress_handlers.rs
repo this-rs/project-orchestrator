@@ -33,6 +33,10 @@ use crate::api::handlers::OrchestratorState;
 use crate::ingress::rule::{self, Rule, MIN_SECRET_BYTES};
 use crate::ingress::{ExternalEvent, IngressOutcome};
 use crate::neo4j::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use axum::{
     body::Body,
     extract::{Path, State},
@@ -353,6 +357,10 @@ mod tests {
     use crate::api::handlers::ServerState;
     use crate::ingress::{IngressConfig, IngressRuntime};
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use crate::runner::{Trigger, TriggerType};
     use crate::vault::grants::{GrantScope, SecretSelector};
     use axum::http::Request;

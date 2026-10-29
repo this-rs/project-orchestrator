@@ -59,6 +59,10 @@ use crate::documents::{
 use crate::embeddings::EmbeddingProvider;
 use crate::neo4j::document::{Document, DocumentChunk};
 use crate::neo4j::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::notes::EntityType;
 use axum::{
     extract::{Multipart, Path, Query, State},
@@ -1066,6 +1070,10 @@ mod tests {
     use super::*;
     use crate::embeddings::MockEmbeddingProvider;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;

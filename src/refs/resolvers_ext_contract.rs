@@ -15,6 +15,10 @@ use super::types::{EntityRef, RefId, RefKind};
 use super::wire::RefStatus;
 use crate::neo4j::models::{FileNode, PersonaNode};
 use crate::neo4j::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::skills::SkillNode;
 use crate::test_helpers::{test_chat_session, test_commit, test_milestone, test_release};
 

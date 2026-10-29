@@ -13,8 +13,6 @@
 //! health and note density only, avoiding duplicate consolidation calls.
 //!
 //! Max 2 corrective actions per cycle to prevent runaway corrections.
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 use std::fmt;
 use std::sync::Arc;
@@ -26,6 +24,10 @@ use uuid::Uuid;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
 
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::notes::manager::NoteManager;
 
 /// Maximum number of corrective actions per evaluation cycle.
@@ -426,6 +428,10 @@ pub async fn execute_actions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
 
     /// Helper to build metrics with defaults.
     fn healthy_metrics() -> HomeostasisMetrics {

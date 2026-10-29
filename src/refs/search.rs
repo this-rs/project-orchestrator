@@ -18,6 +18,10 @@ use super::types::{EntityRef, RefKind};
 use super::validate::{validate_search, InvalidReason, RefsInvalid};
 use super::wire::{RefSearchItem, RefSearchResponse};
 use crate::neo4j::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 
 /// The query string as it arrives: everything optional, everything a string, so
 /// that each malformed part gets its own `refs_invalid` reason instead of a
@@ -322,6 +326,10 @@ mod tests {
     use super::*;
     use crate::neo4j::models::PlanNode;
     use crate::neo4j::GraphStore;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use crate::refs::access::Disclosure;
     use crate::refs::test_support::{task_titled, user, world, Spy, World};
     use crate::refs::wire::ScopeLabel;

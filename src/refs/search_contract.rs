@@ -17,8 +17,10 @@ use super::wire::RefSearchResponse;
 use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::models::{PlanNode, PlanStatus, TaskStatus};
 use crate::neo4j::GraphStore;
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::notes::NoteType;
 use crate::test_helpers::{test_project, test_workspace};
 

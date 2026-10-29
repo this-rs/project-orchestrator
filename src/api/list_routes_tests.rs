@@ -12,8 +12,10 @@ use crate::events::EventBus;
 use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::models::*;
 use crate::neo4j::GraphStore;
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::notes::{Note, NoteImportance, NoteScope, NoteStatus, NoteType};
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::protocol::{Protocol, ProtocolRun, RunStatus};

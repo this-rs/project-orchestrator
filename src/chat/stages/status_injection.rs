@@ -17,8 +17,6 @@
 //!   requires an `EmbeddingProvider` that ChatManager may not have
 //! - Protocol status uses a trait stub (`ProtocolStatusProvider`) for future
 //!   Pattern Federation integration
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,6 +32,10 @@ use crate::chat::enrichment::{
 use crate::neo4j::models::TaskStatus;
 use crate::neo4j::traits::GraphStore;
 
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::reasoning::{ReasoningTree, ReasoningTreeConfig, ReasoningTreeEngine};
 
 // ============================================================================
@@ -641,6 +643,10 @@ mod tests {
     use crate::chat::enrichment::ParallelEnrichmentStage;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::PlanStatus;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
 
     // ── Config tests ────────────────────────────────────────────────────
 

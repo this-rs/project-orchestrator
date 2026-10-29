@@ -10,8 +10,6 @@
 //! - **Skip**: abort import, return conflict info
 //! - **Merge**: add new notes/decisions to the existing skill
 //! - **Replace**: delete the existing skill, create a fresh one
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -21,6 +19,10 @@ use uuid::Uuid;
 
 use crate::episodes::PortableEpisode;
 use crate::neo4j::traits::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::notes::models::{MemoryHorizon, Note, NoteImportance, NoteScope, NoteStatus, NoteType};
 use crate::protocol::models::{
     Protocol, ProtocolCategory, ProtocolState, ProtocolTransition, StateType,

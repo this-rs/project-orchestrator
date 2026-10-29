@@ -9,8 +9,6 @@
 //! Enum-valued fields (`kind`, `status`) are received as plain strings and parsed
 //! here so that an invalid value yields a `400 Bad Request` (rather than the
 //! extractor's generic `422`). A duplicate environment name yields `409 Conflict`.
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams};
@@ -19,6 +17,10 @@ use crate::neo4j::models::{
     DeploymentMatrixEntry, DeploymentNode, DeploymentStatus, EnvironmentKind, EnvironmentNode,
 };
 
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -431,6 +433,10 @@ mod tests {
     use crate::events::CrudAction;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::GraphStore;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use crate::orchestrator::watcher::FileWatcher;
     use crate::orchestrator::Orchestrator;
     use crate::test_helpers::{

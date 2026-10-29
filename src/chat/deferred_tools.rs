@@ -37,6 +37,10 @@ use serde::{Deserialize, Serialize};
 use super::manager::ChatManager;
 use super::provider::settings::GLOBAL;
 use crate::neo4j::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 
 /// Key of the stored document, under the [`GLOBAL`] scope.
 pub const DEFERRED_TOOLS_KEY: &str = "deferred_tools";
@@ -235,6 +239,10 @@ mod tests {
     use super::*;
     use crate::mcp::tools::all_tools;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()

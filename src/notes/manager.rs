@@ -2,8 +2,6 @@
 //!
 //! Provides high-level operations for creating, reading, updating, and deleting notes,
 //! including linking notes to entities and managing note lifecycle.
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 use super::models::*;
 use crate::embeddings::EmbeddingProvider;
@@ -13,6 +11,10 @@ use crate::meilisearch::indexes::NoteDocument;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::GraphStore;
 
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::utils::reciprocal_rank_fusion;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -2267,6 +2269,10 @@ fn fuse_dense_and_lexical(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use crate::test_helpers::*;
 
     // -- Hybrid ranking: dense ∪ lexical, fused by RRF ----------------------

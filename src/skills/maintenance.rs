@@ -8,8 +8,6 @@
 //!
 //! Each level can be triggered manually via the admin MCP tool or API,
 //! or automatically via an optional background timer.
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
@@ -17,6 +15,10 @@ use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
 
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::notes::NoteManager;
 use crate::skills::detection::{ensure_synapse_graph_health, SkillDetectionConfig};
 use crate::skills::evolution::{analyze_evolution, execute_evolution, EvolutionResult};
@@ -885,6 +887,10 @@ async fn count_stuck_tasks(graph_store: &dyn GraphStore, project_id: Uuid) -> us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
 
     #[test]
     fn test_default_config() {

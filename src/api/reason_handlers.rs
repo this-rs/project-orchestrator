@@ -5,6 +5,10 @@
 //! - `POST /api/reason/{tree_id}/feedback` — Provide feedback on a reasoning tree
 
 use crate::api::handlers::{AppError, OrchestratorState};
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::reasoning::models::ReasoningTreeConfig;
 use axum::{
     extract::{Path, State},
@@ -391,6 +395,10 @@ pub async fn reason_feedback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use serde_json::json;
 
     #[test]

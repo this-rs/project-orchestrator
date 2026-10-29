@@ -10,8 +10,8 @@ use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest
 use crate::neo4j::document::{Document, DocumentChunk, DocumentChunkHit};
 use crate::neo4j::models::*;
 use crate::neo4j::traits::{
-    CodeStore, CommitStore, DecisionStore, GraphStore, PlanStore, ProjectStore, ReleaseStore,
-    StoreCapabilities, WorkspaceStore,
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, GraphStore, NoteStore, PlanStore,
+    ProjectStore, ReleaseStore, StoreCapabilities, WorkspaceStore,
 };
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
@@ -885,7713 +885,6 @@ impl GraphStore for MockGraphStore {
             // (mock.rs:22) with no begin / commit / rollback.
             explicit_transactions: false,
         }
-    }
-
-    // ========================================================================
-    // Document operations
-    // ========================================================================
-
-    async fn create_document(&self, document: &Document, chunks: &[DocumentChunk]) -> Result<()> {
-        self.documents
-            .write()
-            .await
-            .insert(document.id, document.clone());
-        self.document_chunks
-            .write()
-            .await
-            .insert(document.id, Vec::new());
-        self.upsert_document_chunks(document.id, chunks).await?;
-        Ok(())
-    }
-
-    async fn get_document(&self, id: Uuid) -> Result<Option<Document>> {
-        Ok(self.documents.read().await.get(&id).cloned())
-    }
-
-    async fn find_document_by_sha256(
-        &self,
-        sha256: &str,
-        project_id: Option<Uuid>,
-    ) -> Result<Option<Document>> {
-        let documents = self.documents.read().await;
-        let mut matches: Vec<&Document> = documents
-            .values()
-            .filter(|d| d.sha256 == sha256)
-            .filter(|d| project_id.is_none() || d.project_id == project_id)
-            .collect();
-        matches.sort_by_key(|d| d.created_at);
-        Ok(matches.first().map(|d| (*d).clone()))
-    }
-
-    async fn list_project_documents(&self, project_id: Uuid) -> Result<Vec<Document>> {
-        let documents = self.documents.read().await;
-        let mut out: Vec<Document> = documents
-            .values()
-            .filter(|d| d.project_id == Some(project_id))
-            .cloned()
-            .collect();
-        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        Ok(out)
-    }
-
-    async fn get_document_chunks(&self, document_id: Uuid) -> Result<Vec<DocumentChunk>> {
-        let chunks = self.document_chunks.read().await;
-        let mut out = chunks.get(&document_id).cloned().unwrap_or_default();
-        out.sort_by_key(|c| c.ordinal);
-        Ok(out)
-    }
-
-    async fn upsert_document_chunks(
-        &self,
-        document_id: Uuid,
-        chunks: &[DocumentChunk],
-    ) -> Result<usize> {
-        let mut store = self.document_chunks.write().await;
-        let existing = store.entry(document_id).or_default();
-        for chunk in chunks {
-            // MERGE on id: a re-ingestion converges instead of duplicating.
-            match existing.iter_mut().find(|c| c.id == chunk.id) {
-                Some(slot) => *slot = chunk.clone(),
-                None => existing.push(chunk.clone()),
-            }
-        }
-        Ok(chunks.len())
-    }
-
-    async fn set_document_chunk_embeddings(
-        &self,
-        embeddings: &[(Uuid, Vec<f32>)],
-        _model: &str,
-    ) -> Result<usize> {
-        let mut store = self.document_chunks.write().await;
-        let mut written = 0;
-        for (chunk_id, vector) in embeddings {
-            for chunks in store.values_mut() {
-                if let Some(chunk) = chunks.iter_mut().find(|c| c.id == *chunk_id) {
-                    chunk.embedding = Some(vector.clone());
-                    written += 1;
-                    break;
-                }
-            }
-        }
-        Ok(written)
-    }
-
-    async fn vector_search_document_chunks(
-        &self,
-        embedding: &[f32],
-        limit: usize,
-        project_id: Option<Uuid>,
-        min_similarity: Option<f64>,
-    ) -> Result<Vec<DocumentChunkHit>> {
-        let documents = self.documents.read().await;
-        let chunks = self.document_chunks.read().await;
-
-        let mut hits: Vec<DocumentChunkHit> = Vec::new();
-        for (document_id, document_chunks) in chunks.iter() {
-            let Some(document) = documents.get(document_id) else {
-                continue;
-            };
-            if project_id.is_some() && document.project_id != project_id {
-                continue;
-            }
-            for chunk in document_chunks {
-                let Some(vector) = chunk.embedding.as_ref() else {
-                    continue;
-                };
-                let score = cosine_similarity(embedding, vector);
-                if let Some(floor) = min_similarity {
-                    if score < floor {
-                        continue;
-                    }
-                }
-                hits.push(DocumentChunkHit {
-                    document_id: *document_id,
-                    filename: document.filename.clone(),
-                    chunk: chunk.clone(),
-                    score,
-                });
-            }
-        }
-
-        hits.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        hits.truncate(limit);
-        Ok(hits)
-    }
-
-    async fn delete_document(&self, id: Uuid) -> Result<bool> {
-        let removed = self.documents.write().await.remove(&id).is_some();
-        // Chunks and links go with the document, as DETACH DELETE does.
-        self.document_chunks.write().await.remove(&id);
-        self.document_links.write().await.remove(&id);
-        Ok(removed)
-    }
-
-    async fn link_document_to_entity(
-        &self,
-        document_id: Uuid,
-        entity_type: &EntityType,
-        entity_id: &str,
-    ) -> Result<()> {
-        let mut links = self.document_links.write().await;
-        let edges = links.entry(document_id).or_default();
-        let edge = (entity_type.clone(), entity_id.to_string());
-        if !edges.contains(&edge) {
-            edges.push(edge);
-        }
-        Ok(())
-    }
-
-    async fn unlink_document_from_entity(
-        &self,
-        document_id: Uuid,
-        entity_type: &EntityType,
-        entity_id: &str,
-    ) -> Result<()> {
-        if let Some(edges) = self.document_links.write().await.get_mut(&document_id) {
-            edges.retain(|(t, id)| !(t == entity_type && id == entity_id));
-        }
-        Ok(())
-    }
-
-    async fn get_documents_for_entity(
-        &self,
-        entity_type: &EntityType,
-        entity_id: &str,
-    ) -> Result<Vec<Document>> {
-        let links = self.document_links.read().await;
-        let documents = self.documents.read().await;
-        let mut out: Vec<Document> = links
-            .iter()
-            .filter(|(_, edges)| {
-                edges
-                    .iter()
-                    .any(|(t, id)| t == entity_type && id == entity_id)
-            })
-            .filter_map(|(document_id, _)| documents.get(document_id).cloned())
-            .collect();
-        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        Ok(out)
-    }
-
-    async fn link_note_to_document(&self, note_id: Uuid, document_id: Uuid) -> Result<()> {
-        // The Cypher writes (:Note)-[:LINKED_TO]->(:Document); reads are
-        // undirected, so the mock records the same edge once.
-        self.link_document_to_entity(document_id, &EntityType::Note, &note_id.to_string())
-            .await
-    }
-
-    // ========================================================================
-    // Knowledge Note operations
-    // ========================================================================
-
-    async fn create_note(&self, note: &Note) -> Result<()> {
-        self.notes.write().await.insert(note.id, note.clone());
-        Ok(())
-    }
-
-    async fn get_note(&self, id: Uuid) -> Result<Option<Note>> {
-        Ok(self.notes.read().await.get(&id).cloned())
-    }
-
-    async fn update_note(
-        &self,
-        id: Uuid,
-        content: Option<String>,
-        importance: Option<NoteImportance>,
-        status: Option<NoteStatus>,
-        tags: Option<Vec<String>>,
-        staleness_score: Option<f64>,
-    ) -> Result<Option<Note>> {
-        let mut notes = self.notes.write().await;
-        if let Some(n) = notes.get_mut(&id) {
-            if let Some(c) = content {
-                n.content = c;
-            }
-            if let Some(i) = importance {
-                n.importance = i;
-            }
-            if let Some(s) = status {
-                n.status = s;
-            }
-            if let Some(t) = tags {
-                n.tags = t;
-            }
-            if let Some(ss) = staleness_score {
-                n.staleness_score = ss;
-            }
-            Ok(Some(n.clone()))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn rescope_note(&self, note_id: Uuid, project_id: Option<Uuid>) -> anyhow::Result<()> {
-        let mut notes = self.notes.write().await;
-        match notes.get_mut(&note_id) {
-            Some(note) => {
-                note.project_id = project_id;
-                Ok(())
-            }
-            None => anyhow::bail!("note {} not found", note_id),
-        }
-    }
-
-    async fn delete_note(&self, id: Uuid) -> Result<bool> {
-        let removed = self.notes.write().await.remove(&id).is_some();
-        self.note_anchors.write().await.remove(&id);
-        // Also clean up synapses (both directions)
-        if removed {
-            let mut synapses = self.note_synapses.write().await;
-            // Remove this note's outgoing synapses
-            synapses.remove(&id);
-            // Remove references to this note from all other notes' synapse lists
-            for neighbors in synapses.values_mut() {
-                neighbors.retain(|(nid, _)| *nid != id);
-            }
-        }
-        Ok(removed)
-    }
-
-    async fn list_notes(
-        &self,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        filters: &NoteFilters,
-    ) -> Result<(Vec<Note>, usize)> {
-        self.log_read("list_notes")?;
-        let ws_projects = if filters.global_only == Some(true) {
-            None
-        } else {
-            self.scope_projects(project_id, workspace_slug).await
-        };
-        let notes = self.notes.read().await;
-        let filtered: Vec<Note> = notes
-            .values()
-            .filter(|n| {
-                if filters.global_only == Some(true) {
-                    if n.project_id.is_some() {
-                        return false;
-                    }
-                } else if let Some(ref scope) = ws_projects {
-                    if !n.project_id.is_some_and(|p| scope.contains(&p)) {
-                        return false;
-                    }
-                }
-                if let Some(ref statuses) = filters.status {
-                    if !statuses.contains(&n.status) {
-                        return false;
-                    }
-                }
-                if let Some(ref note_types) = filters.note_type {
-                    if !note_types.contains(&n.note_type) {
-                        return false;
-                    }
-                }
-                if let Some(ref importances) = filters.importance {
-                    if !importances.contains(&n.importance) {
-                        return false;
-                    }
-                }
-                if let Some(ref tag_filter) = filters.tags {
-                    // AND semantics, like the real query (`'t' IN n.tags` per tag).
-                    if !tag_filter.iter().all(|tg| n.tags.contains(tg)) {
-                        return false;
-                    }
-                }
-                if let Some(ref q) = filters.search {
-                    let q = q.to_lowercase();
-                    if !n.content.to_lowercase().contains(&q) {
-                        return false;
-                    }
-                }
-                if let Some(min_s) = filters.min_staleness {
-                    if n.staleness_score < min_s {
-                        return false;
-                    }
-                }
-                if let Some(max_s) = filters.max_staleness {
-                    if n.staleness_score > max_s {
-                        return false;
-                    }
-                }
-                true
-            })
-            .cloned()
-            .collect();
-        let total = filtered.len();
-        let limit = filters.limit.unwrap_or(50) as usize;
-        let offset = filters.offset.unwrap_or(0) as usize;
-        Ok((paginate(&filtered, limit, offset), total))
-    }
-
-    async fn link_note_to_entity(
-        &self,
-        note_id: Uuid,
-        entity_type: &EntityType,
-        entity_id: &str,
-        signature_hash: Option<&str>,
-        body_hash: Option<&str>,
-    ) -> Result<()> {
-        let anchor = NoteAnchor {
-            entity_type: entity_type.clone(),
-            entity_id: entity_id.to_string(),
-            signature_hash: signature_hash.map(|s| s.to_string()),
-            body_hash: body_hash.map(|s| s.to_string()),
-            last_verified: Utc::now(),
-            is_valid: true,
-        };
-        self.note_anchors
-            .write()
-            .await
-            .entry(note_id)
-            .or_default()
-            .push(anchor);
-        Ok(())
-    }
-
-    async fn unlink_note_from_entity(
-        &self,
-        note_id: Uuid,
-        entity_type: &EntityType,
-        entity_id: &str,
-    ) -> Result<()> {
-        if let Some(anchors) = self.note_anchors.write().await.get_mut(&note_id) {
-            anchors.retain(|a| !(&a.entity_type == entity_type && a.entity_id == entity_id));
-        }
-        Ok(())
-    }
-
-    async fn propagate_structural_links(&self, _project_id: Uuid) -> Result<usize> {
-        Ok(0)
-    }
-
-    async fn propagate_high_level_links(&self, _project_id: Uuid) -> Result<usize> {
-        Ok(0)
-    }
-
-    async fn propagate_note_via_feature_graph(
-        &self,
-        _note_id: Uuid,
-        _feature_graph_id: &str,
-    ) -> Result<usize> {
-        Ok(0)
-    }
-
-    async fn propagate_note_via_skill(&self, _note_id: Uuid, _skill_id: &str) -> Result<usize> {
-        Ok(0)
-    }
-
-    async fn propagate_note_via_protocol(
-        &self,
-        _note_id: Uuid,
-        _protocol_id: &str,
-    ) -> Result<usize> {
-        Ok(0)
-    }
-
-    async fn propagate_semantic_links(
-        &self,
-        _project_id: Uuid,
-        _min_similarity: f64,
-    ) -> Result<usize> {
-        Ok(0)
-    }
-
-    async fn semantic_anchor_note(
-        &self,
-        _note_id: Uuid,
-        _project_id: Uuid,
-        _min_similarity: f64,
-    ) -> Result<usize> {
-        Ok(0)
-    }
-
-    async fn anchor_orphan_notes_to_project(&self, _project_id: Uuid) -> Result<usize> {
-        Ok(0)
-    }
-
-    async fn get_notes_for_entity(
-        &self,
-        entity_type: &EntityType,
-        entity_id: &str,
-    ) -> Result<Vec<Note>> {
-        let anchors = self.note_anchors.read().await;
-        let notes = self.notes.read().await;
-        let mut result = Vec::new();
-        for (note_id, note_anchors) in anchors.iter() {
-            for a in note_anchors {
-                if &a.entity_type == entity_type && a.entity_id == entity_id {
-                    if let Some(n) = notes.get(note_id) {
-                        result.push(n.clone());
-                    }
-                    break;
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    async fn get_propagated_notes(
-        &self,
-        entity_type: &EntityType,
-        entity_id: &str,
-        _max_depth: u32,
-        min_score: f64,
-        _relation_types: Option<&[String]>,
-        source_project_id: Option<Uuid>,
-        force_cross_project: bool,
-    ) -> Result<Vec<PropagatedNote>> {
-        // Simplified: no graph traversal; the candidates are the notes anchored
-        // directly on the entity (distance 0). The scope is applied BEFORE the
-        // top-20 cut, exactly like the Cypher of the real client.
-        let scope =
-            crate::notes::PropagationScope::from_params(source_project_id, force_cross_project);
-        let mut candidates: Vec<Note> = self
-            .get_notes_for_entity(entity_type, entity_id)
-            .await?
-            .into_iter()
-            .filter(|n| n.status == NoteStatus::Active && scope.admits(n.project_id))
-            .collect();
-        // Same consent predicate as the real client, applied before the cut.
-        if let crate::notes::PropagationScope::CrossProject(src) = scope {
-            let mut consent = crate::sharing::consent_gate::ConsentReader::new(self, Some(src));
-            let mut kept = Vec::with_capacity(candidates.len());
-            for n in candidates {
-                if consent.note(&n).await.is_allow() {
-                    kept.push(n);
-                }
-            }
-            candidates = kept;
-        }
-        let mut out: Vec<PropagatedNote> = candidates
-            .into_iter()
-            .map(|n| PropagatedNote {
-                relevance_score: n.importance.weight() * (0.4 + n.energy * 0.6),
-                source_entity: entity_id.to_string(),
-                propagation_path: vec![],
-                distance: 0,
-                path_pagerank: None,
-                relation_path: vec![],
-                path_rel_weight: None,
-                scar_intensity: n.scar_intensity,
-                note: n,
-            })
-            .filter(|pn| pn.relevance_score >= min_score)
-            .collect();
-        // CrossProject: the coupling weights the score of foreign notes BEFORE the
-        // cut to 20, with the same rule as the Cypher client.
-        if let crate::notes::PropagationScope::CrossProject(src) = scope {
-            let couplings = self.pairwise_coupling.read().await.clone();
-            out = out
-                .into_iter()
-                .filter_map(|mut pn| match pn.note.project_id {
-                    Some(pid) if pid != src => {
-                        let key = if src < pid { (src, pid) } else { (pid, src) };
-                        let coupling = Some(couplings.get(&key).copied().unwrap_or(0.0));
-                        let weighted = crate::notes::PropagationScope::weigh_foreign(
-                            pn.relevance_score,
-                            coupling,
-                            min_score,
-                        )?;
-                        pn.relevance_score = weighted;
-                        Some(pn)
-                    }
-                    _ => Some(pn),
-                })
-                .collect();
-        }
-        out.sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
-        out.truncate(20);
-        Ok(out)
-    }
-
-    async fn get_workspace_notes_for_project(
-        &self,
-        project_id: Uuid,
-        propagation_factor: f64,
-    ) -> Result<Vec<PropagatedNote>> {
-        // Find workspace for this project
-        let ws = self.get_project_workspace(project_id).await?;
-        if let Some(workspace) = ws {
-            let ws_notes = self
-                .get_notes_for_entity(&EntityType::Workspace, &workspace.id.to_string())
-                .await?;
-            Ok(ws_notes
-                .into_iter()
-                .map(|n| {
-                    let scar = n.scar_intensity;
-                    PropagatedNote {
-                        relevance_score: propagation_factor,
-                        source_entity: format!("workspace:{}", workspace.slug),
-                        propagation_path: vec![format!("workspace:{}", workspace.slug)],
-                        distance: 1,
-                        note: n,
-                        path_pagerank: None,
-                        relation_path: vec![crate::notes::RelationHop::structural("BELONGS_TO")],
-                        path_rel_weight: Some(1.0),
-                        scar_intensity: scar,
-                    }
-                })
-                .collect())
-        } else {
-            Ok(vec![])
-        }
-    }
-
-    async fn supersede_note(&self, old_note_id: Uuid, new_note_id: Uuid) -> Result<()> {
-        self.note_supersedes
-            .write()
-            .await
-            .insert(old_note_id, new_note_id);
-        // Update old note status
-        if let Some(n) = self.notes.write().await.get_mut(&old_note_id) {
-            n.status = NoteStatus::Obsolete;
-            n.superseded_by = Some(new_note_id);
-        }
-        // Update new note supersedes field
-        if let Some(n) = self.notes.write().await.get_mut(&new_note_id) {
-            n.supersedes = Some(old_note_id);
-        }
-        Ok(())
-    }
-
-    async fn confirm_note(&self, note_id: Uuid, confirmed_by: &str) -> Result<Option<Note>> {
-        let mut notes = self.notes.write().await;
-        if let Some(n) = notes.get_mut(&note_id) {
-            n.confirm(confirmed_by);
-            // Energy boost: +0.3, capped at 1.0
-            n.energy = (n.energy + 0.3).min(1.0);
-            n.last_activated = Some(chrono::Utc::now());
-            Ok(Some(n.clone()))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn get_notes_needing_review(
-        &self,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-    ) -> Result<Vec<Note>> {
-        self.log_read("get_notes_needing_review")?;
-        let scope = self.scope_projects(project_id, workspace_slug).await;
-        let notes = self.notes.read().await;
-        Ok(notes
-            .values()
-            .filter(|n| {
-                if let Some(ref scope) = scope {
-                    if !n.project_id.is_some_and(|p| scope.contains(&p)) {
-                        return false;
-                    }
-                }
-                matches!(n.status, NoteStatus::NeedsReview | NoteStatus::Stale)
-            })
-            .cloned()
-            .collect())
-    }
-
-    async fn update_staleness_scores(&self) -> Result<usize> {
-        let mut notes = self.notes.write().await;
-        let mut count = 0;
-        let now = Utc::now();
-        for n in notes.values_mut() {
-            if n.status == NoteStatus::Active {
-                if let Some(confirmed_at) = n.last_confirmed_at {
-                    let days = (now - confirmed_at).num_days() as f64;
-                    let base_days = n.base_decay_days();
-                    let decay = n.importance.decay_factor();
-                    let raw_staleness = (days * decay / base_days).clamp(0.0, 1.0);
-
-                    // Freshness discount: recent commit touches reduce staleness
-                    let freshness_discount = if let Some(pinged_at) = n.freshness_pinged_at {
-                        let days_since_ping = (now - pinged_at).num_days() as f64;
-                        (-days_since_ping / 30.0_f64).exp() * 0.5
-                    } else {
-                        0.0
-                    };
-
-                    n.staleness_score = (raw_staleness - freshness_discount).clamp(0.0, 1.0);
-                    count += 1;
-                }
-            }
-        }
-        Ok(count)
-    }
-
-    async fn get_note_anchors(&self, note_id: Uuid) -> Result<Vec<NoteAnchor>> {
-        Ok(self
-            .note_anchors
-            .read()
-            .await
-            .get(&note_id)
-            .cloned()
-            .unwrap_or_default())
-    }
-
-    async fn set_note_embedding(
-        &self,
-        note_id: Uuid,
-        embedding: &[f32],
-        model: &str,
-    ) -> Result<()> {
-        self.note_embeddings
-            .write()
-            .await
-            .insert(note_id, (embedding.to_vec(), model.to_string()));
-        Ok(())
-    }
-
-    async fn get_note_embedding(&self, note_id: Uuid) -> Result<Option<Vec<f32>>> {
-        let embeddings = self.note_embeddings.read().await;
-        Ok(embeddings.get(&note_id).map(|(emb, _)| emb.clone()))
-    }
-
-    async fn vector_search_notes(
-        &self,
-        embedding: &[f32],
-        limit: usize,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        min_similarity: Option<f64>,
-    ) -> Result<Vec<(Note, f64)>> {
-        let notes = self.notes.read().await;
-        let embeddings = self.note_embeddings.read().await;
-
-        // Resolve workspace_slug to a set of project IDs
-        let workspace_project_ids: Option<Vec<Uuid>> = if project_id.is_none() {
-            if let Some(slug) = workspace_slug {
-                let ws = self.get_workspace_by_slug(slug).await?;
-                if let Some(ws) = ws {
-                    let wp = self.workspace_projects.read().await;
-                    Some(wp.get(&ws.id).cloned().unwrap_or_default())
-                } else {
-                    Some(vec![]) // unknown workspace → no results
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let mut scored: Vec<(Note, f64)> = notes
-            .values()
-            .filter(|n| {
-                // Filter by status
-                matches!(n.status, NoteStatus::Active | NoteStatus::NeedsReview)
-            })
-            .filter(|n| {
-                // Filter by project_id or workspace projects
-                if let Some(pid) = project_id {
-                    n.project_id == Some(pid)
-                } else if let Some(ref ws_pids) = workspace_project_ids {
-                    // Include notes from workspace projects + global notes
-                    match n.project_id {
-                        Some(pid) => ws_pids.contains(&pid),
-                        None => true, // global notes included
-                    }
-                } else {
-                    true // no filter
-                }
-            })
-            .filter_map(|n| {
-                // Must have an embedding
-                embeddings.get(&n.id).map(|(emb, _model)| {
-                    let score = cosine_similarity(embedding, emb);
-                    (n.clone(), score)
-                })
-            })
-            .collect();
-
-        // Sort by score descending
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Filter by minimum cosine similarity threshold
-        if let Some(min_sim) = min_similarity {
-            scored.retain(|(_, score)| *score >= min_sim);
-        }
-
-        scored.truncate(limit);
-
-        Ok(scored)
-    }
-
-    async fn list_notes_without_embedding(
-        &self,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<Note>, usize)> {
-        let notes = self.notes.read().await;
-        let embeddings = self.note_embeddings.read().await;
-
-        let mut without: Vec<Note> = notes
-            .values()
-            .filter(|n| !embeddings.contains_key(&n.id))
-            .cloned()
-            .collect();
-
-        // Sort by created_at ASC for deterministic ordering
-        without.sort_by_key(|n| n.created_at);
-
-        let total = without.len();
-        let page: Vec<Note> = without.into_iter().skip(offset).take(limit).collect();
-
-        Ok((page, total))
-    }
-
-    // ========================================================================
-    // Code embedding operations (File & Function vector search)
-    // ========================================================================
-
-    async fn set_file_embedding(
-        &self,
-        file_path: &str,
-        embedding: &[f32],
-        model: &str,
-    ) -> Result<()> {
-        self.file_embeddings.write().await.insert(
-            file_path.to_string(),
-            (embedding.to_vec(), model.to_string()),
-        );
-        Ok(())
-    }
-
-    async fn set_function_embedding(
-        &self,
-        function_name: &str,
-        file_path: &str,
-        embedding: &[f32],
-        model: &str,
-    ) -> Result<()> {
-        let key = format!("{}::{}", file_path, function_name);
-        self.function_embeddings
-            .write()
-            .await
-            .insert(key, (embedding.to_vec(), model.to_string()));
-        Ok(())
-    }
-
-    async fn vector_search_files(
-        &self,
-        embedding: &[f32],
-        limit: usize,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<(String, f64)>> {
-        let file_embeddings = self.file_embeddings.read().await;
-
-        // If project_id is specified, get the set of file paths belonging to that project
-        let project_files: Option<Vec<String>> = if let Some(pid) = project_id {
-            let pf = self.project_files.read().await;
-            pf.get(&pid).cloned()
-        } else {
-            None
-        };
-
-        let mut scored: Vec<(String, f64)> = file_embeddings
-            .iter()
-            .filter(|(path, _)| {
-                if let Some(ref pfiles) = project_files {
-                    pfiles.contains(path)
-                } else {
-                    true
-                }
-            })
-            .map(|(path, (emb, _))| {
-                let score = cosine_similarity(embedding, emb);
-                (path.clone(), score)
-            })
-            .collect();
-
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(limit);
-        Ok(scored)
-    }
-
-    async fn vector_search_functions(
-        &self,
-        embedding: &[f32],
-        limit: usize,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<(String, String, f64)>> {
-        let func_embeddings = self.function_embeddings.read().await;
-
-        // If project_id is specified, get the set of file paths belonging to that project
-        let project_files: Option<Vec<String>> = if let Some(pid) = project_id {
-            let pf = self.project_files.read().await;
-            pf.get(&pid).cloned()
-        } else {
-            None
-        };
-
-        let mut scored: Vec<(String, String, f64)> = func_embeddings
-            .iter()
-            .filter_map(|(key, (emb, _))| {
-                // key format: "file_path::func_name"
-                let parts: Vec<&str> = key.splitn(2, "::").collect();
-                if parts.len() != 2 {
-                    return None;
-                }
-                let fpath = parts[0];
-                let fname = parts[1];
-
-                // Filter by project
-                if let Some(ref pfiles) = project_files {
-                    if !pfiles.contains(&fpath.to_string()) {
-                        return None;
-                    }
-                }
-
-                let score = cosine_similarity(embedding, emb);
-                Some((fname.to_string(), fpath.to_string(), score))
-            })
-            .collect();
-
-        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(limit);
-        Ok(scored)
-    }
-
-    // ========================================================================
-    // Synapse operations (Phase 2 — Neural Network)
-    // ========================================================================
-
-    async fn create_synapses(&self, note_id: Uuid, neighbors: &[(Uuid, f64)]) -> Result<usize> {
-        if neighbors.is_empty() {
-            return Ok(0);
-        }
-
-        let mut synapses = self.note_synapses.write().await;
-        let mut sources = self.synapse_sources.write().await;
-        let mut count = 0;
-
-        for &(neighbor_id, weight) in neighbors {
-            // Add source -> neighbor (upsert)
-            let entry = synapses.entry(note_id).or_default();
-            if let Some(existing) = entry.iter_mut().find(|(nid, _)| *nid == neighbor_id) {
-                existing.1 = weight;
-            } else {
-                entry.push((neighbor_id, weight));
-            }
-            count += 1;
-
-            // Add neighbor -> source (bidirectional, upsert)
-            let entry = synapses.entry(neighbor_id).or_default();
-            if let Some(existing) = entry.iter_mut().find(|(nid, _)| *nid == note_id) {
-                existing.1 = weight;
-            } else {
-                entry.push((note_id, weight));
-            }
-            count += 1;
-
-            // Tag source as cosine (backfill origin)
-            let key = if note_id < neighbor_id {
-                (note_id, neighbor_id)
-            } else {
-                (neighbor_id, note_id)
-            };
-            sources.entry(key).or_insert_with(|| "cosine".to_string());
-        }
-
-        Ok(count)
-    }
-
-    async fn get_synapses(&self, note_id: Uuid) -> Result<Vec<(Uuid, f64)>> {
-        let synapses = self.note_synapses.read().await;
-        let mut result = synapses.get(&note_id).cloned().unwrap_or_default();
-        // Sort by weight descending
-        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(result)
-    }
-
-    async fn delete_synapses(&self, note_id: Uuid) -> Result<usize> {
-        let mut synapses = self.note_synapses.write().await;
-
-        // Count outgoing synapses
-        let outgoing_count = synapses.get(&note_id).map(|v| v.len()).unwrap_or(0);
-
-        // Remove from all neighbors' lists
-        if let Some(neighbors) = synapses.remove(&note_id) {
-            for (neighbor_id, _) in &neighbors {
-                if let Some(neighbor_list) = synapses.get_mut(neighbor_id) {
-                    neighbor_list.retain(|(nid, _)| *nid != note_id);
-                }
-            }
-        }
-
-        // Return total deleted (bidirectional = outgoing * 2)
-        Ok(outgoing_count * 2)
-    }
-
-    // ========================================================================
-    // Energy operations (Phase 2 — Neural Network)
-    // ========================================================================
-
-    async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
-        let mut notes = self.notes.write().await;
-        let now = chrono::Utc::now();
-        let mut updated = 0usize;
-
-        for note in notes.values_mut() {
-            if note.status != crate::notes::NoteStatus::Active || note.energy <= 0.0 {
-                continue;
-            }
-            if let Some(last_activated) = note.last_activated {
-                let days_idle = (now - last_activated).num_seconds() as f64 / 86400.0;
-                let new_energy = note.energy * (-days_idle / half_life_days).exp();
-                let clamped = if new_energy < 0.05 { 0.0 } else { new_energy };
-                if (note.energy - clamped).abs() > 0.001 {
-                    note.energy = clamped;
-                    updated += 1;
-                }
-            }
-        }
-
-        Ok(updated)
-    }
-
-    async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<()> {
-        let mut notes = self.notes.write().await;
-        if let Some(note) = notes.get_mut(&note_id) {
-            // Lazy decay: compute current energy before adding boost
-            let current_e = note.computed_energy();
-            note.energy = (current_e + amount).min(1.0);
-            note.last_activated = Some(chrono::Utc::now());
-        }
-        Ok(())
-    }
-
-    async fn track_reactivation(&self, note_ids: &[Uuid]) -> Result<usize> {
-        let mut notes = self.notes.write().await;
-        let now = chrono::Utc::now();
-        let mut count = 0usize;
-        for &id in note_ids {
-            if let Some(note) = notes.get_mut(&id) {
-                note.reactivation_count += 1;
-                note.last_reactivated = Some(now);
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-
-    async fn reinforce_synapses(&self, note_ids: &[Uuid], boost: f64) -> Result<usize> {
-        if note_ids.len() < 2 {
-            anyhow::bail!(
-                "reinforce_synapses needs at least 2 note ids (got {})",
-                note_ids.len()
-            );
-        }
-
-        // Same rule as Cypher: both notes exist and share a known project.
-        let project_of: HashMap<Uuid, Option<Uuid>> = {
-            let notes = self.notes.read().await;
-            note_ids
-                .iter()
-                .map(|id| (*id, notes.get(id).and_then(|n| n.project_id)))
-                .collect()
-        };
-
-        let mut synapses = self.note_synapses.write().await;
-        let mut sources = self.synapse_sources.write().await;
-        let mut count = 0usize;
-
-        for i in 0..note_ids.len() {
-            for j in (i + 1)..note_ids.len() {
-                let a = note_ids[i];
-                let b = note_ids[j];
-                if a == b {
-                    continue;
-                }
-                match (project_of[&a], project_of[&b]) {
-                    (Some(pa), Some(pb)) if pa == pb => {}
-                    _ => continue,
-                }
-
-                // Reinforce or create A → B
-                let entry_a = synapses.entry(a).or_default();
-                if let Some(syn) = entry_a.iter_mut().find(|(id, _)| *id == b) {
-                    syn.1 = (syn.1 + boost).min(1.0);
-                } else {
-                    entry_a.push((b, 0.5));
-                }
-                count += 1;
-
-                // Reinforce or create B → A
-                let entry_b = synapses.entry(b).or_default();
-                if let Some(syn) = entry_b.iter_mut().find(|(id, _)| *id == a) {
-                    syn.1 = (syn.1 + boost).min(1.0);
-                } else {
-                    entry_b.push((a, 0.5));
-                }
-                count += 1;
-
-                // Tag source as coactivation (upgrade from cosine if applicable)
-                let key = if a < b { (a, b) } else { (b, a) };
-                sources.insert(key, "coactivation".to_string());
-            }
-        }
-
-        Ok(count)
-    }
-
-    async fn shadow_synapse_edges(
-        &self,
-        project_id: Uuid,
-        from: &[Uuid],
-    ) -> Result<Vec<crate::neurons::synaptic_shadow::ShadowEdgeRow>> {
-        use crate::neurons::synaptic_shadow::{estimate_tokens, ShadowEdgeRow, ShadowNode};
-        let notes = self.notes.read().await;
-        let synapses = self.note_synapses.read().await;
-        let shadow = self.synapse_shadow.read().await;
-        let in_project = |id: &Uuid| notes.get(id).and_then(|n| n.project_id) == Some(project_id);
-        let mut rows = Vec::new();
-        for a in from {
-            if !in_project(a) {
-                continue;
-            }
-            for (b, w) in synapses.get(a).map(Vec::as_slice).unwrap_or(&[]) {
-                if a == b || !in_project(b) {
-                    continue;
-                }
-                let note = &notes[b];
-                rows.push(ShadowEdgeRow {
-                    from: *a,
-                    to: *b,
-                    weight: shadow.get(&(*a, *b)).map(|s| s.0).unwrap_or(*w),
-                    target: ShadowNode {
-                        energy: note.energy,
-                        scar_intensity: note.scar_intensity,
-                        reachable: matches!(
-                            note.status,
-                            crate::notes::NoteStatus::Active
-                                | crate::notes::NoteStatus::NeedsReview
-                        ),
-                        tokens: estimate_tokens(note.content.chars().count()),
-                        created_at: Some(note.created_at),
-                    },
-                });
-            }
-        }
-        Ok(rows)
-    }
-
-    async fn reward_shadow_synapses(
-        &self,
-        project_id: Uuid,
-        pairs: &[(Uuid, Uuid)],
-        delta: f64,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<usize> {
-        let notes = self.notes.read().await;
-        let synapses = self.note_synapses.read().await;
-        let mut shadow = self.synapse_shadow.write().await;
-        let in_project = |id: &Uuid| notes.get(id).and_then(|n| n.project_id) == Some(project_id);
-        let mut unique: Vec<(Uuid, Uuid)> = pairs
-            .iter()
-            .filter(|(a, b)| a != b)
-            .map(|(a, b)| if a < b { (*a, *b) } else { (*b, *a) })
-            .collect();
-        unique.sort();
-        unique.dedup();
-        let mut written = 0usize;
-        for (a, b) in unique {
-            if !in_project(&a) || !in_project(&b) {
-                continue;
-            }
-            for (x, y) in [(a, b), (b, a)] {
-                // Existing edges only: never create one.
-                let Some(legacy) = synapses
-                    .get(&x)
-                    .and_then(|out| out.iter().find(|(n, _)| *n == y))
-                    .map(|(_, w)| *w)
-                else {
-                    continue;
-                };
-                let entry = shadow.entry((x, y)).or_insert((legacy, None));
-                entry.0 = (entry.0 + delta).clamp(0.0, 1.0);
-                if entry.1.is_none() {
-                    entry.1 = Some(now);
-                }
-                written += 1;
-            }
-        }
-        Ok(written)
-    }
-
-    async fn decay_shadow_synapses(
-        &self,
-        scope: &crate::neurons::synaptic_shadow::ShadowDecayScope,
-        half_life_days: f64,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<usize> {
-        // The mock has no notion of a dormant project: every project in scope decays.
-        let notes = self.notes.read().await;
-        let synapses = self.note_synapses.read().await;
-        let mut shadow = self.synapse_shadow.write().await;
-        let mut visited = 0usize;
-        for (a, out) in synapses.iter() {
-            let Some(pa) = notes.get(a).and_then(|n| n.project_id) else {
-                continue;
-            };
-            if !scope.includes(pa) {
-                continue;
-            }
-            for (b, w) in out {
-                if notes.get(b).and_then(|n| n.project_id) != Some(pa) {
-                    continue;
-                }
-                let entry = shadow.entry((*a, *b)).or_insert((*w, None));
-                let elapsed = entry
-                    .1
-                    .map(|at| (now - at).num_milliseconds() as f64 / 1000.0)
-                    .unwrap_or(0.0);
-                entry.0 = crate::neurons::synaptic_shadow::proportional_decay(
-                    entry.0,
-                    elapsed,
-                    half_life_days,
-                );
-                if elapsed >= 0.0 {
-                    entry.1 = Some(now);
-                }
-                visited += 1;
-            }
-        }
-        Ok(visited)
-    }
-
-    async fn record_synapse_shadow_trace(
-        &self,
-        trace: &crate::neurons::synaptic_shadow::SynapseShadowTrace,
-        keep: usize,
-    ) -> Result<()> {
-        let mut traces = self.synapse_shadow_traces.write().await;
-        traces.push(trace.clone());
-        let mut of_session: Vec<(chrono::DateTime<chrono::Utc>, Uuid)> = traces
-            .iter()
-            .filter(|t| t.session_id == trace.session_id)
-            .map(|t| (t.created_at, t.id))
-            .collect();
-        of_session.sort_by(|a, b| b.cmp(a));
-        let dropped: std::collections::HashSet<Uuid> =
-            of_session.iter().skip(keep).map(|(_, id)| *id).collect();
-        traces.retain(|t| !dropped.contains(&t.id));
-        Ok(())
-    }
-
-    async fn list_synapse_shadow_traces(
-        &self,
-        filter: &crate::neurons::synaptic_shadow::ShadowTraceFilter,
-    ) -> Result<Vec<crate::neurons::synaptic_shadow::SynapseShadowTrace>> {
-        use crate::neurons::synaptic_shadow::ShadowTraceFilter;
-        let traces = self.synapse_shadow_traces.read().await;
-        Ok(match filter {
-            ShadowTraceFilter::Session(sid) => {
-                let mut out: Vec<_> = traces
-                    .iter()
-                    .filter(|t| t.session_id == *sid)
-                    .cloned()
-                    .collect();
-                out.sort_by_key(|t| (t.created_at, t.id));
-                out
-            }
-            ShadowTraceFilter::ContainingNote { note_id, limit } => {
-                let mut out: Vec<_> = traces
-                    .iter()
-                    .filter(|t| t.note_ids().contains(note_id))
-                    .cloned()
-                    .collect();
-                out.sort_by_key(|t| std::cmp::Reverse((t.created_at, t.id)));
-                out.truncate(*limit);
-                out
-            }
-        })
-    }
-
-    async fn get_synapse_shadow_trace(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<crate::neurons::synaptic_shadow::SynapseShadowTrace>> {
-        let traces = self.synapse_shadow_traces.read().await;
-        Ok(traces.iter().find(|t| t.id == id).cloned())
-    }
-
-    async fn claim_shadow_trace_reward(&self, trace_id: Uuid, key: &str) -> Result<bool> {
-        let mut traces = self.synapse_shadow_traces.write().await;
-        let Some(trace) = traces.iter_mut().find(|t| t.id == trace_id) else {
-            return Ok(false);
-        };
-        if trace.rewarded.iter().any(|k| k == key) {
-            return Ok(false);
-        }
-        trace.rewarded.push(key.to_string());
-        Ok(true)
-    }
-
-    async fn shadow_trace_closures(
-        &self,
-        cutoff: chrono::DateTime<chrono::Utc>,
-        limit: usize,
-    ) -> Result<Vec<(Uuid, crate::neurons::synaptic_shadow::TaskClosure)>> {
-        use crate::neurons::synaptic_shadow::{TaskClosure, CLOSURE_KEY};
-        let traces = self.synapse_shadow_traces.read().await;
-        let executions = self.agent_executions.read().await;
-        let tasks = self.tasks.read().await;
-        let mut ordered: Vec<_> = traces
-            .iter()
-            .filter(|t| !t.rewarded.iter().any(|k| k == CLOSURE_KEY))
-            .collect();
-        ordered.sort_by_key(|t| (t.created_at, t.id));
-        let mut out = Vec::new();
-        for trace in ordered {
-            let mut restarted = false;
-            let mut quiet = false;
-            for ae in executions.values().filter(|ae| {
-                ae.session_id == Some(trace.session_id)
-                    && ae.completed_at.is_some_and(|at| at < cutoff)
-            }) {
-                let Some(task) = tasks.get(&ae.task_id) else {
-                    continue;
-                };
-                if executions
-                    .values()
-                    .any(|later| later.task_id == ae.task_id && later.started_at > ae.started_at)
-                {
-                    restarted = true;
-                } else if task.status == crate::neo4j::models::TaskStatus::Completed {
-                    quiet = true;
-                }
-            }
-            if restarted {
-                out.push((trace.id, TaskClosure::Restarted));
-            } else if quiet {
-                out.push((trace.id, TaskClosure::Quiet));
-            }
-            if out.len() >= limit {
-                break;
-            }
-        }
-        Ok(out)
-    }
-
-    async fn weaken_node_synapses(
-        &self,
-        node_id: Uuid,
-        amount: f64,
-        prune_threshold: f64,
-    ) -> Result<usize> {
-        // Same rule as the Cypher: a synapse whose two ends have two different
-        // known projects is left alone (an end without project is not a signal).
-        let project_of =
-            |notes: &HashMap<Uuid, Note>, id: Uuid| notes.get(&id).and_then(|n| n.project_id);
-        let notes = self.notes.read().await;
-        let mine = project_of(&notes, node_id);
-        let allowed = |other: Uuid| match (mine, project_of(&notes, other)) {
-            (Some(a), Some(b)) => a == b,
-            _ => true,
-        };
-        let mut synapses = self.note_synapses.write().await;
-        let mut weakened = 0usize;
-        for (owner, neighbors) in synapses.iter_mut() {
-            for (other, w) in neighbors.iter_mut() {
-                let touches = *owner == node_id || *other == node_id;
-                let far = if *owner == node_id { *other } else { *owner };
-                if touches && allowed(far) {
-                    *w -= amount;
-                    weakened += 1;
-                }
-            }
-            neighbors.retain(|(other, w)| {
-                let touches = *owner == node_id || *other == node_id;
-                let far = if *owner == node_id { *other } else { *owner };
-                !(touches && allowed(far) && *w < prune_threshold)
-            });
-        }
-        Ok(weakened)
-    }
-
-    async fn decay_synapses(
-        &self,
-        decay_amount: f64,
-        prune_threshold: f64,
-    ) -> Result<(usize, usize)> {
-        let mut synapses = self.note_synapses.write().await;
-        let sources = self.synapse_sources.read().await;
-        let mut decayed = 0usize;
-        let mut pruned = 0usize;
-
-        // Decay with differentiated rates: coactivation decays at base rate,
-        // cosine/unknown decays at 2x base rate
-        for (note_id, neighbors) in synapses.iter_mut() {
-            for syn in neighbors.iter_mut() {
-                let key = if *note_id < syn.0 {
-                    (*note_id, syn.0)
-                } else {
-                    (syn.0, *note_id)
-                };
-                let is_coactivation = sources
-                    .get(&key)
-                    .map(|s| s == "coactivation")
-                    .unwrap_or(false);
-                let effective_decay = if is_coactivation {
-                    decay_amount
-                } else {
-                    decay_amount * 2.0
-                };
-                syn.1 -= effective_decay;
-                decayed += 1;
-            }
-        }
-        drop(sources);
-
-        // Prune weak synapses
-        for neighbors in synapses.values_mut() {
-            let before = neighbors.len();
-            neighbors.retain(|(_, w)| *w >= prune_threshold);
-            pruned += before - neighbors.len();
-        }
-
-        // Drop synapses lock before acquiring notes lock to avoid deadlock
-        drop(synapses);
-
-        // Decay knowledge scars (20x slower than synapse decay)
-        let scar_decay_rate = decay_amount * 0.05;
-        if scar_decay_rate > 0.0 {
-            let mut notes = self.notes.write().await;
-            for note in notes.values_mut() {
-                if note.scar_intensity > 0.0 {
-                    note.scar_intensity -= scar_decay_rate;
-                    if note.scar_intensity < 0.001 {
-                        note.scar_intensity = 0.0;
-                    }
-                }
-            }
-        }
-
-        Ok((decayed, pruned))
-    }
-
-    async fn apply_scars(&self, node_ids: &[Uuid], increment: f64) -> Result<usize> {
-        let mut notes = self.notes.write().await;
-        let mut count = 0;
-        for id in node_ids {
-            if let Some(note) = notes.get_mut(id) {
-                note.scar_intensity = (note.scar_intensity + increment).min(1.0);
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-
-    async fn heal_scars(&self, node_id: Uuid) -> Result<bool> {
-        let mut notes = self.notes.write().await;
-        if let Some(note) = notes.get_mut(&node_id) {
-            note.scar_intensity = 0.0;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    async fn consolidate_memory(&self) -> Result<(usize, usize)> {
-        use crate::notes::lifecycle::NoteLifecycleManager;
-        let lifecycle = NoteLifecycleManager::new();
-        let now = chrono::Utc::now();
-        let mut notes = self.notes.write().await;
-        let mut promoted = 0usize;
-        let mut archived = 0usize;
-
-        let ids: Vec<Uuid> = notes
-            .values()
-            .filter(|n| n.status == crate::notes::NoteStatus::Active)
-            .map(|n| n.id)
-            .collect();
-
-        for id in ids {
-            if let Some(note) = notes.get(&id).cloned() {
-                let activation_count = note.activation_count;
-
-                // Check auto-archival (threshold-based rules)
-                if lifecycle.should_auto_archive(&note, activation_count, now) {
-                    if let Some(n) = notes.get_mut(&id) {
-                        n.status = crate::notes::NoteStatus::Archived;
-                        archived += 1;
-                    }
-                    continue;
-                }
-
-                // Check archival for ephemeral (legacy: >48h idle)
-                if lifecycle.should_archive_ephemeral(&note, now) {
-                    if let Some(n) = notes.get_mut(&id) {
-                        n.status = crate::notes::NoteStatus::Archived;
-                        archived += 1;
-                    }
-                    continue;
-                }
-
-                // Skip already-consolidated notes for promotion
-                if note.memory_horizon == crate::notes::MemoryHorizon::Consolidated {
-                    continue;
-                }
-
-                // Check direct ephemeral -> consolidated promotion (new threshold-based)
-                if lifecycle.should_promote_to_consolidated(&note, activation_count, now) {
-                    if let Some(n) = notes.get_mut(&id) {
-                        n.memory_horizon = crate::notes::MemoryHorizon::Consolidated;
-                        promoted += 1;
-                    }
-                    continue;
-                }
-
-                // Evaluate existing promotion rules
-                let promo = lifecycle.evaluate_promotion(&note, activation_count as u64);
-                if let Some(new_horizon) = promo.new_horizon {
-                    if let Some(n) = notes.get_mut(&id) {
-                        n.memory_horizon = new_horizon;
-                        promoted += 1;
-                    }
-                }
-            }
-        }
-
-        Ok((promoted, archived))
-    }
-
-    async fn compute_homeostasis(
-        &self,
-        project_id: Uuid,
-        _custom_ranges: Option<&[(String, f64, f64)]>,
-    ) -> Result<crate::neo4j::models::HomeostasisReport> {
-        use crate::neo4j::models::{HomeostasisRatio, HomeostasisReport, HomeostasisSeverity};
-
-        let notes = self.notes.read().await;
-        let project_notes: Vec<_> = notes
-            .values()
-            .filter(|n| {
-                n.project_id == Some(project_id) && n.status == crate::notes::NoteStatus::Active
-            })
-            .collect();
-
-        let total = project_notes.len() as f64;
-        let scarred = project_notes
-            .iter()
-            .filter(|n| n.scar_intensity > 0.0)
-            .count() as f64;
-        let scar_load = if total > 0.0 { scarred / total } else { 0.0 };
-
-        let mut ratios = vec![HomeostasisRatio {
-            name: "note_density".to_string(),
-            value: total.max(1.0),
-            target_range: (0.3, 2.0),
-            distance_to_equilibrium: 0.0,
-            severity: HomeostasisSeverity::Ok,
-            recommendation: None,
-        }];
-
-        // Add scar_load ratio if there are scarred notes
-        let scar_severity = if scar_load > 0.5 {
-            HomeostasisSeverity::Critical
-        } else if scar_load > 0.2 {
-            HomeostasisSeverity::Warning
-        } else {
-            HomeostasisSeverity::Ok
-        };
-        ratios.push(HomeostasisRatio {
-            name: "scar_load".to_string(),
-            value: scar_load,
-            target_range: (0.0, 0.2),
-            distance_to_equilibrium: if scar_load > 0.2 {
-                scar_load - 0.2
-            } else {
-                0.0
-            },
-            severity: scar_severity,
-            recommendation: if scar_load > 0.2 {
-                Some("High scar density — consider reviewing scarred notes".to_string())
-            } else {
-                None
-            },
-        });
-
-        let pain_score = ratios
-            .iter()
-            .map(|r| r.distance_to_equilibrium)
-            .sum::<f64>()
-            / ratios.len() as f64;
-
-        Ok(HomeostasisReport {
-            ratios,
-            pain_score,
-            recommendations: vec![],
-            total_notes_count: project_notes.len() as i64,
-        })
-    }
-
-    async fn compute_structural_drift(
-        &self,
-        _project_id: Uuid,
-        _warning_threshold: Option<f64>,
-        _critical_threshold: Option<f64>,
-    ) -> Result<crate::neo4j::models::StructuralDriftReport> {
-        Ok(crate::neo4j::models::StructuralDriftReport {
-            drifting_files: vec![],
-            centroids: vec![],
-            mean_drift: 0.0,
-            warning_count: 0,
-            critical_count: 0,
-        })
-    }
-
-    async fn increment_frustration(&self, task_id: Uuid, delta: f64) -> Result<f64> {
-        let mut tasks = self.tasks.write().await;
-        if let Some(task) = tasks.get_mut(&task_id) {
-            task.frustration_score = (task.frustration_score + delta).min(1.0);
-            Ok(task.frustration_score)
-        } else {
-            anyhow::bail!("Task not found: {}", task_id)
-        }
-    }
-
-    async fn decrement_frustration(&self, task_id: Uuid, delta: f64) -> Result<f64> {
-        let mut tasks = self.tasks.write().await;
-        if let Some(task) = tasks.get_mut(&task_id) {
-            task.frustration_score = (task.frustration_score - delta).max(0.0);
-            Ok(task.frustration_score)
-        } else {
-            anyhow::bail!("Task not found: {}", task_id)
-        }
-    }
-
-    async fn get_frustration(&self, task_id: Uuid) -> Result<f64> {
-        let tasks = self.tasks.read().await;
-        if let Some(task) = tasks.get(&task_id) {
-            Ok(task.frustration_score)
-        } else {
-            anyhow::bail!("Task not found: {}", task_id)
-        }
-    }
-
-    async fn get_step_parent_task_id(&self, step_id: Uuid) -> Result<Option<Uuid>> {
-        let task_steps = self.task_steps.read().await;
-        for (task_id, step_ids) in task_steps.iter() {
-            if step_ids.contains(&step_id) {
-                return Ok(Some(*task_id));
-            }
-        }
-        Ok(None)
-    }
-
-    async fn init_note_energy(&self, project_id: Option<Uuid>) -> Result<usize> {
-        self.init_note_energy_calls.write().await.push(project_id);
-        let mut notes = self.notes.write().await;
-        let mut count = 0;
-        for note in notes
-            .values_mut()
-            .filter(|n| project_id.is_none_or(|pid| n.project_id == Some(pid)))
-        {
-            // Simulate: only init if energy would have been NULL (we use 0.0 sentinel or check default)
-            // In mock, energy is always set by Note::new(), so this is a no-op
-            // But for completeness, ensure energy is at least 1.0 if it was 0.0 and never activated
-            if note.last_activated.is_none() && note.energy == 0.0 {
-                note.energy = 1.0;
-                note.last_activated = Some(chrono::Utc::now());
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-
-    async fn list_notes_needing_synapses(
-        &self,
-        limit: usize,
-        _offset: usize,
-        project_id: Option<Uuid>,
-    ) -> Result<(Vec<crate::notes::Note>, usize)> {
-        let notes = self.notes.read().await;
-        let embeddings = self.note_embeddings.read().await;
-        let synapses = self.note_synapses.read().await;
-
-        let needing: Vec<crate::notes::Note> = notes
-            .values()
-            .filter(|n| embeddings.contains_key(&n.id) && !synapses.contains_key(&n.id))
-            .filter(|n| project_id.is_none_or(|pid| n.project_id == Some(pid)))
-            .cloned()
-            .collect();
-
-        let total = needing.len();
-        let batch: Vec<crate::notes::Note> = needing.into_iter().take(limit).collect();
-        Ok((batch, total))
-    }
-
-    async fn create_cross_entity_synapses(
-        &self,
-        source_id: Uuid,
-        neighbors: &[(Uuid, f64)],
-    ) -> Result<usize> {
-        // Reuse existing synapse storage (Note synapses) — in mock, we don't distinguish
-        let mut synapses = self.note_synapses.write().await;
-        let mut created = 0usize;
-        for (target_id, weight) in neighbors {
-            // Forward
-            let entry = synapses.entry(source_id).or_default();
-            entry.push((*target_id, *weight));
-            // Backward
-            let entry = synapses.entry(*target_id).or_default();
-            entry.push((source_id, *weight));
-            created += 2;
-        }
-        Ok(created)
-    }
-
-    async fn get_cross_entity_synapses(&self, node_id: Uuid) -> Result<Vec<(Uuid, f64, String)>> {
-        let synapses = self.note_synapses.read().await;
-        let notes = self.notes.read().await;
-        if let Some(neighbors) = synapses.get(&node_id) {
-            let mut result: Vec<(Uuid, f64, String)> = neighbors
-                .iter()
-                .map(|(id, weight)| {
-                    let entity_type = if notes.contains_key(id) {
-                        "Note".to_string()
-                    } else {
-                        "Decision".to_string()
-                    };
-                    (*id, *weight, entity_type)
-                })
-                .collect();
-            result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            Ok(result)
-        } else {
-            Ok(vec![])
-        }
-    }
-
-    async fn list_decisions_needing_synapses(
-        &self,
-        _limit: usize,
-        _offset: usize,
-    ) -> Result<(Vec<DecisionNode>, usize)> {
-        // Mock: return empty — decisions needing synapses not tracked in mock
-        Ok((vec![], 0))
-    }
-
-    async fn get_all_synapse_weights(&self, project_id: Option<Uuid>) -> Result<Vec<f64>> {
-        // Return weights from the in-memory synapse map, optionally filtered by project.
-        let note_synapses = self.note_synapses.read().await;
-        let notes = self.notes.read().await;
-
-        let weights: Vec<f64> = note_synapses
-            .iter()
-            .filter(|(src_id, _neighbors)| {
-                if let Some(pid) = project_id {
-                    notes
-                        .get(*src_id)
-                        .and_then(|n| n.project_id)
-                        .map(|p| p == pid)
-                        .unwrap_or(false)
-                } else {
-                    true
-                }
-            })
-            .flat_map(|(_src_id, neighbors)| neighbors.iter().map(|(_dst, w)| *w))
-            .collect();
-
-        Ok(weights)
-    }
-
-    async fn get_project_note_entity_links(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<(String, String, String)>> {
-        let notes = self.notes.read().await;
-        let note_anchors = self.note_anchors.read().await;
-
-        let mut links = Vec::new();
-        for note in notes.values() {
-            if note.project_id != Some(project_id) {
-                continue;
-            }
-            if let Some(anchors) = note_anchors.get(&note.id) {
-                for anchor in anchors {
-                    let entity_type = format!("{:?}", anchor.entity_type).to_lowercase();
-                    links.push((note.id.to_string(), entity_type, anchor.entity_id.clone()));
-                }
-            }
-        }
-        Ok(links)
-    }
-
-    async fn get_project_note_synapses(
-        &self,
-        project_id: Uuid,
-        min_weight: f64,
-    ) -> Result<Vec<(String, String, f64)>> {
-        let notes = self.notes.read().await;
-        let synapses = self.note_synapses.read().await;
-
-        // Collect project note IDs
-        let project_note_ids: std::collections::HashSet<Uuid> = notes
-            .values()
-            .filter(|n| n.project_id == Some(project_id))
-            .map(|n| n.id)
-            .collect();
-
-        let mut result = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for (&source_id, neighbors) in synapses.iter() {
-            if !project_note_ids.contains(&source_id) {
-                continue;
-            }
-            for (target_id, weight) in neighbors {
-                if !project_note_ids.contains(target_id) || *weight < min_weight {
-                    continue;
-                }
-                // Deduplicate bidirectional
-                let key = if source_id < *target_id {
-                    (source_id, *target_id)
-                } else {
-                    (*target_id, source_id)
-                };
-                if seen.insert(key) {
-                    result.push((source_id.to_string(), target_id.to_string(), *weight));
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    async fn get_project_decisions_for_graph(
-        &self,
-        _project_id: Uuid,
-    ) -> Result<Vec<(DecisionNode, Vec<AffectsRelation>)>> {
-        // Mock: return all decisions with empty affects (simplified)
-        let decisions = self.decisions.read().await;
-        let results: Vec<(DecisionNode, Vec<AffectsRelation>)> =
-            decisions.values().map(|d| (d.clone(), vec![])).collect();
-        Ok(results)
-    }
-
-    // ========================================================================
-    // Chat session operations
-    // ========================================================================
-
-    async fn create_chat_session(&self, session: &ChatSessionNode) -> Result<()> {
-        if self
-            .fail_session_writes
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            anyhow::bail!("injected failure of create_chat_session");
-        }
-        // As the Neo4j store: a session is created with its shell at home.
-        self.session_shell_moved
-            .write()
-            .await
-            .insert(session.id, false);
-        self.chat_sessions
-            .write()
-            .await
-            .insert(session.id, session.clone());
-        Ok(())
-    }
-
-    async fn get_chat_session(&self, id: Uuid) -> Result<Option<ChatSessionNode>> {
-        self.count_read();
-        // Failure injection without a `read_log` entry (counted read logs stay as they are).
-        if self
-            .fail_reads
-            .lock()
-            .is_ok_and(|f| f.contains("get_chat_session"))
-        {
-            anyhow::bail!("injected failure of get_chat_session");
-        }
-        Ok(self.chat_sessions.read().await.get(&id).cloned())
-    }
-
-    async fn list_chat_sessions(
-        &self,
-        project_slug: Option<&str>,
-        workspace_slug: Option<&str>,
-        limit: usize,
-        offset: usize,
-        include_detached: bool,
-    ) -> Result<(Vec<ChatSessionNode>, usize)> {
-        self.log_read("list_chat_sessions")?;
-        let sessions = self.chat_sessions.read().await;
-        // Collect workspace project slugs for membership check
-        let ws_project_slugs: Vec<String> = if let Some(ws) = workspace_slug {
-            let workspaces = self.workspaces.read().await;
-            if let Some(w) = workspaces.values().find(|w| w.slug == ws) {
-                let wp = self.workspace_projects.read().await;
-                let projects = self.projects.read().await;
-                wp.get(&w.id)
-                    .cloned()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|pid| projects.get(pid).map(|p| p.slug.clone()))
-                    .collect()
-            } else {
-                vec![]
-            }
-        } else {
-            vec![]
-        };
-        let mut filtered: Vec<_> = sessions
-            .values()
-            .filter(|s| {
-                // Filter out detached sessions unless explicitly requested
-                if !include_detached && s.spawned_by.is_some() {
-                    return false;
-                }
-                if let Some(slug) = project_slug {
-                    s.project_slug.as_deref() == Some(slug)
-                } else if let Some(ws) = workspace_slug {
-                    // Match workspace_slug OR project_slug membership
-                    s.workspace_slug.as_deref() == Some(ws)
-                        || s.project_slug
-                            .as_deref()
-                            .is_some_and(|ps| ws_project_slugs.iter().any(|wps| wps == ps))
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .collect();
-        // Sort by updated_at descending
-        filtered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        let total = filtered.len();
-        let page = paginate(&filtered, limit, offset);
-        Ok((page, total))
-    }
-
-    async fn get_session_children(&self, parent_id: Uuid) -> Result<Vec<ChatSessionNode>> {
-        let sessions = self.chat_sessions.read().await;
-        let parent_str = parent_id.to_string();
-        // A parent that no longer exists has no children (same as the Neo4j store).
-        let parent_exists = sessions.contains_key(&parent_id);
-        let mut children: Vec<_> = sessions
-            .values()
-            .filter(|_| parent_exists)
-            .filter(|s| {
-                s.spawned_by
-                    .as_ref()
-                    .is_some_and(|sb| sb.contains(&parent_str))
-            })
-            .cloned()
-            .collect();
-        children.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-        drop(sessions);
-        let landing = self
-            .land_children_after_read
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&parent_id);
-        if let Some(landing) = landing {
-            let mut sessions = self.chat_sessions.write().await;
-            for child in landing {
-                sessions.insert(child.id, child);
-            }
-        }
-        Ok(children)
-    }
-
-    async fn create_spawned_by_relation(
-        &self,
-        child_session_id: &str,
-        parent_session_id: &str,
-        _spawn_type: &str,
-        run_id: Option<Uuid>,
-        task_id: Option<Uuid>,
-    ) -> Result<()> {
-        // Mock: only the thread-relevant part is tracked, as the link row the
-        // real store derives (plan of the run carried, else of the parent).
-        let (Ok(child), Ok(parent)) = (
-            child_session_id.parse::<Uuid>(),
-            parent_session_id.parse::<Uuid>(),
-        ) else {
-            return Ok(());
-        };
-        let mut rows = self.session_link_rows.write().await;
-        let plan = rows
-            .iter()
-            .filter(|r| {
-                r.session_id == parent
-                    && matches!(
-                        r.kind,
-                        SessionLinkKind::RunRelation | SessionLinkKind::PlanAssociation
-                    )
-            })
-            .find_map(|r| r.thread_plan_id);
-        rows.push(SessionLinkRow {
-            session_id: child,
-            kind: SessionLinkKind::SpawnedByRelation,
-            run_id,
-            task_id,
-            plan_id: plan,
-            thread_plan_id: plan,
-        });
-        Ok(())
-    }
-
-    async fn link_session_to_run(
-        &self,
-        session_id: &str,
-        run_id: Uuid,
-        plan_id: Option<Uuid>,
-        task_id: Option<Uuid>,
-    ) -> Result<bool> {
-        let Ok(sid) = session_id.parse::<Uuid>() else {
-            return Ok(false);
-        };
-        if !self.chat_sessions.read().await.contains_key(&sid) {
-            return Ok(false);
-        }
-        let mut rows = self.session_link_rows.write().await;
-        let already = rows.iter().any(|r| {
-            r.session_id == sid
-                && r.kind == SessionLinkKind::RunRelation
-                && r.run_id == Some(run_id)
-        });
-        if !already {
-            rows.push(SessionLinkRow {
-                session_id: sid,
-                kind: SessionLinkKind::RunRelation,
-                run_id: Some(run_id),
-                task_id,
-                plan_id,
-                thread_plan_id: plan_id,
-            });
-        }
-        Ok(true)
-    }
-
-    async fn get_session_link_rows(&self, session_ids: &[Uuid]) -> Result<Vec<SessionLinkRow>> {
-        self.log_read("get_session_link_rows")?;
-        self.session_link_reads
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let rows = self.session_link_rows.read().await;
-        Ok(rows
-            .iter()
-            .filter(|r| session_ids.contains(&r.session_id))
-            .cloned()
-            .collect())
-    }
-
-    async fn get_plans_task_graph(&self, plan_ids: &[Uuid]) -> Result<PlansTaskGraph> {
-        self.log_read("get_plans_task_graph")?;
-        let plan_tasks = self.plan_tasks.read().await;
-        let tasks = self.tasks.read().await;
-        let deps = self.task_dependencies.read().await;
-        let mut graph = PlansTaskGraph::default();
-        for pid in plan_ids {
-            for tid in plan_tasks.get(pid).into_iter().flatten() {
-                if let Some(t) = tasks.get(tid) {
-                    graph.tasks.push((*pid, t.clone()));
-                }
-                for d in deps.get(tid).into_iter().flatten() {
-                    graph.edges.push((*tid, *d));
-                }
-            }
-        }
-        Ok(graph)
-    }
-
-    async fn list_project_workspace_rows(&self) -> Result<Vec<ProjectWorkspaceRow>> {
-        self.log_read("list_project_workspace_rows")?;
-        let workspaces = self.workspaces.read().await;
-        let projects = self.projects.read().await;
-        let wp = self.workspace_projects.read().await;
-        let mut rows = Vec::new();
-        for (wid, pids) in wp.iter() {
-            let Some(w) = workspaces.get(wid) else {
-                continue;
-            };
-            for pid in pids {
-                if let Some(p) = projects.get(pid) {
-                    rows.push(ProjectWorkspaceRow {
-                        project_id: p.id,
-                        project_slug: p.slug.clone(),
-                        workspace_id: w.id,
-                        workspace_slug: w.slug.clone(),
-                    });
-                }
-            }
-        }
-        Ok(rows)
-    }
-
-    /// P18-suite (point 12): a real traversal of the mock's `spawned_by`, with the
-    /// semantics of the Neo4j query — the session itself at depth 0, then every
-    /// descendant found through the JSON parent, breadth first, siblings by
-    /// `created_at`; an unknown session is an empty tree. `status`, provider, model
-    /// and costs stay unset here: the API fills them, as it does for the real store.
-    async fn get_session_tree(&self, session_id: &str) -> Result<Vec<SessionTreeNode>> {
-        let sessions = self.chat_sessions.read().await;
-        let Some(root) = sessions.values().find(|s| s.id.to_string() == session_id) else {
-            return Ok(Vec::new());
-        };
-        let node_of = |s: &ChatSessionNode, depth: u32| {
-            let spawn = spawned_by_of(s);
-            SessionTreeNode {
-                session_id: s.id.to_string(),
-                parent_session_id: if depth == 0 {
-                    None
-                } else {
-                    spawn.parent.clone()
-                },
-                spawn_type: if depth == 0 { None } else { spawn.kind.clone() },
-                run_id: if depth == 0 { None } else { spawn.run_id },
-                task_id: if depth == 0 { None } else { spawn.task_id },
-                depth,
-                created_at: Some(s.created_at),
-                provider_id: None,
-                model: None,
-                cost_usd: None,
-                subtree_cost_usd: None,
-                max_depth: None,
-                max_children: None,
-                status: "closed".to_string(),
-                routed_by: None,
-            }
-        };
-        let mut nodes = vec![node_of(root, 0)];
-        let mut frontier = vec![root.id.to_string()];
-        let mut seen: std::collections::HashSet<String> = frontier.iter().cloned().collect();
-        let mut depth = 0u32;
-        // The real query stops at ten hops (`SPAWNED_BY*0..10`).
-        while !frontier.is_empty() && depth < 10 {
-            depth += 1;
-            let mut next = Vec::new();
-            for parent in &frontier {
-                let mut children: Vec<&ChatSessionNode> = sessions
-                    .values()
-                    .filter(|s| spawned_by_of(s).parent.as_deref() == Some(parent.as_str()))
-                    .filter(|s| !seen.contains(&s.id.to_string()))
-                    .collect();
-                children.sort_by_key(|s| s.created_at);
-                for child in children {
-                    seen.insert(child.id.to_string());
-                    nodes.push(node_of(child, depth));
-                    next.push(child.id.to_string());
-                }
-            }
-            frontier = next;
-        }
-        Ok(nodes)
-    }
-
-    /// P18-suite (point 12): follow the JSON parent upward to the session that has
-    /// none — ten hops at most, a cycle stops the walk — or `None` for an unknown
-    /// session, as the Neo4j query answers.
-    async fn get_session_root(&self, session_id: &str) -> Result<Option<String>> {
-        let sessions = self.chat_sessions.read().await;
-        let by_id = |id: &str| sessions.values().find(|s| s.id.to_string() == id);
-        let Some(mut current) = by_id(session_id) else {
-            return Ok(None);
-        };
-        let mut seen = std::collections::HashSet::from([current.id.to_string()]);
-        for _ in 0..10 {
-            let Some(parent_id) = spawned_by_of(current).parent else {
-                break;
-            };
-            if !seen.insert(parent_id.clone()) {
-                break;
-            }
-            match by_id(&parent_id) {
-                Some(parent) => current = parent,
-                // A parent the store no longer holds: the walk ends on the last known session.
-                None => break,
-            }
-        }
-        Ok(Some(current.id.to_string()))
-    }
-
-    async fn get_run_sessions(&self, _run_id: Uuid) -> Result<Vec<SessionInfo>> {
-        // Mock: return empty
-        Ok(vec![])
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn update_chat_session(
-        &self,
-        id: Uuid,
-        cli_session_id: Option<String>,
-        title: Option<String>,
-        message_count: Option<i64>,
-        total_cost_usd: Option<f64>,
-        conversation_id: Option<String>,
-        preview: Option<String>,
-    ) -> Result<Option<ChatSessionNode>> {
-        let mut sessions = self.chat_sessions.write().await;
-        if let Some(session) = sessions.get_mut(&id) {
-            session.updated_at = Utc::now();
-            if let Some(v) = cli_session_id {
-                session.cli_session_id = Some(v);
-            }
-            if let Some(v) = title {
-                session.title = Some(v);
-            }
-            if let Some(v) = message_count {
-                session.message_count = v;
-            }
-            if let Some(v) = total_cost_usd {
-                session.total_cost_usd = Some(v);
-            }
-            if let Some(v) = conversation_id {
-                session.conversation_id = Some(v);
-            }
-            if let Some(v) = preview {
-                session.preview = Some(v);
-            }
-            Ok(Some(session.clone()))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn add_chat_session_children_cost(&self, id: Uuid, delta_usd: f64) -> Result<f64> {
-        let delta = if delta_usd.is_finite() && delta_usd > 0.0 {
-            delta_usd
-        } else {
-            0.0
-        };
-        let mut costs = self.chat_children_costs.write().await;
-        let total = costs.entry(id).or_insert(0.0);
-        *total += delta;
-        Ok(*total)
-    }
-
-    async fn get_chat_session_children_cost(&self, id: Uuid) -> Result<f64> {
-        Ok(self
-            .chat_children_costs
-            .read()
-            .await
-            .get(&id)
-            .copied()
-            .unwrap_or(0.0))
-    }
-
-    async fn update_chat_session_permission_mode(&self, id: Uuid, mode: &str) -> Result<()> {
-        let mut sessions = self.chat_sessions.write().await;
-        if let Some(session) = sessions.get_mut(&id) {
-            session.permission_mode = Some(mode.to_string());
-            session.updated_at = Utc::now();
-        }
-        Ok(())
-    }
-
-    async fn bind_chat_session_project(&self, id: Uuid, project_slug: &str) -> Result<bool> {
-        let mut sessions = self.chat_sessions.write().await;
-        let Some(session) = sessions.get_mut(&id) else {
-            return Ok(false);
-        };
-        if session
-            .project_slug
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
-        {
-            return Ok(false);
-        }
-        session.project_slug = Some(project_slug.to_string());
-        session.updated_at = Utc::now();
-        Ok(true)
-    }
-
-    async fn update_chat_session_file_scope_lifted(&self, id: Uuid, lifted: bool) -> Result<()> {
-        let mut sessions = self.chat_sessions.write().await;
-        if let Some(session) = sessions.get_mut(&id) {
-            session.file_scope_lifted = lifted;
-            session.updated_at = Utc::now();
-        }
-        Ok(())
-    }
-
-    async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()> {
-        let mut sessions = self.chat_sessions.write().await;
-        if let Some(session) = sessions.get_mut(&id) {
-            session.model = model.to_string();
-            session.updated_at = Utc::now();
-        }
-        Ok(())
-    }
-
-    async fn set_chat_session_fingerprint(&self, id: Uuid, fingerprint: &str) -> Result<()> {
-        self.chat_fingerprints
-            .write()
-            .await
-            .insert(id, fingerprint.to_string());
-        Ok(())
-    }
-
-    async fn get_chat_session_fingerprint(&self, id: Uuid) -> Result<Option<String>> {
-        Ok(self.chat_fingerprints.read().await.get(&id).cloned())
-    }
-
-    async fn update_chat_session_routing(
-        &self,
-        id: Uuid,
-        routing_mode: Option<&str>,
-        routing_pool: Option<&str>,
-        routed_by: Option<&str>,
-    ) -> Result<bool> {
-        let mut sessions = self.chat_sessions.write().await;
-        let Some(session) = sessions.get_mut(&id) else {
-            return Ok(false);
-        };
-        session.routing_mode = routing_mode.map(str::to_owned);
-        session.routing_pool = routing_pool.map(str::to_owned);
-        session.routed_by = routed_by.map(str::to_owned);
-        session.updated_at = Utc::now();
-        Ok(true)
-    }
-
-    async fn update_chat_session_provider(
-        &self,
-        id: Uuid,
-        provider_id: &str,
-        model: &str,
-        routed_by: &str,
-        engine: &str,
-    ) -> Result<bool> {
-        let mut sessions = self.chat_sessions.write().await;
-        let Some(session) = sessions.get_mut(&id) else {
-            return Ok(false);
-        };
-        session.provider_id = Some(provider_id.to_owned());
-        session.model = model.to_owned();
-        session.routed_by = Some(routed_by.to_owned());
-        // Providers do not share a session format: a resume token is refused across
-        // families, so the provider-specific fields are cleared (as the Neo4j store does).
-        session.resume_token = None;
-        session.capabilities = None;
-        session.cli_session_id = None;
-        session.engine = Some(engine.to_owned());
-        session.updated_at = Utc::now();
-        Ok(true)
-    }
-
-    async fn restore_chat_session_provider(
-        &self,
-        node: &ChatSessionNode,
-        provider_id: &str,
-    ) -> Result<bool> {
-        let mut sessions = self.chat_sessions.write().await;
-        let Some(session) = sessions.get_mut(&node.id) else {
-            return Ok(false);
-        };
-        session.provider_id = Some(provider_id.to_owned());
-        session.model = node.model.clone();
-        session.routed_by = node.routed_by.clone();
-        session.resume_token = node.resume_token.clone();
-        session.capabilities = node.capabilities.clone();
-        session.cli_session_id = node.cli_session_id.clone();
-        session.engine = node.engine.clone();
-        session.updated_at = Utc::now();
-        Ok(true)
-    }
-
-    async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>> {
-        loop {
-            let released = self.llm_setting_writes_released.notified();
-            let stalled = self
-                .stall_llm_setting_reads_of
-                .lock()
-                .is_ok_and(|s| s.contains(key));
-            if !stalled {
-                break;
-            }
-            released.await;
-        }
-        if self
-            .fail_llm_setting_reads_of
-            .lock()
-            .is_ok_and(|s| s.contains(key))
-        {
-            anyhow::bail!("mock: injected failure of the read of setting {key}");
-        }
-        Ok(self
-            .llm_settings
-            .read()
-            .await
-            .get(&(scope.to_string(), key.to_string()))
-            .cloned())
-    }
-    async fn put_llm_setting(&self, scope: &str, key: &str, value: &str) -> Result<()> {
-        if scope == "journal"
-            && self
-                .fail_journal_writes
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            anyhow::bail!("mock: the send journal cannot be written");
-        }
-        self.llm_setting_write_gate(key, false).await?;
-        self.llm_settings
-            .write()
-            .await
-            .insert((scope.to_string(), key.to_string()), value.to_string());
-        Ok(())
-    }
-    async fn delete_llm_setting(&self, scope: &str, key: &str) -> Result<bool> {
-        self.llm_setting_write_gate(key, true).await?;
-        Ok(self
-            .llm_settings
-            .write()
-            .await
-            .remove(&(scope.to_string(), key.to_string()))
-            .is_some())
-    }
-    async fn list_llm_settings(&self, scope: &str, prefix: &str) -> Result<Vec<(String, String)>> {
-        let mut rows: Vec<(String, String)> = self
-            .llm_settings
-            .read()
-            .await
-            .iter()
-            .filter(|((s, k), _)| s == scope && k.starts_with(prefix))
-            .map(|((_, k), v)| (k.clone(), v.clone()))
-            .collect();
-        rows.sort();
-        Ok(rows)
-    }
-
-    async fn update_chat_session_harness(
-        &self,
-        id: Uuid,
-        capabilities: Option<&str>,
-        resume_token: Option<&str>,
-    ) -> Result<()> {
-        if self
-            .fail_harness_writes
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            anyhow::bail!("mock: the capability snapshot write failed");
-        }
-        let mut sessions = self.chat_sessions.write().await;
-        if let Some(session) = sessions.get_mut(&id) {
-            if let Some(c) = capabilities {
-                session.capabilities = Some(c.to_string());
-            }
-            if let Some(t) = resume_token {
-                session.resume_token = Some(t.to_string());
-            }
-            session.updated_at = Utc::now();
-        }
-        Ok(())
-    }
-
-    async fn set_chat_session_shell_moved(&self, id: Uuid) -> Result<()> {
-        if self.chat_sessions.read().await.contains_key(&id) {
-            self.session_shell_moved.write().await.insert(id, true);
-        }
-        Ok(())
-    }
-
-    async fn get_chat_session_shell_moved(&self, id: Uuid) -> Result<Option<bool>> {
-        Ok(self.session_shell_moved.read().await.get(&id).copied())
-    }
-
-    async fn backfill_chat_session_previews(&self) -> Result<usize> {
-        // Mock: no events stored, nothing to backfill
-        Ok(0)
-    }
-
-    async fn delete_chat_session(&self, id: Uuid) -> Result<bool> {
-        // Anchors and their journal go with the session; their targets stay.
-        let mut anchors = self.anchor_store.write().await;
-        anchors.anchors.retain(|_, a| a.session_id != id);
-        anchors.events.retain(|e| e.session_id != id);
-        anchors.versions.remove(&id);
-        drop(anchors);
-        // Same lock order as `save_session_episode` (sessions, then episodes).
-        let mut sessions = self.chat_sessions.write().await;
-        let existed = sessions.remove(&id).is_some();
-        self.session_episodes.write().await.remove(&id);
-        Ok(existed)
-    }
-
-    // Session episodes — same rules as the Neo4j store: written only while the session
-    // exists, one per session.
-
-    async fn save_session_episode(
-        &self,
-        episode: &crate::episodes::models::Episode,
-    ) -> Result<bool> {
-        self.session_episode_save_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self
-            .fail_session_episode_writes
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            anyhow::bail!("mock: session episode write failed");
-        }
-        let Some(session) = episode.session.as_ref() else {
-            return Ok(false);
-        };
-        // The session lock held across the write: a delete cannot slip in between.
-        let sessions = self.chat_sessions.read().await;
-        if !sessions.contains_key(&session.session_id) {
-            return Ok(false);
-        }
-        self.session_episodes
-            .write()
-            .await
-            .insert(session.session_id, episode.clone());
-        Ok(true)
-    }
-
-    async fn list_session_episodes(
-        &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> Result<Vec<crate::episodes::models::Episode>> {
-        let mut out: Vec<_> = self
-            .session_episodes
-            .read()
-            .await
-            .values()
-            .filter(|e| e.project_id == project_id)
-            .cloned()
-            .collect();
-        out.sort_by(|a, b| b.collected_at.cmp(&a.collected_at));
-        out.truncate(limit);
-        Ok(out)
-    }
-
-    /// Over the session episodes, as the Neo4j store does (cosine on the stored
-    /// embedding; an episode without one is never a hit).
-    async fn search_episodes_by_embedding(
-        &self,
-        project_id: Uuid,
-        embedding: &[f32],
-        limit: usize,
-    ) -> Result<Vec<(crate::episodes::models::Episode, f64)>> {
-        let mut hits: Vec<(crate::episodes::models::Episode, f64)> = self
-            .session_episodes
-            .read()
-            .await
-            .values()
-            .filter(|e| e.project_id == project_id)
-            .filter_map(|e| {
-                let stored = e.embedding.as_ref()?;
-                Some((e.clone(), cosine_similarity(stored, embedding)))
-            })
-            .collect();
-        hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        hits.truncate(limit);
-        Ok(hits)
-    }
-
-    async fn agent_identity_namespace(&self) -> Result<Uuid> {
-        // One lock for the read and the creation: the MERGE of the Neo4j store.
-        let mut root = self
-            .agent_identity_root
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(*root.get_or_insert_with(Uuid::new_v4))
-    }
-
-    // Chat anchors — same rules as the Neo4j store (both call `anchor::apply_op`).
-
-    async fn apply_anchor_op_if(
-        &self,
-        session_id: Uuid,
-        op: crate::chat::anchor::AnchorOp,
-        if_match: Option<u64>,
-    ) -> Result<crate::chat::anchor::AnchorSetChange> {
-        use crate::chat::anchor::*;
-        // One lock over anchors + journal: state and event change together.
-        let mut store = self.anchor_store.write().await;
-        if !self.chat_sessions.read().await.contains_key(&session_id) {
-            return Err(AnchorError::SessionNotFound(session_id).into());
-        }
-        let current = store.versions.get(&session_id).copied().unwrap_or(0);
-        if let Some(expected) = if_match.filter(|v| *v != current) {
-            return Err(AnchorError::SetVersionConflict {
-                expected,
-                actual: current,
-            }
-            .into());
-        }
-        let existing: Vec<Anchor> = store
-            .anchors
-            .values()
-            .filter(|a| a.session_id == session_id)
-            .cloned()
-            .collect();
-        let mut change = apply_op(session_id, &existing, op, chrono::Utc::now())?;
-        let next_seq = current + 1;
-        if let Some(ev) = change.event.as_mut() {
-            ev.seq = next_seq;
-        }
-        let version = if change.event.is_some() {
-            store.versions.insert(session_id, next_seq);
-            next_seq
-        } else {
-            current
-        };
-        if change.deleted {
-            store.anchors.remove(&change.anchor.id);
-        } else if change.event.is_some() {
-            store
-                .anchors
-                .insert(change.anchor.id, change.anchor.clone());
-        }
-        if let Some(ev) = &change.event {
-            store.events.push(ev.clone());
-        }
-        Ok(AnchorSetChange { change, version })
-    }
-
-    async fn get_anchor_set(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Option<crate::chat::anchor::AnchorSet>> {
-        // Same lock as the writes: anchors and version are one consistent read.
-        let store = self.anchor_store.read().await;
-        if !self.chat_sessions.read().await.contains_key(&session_id) {
-            return Ok(None);
-        }
-        let mut anchors: Vec<_> = store
-            .anchors
-            .values()
-            .filter(|a| a.session_id == session_id)
-            .cloned()
-            .collect();
-        anchors.sort_by_key(|a| (a.created_at, a.id));
-        Ok(Some(crate::chat::anchor::AnchorSet {
-            version: store.versions.get(&session_id).copied().unwrap_or(0),
-            anchors,
-        }))
-    }
-
-    async fn list_session_anchors(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Vec<crate::chat::anchor::Anchor>> {
-        self.count_read();
-        let store = self.anchor_store.read().await;
-        let mut v: Vec<_> = store
-            .anchors
-            .values()
-            .filter(|a| a.session_id == session_id)
-            .cloned()
-            .collect();
-        v.sort_by_key(|a| (a.created_at, a.id));
-        Ok(v)
-    }
-
-    async fn list_sessions_for_target(
-        &self,
-        target_type: crate::chat::anchor::AnchorTargetType,
-        target_id: &str,
-        state: Option<crate::chat::anchor::AnchorState>,
-        limit: usize,
-        cursor: Option<&str>,
-    ) -> Result<crate::chat::anchor::AnchorPage> {
-        let limit = limit.clamp(1, 200);
-        let after = cursor.unwrap_or("").to_string();
-        let store = self.anchor_store.read().await;
-        let mut items: Vec<_> = store
-            .anchors
-            .values()
-            .filter(|a| a.target_type == target_type && a.target_id == target_id)
-            .filter(|a| state.is_none_or(|s| a.state == s))
-            .filter(|a| after.is_empty() || a.id.to_string() > after)
-            .cloned()
-            .collect();
-        items.sort_by_key(|a| a.id.to_string());
-        items.truncate(limit + 1);
-        let next_cursor = if items.len() > limit {
-            items.truncate(limit);
-            items.last().map(|a| a.id.to_string())
-        } else {
-            None
-        };
-        Ok(crate::chat::anchor::AnchorPage { items, next_cursor })
-    }
-
-    async fn list_anchor_events(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Vec<crate::chat::anchor::AnchorEvent>> {
-        let store = self.anchor_store.read().await;
-        let mut out: Vec<_> = store
-            .events
-            .iter()
-            .filter(|e| e.session_id == session_id)
-            .cloned()
-            .collect();
-        out.sort_by_key(|e| (e.seq, e.at, e.id));
-        Ok(out)
-    }
-
-    async fn create_execution_place_event(
-        &self,
-        event: &crate::neo4j::models::ExecutionPlaceEvent,
-    ) -> Result<()> {
-        self.execution_place_events
-            .write()
-            .await
-            .push(event.clone());
-        Ok(())
-    }
-
-    async fn list_execution_place_events(
-        &self,
-        task_id: Uuid,
-    ) -> Result<Vec<crate::neo4j::models::ExecutionPlaceEvent>> {
-        let mut out: Vec<_> = self
-            .execution_place_events
-            .read()
-            .await
-            .iter()
-            .filter(|e| e.task_id == task_id)
-            .cloned()
-            .collect();
-        out.sort_by_key(|e| (e.at, e.id));
-        Ok(out)
-    }
-
-    async fn mark_anchors_dangling(
-        &self,
-        target_type: crate::chat::anchor::AnchorTargetType,
-        target_id: &str,
-    ) -> Result<usize> {
-        use crate::chat::anchor::*;
-        let todo: Vec<(Uuid, Uuid)> = self
-            .anchor_store
-            .read()
-            .await
-            .anchors
-            .values()
-            .filter(|a| {
-                a.target_type == target_type
-                    && a.target_id == target_id
-                    && a.state != AnchorState::Dangling
-            })
-            .map(|a| (a.session_id, a.id))
-            .collect();
-        let mut changed = 0;
-        for (session_id, anchor_id) in todo {
-            let op = AnchorOp::SetState {
-                anchor_id,
-                state: AnchorState::Dangling,
-                expected_version: None,
-                by: AnchorActor::System,
-                actor: DANGLING_ACTOR.to_string(),
-            };
-            if self.apply_anchor_op(session_id, op).await?.event.is_some() {
-                changed += 1;
-            }
-        }
-        Ok(changed)
-    }
-
-    async fn backfill_project_anchors(&self) -> Result<crate::chat::anchor::BackfillReport> {
-        use crate::chat::anchor::*;
-        let mut sessions: Vec<(Uuid, String)> = self
-            .chat_sessions
-            .read()
-            .await
-            .values()
-            .filter_map(|s| {
-                s.project_slug
-                    .clone()
-                    .filter(|p| !p.is_empty())
-                    .map(|p| (s.id, p))
-            })
-            .collect();
-        sessions.sort();
-        let mut report = BackfillReport::default();
-        for (session_id, slug) in sessions {
-            let matches: Vec<ProjectNode> = self
-                .projects
-                .read()
-                .await
-                .values()
-                .filter(|p| p.slug == slug)
-                .cloned()
-                .collect();
-            let [project] = matches.as_slice() else {
-                report.skipped_unresolved += 1;
-                continue;
-            };
-            match self
-                .apply_anchor_op(session_id, AnchorOp::Add(backfill_new_anchor(project)))
-                .await
-            {
-                Ok(c) if c.created => report.created += 1,
-                Ok(_) => report.already_present += 1,
-                Err(e) => match e.downcast_ref::<AnchorError>() {
-                    Some(AnchorError::AlreadyAnchored { .. }) => report.already_present += 1,
-                    Some(AnchorError::SessionNotFound(_)) => report.skipped_unresolved += 1,
-                    Some(_) => report.skipped_by_rule += 1,
-                    None => return Err(e),
-                },
-            }
-        }
-        Ok(report)
-    }
-
-    async fn backfill_spawned_by_edges(&self) -> Result<usize> {
-        // The mock keeps no edges: its only lineage is the `spawned_by` JSON.
-        Ok(0)
-    }
-
-    async fn revert_inferred_anchors(&self) -> Result<usize> {
-        use crate::chat::anchor::*;
-        let mut store = self.anchor_store.write().await;
-        let doomed: Vec<Uuid> = store
-            .anchors
-            .values()
-            .filter(|a| {
-                let added_by = store
-                    .events
-                    .iter()
-                    .find(|e| e.anchor_id == a.id && e.kind == AnchorEventKind::Added)
-                    .map(|e| e.actor.as_str());
-                is_revertible_backfill(a, added_by)
-            })
-            .map(|a| a.id)
-            .collect();
-        for id in &doomed {
-            store.anchors.remove(id);
-        }
-        store.events.retain(|e| !doomed.contains(&e.anchor_id));
-        Ok(doomed.len())
-    }
-
-    // Chat event operations
-
-    async fn store_chat_events(
-        &self,
-        session_id: Uuid,
-        events: Vec<ChatEventRecord>,
-    ) -> Result<()> {
-        loop {
-            // Created before the check: a release in between still wakes it.
-            let released = self.chat_events_released.notified();
-            let stalled = self
-                .stall_chat_events_of
-                .lock()
-                .is_ok_and(|s| events.iter().any(|e| s.contains(&e.event_type)));
-            if !stalled {
-                break;
-            }
-            released.await;
-        }
-        let mut store = self.chat_events.write().await;
-        let entry = store.entry(session_id).or_default();
-        entry.extend(events);
-        Ok(())
-    }
-
-    async fn get_chat_events(
-        &self,
-        session_id: Uuid,
-        after_seq: i64,
-        limit: i64,
-    ) -> Result<Vec<ChatEventRecord>> {
-        let store = self.chat_events.read().await;
-        let events = store
-            .get(&session_id)
-            .map(|v| {
-                v.iter()
-                    .filter(|e| e.seq > after_seq)
-                    .take(limit as usize)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        Ok(events)
-    }
-
-    async fn get_attention_events(&self, session_ids: &[Uuid]) -> Result<Vec<ChatEventRecord>> {
-        self.log_read("get_attention_events")?;
-        let store = self.chat_events.read().await;
-        let mut out = Vec::new();
-        for id in session_ids {
-            if let Some(events) = store.get(id) {
-                for e in events {
-                    if matches!(
-                        e.event_type.as_str(),
-                        "permission_request"
-                            | "permission_decision"
-                            | "ask_user_question"
-                            | "session_error"
-                    ) {
-                        out.push(e.clone());
-                    } else if e.event_type == "user_message" {
-                        let mut e = e.clone();
-                        e.data = String::new();
-                        out.push(e);
-                    }
-                }
-            }
-        }
-        out.sort_by_key(|e| (e.session_id, e.seq));
-        Ok(out)
-    }
-
-    async fn get_chat_events_paginated(
-        &self,
-        session_id: Uuid,
-        offset: i64,
-        limit: i64,
-    ) -> Result<Vec<ChatEventRecord>> {
-        let store = self.chat_events.read().await;
-        let events = store
-            .get(&session_id)
-            .map(|v| {
-                let mut sorted = v.clone();
-                sorted.sort_by_key(|e| e.seq);
-                sorted
-                    .into_iter()
-                    .skip(offset as usize)
-                    .take(limit as usize)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        Ok(events)
-    }
-
-    async fn count_chat_events(&self, session_id: Uuid) -> Result<i64> {
-        let store = self.chat_events.read().await;
-        let count = store.get(&session_id).map(|v| v.len() as i64).unwrap_or(0);
-        Ok(count)
-    }
-
-    async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> Result<i64> {
-        let store = self.chat_events.read().await;
-        let max_seq = store
-            .get(&session_id)
-            .and_then(|v| v.iter().map(|e| e.seq).max())
-            .unwrap_or(0);
-        Ok(max_seq)
-    }
-
-    async fn delete_chat_events(&self, session_id: Uuid) -> Result<()> {
-        self.chat_events.write().await.remove(&session_id);
-        Ok(())
-    }
-
-    // ========================================================================
-    // Chat DISCUSSED relations
-    // ========================================================================
-
-    async fn add_discussed(
-        &self,
-        session_id: Uuid,
-        entities: &[(String, String)],
-    ) -> Result<usize> {
-        // Mock: record the call and answer as if all were created
-        self.discussed_calls
-            .write()
-            .await
-            .push((session_id, entities.to_vec()));
-        Ok(entities.len())
-    }
-
-    async fn get_session_entities(
-        &self,
-        _session_id: Uuid,
-        _project_id: Option<Uuid>,
-    ) -> Result<Vec<DiscussedEntity>> {
-        Ok(Vec::new())
-    }
-
-    async fn get_discussed_co_changers(
-        &self,
-        _project_id: Uuid,
-        _max_sessions: i64,
-        _max_results: i64,
-    ) -> Result<Vec<CoChanger>> {
-        Ok(Vec::new())
-    }
-
-    async fn backfill_discussed(&self) -> Result<(usize, usize, usize)> {
-        Ok((0, 0, 0))
-    }
-
-    // ========================================================================
-    // Chat ↔ Plan/Task/RFC linking (ASSOCIATED_WITH relation)
-    // ========================================================================
-
-    async fn create_associated_with(
-        &self,
-        _session_id: Uuid,
-        _entity_type: &str,
-        _entity_id: Uuid,
-        _source: &str,
-    ) -> Result<bool> {
-        Ok(true)
-    }
-
-    async fn get_session_links(&self, _session_id: Uuid) -> Result<LinkedSessionInfo> {
-        Ok(LinkedSessionInfo::default())
-    }
-
-    async fn get_sessions_for_plan(&self, _plan_id: Uuid) -> Result<Vec<SessionWithLinks>> {
-        Ok(Vec::new())
-    }
-
-    async fn get_sessions_for_task(&self, _task_id: Uuid) -> Result<Vec<SessionWithLinks>> {
-        Ok(Vec::new())
-    }
-
-    async fn get_session_links_batch(
-        &self,
-        _session_ids: &[Uuid],
-    ) -> Result<std::collections::HashMap<Uuid, LinkedSessionInfo>> {
-        Ok(std::collections::HashMap::new())
-    }
-
-    async fn get_task_plan_id(&self, task_id: Uuid) -> Result<Option<Uuid>> {
-        let pt = self.plan_tasks.read().await;
-        Ok(pt
-            .iter()
-            .find(|(_, ids)| ids.contains(&task_id))
-            .map(|(plan_id, _)| *plan_id))
-    }
-
-    // ========================================================================
-    // Graph visualization queries (PM + Chat layers)
-    // ========================================================================
-
-    async fn get_pm_graph_data(
-        &self,
-        _project_id: Uuid,
-        _limit: usize,
-    ) -> Result<(Vec<PmGraphNode>, Vec<PmGraphEdge>)> {
-        Ok((Vec::new(), Vec::new()))
-    }
-
-    async fn get_chat_graph_data(
-        &self,
-        _project_id: Uuid,
-        _limit: usize,
-    ) -> Result<(Vec<ChatGraphSession>, Vec<ChatGraphDiscussed>)> {
-        Ok((Vec::new(), Vec::new()))
-    }
-
-    // ========================================================================
-    // User / Auth operations
-    // ========================================================================
-
-    async fn upsert_user(&self, user: &UserNode) -> Result<UserNode> {
-        use crate::neo4j::models::AuthProvider;
-
-        let mut users = self.users.write().await;
-
-        // Find existing user based on auth provider strategy
-        let existing_id = match user.auth_provider {
-            AuthProvider::Oidc => {
-                // OIDC: match on auth_provider + external_id
-                let ext_id = user.external_id.as_deref().unwrap_or_default();
-                users
-                    .values()
-                    .find(|u| {
-                        u.auth_provider == AuthProvider::Oidc
-                            && u.external_id.as_deref() == Some(ext_id)
-                    })
-                    .map(|u| u.id)
-            }
-            AuthProvider::Password => {
-                // Password: match on auth_provider + email
-                users
-                    .values()
-                    .find(|u| u.auth_provider == AuthProvider::Password && u.email == user.email)
-                    .map(|u| u.id)
-            }
-        };
-
-        if let Some(id) = existing_id {
-            // Update existing user
-            let existing = users.get_mut(&id).unwrap();
-            existing.email = user.email.clone();
-            existing.name = user.name.clone();
-            existing.picture_url = user.picture_url.clone();
-            existing.last_login_at = user.last_login_at;
-            Ok(existing.clone())
-        } else {
-            // Insert new user
-            users.insert(user.id, user.clone());
-            Ok(user.clone())
-        }
-    }
-
-    async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserNode>> {
-        Ok(self.users.read().await.get(&id).cloned())
-    }
-
-    async fn get_user_by_provider_id(
-        &self,
-        provider: &str,
-        external_id: &str,
-    ) -> Result<Option<UserNode>> {
-        let provider_parsed: crate::neo4j::models::AuthProvider =
-            provider.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-        Ok(self
-            .users
-            .read()
-            .await
-            .values()
-            .find(|u| {
-                u.auth_provider == provider_parsed && u.external_id.as_deref() == Some(external_id)
-            })
-            .cloned())
-    }
-
-    async fn get_user_by_email_and_provider(
-        &self,
-        email: &str,
-        provider: &str,
-    ) -> Result<Option<UserNode>> {
-        let provider_parsed: crate::neo4j::models::AuthProvider =
-            provider.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-        Ok(self
-            .users
-            .read()
-            .await
-            .values()
-            .find(|u| u.email == email && u.auth_provider == provider_parsed)
-            .cloned())
-    }
-
-    async fn get_user_by_email(&self, email: &str) -> Result<Option<UserNode>> {
-        Ok(self
-            .users
-            .read()
-            .await
-            .values()
-            .find(|u| u.email == email)
-            .cloned())
-    }
-
-    async fn create_password_user(
-        &self,
-        email: &str,
-        name: &str,
-        password_hash: &str,
-    ) -> Result<UserNode> {
-        let now = chrono::Utc::now();
-        let user = UserNode {
-            id: Uuid::new_v4(),
-            email: email.to_string(),
-            name: name.to_string(),
-            picture_url: None,
-            auth_provider: crate::neo4j::models::AuthProvider::Password,
-            external_id: None,
-            password_hash: Some(password_hash.to_string()),
-            created_at: now,
-            last_login_at: now,
-        };
-        self.upsert_user(&user).await
-    }
-
-    async fn list_users(&self) -> Result<Vec<UserNode>> {
-        Ok(self.users.read().await.values().cloned().collect())
-    }
-
-    // Refresh Tokens
-    async fn create_refresh_token(
-        &self,
-        user_id: Uuid,
-        token_hash: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<()> {
-        let token = crate::neo4j::models::RefreshTokenNode {
-            token_hash: token_hash.to_string(),
-            user_id,
-            expires_at,
-            created_at: chrono::Utc::now(),
-            revoked: false,
-        };
-        self.refresh_tokens
-            .write()
-            .await
-            .insert(token_hash.to_string(), token);
-        Ok(())
-    }
-
-    async fn validate_refresh_token(
-        &self,
-        token_hash: &str,
-    ) -> Result<Option<crate::neo4j::models::RefreshTokenNode>> {
-        let tokens = self.refresh_tokens.read().await;
-        match tokens.get(token_hash) {
-            Some(token) if !token.revoked && token.expires_at > chrono::Utc::now() => {
-                Ok(Some(token.clone()))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool> {
-        let mut tokens = self.refresh_tokens.write().await;
-        match tokens.get_mut(token_hash) {
-            Some(token) => {
-                token.revoked = true;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
-    async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64> {
-        let mut tokens = self.refresh_tokens.write().await;
-        let mut count = 0u64;
-        for token in tokens.values_mut() {
-            if token.user_id == user_id && !token.revoked {
-                token.revoked = true;
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-
-    // MCP Tokens
-    async fn create_mcp_token(
-        &self,
-        user_id: Uuid,
-        jti: &str,
-        label: &str,
-        scope: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<()> {
-        let token = crate::neo4j::models::McpTokenNode {
-            jti: jti.to_string(),
-            user_id,
-            label: label.to_string(),
-            scope: scope.to_string(),
-            expires_at,
-            created_at: chrono::Utc::now(),
-            revoked: false,
-        };
-        self.mcp_tokens.write().await.insert(jti.to_string(), token);
-        Ok(())
-    }
-
-    async fn is_mcp_token_active(&self, jti: &str) -> Result<bool> {
-        let tokens = self.mcp_tokens.read().await;
-        Ok(tokens
-            .get(jti)
-            .is_some_and(|t| !t.revoked && t.expires_at > chrono::Utc::now()))
-    }
-
-    async fn revoke_mcp_token(&self, user_id: Uuid, jti: &str) -> Result<bool> {
-        let mut tokens = self.mcp_tokens.write().await;
-        match tokens.get_mut(jti) {
-            Some(token) if token.user_id == user_id => {
-                token.revoked = true;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    async fn list_mcp_tokens(
-        &self,
-        user_id: Uuid,
-    ) -> Result<Vec<crate::neo4j::models::McpTokenNode>> {
-        let tokens = self.mcp_tokens.read().await;
-        Ok(tokens
-            .values()
-            .filter(|t| t.user_id == user_id)
-            .cloned()
-            .collect())
-    }
-
-    async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64> {
-        let mut tokens = self.mcp_tokens.write().await;
-        let now = chrono::Utc::now();
-        let before = tokens.len();
-        // Same predicate as the Cypher: owned by this user AND already dead.
-        tokens.retain(|_, t| !(t.user_id == user_id && (t.revoked || t.expires_at < now)));
-        Ok((before - tokens.len()) as u64)
-    }
-
-    // Feature Graphs
-    async fn create_feature_graph(&self, graph: &FeatureGraphNode) -> Result<()> {
-        self.feature_graphs
-            .write()
-            .await
-            .insert(graph.id, graph.clone());
-        Ok(())
-    }
-
-    async fn get_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphNode>> {
-        Ok(self.feature_graphs.read().await.get(&id).cloned())
-    }
-
-    async fn get_feature_graph_detail(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>> {
-        let graphs = self.feature_graphs.read().await;
-        let Some(fg) = graphs.get(&id).cloned() else {
-            return Ok(None);
-        };
-
-        let fg_entities = self.feature_graph_entities.read().await;
-        let funcs = self.functions.read().await;
-        let structs = self.structs_map.read().await;
-        let traits = self.traits_map.read().await;
-        let entities = fg_entities
-            .get(&id)
-            .map(|ents| {
-                ents.iter()
-                    .map(|(et, eid, role)| {
-                        let mut ent = FeatureGraphEntity {
-                            entity_type: et.clone(),
-                            entity_id: eid.clone(),
-                            name: Some(eid.clone()),
-                            role: role.clone(),
-                            ..Default::default()
-                        };
-                        match et.to_lowercase().as_str() {
-                            "file" => ent.file_path = Some(eid.clone()),
-                            "function" => {
-                                if let Some(f) = funcs.values().find(|f| &f.name == eid) {
-                                    let vis = normalize_visibility(&format!("{:?}", f.visibility));
-                                    let params = serde_json::to_string(&f.params).ok();
-                                    ent.file_path = Some(f.file_path.clone());
-                                    ent.docstring =
-                                        f.docstring.as_deref().and_then(clean_entity_docstring);
-                                    ent.signature = Some(build_function_signature(
-                                        &f.name,
-                                        vis.as_deref(),
-                                        f.is_async,
-                                        f.is_unsafe,
-                                        params.as_deref(),
-                                        f.return_type.as_deref(),
-                                    ));
-                                    ent.line_start = Some(f.line_start);
-                                    ent.visibility = vis;
-                                }
-                            }
-                            "struct" => {
-                                if let Some(x) = structs.values().find(|x| &x.name == eid) {
-                                    let vis = normalize_visibility(&format!("{:?}", x.visibility));
-                                    ent.file_path = Some(x.file_path.clone());
-                                    ent.docstring =
-                                        x.docstring.as_deref().and_then(clean_entity_docstring);
-                                    ent.signature = Some(build_type_signature(
-                                        "struct",
-                                        &x.name,
-                                        vis.as_deref(),
-                                    ));
-                                    ent.line_start = Some(x.line_start);
-                                    ent.visibility = vis;
-                                }
-                            }
-                            "trait" => {
-                                if let Some(x) = traits.values().find(|x| &x.name == eid) {
-                                    let vis = normalize_visibility(&format!("{:?}", x.visibility));
-                                    ent.file_path = Some(x.file_path.clone());
-                                    ent.docstring =
-                                        x.docstring.as_deref().and_then(clean_entity_docstring);
-                                    ent.signature = Some(build_type_signature(
-                                        "trait",
-                                        &x.name,
-                                        vis.as_deref(),
-                                    ));
-                                    ent.line_start = Some(x.line_start);
-                                    ent.visibility = vis;
-                                }
-                            }
-                            _ => {}
-                        }
-                        ent
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Ok(Some(FeatureGraphDetail {
-            graph: fg,
-            entities,
-            relations: vec![],
-        }))
-    }
-
-    async fn list_feature_graphs(&self, project_id: Option<Uuid>) -> Result<Vec<FeatureGraphNode>> {
-        let graphs = self.feature_graphs.read().await;
-        let entities = self.feature_graph_entities.read().await;
-        let mut result: Vec<FeatureGraphNode> = graphs
-            .values()
-            .filter(|fg| {
-                if let Some(pid) = project_id {
-                    fg.project_id == pid
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .map(|mut fg| {
-                fg.entity_count = Some(entities.get(&fg.id).map(|v| v.len() as i64).unwrap_or(0));
-                fg
-            })
-            .collect();
-        result.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        Ok(result)
-    }
-
-    async fn delete_feature_graph(&self, id: Uuid) -> Result<bool> {
-        let removed = self.feature_graphs.write().await.remove(&id).is_some();
-        self.feature_graph_entities.write().await.remove(&id);
-        Ok(removed)
-    }
-
-    async fn add_entity_to_feature_graph(
-        &self,
-        feature_graph_id: Uuid,
-        entity_type: &str,
-        entity_id: &str,
-        role: Option<&str>,
-        _project_id: Option<Uuid>,
-    ) -> Result<()> {
-        let mut entities = self.feature_graph_entities.write().await;
-        let list = entities.entry(feature_graph_id).or_default();
-        // Check if entity already exists (by type + id)
-        if let Some(existing) = list
-            .iter_mut()
-            .find(|(et, eid, _)| et == entity_type && eid == entity_id)
-        {
-            // Update role if provided
-            if role.is_some() {
-                existing.2 = role.map(|r| r.to_string());
-            }
-        } else {
-            list.push((
-                entity_type.to_string(),
-                entity_id.to_string(),
-                role.map(|r| r.to_string()),
-            ));
-        }
-        // Update updated_at
-        if let Some(fg) = self.feature_graphs.write().await.get_mut(&feature_graph_id) {
-            fg.updated_at = chrono::Utc::now();
-        }
-        Ok(())
-    }
-
-    async fn remove_entity_from_feature_graph(
-        &self,
-        feature_graph_id: Uuid,
-        entity_type: &str,
-        entity_id: &str,
-    ) -> Result<bool> {
-        let mut entities = self.feature_graph_entities.write().await;
-        if let Some(list) = entities.get_mut(&feature_graph_id) {
-            let before = list.len();
-            list.retain(|(et, eid, _)| !(et == entity_type && eid == entity_id));
-            Ok(list.len() < before)
-        } else {
-            Ok(false)
-        }
-    }
-
-    async fn auto_build_feature_graph(
-        &self,
-        name: &str,
-        description: Option<&str>,
-        project_id: Uuid,
-        entry_function: &str,
-        depth: u32,
-        include_relations: Option<&[String]>,
-        filter_community: Option<bool>,
-    ) -> Result<FeatureGraphDetail> {
-        let should_include = |rel: &str| -> bool {
-            match &include_relations {
-                None => true,
-                Some(rels) => rels.iter().any(|r| r.eq_ignore_ascii_case(rel)),
-            }
-        };
-        let filter_community = filter_community.unwrap_or(true);
-        let depth = depth.clamp(1, 5);
-
-        // Collect callees from the mock call_relationships
-        let cr = self.call_relationships.read().await;
-        let mut all_functions = std::collections::HashSet::new();
-        all_functions.insert(entry_function.to_string());
-
-        // Track direct (depth=1) connections for community filtering
-        let mut direct_connections: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
-        // Simple BFS traversal for callees
-        let mut queue: Vec<String> = vec![entry_function.to_string()];
-        for current_depth in 0..depth {
-            let mut next_queue = Vec::new();
-            for func in &queue {
-                // Check direct name match
-                if let Some(callees) = cr.get(func) {
-                    for callee in callees {
-                        if current_depth == 0 {
-                            direct_connections.insert(callee.clone());
-                        }
-                        if all_functions.insert(callee.clone()) {
-                            next_queue.push(callee.clone());
-                        }
-                    }
-                }
-                // Check qualified name match (e.g. "module::func")
-                for (caller_id, callees) in cr.iter() {
-                    if caller_id.ends_with(&format!("::{}", func)) {
-                        for callee in callees {
-                            if current_depth == 0 {
-                                direct_connections.insert(callee.clone());
-                            }
-                            if all_functions.insert(callee.clone()) {
-                                next_queue.push(callee.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            queue = next_queue;
-        }
-
-        // Collect callers (all are direct connections)
-        for (caller, callees) in cr.iter() {
-            if callees.contains(&entry_function.to_string()) {
-                all_functions.insert(caller.clone());
-                direct_connections.insert(caller.clone());
-            }
-        }
-        drop(cr);
-
-        // Community-based filtering
-        if filter_community {
-            let fa = self.function_analytics.read().await;
-            let entry_community = fa.get(entry_function).map(|a| a.community_id as i64);
-
-            if let Some(entry_cid) = entry_community {
-                all_functions.retain(|fname| {
-                    fname == entry_function
-                        || direct_connections.contains(fname)
-                        || fa
-                            .get(fname)
-                            .map(|a| a.community_id as i64)
-                            .map(|c| c == entry_cid)
-                            .unwrap_or(true) // no analytics → keep
-                });
-            }
-            drop(fa);
-        }
-
-        if all_functions.len() <= 1 {
-            // Only entry function found — check it even exists in functions
-            let funcs = self.functions.read().await;
-            let exists = funcs.values().any(|f| f.name == entry_function);
-            if !exists {
-                return Err(anyhow::anyhow!(
-                    "No function found matching '{}'",
-                    entry_function
-                ));
-            }
-        }
-
-        // Collect file paths from known functions
-        let funcs = self.functions.read().await;
-        let mut files = std::collections::HashSet::new();
-        for func in &all_functions {
-            for f in funcs.values() {
-                if f.name == *func {
-                    files.insert(f.file_path.clone());
-                }
-            }
-        }
-        drop(funcs);
-
-        // Expand via IMPLEMENTS_TRAIT + IMPLEMENTS_FOR for structs/enums in collected files
-        let mut discovered_structs = std::collections::HashSet::new();
-        let mut discovered_traits = std::collections::HashSet::new();
-
-        if should_include("implements_trait") || should_include("implements_for") {
-            // Find structs in collected files
-            let structs_map = self.structs_map.read().await;
-            for s in structs_map.values() {
-                if files.contains(&s.file_path) {
-                    discovered_structs.insert(s.name.clone());
-                }
-            }
-            drop(structs_map);
-
-            // Find enums in collected files
-            let enums_map = self.enums_map.read().await;
-            for e in enums_map.values() {
-                if files.contains(&e.file_path) {
-                    discovered_structs.insert(e.name.clone());
-                }
-            }
-            drop(enums_map);
-
-            // Find traits via impls (IMPLEMENTS_TRAIT + IMPLEMENTS_FOR)
-            let impls_map = self.impls_map.read().await;
-            for imp in impls_map.values() {
-                if discovered_structs.contains(&imp.for_type) {
-                    if let Some(ref trait_name) = imp.trait_name {
-                        discovered_traits.insert(trait_name.clone());
-                    }
-                }
-            }
-            drop(impls_map);
-        } // end if should_include implements_trait/implements_for
-
-        // Expand via IMPORTS — include files imported by the feature's files
-        if should_include("imports") {
-            let ir = self.import_relationships.read().await;
-            let original_files: Vec<String> = files.iter().cloned().collect();
-            for file_path in &original_files {
-                if let Some(imported) = ir.get(file_path) {
-                    for imp in imported {
-                        files.insert(imp.clone());
-                    }
-                }
-            }
-            drop(ir);
-        } // end if should_include imports
-
-        // Step 1d: Expand via vector similarity (best-effort)
-        // For each function with an embedding, find semantically similar functions
-        let mut vector_expanded_funcs: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        {
-            let func_embeddings = self.function_embeddings.read().await;
-            let funcs_map = self.functions.read().await;
-
-            // Collect embeddings for all current functions
-            let mut func_with_embeddings: Vec<Vec<f32>> = Vec::new();
-            for func_name in all_functions.iter() {
-                if let Some(func) = funcs_map.values().find(|f| f.name == *func_name) {
-                    let key = format!("{}::{}", func.file_path, func_name);
-                    if let Some((emb, _)) = func_embeddings.get(&key) {
-                        func_with_embeddings.push(emb.clone());
-                    }
-                }
-            }
-            drop(func_embeddings);
-            drop(funcs_map);
-
-            let entry_cid = if filter_community {
-                let fa = self.function_analytics.read().await;
-                fa.get(entry_function).map(|a| a.community_id)
-            } else {
-                None
-            };
-
-            for embedding in &func_with_embeddings {
-                let neighbors = self
-                    .vector_search_functions(embedding, 5, Some(project_id))
-                    .await
-                    .unwrap_or_default();
-                for (neighbor_name, neighbor_path, score) in neighbors {
-                    if score < 0.8 || all_functions.contains(&neighbor_name) {
-                        continue;
-                    }
-                    // Community filter
-                    if let Some(target_cid) = entry_cid {
-                        let fa = self.function_analytics.read().await;
-                        if let Some(analytics) = fa.get(&neighbor_name) {
-                            if analytics.community_id != target_cid {
-                                continue;
-                            }
-                        }
-                    }
-                    vector_expanded_funcs.insert(neighbor_name.clone());
-                    all_functions.insert(neighbor_name);
-                    files.insert(neighbor_path);
-                }
-            }
-        }
-
-        // Step 1e: Expand via community — find related files in same Louvain cluster (best-effort)
-        {
-            let fa = self.file_analytics.read().await;
-            let mut seen_communities: std::collections::HashSet<u32> =
-                std::collections::HashSet::new();
-            for file_path in files.iter() {
-                if let Some(analytics) = fa.get(file_path) {
-                    seen_communities.insert(analytics.community_id);
-                }
-            }
-            let original_files: std::collections::HashSet<String> = files.clone();
-            for cid in &seen_communities {
-                let mut peers: Vec<(String, f64)> = Vec::new();
-                for (path, analytics) in fa.iter() {
-                    if analytics.community_id == *cid && !original_files.contains(path) {
-                        peers.push((path.clone(), analytics.pagerank));
-                    }
-                }
-                peers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                for (path, _) in peers.into_iter().take(5) {
-                    files.insert(path);
-                }
-            }
-            drop(fa);
-        }
-
-        // Create the feature graph (with build params for refresh)
-        let fg = FeatureGraphNode {
-            id: Uuid::new_v4(),
-            name: name.to_string(),
-            description: description.map(|d| d.to_string()),
-            project_id,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            entity_count: None,
-            entry_function: Some(entry_function.to_string()),
-            build_depth: Some(depth),
-            include_relations: include_relations.map(|r| r.iter().map(|s| s.to_string()).collect()),
-        };
-        self.create_feature_graph(&fg).await?;
-
-        // Add entities with auto-assigned roles
-        let mut entities = Vec::new();
-        for func_name in &all_functions {
-            let role = if func_name == entry_function {
-                "entry_point"
-            } else if vector_expanded_funcs.contains(func_name) {
-                "support"
-            } else {
-                "core_logic"
-            };
-            let _ = self
-                .add_entity_to_feature_graph(
-                    fg.id,
-                    "function",
-                    func_name,
-                    Some(role),
-                    Some(project_id),
-                )
-                .await;
-            entities.push(FeatureGraphEntity {
-                entity_type: "function".to_string(),
-                entity_id: func_name.clone(),
-                name: Some(func_name.clone()),
-                role: Some(role.to_string()),
-                importance_score: None,
-                ..Default::default()
-            });
-        }
-        for file_path in &files {
-            let _ = self
-                .add_entity_to_feature_graph(
-                    fg.id,
-                    "file",
-                    file_path,
-                    Some("support"),
-                    Some(project_id),
-                )
-                .await;
-            entities.push(FeatureGraphEntity {
-                entity_type: "file".to_string(),
-                entity_id: file_path.clone(),
-                name: Some(file_path.clone()),
-                role: Some("support".to_string()),
-                importance_score: None,
-                ..Default::default()
-            });
-        }
-
-        // Add structs/enums discovered via IMPLEMENTS_FOR with role: data_model
-        for struct_name in &discovered_structs {
-            let _ = self
-                .add_entity_to_feature_graph(
-                    fg.id,
-                    "struct",
-                    struct_name,
-                    Some("data_model"),
-                    Some(project_id),
-                )
-                .await;
-            entities.push(FeatureGraphEntity {
-                entity_type: "struct".to_string(),
-                entity_id: struct_name.clone(),
-                name: Some(struct_name.clone()),
-                role: Some("data_model".to_string()),
-                importance_score: None,
-                ..Default::default()
-            });
-        }
-
-        // Add traits discovered via IMPLEMENTS_TRAIT with role: trait_contract
-        for trait_name in &discovered_traits {
-            let _ = self
-                .add_entity_to_feature_graph(
-                    fg.id,
-                    "trait",
-                    trait_name,
-                    Some("trait_contract"),
-                    Some(project_id),
-                )
-                .await;
-            entities.push(FeatureGraphEntity {
-                entity_type: "trait".to_string(),
-                entity_id: trait_name.clone(),
-                name: Some(trait_name.clone()),
-                role: Some("trait_contract".to_string()),
-                importance_score: None,
-                ..Default::default()
-            });
-        }
-
-        Ok(FeatureGraphDetail {
-            graph: fg,
-            entities,
-            relations: vec![],
-        })
-    }
-
-    async fn refresh_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>> {
-        // 1. Load the existing feature graph
-        let fg = {
-            let fgs = self.feature_graphs.read().await;
-            fgs.get(&id).cloned()
-        };
-        let fg = match fg {
-            Some(fg) => fg,
-            None => return Err(anyhow::anyhow!("Feature graph {} not found", id)),
-        };
-
-        // 2. Check if it was auto-built (has entry_function)
-        let entry_function = match &fg.entry_function {
-            Some(ef) => ef.clone(),
-            None => return Ok(None), // manually created, skip refresh
-        };
-
-        let depth = fg.build_depth.unwrap_or(2);
-        let include_relations = fg.include_relations.clone();
-        let project_id = fg.project_id;
-
-        let should_include = |rel: &str| -> bool {
-            match &include_relations {
-                None => true,
-                Some(rels) => rels.iter().any(|r| r.eq_ignore_ascii_case(rel)),
-            }
-        };
-
-        // 3. Delete all existing INCLUDES_ENTITY relationships
-        {
-            let mut fge = self.feature_graph_entities.write().await;
-            fge.remove(&id);
-        }
-
-        // 4. Re-run BFS traversal (same logic as auto_build)
-        let depth = depth.clamp(1, 5);
-
-        let cr = self.call_relationships.read().await;
-        let mut all_functions = std::collections::HashSet::new();
-        all_functions.insert(entry_function.clone());
-
-        let mut queue: Vec<String> = vec![entry_function.clone()];
-        for _ in 0..depth {
-            let mut next_queue = Vec::new();
-            for func in &queue {
-                if let Some(callees) = cr.get(func) {
-                    for callee in callees {
-                        if all_functions.insert(callee.clone()) {
-                            next_queue.push(callee.clone());
-                        }
-                    }
-                }
-                for (caller_id, callees) in cr.iter() {
-                    if caller_id.ends_with(&format!("::{}", func)) {
-                        for callee in callees {
-                            if all_functions.insert(callee.clone()) {
-                                next_queue.push(callee.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            queue = next_queue;
-        }
-
-        for (caller, callees) in cr.iter() {
-            if callees.contains(&entry_function) {
-                all_functions.insert(caller.clone());
-            }
-        }
-        drop(cr);
-
-        if all_functions.len() <= 1 {
-            let funcs = self.functions.read().await;
-            let exists = funcs.values().any(|f| f.name == entry_function);
-            if !exists {
-                return Err(anyhow::anyhow!(
-                    "No function found matching '{}' during refresh",
-                    entry_function
-                ));
-            }
-        }
-
-        let funcs = self.functions.read().await;
-        let mut files = std::collections::HashSet::new();
-        for func in &all_functions {
-            for f in funcs.values() {
-                if f.name == *func {
-                    files.insert(f.file_path.clone());
-                }
-            }
-        }
-        drop(funcs);
-
-        // Expand via IMPLEMENTS_TRAIT + IMPLEMENTS_FOR
-        let mut discovered_structs = std::collections::HashSet::new();
-        let mut discovered_traits = std::collections::HashSet::new();
-
-        if should_include("implements_trait") || should_include("implements_for") {
-            let structs_map = self.structs_map.read().await;
-            for s in structs_map.values() {
-                if files.contains(&s.file_path) {
-                    discovered_structs.insert(s.name.clone());
-                }
-            }
-            drop(structs_map);
-
-            let enums_map = self.enums_map.read().await;
-            for e in enums_map.values() {
-                if files.contains(&e.file_path) {
-                    discovered_structs.insert(e.name.clone());
-                }
-            }
-            drop(enums_map);
-
-            let impls_map = self.impls_map.read().await;
-            for imp in impls_map.values() {
-                if discovered_structs.contains(&imp.for_type) {
-                    if let Some(ref trait_name) = imp.trait_name {
-                        discovered_traits.insert(trait_name.clone());
-                    }
-                }
-            }
-            drop(impls_map);
-        }
-
-        // Expand via IMPORTS
-        if should_include("imports") {
-            let ir = self.import_relationships.read().await;
-            let original_files: Vec<String> = files.iter().cloned().collect();
-            for file_path in &original_files {
-                if let Some(imported) = ir.get(file_path) {
-                    for imp in imported {
-                        files.insert(imp.clone());
-                    }
-                }
-            }
-            drop(ir);
-        }
-
-        // 5. Update timestamp
-        {
-            let mut fgs = self.feature_graphs.write().await;
-            if let Some(fg) = fgs.get_mut(&id) {
-                fg.updated_at = chrono::Utc::now();
-            }
-        }
-
-        // 6. Re-add entities with auto-assigned roles
-        let mut entities = Vec::new();
-        for func_name in &all_functions {
-            let role = if *func_name == entry_function {
-                "entry_point"
-            } else {
-                "core_logic"
-            };
-            let _ = self
-                .add_entity_to_feature_graph(
-                    id,
-                    "function",
-                    func_name,
-                    Some(role),
-                    Some(project_id),
-                )
-                .await;
-            entities.push(FeatureGraphEntity {
-                entity_type: "function".to_string(),
-                entity_id: func_name.clone(),
-                name: Some(func_name.clone()),
-                role: Some(role.to_string()),
-                importance_score: None,
-                ..Default::default()
-            });
-        }
-        for file_path in &files {
-            let _ = self
-                .add_entity_to_feature_graph(
-                    id,
-                    "file",
-                    file_path,
-                    Some("support"),
-                    Some(project_id),
-                )
-                .await;
-            entities.push(FeatureGraphEntity {
-                entity_type: "file".to_string(),
-                entity_id: file_path.clone(),
-                name: Some(file_path.clone()),
-                role: Some("support".to_string()),
-                importance_score: None,
-                ..Default::default()
-            });
-        }
-        for struct_name in &discovered_structs {
-            let _ = self
-                .add_entity_to_feature_graph(
-                    id,
-                    "struct",
-                    struct_name,
-                    Some("data_model"),
-                    Some(project_id),
-                )
-                .await;
-            entities.push(FeatureGraphEntity {
-                entity_type: "struct".to_string(),
-                entity_id: struct_name.clone(),
-                name: Some(struct_name.clone()),
-                role: Some("data_model".to_string()),
-                importance_score: None,
-                ..Default::default()
-            });
-        }
-        for trait_name in &discovered_traits {
-            let _ = self
-                .add_entity_to_feature_graph(
-                    id,
-                    "trait",
-                    trait_name,
-                    Some("trait_contract"),
-                    Some(project_id),
-                )
-                .await;
-            entities.push(FeatureGraphEntity {
-                entity_type: "trait".to_string(),
-                entity_id: trait_name.clone(),
-                name: Some(trait_name.clone()),
-                role: Some("trait_contract".to_string()),
-                importance_score: None,
-                ..Default::default()
-            });
-        }
-
-        // Re-read the full detail (converts tuples to FeatureGraphEntity)
-        let detail = self
-            .get_feature_graph_detail(id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Feature graph {} disappeared after refresh", id))?;
-
-        Ok(Some(detail))
-    }
-
-    async fn get_top_entry_functions(&self, project_id: Uuid, limit: usize) -> Result<Vec<String>> {
-        // Collect file paths that belong to this project
-        let files = self.files.read().await;
-        let project_paths: std::collections::HashSet<_> = files
-            .values()
-            .filter(|f| f.project_id == Some(project_id))
-            .map(|f| f.path.clone())
-            .collect();
-        drop(files);
-
-        // Collect function names that belong to project files
-        let funcs = self.functions.read().await;
-        let project_functions: std::collections::HashSet<String> = funcs
-            .values()
-            .filter(|f| project_paths.contains(&f.file_path))
-            .map(|f| f.name.clone())
-            .collect();
-        drop(funcs);
-
-        // Count callers + callees for each function
-        let cr = self.call_relationships.read().await;
-        let mut connection_counts: HashMap<String, usize> = HashMap::new();
-
-        for func_name in &project_functions {
-            let mut count = 0usize;
-            // Count callees
-            if let Some(callees) = cr.get(func_name) {
-                count += callees.len();
-            }
-            // Count callers
-            for (_caller, callees) in cr.iter() {
-                if callees.contains(func_name) {
-                    count += 1;
-                }
-            }
-            if count > 0 {
-                connection_counts.insert(func_name.clone(), count);
-            }
-        }
-        drop(cr);
-
-        // Sort by connection count descending
-        let mut sorted: Vec<_> = connection_counts.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
-        sorted.truncate(limit);
-
-        Ok(sorted.into_iter().map(|(name, _)| name).collect())
-    }
-
-    async fn get_feature_graph_statistics(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<FeatureGraphStatistics>> {
-        let detail = match self.get_feature_graph_detail(id).await? {
-            Some(d) => d,
-            None => return Ok(None),
-        };
-
-        let entity_count = detail.entities.len();
-        if entity_count == 0 {
-            return Ok(Some(FeatureGraphStatistics {
-                id,
-                name: detail.graph.name.clone(),
-                entity_count: 0,
-                entity_breakdown: std::collections::HashMap::new(),
-                role_breakdown: std::collections::HashMap::new(),
-                internal_edge_count: 0,
-                external_edge_count: 0,
-                cohesion: 0.0,
-                coupling: 0.0,
-                avg_importance: None,
-                entry_points: vec![],
-                exit_points: vec![],
-            }));
-        }
-
-        let mut entity_breakdown: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        let mut role_breakdown: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        let mut importance_sum = 0.0_f64;
-        let mut importance_count = 0_usize;
-
-        let entity_ids: std::collections::HashSet<String> = detail
-            .entities
-            .iter()
-            .map(|e| e.entity_id.clone())
-            .collect();
-
-        for e in &detail.entities {
-            *entity_breakdown.entry(e.entity_type.clone()).or_insert(0) += 1;
-            if let Some(role) = &e.role {
-                *role_breakdown.entry(role.clone()).or_insert(0) += 1;
-            }
-            if let Some(score) = e.importance_score {
-                importance_sum += score;
-                importance_count += 1;
-            }
-        }
-
-        let internal_edge_count = detail.relations.len();
-
-        // External edges: count call relationships going outside the graph
-        let cr = self.call_relationships.read().await;
-        let mut external_edge_count = 0_usize;
-        let mut entry_points_set: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut exit_points_set: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
-        for e in &detail.entities {
-            if e.entity_type == "function" || e.entity_type == "Function" {
-                // Outgoing calls to outside
-                if let Some(callees) = cr.get(&e.entity_id) {
-                    for callee in callees {
-                        if !entity_ids.contains(callee) {
-                            external_edge_count += 1;
-                            exit_points_set.insert(e.entity_id.clone());
-                        }
-                    }
-                }
-                // Incoming calls from outside
-                for (caller, callees) in cr.iter() {
-                    if !entity_ids.contains(caller) && callees.contains(&e.entity_id) {
-                        external_edge_count += 1;
-                        entry_points_set.insert(e.entity_id.clone());
-                    }
-                }
-            }
-        }
-        drop(cr);
-
-        let max_possible = if entity_count > 1 {
-            entity_count * (entity_count - 1) / 2
-        } else {
-            1
-        };
-        let cohesion = internal_edge_count as f64 / max_possible as f64;
-        let total_edges = internal_edge_count + external_edge_count;
-        let coupling = if total_edges > 0 {
-            external_edge_count as f64 / total_edges as f64
-        } else {
-            0.0
-        };
-
-        let avg_importance = if importance_count > 0 {
-            Some(importance_sum / importance_count as f64)
-        } else {
-            None
-        };
-
-        Ok(Some(FeatureGraphStatistics {
-            id,
-            name: detail.graph.name,
-            entity_count,
-            entity_breakdown,
-            role_breakdown,
-            internal_edge_count,
-            external_edge_count,
-            cohesion,
-            coupling,
-            avg_importance,
-            entry_points: entry_points_set.into_iter().collect(),
-            exit_points: exit_points_set.into_iter().collect(),
-        }))
-    }
-
-    async fn compare_feature_graphs(
-        &self,
-        id_a: Uuid,
-        id_b: Uuid,
-    ) -> Result<Option<FeatureGraphComparison>> {
-        let detail_a = match self.get_feature_graph_detail(id_a).await? {
-            Some(d) => d,
-            None => return Ok(None),
-        };
-        let detail_b = match self.get_feature_graph_detail(id_b).await? {
-            Some(d) => d,
-            None => return Ok(None),
-        };
-
-        let set_a: std::collections::HashSet<(String, String)> = detail_a
-            .entities
-            .iter()
-            .map(|e| (e.entity_type.clone(), e.entity_id.clone()))
-            .collect();
-        let set_b: std::collections::HashSet<(String, String)> = detail_b
-            .entities
-            .iter()
-            .map(|e| (e.entity_type.clone(), e.entity_id.clone()))
-            .collect();
-
-        let shared_keys: std::collections::HashSet<_> = set_a.intersection(&set_b).collect();
-        let union_count = set_a.union(&set_b).count();
-
-        let shared_entities: Vec<FeatureGraphEntity> = detail_a
-            .entities
-            .iter()
-            .filter(|e| shared_keys.contains(&(e.entity_type.clone(), e.entity_id.clone())))
-            .cloned()
-            .collect();
-
-        let unique_to_a: Vec<FeatureGraphEntity> = detail_a
-            .entities
-            .iter()
-            .filter(|e| !set_b.contains(&(e.entity_type.clone(), e.entity_id.clone())))
-            .cloned()
-            .collect();
-
-        let unique_to_b: Vec<FeatureGraphEntity> = detail_b
-            .entities
-            .iter()
-            .filter(|e| !set_a.contains(&(e.entity_type.clone(), e.entity_id.clone())))
-            .cloned()
-            .collect();
-
-        let similarity = if union_count > 0 {
-            shared_keys.len() as f64 / union_count as f64
-        } else {
-            0.0
-        };
-
-        Ok(Some(FeatureGraphComparison {
-            graph_a: FeatureGraphComparisonSide {
-                id: id_a,
-                name: detail_a.graph.name,
-                entity_count: detail_a.entities.len(),
-            },
-            graph_b: FeatureGraphComparisonSide {
-                id: id_b,
-                name: detail_b.graph.name,
-                entity_count: detail_b.entities.len(),
-            },
-            shared_entities,
-            unique_to_a,
-            unique_to_b,
-            similarity,
-        }))
-    }
-
-    async fn find_overlapping_feature_graphs(
-        &self,
-        id: Uuid,
-        min_overlap: f64,
-    ) -> Result<Vec<FeatureGraphOverlap>> {
-        let detail = match self.get_feature_graph_detail(id).await? {
-            Some(d) => d,
-            None => return Ok(vec![]),
-        };
-        let ref_set: std::collections::HashSet<(String, String)> = detail
-            .entities
-            .iter()
-            .map(|e| (e.entity_type.clone(), e.entity_id.clone()))
-            .collect();
-        let ref_count = ref_set.len();
-        if ref_count == 0 {
-            return Ok(vec![]);
-        }
-
-        let others = self
-            .list_feature_graphs(Some(detail.graph.project_id))
-            .await?;
-
-        let mut overlaps = Vec::new();
-        for other in others {
-            if other.id == id {
-                continue;
-            }
-            let other_detail = match self.get_feature_graph_detail(other.id).await? {
-                Some(d) => d,
-                None => continue,
-            };
-            let other_set: std::collections::HashSet<(String, String)> = other_detail
-                .entities
-                .iter()
-                .map(|e| (e.entity_type.clone(), e.entity_id.clone()))
-                .collect();
-
-            let shared: Vec<String> = ref_set
-                .intersection(&other_set)
-                .map(|(t, id)| format!("{}:{}", t, id))
-                .collect();
-            let shared_count = shared.len();
-            if shared_count == 0 {
-                continue;
-            }
-
-            let min_count = ref_count.min(other_set.len());
-            let overlap_ratio = shared_count as f64 / min_count as f64;
-
-            if overlap_ratio >= min_overlap {
-                overlaps.push(FeatureGraphOverlap {
-                    id: other.id,
-                    name: other.name,
-                    entity_count: other_set.len(),
-                    shared_count,
-                    shared_entities: shared,
-                    overlap_ratio,
-                });
-            }
-        }
-
-        overlaps.sort_by(|a, b| b.overlap_ratio.partial_cmp(&a.overlap_ratio).unwrap());
-        Ok(overlaps)
-    }
-
-    async fn get_project_import_edges(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<(String, String)>> {
-        let pf = self.project_files.read().await;
-        let project_paths: std::collections::HashSet<&String> = pf
-            .get(&project_id)
-            .map(|v| v.iter().collect())
-            .unwrap_or_default();
-
-        if project_paths.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let ir = self.import_relationships.read().await;
-        let mut edges = Vec::new();
-
-        for (source, targets) in ir.iter() {
-            if project_paths.contains(source) {
-                for target in targets {
-                    if project_paths.contains(target) {
-                        edges.push((source.clone(), target.clone()));
-                    }
-                }
-            }
-        }
-
-        Ok(edges)
-    }
-
-    async fn get_project_call_edges(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<(String, String)>> {
-        let pf = self.project_files.read().await;
-        let project_paths: std::collections::HashSet<&String> = pf
-            .get(&project_id)
-            .map(|v| v.iter().collect())
-            .unwrap_or_default();
-
-        if project_paths.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let cr = self.call_relationships.read().await;
-        let functions = self.functions.read().await;
-        let mut edges = Vec::new();
-
-        for (caller_id, callees) in cr.iter() {
-            // Check caller belongs to project and get its id
-            let caller_fn = match functions.get(caller_id) {
-                Some(f) if project_paths.contains(&f.file_path) => f,
-                _ => continue,
-            };
-            // Build function id matching Neo4j format: "file_path:name:line_start"
-            let caller_func_id = format!(
-                "{}:{}:{}",
-                caller_fn.file_path, caller_fn.name, caller_fn.line_start
-            );
-            for callee_name in callees {
-                // Check callee belongs to project and get its id
-                if let Some(callee_fn) = functions
-                    .values()
-                    .find(|f| f.name == *callee_name && project_paths.contains(&f.file_path))
-                {
-                    let callee_func_id = format!(
-                        "{}:{}:{}",
-                        callee_fn.file_path, callee_fn.name, callee_fn.line_start
-                    );
-                    // Return function IDs (matching the real Cypher: f1.id, f2.id)
-                    edges.push((caller_func_id.clone(), callee_func_id));
-                }
-            }
-        }
-
-        Ok(edges)
-    }
-
-    async fn get_project_extends_edges(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<(String, String)>> {
-        let pf = self.project_files.read().await;
-        let project_paths: std::collections::HashSet<&String> = pf
-            .get(&project_id)
-            .map(|v| v.iter().collect())
-            .unwrap_or_default();
-
-        if project_paths.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let cr = self.call_relationships.read().await;
-        let structs = self.structs_map.read().await;
-        let mut edges = Vec::new();
-
-        for (key, parents) in cr.iter() {
-            if let Some(child_name) = key.strip_prefix("extends:") {
-                // Find the child struct's file
-                if let Some(child_struct) = structs
-                    .values()
-                    .find(|s| s.name == child_name && project_paths.contains(&s.file_path))
-                {
-                    for parent_name in parents {
-                        // Find the parent struct's file
-                        if let Some(parent_struct) = structs.values().find(|s| {
-                            s.name == *parent_name && project_paths.contains(&s.file_path)
-                        }) {
-                            if child_struct.file_path != parent_struct.file_path {
-                                edges.push((
-                                    child_struct.file_path.clone(),
-                                    parent_struct.file_path.clone(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(edges)
-    }
-
-    async fn get_project_implements_edges(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<(String, String)>> {
-        let pf = self.project_files.read().await;
-        let project_paths: std::collections::HashSet<&String> = pf
-            .get(&project_id)
-            .map(|v| v.iter().collect())
-            .unwrap_or_default();
-
-        if project_paths.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let cr = self.call_relationships.read().await;
-        let structs = self.structs_map.read().await;
-        let traits = self.traits_map.read().await;
-        let mut edges = Vec::new();
-
-        for (key, ifaces) in cr.iter() {
-            if let Some(struct_name) = key.strip_prefix("implements:") {
-                // Find the struct's file
-                if let Some(struct_node) = structs
-                    .values()
-                    .find(|s| s.name == struct_name && project_paths.contains(&s.file_path))
-                {
-                    for iface_name in ifaces {
-                        // Find the trait's file
-                        if let Some(trait_node) = traits
-                            .values()
-                            .find(|t| t.name == *iface_name && project_paths.contains(&t.file_path))
-                        {
-                            if struct_node.file_path != trait_node.file_path {
-                                edges.push((
-                                    struct_node.file_path.clone(),
-                                    trait_node.file_path.clone(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(edges)
-    }
-
-    async fn batch_update_file_analytics(
-        &self,
-        updates: &[crate::graph::models::FileAnalyticsUpdate],
-    ) -> anyhow::Result<()> {
-        let mut fa = self.file_analytics.write().await;
-        for update in updates {
-            fa.insert(update.path.clone(), update.clone());
-        }
-        Ok(())
-    }
-
-    async fn batch_update_function_analytics(
-        &self,
-        updates: &[crate::graph::models::FunctionAnalyticsUpdate],
-    ) -> anyhow::Result<()> {
-        let mut fa = self.function_analytics.write().await;
-        for update in updates {
-            fa.insert(update.id.clone(), update.clone());
-        }
-        Ok(())
-    }
-
-    async fn batch_update_fabric_file_analytics(
-        &self,
-        updates: &[crate::graph::models::FabricFileAnalyticsUpdate],
-    ) -> anyhow::Result<()> {
-        // Mock: only record which paths were written
-        self.fabric_written_paths
-            .write()
-            .await
-            .extend(updates.iter().map(|u| u.path.clone()));
-        Ok(())
-    }
-
-    async fn batch_update_structural_dna(
-        &self,
-        _updates: &[crate::graph::models::StructuralDnaUpdate],
-    ) -> anyhow::Result<()> {
-        // Mock: structural DNA not stored separately in tests
-        Ok(())
-    }
-
-    async fn batch_update_structural_fingerprints(
-        &self,
-        _updates: &[crate::graph::models::StructuralFingerprintUpdate],
-    ) -> anyhow::Result<()> {
-        // Mock: structural fingerprints not stored separately in tests
-        Ok(())
-    }
-
-    async fn get_project_structural_fingerprints(
-        &self,
-        _project_id: &str,
-    ) -> anyhow::Result<Vec<(String, Vec<f64>)>> {
-        // Mock: no structural fingerprints in tests by default
-        Ok(vec![])
-    }
-
-    async fn get_project_file_signals(
-        &self,
-        _project_id: &str,
-    ) -> anyhow::Result<Vec<crate::graph::models::FileSignalRecord>> {
-        // Mock: no file signals in tests by default
-        Ok(vec![])
-    }
-
-    async fn write_predicted_links(
-        &self,
-        _project_id: &str,
-        _links: &[crate::graph::models::LinkPrediction],
-    ) -> anyhow::Result<()> {
-        // Mock: predicted links not stored in tests
-        Ok(())
-    }
-
-    async fn get_project_structural_dna(
-        &self,
-        _project_id: &str,
-    ) -> anyhow::Result<Vec<(String, Vec<f64>)>> {
-        // Mock: no structural DNA in tests by default
-        Ok(vec![])
-    }
-
-    async fn get_project_synapse_edges(
-        &self,
-        _project_id: Uuid,
-    ) -> anyhow::Result<Vec<(String, String, f64)>> {
-        // Mock: no SYNAPSE edges in tests by default
-        Ok(vec![])
-    }
-
-    async fn get_neural_metrics(
-        &self,
-        _project_id: Uuid,
-    ) -> anyhow::Result<crate::neo4j::models::NeuralMetrics> {
-        Ok(crate::neo4j::models::NeuralMetrics {
-            active_synapses: 0,
-            avg_energy: 0.0,
-            weak_synapses_ratio: 0.0,
-            dead_notes_count: 0,
-            total_notes_count: 0,
-            avg_reactivation_rate: 0.0,
-        })
-    }
-
-    // T5.5 — Churn score
-    async fn compute_churn_scores(
-        &self,
-        _project_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::neo4j::models::FileChurnScore>> {
-        Ok(vec![])
-    }
-
-    async fn batch_update_churn_scores(
-        &self,
-        _updates: &[crate::neo4j::models::FileChurnScore],
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn get_top_hotspots(
-        &self,
-        _project_id: Uuid,
-        _limit: usize,
-    ) -> anyhow::Result<Vec<crate::neo4j::models::FileChurnScore>> {
-        Ok(vec![])
-    }
-
-    // T5.6 — Knowledge density
-    async fn compute_knowledge_density(
-        &self,
-        _project_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::neo4j::models::FileKnowledgeDensity>> {
-        Ok(vec![])
-    }
-
-    async fn batch_update_knowledge_density(
-        &self,
-        _updates: &[crate::neo4j::models::FileKnowledgeDensity],
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn get_top_knowledge_gaps(
-        &self,
-        _project_id: Uuid,
-        _limit: usize,
-    ) -> anyhow::Result<Vec<crate::neo4j::models::FileKnowledgeDensity>> {
-        Ok(vec![])
-    }
-
-    // T5.7 — Risk score composite
-    async fn compute_risk_scores(
-        &self,
-        _project_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::neo4j::models::FileRiskScore>> {
-        Ok(vec![])
-    }
-
-    async fn batch_update_risk_scores(
-        &self,
-        _updates: &[crate::neo4j::models::FileRiskScore],
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn get_risk_summary(&self, _project_id: Uuid) -> anyhow::Result<serde_json::Value> {
-        Ok(serde_json::json!(null))
-    }
-
-    async fn batch_upsert_processes(&self, _processes: &[ProcessNode]) -> anyhow::Result<()> {
-        // No-op in mock — process persistence is tested via integration tests
-        Ok(())
-    }
-
-    async fn batch_create_step_relationships(
-        &self,
-        _steps: &[(String, String, u32)],
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn delete_project_processes(&self, project_id: Uuid) -> anyhow::Result<u64> {
-        self.processes_purged_for.write().await.push(project_id);
-        Ok(0)
-    }
-
-    // ========================================================================
-    // Topology Firewall operations
-    // ========================================================================
-
-    async fn create_topology_rule(
-        &self,
-        rule: &crate::graph::models::TopologyRule,
-    ) -> anyhow::Result<()> {
-        let mut rules = self.topology_rules.write().await;
-        rules.insert(rule.id.clone(), rule.clone());
-        Ok(())
-    }
-
-    async fn list_topology_rules(
-        &self,
-        project_id: &str,
-    ) -> anyhow::Result<Vec<crate::graph::models::TopologyRule>> {
-        let rules = self.topology_rules.read().await;
-        let mut result: Vec<_> = rules
-            .values()
-            .filter(|r| r.project_id == project_id)
-            .cloned()
-            .collect();
-        result.sort_by(|a, b| {
-            a.rule_type
-                .to_string()
-                .cmp(&b.rule_type.to_string())
-                .then(a.source_pattern.cmp(&b.source_pattern))
-        });
-        Ok(result)
-    }
-
-    async fn delete_topology_rule(&self, rule_id: &str) -> anyhow::Result<()> {
-        let mut rules = self.topology_rules.write().await;
-        rules.remove(rule_id);
-        Ok(())
-    }
-
-    async fn check_topology_rules(
-        &self,
-        _project_id: &str,
-    ) -> anyhow::Result<Vec<crate::graph::models::TopologyViolation>> {
-        // Mock: no graph traversal, return empty violations
-        Ok(Vec::new())
-    }
-
-    async fn check_file_topology(
-        &self,
-        project_id: &str,
-        file_path: &str,
-        new_imports: &[String],
-    ) -> anyhow::Result<Vec<crate::graph::models::TopologyViolation>> {
-        use crate::graph::models::{
-            glob_to_regex, TopologyRuleType, TopologySeverity, TopologyViolation,
-        };
-
-        if new_imports.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let rules = self.topology_rules.read().await;
-        let mut violations = Vec::new();
-        let fallback_re = regex::Regex::new("^$").unwrap();
-
-        for rule in rules.values() {
-            if rule.project_id != project_id {
-                continue;
-            }
-            if !matches!(
-                rule.rule_type,
-                TopologyRuleType::MustNotImport | TopologyRuleType::MustNotCall
-            ) {
-                continue;
-            }
-
-            let source_re = regex::Regex::new(&glob_to_regex(&rule.source_pattern))
-                .unwrap_or_else(|_| fallback_re.clone());
-            if !source_re.is_match(file_path) {
-                continue;
-            }
-
-            let target_pattern = rule.target_pattern.as_deref().unwrap_or("**");
-            let target_re = regex::Regex::new(&glob_to_regex(target_pattern))
-                .unwrap_or_else(|_| fallback_re.clone());
-
-            for import_path in new_imports {
-                if target_re.is_match(import_path) {
-                    let severity_weight = match rule.severity {
-                        TopologySeverity::Error => 1.0,
-                        TopologySeverity::Warning => 0.5,
-                    };
-                    violations.push(TopologyViolation {
-                        rule_id: rule.id.clone(),
-                        rule_description: rule.description.clone(),
-                        rule_type: rule.rule_type.clone(),
-                        violator_path: file_path.to_string(),
-                        target_path: Some(import_path.clone()),
-                        severity: rule.severity.clone(),
-                        details: format!(
-                            "{} would import {} which violates rule: {}",
-                            file_path, import_path, rule.description
-                        ),
-                        violation_score: severity_weight,
-                    });
-                }
-            }
-        }
-
-        Ok(violations)
-    }
-
-    async fn health_check(&self) -> anyhow::Result<bool> {
-        Ok(true)
-    }
-
-    // ========================================================================
-    // Persona operations (Living Personas)
-    // ========================================================================
-
-    async fn create_persona(&self, persona: &PersonaNode) -> Result<()> {
-        self.personas
-            .write()
-            .await
-            .insert(persona.id, persona.clone());
-        Ok(())
-    }
-
-    async fn get_persona(&self, id: Uuid) -> Result<Option<PersonaNode>> {
-        Ok(self.personas.read().await.get(&id).cloned())
-    }
-
-    async fn update_persona(&self, persona: &PersonaNode) -> Result<()> {
-        let mut store = self.personas.write().await;
-        if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(persona.id) {
-            e.insert(persona.clone());
-            Ok(())
-        } else {
-            anyhow::bail!("Persona {} not found", persona.id)
-        }
-    }
-
-    async fn delete_persona(&self, id: Uuid) -> Result<bool> {
-        let existed = self.personas.write().await.remove(&id).is_some();
-        if existed {
-            // Clean up relations
-            self.persona_skills.write().await.remove(&id);
-            self.persona_protocols.write().await.remove(&id);
-            self.persona_feature_graph.write().await.remove(&id);
-            self.persona_files.write().await.remove(&id);
-            self.persona_functions.write().await.remove(&id);
-            self.persona_notes.write().await.remove(&id);
-            self.persona_decisions.write().await.remove(&id);
-            self.persona_extends.write().await.remove(&id);
-        }
-        Ok(existed)
-    }
-
-    async fn list_personas(
-        &self,
-        project_id: Uuid,
-        status: Option<PersonaStatus>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<PersonaNode>, usize)> {
-        let store = self.personas.read().await;
-        let mut all: Vec<PersonaNode> = store
-            .values()
-            .filter(|p| p.project_id == Some(project_id))
-            .filter(|p| status.is_none_or(|s| p.status == s))
-            .cloned()
-            .collect();
-        all.sort_by(|a, b| {
-            b.energy
-                .partial_cmp(&a.energy)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let total = all.len();
-        let page = all.into_iter().skip(offset).take(limit).collect();
-        Ok((page, total))
-    }
-
-    async fn list_global_personas(&self) -> Result<Vec<PersonaNode>> {
-        let store = self.personas.read().await;
-        Ok(store
-            .values()
-            .filter(|p| p.project_id.is_none())
-            .cloned()
-            .collect())
-    }
-
-    async fn add_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()> {
-        self.persona_skills
-            .write()
-            .await
-            .entry(persona_id)
-            .or_default()
-            .insert(skill_id);
-        Ok(())
-    }
-
-    async fn remove_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()> {
-        if let Some(set) = self.persona_skills.write().await.get_mut(&persona_id) {
-            set.remove(&skill_id);
-        }
-        Ok(())
-    }
-
-    async fn add_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()> {
-        self.persona_protocols
-            .write()
-            .await
-            .entry(persona_id)
-            .or_default()
-            .insert(protocol_id);
-        Ok(())
-    }
-
-    async fn remove_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()> {
-        if let Some(set) = self.persona_protocols.write().await.get_mut(&persona_id) {
-            set.remove(&protocol_id);
-        }
-        Ok(())
-    }
-
-    async fn increment_persona_activation(&self, persona_id: Uuid) -> Result<()> {
-        let mut personas = self.personas.write().await;
-        if let Some(persona) = personas.get_mut(&persona_id) {
-            persona.activation_count += 1;
-            persona.last_activated = Some(chrono::Utc::now());
-        }
-        Ok(())
-    }
-
-    async fn set_persona_feature_graph(
-        &self,
-        persona_id: Uuid,
-        feature_graph_id: Uuid,
-    ) -> Result<()> {
-        self.persona_feature_graph
-            .write()
-            .await
-            .insert(persona_id, feature_graph_id);
-        Ok(())
-    }
-
-    async fn remove_persona_feature_graph(&self, persona_id: Uuid) -> Result<()> {
-        self.persona_feature_graph.write().await.remove(&persona_id);
-        Ok(())
-    }
-
-    async fn add_persona_file(&self, persona_id: Uuid, file_path: &str, weight: f64) -> Result<()> {
-        self.persona_files
-            .write()
-            .await
-            .entry(persona_id)
-            .or_default()
-            .insert(file_path.to_string(), weight);
-        Ok(())
-    }
-
-    async fn remove_persona_file(&self, persona_id: Uuid, file_path: &str) -> Result<()> {
-        if let Some(map) = self.persona_files.write().await.get_mut(&persona_id) {
-            map.remove(file_path);
-        }
-        Ok(())
-    }
-
-    async fn add_persona_function(
-        &self,
-        persona_id: Uuid,
-        function_id: &str,
-        weight: f64,
-    ) -> Result<()> {
-        self.persona_functions
-            .write()
-            .await
-            .entry(persona_id)
-            .or_default()
-            .insert(function_id.to_string(), weight);
-        Ok(())
-    }
-
-    async fn remove_persona_function(&self, persona_id: Uuid, function_id: &str) -> Result<()> {
-        if let Some(map) = self.persona_functions.write().await.get_mut(&persona_id) {
-            map.remove(function_id);
-        }
-        Ok(())
-    }
-
-    async fn add_persona_note(&self, persona_id: Uuid, note_id: Uuid, weight: f64) -> Result<()> {
-        self.persona_notes
-            .write()
-            .await
-            .entry(persona_id)
-            .or_default()
-            .insert(note_id, weight);
-        Ok(())
-    }
-
-    async fn remove_persona_note(&self, persona_id: Uuid, note_id: Uuid) -> Result<()> {
-        if let Some(map) = self.persona_notes.write().await.get_mut(&persona_id) {
-            map.remove(&note_id);
-        }
-        Ok(())
-    }
-
-    async fn add_persona_decision(
-        &self,
-        persona_id: Uuid,
-        decision_id: Uuid,
-        weight: f64,
-    ) -> Result<()> {
-        self.persona_decisions
-            .write()
-            .await
-            .entry(persona_id)
-            .or_default()
-            .insert(decision_id, weight);
-        Ok(())
-    }
-
-    async fn remove_persona_decision(&self, persona_id: Uuid, decision_id: Uuid) -> Result<()> {
-        if let Some(map) = self.persona_decisions.write().await.get_mut(&persona_id) {
-            map.remove(&decision_id);
-        }
-        Ok(())
-    }
-
-    async fn add_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()> {
-        self.persona_extends
-            .write()
-            .await
-            .entry(child_id)
-            .or_default()
-            .push(parent_id);
-        Ok(())
-    }
-
-    async fn remove_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()> {
-        if let Some(vec) = self.persona_extends.write().await.get_mut(&child_id) {
-            vec.retain(|&id| id != parent_id);
-        }
-        Ok(())
-    }
-
-    async fn get_persona_subgraph(&self, persona_id: Uuid) -> Result<PersonaSubgraph> {
-        let persona = self
-            .get_persona(persona_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Persona {} not found", persona_id))?;
-
-        let files: Vec<PersonaWeightedRelation> = self
-            .persona_files
-            .read()
-            .await
-            .get(&persona_id)
-            .map(|m| {
-                m.iter()
-                    .map(|(path, &w)| PersonaWeightedRelation {
-                        entity_type: "file".to_string(),
-                        entity_id: path.clone(),
-                        weight: w,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let functions: Vec<PersonaWeightedRelation> = self
-            .persona_functions
-            .read()
-            .await
-            .get(&persona_id)
-            .map(|m| {
-                m.iter()
-                    .map(|(fid, &w)| PersonaWeightedRelation {
-                        entity_type: "function".to_string(),
-                        entity_id: fid.clone(),
-                        weight: w,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let notes: Vec<PersonaWeightedRelation> = self
-            .persona_notes
-            .read()
-            .await
-            .get(&persona_id)
-            .map(|m| {
-                m.iter()
-                    .map(|(nid, &w)| PersonaWeightedRelation {
-                        entity_type: "note".to_string(),
-                        entity_id: nid.to_string(),
-                        weight: w,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let decisions: Vec<PersonaWeightedRelation> = self
-            .persona_decisions
-            .read()
-            .await
-            .get(&persona_id)
-            .map(|m| {
-                m.iter()
-                    .map(|(did, &w)| PersonaWeightedRelation {
-                        entity_type: "decision".to_string(),
-                        entity_id: did.to_string(),
-                        weight: w,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let skills: Vec<PersonaWeightedRelation> = self
-            .persona_skills
-            .read()
-            .await
-            .get(&persona_id)
-            .map(|s| {
-                s.iter()
-                    .map(|sid| PersonaWeightedRelation {
-                        entity_type: "skill".to_string(),
-                        entity_id: sid.to_string(),
-                        weight: 1.0,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let protocols: Vec<PersonaWeightedRelation> = self
-            .persona_protocols
-            .read()
-            .await
-            .get(&persona_id)
-            .map(|s| {
-                s.iter()
-                    .map(|pid| PersonaWeightedRelation {
-                        entity_type: "protocol".to_string(),
-                        entity_id: pid.to_string(),
-                        weight: 1.0,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let feature_graph_id = self
-            .persona_feature_graph
-            .read()
-            .await
-            .get(&persona_id)
-            .copied();
-
-        let parents: Vec<PersonaWeightedRelation> = self
-            .persona_extends
-            .read()
-            .await
-            .get(&persona_id)
-            .map(|ids| {
-                ids.iter()
-                    .map(|pid| PersonaWeightedRelation {
-                        entity_type: "persona".to_string(),
-                        entity_id: pid.to_string(),
-                        weight: 1.0,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let children: Vec<PersonaWeightedRelation> = Vec::new(); // Mock doesn't track reverse extends
-
-        let total_entities = files.len()
-            + functions.len()
-            + notes.len()
-            + decisions.len()
-            + skills.len()
-            + protocols.len()
-            + if feature_graph_id.is_some() { 1 } else { 0 };
-
-        Ok(PersonaSubgraph {
-            persona_id,
-            persona_name: persona.name,
-            files,
-            functions,
-            notes,
-            decisions,
-            skills,
-            protocols,
-            feature_graph_id,
-            parents,
-            children,
-            stats: PersonaSubgraphStats {
-                total_entities,
-                coverage_score: 0.0,
-                freshness: 0.0,
-            },
-        })
-    }
-
-    async fn find_personas_for_file(
-        &self,
-        file_path: &str,
-        project_id: Uuid,
-    ) -> Result<Vec<(PersonaNode, f64)>> {
-        let personas = self.personas.read().await;
-        let files = self.persona_files.read().await;
-        let mut results: Vec<(PersonaNode, f64)> = Vec::new();
-        for persona in personas.values() {
-            if persona.project_id != Some(project_id) {
-                continue;
-            }
-            if let Some(file_map) = files.get(&persona.id) {
-                if let Some(&weight) = file_map.get(file_path) {
-                    results.push((persona.clone(), weight));
-                }
-            }
-        }
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(results)
-    }
-
-    async fn get_all_persona_knows(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<(PersonaNode, String, f64)>> {
-        let personas = self.personas.read().await;
-        let files = self.persona_files.read().await;
-        let mut results: Vec<(PersonaNode, String, f64)> = Vec::new();
-        for persona in personas.values() {
-            if persona.project_id != Some(project_id) {
-                continue;
-            }
-            if let Some(file_map) = files.get(&persona.id) {
-                for (path, &weight) in file_map {
-                    results.push((persona.clone(), path.clone(), weight));
-                }
-            }
-        }
-        results.sort_by(|a, b| {
-            a.0.name
-                .cmp(&b.0.name)
-                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-        });
-        Ok(results)
-    }
-
-    async fn auto_scope_to_feature_graphs(&self, _project_id: Uuid) -> Result<usize> {
-        // Mock: no-op, return 0 scoped
-        Ok(0)
-    }
-
-    async fn compute_adaptive_thresholds(
-        &self,
-        _project_id: Uuid,
-    ) -> Result<crate::neo4j::persona::AdaptivePersonaThresholds> {
-        // Mock: compute from in-memory persona KNOWS weights
-        use crate::analytics::distribution::{adaptive_threshold, detect_outliers};
-
-        let personas = self.personas.read().await;
-        let persona_files = self.persona_files.read().await;
-
-        let mut weights: Vec<f64> = Vec::new();
-        for (pid, _) in personas.iter() {
-            if let Some(files) = persona_files.get(pid) {
-                for w in files.values() {
-                    weights.push(*w);
-                }
-            }
-        }
-
-        if weights.len() < 10 {
-            return Ok(crate::neo4j::persona::AdaptivePersonaThresholds {
-                sample_size: weights.len(),
-                ..Default::default()
-            });
-        }
-
-        let prune_cutoff = adaptive_threshold(&weights, 0.05, 0.1);
-        let outliers = detect_outliers(&weights, 1.5);
-
-        Ok(crate::neo4j::persona::AdaptivePersonaThresholds {
-            prune_cutoff,
-            confidence_p90: 20.0, // Mock: no community data
-            weight_outlier_count: outliers.len(),
-            sample_size: weights.len(),
-            lower_fence: 0.0,
-        })
-    }
-
-    async fn maintain_personas(&self, _project_id: Uuid) -> Result<(usize, usize, usize)> {
-        Ok((0, 0, 0))
-    }
-
-    async fn detect_personas(
-        &self,
-        _project_id: Uuid,
-    ) -> Result<Vec<crate::neo4j::persona::PersonaProposal>> {
-        Ok(vec![])
-    }
-
-    async fn find_adjacent_personas(
-        &self,
-        _file_path: &str,
-        _project_id: Uuid,
-    ) -> Result<Vec<(Uuid, String)>> {
-        Ok(vec![])
-    }
-
-    async fn auto_grow_file_knows(
-        &self,
-        _persona_id: Uuid,
-        _file_path: &str,
-        _weight: f64,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn find_relevant_personas_for_note(
-        &self,
-        _file_paths: &[String],
-        _project_id: Uuid,
-    ) -> Result<Vec<(Uuid, f64)>> {
-        Ok(vec![])
-    }
-
-    async fn find_relevant_personas_for_decision(
-        &self,
-        _decision_id: Uuid,
-        _project_id: Uuid,
-    ) -> Result<Vec<(Uuid, f64)>> {
-        Ok(vec![])
-    }
-
-    async fn auto_link_note_to_persona(
-        &self,
-        _persona_id: Uuid,
-        _note_id: Uuid,
-        _weight: f64,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn auto_link_decision_to_persona(
-        &self,
-        _persona_id: Uuid,
-        _decision_id: Uuid,
-        _weight: f64,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn auto_link_file_to_persona(
-        &self,
-        _persona_id: Uuid,
-        _file_path: &str,
-        _weight: f64,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    // ========================================================================
-    // Persona learning methods (mock stubs)
-    // ========================================================================
-
-    async fn propagate_knows_via_co_change(
-        &self,
-        _persona_id: Uuid,
-        _file_path: &str,
-        _base_weight: f64,
-    ) -> Result<usize> {
-        Ok(0)
-    }
-
-    async fn compute_persona_affinity(
-        &self,
-        _persona_a: Uuid,
-        _persona_b: Uuid,
-    ) -> Result<crate::neo4j::persona::PersonaAffinityScore> {
-        Ok(crate::neo4j::persona::PersonaAffinityScore {
-            persona_a_id: _persona_a,
-            persona_b_id: _persona_b,
-            jaccard_files: 0.0,
-            synapse_density: 0.0,
-            combined: 0.0,
-        })
-    }
-
-    async fn merge_personas(&self, _keep_id: Uuid, _merge_id: Uuid) -> Result<()> {
-        Ok(())
-    }
-
-    async fn find_synapse_linked_personas(
-        &self,
-        _persona_id: Uuid,
-    ) -> Result<Vec<(Uuid, String, f64)>> {
-        Ok(vec![])
-    }
-
-    async fn rate_limited_energy_boost(
-        &self,
-        _persona_id: Uuid,
-        _boost: f64,
-        _max_per_cycle: f64,
-    ) -> Result<bool> {
-        Ok(true)
-    }
-
-    async fn get_learning_health(
-        &self,
-        _project_id: Uuid,
-    ) -> Result<crate::neo4j::analytics::LearningHealthReport> {
-        Ok(crate::neo4j::analytics::LearningHealthReport {
-            knows_convergence: 0.0,
-            knows_coverage: 0.0,
-            decay_rate: 0.0,
-            synapse_health: 0.0,
-            co_change_coverage: 0.0,
-            persona_count: 0,
-            total_knows: 0,
-        })
-    }
-
-    // ========================================================================
-    // Analysis Profile operations
-    // ========================================================================
-
-    async fn create_analysis_profile(
-        &self,
-        profile: &crate::graph::models::AnalysisProfile,
-    ) -> anyhow::Result<()> {
-        let mut profiles = self.analysis_profiles.write().await;
-        profiles.insert(profile.id.clone(), profile.clone());
-        Ok(())
-    }
-
-    async fn list_analysis_profiles(
-        &self,
-        project_id: Option<&str>,
-    ) -> anyhow::Result<Vec<crate::graph::models::AnalysisProfile>> {
-        let profiles = self.analysis_profiles.read().await;
-        let mut result: Vec<_> = profiles
-            .values()
-            .filter(|p| {
-                // Include global profiles (no project_id)
-                if p.project_id.is_none() {
-                    return true;
-                }
-                // Include project-specific profiles if matching
-                if let Some(pid) = project_id {
-                    if p.project_id.as_deref() == Some(pid) {
-                        return true;
-                    }
-                }
-                false
-            })
-            .cloned()
-            .collect();
-        // Sort: built-in first, then by name
-        result.sort_by(|a, b| {
-            b.is_builtin
-                .cmp(&a.is_builtin)
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        Ok(result)
-    }
-
-    async fn get_analysis_profile(
-        &self,
-        id: &str,
-    ) -> anyhow::Result<Option<crate::graph::models::AnalysisProfile>> {
-        let profiles = self.analysis_profiles.read().await;
-        Ok(profiles.get(id).cloned())
-    }
-
-    async fn delete_analysis_profile(&self, id: &str) -> anyhow::Result<()> {
-        let mut profiles = self.analysis_profiles.write().await;
-        if let Some(profile) = profiles.get(id) {
-            if profile.is_builtin {
-                anyhow::bail!("Cannot delete built-in profile '{}'", profile.name);
-            }
-        }
-        profiles.remove(id);
-        Ok(())
-    }
-
-    // ========================================================================
-    // Multi-signal impact queries
-    // ========================================================================
-
-    async fn get_knowledge_density(
-        &self,
-        file_path: &str,
-        _project_id: &str,
-    ) -> anyhow::Result<f64> {
-        // In mock: count notes linked to this file path via anchors
-        let notes = self.notes.read().await;
-        let count = notes
-            .values()
-            .filter(|n| {
-                n.anchors.iter().any(|a| {
-                    a.entity_type == crate::notes::EntityType::File && a.entity_id == file_path
-                })
-            })
-            .count();
-        // Simple normalization: max 10 => density 1.0
-        Ok((count as f64 / 10.0).min(1.0))
-    }
-
-    async fn get_node_pagerank(&self, _file_path: &str, _project_id: &str) -> anyhow::Result<f64> {
-        // Mock: return 0.0 (no GDS in tests)
-        Ok(0.0)
-    }
-
-    async fn get_bridge_proximity(
-        &self,
-        _file_path: &str,
-        _project_id: &str,
-    ) -> anyhow::Result<Vec<(String, f64)>> {
-        // Mock: return empty (no graph traversal in tests)
-        Ok(Vec::new())
-    }
-
-    async fn get_avg_multi_signal_score(&self, _project_id: Uuid) -> anyhow::Result<f64> {
-        // Mock: no GDS metrics in tests, return 0.0
-        Ok(0.0)
-    }
-
-    async fn find_bridge_subgraph(
-        &self,
-        source: &str,
-        target: &str,
-        _max_hops: u32,
-        _relation_types: &[String],
-        _project_id: &str,
-    ) -> anyhow::Result<(
-        Vec<crate::graph::models::BridgeRawNode>,
-        Vec<crate::graph::models::BridgeRawEdge>,
-    )> {
-        use crate::graph::models::{BridgeRawEdge, BridgeRawNode};
-
-        // Mock: return source and target as nodes with a direct IMPORTS edge
-        let nodes = vec![
-            BridgeRawNode {
-                path: source.to_string(),
-                node_type: "File".to_string(),
-            },
-            BridgeRawNode {
-                path: target.to_string(),
-                node_type: "File".to_string(),
-            },
-        ];
-        let edges = vec![BridgeRawEdge {
-            from_path: source.to_string(),
-            to_path: target.to_string(),
-            rel_type: "IMPORTS".to_string(),
-        }];
-        Ok((nodes, edges))
-    }
-
-    // ========================================================================
-    // Skill operations (Neural Skills)
-    // ========================================================================
-
-    async fn create_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
-        // Validate project exists (only if projects map is populated, for backward compatibility)
-        // A transverse skill has no project, by design: nothing to validate.
-        if let Some(pid) = skill.project_id {
-            let projects = self.projects.read().await;
-            if !projects.is_empty() && !projects.contains_key(&pid) {
-                anyhow::bail!(
-                    "Project not found: {}. Cannot create skill in non-existent project.",
-                    pid
-                );
-            }
-        }
-        self.skills.write().await.insert(skill.id, skill.clone());
-        Ok(())
-    }
-
-    async fn get_skill(&self, id: Uuid) -> anyhow::Result<Option<crate::skills::SkillNode>> {
-        Ok(self.skills.read().await.get(&id).cloned())
-    }
-
-    async fn update_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
-        let mut store = self.skills.write().await;
-        if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(skill.id) {
-            e.insert(skill.clone());
-            Ok(())
-        } else {
-            anyhow::bail!("Skill not found: {}", skill.id)
-        }
-    }
-
-    async fn delete_skill(&self, id: Uuid) -> anyhow::Result<bool> {
-        let existed = self.skills.write().await.remove(&id).is_some();
-        if existed {
-            self.skill_members.write().await.remove(&id);
-        }
-        Ok(existed)
-    }
-
-    async fn rescope_skill(&self, skill_id: Uuid, project_id: Option<Uuid>) -> anyhow::Result<()> {
-        let mut skills = self.skills.write().await;
-        match skills.values_mut().find(|s| s.id == skill_id) {
-            Some(skill) => {
-                skill.project_id = project_id;
-                Ok(())
-            }
-            None => anyhow::bail!("skill {} not found", skill_id),
-        }
-    }
-
-    async fn rescope_protocol(
-        &self,
-        protocol_id: Uuid,
-        project_id: Option<Uuid>,
-    ) -> anyhow::Result<()> {
-        let mut protocols = self.protocols.write().await;
-        match protocols.values_mut().find(|p| p.id == protocol_id) {
-            Some(protocol) => {
-                protocol.project_id = project_id;
-                Ok(())
-            }
-            None => anyhow::bail!("protocol {} not found", protocol_id),
-        }
-    }
-
-    async fn list_skills(
-        &self,
-        project_id: Option<Uuid>,
-        status: Option<crate::skills::SkillStatus>,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<(Vec<crate::skills::SkillNode>, usize)> {
-        let store = self.skills.read().await;
-        let mut filtered: Vec<_> = store
-            .values()
-            .filter(|s| match project_id {
-                Some(pid) => s.project_id == Some(pid) || s.project_id.is_none(),
-                None => s.project_id.is_none(),
-            })
-            .filter(|s| status.is_none_or(|st| s.status == st))
-            .cloned()
-            .collect();
-        // Sort by energy DESC, name ASC (consistent with Neo4j query)
-        filtered.sort_by(|a, b| {
-            b.energy
-                .partial_cmp(&a.energy)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        let total = filtered.len();
-        let page = filtered.into_iter().skip(offset).take(limit).collect();
-        Ok((page, total))
-    }
-
-    async fn get_skill_members(
-        &self,
-        skill_id: Uuid,
-    ) -> anyhow::Result<(Vec<crate::notes::Note>, Vec<DecisionNode>)> {
-        let members = self.skill_members.read().await;
-        let entries = members.get(&skill_id).cloned().unwrap_or_default();
-        let notes_store = self.notes.read().await;
-        let decisions_store = self.decisions.read().await;
-        let mut notes = Vec::new();
-        let mut decisions = Vec::new();
-        for (entity_type, entity_id) in &entries {
-            match entity_type.as_str() {
-                "note" => {
-                    if let Some(n) = notes_store.get(entity_id) {
-                        notes.push(n.clone());
-                    }
-                }
-                "decision" => {
-                    if let Some(d) = decisions_store.get(entity_id) {
-                        decisions.push(d.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok((notes, decisions))
-    }
-
-    async fn add_skill_member(
-        &self,
-        skill_id: Uuid,
-        entity_type: &str,
-        entity_id: Uuid,
-    ) -> anyhow::Result<()> {
-        let entry = (entity_type.to_string(), entity_id);
-        let mut members = self.skill_members.write().await;
-        let list = members.entry(skill_id).or_default();
-        if !list.contains(&entry) {
-            list.push(entry);
-            // Update counters on the skill (consistent with Neo4j behavior)
-            drop(members);
-            let mut skills = self.skills.write().await;
-            if let Some(skill) = skills.get_mut(&skill_id) {
-                match entity_type {
-                    "note" => skill.note_count += 1,
-                    "decision" => skill.decision_count += 1,
-                    _ => {}
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn remove_skill_member(
-        &self,
-        skill_id: Uuid,
-        entity_type: &str,
-        entity_id: Uuid,
-    ) -> anyhow::Result<bool> {
-        let entry = (entity_type.to_string(), entity_id);
-        let mut members = self.skill_members.write().await;
-        if let Some(list) = members.get_mut(&skill_id) {
-            let len_before = list.len();
-            list.retain(|e| e != &entry);
-            Ok(list.len() < len_before)
-        } else {
-            Ok(false)
-        }
-    }
-
-    async fn remove_all_skill_members(&self, skill_id: Uuid) -> anyhow::Result<i64> {
-        let mut members = self.skill_members.write().await;
-        if let Some(list) = members.remove(&skill_id) {
-            Ok(list.len() as i64)
-        } else {
-            Ok(0)
-        }
-    }
-
-    async fn get_skills_for_note(
-        &self,
-        note_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
-        let members = self.skill_members.read().await;
-        let skills_store = self.skills.read().await;
-        let mut result = Vec::new();
-        for (skill_id, entries) in members.iter() {
-            if entries.iter().any(|(t, id)| t == "note" && *id == note_id) {
-                if let Some(s) = skills_store.get(skill_id) {
-                    result.push(s.clone());
-                }
-            }
-        }
-        // Sort by energy DESC for consistency with Neo4j query
-        result.sort_by(|a, b| {
-            b.energy
-                .partial_cmp(&a.energy)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        Ok(result)
-    }
-
-    async fn get_skills_for_project(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
-        let store = self.skills.read().await;
-        Ok(store
-            .values()
-            .filter(|s| s.project_id == Some(project_id))
-            .cloned()
-            .collect())
-    }
-
-    async fn activate_skill(
-        &self,
-        skill_id: Uuid,
-        _query: &str,
-    ) -> anyhow::Result<crate::skills::ActivatedSkillContext> {
-        let skill = self
-            .get_skill(skill_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Skill not found: {}", skill_id))?;
-        // Return actual member notes/decisions (consistent with Neo4j behavior)
-        let (member_notes, relevant_decisions) = self.get_skill_members(skill_id).await?;
-        // Wrap notes as ActivatedNote
-        let activated_notes: Vec<crate::neurons::activation::ActivatedNote> = member_notes
-            .iter()
-            .map(|n| crate::neurons::activation::ActivatedNote {
-                note: n.clone(),
-                activation_score: 1.0,
-                source: crate::neurons::activation::ActivationSource::Direct,
-                entity_type: "note".to_string(),
-            })
-            .collect();
-        // Build context_text from note content
-        let context_text = if let Some(ref tpl) = skill.context_template {
-            tpl.clone()
-        } else {
-            member_notes
-                .iter()
-                .map(|n| n.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        };
-        Ok(crate::skills::ActivatedSkillContext {
-            skill,
-            activated_notes,
-            relevant_decisions,
-            context_text,
-            confidence: 1.0,
-        })
-    }
-
-    async fn increment_skill_activation(&self, skill_id: Uuid) -> anyhow::Result<()> {
-        let mut store = self.skills.write().await;
-        if let Some(skill) = store.get_mut(&skill_id) {
-            skill.activation_count += 1;
-        }
-        Ok(())
-    }
-
-    async fn match_skills_by_trigger(
-        &self,
-        project_id: Option<Uuid>,
-        input: &str,
-    ) -> anyhow::Result<Vec<(crate::skills::SkillNode, f64)>> {
-        let store = self.skills.read().await;
-        let candidates: Vec<_> = store
-            .values()
-            .filter(|s| {
-                let in_scope = match project_id {
-                    Some(pid) => s.project_id == Some(pid) || s.project_id.is_none(),
-                    None => s.project_id.is_none(),
-                };
-                in_scope
-                    && matches!(
-                        s.status,
-                        crate::skills::SkillStatus::Active | crate::skills::SkillStatus::Emerging
-                    )
-            })
-            .cloned()
-            .collect();
-        drop(store);
-
-        let mut results = Vec::new();
-        for skill in candidates {
-            // Evaluate trigger_patterns against input (if skill has triggers)
-            let mut best_confidence = None;
-            for trigger in &skill.trigger_patterns {
-                let matched = match trigger.pattern_type {
-                    crate::skills::TriggerType::Regex => {
-                        regex::RegexBuilder::new(&format!("(?i){}", &trigger.pattern_value))
-                            .build()
-                            .map(|re| re.is_match(input))
-                            .unwrap_or(false)
-                    }
-                    crate::skills::TriggerType::FileGlob => {
-                        glob::Pattern::new(&trigger.pattern_value)
-                            .map(|g| g.matches(input))
-                            .unwrap_or(false)
-                    }
-                    crate::skills::TriggerType::Semantic => {
-                        // Semantic triggers can't be evaluated in mock
-                        false
-                    }
-                    crate::skills::TriggerType::McpAction => {
-                        crate::skills::activation::match_mcp_action_trigger(
-                            &trigger.pattern_value,
-                            input,
-                        )
-                    }
-                };
-                if matched {
-                    let c = trigger.confidence_threshold;
-                    best_confidence = Some(best_confidence.map_or(c, |prev: f64| prev.max(c)));
-                }
-            }
-            // If no triggers defined, fall back to matching all (backward compatibility)
-            let confidence = if skill.trigger_patterns.is_empty() {
-                1.0
-            } else if let Some(c) = best_confidence {
-                c
-            } else {
-                continue; // Has triggers but none matched → skip
-            };
-            // Emerging skills get 0.8x penalty
-            let final_confidence = if skill.status == crate::skills::SkillStatus::Emerging {
-                confidence * 0.8
-            } else {
-                confidence
-            };
-            results.push((skill, final_confidence));
-        }
-        // Sort by energy DESC for consistency with Neo4j
-        results.sort_by(|a, b| {
-            b.0.energy
-                .partial_cmp(&a.0.energy)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        Ok(results)
-    }
-
-    async fn get_synapse_graph(
-        &self,
-        _project_id: Uuid,
-        _min_weight: f64,
-    ) -> anyhow::Result<Vec<(String, String, f64)>> {
-        // Mock: return empty synapse graph (no synapses in mock store)
-        Ok(Vec::new())
-    }
-
-    // ========================================================================
-    // Context Cards persistence
-    // ========================================================================
-
-    async fn batch_save_context_cards(
-        &self,
-        _cards: &[crate::graph::models::ContextCard],
-    ) -> anyhow::Result<()> {
-        // Mock: no-op (context cards not persisted in mock store)
-        Ok(())
-    }
-
-    async fn invalidate_context_cards(
-        &self,
-        _paths: &[String],
-        _project_id: &str,
-    ) -> anyhow::Result<()> {
-        // Mock: no-op (no context cards to invalidate in mock store)
-        Ok(())
-    }
-
-    async fn get_context_card(
-        &self,
-        _path: &str,
-        _project_id: &str,
-    ) -> anyhow::Result<Option<crate::graph::models::ContextCard>> {
-        // Mock: no context cards stored
-        Ok(None)
-    }
-
-    async fn get_context_cards_batch(
-        &self,
-        _paths: &[String],
-        _project_id: &str,
-    ) -> anyhow::Result<Vec<crate::graph::models::ContextCard>> {
-        // Mock: no context cards stored
-        Ok(Vec::new())
-    }
-
-    async fn find_isomorphic_groups(
-        &self,
-        _project_id: &str,
-        _min_group_size: usize,
-    ) -> anyhow::Result<Vec<crate::graph::models::IsomorphicGroup>> {
-        // Mock: the groups declared with `isomorphic_groups` (none by default)
-        Ok(self.isomorphic_groups.read().await.clone())
-    }
-
-    async fn has_context_cards(&self, _project_id: &str) -> anyhow::Result<bool> {
-        Ok(self
-            .mock_has_context_cards
-            .load(std::sync::atomic::Ordering::Relaxed))
-    }
-
-    async fn get_note_embeddings_for_project(
-        &self,
-        project_id: uuid::Uuid,
-    ) -> anyhow::Result<Vec<crate::neo4j::models::NoteEmbeddingPoint>> {
-        let notes = self.notes.read().await;
-        let embeddings = self.note_embeddings.read().await;
-        let mut points = Vec::new();
-        for note in notes.values() {
-            if note.project_id != Some(project_id) {
-                continue;
-            }
-            if let Some((emb, _model)) = embeddings.get(&note.id) {
-                points.push(crate::neo4j::models::NoteEmbeddingPoint {
-                    id: note.id,
-                    embedding: emb.clone(),
-                    note_type: note.note_type.to_string(),
-                    importance: note.importance.to_string(),
-                    energy: note.energy,
-                    tags: note.tags.clone(),
-                    content_preview: note.content.chars().take(120).collect(),
-                });
-            }
-        }
-        Ok(points)
-    }
-
-    // ========================================================================
-    // Protocol operations (Pattern Federation)
-    // ========================================================================
-
-    async fn upsert_protocol(&self, protocol: &crate::protocol::Protocol) -> anyhow::Result<()> {
-        // Validate project exists
-        let projects = self.projects.read().await;
-        // A transverse protocol has no project, by design: nothing to validate.
-        if !projects.is_empty()
-            && protocol
-                .project_id
-                .is_some_and(|pid| !projects.contains_key(&pid))
-        {
-            anyhow::bail!(
-                "Project not found: {}. Cannot create protocol in non-existent project.",
-                protocol
-                    .project_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_default()
-            );
-        }
-        drop(projects);
-        self.protocols
-            .write()
-            .await
-            .insert(protocol.id, protocol.clone());
-        Ok(())
-    }
-
-    async fn get_protocol(&self, id: Uuid) -> anyhow::Result<Option<crate::protocol::Protocol>> {
-        Ok(self.protocols.read().await.get(&id).cloned())
-    }
-
-    async fn list_protocols(
-        &self,
-        project_id: Option<Uuid>,
-        category: Option<crate::protocol::ProtocolCategory>,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<(Vec<crate::protocol::Protocol>, usize)> {
-        let store = self.protocols.read().await;
-        let mut filtered: Vec<_> = store
-            .values()
-            .filter(|p| {
-                // Same scope rule as skills: no project lists the transverse
-                // library alone, a project sees its own protocols and those.
-                let in_scope = match project_id {
-                    Some(pid) => p.project_id == Some(pid) || p.project_id.is_none(),
-                    None => p.project_id.is_none(),
-                };
-                in_scope && category.as_ref().is_none_or(|c| p.protocol_category == *c)
-            })
-            .cloned()
-            .collect();
-        filtered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        let total = filtered.len();
-        let page = filtered.into_iter().skip(offset).take(limit).collect();
-        Ok((page, total))
-    }
-
-    async fn delete_protocol(&self, id: Uuid) -> anyhow::Result<bool> {
-        let existed = self.protocols.write().await.remove(&id).is_some();
-        if existed {
-            // Remove associated states and transitions
-            self.protocol_states
-                .write()
-                .await
-                .retain(|_, s| s.protocol_id != id);
-            self.protocol_transitions
-                .write()
-                .await
-                .retain(|_, t| t.protocol_id != id);
-        }
-        Ok(existed)
-    }
-
-    async fn upsert_protocol_state(
-        &self,
-        state: &crate::protocol::ProtocolState,
-    ) -> anyhow::Result<()> {
-        self.protocol_states
-            .write()
-            .await
-            .insert(state.id, state.clone());
-        Ok(())
-    }
-
-    async fn get_protocol_states(
-        &self,
-        protocol_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::protocol::ProtocolState>> {
-        let store = self.protocol_states.read().await;
-        let mut states: Vec<_> = store
-            .values()
-            .filter(|s| s.protocol_id == protocol_id)
-            .cloned()
-            .collect();
-        states.sort_by(|a, b| a.state_type.to_string().cmp(&b.state_type.to_string()));
-        Ok(states)
-    }
-
-    async fn get_protocol_by_name_and_project(
-        &self,
-        name: &str,
-        project_id: Uuid,
-    ) -> anyhow::Result<Option<Uuid>> {
-        let store = self.protocols.read().await;
-        for proto in store.values() {
-            if proto.name == name && proto.project_id == Some(project_id) {
-                return Ok(Some(proto.id));
-            }
-        }
-        Ok(None)
-    }
-
-    async fn delete_protocol_state(&self, state_id: Uuid) -> anyhow::Result<bool> {
-        Ok(self
-            .protocol_states
-            .write()
-            .await
-            .remove(&state_id)
-            .is_some())
-    }
-
-    async fn upsert_protocol_transition(
-        &self,
-        transition: &crate::protocol::ProtocolTransition,
-    ) -> anyhow::Result<()> {
-        self.protocol_transitions
-            .write()
-            .await
-            .insert(transition.id, transition.clone());
-        Ok(())
-    }
-
-    async fn get_protocol_transitions(
-        &self,
-        protocol_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::protocol::ProtocolTransition>> {
-        let store = self.protocol_transitions.read().await;
-        let mut transitions: Vec<_> = store
-            .values()
-            .filter(|t| t.protocol_id == protocol_id)
-            .cloned()
-            .collect();
-        transitions.sort_by(|a, b| a.trigger.cmp(&b.trigger));
-        Ok(transitions)
-    }
-
-    async fn delete_protocol_transition(&self, transition_id: Uuid) -> anyhow::Result<bool> {
-        Ok(self
-            .protocol_transitions
-            .write()
-            .await
-            .remove(&transition_id)
-            .is_some())
-    }
-
-    // ========================================================================
-    // ProtocolRun operations (FSM Runtime)
-    // ========================================================================
-
-    async fn create_protocol_run(&self, run: &crate::protocol::ProtocolRun) -> anyhow::Result<()> {
-        let mut store = self.protocol_runs.write().await;
-
-        // Atomic concurrency guard: reject if a Running run already exists
-        // for this protocol. Check and insert happen within the same write
-        // lock, so there's no TOCTOU window.
-        // Child runs (with parent_run_id) are exempt — the parent manages exclusion.
-        if run.parent_run_id.is_none() {
-            let has_running = store.values().any(|r| {
-                r.protocol_id == run.protocol_id
-                    && r.status == crate::protocol::RunStatus::Running
-                    && r.parent_run_id.is_none()
-            });
-            if has_running {
-                anyhow::bail!(
-                    "Skipped: concurrent run already running for protocol {}",
-                    run.protocol_id
-                );
-            }
-        }
-
-        store.insert(run.id, run.clone());
-        Ok(())
-    }
-
-    async fn get_protocol_run(
-        &self,
-        run_id: Uuid,
-    ) -> anyhow::Result<Option<crate::protocol::ProtocolRun>> {
-        Ok(self.protocol_runs.read().await.get(&run_id).cloned())
-    }
-
-    async fn update_protocol_run(
-        &self,
-        run: &mut crate::protocol::ProtocolRun,
-    ) -> anyhow::Result<()> {
-        let mut store = self.protocol_runs.write().await;
-        if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(run.id) {
-            let existing = e.get();
-            if existing.version != run.version {
-                anyhow::bail!(
-                    "OptimisticLockError: protocol run {} was modified concurrently (expected version {}, found {})",
-                    run.id,
-                    run.version,
-                    existing.version
-                );
-            }
-            let new_version = run.version + 1;
-            let mut updated = run.clone();
-            updated.version = new_version;
-            e.insert(updated);
-            // Bump version in-place so the caller's struct stays in sync
-            run.version = new_version;
-            Ok(())
-        } else {
-            anyhow::bail!("ProtocolRun not found: {}", run.id)
-        }
-    }
-
-    async fn list_all_protocol_runs(
-        &self,
-        status: Option<crate::protocol::RunStatus>,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<(Vec<crate::protocol::ProtocolRun>, usize)> {
-        self.log_read("list_all_protocol_runs")?;
-        let scope = self.scope_projects(project_id, workspace_slug).await;
-        let protocols = self.protocols.read().await;
-        let store = self.protocol_runs.read().await;
-        let mut filtered: Vec<_> = store
-            .values()
-            .filter(|r| status.as_ref().is_none_or(|s| r.status == *s))
-            .filter(|r| match scope {
-                Some(ref s) => protocols
-                    .get(&r.protocol_id)
-                    .is_some_and(|p| p.project_id.is_some_and(|pid| s.contains(&pid))),
-                None => true,
-            })
-            .cloned()
-            .collect();
-        filtered.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-        let total = filtered.len();
-        let page = filtered.into_iter().skip(offset).take(limit).collect();
-        Ok((page, total))
-    }
-
-    async fn list_protocol_runs(
-        &self,
-        protocol_id: Uuid,
-        status: Option<crate::protocol::RunStatus>,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<(Vec<crate::protocol::ProtocolRun>, usize)> {
-        let store = self.protocol_runs.read().await;
-        let mut filtered: Vec<_> = store
-            .values()
-            .filter(|r| {
-                r.protocol_id == protocol_id && status.as_ref().is_none_or(|s| r.status == *s)
-            })
-            .cloned()
-            .collect();
-        filtered.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-        let total = filtered.len();
-        let page = filtered.into_iter().skip(offset).take(limit).collect();
-        Ok((page, total))
-    }
-
-    async fn list_child_runs(
-        &self,
-        parent_run_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::protocol::ProtocolRun>> {
-        let store = self.protocol_runs.read().await;
-        let mut children: Vec<_> = store
-            .values()
-            .filter(|r| r.parent_run_id == Some(parent_run_id))
-            .cloned()
-            .collect();
-        children.sort_by(|a, b| a.started_at.cmp(&b.started_at));
-        Ok(children)
-    }
-
-    async fn count_child_runs(&self, parent_run_id: Uuid) -> anyhow::Result<usize> {
-        let store = self.protocol_runs.read().await;
-        Ok(store
-            .values()
-            .filter(|r| r.parent_run_id == Some(parent_run_id))
-            .count())
-    }
-
-    async fn get_run_tree(
-        &self,
-        root_run_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::protocol::ProtocolRun>> {
-        let store = self.protocol_runs.read().await;
-
-        // Check root exists
-        let root = store.get(&root_run_id).cloned();
-        let Some(root) = root else {
-            return Ok(vec![]);
-        };
-
-        // BFS to collect all descendants (depth limit 5)
-        let mut result = vec![root];
-        let mut current_parents = vec![root_run_id];
-        for _depth in 0..5 {
-            let children: Vec<_> = store
-                .values()
-                .filter(|r| {
-                    r.parent_run_id
-                        .is_some_and(|pid| current_parents.contains(&pid))
-                })
-                .cloned()
-                .collect();
-            if children.is_empty() {
-                break;
-            }
-            current_parents = children.iter().map(|r| r.id).collect();
-            result.extend(children);
-        }
-
-        // Sort by depth then started_at
-        result.sort_by(|a, b| a.depth.cmp(&b.depth).then(a.started_at.cmp(&b.started_at)));
-        Ok(result)
-    }
-
-    async fn delete_protocol_run(&self, run_id: Uuid) -> anyhow::Result<bool> {
-        let existed = self.protocol_runs.write().await.remove(&run_id).is_some();
-        if existed {
-            // Cascade delete runtime states for this run
-            self.runtime_states
-                .write()
-                .await
-                .retain(|_, rs| rs.run_id != run_id);
-        }
-        Ok(existed)
-    }
-
-    async fn create_produced_during(
-        &self,
-        _entity_type: &str,
-        _entity_id: Uuid,
-        _run_id: Uuid,
-    ) -> anyhow::Result<bool> {
-        // Mock: always succeed
-        Ok(true)
-    }
-
-    async fn get_run_outcomes(
-        &self,
-        _run_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::neo4j::protocol::ProducedArtefact>> {
-        // Mock: return empty
-        Ok(Vec::new())
-    }
-
-    async fn find_active_run_for_project(&self, _project_id: Uuid) -> anyhow::Result<Option<Uuid>> {
-        // Mock: no active run
-        Ok(None)
-    }
-
-    async fn persist_reasoning_tree(
-        &self,
-        tree: &crate::reasoning::ReasoningTree,
-        linked_entity_type: Option<&str>,
-        linked_entity_id: Option<Uuid>,
-    ) -> anyhow::Result<Uuid> {
-        if let (Some("run" | "ProtocolRun"), Some(run_id)) = (linked_entity_type, linked_entity_id)
-        {
-            self.run_reasoning_trees
-                .write()
-                .await
-                .insert(run_id, tree.id);
-        }
-        Ok(tree.id)
-    }
-
-    async fn get_run_reasoning_tree_id(&self, run_id: Uuid) -> anyhow::Result<Option<Uuid>> {
-        Ok(self.run_reasoning_trees.read().await.get(&run_id).copied())
-    }
-
-    async fn list_completed_runs_for_project(
-        &self,
-        _project_id: Uuid,
-        _limit: usize,
-    ) -> anyhow::Result<Vec<crate::protocol::models::ProtocolRun>> {
-        // Mock: no completed runs
-        Ok(Vec::new())
-    }
-
-    // ========================================================================
-    // RuntimeState operations (Generator-produced dynamic states)
-    // ========================================================================
-
-    async fn create_runtime_state(
-        &self,
-        state: &crate::protocol::RuntimeState,
-    ) -> anyhow::Result<()> {
-        self.runtime_states
-            .write()
-            .await
-            .insert(state.id, state.clone());
-        Ok(())
-    }
-
-    async fn get_runtime_states(
-        &self,
-        run_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::protocol::RuntimeState>> {
-        let store = self.runtime_states.read().await;
-        let mut states: Vec<_> = store
-            .values()
-            .filter(|rs| rs.run_id == run_id)
-            .cloned()
-            .collect();
-        states.sort_by_key(|rs| rs.index);
-        Ok(states)
-    }
-
-    async fn delete_runtime_states(&self, run_id: Uuid) -> anyhow::Result<()> {
-        self.runtime_states
-            .write()
-            .await
-            .retain(|_, rs| rs.run_id != run_id);
-        Ok(())
-    }
-
-    // SI — System Inference: audit knowledge gaps
-    async fn audit_knowledge_gaps(
-        &self,
-        _project_id: Uuid,
-    ) -> anyhow::Result<crate::neo4j::models::AuditGapsReport> {
-        Ok(crate::neo4j::models::AuditGapsReport {
-            total_gaps: 0,
-            orphan_notes: vec![],
-            orphan_notes_total: 0,
-            decisions_without_affects: vec![],
-            decisions_without_affects_total: 0,
-            commits_without_touches: vec![],
-            commits_without_touches_total: 0,
-            skills_without_members: vec![],
-            skills_without_members_total: 0,
-            relationship_type_counts: vec![],
-        })
-    }
-
-    // ========================================================================
-    // Registry operations (Skill Registry)
-    // ========================================================================
-
-    async fn upsert_published_skill(
-        &self,
-        published: &crate::skills::registry::PublishedSkill,
-    ) -> anyhow::Result<()> {
-        self.published_skills
-            .write()
-            .await
-            .insert(published.id, published.clone());
-        Ok(())
-    }
-
-    async fn get_published_skill(
-        &self,
-        id: Uuid,
-    ) -> anyhow::Result<Option<crate::skills::registry::PublishedSkill>> {
-        Ok(self.published_skills.read().await.get(&id).cloned())
-    }
-
-    async fn search_published_skills(
-        &self,
-        search_query: Option<&str>,
-        min_trust: Option<f64>,
-        tags: Option<&[String]>,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<(Vec<crate::skills::registry::PublishedSkill>, usize)> {
-        let store = self.published_skills.read().await;
-        let mut filtered: Vec<_> = store
-            .values()
-            .filter(|ps| {
-                // Search filter
-                if let Some(q) = search_query {
-                    let q_lower = q.to_lowercase();
-                    if !ps.name.to_lowercase().contains(&q_lower)
-                        && !ps.description.to_lowercase().contains(&q_lower)
-                    {
-                        return false;
-                    }
-                }
-                // Min trust filter
-                if let Some(mt) = min_trust {
-                    if ps.trust_score < mt {
-                        return false;
-                    }
-                }
-                // Tags filter (AND logic)
-                if let Some(t) = tags {
-                    for tag in t {
-                        if !ps.tags.contains(tag) {
-                            return false;
-                        }
-                    }
-                }
-                true
-            })
-            .cloned()
-            .collect();
-
-        // Sort by trust_score DESC, then published_at DESC
-        filtered.sort_by(|a, b| {
-            b.trust_score
-                .partial_cmp(&a.trust_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.published_at.cmp(&a.published_at))
-        });
-
-        let total = filtered.len();
-        let page = filtered.into_iter().skip(offset).take(limit).collect();
-        Ok((page, total))
-    }
-
-    async fn increment_published_skill_imports(&self, id: Uuid) -> anyhow::Result<()> {
-        let mut store = self.published_skills.write().await;
-        if let Some(ps) = store.get_mut(&id) {
-            ps.import_count += 1;
-            Ok(())
-        } else {
-            anyhow::bail!("PublishedSkill not found: {}", id)
-        }
-    }
-
-    // ========================================================================
-    // Graph visualization helpers
-    // ========================================================================
-
-    async fn list_project_symbols(
-        &self,
-        _project_id: Uuid,
-        _limit: usize,
-    ) -> anyhow::Result<Vec<(String, String, String, String, Option<String>, Option<i64>)>> {
-        // Mock: return symbols from functions stored in mock
-        let functions = self.functions.read().await;
-        let mut symbols = Vec::new();
-        for (id, func) in functions.iter() {
-            symbols.push((
-                id.clone(),
-                func.name.clone(),
-                "function".to_string(),
-                func.file_path.clone(),
-                Some(format!("{:?}", func.visibility).to_lowercase()),
-                Some(func.line_start as i64),
-            ));
-        }
-        Ok(symbols)
-    }
-
-    async fn get_project_inheritance_edges(
-        &self,
-        _project_id: Uuid,
-    ) -> anyhow::Result<Vec<(String, String, String)>> {
-        Ok(vec![])
-    }
-
-    async fn get_project_constraints(
-        &self,
-        _project_id: Uuid,
-    ) -> anyhow::Result<Vec<(crate::neo4j::models::ConstraintNode, Uuid)>> {
-        Ok(vec![])
-    }
-
-    // ========================================================================
-    // PlanRun operations (Runner) — in-memory mock
-    // ========================================================================
-
-    async fn create_plan_run(&self, state: &crate::runner::RunnerState) -> anyhow::Result<()> {
-        let mut runs = self.plan_runs.write().await;
-        runs.insert(state.run_id, state.clone());
-        Ok(())
-    }
-
-    async fn update_plan_run(&self, state: &crate::runner::RunnerState) -> anyhow::Result<()> {
-        if self
-            .fail_plan_run_updates
-            .lock()
-            .is_ok_and(|f| f.contains(&state.run_id))
-        {
-            anyhow::bail!(
-                "mock: update_plan_run failure injected for {}",
-                state.run_id
-            );
-        }
-        let mut runs = self.plan_runs.write().await;
-        runs.insert(state.run_id, state.clone());
-        Ok(())
-    }
-
-    async fn get_plan_run(
-        &self,
-        run_id: Uuid,
-    ) -> anyhow::Result<Option<crate::runner::RunnerState>> {
-        let runs = self.plan_runs.read().await;
-        Ok(runs.get(&run_id).cloned())
-    }
-
-    async fn list_active_plan_runs(&self) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
-        if let Some(frozen) = self
-            .frozen_active_plan_runs
-            .lock()
-            .ok()
-            .and_then(|f| f.clone())
-        {
-            return Ok(frozen);
-        }
-        let runs = self.plan_runs.read().await;
-        let mut active: Vec<_> = runs
-            .values()
-            .filter(|s| s.status == crate::runner::PlanRunStatus::Running)
-            .cloned()
-            .collect();
-        // Same order as the Cypher (`ORDER BY r.started_at DESC`).
-        active.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-        Ok(active)
-    }
-
-    async fn list_all_plan_runs(
-        &self,
-        limit: i64,
-        offset: i64,
-        status: Option<&str>,
-        _workspace_slug: Option<&str>,
-    ) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
-        self.log_read("list_all_plan_runs")?;
-        let runs = self.plan_runs.read().await;
-        let mut result: Vec<_> = runs
-            .values()
-            .filter(|s| {
-                if let Some(st) = status {
-                    format!("{:?}", s.status) == st
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .collect();
-        result.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-        let start = (offset as usize).min(result.len());
-        result = result
-            .into_iter()
-            .skip(start)
-            .take(limit as usize)
-            .collect();
-        Ok(result)
-    }
-
-    async fn list_plan_runs(
-        &self,
-        plan_id: Uuid,
-        limit: i64,
-    ) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
-        let runs = self.plan_runs.read().await;
-        let mut result: Vec<_> = runs
-            .values()
-            .filter(|s| s.plan_id == plan_id)
-            .cloned()
-            .collect();
-        result.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-        result.truncate(limit as usize);
-        Ok(result)
-    }
-
-    // ── Triggers ──────────────────────────────────────────────────────────
-
-    async fn create_trigger(
-        &self,
-        trigger: &crate::runner::Trigger,
-    ) -> anyhow::Result<crate::runner::Trigger> {
-        // As the store does: the plan's mark is read in the same write.
-        let mut stored = trigger.clone();
-        stored.approved_mark = self
-            .plan_third_party_writes
-            .read()
-            .await
-            .get(&trigger.plan_id)
-            .copied();
-        let mut triggers = self.triggers.write().await;
-        triggers.insert(trigger.id, stored.clone());
-        Ok(stored)
-    }
-
-    async fn get_trigger(
-        &self,
-        trigger_id: Uuid,
-    ) -> anyhow::Result<Option<crate::runner::Trigger>> {
-        self.trigger_reads
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let triggers = self.triggers.read().await;
-        Ok(triggers.get(&trigger_id).cloned())
-    }
-
-    async fn list_triggers(&self, plan_id: Uuid) -> anyhow::Result<Vec<crate::runner::Trigger>> {
-        let triggers = self.triggers.read().await;
-        Ok(triggers
-            .values()
-            .filter(|t| t.plan_id == plan_id)
-            .cloned()
-            .collect())
-    }
-
-    async fn list_all_triggers(
-        &self,
-        trigger_type: Option<&str>,
-    ) -> anyhow::Result<Vec<crate::runner::Trigger>> {
-        let triggers = self.triggers.read().await;
-        Ok(triggers
-            .values()
-            .filter(|t| trigger_type.is_none_or(|tt| t.trigger_type.to_string() == tt))
-            .cloned()
-            .collect())
-    }
-
-    async fn disable_trigger(
-        &self,
-        trigger_id: Uuid,
-        reason: Option<&str>,
-    ) -> anyhow::Result<Option<crate::runner::Trigger>> {
-        let mut triggers = self.triggers.write().await;
-        Ok(triggers.get_mut(&trigger_id).map(|t| {
-            t.enabled = false;
-            t.disabled_reason = reason.map(str::to_string);
-            t.clone()
-        }))
-    }
-
-    async fn mark_third_party_write(
-        &self,
-        content: crate::runner::PlanContent,
-    ) -> anyhow::Result<Option<Uuid>> {
-        use crate::runner::PlanContent;
-        let plan_of_task = |task_id: Uuid| async move {
-            self.plan_tasks
-                .read()
-                .await
-                .iter()
-                .find(|(_, tasks)| tasks.contains(&task_id))
-                .map(|(plan, _)| *plan)
-        };
-        let task_of = |map: &HashMap<Uuid, Vec<Uuid>>, id: Uuid| {
-            map.iter()
-                .find(|(_, children)| children.contains(&id))
-                .map(|(task, _)| *task)
-        };
-        let plan_id = match content {
-            PlanContent::Plan(id) => self.plans.read().await.contains_key(&id).then_some(id),
-            PlanContent::Task(id) => plan_of_task(id).await,
-            PlanContent::Step(id) => {
-                let task = task_of(&*self.task_steps.read().await, id);
-                match task {
-                    Some(task) => plan_of_task(task).await,
-                    None => None,
-                }
-            }
-            PlanContent::Decision(id) => {
-                let task = task_of(&*self.task_decisions.read().await, id);
-                match task {
-                    Some(task) => plan_of_task(task).await,
-                    None => None,
-                }
-            }
-            PlanContent::Constraint(id) => task_of(&*self.plan_constraints.read().await, id),
-        };
-        if let Some(plan_id) = plan_id {
-            self.plan_third_party_writes
-                .write()
-                .await
-                .insert(plan_id, chrono::Utc::now());
-        }
-        Ok(plan_id)
-    }
-
-    async fn plan_third_party_written_at(
-        &self,
-        plan_id: Uuid,
-    ) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
-        if self
-            .fail_mark_read
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            anyhow::bail!("mark read failed (test)");
-        }
-        Ok(self
-            .plan_third_party_writes
-            .read()
-            .await
-            .get(&plan_id)
-            .copied())
-    }
-
-    async fn delete_trigger(&self, trigger_id: Uuid) -> anyhow::Result<()> {
-        let mut triggers = self.triggers.write().await;
-        triggers.remove(&trigger_id);
-        let mut firings = self.trigger_firings.write().await;
-        firings.remove(&trigger_id);
-        Ok(())
-    }
-
-    async fn record_trigger_firing(
-        &self,
-        firing: &crate::runner::TriggerFiring,
-    ) -> anyhow::Result<()> {
-        let mut firings = self.trigger_firings.write().await;
-        firings
-            .entry(firing.trigger_id)
-            .or_default()
-            .push(firing.clone());
-        // Update trigger fire_count and last_fired
-        let mut triggers = self.triggers.write().await;
-        if let Some(t) = triggers.get_mut(&firing.trigger_id) {
-            // `last_fired` belongs to the reservation (`reserve_trigger_signal`):
-            // a firing refused before it consumes no cooldown.
-            t.fire_count += 1;
-        }
-        Ok(())
-    }
-
-    async fn enable_trigger_as(
-        &self,
-        trigger_id: Uuid,
-        author: &crate::runner::TriggerAuthor,
-    ) -> anyhow::Result<Option<crate::runner::Trigger>> {
-        let marks = self.plan_third_party_writes.read().await;
-        let mut triggers = self.triggers.write().await;
-        Ok(triggers.get_mut(&trigger_id).map(|t| {
-            t.enabled = true;
-            t.author = Some(author.clone());
-            t.disabled_reason = None;
-            t.approved_mark = marks.get(&t.plan_id).copied();
-            t.clone()
-        }))
-    }
-
-    async fn reserve_trigger_signal(
-        &self,
-        trigger_id: Uuid,
-        key: &str,
-        cooldown_secs: u64,
-    ) -> anyhow::Result<crate::runner::SignalReservation> {
-        use crate::runner::SignalReservation;
-        // The trigger's write lock held across the reads and the writes, as
-        // the Cypher statement holds the Trigger node's.
-        let mut triggers = self.triggers.write().await;
-        let Some(trigger) = triggers.get_mut(&trigger_id) else {
-            return Ok(SignalReservation::Duplicate);
-        };
-        let now = chrono::Utc::now();
-        let mut reservations = self.trigger_reservations.write().await;
-        reservations.retain(|_, at| {
-            now - *at
-                < chrono::Duration::hours(crate::neo4j::trigger::TRIGGER_SIGNAL_RETENTION_HOURS)
-        });
-        if reservations.contains_key(&(trigger_id, key.to_string())) {
-            return Ok(SignalReservation::Duplicate);
-        }
-        if cooldown_secs > 0
-            && trigger
-                .last_fired
-                .is_some_and(|at| now - at < chrono::Duration::seconds(cooldown_secs as i64))
-        {
-            return Ok(SignalReservation::Cooldown);
-        }
-        reservations.insert((trigger_id, key.to_string()), now);
-        trigger.last_fired = Some(now);
-        Ok(SignalReservation::Reserved)
-    }
-
-    async fn list_trigger_firings(
-        &self,
-        trigger_id: Uuid,
-        limit: i64,
-    ) -> anyhow::Result<Vec<crate::runner::TriggerFiring>> {
-        let firings = self.trigger_firings.read().await;
-        let mut result: Vec<_> = firings.get(&trigger_id).cloned().unwrap_or_default();
-        result.sort_by(|a, b| b.fired_at.cmp(&a.fired_at));
-        result.truncate(limit as usize);
-        Ok(result)
-    }
-
-    async fn record_external_event(
-        &self,
-        event: &crate::ingress::ExternalEvent,
-    ) -> anyhow::Result<()> {
-        if self
-            .fail_external_event_writes
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            anyhow::bail!("mock: external event journal write failed");
-        }
-        self.external_events.write().await.push(event.clone());
-        Ok(())
-    }
-
-    async fn list_external_events(
-        &self,
-        trigger_id: Uuid,
-        limit: i64,
-    ) -> anyhow::Result<Vec<crate::ingress::ExternalEvent>> {
-        let events = self.external_events.read().await;
-        let mut result: Vec<_> = events
-            .iter()
-            .filter(|e| e.trigger_id == trigger_id)
-            .cloned()
-            .collect();
-        result.sort_by(|a, b| b.received_at.cmp(&a.received_at));
-        result.truncate(limit.max(0) as usize);
-        Ok(result)
-    }
-
-    async fn claim_external_delivery(
-        &self,
-        trigger_id: Uuid,
-        delivery_key: &str,
-    ) -> anyhow::Result<bool> {
-        Ok(self
-            .external_deliveries
-            .write()
-            .await
-            .insert((trigger_id, delivery_key.to_string())))
-    }
-
-    async fn release_external_delivery(
-        &self,
-        trigger_id: Uuid,
-        delivery_key: &str,
-    ) -> anyhow::Result<bool> {
-        Ok(self
-            .external_deliveries
-            .write()
-            .await
-            .remove(&(trigger_id, delivery_key.to_string())))
-    }
-
-    async fn purge_external_events_before(
-        &self,
-        before: chrono::DateTime<chrono::Utc>,
-    ) -> anyhow::Result<u64> {
-        let mut events = self.external_events.write().await;
-        let len = events.len();
-        events.retain(|e| e.received_at >= before);
-        Ok((len - events.len()) as u64)
-    }
-
-    // ── Cognitive routing (in-memory mock) ──────────────────────────────────
-
-    async fn get_routing_arm(
-        &self,
-        key: &crate::chat::provider::cognitive::store::ArmKey,
-    ) -> anyhow::Result<Option<crate::chat::provider::cognitive::store::ArmStats>> {
-        use crate::chat::provider::cognitive::store::RoutingArmStore;
-        self.routing.arm(key).await
-    }
-
-    async fn list_routing_arms(
-        &self,
-        class: &str,
-    ) -> anyhow::Result<Vec<crate::chat::provider::cognitive::store::ArmStats>> {
-        use crate::chat::provider::cognitive::store::RoutingArmStore;
-        self.routing.arms_of_class(class).await
-    }
-
-    async fn observe_routing_arm(
-        &self,
-        key: &crate::chat::provider::cognitive::store::ArmKey,
-        observation: &crate::chat::provider::cognitive::store::ArmObservation,
-    ) -> anyhow::Result<crate::chat::provider::cognitive::store::ArmStats> {
-        use crate::chat::provider::cognitive::store::RoutingArmStore;
-        self.routing.observe(key, observation).await
-    }
-
-    async fn put_routing_decision(
-        &self,
-        decision: &crate::chat::provider::cognitive::decision::CognitiveDecision,
-    ) -> anyhow::Result<()> {
-        use crate::chat::provider::cognitive::store::RoutingArmStore;
-        self.routing.put_decision(decision).await
-    }
-
-    async fn get_routing_decision(
-        &self,
-        id: Uuid,
-    ) -> anyhow::Result<Option<crate::chat::provider::cognitive::decision::CognitiveDecision>> {
-        use crate::chat::provider::cognitive::store::RoutingArmStore;
-        self.routing.decision(id).await
-    }
-
-    async fn list_routing_decisions(
-        &self,
-        filter: &crate::chat::provider::cognitive::store::DecisionFilter,
-    ) -> anyhow::Result<Vec<crate::chat::provider::cognitive::decision::CognitiveDecision>> {
-        use crate::chat::provider::cognitive::store::RoutingArmStore;
-        self.routing.decisions(filter).await
-    }
-
-    async fn set_routing_decision_outcome(
-        &self,
-        id: Uuid,
-        outcome: crate::chat::provider::cognitive::decision::DecisionOutcome,
-    ) -> anyhow::Result<bool> {
-        use crate::chat::provider::cognitive::store::RoutingArmStore;
-        self.routing.set_outcome(id, outcome).await
-    }
-
-    // ── Conversation segments (in-memory mock) ──────────────────────────────
-
-    async fn put_segments(
-        &self,
-        conversation: &str,
-        segments: &[crate::chat::provider::cognitive::segment::Segment],
-    ) -> anyhow::Result<()> {
-        use crate::chat::provider::cognitive::segment_store::SegmentStore;
-        self.segments.put_segments(conversation, segments).await
-    }
-
-    async fn get_segments(
-        &self,
-        conversation: &str,
-    ) -> anyhow::Result<Vec<crate::chat::provider::cognitive::segment::Segment>> {
-        use crate::chat::provider::cognitive::segment_store::SegmentStore;
-        self.segments.segments(conversation).await
-    }
-
-    async fn put_boundaries(
-        &self,
-        conversation: &str,
-        boundaries: &[crate::chat::provider::cognitive::segment::Boundary],
-    ) -> anyhow::Result<()> {
-        use crate::chat::provider::cognitive::segment_store::SegmentStore;
-        self.segments.put_boundaries(conversation, boundaries).await
-    }
-
-    async fn get_boundaries(
-        &self,
-        conversation: &str,
-    ) -> anyhow::Result<Vec<crate::chat::provider::cognitive::segment::Boundary>> {
-        use crate::chat::provider::cognitive::segment_store::SegmentStore;
-        self.segments.boundaries(conversation).await
-    }
-
-    // ── AgentExecution (in-memory mock) ─────────────────────────────────────
-
-    async fn create_agent_execution(
-        &self,
-        ae: &crate::neo4j::agent_execution::AgentExecutionNode,
-    ) -> anyhow::Result<()> {
-        self.agent_executions
-            .write()
-            .await
-            .insert(ae.id, ae.clone());
-        Ok(())
-    }
-
-    async fn update_agent_execution(
-        &self,
-        ae: &crate::neo4j::agent_execution::AgentExecutionNode,
-    ) -> anyhow::Result<()> {
-        if self
-            .fail_agent_execution_updates
-            .lock()
-            .is_ok_and(|f| f.contains(&ae.id))
-        {
-            anyhow::bail!(
-                "mock: update_agent_execution failure injected for {}",
-                ae.id
-            );
-        }
-        // Like the Cypher `MATCH ... SET`: updating a node that is absent is a no-op.
-        if let Some(slot) = self.agent_executions.write().await.get_mut(&ae.id) {
-            *slot = ae.clone();
-        }
-        Ok(())
-    }
-
-    async fn get_agent_executions_for_run(
-        &self,
-        run_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>> {
-        let mut v: Vec<_> = self
-            .agent_executions
-            .read()
-            .await
-            .values()
-            .filter(|ae| ae.run_id == run_id)
-            .cloned()
-            .collect();
-        v.sort_by_key(|ae| ae.started_at);
-        Ok(v)
-    }
-
-    async fn list_running_agent_executions(
-        &self,
-    ) -> anyhow::Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>> {
-        let mut v: Vec<_> = self
-            .agent_executions
-            .read()
-            .await
-            .values()
-            .filter(|ae| ae.status == crate::neo4j::agent_execution::AgentExecutionStatus::Running)
-            .cloned()
-            .collect();
-        v.sort_by_key(|ae| ae.started_at);
-        Ok(v)
-    }
-
-    async fn record_agent_execution_verification(
-        &self,
-        agent_execution_id: Uuid,
-        verification_json: &str,
-    ) -> anyhow::Result<()> {
-        if let Some(node) = self
-            .agent_executions
-            .write()
-            .await
-            .get_mut(&agent_execution_id)
-        {
-            node.verification_json = Some(verification_json.to_string());
-            if let Some(passed) =
-                crate::runner::routing::verification_passed(Some(verification_json))
-            {
-                node.verification_passed = Some(passed);
-            }
-        }
-        Ok(())
-    }
-
-    async fn agent_execution_cost_breakdown(
-        &self,
-        group_by: crate::neo4j::agent_execution::CostGroupBy,
-        from: chrono::DateTime<chrono::Utc>,
-        to: chrono::DateTime<chrono::Utc>,
-    ) -> anyhow::Result<Vec<crate::neo4j::agent_execution::CostBreakdownRow>> {
-        use crate::neo4j::agent_execution::{breakdown, in_breakdown_window};
-        let store = self.agent_executions.read().await;
-        Ok(breakdown(
-            store
-                .values()
-                .filter(|ae| in_breakdown_window(ae, from, to)),
-            group_by,
-        ))
-    }
-
-    async fn create_used_skill_relation(
-        &self,
-        _agent_execution_id: Uuid,
-        _skill_id: Uuid,
-        _result: &str,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn get_all_pagerank_values(&self, _project_id: Uuid) -> anyhow::Result<Vec<f64>> {
-        Ok(Vec::new())
-    }
-
-    async fn get_community_risk_vectors(&self, _project_id: Uuid) -> anyhow::Result<Vec<Vec<f64>>> {
-        Ok(Vec::new())
-    }
-
-    async fn get_all_risk_score_values(&self, _project_id: Uuid) -> anyhow::Result<Vec<f64>> {
-        Ok(Vec::new())
-    }
-
-    // ========================================================================
-    // Sharing & Privacy operations
-    // ========================================================================
-
-    async fn get_sharing_policy(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Option<crate::episodes::distill_models::SharingPolicy>> {
-        self.count_read();
-        Ok(self.sharing_policies.read().await.get(&project_id).cloned())
-    }
-
-    async fn update_sharing_policy(
-        &self,
-        project_id: Uuid,
-        policy: &crate::episodes::distill_models::SharingPolicy,
-    ) -> anyhow::Result<()> {
-        self.sharing_policies
-            .write()
-            .await
-            .insert(project_id, policy.clone());
-        Ok(())
-    }
-
-    async fn get_sharing_consent(
-        &self,
-        note_id: Uuid,
-    ) -> anyhow::Result<crate::episodes::distill_models::SharingConsent> {
-        Ok(self
-            .notes
-            .read()
-            .await
-            .get(&note_id)
-            .map(|n| n.sharing_consent)
-            .unwrap_or_default())
-    }
-
-    async fn update_sharing_consent(
-        &self,
-        note_id: Uuid,
-        consent: &crate::episodes::distill_models::SharingConsent,
-    ) -> anyhow::Result<()> {
-        if let Some(n) = self.notes.write().await.get_mut(&note_id) {
-            n.sharing_consent = *consent;
-        }
-        Ok(())
-    }
-
-    async fn update_decision_sharing_consent(
-        &self,
-        decision_id: Uuid,
-        consent: &crate::episodes::distill_models::SharingConsent,
-    ) -> anyhow::Result<()> {
-        if let Some(d) = self.decisions.write().await.get_mut(&decision_id) {
-            d.sharing_consent = *consent;
-        }
-        Ok(())
-    }
-
-    async fn count_notes_by_consent(
-        &self,
-        project_id: Option<Uuid>,
-    ) -> anyhow::Result<crate::episodes::distill_models::ConsentCounts> {
-        let mut counts = crate::episodes::distill_models::ConsentCounts::default();
-        for n in self.notes.read().await.values() {
-            if project_id.is_none() || n.project_id == project_id {
-                counts.add(n.sharing_consent, 1);
-            }
-        }
-        Ok(counts)
-    }
-
-    async fn create_sharing_event(
-        &self,
-        _event: &crate::episodes::distill_models::SharingEvent,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn list_sharing_events(
-        &self,
-        _project_id: Uuid,
-        _limit: i64,
-        _offset: i64,
-    ) -> anyhow::Result<Vec<crate::episodes::distill_models::SharingEvent>> {
-        Ok(Vec::new())
-    }
-
-    async fn persist_tombstone(
-        &self,
-        _tombstone: &crate::reception::anchor::SignedTombstone,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn list_tombstones(
-        &self,
-    ) -> anyhow::Result<Vec<crate::reception::anchor::SignedTombstone>> {
-        Ok(Vec::new())
-    }
-
-    async fn is_tombstoned(&self, _content_hash: &str) -> anyhow::Result<bool> {
-        Ok(false)
-    }
-
-    // ========================================================================
-    // UserProfile operations
-    // ========================================================================
-
-    async fn create_or_get_user_profile(
-        &self,
-        user_id: &str,
-    ) -> anyhow::Result<crate::profile::UserProfile> {
-        let mut profiles = self.user_profiles.write().await;
-        if let Some(profile) = profiles.get(user_id) {
-            return Ok(profile.clone());
-        }
-        let profile = crate::profile::UserProfile::new(user_id);
-        profiles.insert(user_id.to_string(), profile.clone());
-        Ok(profile)
-    }
-
-    async fn update_user_profile(
-        &self,
-        profile: &crate::profile::UserProfile,
-    ) -> anyhow::Result<()> {
-        let mut profiles = self.user_profiles.write().await;
-        profiles.insert(profile.user_id.clone(), profile.clone());
-        Ok(())
-    }
-
-    async fn get_user_profile(
-        &self,
-        user_id: &str,
-    ) -> anyhow::Result<Option<crate::profile::UserProfile>> {
-        let profiles = self.user_profiles.read().await;
-        Ok(profiles.get(user_id).cloned())
-    }
-
-    async fn upsert_works_on(&self, user_id: &str, project_id: Uuid) -> anyhow::Result<()> {
-        let mut works = self.works_on.write().await;
-        let key = (user_id.to_string(), project_id);
-        let entry = works
-            .entry(key)
-            .or_insert_with(|| crate::profile::WorksOnRelation {
-                user_id: user_id.to_string(),
-                project_id,
-                frequency: 0,
-                last_active: chrono::Utc::now(),
-            });
-        entry.frequency += 1;
-        entry.last_active = chrono::Utc::now();
-        Ok(())
-    }
-
-    async fn get_works_on(
-        &self,
-        user_id: &str,
-    ) -> anyhow::Result<Vec<crate::profile::WorksOnRelation>> {
-        let works = self.works_on.read().await;
-        let mut result: Vec<_> = works
-            .iter()
-            .filter(|((uid, _), _)| uid == user_id)
-            .map(|(_, rel)| rel.clone())
-            .collect();
-        result.sort_by(|a, b| b.last_active.cmp(&a.last_active));
-        Ok(result)
-    }
-
-    // ========================================================================
-    // Alert operations (Heartbeat Engine)
-    // ========================================================================
-
-    async fn create_alert(&self, alert: &AlertNode) -> anyhow::Result<()> {
-        self.alerts.write().await.insert(alert.id, alert.clone());
-        Ok(())
-    }
-
-    async fn list_pending_alerts(
-        &self,
-        project_id: Option<Uuid>,
-        limit: usize,
-    ) -> anyhow::Result<Vec<AlertNode>> {
-        let alerts = self.alerts.read().await;
-        let mut result: Vec<_> = alerts
-            .values()
-            .filter(|a| !a.acknowledged)
-            .filter(|a| match project_id {
-                Some(pid) => a.project_id == Some(pid),
-                None => true,
-            })
-            .cloned()
-            .collect();
-        result.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        result.truncate(limit);
-        Ok(result)
-    }
-
-    async fn acknowledge_alert(&self, alert_id: Uuid, acknowledged_by: &str) -> anyhow::Result<()> {
-        let mut alerts = self.alerts.write().await;
-        if let Some(alert) = alerts.get_mut(&alert_id) {
-            alert.acknowledged = true;
-            alert.acknowledged_by = Some(acknowledged_by.to_string());
-            alert.acknowledged_at = Some(Utc::now());
-        }
-        Ok(())
-    }
-
-    async fn get_alert(&self, alert_id: Uuid) -> anyhow::Result<Option<AlertNode>> {
-        Ok(self.alerts.read().await.get(&alert_id).cloned())
-    }
-
-    async fn list_alerts(
-        &self,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<(Vec<AlertNode>, usize)> {
-        self.log_read("list_alerts")?;
-        let scope = self.scope_projects(project_id, workspace_slug).await;
-        let alerts = self.alerts.read().await;
-        let mut all: Vec<_> = alerts
-            .values()
-            .filter(|a| match scope {
-                Some(ref s) => a.project_id.is_some_and(|p| s.contains(&p)),
-                None => true,
-            })
-            .cloned()
-            .collect();
-        all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        let total = all.len();
-        let page = all.into_iter().skip(offset).take(limit).collect();
-        Ok((page, total))
-    }
-
-    async fn list_event_triggers(
-        &self,
-        project_scope: Option<Uuid>,
-        enabled_only: bool,
-    ) -> Result<Vec<EventTrigger>> {
-        Ok(self
-            .event_triggers
-            .read()
-            .await
-            .values()
-            .filter(|t| !enabled_only || t.enabled)
-            .filter(|t| project_scope.is_none() || t.project_scope == project_scope)
-            .cloned()
-            .collect())
-    }
-
-    async fn create_event_trigger(&self, trigger: &EventTrigger) -> Result<Uuid> {
-        self.event_triggers
-            .write()
-            .await
-            .insert(trigger.id, trigger.clone());
-        Ok(trigger.id)
-    }
-
-    async fn get_event_trigger(&self, _id: Uuid) -> Result<Option<EventTrigger>> {
-        Ok(None)
-    }
-
-    async fn update_event_trigger(
-        &self,
-        _id: Uuid,
-        _enabled: Option<bool>,
-        _name: Option<String>,
-        _entity_type_pattern: Option<Option<String>>,
-        _action_pattern: Option<Option<String>>,
-        _payload_conditions: Option<Option<serde_json::Value>>,
-        _cooldown_secs: Option<u32>,
-        _project_scope: Option<Option<Uuid>>,
-    ) -> Result<bool> {
-        Ok(false)
-    }
-
-    async fn delete_event_trigger(&self, _id: Uuid) -> Result<bool> {
-        Ok(false)
-    }
-
-    // ========================================================================
-    // LifecycleHook operations
-    // ========================================================================
-
-    async fn create_lifecycle_hook(&self, hook: &LifecycleHook) -> Result<()> {
-        self.lifecycle_hooks
-            .write()
-            .await
-            .insert(hook.id, hook.clone());
-        Ok(())
-    }
-
-    async fn get_lifecycle_hook(&self, id: Uuid) -> Result<Option<LifecycleHook>> {
-        Ok(self.lifecycle_hooks.read().await.get(&id).cloned())
-    }
-
-    async fn list_lifecycle_hooks(&self, project_id: Option<Uuid>) -> Result<Vec<LifecycleHook>> {
-        let hooks = self.lifecycle_hooks.read().await;
-        let mut result: Vec<LifecycleHook> = hooks
-            .values()
-            .filter(|h| match project_id {
-                Some(pid) => h.project_id == Some(pid) || h.project_id.is_none(),
-                None => true,
-            })
-            .cloned()
-            .collect();
-        result.sort_by_key(|h| h.priority);
-        Ok(result)
-    }
-
-    async fn update_lifecycle_hook(
-        &self,
-        id: Uuid,
-        updates: &UpdateLifecycleHookRequest,
-    ) -> Result<()> {
-        if let Some(h) = self.lifecycle_hooks.write().await.get_mut(&id) {
-            if let Some(name) = &updates.name {
-                h.name = name.clone();
-            }
-            if let Some(description) = &updates.description {
-                h.description = description.clone();
-            }
-            if let Some(on_status) = &updates.on_status {
-                h.on_status = on_status.clone();
-            }
-            if let Some(action_config) = &updates.action_config {
-                h.action_config = action_config.clone();
-            }
-            if let Some(priority) = &updates.priority {
-                h.priority = *priority;
-            }
-            if let Some(enabled) = &updates.enabled {
-                h.enabled = *enabled;
-            }
-            h.updated_at = Some(Utc::now());
-        }
-        Ok(())
-    }
-
-    async fn delete_lifecycle_hook(&self, id: Uuid) -> Result<()> {
-        let hooks = self.lifecycle_hooks.read().await;
-        if let Some(h) = hooks.get(&id) {
-            if h.builtin {
-                anyhow::bail!("Cannot delete builtin lifecycle hook");
-            }
-        }
-        drop(hooks);
-        self.lifecycle_hooks.write().await.remove(&id);
-        Ok(())
-    }
-
-    async fn list_hooks_for_scope(
-        &self,
-        scope: &LifecycleScope,
-        on_status: &str,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<LifecycleHook>> {
-        let hooks = self.lifecycle_hooks.read().await;
-        let mut result: Vec<LifecycleHook> = hooks
-            .values()
-            .filter(|h| {
-                h.scope == *scope
-                    && h.on_status == on_status
-                    && h.enabled
-                    && match project_id {
-                        Some(pid) => h.project_id == Some(pid) || h.project_id.is_none(),
-                        None => h.project_id.is_none(),
-                    }
-            })
-            .cloned()
-            .collect();
-        result.sort_by_key(|h| h.priority);
-        Ok(result)
-    }
-
-    // ========================================================================
-    // MCP Federation operations
-    // ========================================================================
-
-    async fn create_mcp_server(&self, server: &McpServerNode) -> Result<()> {
-        let sid = server.id;
-        self.mcp_project_servers
-            .write()
-            .await
-            .entry(server.project_id)
-            .or_default()
-            .push(sid);
-        self.mcp_servers.write().await.insert(sid, server.clone());
-        Ok(())
-    }
-
-    async fn get_mcp_server(&self, id: Uuid) -> Result<Option<McpServerNode>> {
-        Ok(self.mcp_servers.read().await.get(&id).cloned())
-    }
-
-    async fn list_mcp_servers(&self, project_id: Uuid) -> Result<Vec<McpServerNode>> {
-        let idx = self.mcp_project_servers.read().await;
-        let servers = self.mcp_servers.read().await;
-        let ids = idx.get(&project_id).cloned().unwrap_or_default();
-        let mut result: Vec<_> = ids
-            .iter()
-            .filter_map(|id| servers.get(id).cloned())
-            .collect();
-        result.sort_by(|a, b| a.server_id.cmp(&b.server_id));
-        Ok(result)
-    }
-
-    async fn list_all_mcp_servers(&self) -> Result<Vec<McpServerNode>> {
-        let servers = self.mcp_servers.read().await;
-        let mut result: Vec<_> = servers.values().cloned().collect();
-        result.sort_by(|a, b| a.server_id.cmp(&b.server_id));
-        Ok(result)
-    }
-
-    async fn delete_mcp_server(&self, id: Uuid) -> Result<()> {
-        if let Some(server) = self.mcp_servers.write().await.remove(&id) {
-            // Remove from project index
-            if let Some(ids) = self
-                .mcp_project_servers
-                .write()
-                .await
-                .get_mut(&server.project_id)
-            {
-                ids.retain(|i| *i != id);
-            }
-            // Remove associated tools
-            let server_id = server.server_id;
-            let tool_ids = self
-                .mcp_server_tools
-                .write()
-                .await
-                .remove(&server_id)
-                .unwrap_or_default();
-            let mut tools = self.mcp_tools.write().await;
-            for tid in tool_ids {
-                tools.remove(&tid);
-            }
-        }
-        Ok(())
-    }
-
-    async fn delete_mcp_server_by_server_id(&self, server_id: &str) -> Result<()> {
-        // Find the UUID for this server_id
-        let uuid = {
-            let servers = self.mcp_servers.read().await;
-            servers
-                .values()
-                .find(|s| s.server_id == server_id)
-                .map(|s| s.id)
-        };
-        if let Some(id) = uuid {
-            self.delete_mcp_server(id).await?;
-        }
-        Ok(())
-    }
-
-    async fn update_mcp_server_status(&self, id: Uuid, status: &str) -> Result<()> {
-        if let Some(s) = self.mcp_servers.write().await.get_mut(&id) {
-            s.status = status.to_string();
-            s.updated_at = Some(Utc::now());
-        }
-        Ok(())
-    }
-
-    async fn create_mcp_tool(&self, tool: &McpToolNode) -> Result<()> {
-        let tid = tool.id;
-        self.mcp_server_tools
-            .write()
-            .await
-            .entry(tool.server_id.clone())
-            .or_default()
-            .push(tid);
-        self.mcp_tools.write().await.insert(tid, tool.clone());
-        Ok(())
-    }
-
-    async fn list_mcp_tools_for_server(&self, server_id: &str) -> Result<Vec<McpToolNode>> {
-        let idx = self.mcp_server_tools.read().await;
-        let tools = self.mcp_tools.read().await;
-        let ids = idx.get(server_id).cloned().unwrap_or_default();
-        let mut result: Vec<_> = ids.iter().filter_map(|id| tools.get(id).cloned()).collect();
-        result.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(result)
-    }
-
-    async fn delete_mcp_tools_for_server(&self, server_id: &str) -> Result<()> {
-        let tool_ids = self
-            .mcp_server_tools
-            .write()
-            .await
-            .remove(server_id)
-            .unwrap_or_default();
-        let mut tools = self.mcp_tools.write().await;
-        for tid in tool_ids {
-            tools.remove(&tid);
-        }
-        Ok(())
-    }
-
-    async fn create_mcp_similar_to(
-        &self,
-        tool_fqn: &str,
-        similar_to_fqn: &str,
-        score: f64,
-    ) -> Result<()> {
-        self.mcp_similar_to
-            .write()
-            .await
-            .insert((tool_fqn.to_string(), similar_to_fqn.to_string()), score);
-        Ok(())
-    }
-
-    async fn create_mcp_co_activated(
-        &self,
-        tool_fqn_a: &str,
-        tool_fqn_b: &str,
-        count: i64,
-    ) -> Result<()> {
-        self.mcp_co_activated
-            .write()
-            .await
-            .insert((tool_fqn_a.to_string(), tool_fqn_b.to_string()), count);
-        Ok(())
-    }
-
-    async fn create_mcp_often_follows(
-        &self,
-        tool_fqn_a: &str,
-        tool_fqn_b: &str,
-        count: i64,
-        avg_delta_ms: f64,
-    ) -> Result<()> {
-        self.mcp_often_follows.write().await.insert(
-            (tool_fqn_a.to_string(), tool_fqn_b.to_string()),
-            (count, avg_delta_ms),
-        );
-        Ok(())
-    }
-
-    async fn backfill_co_activated_with(&self) -> Result<usize> {
-        // Mock: no chat event records to scan, return 0
-        Ok(0)
-    }
-
-    async fn backfill_often_follows(&self) -> Result<usize> {
-        // Mock: no chat event records to scan, return 0
-        Ok(0)
-    }
-
-    async fn get_entity_neighborhood(
-        &self,
-        center_type: &str,
-        center_id: &str,
-        params: &crate::graph::neighborhood::NeighborhoodParams,
-    ) -> Result<Option<crate::graph::neighborhood::RawNeighborhood>> {
-        let graph = self.neighborhood_graph.read().await;
-        Ok(crate::graph::neighborhood::expand_in_memory(
-            &graph,
-            center_type,
-            center_id,
-            params,
-        ))
-    }
-
-    async fn get_scoped_entity_neighborhood(
-        &self,
-        center_type: &str,
-        center_id: &str,
-        params: &crate::graph::neighborhood::NeighborhoodParams,
-        filter: &crate::graph::neighborhood::ProjectFilter,
-    ) -> Result<Option<crate::graph::neighborhood::ScopedNeighborhood>> {
-        self.count_read();
-        let graph = self.neighborhood_graph.read().await;
-        let ownership = self.neighborhood_ownership.read().await;
-        Ok(crate::graph::neighborhood::expand_in_memory_scoped(
-            &graph,
-            &ownership,
-            center_type,
-            center_id,
-            params,
-            filter,
-        ))
     }
 }
 
@@ -19363,5 +11656,7718 @@ impl ReleaseStore for MockGraphStore {
             .collect();
         let total = filtered.len();
         Ok((paginate(&filtered, limit, offset), total))
+    }
+}
+
+#[async_trait]
+impl NoteStore for MockGraphStore {
+    // ========================================================================
+    // Document operations
+    // ========================================================================
+
+    async fn create_document(&self, document: &Document, chunks: &[DocumentChunk]) -> Result<()> {
+        self.documents
+            .write()
+            .await
+            .insert(document.id, document.clone());
+        self.document_chunks
+            .write()
+            .await
+            .insert(document.id, Vec::new());
+        self.upsert_document_chunks(document.id, chunks).await?;
+        Ok(())
+    }
+
+    async fn get_document(&self, id: Uuid) -> Result<Option<Document>> {
+        Ok(self.documents.read().await.get(&id).cloned())
+    }
+
+    async fn find_document_by_sha256(
+        &self,
+        sha256: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Option<Document>> {
+        let documents = self.documents.read().await;
+        let mut matches: Vec<&Document> = documents
+            .values()
+            .filter(|d| d.sha256 == sha256)
+            .filter(|d| project_id.is_none() || d.project_id == project_id)
+            .collect();
+        matches.sort_by_key(|d| d.created_at);
+        Ok(matches.first().map(|d| (*d).clone()))
+    }
+
+    async fn list_project_documents(&self, project_id: Uuid) -> Result<Vec<Document>> {
+        let documents = self.documents.read().await;
+        let mut out: Vec<Document> = documents
+            .values()
+            .filter(|d| d.project_id == Some(project_id))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(out)
+    }
+
+    async fn get_document_chunks(&self, document_id: Uuid) -> Result<Vec<DocumentChunk>> {
+        let chunks = self.document_chunks.read().await;
+        let mut out = chunks.get(&document_id).cloned().unwrap_or_default();
+        out.sort_by_key(|c| c.ordinal);
+        Ok(out)
+    }
+
+    async fn upsert_document_chunks(
+        &self,
+        document_id: Uuid,
+        chunks: &[DocumentChunk],
+    ) -> Result<usize> {
+        let mut store = self.document_chunks.write().await;
+        let existing = store.entry(document_id).or_default();
+        for chunk in chunks {
+            // MERGE on id: a re-ingestion converges instead of duplicating.
+            match existing.iter_mut().find(|c| c.id == chunk.id) {
+                Some(slot) => *slot = chunk.clone(),
+                None => existing.push(chunk.clone()),
+            }
+        }
+        Ok(chunks.len())
+    }
+
+    async fn set_document_chunk_embeddings(
+        &self,
+        embeddings: &[(Uuid, Vec<f32>)],
+        _model: &str,
+    ) -> Result<usize> {
+        let mut store = self.document_chunks.write().await;
+        let mut written = 0;
+        for (chunk_id, vector) in embeddings {
+            for chunks in store.values_mut() {
+                if let Some(chunk) = chunks.iter_mut().find(|c| c.id == *chunk_id) {
+                    chunk.embedding = Some(vector.clone());
+                    written += 1;
+                    break;
+                }
+            }
+        }
+        Ok(written)
+    }
+
+    async fn vector_search_document_chunks(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+        min_similarity: Option<f64>,
+    ) -> Result<Vec<DocumentChunkHit>> {
+        let documents = self.documents.read().await;
+        let chunks = self.document_chunks.read().await;
+
+        let mut hits: Vec<DocumentChunkHit> = Vec::new();
+        for (document_id, document_chunks) in chunks.iter() {
+            let Some(document) = documents.get(document_id) else {
+                continue;
+            };
+            if project_id.is_some() && document.project_id != project_id {
+                continue;
+            }
+            for chunk in document_chunks {
+                let Some(vector) = chunk.embedding.as_ref() else {
+                    continue;
+                };
+                let score = cosine_similarity(embedding, vector);
+                if let Some(floor) = min_similarity {
+                    if score < floor {
+                        continue;
+                    }
+                }
+                hits.push(DocumentChunkHit {
+                    document_id: *document_id,
+                    filename: document.filename.clone(),
+                    chunk: chunk.clone(),
+                    score,
+                });
+            }
+        }
+
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    async fn delete_document(&self, id: Uuid) -> Result<bool> {
+        let removed = self.documents.write().await.remove(&id).is_some();
+        // Chunks and links go with the document, as DETACH DELETE does.
+        self.document_chunks.write().await.remove(&id);
+        self.document_links.write().await.remove(&id);
+        Ok(removed)
+    }
+
+    async fn link_document_to_entity(
+        &self,
+        document_id: Uuid,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<()> {
+        let mut links = self.document_links.write().await;
+        let edges = links.entry(document_id).or_default();
+        let edge = (entity_type.clone(), entity_id.to_string());
+        if !edges.contains(&edge) {
+            edges.push(edge);
+        }
+        Ok(())
+    }
+
+    async fn unlink_document_from_entity(
+        &self,
+        document_id: Uuid,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<()> {
+        if let Some(edges) = self.document_links.write().await.get_mut(&document_id) {
+            edges.retain(|(t, id)| !(t == entity_type && id == entity_id));
+        }
+        Ok(())
+    }
+
+    async fn get_documents_for_entity(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<Vec<Document>> {
+        let links = self.document_links.read().await;
+        let documents = self.documents.read().await;
+        let mut out: Vec<Document> = links
+            .iter()
+            .filter(|(_, edges)| {
+                edges
+                    .iter()
+                    .any(|(t, id)| t == entity_type && id == entity_id)
+            })
+            .filter_map(|(document_id, _)| documents.get(document_id).cloned())
+            .collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(out)
+    }
+
+    async fn link_note_to_document(&self, note_id: Uuid, document_id: Uuid) -> Result<()> {
+        // The Cypher writes (:Note)-[:LINKED_TO]->(:Document); reads are
+        // undirected, so the mock records the same edge once.
+        self.link_document_to_entity(document_id, &EntityType::Note, &note_id.to_string())
+            .await
+    }
+
+    // ========================================================================
+    // Knowledge Note operations
+    // ========================================================================
+
+    async fn create_note(&self, note: &Note) -> Result<()> {
+        self.notes.write().await.insert(note.id, note.clone());
+        Ok(())
+    }
+
+    async fn get_note(&self, id: Uuid) -> Result<Option<Note>> {
+        Ok(self.notes.read().await.get(&id).cloned())
+    }
+
+    async fn update_note(
+        &self,
+        id: Uuid,
+        content: Option<String>,
+        importance: Option<NoteImportance>,
+        status: Option<NoteStatus>,
+        tags: Option<Vec<String>>,
+        staleness_score: Option<f64>,
+    ) -> Result<Option<Note>> {
+        let mut notes = self.notes.write().await;
+        if let Some(n) = notes.get_mut(&id) {
+            if let Some(c) = content {
+                n.content = c;
+            }
+            if let Some(i) = importance {
+                n.importance = i;
+            }
+            if let Some(s) = status {
+                n.status = s;
+            }
+            if let Some(t) = tags {
+                n.tags = t;
+            }
+            if let Some(ss) = staleness_score {
+                n.staleness_score = ss;
+            }
+            Ok(Some(n.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn rescope_note(&self, note_id: Uuid, project_id: Option<Uuid>) -> anyhow::Result<()> {
+        let mut notes = self.notes.write().await;
+        match notes.get_mut(&note_id) {
+            Some(note) => {
+                note.project_id = project_id;
+                Ok(())
+            }
+            None => anyhow::bail!("note {} not found", note_id),
+        }
+    }
+
+    async fn delete_note(&self, id: Uuid) -> Result<bool> {
+        let removed = self.notes.write().await.remove(&id).is_some();
+        self.note_anchors.write().await.remove(&id);
+        // Also clean up synapses (both directions)
+        if removed {
+            let mut synapses = self.note_synapses.write().await;
+            // Remove this note's outgoing synapses
+            synapses.remove(&id);
+            // Remove references to this note from all other notes' synapse lists
+            for neighbors in synapses.values_mut() {
+                neighbors.retain(|(nid, _)| *nid != id);
+            }
+        }
+        Ok(removed)
+    }
+
+    async fn list_notes(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        filters: &NoteFilters,
+    ) -> Result<(Vec<Note>, usize)> {
+        self.log_read("list_notes")?;
+        let ws_projects = if filters.global_only == Some(true) {
+            None
+        } else {
+            self.scope_projects(project_id, workspace_slug).await
+        };
+        let notes = self.notes.read().await;
+        let filtered: Vec<Note> = notes
+            .values()
+            .filter(|n| {
+                if filters.global_only == Some(true) {
+                    if n.project_id.is_some() {
+                        return false;
+                    }
+                } else if let Some(ref scope) = ws_projects {
+                    if !n.project_id.is_some_and(|p| scope.contains(&p)) {
+                        return false;
+                    }
+                }
+                if let Some(ref statuses) = filters.status {
+                    if !statuses.contains(&n.status) {
+                        return false;
+                    }
+                }
+                if let Some(ref note_types) = filters.note_type {
+                    if !note_types.contains(&n.note_type) {
+                        return false;
+                    }
+                }
+                if let Some(ref importances) = filters.importance {
+                    if !importances.contains(&n.importance) {
+                        return false;
+                    }
+                }
+                if let Some(ref tag_filter) = filters.tags {
+                    // AND semantics, like the real query (`'t' IN n.tags` per tag).
+                    if !tag_filter.iter().all(|tg| n.tags.contains(tg)) {
+                        return false;
+                    }
+                }
+                if let Some(ref q) = filters.search {
+                    let q = q.to_lowercase();
+                    if !n.content.to_lowercase().contains(&q) {
+                        return false;
+                    }
+                }
+                if let Some(min_s) = filters.min_staleness {
+                    if n.staleness_score < min_s {
+                        return false;
+                    }
+                }
+                if let Some(max_s) = filters.max_staleness {
+                    if n.staleness_score > max_s {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        let total = filtered.len();
+        let limit = filters.limit.unwrap_or(50) as usize;
+        let offset = filters.offset.unwrap_or(0) as usize;
+        Ok((paginate(&filtered, limit, offset), total))
+    }
+
+    async fn link_note_to_entity(
+        &self,
+        note_id: Uuid,
+        entity_type: &EntityType,
+        entity_id: &str,
+        signature_hash: Option<&str>,
+        body_hash: Option<&str>,
+    ) -> Result<()> {
+        let anchor = NoteAnchor {
+            entity_type: entity_type.clone(),
+            entity_id: entity_id.to_string(),
+            signature_hash: signature_hash.map(|s| s.to_string()),
+            body_hash: body_hash.map(|s| s.to_string()),
+            last_verified: Utc::now(),
+            is_valid: true,
+        };
+        self.note_anchors
+            .write()
+            .await
+            .entry(note_id)
+            .or_default()
+            .push(anchor);
+        Ok(())
+    }
+
+    async fn unlink_note_from_entity(
+        &self,
+        note_id: Uuid,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<()> {
+        if let Some(anchors) = self.note_anchors.write().await.get_mut(&note_id) {
+            anchors.retain(|a| !(&a.entity_type == entity_type && a.entity_id == entity_id));
+        }
+        Ok(())
+    }
+
+    async fn propagate_structural_links(&self, _project_id: Uuid) -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn propagate_high_level_links(&self, _project_id: Uuid) -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn propagate_note_via_feature_graph(
+        &self,
+        _note_id: Uuid,
+        _feature_graph_id: &str,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn propagate_note_via_skill(&self, _note_id: Uuid, _skill_id: &str) -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn propagate_note_via_protocol(
+        &self,
+        _note_id: Uuid,
+        _protocol_id: &str,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn propagate_semantic_links(
+        &self,
+        _project_id: Uuid,
+        _min_similarity: f64,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn semantic_anchor_note(
+        &self,
+        _note_id: Uuid,
+        _project_id: Uuid,
+        _min_similarity: f64,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn anchor_orphan_notes_to_project(&self, _project_id: Uuid) -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn get_notes_for_entity(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<Vec<Note>> {
+        let anchors = self.note_anchors.read().await;
+        let notes = self.notes.read().await;
+        let mut result = Vec::new();
+        for (note_id, note_anchors) in anchors.iter() {
+            for a in note_anchors {
+                if &a.entity_type == entity_type && a.entity_id == entity_id {
+                    if let Some(n) = notes.get(note_id) {
+                        result.push(n.clone());
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_propagated_notes(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &str,
+        _max_depth: u32,
+        min_score: f64,
+        _relation_types: Option<&[String]>,
+        source_project_id: Option<Uuid>,
+        force_cross_project: bool,
+    ) -> Result<Vec<PropagatedNote>> {
+        // Simplified: no graph traversal; the candidates are the notes anchored
+        // directly on the entity (distance 0). The scope is applied BEFORE the
+        // top-20 cut, exactly like the Cypher of the real client.
+        let scope =
+            crate::notes::PropagationScope::from_params(source_project_id, force_cross_project);
+        let mut candidates: Vec<Note> = self
+            .get_notes_for_entity(entity_type, entity_id)
+            .await?
+            .into_iter()
+            .filter(|n| n.status == NoteStatus::Active && scope.admits(n.project_id))
+            .collect();
+        // Same consent predicate as the real client, applied before the cut.
+        if let crate::notes::PropagationScope::CrossProject(src) = scope {
+            let mut consent = crate::sharing::consent_gate::ConsentReader::new(self, Some(src));
+            let mut kept = Vec::with_capacity(candidates.len());
+            for n in candidates {
+                if consent.note(&n).await.is_allow() {
+                    kept.push(n);
+                }
+            }
+            candidates = kept;
+        }
+        let mut out: Vec<PropagatedNote> = candidates
+            .into_iter()
+            .map(|n| PropagatedNote {
+                relevance_score: n.importance.weight() * (0.4 + n.energy * 0.6),
+                source_entity: entity_id.to_string(),
+                propagation_path: vec![],
+                distance: 0,
+                path_pagerank: None,
+                relation_path: vec![],
+                path_rel_weight: None,
+                scar_intensity: n.scar_intensity,
+                note: n,
+            })
+            .filter(|pn| pn.relevance_score >= min_score)
+            .collect();
+        // CrossProject: the coupling weights the score of foreign notes BEFORE the
+        // cut to 20, with the same rule as the Cypher client.
+        if let crate::notes::PropagationScope::CrossProject(src) = scope {
+            let couplings = self.pairwise_coupling.read().await.clone();
+            out = out
+                .into_iter()
+                .filter_map(|mut pn| match pn.note.project_id {
+                    Some(pid) if pid != src => {
+                        let key = if src < pid { (src, pid) } else { (pid, src) };
+                        let coupling = Some(couplings.get(&key).copied().unwrap_or(0.0));
+                        let weighted = crate::notes::PropagationScope::weigh_foreign(
+                            pn.relevance_score,
+                            coupling,
+                            min_score,
+                        )?;
+                        pn.relevance_score = weighted;
+                        Some(pn)
+                    }
+                    _ => Some(pn),
+                })
+                .collect();
+        }
+        out.sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
+        out.truncate(20);
+        Ok(out)
+    }
+
+    async fn get_workspace_notes_for_project(
+        &self,
+        project_id: Uuid,
+        propagation_factor: f64,
+    ) -> Result<Vec<PropagatedNote>> {
+        // Find workspace for this project
+        let ws = self.get_project_workspace(project_id).await?;
+        if let Some(workspace) = ws {
+            let ws_notes = self
+                .get_notes_for_entity(&EntityType::Workspace, &workspace.id.to_string())
+                .await?;
+            Ok(ws_notes
+                .into_iter()
+                .map(|n| {
+                    let scar = n.scar_intensity;
+                    PropagatedNote {
+                        relevance_score: propagation_factor,
+                        source_entity: format!("workspace:{}", workspace.slug),
+                        propagation_path: vec![format!("workspace:{}", workspace.slug)],
+                        distance: 1,
+                        note: n,
+                        path_pagerank: None,
+                        relation_path: vec![crate::notes::RelationHop::structural("BELONGS_TO")],
+                        path_rel_weight: Some(1.0),
+                        scar_intensity: scar,
+                    }
+                })
+                .collect())
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    async fn supersede_note(&self, old_note_id: Uuid, new_note_id: Uuid) -> Result<()> {
+        self.note_supersedes
+            .write()
+            .await
+            .insert(old_note_id, new_note_id);
+        // Update old note status
+        if let Some(n) = self.notes.write().await.get_mut(&old_note_id) {
+            n.status = NoteStatus::Obsolete;
+            n.superseded_by = Some(new_note_id);
+        }
+        // Update new note supersedes field
+        if let Some(n) = self.notes.write().await.get_mut(&new_note_id) {
+            n.supersedes = Some(old_note_id);
+        }
+        Ok(())
+    }
+
+    async fn confirm_note(&self, note_id: Uuid, confirmed_by: &str) -> Result<Option<Note>> {
+        let mut notes = self.notes.write().await;
+        if let Some(n) = notes.get_mut(&note_id) {
+            n.confirm(confirmed_by);
+            // Energy boost: +0.3, capped at 1.0
+            n.energy = (n.energy + 0.3).min(1.0);
+            n.last_activated = Some(chrono::Utc::now());
+            Ok(Some(n.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn get_notes_needing_review(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+    ) -> Result<Vec<Note>> {
+        self.log_read("get_notes_needing_review")?;
+        let scope = self.scope_projects(project_id, workspace_slug).await;
+        let notes = self.notes.read().await;
+        Ok(notes
+            .values()
+            .filter(|n| {
+                if let Some(ref scope) = scope {
+                    if !n.project_id.is_some_and(|p| scope.contains(&p)) {
+                        return false;
+                    }
+                }
+                matches!(n.status, NoteStatus::NeedsReview | NoteStatus::Stale)
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn update_staleness_scores(&self) -> Result<usize> {
+        let mut notes = self.notes.write().await;
+        let mut count = 0;
+        let now = Utc::now();
+        for n in notes.values_mut() {
+            if n.status == NoteStatus::Active {
+                if let Some(confirmed_at) = n.last_confirmed_at {
+                    let days = (now - confirmed_at).num_days() as f64;
+                    let base_days = n.base_decay_days();
+                    let decay = n.importance.decay_factor();
+                    let raw_staleness = (days * decay / base_days).clamp(0.0, 1.0);
+
+                    // Freshness discount: recent commit touches reduce staleness
+                    let freshness_discount = if let Some(pinged_at) = n.freshness_pinged_at {
+                        let days_since_ping = (now - pinged_at).num_days() as f64;
+                        (-days_since_ping / 30.0_f64).exp() * 0.5
+                    } else {
+                        0.0
+                    };
+
+                    n.staleness_score = (raw_staleness - freshness_discount).clamp(0.0, 1.0);
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    async fn get_note_anchors(&self, note_id: Uuid) -> Result<Vec<NoteAnchor>> {
+        Ok(self
+            .note_anchors
+            .read()
+            .await
+            .get(&note_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn set_note_embedding(
+        &self,
+        note_id: Uuid,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        self.note_embeddings
+            .write()
+            .await
+            .insert(note_id, (embedding.to_vec(), model.to_string()));
+        Ok(())
+    }
+
+    async fn get_note_embedding(&self, note_id: Uuid) -> Result<Option<Vec<f32>>> {
+        let embeddings = self.note_embeddings.read().await;
+        Ok(embeddings.get(&note_id).map(|(emb, _)| emb.clone()))
+    }
+
+    async fn vector_search_notes(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        min_similarity: Option<f64>,
+    ) -> Result<Vec<(Note, f64)>> {
+        let notes = self.notes.read().await;
+        let embeddings = self.note_embeddings.read().await;
+
+        // Resolve workspace_slug to a set of project IDs
+        let workspace_project_ids: Option<Vec<Uuid>> = if project_id.is_none() {
+            if let Some(slug) = workspace_slug {
+                let ws = self.get_workspace_by_slug(slug).await?;
+                if let Some(ws) = ws {
+                    let wp = self.workspace_projects.read().await;
+                    Some(wp.get(&ws.id).cloned().unwrap_or_default())
+                } else {
+                    Some(vec![]) // unknown workspace → no results
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut scored: Vec<(Note, f64)> = notes
+            .values()
+            .filter(|n| {
+                // Filter by status
+                matches!(n.status, NoteStatus::Active | NoteStatus::NeedsReview)
+            })
+            .filter(|n| {
+                // Filter by project_id or workspace projects
+                if let Some(pid) = project_id {
+                    n.project_id == Some(pid)
+                } else if let Some(ref ws_pids) = workspace_project_ids {
+                    // Include notes from workspace projects + global notes
+                    match n.project_id {
+                        Some(pid) => ws_pids.contains(&pid),
+                        None => true, // global notes included
+                    }
+                } else {
+                    true // no filter
+                }
+            })
+            .filter_map(|n| {
+                // Must have an embedding
+                embeddings.get(&n.id).map(|(emb, _model)| {
+                    let score = cosine_similarity(embedding, emb);
+                    (n.clone(), score)
+                })
+            })
+            .collect();
+
+        // Sort by score descending
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Filter by minimum cosine similarity threshold
+        if let Some(min_sim) = min_similarity {
+            scored.retain(|(_, score)| *score >= min_sim);
+        }
+
+        scored.truncate(limit);
+
+        Ok(scored)
+    }
+
+    async fn list_notes_without_embedding(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Note>, usize)> {
+        let notes = self.notes.read().await;
+        let embeddings = self.note_embeddings.read().await;
+
+        let mut without: Vec<Note> = notes
+            .values()
+            .filter(|n| !embeddings.contains_key(&n.id))
+            .cloned()
+            .collect();
+
+        // Sort by created_at ASC for deterministic ordering
+        without.sort_by_key(|n| n.created_at);
+
+        let total = without.len();
+        let page: Vec<Note> = without.into_iter().skip(offset).take(limit).collect();
+
+        Ok((page, total))
+    }
+}
+
+#[async_trait]
+impl AnalyticsStore for MockGraphStore {
+    // ========================================================================
+    // Code embedding operations (File & Function vector search)
+    // ========================================================================
+
+    async fn set_file_embedding(
+        &self,
+        file_path: &str,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        self.file_embeddings.write().await.insert(
+            file_path.to_string(),
+            (embedding.to_vec(), model.to_string()),
+        );
+        Ok(())
+    }
+
+    async fn set_function_embedding(
+        &self,
+        function_name: &str,
+        file_path: &str,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        let key = format!("{}::{}", file_path, function_name);
+        self.function_embeddings
+            .write()
+            .await
+            .insert(key, (embedding.to_vec(), model.to_string()));
+        Ok(())
+    }
+
+    async fn vector_search_files(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, f64)>> {
+        let file_embeddings = self.file_embeddings.read().await;
+
+        // If project_id is specified, get the set of file paths belonging to that project
+        let project_files: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            pf.get(&pid).cloned()
+        } else {
+            None
+        };
+
+        let mut scored: Vec<(String, f64)> = file_embeddings
+            .iter()
+            .filter(|(path, _)| {
+                if let Some(ref pfiles) = project_files {
+                    pfiles.contains(path)
+                } else {
+                    true
+                }
+            })
+            .map(|(path, (emb, _))| {
+                let score = cosine_similarity(embedding, emb);
+                (path.clone(), score)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored)
+    }
+
+    async fn vector_search_functions(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64)>> {
+        let func_embeddings = self.function_embeddings.read().await;
+
+        // If project_id is specified, get the set of file paths belonging to that project
+        let project_files: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            pf.get(&pid).cloned()
+        } else {
+            None
+        };
+
+        let mut scored: Vec<(String, String, f64)> = func_embeddings
+            .iter()
+            .filter_map(|(key, (emb, _))| {
+                // key format: "file_path::func_name"
+                let parts: Vec<&str> = key.splitn(2, "::").collect();
+                if parts.len() != 2 {
+                    return None;
+                }
+                let fpath = parts[0];
+                let fname = parts[1];
+
+                // Filter by project
+                if let Some(ref pfiles) = project_files {
+                    if !pfiles.contains(&fpath.to_string()) {
+                        return None;
+                    }
+                }
+
+                let score = cosine_similarity(embedding, emb);
+                Some((fname.to_string(), fpath.to_string(), score))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored)
+    }
+
+    // ========================================================================
+    // Synapse operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    async fn create_synapses(&self, note_id: Uuid, neighbors: &[(Uuid, f64)]) -> Result<usize> {
+        if neighbors.is_empty() {
+            return Ok(0);
+        }
+
+        let mut synapses = self.note_synapses.write().await;
+        let mut sources = self.synapse_sources.write().await;
+        let mut count = 0;
+
+        for &(neighbor_id, weight) in neighbors {
+            // Add source -> neighbor (upsert)
+            let entry = synapses.entry(note_id).or_default();
+            if let Some(existing) = entry.iter_mut().find(|(nid, _)| *nid == neighbor_id) {
+                existing.1 = weight;
+            } else {
+                entry.push((neighbor_id, weight));
+            }
+            count += 1;
+
+            // Add neighbor -> source (bidirectional, upsert)
+            let entry = synapses.entry(neighbor_id).or_default();
+            if let Some(existing) = entry.iter_mut().find(|(nid, _)| *nid == note_id) {
+                existing.1 = weight;
+            } else {
+                entry.push((note_id, weight));
+            }
+            count += 1;
+
+            // Tag source as cosine (backfill origin)
+            let key = if note_id < neighbor_id {
+                (note_id, neighbor_id)
+            } else {
+                (neighbor_id, note_id)
+            };
+            sources.entry(key).or_insert_with(|| "cosine".to_string());
+        }
+
+        Ok(count)
+    }
+
+    async fn get_synapses(&self, note_id: Uuid) -> Result<Vec<(Uuid, f64)>> {
+        let synapses = self.note_synapses.read().await;
+        let mut result = synapses.get(&note_id).cloned().unwrap_or_default();
+        // Sort by weight descending
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(result)
+    }
+
+    async fn delete_synapses(&self, note_id: Uuid) -> Result<usize> {
+        let mut synapses = self.note_synapses.write().await;
+
+        // Count outgoing synapses
+        let outgoing_count = synapses.get(&note_id).map(|v| v.len()).unwrap_or(0);
+
+        // Remove from all neighbors' lists
+        if let Some(neighbors) = synapses.remove(&note_id) {
+            for (neighbor_id, _) in &neighbors {
+                if let Some(neighbor_list) = synapses.get_mut(neighbor_id) {
+                    neighbor_list.retain(|(nid, _)| *nid != note_id);
+                }
+            }
+        }
+
+        // Return total deleted (bidirectional = outgoing * 2)
+        Ok(outgoing_count * 2)
+    }
+
+    // ========================================================================
+    // Energy operations (Phase 2 — Neural Network)
+    // ========================================================================
+
+    async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
+        let mut notes = self.notes.write().await;
+        let now = chrono::Utc::now();
+        let mut updated = 0usize;
+
+        for note in notes.values_mut() {
+            if note.status != crate::notes::NoteStatus::Active || note.energy <= 0.0 {
+                continue;
+            }
+            if let Some(last_activated) = note.last_activated {
+                let days_idle = (now - last_activated).num_seconds() as f64 / 86400.0;
+                let new_energy = note.energy * (-days_idle / half_life_days).exp();
+                let clamped = if new_energy < 0.05 { 0.0 } else { new_energy };
+                if (note.energy - clamped).abs() > 0.001 {
+                    note.energy = clamped;
+                    updated += 1;
+                }
+            }
+        }
+
+        Ok(updated)
+    }
+
+    async fn boost_energy(&self, note_id: Uuid, amount: f64) -> Result<()> {
+        let mut notes = self.notes.write().await;
+        if let Some(note) = notes.get_mut(&note_id) {
+            // Lazy decay: compute current energy before adding boost
+            let current_e = note.computed_energy();
+            note.energy = (current_e + amount).min(1.0);
+            note.last_activated = Some(chrono::Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn track_reactivation(&self, note_ids: &[Uuid]) -> Result<usize> {
+        let mut notes = self.notes.write().await;
+        let now = chrono::Utc::now();
+        let mut count = 0usize;
+        for &id in note_ids {
+            if let Some(note) = notes.get_mut(&id) {
+                note.reactivation_count += 1;
+                note.last_reactivated = Some(now);
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn reinforce_synapses(&self, note_ids: &[Uuid], boost: f64) -> Result<usize> {
+        if note_ids.len() < 2 {
+            anyhow::bail!(
+                "reinforce_synapses needs at least 2 note ids (got {})",
+                note_ids.len()
+            );
+        }
+
+        // Same rule as Cypher: both notes exist and share a known project.
+        let project_of: HashMap<Uuid, Option<Uuid>> = {
+            let notes = self.notes.read().await;
+            note_ids
+                .iter()
+                .map(|id| (*id, notes.get(id).and_then(|n| n.project_id)))
+                .collect()
+        };
+
+        let mut synapses = self.note_synapses.write().await;
+        let mut sources = self.synapse_sources.write().await;
+        let mut count = 0usize;
+
+        for i in 0..note_ids.len() {
+            for j in (i + 1)..note_ids.len() {
+                let a = note_ids[i];
+                let b = note_ids[j];
+                if a == b {
+                    continue;
+                }
+                match (project_of[&a], project_of[&b]) {
+                    (Some(pa), Some(pb)) if pa == pb => {}
+                    _ => continue,
+                }
+
+                // Reinforce or create A → B
+                let entry_a = synapses.entry(a).or_default();
+                if let Some(syn) = entry_a.iter_mut().find(|(id, _)| *id == b) {
+                    syn.1 = (syn.1 + boost).min(1.0);
+                } else {
+                    entry_a.push((b, 0.5));
+                }
+                count += 1;
+
+                // Reinforce or create B → A
+                let entry_b = synapses.entry(b).or_default();
+                if let Some(syn) = entry_b.iter_mut().find(|(id, _)| *id == a) {
+                    syn.1 = (syn.1 + boost).min(1.0);
+                } else {
+                    entry_b.push((a, 0.5));
+                }
+                count += 1;
+
+                // Tag source as coactivation (upgrade from cosine if applicable)
+                let key = if a < b { (a, b) } else { (b, a) };
+                sources.insert(key, "coactivation".to_string());
+            }
+        }
+
+        Ok(count)
+    }
+
+    async fn shadow_synapse_edges(
+        &self,
+        project_id: Uuid,
+        from: &[Uuid],
+    ) -> Result<Vec<crate::neurons::synaptic_shadow::ShadowEdgeRow>> {
+        use crate::neurons::synaptic_shadow::{estimate_tokens, ShadowEdgeRow, ShadowNode};
+        let notes = self.notes.read().await;
+        let synapses = self.note_synapses.read().await;
+        let shadow = self.synapse_shadow.read().await;
+        let in_project = |id: &Uuid| notes.get(id).and_then(|n| n.project_id) == Some(project_id);
+        let mut rows = Vec::new();
+        for a in from {
+            if !in_project(a) {
+                continue;
+            }
+            for (b, w) in synapses.get(a).map(Vec::as_slice).unwrap_or(&[]) {
+                if a == b || !in_project(b) {
+                    continue;
+                }
+                let note = &notes[b];
+                rows.push(ShadowEdgeRow {
+                    from: *a,
+                    to: *b,
+                    weight: shadow.get(&(*a, *b)).map(|s| s.0).unwrap_or(*w),
+                    target: ShadowNode {
+                        energy: note.energy,
+                        scar_intensity: note.scar_intensity,
+                        reachable: matches!(
+                            note.status,
+                            crate::notes::NoteStatus::Active
+                                | crate::notes::NoteStatus::NeedsReview
+                        ),
+                        tokens: estimate_tokens(note.content.chars().count()),
+                        created_at: Some(note.created_at),
+                    },
+                });
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn reward_shadow_synapses(
+        &self,
+        project_id: Uuid,
+        pairs: &[(Uuid, Uuid)],
+        delta: f64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize> {
+        let notes = self.notes.read().await;
+        let synapses = self.note_synapses.read().await;
+        let mut shadow = self.synapse_shadow.write().await;
+        let in_project = |id: &Uuid| notes.get(id).and_then(|n| n.project_id) == Some(project_id);
+        let mut unique: Vec<(Uuid, Uuid)> = pairs
+            .iter()
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| if a < b { (*a, *b) } else { (*b, *a) })
+            .collect();
+        unique.sort();
+        unique.dedup();
+        let mut written = 0usize;
+        for (a, b) in unique {
+            if !in_project(&a) || !in_project(&b) {
+                continue;
+            }
+            for (x, y) in [(a, b), (b, a)] {
+                // Existing edges only: never create one.
+                let Some(legacy) = synapses
+                    .get(&x)
+                    .and_then(|out| out.iter().find(|(n, _)| *n == y))
+                    .map(|(_, w)| *w)
+                else {
+                    continue;
+                };
+                let entry = shadow.entry((x, y)).or_insert((legacy, None));
+                entry.0 = (entry.0 + delta).clamp(0.0, 1.0);
+                if entry.1.is_none() {
+                    entry.1 = Some(now);
+                }
+                written += 1;
+            }
+        }
+        Ok(written)
+    }
+
+    async fn decay_shadow_synapses(
+        &self,
+        scope: &crate::neurons::synaptic_shadow::ShadowDecayScope,
+        half_life_days: f64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize> {
+        // The mock has no notion of a dormant project: every project in scope decays.
+        let notes = self.notes.read().await;
+        let synapses = self.note_synapses.read().await;
+        let mut shadow = self.synapse_shadow.write().await;
+        let mut visited = 0usize;
+        for (a, out) in synapses.iter() {
+            let Some(pa) = notes.get(a).and_then(|n| n.project_id) else {
+                continue;
+            };
+            if !scope.includes(pa) {
+                continue;
+            }
+            for (b, w) in out {
+                if notes.get(b).and_then(|n| n.project_id) != Some(pa) {
+                    continue;
+                }
+                let entry = shadow.entry((*a, *b)).or_insert((*w, None));
+                let elapsed = entry
+                    .1
+                    .map(|at| (now - at).num_milliseconds() as f64 / 1000.0)
+                    .unwrap_or(0.0);
+                entry.0 = crate::neurons::synaptic_shadow::proportional_decay(
+                    entry.0,
+                    elapsed,
+                    half_life_days,
+                );
+                if elapsed >= 0.0 {
+                    entry.1 = Some(now);
+                }
+                visited += 1;
+            }
+        }
+        Ok(visited)
+    }
+
+    async fn record_synapse_shadow_trace(
+        &self,
+        trace: &crate::neurons::synaptic_shadow::SynapseShadowTrace,
+        keep: usize,
+    ) -> Result<()> {
+        let mut traces = self.synapse_shadow_traces.write().await;
+        traces.push(trace.clone());
+        let mut of_session: Vec<(chrono::DateTime<chrono::Utc>, Uuid)> = traces
+            .iter()
+            .filter(|t| t.session_id == trace.session_id)
+            .map(|t| (t.created_at, t.id))
+            .collect();
+        of_session.sort_by(|a, b| b.cmp(a));
+        let dropped: std::collections::HashSet<Uuid> =
+            of_session.iter().skip(keep).map(|(_, id)| *id).collect();
+        traces.retain(|t| !dropped.contains(&t.id));
+        Ok(())
+    }
+
+    async fn list_synapse_shadow_traces(
+        &self,
+        filter: &crate::neurons::synaptic_shadow::ShadowTraceFilter,
+    ) -> Result<Vec<crate::neurons::synaptic_shadow::SynapseShadowTrace>> {
+        use crate::neurons::synaptic_shadow::ShadowTraceFilter;
+        let traces = self.synapse_shadow_traces.read().await;
+        Ok(match filter {
+            ShadowTraceFilter::Session(sid) => {
+                let mut out: Vec<_> = traces
+                    .iter()
+                    .filter(|t| t.session_id == *sid)
+                    .cloned()
+                    .collect();
+                out.sort_by_key(|t| (t.created_at, t.id));
+                out
+            }
+            ShadowTraceFilter::ContainingNote { note_id, limit } => {
+                let mut out: Vec<_> = traces
+                    .iter()
+                    .filter(|t| t.note_ids().contains(note_id))
+                    .cloned()
+                    .collect();
+                out.sort_by_key(|t| std::cmp::Reverse((t.created_at, t.id)));
+                out.truncate(*limit);
+                out
+            }
+        })
+    }
+
+    async fn get_synapse_shadow_trace(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<crate::neurons::synaptic_shadow::SynapseShadowTrace>> {
+        let traces = self.synapse_shadow_traces.read().await;
+        Ok(traces.iter().find(|t| t.id == id).cloned())
+    }
+
+    async fn claim_shadow_trace_reward(&self, trace_id: Uuid, key: &str) -> Result<bool> {
+        let mut traces = self.synapse_shadow_traces.write().await;
+        let Some(trace) = traces.iter_mut().find(|t| t.id == trace_id) else {
+            return Ok(false);
+        };
+        if trace.rewarded.iter().any(|k| k == key) {
+            return Ok(false);
+        }
+        trace.rewarded.push(key.to_string());
+        Ok(true)
+    }
+
+    async fn shadow_trace_closures(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, crate::neurons::synaptic_shadow::TaskClosure)>> {
+        use crate::neurons::synaptic_shadow::{TaskClosure, CLOSURE_KEY};
+        let traces = self.synapse_shadow_traces.read().await;
+        let executions = self.agent_executions.read().await;
+        let tasks = self.tasks.read().await;
+        let mut ordered: Vec<_> = traces
+            .iter()
+            .filter(|t| !t.rewarded.iter().any(|k| k == CLOSURE_KEY))
+            .collect();
+        ordered.sort_by_key(|t| (t.created_at, t.id));
+        let mut out = Vec::new();
+        for trace in ordered {
+            let mut restarted = false;
+            let mut quiet = false;
+            for ae in executions.values().filter(|ae| {
+                ae.session_id == Some(trace.session_id)
+                    && ae.completed_at.is_some_and(|at| at < cutoff)
+            }) {
+                let Some(task) = tasks.get(&ae.task_id) else {
+                    continue;
+                };
+                if executions
+                    .values()
+                    .any(|later| later.task_id == ae.task_id && later.started_at > ae.started_at)
+                {
+                    restarted = true;
+                } else if task.status == crate::neo4j::models::TaskStatus::Completed {
+                    quiet = true;
+                }
+            }
+            if restarted {
+                out.push((trace.id, TaskClosure::Restarted));
+            } else if quiet {
+                out.push((trace.id, TaskClosure::Quiet));
+            }
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    async fn weaken_node_synapses(
+        &self,
+        node_id: Uuid,
+        amount: f64,
+        prune_threshold: f64,
+    ) -> Result<usize> {
+        // Same rule as the Cypher: a synapse whose two ends have two different
+        // known projects is left alone (an end without project is not a signal).
+        let project_of =
+            |notes: &HashMap<Uuid, Note>, id: Uuid| notes.get(&id).and_then(|n| n.project_id);
+        let notes = self.notes.read().await;
+        let mine = project_of(&notes, node_id);
+        let allowed = |other: Uuid| match (mine, project_of(&notes, other)) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
+        let mut synapses = self.note_synapses.write().await;
+        let mut weakened = 0usize;
+        for (owner, neighbors) in synapses.iter_mut() {
+            for (other, w) in neighbors.iter_mut() {
+                let touches = *owner == node_id || *other == node_id;
+                let far = if *owner == node_id { *other } else { *owner };
+                if touches && allowed(far) {
+                    *w -= amount;
+                    weakened += 1;
+                }
+            }
+            neighbors.retain(|(other, w)| {
+                let touches = *owner == node_id || *other == node_id;
+                let far = if *owner == node_id { *other } else { *owner };
+                !(touches && allowed(far) && *w < prune_threshold)
+            });
+        }
+        Ok(weakened)
+    }
+
+    async fn decay_synapses(
+        &self,
+        decay_amount: f64,
+        prune_threshold: f64,
+    ) -> Result<(usize, usize)> {
+        let mut synapses = self.note_synapses.write().await;
+        let sources = self.synapse_sources.read().await;
+        let mut decayed = 0usize;
+        let mut pruned = 0usize;
+
+        // Decay with differentiated rates: coactivation decays at base rate,
+        // cosine/unknown decays at 2x base rate
+        for (note_id, neighbors) in synapses.iter_mut() {
+            for syn in neighbors.iter_mut() {
+                let key = if *note_id < syn.0 {
+                    (*note_id, syn.0)
+                } else {
+                    (syn.0, *note_id)
+                };
+                let is_coactivation = sources
+                    .get(&key)
+                    .map(|s| s == "coactivation")
+                    .unwrap_or(false);
+                let effective_decay = if is_coactivation {
+                    decay_amount
+                } else {
+                    decay_amount * 2.0
+                };
+                syn.1 -= effective_decay;
+                decayed += 1;
+            }
+        }
+        drop(sources);
+
+        // Prune weak synapses
+        for neighbors in synapses.values_mut() {
+            let before = neighbors.len();
+            neighbors.retain(|(_, w)| *w >= prune_threshold);
+            pruned += before - neighbors.len();
+        }
+
+        // Drop synapses lock before acquiring notes lock to avoid deadlock
+        drop(synapses);
+
+        // Decay knowledge scars (20x slower than synapse decay)
+        let scar_decay_rate = decay_amount * 0.05;
+        if scar_decay_rate > 0.0 {
+            let mut notes = self.notes.write().await;
+            for note in notes.values_mut() {
+                if note.scar_intensity > 0.0 {
+                    note.scar_intensity -= scar_decay_rate;
+                    if note.scar_intensity < 0.001 {
+                        note.scar_intensity = 0.0;
+                    }
+                }
+            }
+        }
+
+        Ok((decayed, pruned))
+    }
+
+    async fn apply_scars(&self, node_ids: &[Uuid], increment: f64) -> Result<usize> {
+        let mut notes = self.notes.write().await;
+        let mut count = 0;
+        for id in node_ids {
+            if let Some(note) = notes.get_mut(id) {
+                note.scar_intensity = (note.scar_intensity + increment).min(1.0);
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn heal_scars(&self, node_id: Uuid) -> Result<bool> {
+        let mut notes = self.notes.write().await;
+        if let Some(note) = notes.get_mut(&node_id) {
+            note.scar_intensity = 0.0;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn consolidate_memory(&self) -> Result<(usize, usize)> {
+        use crate::notes::lifecycle::NoteLifecycleManager;
+        let lifecycle = NoteLifecycleManager::new();
+        let now = chrono::Utc::now();
+        let mut notes = self.notes.write().await;
+        let mut promoted = 0usize;
+        let mut archived = 0usize;
+
+        let ids: Vec<Uuid> = notes
+            .values()
+            .filter(|n| n.status == crate::notes::NoteStatus::Active)
+            .map(|n| n.id)
+            .collect();
+
+        for id in ids {
+            if let Some(note) = notes.get(&id).cloned() {
+                let activation_count = note.activation_count;
+
+                // Check auto-archival (threshold-based rules)
+                if lifecycle.should_auto_archive(&note, activation_count, now) {
+                    if let Some(n) = notes.get_mut(&id) {
+                        n.status = crate::notes::NoteStatus::Archived;
+                        archived += 1;
+                    }
+                    continue;
+                }
+
+                // Check archival for ephemeral (legacy: >48h idle)
+                if lifecycle.should_archive_ephemeral(&note, now) {
+                    if let Some(n) = notes.get_mut(&id) {
+                        n.status = crate::notes::NoteStatus::Archived;
+                        archived += 1;
+                    }
+                    continue;
+                }
+
+                // Skip already-consolidated notes for promotion
+                if note.memory_horizon == crate::notes::MemoryHorizon::Consolidated {
+                    continue;
+                }
+
+                // Check direct ephemeral -> consolidated promotion (new threshold-based)
+                if lifecycle.should_promote_to_consolidated(&note, activation_count, now) {
+                    if let Some(n) = notes.get_mut(&id) {
+                        n.memory_horizon = crate::notes::MemoryHorizon::Consolidated;
+                        promoted += 1;
+                    }
+                    continue;
+                }
+
+                // Evaluate existing promotion rules
+                let promo = lifecycle.evaluate_promotion(&note, activation_count as u64);
+                if let Some(new_horizon) = promo.new_horizon {
+                    if let Some(n) = notes.get_mut(&id) {
+                        n.memory_horizon = new_horizon;
+                        promoted += 1;
+                    }
+                }
+            }
+        }
+
+        Ok((promoted, archived))
+    }
+
+    async fn compute_homeostasis(
+        &self,
+        project_id: Uuid,
+        _custom_ranges: Option<&[(String, f64, f64)]>,
+    ) -> Result<crate::neo4j::models::HomeostasisReport> {
+        use crate::neo4j::models::{HomeostasisRatio, HomeostasisReport, HomeostasisSeverity};
+
+        let notes = self.notes.read().await;
+        let project_notes: Vec<_> = notes
+            .values()
+            .filter(|n| {
+                n.project_id == Some(project_id) && n.status == crate::notes::NoteStatus::Active
+            })
+            .collect();
+
+        let total = project_notes.len() as f64;
+        let scarred = project_notes
+            .iter()
+            .filter(|n| n.scar_intensity > 0.0)
+            .count() as f64;
+        let scar_load = if total > 0.0 { scarred / total } else { 0.0 };
+
+        let mut ratios = vec![HomeostasisRatio {
+            name: "note_density".to_string(),
+            value: total.max(1.0),
+            target_range: (0.3, 2.0),
+            distance_to_equilibrium: 0.0,
+            severity: HomeostasisSeverity::Ok,
+            recommendation: None,
+        }];
+
+        // Add scar_load ratio if there are scarred notes
+        let scar_severity = if scar_load > 0.5 {
+            HomeostasisSeverity::Critical
+        } else if scar_load > 0.2 {
+            HomeostasisSeverity::Warning
+        } else {
+            HomeostasisSeverity::Ok
+        };
+        ratios.push(HomeostasisRatio {
+            name: "scar_load".to_string(),
+            value: scar_load,
+            target_range: (0.0, 0.2),
+            distance_to_equilibrium: if scar_load > 0.2 {
+                scar_load - 0.2
+            } else {
+                0.0
+            },
+            severity: scar_severity,
+            recommendation: if scar_load > 0.2 {
+                Some("High scar density — consider reviewing scarred notes".to_string())
+            } else {
+                None
+            },
+        });
+
+        let pain_score = ratios
+            .iter()
+            .map(|r| r.distance_to_equilibrium)
+            .sum::<f64>()
+            / ratios.len() as f64;
+
+        Ok(HomeostasisReport {
+            ratios,
+            pain_score,
+            recommendations: vec![],
+            total_notes_count: project_notes.len() as i64,
+        })
+    }
+
+    async fn compute_structural_drift(
+        &self,
+        _project_id: Uuid,
+        _warning_threshold: Option<f64>,
+        _critical_threshold: Option<f64>,
+    ) -> Result<crate::neo4j::models::StructuralDriftReport> {
+        Ok(crate::neo4j::models::StructuralDriftReport {
+            drifting_files: vec![],
+            centroids: vec![],
+            mean_drift: 0.0,
+            warning_count: 0,
+            critical_count: 0,
+        })
+    }
+
+    async fn increment_frustration(&self, task_id: Uuid, delta: f64) -> Result<f64> {
+        let mut tasks = self.tasks.write().await;
+        if let Some(task) = tasks.get_mut(&task_id) {
+            task.frustration_score = (task.frustration_score + delta).min(1.0);
+            Ok(task.frustration_score)
+        } else {
+            anyhow::bail!("Task not found: {}", task_id)
+        }
+    }
+
+    async fn decrement_frustration(&self, task_id: Uuid, delta: f64) -> Result<f64> {
+        let mut tasks = self.tasks.write().await;
+        if let Some(task) = tasks.get_mut(&task_id) {
+            task.frustration_score = (task.frustration_score - delta).max(0.0);
+            Ok(task.frustration_score)
+        } else {
+            anyhow::bail!("Task not found: {}", task_id)
+        }
+    }
+
+    async fn get_frustration(&self, task_id: Uuid) -> Result<f64> {
+        let tasks = self.tasks.read().await;
+        if let Some(task) = tasks.get(&task_id) {
+            Ok(task.frustration_score)
+        } else {
+            anyhow::bail!("Task not found: {}", task_id)
+        }
+    }
+
+    async fn get_step_parent_task_id(&self, step_id: Uuid) -> Result<Option<Uuid>> {
+        let task_steps = self.task_steps.read().await;
+        for (task_id, step_ids) in task_steps.iter() {
+            if step_ids.contains(&step_id) {
+                return Ok(Some(*task_id));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn init_note_energy(&self, project_id: Option<Uuid>) -> Result<usize> {
+        self.init_note_energy_calls.write().await.push(project_id);
+        let mut notes = self.notes.write().await;
+        let mut count = 0;
+        for note in notes
+            .values_mut()
+            .filter(|n| project_id.is_none_or(|pid| n.project_id == Some(pid)))
+        {
+            // Simulate: only init if energy would have been NULL (we use 0.0 sentinel or check default)
+            // In mock, energy is always set by Note::new(), so this is a no-op
+            // But for completeness, ensure energy is at least 1.0 if it was 0.0 and never activated
+            if note.last_activated.is_none() && note.energy == 0.0 {
+                note.energy = 1.0;
+                note.last_activated = Some(chrono::Utc::now());
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn list_notes_needing_synapses(
+        &self,
+        limit: usize,
+        _offset: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<(Vec<crate::notes::Note>, usize)> {
+        let notes = self.notes.read().await;
+        let embeddings = self.note_embeddings.read().await;
+        let synapses = self.note_synapses.read().await;
+
+        let needing: Vec<crate::notes::Note> = notes
+            .values()
+            .filter(|n| embeddings.contains_key(&n.id) && !synapses.contains_key(&n.id))
+            .filter(|n| project_id.is_none_or(|pid| n.project_id == Some(pid)))
+            .cloned()
+            .collect();
+
+        let total = needing.len();
+        let batch: Vec<crate::notes::Note> = needing.into_iter().take(limit).collect();
+        Ok((batch, total))
+    }
+
+    async fn create_cross_entity_synapses(
+        &self,
+        source_id: Uuid,
+        neighbors: &[(Uuid, f64)],
+    ) -> Result<usize> {
+        // Reuse existing synapse storage (Note synapses) — in mock, we don't distinguish
+        let mut synapses = self.note_synapses.write().await;
+        let mut created = 0usize;
+        for (target_id, weight) in neighbors {
+            // Forward
+            let entry = synapses.entry(source_id).or_default();
+            entry.push((*target_id, *weight));
+            // Backward
+            let entry = synapses.entry(*target_id).or_default();
+            entry.push((source_id, *weight));
+            created += 2;
+        }
+        Ok(created)
+    }
+
+    async fn get_cross_entity_synapses(&self, node_id: Uuid) -> Result<Vec<(Uuid, f64, String)>> {
+        let synapses = self.note_synapses.read().await;
+        let notes = self.notes.read().await;
+        if let Some(neighbors) = synapses.get(&node_id) {
+            let mut result: Vec<(Uuid, f64, String)> = neighbors
+                .iter()
+                .map(|(id, weight)| {
+                    let entity_type = if notes.contains_key(id) {
+                        "Note".to_string()
+                    } else {
+                        "Decision".to_string()
+                    };
+                    (*id, *weight, entity_type)
+                })
+                .collect();
+            result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            Ok(result)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    async fn list_decisions_needing_synapses(
+        &self,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<(Vec<DecisionNode>, usize)> {
+        // Mock: return empty — decisions needing synapses not tracked in mock
+        Ok((vec![], 0))
+    }
+
+    async fn get_all_synapse_weights(&self, project_id: Option<Uuid>) -> Result<Vec<f64>> {
+        // Return weights from the in-memory synapse map, optionally filtered by project.
+        let note_synapses = self.note_synapses.read().await;
+        let notes = self.notes.read().await;
+
+        let weights: Vec<f64> = note_synapses
+            .iter()
+            .filter(|(src_id, _neighbors)| {
+                if let Some(pid) = project_id {
+                    notes
+                        .get(*src_id)
+                        .and_then(|n| n.project_id)
+                        .map(|p| p == pid)
+                        .unwrap_or(false)
+                } else {
+                    true
+                }
+            })
+            .flat_map(|(_src_id, neighbors)| neighbors.iter().map(|(_dst, w)| *w))
+            .collect();
+
+        Ok(weights)
+    }
+
+    async fn get_project_note_entity_links(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(String, String, String)>> {
+        let notes = self.notes.read().await;
+        let note_anchors = self.note_anchors.read().await;
+
+        let mut links = Vec::new();
+        for note in notes.values() {
+            if note.project_id != Some(project_id) {
+                continue;
+            }
+            if let Some(anchors) = note_anchors.get(&note.id) {
+                for anchor in anchors {
+                    let entity_type = format!("{:?}", anchor.entity_type).to_lowercase();
+                    links.push((note.id.to_string(), entity_type, anchor.entity_id.clone()));
+                }
+            }
+        }
+        Ok(links)
+    }
+
+    async fn get_project_note_synapses(
+        &self,
+        project_id: Uuid,
+        min_weight: f64,
+    ) -> Result<Vec<(String, String, f64)>> {
+        let notes = self.notes.read().await;
+        let synapses = self.note_synapses.read().await;
+
+        // Collect project note IDs
+        let project_note_ids: std::collections::HashSet<Uuid> = notes
+            .values()
+            .filter(|n| n.project_id == Some(project_id))
+            .map(|n| n.id)
+            .collect();
+
+        let mut result = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (&source_id, neighbors) in synapses.iter() {
+            if !project_note_ids.contains(&source_id) {
+                continue;
+            }
+            for (target_id, weight) in neighbors {
+                if !project_note_ids.contains(target_id) || *weight < min_weight {
+                    continue;
+                }
+                // Deduplicate bidirectional
+                let key = if source_id < *target_id {
+                    (source_id, *target_id)
+                } else {
+                    (*target_id, source_id)
+                };
+                if seen.insert(key) {
+                    result.push((source_id.to_string(), target_id.to_string(), *weight));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_project_decisions_for_graph(
+        &self,
+        _project_id: Uuid,
+    ) -> Result<Vec<(DecisionNode, Vec<AffectsRelation>)>> {
+        // Mock: return all decisions with empty affects (simplified)
+        let decisions = self.decisions.read().await;
+        let results: Vec<(DecisionNode, Vec<AffectsRelation>)> =
+            decisions.values().map(|d| (d.clone(), vec![])).collect();
+        Ok(results)
+    }
+
+    // ========================================================================
+    // Chat session operations
+    // ========================================================================
+
+    async fn create_chat_session(&self, session: &ChatSessionNode) -> Result<()> {
+        if self
+            .fail_session_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected failure of create_chat_session");
+        }
+        // As the Neo4j store: a session is created with its shell at home.
+        self.session_shell_moved
+            .write()
+            .await
+            .insert(session.id, false);
+        self.chat_sessions
+            .write()
+            .await
+            .insert(session.id, session.clone());
+        Ok(())
+    }
+
+    async fn get_chat_session(&self, id: Uuid) -> Result<Option<ChatSessionNode>> {
+        self.count_read();
+        // Failure injection without a `read_log` entry (counted read logs stay as they are).
+        if self
+            .fail_reads
+            .lock()
+            .is_ok_and(|f| f.contains("get_chat_session"))
+        {
+            anyhow::bail!("injected failure of get_chat_session");
+        }
+        Ok(self.chat_sessions.read().await.get(&id).cloned())
+    }
+
+    async fn list_chat_sessions(
+        &self,
+        project_slug: Option<&str>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+        include_detached: bool,
+    ) -> Result<(Vec<ChatSessionNode>, usize)> {
+        self.log_read("list_chat_sessions")?;
+        let sessions = self.chat_sessions.read().await;
+        // Collect workspace project slugs for membership check
+        let ws_project_slugs: Vec<String> = if let Some(ws) = workspace_slug {
+            let workspaces = self.workspaces.read().await;
+            if let Some(w) = workspaces.values().find(|w| w.slug == ws) {
+                let wp = self.workspace_projects.read().await;
+                let projects = self.projects.read().await;
+                wp.get(&w.id)
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|pid| projects.get(pid).map(|p| p.slug.clone()))
+                    .collect()
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+        let mut filtered: Vec<_> = sessions
+            .values()
+            .filter(|s| {
+                // Filter out detached sessions unless explicitly requested
+                if !include_detached && s.spawned_by.is_some() {
+                    return false;
+                }
+                if let Some(slug) = project_slug {
+                    s.project_slug.as_deref() == Some(slug)
+                } else if let Some(ws) = workspace_slug {
+                    // Match workspace_slug OR project_slug membership
+                    s.workspace_slug.as_deref() == Some(ws)
+                        || s.project_slug
+                            .as_deref()
+                            .is_some_and(|ps| ws_project_slugs.iter().any(|wps| wps == ps))
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        // Sort by updated_at descending
+        filtered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let total = filtered.len();
+        let page = paginate(&filtered, limit, offset);
+        Ok((page, total))
+    }
+
+    async fn get_session_children(&self, parent_id: Uuid) -> Result<Vec<ChatSessionNode>> {
+        let sessions = self.chat_sessions.read().await;
+        let parent_str = parent_id.to_string();
+        // A parent that no longer exists has no children (same as the Neo4j store).
+        let parent_exists = sessions.contains_key(&parent_id);
+        let mut children: Vec<_> = sessions
+            .values()
+            .filter(|_| parent_exists)
+            .filter(|s| {
+                s.spawned_by
+                    .as_ref()
+                    .is_some_and(|sb| sb.contains(&parent_str))
+            })
+            .cloned()
+            .collect();
+        children.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        drop(sessions);
+        let landing = self
+            .land_children_after_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&parent_id);
+        if let Some(landing) = landing {
+            let mut sessions = self.chat_sessions.write().await;
+            for child in landing {
+                sessions.insert(child.id, child);
+            }
+        }
+        Ok(children)
+    }
+
+    async fn create_spawned_by_relation(
+        &self,
+        child_session_id: &str,
+        parent_session_id: &str,
+        _spawn_type: &str,
+        run_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> Result<()> {
+        // Mock: only the thread-relevant part is tracked, as the link row the
+        // real store derives (plan of the run carried, else of the parent).
+        let (Ok(child), Ok(parent)) = (
+            child_session_id.parse::<Uuid>(),
+            parent_session_id.parse::<Uuid>(),
+        ) else {
+            return Ok(());
+        };
+        let mut rows = self.session_link_rows.write().await;
+        let plan = rows
+            .iter()
+            .filter(|r| {
+                r.session_id == parent
+                    && matches!(
+                        r.kind,
+                        SessionLinkKind::RunRelation | SessionLinkKind::PlanAssociation
+                    )
+            })
+            .find_map(|r| r.thread_plan_id);
+        rows.push(SessionLinkRow {
+            session_id: child,
+            kind: SessionLinkKind::SpawnedByRelation,
+            run_id,
+            task_id,
+            plan_id: plan,
+            thread_plan_id: plan,
+        });
+        Ok(())
+    }
+
+    async fn link_session_to_run(
+        &self,
+        session_id: &str,
+        run_id: Uuid,
+        plan_id: Option<Uuid>,
+        task_id: Option<Uuid>,
+    ) -> Result<bool> {
+        let Ok(sid) = session_id.parse::<Uuid>() else {
+            return Ok(false);
+        };
+        if !self.chat_sessions.read().await.contains_key(&sid) {
+            return Ok(false);
+        }
+        let mut rows = self.session_link_rows.write().await;
+        let already = rows.iter().any(|r| {
+            r.session_id == sid
+                && r.kind == SessionLinkKind::RunRelation
+                && r.run_id == Some(run_id)
+        });
+        if !already {
+            rows.push(SessionLinkRow {
+                session_id: sid,
+                kind: SessionLinkKind::RunRelation,
+                run_id: Some(run_id),
+                task_id,
+                plan_id,
+                thread_plan_id: plan_id,
+            });
+        }
+        Ok(true)
+    }
+
+    async fn get_session_link_rows(&self, session_ids: &[Uuid]) -> Result<Vec<SessionLinkRow>> {
+        self.log_read("get_session_link_rows")?;
+        self.session_link_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let rows = self.session_link_rows.read().await;
+        Ok(rows
+            .iter()
+            .filter(|r| session_ids.contains(&r.session_id))
+            .cloned()
+            .collect())
+    }
+
+    async fn get_plans_task_graph(&self, plan_ids: &[Uuid]) -> Result<PlansTaskGraph> {
+        self.log_read("get_plans_task_graph")?;
+        let plan_tasks = self.plan_tasks.read().await;
+        let tasks = self.tasks.read().await;
+        let deps = self.task_dependencies.read().await;
+        let mut graph = PlansTaskGraph::default();
+        for pid in plan_ids {
+            for tid in plan_tasks.get(pid).into_iter().flatten() {
+                if let Some(t) = tasks.get(tid) {
+                    graph.tasks.push((*pid, t.clone()));
+                }
+                for d in deps.get(tid).into_iter().flatten() {
+                    graph.edges.push((*tid, *d));
+                }
+            }
+        }
+        Ok(graph)
+    }
+
+    async fn list_project_workspace_rows(&self) -> Result<Vec<ProjectWorkspaceRow>> {
+        self.log_read("list_project_workspace_rows")?;
+        let workspaces = self.workspaces.read().await;
+        let projects = self.projects.read().await;
+        let wp = self.workspace_projects.read().await;
+        let mut rows = Vec::new();
+        for (wid, pids) in wp.iter() {
+            let Some(w) = workspaces.get(wid) else {
+                continue;
+            };
+            for pid in pids {
+                if let Some(p) = projects.get(pid) {
+                    rows.push(ProjectWorkspaceRow {
+                        project_id: p.id,
+                        project_slug: p.slug.clone(),
+                        workspace_id: w.id,
+                        workspace_slug: w.slug.clone(),
+                    });
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// P18-suite (point 12): a real traversal of the mock's `spawned_by`, with the
+    /// semantics of the Neo4j query — the session itself at depth 0, then every
+    /// descendant found through the JSON parent, breadth first, siblings by
+    /// `created_at`; an unknown session is an empty tree. `status`, provider, model
+    /// and costs stay unset here: the API fills them, as it does for the real store.
+    async fn get_session_tree(&self, session_id: &str) -> Result<Vec<SessionTreeNode>> {
+        let sessions = self.chat_sessions.read().await;
+        let Some(root) = sessions.values().find(|s| s.id.to_string() == session_id) else {
+            return Ok(Vec::new());
+        };
+        let node_of = |s: &ChatSessionNode, depth: u32| {
+            let spawn = spawned_by_of(s);
+            SessionTreeNode {
+                session_id: s.id.to_string(),
+                parent_session_id: if depth == 0 {
+                    None
+                } else {
+                    spawn.parent.clone()
+                },
+                spawn_type: if depth == 0 { None } else { spawn.kind.clone() },
+                run_id: if depth == 0 { None } else { spawn.run_id },
+                task_id: if depth == 0 { None } else { spawn.task_id },
+                depth,
+                created_at: Some(s.created_at),
+                provider_id: None,
+                model: None,
+                cost_usd: None,
+                subtree_cost_usd: None,
+                max_depth: None,
+                max_children: None,
+                status: "closed".to_string(),
+                routed_by: None,
+            }
+        };
+        let mut nodes = vec![node_of(root, 0)];
+        let mut frontier = vec![root.id.to_string()];
+        let mut seen: std::collections::HashSet<String> = frontier.iter().cloned().collect();
+        let mut depth = 0u32;
+        // The real query stops at ten hops (`SPAWNED_BY*0..10`).
+        while !frontier.is_empty() && depth < 10 {
+            depth += 1;
+            let mut next = Vec::new();
+            for parent in &frontier {
+                let mut children: Vec<&ChatSessionNode> = sessions
+                    .values()
+                    .filter(|s| spawned_by_of(s).parent.as_deref() == Some(parent.as_str()))
+                    .filter(|s| !seen.contains(&s.id.to_string()))
+                    .collect();
+                children.sort_by_key(|s| s.created_at);
+                for child in children {
+                    seen.insert(child.id.to_string());
+                    nodes.push(node_of(child, depth));
+                    next.push(child.id.to_string());
+                }
+            }
+            frontier = next;
+        }
+        Ok(nodes)
+    }
+
+    /// P18-suite (point 12): follow the JSON parent upward to the session that has
+    /// none — ten hops at most, a cycle stops the walk — or `None` for an unknown
+    /// session, as the Neo4j query answers.
+    async fn get_session_root(&self, session_id: &str) -> Result<Option<String>> {
+        let sessions = self.chat_sessions.read().await;
+        let by_id = |id: &str| sessions.values().find(|s| s.id.to_string() == id);
+        let Some(mut current) = by_id(session_id) else {
+            return Ok(None);
+        };
+        let mut seen = std::collections::HashSet::from([current.id.to_string()]);
+        for _ in 0..10 {
+            let Some(parent_id) = spawned_by_of(current).parent else {
+                break;
+            };
+            if !seen.insert(parent_id.clone()) {
+                break;
+            }
+            match by_id(&parent_id) {
+                Some(parent) => current = parent,
+                // A parent the store no longer holds: the walk ends on the last known session.
+                None => break,
+            }
+        }
+        Ok(Some(current.id.to_string()))
+    }
+
+    async fn get_run_sessions(&self, _run_id: Uuid) -> Result<Vec<SessionInfo>> {
+        // Mock: return empty
+        Ok(vec![])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn update_chat_session(
+        &self,
+        id: Uuid,
+        cli_session_id: Option<String>,
+        title: Option<String>,
+        message_count: Option<i64>,
+        total_cost_usd: Option<f64>,
+        conversation_id: Option<String>,
+        preview: Option<String>,
+    ) -> Result<Option<ChatSessionNode>> {
+        let mut sessions = self.chat_sessions.write().await;
+        if let Some(session) = sessions.get_mut(&id) {
+            session.updated_at = Utc::now();
+            if let Some(v) = cli_session_id {
+                session.cli_session_id = Some(v);
+            }
+            if let Some(v) = title {
+                session.title = Some(v);
+            }
+            if let Some(v) = message_count {
+                session.message_count = v;
+            }
+            if let Some(v) = total_cost_usd {
+                session.total_cost_usd = Some(v);
+            }
+            if let Some(v) = conversation_id {
+                session.conversation_id = Some(v);
+            }
+            if let Some(v) = preview {
+                session.preview = Some(v);
+            }
+            Ok(Some(session.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn add_chat_session_children_cost(&self, id: Uuid, delta_usd: f64) -> Result<f64> {
+        let delta = if delta_usd.is_finite() && delta_usd > 0.0 {
+            delta_usd
+        } else {
+            0.0
+        };
+        let mut costs = self.chat_children_costs.write().await;
+        let total = costs.entry(id).or_insert(0.0);
+        *total += delta;
+        Ok(*total)
+    }
+
+    async fn get_chat_session_children_cost(&self, id: Uuid) -> Result<f64> {
+        Ok(self
+            .chat_children_costs
+            .read()
+            .await
+            .get(&id)
+            .copied()
+            .unwrap_or(0.0))
+    }
+
+    async fn update_chat_session_permission_mode(&self, id: Uuid, mode: &str) -> Result<()> {
+        let mut sessions = self.chat_sessions.write().await;
+        if let Some(session) = sessions.get_mut(&id) {
+            session.permission_mode = Some(mode.to_string());
+            session.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn bind_chat_session_project(&self, id: Uuid, project_slug: &str) -> Result<bool> {
+        let mut sessions = self.chat_sessions.write().await;
+        let Some(session) = sessions.get_mut(&id) else {
+            return Ok(false);
+        };
+        if session
+            .project_slug
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            return Ok(false);
+        }
+        session.project_slug = Some(project_slug.to_string());
+        session.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    async fn update_chat_session_file_scope_lifted(&self, id: Uuid, lifted: bool) -> Result<()> {
+        let mut sessions = self.chat_sessions.write().await;
+        if let Some(session) = sessions.get_mut(&id) {
+            session.file_scope_lifted = lifted;
+            session.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn update_chat_session_model(&self, id: Uuid, model: &str) -> Result<()> {
+        let mut sessions = self.chat_sessions.write().await;
+        if let Some(session) = sessions.get_mut(&id) {
+            session.model = model.to_string();
+            session.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn set_chat_session_fingerprint(&self, id: Uuid, fingerprint: &str) -> Result<()> {
+        self.chat_fingerprints
+            .write()
+            .await
+            .insert(id, fingerprint.to_string());
+        Ok(())
+    }
+
+    async fn get_chat_session_fingerprint(&self, id: Uuid) -> Result<Option<String>> {
+        Ok(self.chat_fingerprints.read().await.get(&id).cloned())
+    }
+
+    async fn update_chat_session_routing(
+        &self,
+        id: Uuid,
+        routing_mode: Option<&str>,
+        routing_pool: Option<&str>,
+        routed_by: Option<&str>,
+    ) -> Result<bool> {
+        let mut sessions = self.chat_sessions.write().await;
+        let Some(session) = sessions.get_mut(&id) else {
+            return Ok(false);
+        };
+        session.routing_mode = routing_mode.map(str::to_owned);
+        session.routing_pool = routing_pool.map(str::to_owned);
+        session.routed_by = routed_by.map(str::to_owned);
+        session.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    async fn update_chat_session_provider(
+        &self,
+        id: Uuid,
+        provider_id: &str,
+        model: &str,
+        routed_by: &str,
+        engine: &str,
+    ) -> Result<bool> {
+        let mut sessions = self.chat_sessions.write().await;
+        let Some(session) = sessions.get_mut(&id) else {
+            return Ok(false);
+        };
+        session.provider_id = Some(provider_id.to_owned());
+        session.model = model.to_owned();
+        session.routed_by = Some(routed_by.to_owned());
+        // Providers do not share a session format: a resume token is refused across
+        // families, so the provider-specific fields are cleared (as the Neo4j store does).
+        session.resume_token = None;
+        session.capabilities = None;
+        session.cli_session_id = None;
+        session.engine = Some(engine.to_owned());
+        session.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    async fn restore_chat_session_provider(
+        &self,
+        node: &ChatSessionNode,
+        provider_id: &str,
+    ) -> Result<bool> {
+        let mut sessions = self.chat_sessions.write().await;
+        let Some(session) = sessions.get_mut(&node.id) else {
+            return Ok(false);
+        };
+        session.provider_id = Some(provider_id.to_owned());
+        session.model = node.model.clone();
+        session.routed_by = node.routed_by.clone();
+        session.resume_token = node.resume_token.clone();
+        session.capabilities = node.capabilities.clone();
+        session.cli_session_id = node.cli_session_id.clone();
+        session.engine = node.engine.clone();
+        session.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    async fn get_llm_setting(&self, scope: &str, key: &str) -> Result<Option<String>> {
+        loop {
+            let released = self.llm_setting_writes_released.notified();
+            let stalled = self
+                .stall_llm_setting_reads_of
+                .lock()
+                .is_ok_and(|s| s.contains(key));
+            if !stalled {
+                break;
+            }
+            released.await;
+        }
+        if self
+            .fail_llm_setting_reads_of
+            .lock()
+            .is_ok_and(|s| s.contains(key))
+        {
+            anyhow::bail!("mock: injected failure of the read of setting {key}");
+        }
+        Ok(self
+            .llm_settings
+            .read()
+            .await
+            .get(&(scope.to_string(), key.to_string()))
+            .cloned())
+    }
+    async fn put_llm_setting(&self, scope: &str, key: &str, value: &str) -> Result<()> {
+        if scope == "journal"
+            && self
+                .fail_journal_writes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("mock: the send journal cannot be written");
+        }
+        self.llm_setting_write_gate(key, false).await?;
+        self.llm_settings
+            .write()
+            .await
+            .insert((scope.to_string(), key.to_string()), value.to_string());
+        Ok(())
+    }
+    async fn delete_llm_setting(&self, scope: &str, key: &str) -> Result<bool> {
+        self.llm_setting_write_gate(key, true).await?;
+        Ok(self
+            .llm_settings
+            .write()
+            .await
+            .remove(&(scope.to_string(), key.to_string()))
+            .is_some())
+    }
+    async fn list_llm_settings(&self, scope: &str, prefix: &str) -> Result<Vec<(String, String)>> {
+        let mut rows: Vec<(String, String)> = self
+            .llm_settings
+            .read()
+            .await
+            .iter()
+            .filter(|((s, k), _)| s == scope && k.starts_with(prefix))
+            .map(|((_, k), v)| (k.clone(), v.clone()))
+            .collect();
+        rows.sort();
+        Ok(rows)
+    }
+
+    async fn update_chat_session_harness(
+        &self,
+        id: Uuid,
+        capabilities: Option<&str>,
+        resume_token: Option<&str>,
+    ) -> Result<()> {
+        if self
+            .fail_harness_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("mock: the capability snapshot write failed");
+        }
+        let mut sessions = self.chat_sessions.write().await;
+        if let Some(session) = sessions.get_mut(&id) {
+            if let Some(c) = capabilities {
+                session.capabilities = Some(c.to_string());
+            }
+            if let Some(t) = resume_token {
+                session.resume_token = Some(t.to_string());
+            }
+            session.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn set_chat_session_shell_moved(&self, id: Uuid) -> Result<()> {
+        if self.chat_sessions.read().await.contains_key(&id) {
+            self.session_shell_moved.write().await.insert(id, true);
+        }
+        Ok(())
+    }
+
+    async fn get_chat_session_shell_moved(&self, id: Uuid) -> Result<Option<bool>> {
+        Ok(self.session_shell_moved.read().await.get(&id).copied())
+    }
+
+    async fn backfill_chat_session_previews(&self) -> Result<usize> {
+        // Mock: no events stored, nothing to backfill
+        Ok(0)
+    }
+
+    async fn delete_chat_session(&self, id: Uuid) -> Result<bool> {
+        // Anchors and their journal go with the session; their targets stay.
+        let mut anchors = self.anchor_store.write().await;
+        anchors.anchors.retain(|_, a| a.session_id != id);
+        anchors.events.retain(|e| e.session_id != id);
+        anchors.versions.remove(&id);
+        drop(anchors);
+        // Same lock order as `save_session_episode` (sessions, then episodes).
+        let mut sessions = self.chat_sessions.write().await;
+        let existed = sessions.remove(&id).is_some();
+        self.session_episodes.write().await.remove(&id);
+        Ok(existed)
+    }
+
+    // Session episodes — same rules as the Neo4j store: written only while the session
+    // exists, one per session.
+
+    async fn save_session_episode(
+        &self,
+        episode: &crate::episodes::models::Episode,
+    ) -> Result<bool> {
+        self.session_episode_save_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .fail_session_episode_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("mock: session episode write failed");
+        }
+        let Some(session) = episode.session.as_ref() else {
+            return Ok(false);
+        };
+        // The session lock held across the write: a delete cannot slip in between.
+        let sessions = self.chat_sessions.read().await;
+        if !sessions.contains_key(&session.session_id) {
+            return Ok(false);
+        }
+        self.session_episodes
+            .write()
+            .await
+            .insert(session.session_id, episode.clone());
+        Ok(true)
+    }
+
+    async fn list_session_episodes(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<crate::episodes::models::Episode>> {
+        let mut out: Vec<_> = self
+            .session_episodes
+            .read()
+            .await
+            .values()
+            .filter(|e| e.project_id == project_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.collected_at.cmp(&a.collected_at));
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Over the session episodes, as the Neo4j store does (cosine on the stored
+    /// embedding; an episode without one is never a hit).
+    async fn search_episodes_by_embedding(
+        &self,
+        project_id: Uuid,
+        embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(crate::episodes::models::Episode, f64)>> {
+        let mut hits: Vec<(crate::episodes::models::Episode, f64)> = self
+            .session_episodes
+            .read()
+            .await
+            .values()
+            .filter(|e| e.project_id == project_id)
+            .filter_map(|e| {
+                let stored = e.embedding.as_ref()?;
+                Some((e.clone(), cosine_similarity(stored, embedding)))
+            })
+            .collect();
+        hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    async fn agent_identity_namespace(&self) -> Result<Uuid> {
+        // One lock for the read and the creation: the MERGE of the Neo4j store.
+        let mut root = self
+            .agent_identity_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(*root.get_or_insert_with(Uuid::new_v4))
+    }
+
+    // Chat anchors — same rules as the Neo4j store (both call `anchor::apply_op`).
+
+    async fn apply_anchor_op_if(
+        &self,
+        session_id: Uuid,
+        op: crate::chat::anchor::AnchorOp,
+        if_match: Option<u64>,
+    ) -> Result<crate::chat::anchor::AnchorSetChange> {
+        use crate::chat::anchor::*;
+        // One lock over anchors + journal: state and event change together.
+        let mut store = self.anchor_store.write().await;
+        if !self.chat_sessions.read().await.contains_key(&session_id) {
+            return Err(AnchorError::SessionNotFound(session_id).into());
+        }
+        let current = store.versions.get(&session_id).copied().unwrap_or(0);
+        if let Some(expected) = if_match.filter(|v| *v != current) {
+            return Err(AnchorError::SetVersionConflict {
+                expected,
+                actual: current,
+            }
+            .into());
+        }
+        let existing: Vec<Anchor> = store
+            .anchors
+            .values()
+            .filter(|a| a.session_id == session_id)
+            .cloned()
+            .collect();
+        let mut change = apply_op(session_id, &existing, op, chrono::Utc::now())?;
+        let next_seq = current + 1;
+        if let Some(ev) = change.event.as_mut() {
+            ev.seq = next_seq;
+        }
+        let version = if change.event.is_some() {
+            store.versions.insert(session_id, next_seq);
+            next_seq
+        } else {
+            current
+        };
+        if change.deleted {
+            store.anchors.remove(&change.anchor.id);
+        } else if change.event.is_some() {
+            store
+                .anchors
+                .insert(change.anchor.id, change.anchor.clone());
+        }
+        if let Some(ev) = &change.event {
+            store.events.push(ev.clone());
+        }
+        Ok(AnchorSetChange { change, version })
+    }
+
+    async fn get_anchor_set(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<crate::chat::anchor::AnchorSet>> {
+        // Same lock as the writes: anchors and version are one consistent read.
+        let store = self.anchor_store.read().await;
+        if !self.chat_sessions.read().await.contains_key(&session_id) {
+            return Ok(None);
+        }
+        let mut anchors: Vec<_> = store
+            .anchors
+            .values()
+            .filter(|a| a.session_id == session_id)
+            .cloned()
+            .collect();
+        anchors.sort_by_key(|a| (a.created_at, a.id));
+        Ok(Some(crate::chat::anchor::AnchorSet {
+            version: store.versions.get(&session_id).copied().unwrap_or(0),
+            anchors,
+        }))
+    }
+
+    async fn list_session_anchors(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::chat::anchor::Anchor>> {
+        self.count_read();
+        let store = self.anchor_store.read().await;
+        let mut v: Vec<_> = store
+            .anchors
+            .values()
+            .filter(|a| a.session_id == session_id)
+            .cloned()
+            .collect();
+        v.sort_by_key(|a| (a.created_at, a.id));
+        Ok(v)
+    }
+
+    async fn list_sessions_for_target(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+        state: Option<crate::chat::anchor::AnchorState>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<crate::chat::anchor::AnchorPage> {
+        let limit = limit.clamp(1, 200);
+        let after = cursor.unwrap_or("").to_string();
+        let store = self.anchor_store.read().await;
+        let mut items: Vec<_> = store
+            .anchors
+            .values()
+            .filter(|a| a.target_type == target_type && a.target_id == target_id)
+            .filter(|a| state.is_none_or(|s| a.state == s))
+            .filter(|a| after.is_empty() || a.id.to_string() > after)
+            .cloned()
+            .collect();
+        items.sort_by_key(|a| a.id.to_string());
+        items.truncate(limit + 1);
+        let next_cursor = if items.len() > limit {
+            items.truncate(limit);
+            items.last().map(|a| a.id.to_string())
+        } else {
+            None
+        };
+        Ok(crate::chat::anchor::AnchorPage { items, next_cursor })
+    }
+
+    async fn list_anchor_events(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::chat::anchor::AnchorEvent>> {
+        let store = self.anchor_store.read().await;
+        let mut out: Vec<_> = store
+            .events
+            .iter()
+            .filter(|e| e.session_id == session_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|e| (e.seq, e.at, e.id));
+        Ok(out)
+    }
+
+    async fn create_execution_place_event(
+        &self,
+        event: &crate::neo4j::models::ExecutionPlaceEvent,
+    ) -> Result<()> {
+        self.execution_place_events
+            .write()
+            .await
+            .push(event.clone());
+        Ok(())
+    }
+
+    async fn list_execution_place_events(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::models::ExecutionPlaceEvent>> {
+        let mut out: Vec<_> = self
+            .execution_place_events
+            .read()
+            .await
+            .iter()
+            .filter(|e| e.task_id == task_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|e| (e.at, e.id));
+        Ok(out)
+    }
+
+    async fn mark_anchors_dangling(
+        &self,
+        target_type: crate::chat::anchor::AnchorTargetType,
+        target_id: &str,
+    ) -> Result<usize> {
+        use crate::chat::anchor::*;
+        let todo: Vec<(Uuid, Uuid)> = self
+            .anchor_store
+            .read()
+            .await
+            .anchors
+            .values()
+            .filter(|a| {
+                a.target_type == target_type
+                    && a.target_id == target_id
+                    && a.state != AnchorState::Dangling
+            })
+            .map(|a| (a.session_id, a.id))
+            .collect();
+        let mut changed = 0;
+        for (session_id, anchor_id) in todo {
+            let op = AnchorOp::SetState {
+                anchor_id,
+                state: AnchorState::Dangling,
+                expected_version: None,
+                by: AnchorActor::System,
+                actor: DANGLING_ACTOR.to_string(),
+            };
+            if self.apply_anchor_op(session_id, op).await?.event.is_some() {
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
+
+    async fn backfill_project_anchors(&self) -> Result<crate::chat::anchor::BackfillReport> {
+        use crate::chat::anchor::*;
+        let mut sessions: Vec<(Uuid, String)> = self
+            .chat_sessions
+            .read()
+            .await
+            .values()
+            .filter_map(|s| {
+                s.project_slug
+                    .clone()
+                    .filter(|p| !p.is_empty())
+                    .map(|p| (s.id, p))
+            })
+            .collect();
+        sessions.sort();
+        let mut report = BackfillReport::default();
+        for (session_id, slug) in sessions {
+            let matches: Vec<ProjectNode> = self
+                .projects
+                .read()
+                .await
+                .values()
+                .filter(|p| p.slug == slug)
+                .cloned()
+                .collect();
+            let [project] = matches.as_slice() else {
+                report.skipped_unresolved += 1;
+                continue;
+            };
+            match self
+                .apply_anchor_op(session_id, AnchorOp::Add(backfill_new_anchor(project)))
+                .await
+            {
+                Ok(c) if c.created => report.created += 1,
+                Ok(_) => report.already_present += 1,
+                Err(e) => match e.downcast_ref::<AnchorError>() {
+                    Some(AnchorError::AlreadyAnchored { .. }) => report.already_present += 1,
+                    Some(AnchorError::SessionNotFound(_)) => report.skipped_unresolved += 1,
+                    Some(_) => report.skipped_by_rule += 1,
+                    None => return Err(e),
+                },
+            }
+        }
+        Ok(report)
+    }
+
+    async fn backfill_spawned_by_edges(&self) -> Result<usize> {
+        // The mock keeps no edges: its only lineage is the `spawned_by` JSON.
+        Ok(0)
+    }
+
+    async fn revert_inferred_anchors(&self) -> Result<usize> {
+        use crate::chat::anchor::*;
+        let mut store = self.anchor_store.write().await;
+        let doomed: Vec<Uuid> = store
+            .anchors
+            .values()
+            .filter(|a| {
+                let added_by = store
+                    .events
+                    .iter()
+                    .find(|e| e.anchor_id == a.id && e.kind == AnchorEventKind::Added)
+                    .map(|e| e.actor.as_str());
+                is_revertible_backfill(a, added_by)
+            })
+            .map(|a| a.id)
+            .collect();
+        for id in &doomed {
+            store.anchors.remove(id);
+        }
+        store.events.retain(|e| !doomed.contains(&e.anchor_id));
+        Ok(doomed.len())
+    }
+
+    // Chat event operations
+
+    async fn store_chat_events(
+        &self,
+        session_id: Uuid,
+        events: Vec<ChatEventRecord>,
+    ) -> Result<()> {
+        loop {
+            // Created before the check: a release in between still wakes it.
+            let released = self.chat_events_released.notified();
+            let stalled = self
+                .stall_chat_events_of
+                .lock()
+                .is_ok_and(|s| events.iter().any(|e| s.contains(&e.event_type)));
+            if !stalled {
+                break;
+            }
+            released.await;
+        }
+        let mut store = self.chat_events.write().await;
+        let entry = store.entry(session_id).or_default();
+        entry.extend(events);
+        Ok(())
+    }
+
+    async fn get_chat_events(
+        &self,
+        session_id: Uuid,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<ChatEventRecord>> {
+        let store = self.chat_events.read().await;
+        let events = store
+            .get(&session_id)
+            .map(|v| {
+                v.iter()
+                    .filter(|e| e.seq > after_seq)
+                    .take(limit as usize)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(events)
+    }
+
+    async fn get_attention_events(&self, session_ids: &[Uuid]) -> Result<Vec<ChatEventRecord>> {
+        self.log_read("get_attention_events")?;
+        let store = self.chat_events.read().await;
+        let mut out = Vec::new();
+        for id in session_ids {
+            if let Some(events) = store.get(id) {
+                for e in events {
+                    if matches!(
+                        e.event_type.as_str(),
+                        "permission_request"
+                            | "permission_decision"
+                            | "ask_user_question"
+                            | "session_error"
+                    ) {
+                        out.push(e.clone());
+                    } else if e.event_type == "user_message" {
+                        let mut e = e.clone();
+                        e.data = String::new();
+                        out.push(e);
+                    }
+                }
+            }
+        }
+        out.sort_by_key(|e| (e.session_id, e.seq));
+        Ok(out)
+    }
+
+    async fn get_chat_events_paginated(
+        &self,
+        session_id: Uuid,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<ChatEventRecord>> {
+        let store = self.chat_events.read().await;
+        let events = store
+            .get(&session_id)
+            .map(|v| {
+                let mut sorted = v.clone();
+                sorted.sort_by_key(|e| e.seq);
+                sorted
+                    .into_iter()
+                    .skip(offset as usize)
+                    .take(limit as usize)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(events)
+    }
+
+    async fn count_chat_events(&self, session_id: Uuid) -> Result<i64> {
+        let store = self.chat_events.read().await;
+        let count = store.get(&session_id).map(|v| v.len() as i64).unwrap_or(0);
+        Ok(count)
+    }
+
+    async fn get_latest_chat_event_seq(&self, session_id: Uuid) -> Result<i64> {
+        let store = self.chat_events.read().await;
+        let max_seq = store
+            .get(&session_id)
+            .and_then(|v| v.iter().map(|e| e.seq).max())
+            .unwrap_or(0);
+        Ok(max_seq)
+    }
+
+    async fn delete_chat_events(&self, session_id: Uuid) -> Result<()> {
+        self.chat_events.write().await.remove(&session_id);
+        Ok(())
+    }
+
+    // ========================================================================
+    // Chat DISCUSSED relations
+    // ========================================================================
+
+    async fn add_discussed(
+        &self,
+        session_id: Uuid,
+        entities: &[(String, String)],
+    ) -> Result<usize> {
+        // Mock: record the call and answer as if all were created
+        self.discussed_calls
+            .write()
+            .await
+            .push((session_id, entities.to_vec()));
+        Ok(entities.len())
+    }
+
+    async fn get_session_entities(
+        &self,
+        _session_id: Uuid,
+        _project_id: Option<Uuid>,
+    ) -> Result<Vec<DiscussedEntity>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_discussed_co_changers(
+        &self,
+        _project_id: Uuid,
+        _max_sessions: i64,
+        _max_results: i64,
+    ) -> Result<Vec<CoChanger>> {
+        Ok(Vec::new())
+    }
+
+    async fn backfill_discussed(&self) -> Result<(usize, usize, usize)> {
+        Ok((0, 0, 0))
+    }
+
+    // ========================================================================
+    // Chat ↔ Plan/Task/RFC linking (ASSOCIATED_WITH relation)
+    // ========================================================================
+
+    async fn create_associated_with(
+        &self,
+        _session_id: Uuid,
+        _entity_type: &str,
+        _entity_id: Uuid,
+        _source: &str,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn get_session_links(&self, _session_id: Uuid) -> Result<LinkedSessionInfo> {
+        Ok(LinkedSessionInfo::default())
+    }
+
+    async fn get_sessions_for_plan(&self, _plan_id: Uuid) -> Result<Vec<SessionWithLinks>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_sessions_for_task(&self, _task_id: Uuid) -> Result<Vec<SessionWithLinks>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_session_links_batch(
+        &self,
+        _session_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, LinkedSessionInfo>> {
+        Ok(std::collections::HashMap::new())
+    }
+
+    async fn get_task_plan_id(&self, task_id: Uuid) -> Result<Option<Uuid>> {
+        let pt = self.plan_tasks.read().await;
+        Ok(pt
+            .iter()
+            .find(|(_, ids)| ids.contains(&task_id))
+            .map(|(plan_id, _)| *plan_id))
+    }
+
+    // ========================================================================
+    // Graph visualization queries (PM + Chat layers)
+    // ========================================================================
+
+    async fn get_pm_graph_data(
+        &self,
+        _project_id: Uuid,
+        _limit: usize,
+    ) -> Result<(Vec<PmGraphNode>, Vec<PmGraphEdge>)> {
+        Ok((Vec::new(), Vec::new()))
+    }
+
+    async fn get_chat_graph_data(
+        &self,
+        _project_id: Uuid,
+        _limit: usize,
+    ) -> Result<(Vec<ChatGraphSession>, Vec<ChatGraphDiscussed>)> {
+        Ok((Vec::new(), Vec::new()))
+    }
+
+    // ========================================================================
+    // User / Auth operations
+    // ========================================================================
+
+    async fn upsert_user(&self, user: &UserNode) -> Result<UserNode> {
+        use crate::neo4j::models::AuthProvider;
+
+        let mut users = self.users.write().await;
+
+        // Find existing user based on auth provider strategy
+        let existing_id = match user.auth_provider {
+            AuthProvider::Oidc => {
+                // OIDC: match on auth_provider + external_id
+                let ext_id = user.external_id.as_deref().unwrap_or_default();
+                users
+                    .values()
+                    .find(|u| {
+                        u.auth_provider == AuthProvider::Oidc
+                            && u.external_id.as_deref() == Some(ext_id)
+                    })
+                    .map(|u| u.id)
+            }
+            AuthProvider::Password => {
+                // Password: match on auth_provider + email
+                users
+                    .values()
+                    .find(|u| u.auth_provider == AuthProvider::Password && u.email == user.email)
+                    .map(|u| u.id)
+            }
+        };
+
+        if let Some(id) = existing_id {
+            // Update existing user
+            let existing = users.get_mut(&id).unwrap();
+            existing.email = user.email.clone();
+            existing.name = user.name.clone();
+            existing.picture_url = user.picture_url.clone();
+            existing.last_login_at = user.last_login_at;
+            Ok(existing.clone())
+        } else {
+            // Insert new user
+            users.insert(user.id, user.clone());
+            Ok(user.clone())
+        }
+    }
+
+    async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserNode>> {
+        Ok(self.users.read().await.get(&id).cloned())
+    }
+
+    async fn get_user_by_provider_id(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<Option<UserNode>> {
+        let provider_parsed: crate::neo4j::models::AuthProvider =
+            provider.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+        Ok(self
+            .users
+            .read()
+            .await
+            .values()
+            .find(|u| {
+                u.auth_provider == provider_parsed && u.external_id.as_deref() == Some(external_id)
+            })
+            .cloned())
+    }
+
+    async fn get_user_by_email_and_provider(
+        &self,
+        email: &str,
+        provider: &str,
+    ) -> Result<Option<UserNode>> {
+        let provider_parsed: crate::neo4j::models::AuthProvider =
+            provider.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+        Ok(self
+            .users
+            .read()
+            .await
+            .values()
+            .find(|u| u.email == email && u.auth_provider == provider_parsed)
+            .cloned())
+    }
+
+    async fn get_user_by_email(&self, email: &str) -> Result<Option<UserNode>> {
+        Ok(self
+            .users
+            .read()
+            .await
+            .values()
+            .find(|u| u.email == email)
+            .cloned())
+    }
+
+    async fn create_password_user(
+        &self,
+        email: &str,
+        name: &str,
+        password_hash: &str,
+    ) -> Result<UserNode> {
+        let now = chrono::Utc::now();
+        let user = UserNode {
+            id: Uuid::new_v4(),
+            email: email.to_string(),
+            name: name.to_string(),
+            picture_url: None,
+            auth_provider: crate::neo4j::models::AuthProvider::Password,
+            external_id: None,
+            password_hash: Some(password_hash.to_string()),
+            created_at: now,
+            last_login_at: now,
+        };
+        self.upsert_user(&user).await
+    }
+
+    async fn list_users(&self) -> Result<Vec<UserNode>> {
+        Ok(self.users.read().await.values().cloned().collect())
+    }
+
+    // Refresh Tokens
+    async fn create_refresh_token(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let token = crate::neo4j::models::RefreshTokenNode {
+            token_hash: token_hash.to_string(),
+            user_id,
+            expires_at,
+            created_at: chrono::Utc::now(),
+            revoked: false,
+        };
+        self.refresh_tokens
+            .write()
+            .await
+            .insert(token_hash.to_string(), token);
+        Ok(())
+    }
+
+    async fn validate_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<crate::neo4j::models::RefreshTokenNode>> {
+        let tokens = self.refresh_tokens.read().await;
+        match tokens.get(token_hash) {
+            Some(token) if !token.revoked && token.expires_at > chrono::Utc::now() => {
+                Ok(Some(token.clone()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool> {
+        let mut tokens = self.refresh_tokens.write().await;
+        match tokens.get_mut(token_hash) {
+            Some(token) => {
+                token.revoked = true;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64> {
+        let mut tokens = self.refresh_tokens.write().await;
+        let mut count = 0u64;
+        for token in tokens.values_mut() {
+            if token.user_id == user_id && !token.revoked {
+                token.revoked = true;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    // MCP Tokens
+    async fn create_mcp_token(
+        &self,
+        user_id: Uuid,
+        jti: &str,
+        label: &str,
+        scope: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let token = crate::neo4j::models::McpTokenNode {
+            jti: jti.to_string(),
+            user_id,
+            label: label.to_string(),
+            scope: scope.to_string(),
+            expires_at,
+            created_at: chrono::Utc::now(),
+            revoked: false,
+        };
+        self.mcp_tokens.write().await.insert(jti.to_string(), token);
+        Ok(())
+    }
+
+    async fn is_mcp_token_active(&self, jti: &str) -> Result<bool> {
+        let tokens = self.mcp_tokens.read().await;
+        Ok(tokens
+            .get(jti)
+            .is_some_and(|t| !t.revoked && t.expires_at > chrono::Utc::now()))
+    }
+
+    async fn revoke_mcp_token(&self, user_id: Uuid, jti: &str) -> Result<bool> {
+        let mut tokens = self.mcp_tokens.write().await;
+        match tokens.get_mut(jti) {
+            Some(token) if token.user_id == user_id => {
+                token.revoked = true;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn list_mcp_tokens(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::models::McpTokenNode>> {
+        let tokens = self.mcp_tokens.read().await;
+        Ok(tokens
+            .values()
+            .filter(|t| t.user_id == user_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64> {
+        let mut tokens = self.mcp_tokens.write().await;
+        let now = chrono::Utc::now();
+        let before = tokens.len();
+        // Same predicate as the Cypher: owned by this user AND already dead.
+        tokens.retain(|_, t| !(t.user_id == user_id && (t.revoked || t.expires_at < now)));
+        Ok((before - tokens.len()) as u64)
+    }
+
+    // Feature Graphs
+    async fn create_feature_graph(&self, graph: &FeatureGraphNode) -> Result<()> {
+        self.feature_graphs
+            .write()
+            .await
+            .insert(graph.id, graph.clone());
+        Ok(())
+    }
+
+    async fn get_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphNode>> {
+        Ok(self.feature_graphs.read().await.get(&id).cloned())
+    }
+
+    async fn get_feature_graph_detail(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>> {
+        let graphs = self.feature_graphs.read().await;
+        let Some(fg) = graphs.get(&id).cloned() else {
+            return Ok(None);
+        };
+
+        let fg_entities = self.feature_graph_entities.read().await;
+        let funcs = self.functions.read().await;
+        let structs = self.structs_map.read().await;
+        let traits = self.traits_map.read().await;
+        let entities = fg_entities
+            .get(&id)
+            .map(|ents| {
+                ents.iter()
+                    .map(|(et, eid, role)| {
+                        let mut ent = FeatureGraphEntity {
+                            entity_type: et.clone(),
+                            entity_id: eid.clone(),
+                            name: Some(eid.clone()),
+                            role: role.clone(),
+                            ..Default::default()
+                        };
+                        match et.to_lowercase().as_str() {
+                            "file" => ent.file_path = Some(eid.clone()),
+                            "function" => {
+                                if let Some(f) = funcs.values().find(|f| &f.name == eid) {
+                                    let vis = normalize_visibility(&format!("{:?}", f.visibility));
+                                    let params = serde_json::to_string(&f.params).ok();
+                                    ent.file_path = Some(f.file_path.clone());
+                                    ent.docstring =
+                                        f.docstring.as_deref().and_then(clean_entity_docstring);
+                                    ent.signature = Some(build_function_signature(
+                                        &f.name,
+                                        vis.as_deref(),
+                                        f.is_async,
+                                        f.is_unsafe,
+                                        params.as_deref(),
+                                        f.return_type.as_deref(),
+                                    ));
+                                    ent.line_start = Some(f.line_start);
+                                    ent.visibility = vis;
+                                }
+                            }
+                            "struct" => {
+                                if let Some(x) = structs.values().find(|x| &x.name == eid) {
+                                    let vis = normalize_visibility(&format!("{:?}", x.visibility));
+                                    ent.file_path = Some(x.file_path.clone());
+                                    ent.docstring =
+                                        x.docstring.as_deref().and_then(clean_entity_docstring);
+                                    ent.signature = Some(build_type_signature(
+                                        "struct",
+                                        &x.name,
+                                        vis.as_deref(),
+                                    ));
+                                    ent.line_start = Some(x.line_start);
+                                    ent.visibility = vis;
+                                }
+                            }
+                            "trait" => {
+                                if let Some(x) = traits.values().find(|x| &x.name == eid) {
+                                    let vis = normalize_visibility(&format!("{:?}", x.visibility));
+                                    ent.file_path = Some(x.file_path.clone());
+                                    ent.docstring =
+                                        x.docstring.as_deref().and_then(clean_entity_docstring);
+                                    ent.signature = Some(build_type_signature(
+                                        "trait",
+                                        &x.name,
+                                        vis.as_deref(),
+                                    ));
+                                    ent.line_start = Some(x.line_start);
+                                    ent.visibility = vis;
+                                }
+                            }
+                            _ => {}
+                        }
+                        ent
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(Some(FeatureGraphDetail {
+            graph: fg,
+            entities,
+            relations: vec![],
+        }))
+    }
+
+    async fn list_feature_graphs(&self, project_id: Option<Uuid>) -> Result<Vec<FeatureGraphNode>> {
+        let graphs = self.feature_graphs.read().await;
+        let entities = self.feature_graph_entities.read().await;
+        let mut result: Vec<FeatureGraphNode> = graphs
+            .values()
+            .filter(|fg| {
+                if let Some(pid) = project_id {
+                    fg.project_id == pid
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .map(|mut fg| {
+                fg.entity_count = Some(entities.get(&fg.id).map(|v| v.len() as i64).unwrap_or(0));
+                fg
+            })
+            .collect();
+        result.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(result)
+    }
+
+    async fn delete_feature_graph(&self, id: Uuid) -> Result<bool> {
+        let removed = self.feature_graphs.write().await.remove(&id).is_some();
+        self.feature_graph_entities.write().await.remove(&id);
+        Ok(removed)
+    }
+
+    async fn add_entity_to_feature_graph(
+        &self,
+        feature_graph_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+        role: Option<&str>,
+        _project_id: Option<Uuid>,
+    ) -> Result<()> {
+        let mut entities = self.feature_graph_entities.write().await;
+        let list = entities.entry(feature_graph_id).or_default();
+        // Check if entity already exists (by type + id)
+        if let Some(existing) = list
+            .iter_mut()
+            .find(|(et, eid, _)| et == entity_type && eid == entity_id)
+        {
+            // Update role if provided
+            if role.is_some() {
+                existing.2 = role.map(|r| r.to_string());
+            }
+        } else {
+            list.push((
+                entity_type.to_string(),
+                entity_id.to_string(),
+                role.map(|r| r.to_string()),
+            ));
+        }
+        // Update updated_at
+        if let Some(fg) = self.feature_graphs.write().await.get_mut(&feature_graph_id) {
+            fg.updated_at = chrono::Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn remove_entity_from_feature_graph(
+        &self,
+        feature_graph_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<bool> {
+        let mut entities = self.feature_graph_entities.write().await;
+        if let Some(list) = entities.get_mut(&feature_graph_id) {
+            let before = list.len();
+            list.retain(|(et, eid, _)| !(et == entity_type && eid == entity_id));
+            Ok(list.len() < before)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn auto_build_feature_graph(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        project_id: Uuid,
+        entry_function: &str,
+        depth: u32,
+        include_relations: Option<&[String]>,
+        filter_community: Option<bool>,
+    ) -> Result<FeatureGraphDetail> {
+        let should_include = |rel: &str| -> bool {
+            match &include_relations {
+                None => true,
+                Some(rels) => rels.iter().any(|r| r.eq_ignore_ascii_case(rel)),
+            }
+        };
+        let filter_community = filter_community.unwrap_or(true);
+        let depth = depth.clamp(1, 5);
+
+        // Collect callees from the mock call_relationships
+        let cr = self.call_relationships.read().await;
+        let mut all_functions = std::collections::HashSet::new();
+        all_functions.insert(entry_function.to_string());
+
+        // Track direct (depth=1) connections for community filtering
+        let mut direct_connections: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        // Simple BFS traversal for callees
+        let mut queue: Vec<String> = vec![entry_function.to_string()];
+        for current_depth in 0..depth {
+            let mut next_queue = Vec::new();
+            for func in &queue {
+                // Check direct name match
+                if let Some(callees) = cr.get(func) {
+                    for callee in callees {
+                        if current_depth == 0 {
+                            direct_connections.insert(callee.clone());
+                        }
+                        if all_functions.insert(callee.clone()) {
+                            next_queue.push(callee.clone());
+                        }
+                    }
+                }
+                // Check qualified name match (e.g. "module::func")
+                for (caller_id, callees) in cr.iter() {
+                    if caller_id.ends_with(&format!("::{}", func)) {
+                        for callee in callees {
+                            if current_depth == 0 {
+                                direct_connections.insert(callee.clone());
+                            }
+                            if all_functions.insert(callee.clone()) {
+                                next_queue.push(callee.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            queue = next_queue;
+        }
+
+        // Collect callers (all are direct connections)
+        for (caller, callees) in cr.iter() {
+            if callees.contains(&entry_function.to_string()) {
+                all_functions.insert(caller.clone());
+                direct_connections.insert(caller.clone());
+            }
+        }
+        drop(cr);
+
+        // Community-based filtering
+        if filter_community {
+            let fa = self.function_analytics.read().await;
+            let entry_community = fa.get(entry_function).map(|a| a.community_id as i64);
+
+            if let Some(entry_cid) = entry_community {
+                all_functions.retain(|fname| {
+                    fname == entry_function
+                        || direct_connections.contains(fname)
+                        || fa
+                            .get(fname)
+                            .map(|a| a.community_id as i64)
+                            .map(|c| c == entry_cid)
+                            .unwrap_or(true) // no analytics → keep
+                });
+            }
+            drop(fa);
+        }
+
+        if all_functions.len() <= 1 {
+            // Only entry function found — check it even exists in functions
+            let funcs = self.functions.read().await;
+            let exists = funcs.values().any(|f| f.name == entry_function);
+            if !exists {
+                return Err(anyhow::anyhow!(
+                    "No function found matching '{}'",
+                    entry_function
+                ));
+            }
+        }
+
+        // Collect file paths from known functions
+        let funcs = self.functions.read().await;
+        let mut files = std::collections::HashSet::new();
+        for func in &all_functions {
+            for f in funcs.values() {
+                if f.name == *func {
+                    files.insert(f.file_path.clone());
+                }
+            }
+        }
+        drop(funcs);
+
+        // Expand via IMPLEMENTS_TRAIT + IMPLEMENTS_FOR for structs/enums in collected files
+        let mut discovered_structs = std::collections::HashSet::new();
+        let mut discovered_traits = std::collections::HashSet::new();
+
+        if should_include("implements_trait") || should_include("implements_for") {
+            // Find structs in collected files
+            let structs_map = self.structs_map.read().await;
+            for s in structs_map.values() {
+                if files.contains(&s.file_path) {
+                    discovered_structs.insert(s.name.clone());
+                }
+            }
+            drop(structs_map);
+
+            // Find enums in collected files
+            let enums_map = self.enums_map.read().await;
+            for e in enums_map.values() {
+                if files.contains(&e.file_path) {
+                    discovered_structs.insert(e.name.clone());
+                }
+            }
+            drop(enums_map);
+
+            // Find traits via impls (IMPLEMENTS_TRAIT + IMPLEMENTS_FOR)
+            let impls_map = self.impls_map.read().await;
+            for imp in impls_map.values() {
+                if discovered_structs.contains(&imp.for_type) {
+                    if let Some(ref trait_name) = imp.trait_name {
+                        discovered_traits.insert(trait_name.clone());
+                    }
+                }
+            }
+            drop(impls_map);
+        } // end if should_include implements_trait/implements_for
+
+        // Expand via IMPORTS — include files imported by the feature's files
+        if should_include("imports") {
+            let ir = self.import_relationships.read().await;
+            let original_files: Vec<String> = files.iter().cloned().collect();
+            for file_path in &original_files {
+                if let Some(imported) = ir.get(file_path) {
+                    for imp in imported {
+                        files.insert(imp.clone());
+                    }
+                }
+            }
+            drop(ir);
+        } // end if should_include imports
+
+        // Step 1d: Expand via vector similarity (best-effort)
+        // For each function with an embedding, find semantically similar functions
+        let mut vector_expanded_funcs: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        {
+            let func_embeddings = self.function_embeddings.read().await;
+            let funcs_map = self.functions.read().await;
+
+            // Collect embeddings for all current functions
+            let mut func_with_embeddings: Vec<Vec<f32>> = Vec::new();
+            for func_name in all_functions.iter() {
+                if let Some(func) = funcs_map.values().find(|f| f.name == *func_name) {
+                    let key = format!("{}::{}", func.file_path, func_name);
+                    if let Some((emb, _)) = func_embeddings.get(&key) {
+                        func_with_embeddings.push(emb.clone());
+                    }
+                }
+            }
+            drop(func_embeddings);
+            drop(funcs_map);
+
+            let entry_cid = if filter_community {
+                let fa = self.function_analytics.read().await;
+                fa.get(entry_function).map(|a| a.community_id)
+            } else {
+                None
+            };
+
+            for embedding in &func_with_embeddings {
+                let neighbors = self
+                    .vector_search_functions(embedding, 5, Some(project_id))
+                    .await
+                    .unwrap_or_default();
+                for (neighbor_name, neighbor_path, score) in neighbors {
+                    if score < 0.8 || all_functions.contains(&neighbor_name) {
+                        continue;
+                    }
+                    // Community filter
+                    if let Some(target_cid) = entry_cid {
+                        let fa = self.function_analytics.read().await;
+                        if let Some(analytics) = fa.get(&neighbor_name) {
+                            if analytics.community_id != target_cid {
+                                continue;
+                            }
+                        }
+                    }
+                    vector_expanded_funcs.insert(neighbor_name.clone());
+                    all_functions.insert(neighbor_name);
+                    files.insert(neighbor_path);
+                }
+            }
+        }
+
+        // Step 1e: Expand via community — find related files in same Louvain cluster (best-effort)
+        {
+            let fa = self.file_analytics.read().await;
+            let mut seen_communities: std::collections::HashSet<u32> =
+                std::collections::HashSet::new();
+            for file_path in files.iter() {
+                if let Some(analytics) = fa.get(file_path) {
+                    seen_communities.insert(analytics.community_id);
+                }
+            }
+            let original_files: std::collections::HashSet<String> = files.clone();
+            for cid in &seen_communities {
+                let mut peers: Vec<(String, f64)> = Vec::new();
+                for (path, analytics) in fa.iter() {
+                    if analytics.community_id == *cid && !original_files.contains(path) {
+                        peers.push((path.clone(), analytics.pagerank));
+                    }
+                }
+                peers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                for (path, _) in peers.into_iter().take(5) {
+                    files.insert(path);
+                }
+            }
+            drop(fa);
+        }
+
+        // Create the feature graph (with build params for refresh)
+        let fg = FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            description: description.map(|d| d.to_string()),
+            project_id,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            entity_count: None,
+            entry_function: Some(entry_function.to_string()),
+            build_depth: Some(depth),
+            include_relations: include_relations.map(|r| r.iter().map(|s| s.to_string()).collect()),
+        };
+        self.create_feature_graph(&fg).await?;
+
+        // Add entities with auto-assigned roles
+        let mut entities = Vec::new();
+        for func_name in &all_functions {
+            let role = if func_name == entry_function {
+                "entry_point"
+            } else if vector_expanded_funcs.contains(func_name) {
+                "support"
+            } else {
+                "core_logic"
+            };
+            let _ = self
+                .add_entity_to_feature_graph(
+                    fg.id,
+                    "function",
+                    func_name,
+                    Some(role),
+                    Some(project_id),
+                )
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "function".to_string(),
+                entity_id: func_name.clone(),
+                name: Some(func_name.clone()),
+                role: Some(role.to_string()),
+                importance_score: None,
+                ..Default::default()
+            });
+        }
+        for file_path in &files {
+            let _ = self
+                .add_entity_to_feature_graph(
+                    fg.id,
+                    "file",
+                    file_path,
+                    Some("support"),
+                    Some(project_id),
+                )
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "file".to_string(),
+                entity_id: file_path.clone(),
+                name: Some(file_path.clone()),
+                role: Some("support".to_string()),
+                importance_score: None,
+                ..Default::default()
+            });
+        }
+
+        // Add structs/enums discovered via IMPLEMENTS_FOR with role: data_model
+        for struct_name in &discovered_structs {
+            let _ = self
+                .add_entity_to_feature_graph(
+                    fg.id,
+                    "struct",
+                    struct_name,
+                    Some("data_model"),
+                    Some(project_id),
+                )
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "struct".to_string(),
+                entity_id: struct_name.clone(),
+                name: Some(struct_name.clone()),
+                role: Some("data_model".to_string()),
+                importance_score: None,
+                ..Default::default()
+            });
+        }
+
+        // Add traits discovered via IMPLEMENTS_TRAIT with role: trait_contract
+        for trait_name in &discovered_traits {
+            let _ = self
+                .add_entity_to_feature_graph(
+                    fg.id,
+                    "trait",
+                    trait_name,
+                    Some("trait_contract"),
+                    Some(project_id),
+                )
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "trait".to_string(),
+                entity_id: trait_name.clone(),
+                name: Some(trait_name.clone()),
+                role: Some("trait_contract".to_string()),
+                importance_score: None,
+                ..Default::default()
+            });
+        }
+
+        Ok(FeatureGraphDetail {
+            graph: fg,
+            entities,
+            relations: vec![],
+        })
+    }
+
+    async fn refresh_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>> {
+        // 1. Load the existing feature graph
+        let fg = {
+            let fgs = self.feature_graphs.read().await;
+            fgs.get(&id).cloned()
+        };
+        let fg = match fg {
+            Some(fg) => fg,
+            None => return Err(anyhow::anyhow!("Feature graph {} not found", id)),
+        };
+
+        // 2. Check if it was auto-built (has entry_function)
+        let entry_function = match &fg.entry_function {
+            Some(ef) => ef.clone(),
+            None => return Ok(None), // manually created, skip refresh
+        };
+
+        let depth = fg.build_depth.unwrap_or(2);
+        let include_relations = fg.include_relations.clone();
+        let project_id = fg.project_id;
+
+        let should_include = |rel: &str| -> bool {
+            match &include_relations {
+                None => true,
+                Some(rels) => rels.iter().any(|r| r.eq_ignore_ascii_case(rel)),
+            }
+        };
+
+        // 3. Delete all existing INCLUDES_ENTITY relationships
+        {
+            let mut fge = self.feature_graph_entities.write().await;
+            fge.remove(&id);
+        }
+
+        // 4. Re-run BFS traversal (same logic as auto_build)
+        let depth = depth.clamp(1, 5);
+
+        let cr = self.call_relationships.read().await;
+        let mut all_functions = std::collections::HashSet::new();
+        all_functions.insert(entry_function.clone());
+
+        let mut queue: Vec<String> = vec![entry_function.clone()];
+        for _ in 0..depth {
+            let mut next_queue = Vec::new();
+            for func in &queue {
+                if let Some(callees) = cr.get(func) {
+                    for callee in callees {
+                        if all_functions.insert(callee.clone()) {
+                            next_queue.push(callee.clone());
+                        }
+                    }
+                }
+                for (caller_id, callees) in cr.iter() {
+                    if caller_id.ends_with(&format!("::{}", func)) {
+                        for callee in callees {
+                            if all_functions.insert(callee.clone()) {
+                                next_queue.push(callee.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            queue = next_queue;
+        }
+
+        for (caller, callees) in cr.iter() {
+            if callees.contains(&entry_function) {
+                all_functions.insert(caller.clone());
+            }
+        }
+        drop(cr);
+
+        if all_functions.len() <= 1 {
+            let funcs = self.functions.read().await;
+            let exists = funcs.values().any(|f| f.name == entry_function);
+            if !exists {
+                return Err(anyhow::anyhow!(
+                    "No function found matching '{}' during refresh",
+                    entry_function
+                ));
+            }
+        }
+
+        let funcs = self.functions.read().await;
+        let mut files = std::collections::HashSet::new();
+        for func in &all_functions {
+            for f in funcs.values() {
+                if f.name == *func {
+                    files.insert(f.file_path.clone());
+                }
+            }
+        }
+        drop(funcs);
+
+        // Expand via IMPLEMENTS_TRAIT + IMPLEMENTS_FOR
+        let mut discovered_structs = std::collections::HashSet::new();
+        let mut discovered_traits = std::collections::HashSet::new();
+
+        if should_include("implements_trait") || should_include("implements_for") {
+            let structs_map = self.structs_map.read().await;
+            for s in structs_map.values() {
+                if files.contains(&s.file_path) {
+                    discovered_structs.insert(s.name.clone());
+                }
+            }
+            drop(structs_map);
+
+            let enums_map = self.enums_map.read().await;
+            for e in enums_map.values() {
+                if files.contains(&e.file_path) {
+                    discovered_structs.insert(e.name.clone());
+                }
+            }
+            drop(enums_map);
+
+            let impls_map = self.impls_map.read().await;
+            for imp in impls_map.values() {
+                if discovered_structs.contains(&imp.for_type) {
+                    if let Some(ref trait_name) = imp.trait_name {
+                        discovered_traits.insert(trait_name.clone());
+                    }
+                }
+            }
+            drop(impls_map);
+        }
+
+        // Expand via IMPORTS
+        if should_include("imports") {
+            let ir = self.import_relationships.read().await;
+            let original_files: Vec<String> = files.iter().cloned().collect();
+            for file_path in &original_files {
+                if let Some(imported) = ir.get(file_path) {
+                    for imp in imported {
+                        files.insert(imp.clone());
+                    }
+                }
+            }
+            drop(ir);
+        }
+
+        // 5. Update timestamp
+        {
+            let mut fgs = self.feature_graphs.write().await;
+            if let Some(fg) = fgs.get_mut(&id) {
+                fg.updated_at = chrono::Utc::now();
+            }
+        }
+
+        // 6. Re-add entities with auto-assigned roles
+        let mut entities = Vec::new();
+        for func_name in &all_functions {
+            let role = if *func_name == entry_function {
+                "entry_point"
+            } else {
+                "core_logic"
+            };
+            let _ = self
+                .add_entity_to_feature_graph(
+                    id,
+                    "function",
+                    func_name,
+                    Some(role),
+                    Some(project_id),
+                )
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "function".to_string(),
+                entity_id: func_name.clone(),
+                name: Some(func_name.clone()),
+                role: Some(role.to_string()),
+                importance_score: None,
+                ..Default::default()
+            });
+        }
+        for file_path in &files {
+            let _ = self
+                .add_entity_to_feature_graph(
+                    id,
+                    "file",
+                    file_path,
+                    Some("support"),
+                    Some(project_id),
+                )
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "file".to_string(),
+                entity_id: file_path.clone(),
+                name: Some(file_path.clone()),
+                role: Some("support".to_string()),
+                importance_score: None,
+                ..Default::default()
+            });
+        }
+        for struct_name in &discovered_structs {
+            let _ = self
+                .add_entity_to_feature_graph(
+                    id,
+                    "struct",
+                    struct_name,
+                    Some("data_model"),
+                    Some(project_id),
+                )
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "struct".to_string(),
+                entity_id: struct_name.clone(),
+                name: Some(struct_name.clone()),
+                role: Some("data_model".to_string()),
+                importance_score: None,
+                ..Default::default()
+            });
+        }
+        for trait_name in &discovered_traits {
+            let _ = self
+                .add_entity_to_feature_graph(
+                    id,
+                    "trait",
+                    trait_name,
+                    Some("trait_contract"),
+                    Some(project_id),
+                )
+                .await;
+            entities.push(FeatureGraphEntity {
+                entity_type: "trait".to_string(),
+                entity_id: trait_name.clone(),
+                name: Some(trait_name.clone()),
+                role: Some("trait_contract".to_string()),
+                importance_score: None,
+                ..Default::default()
+            });
+        }
+
+        // Re-read the full detail (converts tuples to FeatureGraphEntity)
+        let detail = self
+            .get_feature_graph_detail(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Feature graph {} disappeared after refresh", id))?;
+
+        Ok(Some(detail))
+    }
+
+    async fn get_top_entry_functions(&self, project_id: Uuid, limit: usize) -> Result<Vec<String>> {
+        // Collect file paths that belong to this project
+        let files = self.files.read().await;
+        let project_paths: std::collections::HashSet<_> = files
+            .values()
+            .filter(|f| f.project_id == Some(project_id))
+            .map(|f| f.path.clone())
+            .collect();
+        drop(files);
+
+        // Collect function names that belong to project files
+        let funcs = self.functions.read().await;
+        let project_functions: std::collections::HashSet<String> = funcs
+            .values()
+            .filter(|f| project_paths.contains(&f.file_path))
+            .map(|f| f.name.clone())
+            .collect();
+        drop(funcs);
+
+        // Count callers + callees for each function
+        let cr = self.call_relationships.read().await;
+        let mut connection_counts: HashMap<String, usize> = HashMap::new();
+
+        for func_name in &project_functions {
+            let mut count = 0usize;
+            // Count callees
+            if let Some(callees) = cr.get(func_name) {
+                count += callees.len();
+            }
+            // Count callers
+            for (_caller, callees) in cr.iter() {
+                if callees.contains(func_name) {
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                connection_counts.insert(func_name.clone(), count);
+            }
+        }
+        drop(cr);
+
+        // Sort by connection count descending
+        let mut sorted: Vec<_> = connection_counts.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.truncate(limit);
+
+        Ok(sorted.into_iter().map(|(name, _)| name).collect())
+    }
+
+    async fn get_feature_graph_statistics(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<FeatureGraphStatistics>> {
+        let detail = match self.get_feature_graph_detail(id).await? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let entity_count = detail.entities.len();
+        if entity_count == 0 {
+            return Ok(Some(FeatureGraphStatistics {
+                id,
+                name: detail.graph.name.clone(),
+                entity_count: 0,
+                entity_breakdown: std::collections::HashMap::new(),
+                role_breakdown: std::collections::HashMap::new(),
+                internal_edge_count: 0,
+                external_edge_count: 0,
+                cohesion: 0.0,
+                coupling: 0.0,
+                avg_importance: None,
+                entry_points: vec![],
+                exit_points: vec![],
+            }));
+        }
+
+        let mut entity_breakdown: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut role_breakdown: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut importance_sum = 0.0_f64;
+        let mut importance_count = 0_usize;
+
+        let entity_ids: std::collections::HashSet<String> = detail
+            .entities
+            .iter()
+            .map(|e| e.entity_id.clone())
+            .collect();
+
+        for e in &detail.entities {
+            *entity_breakdown.entry(e.entity_type.clone()).or_insert(0) += 1;
+            if let Some(role) = &e.role {
+                *role_breakdown.entry(role.clone()).or_insert(0) += 1;
+            }
+            if let Some(score) = e.importance_score {
+                importance_sum += score;
+                importance_count += 1;
+            }
+        }
+
+        let internal_edge_count = detail.relations.len();
+
+        // External edges: count call relationships going outside the graph
+        let cr = self.call_relationships.read().await;
+        let mut external_edge_count = 0_usize;
+        let mut entry_points_set: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut exit_points_set: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        for e in &detail.entities {
+            if e.entity_type == "function" || e.entity_type == "Function" {
+                // Outgoing calls to outside
+                if let Some(callees) = cr.get(&e.entity_id) {
+                    for callee in callees {
+                        if !entity_ids.contains(callee) {
+                            external_edge_count += 1;
+                            exit_points_set.insert(e.entity_id.clone());
+                        }
+                    }
+                }
+                // Incoming calls from outside
+                for (caller, callees) in cr.iter() {
+                    if !entity_ids.contains(caller) && callees.contains(&e.entity_id) {
+                        external_edge_count += 1;
+                        entry_points_set.insert(e.entity_id.clone());
+                    }
+                }
+            }
+        }
+        drop(cr);
+
+        let max_possible = if entity_count > 1 {
+            entity_count * (entity_count - 1) / 2
+        } else {
+            1
+        };
+        let cohesion = internal_edge_count as f64 / max_possible as f64;
+        let total_edges = internal_edge_count + external_edge_count;
+        let coupling = if total_edges > 0 {
+            external_edge_count as f64 / total_edges as f64
+        } else {
+            0.0
+        };
+
+        let avg_importance = if importance_count > 0 {
+            Some(importance_sum / importance_count as f64)
+        } else {
+            None
+        };
+
+        Ok(Some(FeatureGraphStatistics {
+            id,
+            name: detail.graph.name,
+            entity_count,
+            entity_breakdown,
+            role_breakdown,
+            internal_edge_count,
+            external_edge_count,
+            cohesion,
+            coupling,
+            avg_importance,
+            entry_points: entry_points_set.into_iter().collect(),
+            exit_points: exit_points_set.into_iter().collect(),
+        }))
+    }
+
+    async fn compare_feature_graphs(
+        &self,
+        id_a: Uuid,
+        id_b: Uuid,
+    ) -> Result<Option<FeatureGraphComparison>> {
+        let detail_a = match self.get_feature_graph_detail(id_a).await? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let detail_b = match self.get_feature_graph_detail(id_b).await? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let set_a: std::collections::HashSet<(String, String)> = detail_a
+            .entities
+            .iter()
+            .map(|e| (e.entity_type.clone(), e.entity_id.clone()))
+            .collect();
+        let set_b: std::collections::HashSet<(String, String)> = detail_b
+            .entities
+            .iter()
+            .map(|e| (e.entity_type.clone(), e.entity_id.clone()))
+            .collect();
+
+        let shared_keys: std::collections::HashSet<_> = set_a.intersection(&set_b).collect();
+        let union_count = set_a.union(&set_b).count();
+
+        let shared_entities: Vec<FeatureGraphEntity> = detail_a
+            .entities
+            .iter()
+            .filter(|e| shared_keys.contains(&(e.entity_type.clone(), e.entity_id.clone())))
+            .cloned()
+            .collect();
+
+        let unique_to_a: Vec<FeatureGraphEntity> = detail_a
+            .entities
+            .iter()
+            .filter(|e| !set_b.contains(&(e.entity_type.clone(), e.entity_id.clone())))
+            .cloned()
+            .collect();
+
+        let unique_to_b: Vec<FeatureGraphEntity> = detail_b
+            .entities
+            .iter()
+            .filter(|e| !set_a.contains(&(e.entity_type.clone(), e.entity_id.clone())))
+            .cloned()
+            .collect();
+
+        let similarity = if union_count > 0 {
+            shared_keys.len() as f64 / union_count as f64
+        } else {
+            0.0
+        };
+
+        Ok(Some(FeatureGraphComparison {
+            graph_a: FeatureGraphComparisonSide {
+                id: id_a,
+                name: detail_a.graph.name,
+                entity_count: detail_a.entities.len(),
+            },
+            graph_b: FeatureGraphComparisonSide {
+                id: id_b,
+                name: detail_b.graph.name,
+                entity_count: detail_b.entities.len(),
+            },
+            shared_entities,
+            unique_to_a,
+            unique_to_b,
+            similarity,
+        }))
+    }
+
+    async fn find_overlapping_feature_graphs(
+        &self,
+        id: Uuid,
+        min_overlap: f64,
+    ) -> Result<Vec<FeatureGraphOverlap>> {
+        let detail = match self.get_feature_graph_detail(id).await? {
+            Some(d) => d,
+            None => return Ok(vec![]),
+        };
+        let ref_set: std::collections::HashSet<(String, String)> = detail
+            .entities
+            .iter()
+            .map(|e| (e.entity_type.clone(), e.entity_id.clone()))
+            .collect();
+        let ref_count = ref_set.len();
+        if ref_count == 0 {
+            return Ok(vec![]);
+        }
+
+        let others = self
+            .list_feature_graphs(Some(detail.graph.project_id))
+            .await?;
+
+        let mut overlaps = Vec::new();
+        for other in others {
+            if other.id == id {
+                continue;
+            }
+            let other_detail = match self.get_feature_graph_detail(other.id).await? {
+                Some(d) => d,
+                None => continue,
+            };
+            let other_set: std::collections::HashSet<(String, String)> = other_detail
+                .entities
+                .iter()
+                .map(|e| (e.entity_type.clone(), e.entity_id.clone()))
+                .collect();
+
+            let shared: Vec<String> = ref_set
+                .intersection(&other_set)
+                .map(|(t, id)| format!("{}:{}", t, id))
+                .collect();
+            let shared_count = shared.len();
+            if shared_count == 0 {
+                continue;
+            }
+
+            let min_count = ref_count.min(other_set.len());
+            let overlap_ratio = shared_count as f64 / min_count as f64;
+
+            if overlap_ratio >= min_overlap {
+                overlaps.push(FeatureGraphOverlap {
+                    id: other.id,
+                    name: other.name,
+                    entity_count: other_set.len(),
+                    shared_count,
+                    shared_entities: shared,
+                    overlap_ratio,
+                });
+            }
+        }
+
+        overlaps.sort_by(|a, b| b.overlap_ratio.partial_cmp(&a.overlap_ratio).unwrap());
+        Ok(overlaps)
+    }
+
+    async fn get_project_import_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let pf = self.project_files.read().await;
+        let project_paths: std::collections::HashSet<&String> = pf
+            .get(&project_id)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+
+        if project_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let ir = self.import_relationships.read().await;
+        let mut edges = Vec::new();
+
+        for (source, targets) in ir.iter() {
+            if project_paths.contains(source) {
+                for target in targets {
+                    if project_paths.contains(target) {
+                        edges.push((source.clone(), target.clone()));
+                    }
+                }
+            }
+        }
+
+        Ok(edges)
+    }
+
+    async fn get_project_call_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let pf = self.project_files.read().await;
+        let project_paths: std::collections::HashSet<&String> = pf
+            .get(&project_id)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+
+        if project_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let cr = self.call_relationships.read().await;
+        let functions = self.functions.read().await;
+        let mut edges = Vec::new();
+
+        for (caller_id, callees) in cr.iter() {
+            // Check caller belongs to project and get its id
+            let caller_fn = match functions.get(caller_id) {
+                Some(f) if project_paths.contains(&f.file_path) => f,
+                _ => continue,
+            };
+            // Build function id matching Neo4j format: "file_path:name:line_start"
+            let caller_func_id = format!(
+                "{}:{}:{}",
+                caller_fn.file_path, caller_fn.name, caller_fn.line_start
+            );
+            for callee_name in callees {
+                // Check callee belongs to project and get its id
+                if let Some(callee_fn) = functions
+                    .values()
+                    .find(|f| f.name == *callee_name && project_paths.contains(&f.file_path))
+                {
+                    let callee_func_id = format!(
+                        "{}:{}:{}",
+                        callee_fn.file_path, callee_fn.name, callee_fn.line_start
+                    );
+                    // Return function IDs (matching the real Cypher: f1.id, f2.id)
+                    edges.push((caller_func_id.clone(), callee_func_id));
+                }
+            }
+        }
+
+        Ok(edges)
+    }
+
+    async fn get_project_extends_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let pf = self.project_files.read().await;
+        let project_paths: std::collections::HashSet<&String> = pf
+            .get(&project_id)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+
+        if project_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let cr = self.call_relationships.read().await;
+        let structs = self.structs_map.read().await;
+        let mut edges = Vec::new();
+
+        for (key, parents) in cr.iter() {
+            if let Some(child_name) = key.strip_prefix("extends:") {
+                // Find the child struct's file
+                if let Some(child_struct) = structs
+                    .values()
+                    .find(|s| s.name == child_name && project_paths.contains(&s.file_path))
+                {
+                    for parent_name in parents {
+                        // Find the parent struct's file
+                        if let Some(parent_struct) = structs.values().find(|s| {
+                            s.name == *parent_name && project_paths.contains(&s.file_path)
+                        }) {
+                            if child_struct.file_path != parent_struct.file_path {
+                                edges.push((
+                                    child_struct.file_path.clone(),
+                                    parent_struct.file_path.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(edges)
+    }
+
+    async fn get_project_implements_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let pf = self.project_files.read().await;
+        let project_paths: std::collections::HashSet<&String> = pf
+            .get(&project_id)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+
+        if project_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let cr = self.call_relationships.read().await;
+        let structs = self.structs_map.read().await;
+        let traits = self.traits_map.read().await;
+        let mut edges = Vec::new();
+
+        for (key, ifaces) in cr.iter() {
+            if let Some(struct_name) = key.strip_prefix("implements:") {
+                // Find the struct's file
+                if let Some(struct_node) = structs
+                    .values()
+                    .find(|s| s.name == struct_name && project_paths.contains(&s.file_path))
+                {
+                    for iface_name in ifaces {
+                        // Find the trait's file
+                        if let Some(trait_node) = traits
+                            .values()
+                            .find(|t| t.name == *iface_name && project_paths.contains(&t.file_path))
+                        {
+                            if struct_node.file_path != trait_node.file_path {
+                                edges.push((
+                                    struct_node.file_path.clone(),
+                                    trait_node.file_path.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(edges)
+    }
+
+    async fn batch_update_file_analytics(
+        &self,
+        updates: &[crate::graph::models::FileAnalyticsUpdate],
+    ) -> anyhow::Result<()> {
+        let mut fa = self.file_analytics.write().await;
+        for update in updates {
+            fa.insert(update.path.clone(), update.clone());
+        }
+        Ok(())
+    }
+
+    async fn batch_update_function_analytics(
+        &self,
+        updates: &[crate::graph::models::FunctionAnalyticsUpdate],
+    ) -> anyhow::Result<()> {
+        let mut fa = self.function_analytics.write().await;
+        for update in updates {
+            fa.insert(update.id.clone(), update.clone());
+        }
+        Ok(())
+    }
+
+    async fn batch_update_fabric_file_analytics(
+        &self,
+        updates: &[crate::graph::models::FabricFileAnalyticsUpdate],
+    ) -> anyhow::Result<()> {
+        // Mock: only record which paths were written
+        self.fabric_written_paths
+            .write()
+            .await
+            .extend(updates.iter().map(|u| u.path.clone()));
+        Ok(())
+    }
+
+    async fn batch_update_structural_dna(
+        &self,
+        _updates: &[crate::graph::models::StructuralDnaUpdate],
+    ) -> anyhow::Result<()> {
+        // Mock: structural DNA not stored separately in tests
+        Ok(())
+    }
+
+    async fn batch_update_structural_fingerprints(
+        &self,
+        _updates: &[crate::graph::models::StructuralFingerprintUpdate],
+    ) -> anyhow::Result<()> {
+        // Mock: structural fingerprints not stored separately in tests
+        Ok(())
+    }
+
+    async fn get_project_structural_fingerprints(
+        &self,
+        _project_id: &str,
+    ) -> anyhow::Result<Vec<(String, Vec<f64>)>> {
+        // Mock: no structural fingerprints in tests by default
+        Ok(vec![])
+    }
+
+    async fn get_project_file_signals(
+        &self,
+        _project_id: &str,
+    ) -> anyhow::Result<Vec<crate::graph::models::FileSignalRecord>> {
+        // Mock: no file signals in tests by default
+        Ok(vec![])
+    }
+
+    async fn write_predicted_links(
+        &self,
+        _project_id: &str,
+        _links: &[crate::graph::models::LinkPrediction],
+    ) -> anyhow::Result<()> {
+        // Mock: predicted links not stored in tests
+        Ok(())
+    }
+
+    async fn get_project_structural_dna(
+        &self,
+        _project_id: &str,
+    ) -> anyhow::Result<Vec<(String, Vec<f64>)>> {
+        // Mock: no structural DNA in tests by default
+        Ok(vec![])
+    }
+
+    async fn get_project_synapse_edges(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String, f64)>> {
+        // Mock: no SYNAPSE edges in tests by default
+        Ok(vec![])
+    }
+
+    async fn get_neural_metrics(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<crate::neo4j::models::NeuralMetrics> {
+        Ok(crate::neo4j::models::NeuralMetrics {
+            active_synapses: 0,
+            avg_energy: 0.0,
+            weak_synapses_ratio: 0.0,
+            dead_notes_count: 0,
+            total_notes_count: 0,
+            avg_reactivation_rate: 0.0,
+        })
+    }
+
+    // T5.5 — Churn score
+    async fn compute_churn_scores(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::FileChurnScore>> {
+        Ok(vec![])
+    }
+
+    async fn batch_update_churn_scores(
+        &self,
+        _updates: &[crate::neo4j::models::FileChurnScore],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn get_top_hotspots(
+        &self,
+        _project_id: Uuid,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::FileChurnScore>> {
+        Ok(vec![])
+    }
+
+    // T5.6 — Knowledge density
+    async fn compute_knowledge_density(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::FileKnowledgeDensity>> {
+        Ok(vec![])
+    }
+
+    async fn batch_update_knowledge_density(
+        &self,
+        _updates: &[crate::neo4j::models::FileKnowledgeDensity],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn get_top_knowledge_gaps(
+        &self,
+        _project_id: Uuid,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::FileKnowledgeDensity>> {
+        Ok(vec![])
+    }
+
+    // T5.7 — Risk score composite
+    async fn compute_risk_scores(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::FileRiskScore>> {
+        Ok(vec![])
+    }
+
+    async fn batch_update_risk_scores(
+        &self,
+        _updates: &[crate::neo4j::models::FileRiskScore],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn get_risk_summary(&self, _project_id: Uuid) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!(null))
+    }
+
+    async fn batch_upsert_processes(&self, _processes: &[ProcessNode]) -> anyhow::Result<()> {
+        // No-op in mock — process persistence is tested via integration tests
+        Ok(())
+    }
+
+    async fn batch_create_step_relationships(
+        &self,
+        _steps: &[(String, String, u32)],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn delete_project_processes(&self, project_id: Uuid) -> anyhow::Result<u64> {
+        self.processes_purged_for.write().await.push(project_id);
+        Ok(0)
+    }
+
+    // ========================================================================
+    // Topology Firewall operations
+    // ========================================================================
+
+    async fn create_topology_rule(
+        &self,
+        rule: &crate::graph::models::TopologyRule,
+    ) -> anyhow::Result<()> {
+        let mut rules = self.topology_rules.write().await;
+        rules.insert(rule.id.clone(), rule.clone());
+        Ok(())
+    }
+
+    async fn list_topology_rules(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Vec<crate::graph::models::TopologyRule>> {
+        let rules = self.topology_rules.read().await;
+        let mut result: Vec<_> = rules
+            .values()
+            .filter(|r| r.project_id == project_id)
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| {
+            a.rule_type
+                .to_string()
+                .cmp(&b.rule_type.to_string())
+                .then(a.source_pattern.cmp(&b.source_pattern))
+        });
+        Ok(result)
+    }
+
+    async fn delete_topology_rule(&self, rule_id: &str) -> anyhow::Result<()> {
+        let mut rules = self.topology_rules.write().await;
+        rules.remove(rule_id);
+        Ok(())
+    }
+
+    async fn check_topology_rules(
+        &self,
+        _project_id: &str,
+    ) -> anyhow::Result<Vec<crate::graph::models::TopologyViolation>> {
+        // Mock: no graph traversal, return empty violations
+        Ok(Vec::new())
+    }
+
+    async fn check_file_topology(
+        &self,
+        project_id: &str,
+        file_path: &str,
+        new_imports: &[String],
+    ) -> anyhow::Result<Vec<crate::graph::models::TopologyViolation>> {
+        use crate::graph::models::{
+            glob_to_regex, TopologyRuleType, TopologySeverity, TopologyViolation,
+        };
+
+        if new_imports.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let rules = self.topology_rules.read().await;
+        let mut violations = Vec::new();
+        let fallback_re = regex::Regex::new("^$").unwrap();
+
+        for rule in rules.values() {
+            if rule.project_id != project_id {
+                continue;
+            }
+            if !matches!(
+                rule.rule_type,
+                TopologyRuleType::MustNotImport | TopologyRuleType::MustNotCall
+            ) {
+                continue;
+            }
+
+            let source_re = regex::Regex::new(&glob_to_regex(&rule.source_pattern))
+                .unwrap_or_else(|_| fallback_re.clone());
+            if !source_re.is_match(file_path) {
+                continue;
+            }
+
+            let target_pattern = rule.target_pattern.as_deref().unwrap_or("**");
+            let target_re = regex::Regex::new(&glob_to_regex(target_pattern))
+                .unwrap_or_else(|_| fallback_re.clone());
+
+            for import_path in new_imports {
+                if target_re.is_match(import_path) {
+                    let severity_weight = match rule.severity {
+                        TopologySeverity::Error => 1.0,
+                        TopologySeverity::Warning => 0.5,
+                    };
+                    violations.push(TopologyViolation {
+                        rule_id: rule.id.clone(),
+                        rule_description: rule.description.clone(),
+                        rule_type: rule.rule_type.clone(),
+                        violator_path: file_path.to_string(),
+                        target_path: Some(import_path.clone()),
+                        severity: rule.severity.clone(),
+                        details: format!(
+                            "{} would import {} which violates rule: {}",
+                            file_path, import_path, rule.description
+                        ),
+                        violation_score: severity_weight,
+                    });
+                }
+            }
+        }
+
+        Ok(violations)
+    }
+
+    async fn health_check(&self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
+    // ========================================================================
+    // Persona operations (Living Personas)
+    // ========================================================================
+
+    async fn create_persona(&self, persona: &PersonaNode) -> Result<()> {
+        self.personas
+            .write()
+            .await
+            .insert(persona.id, persona.clone());
+        Ok(())
+    }
+
+    async fn get_persona(&self, id: Uuid) -> Result<Option<PersonaNode>> {
+        Ok(self.personas.read().await.get(&id).cloned())
+    }
+
+    async fn update_persona(&self, persona: &PersonaNode) -> Result<()> {
+        let mut store = self.personas.write().await;
+        if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(persona.id) {
+            e.insert(persona.clone());
+            Ok(())
+        } else {
+            anyhow::bail!("Persona {} not found", persona.id)
+        }
+    }
+
+    async fn delete_persona(&self, id: Uuid) -> Result<bool> {
+        let existed = self.personas.write().await.remove(&id).is_some();
+        if existed {
+            // Clean up relations
+            self.persona_skills.write().await.remove(&id);
+            self.persona_protocols.write().await.remove(&id);
+            self.persona_feature_graph.write().await.remove(&id);
+            self.persona_files.write().await.remove(&id);
+            self.persona_functions.write().await.remove(&id);
+            self.persona_notes.write().await.remove(&id);
+            self.persona_decisions.write().await.remove(&id);
+            self.persona_extends.write().await.remove(&id);
+        }
+        Ok(existed)
+    }
+
+    async fn list_personas(
+        &self,
+        project_id: Uuid,
+        status: Option<PersonaStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<PersonaNode>, usize)> {
+        let store = self.personas.read().await;
+        let mut all: Vec<PersonaNode> = store
+            .values()
+            .filter(|p| p.project_id == Some(project_id))
+            .filter(|p| status.is_none_or(|s| p.status == s))
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| {
+            b.energy
+                .partial_cmp(&a.energy)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let total = all.len();
+        let page = all.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
+    async fn list_global_personas(&self) -> Result<Vec<PersonaNode>> {
+        let store = self.personas.read().await;
+        Ok(store
+            .values()
+            .filter(|p| p.project_id.is_none())
+            .cloned()
+            .collect())
+    }
+
+    async fn add_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()> {
+        self.persona_skills
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(skill_id);
+        Ok(())
+    }
+
+    async fn remove_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()> {
+        if let Some(set) = self.persona_skills.write().await.get_mut(&persona_id) {
+            set.remove(&skill_id);
+        }
+        Ok(())
+    }
+
+    async fn add_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()> {
+        self.persona_protocols
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(protocol_id);
+        Ok(())
+    }
+
+    async fn remove_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()> {
+        if let Some(set) = self.persona_protocols.write().await.get_mut(&persona_id) {
+            set.remove(&protocol_id);
+        }
+        Ok(())
+    }
+
+    async fn increment_persona_activation(&self, persona_id: Uuid) -> Result<()> {
+        let mut personas = self.personas.write().await;
+        if let Some(persona) = personas.get_mut(&persona_id) {
+            persona.activation_count += 1;
+            persona.last_activated = Some(chrono::Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn set_persona_feature_graph(
+        &self,
+        persona_id: Uuid,
+        feature_graph_id: Uuid,
+    ) -> Result<()> {
+        self.persona_feature_graph
+            .write()
+            .await
+            .insert(persona_id, feature_graph_id);
+        Ok(())
+    }
+
+    async fn remove_persona_feature_graph(&self, persona_id: Uuid) -> Result<()> {
+        self.persona_feature_graph.write().await.remove(&persona_id);
+        Ok(())
+    }
+
+    async fn add_persona_file(&self, persona_id: Uuid, file_path: &str, weight: f64) -> Result<()> {
+        self.persona_files
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(file_path.to_string(), weight);
+        Ok(())
+    }
+
+    async fn remove_persona_file(&self, persona_id: Uuid, file_path: &str) -> Result<()> {
+        if let Some(map) = self.persona_files.write().await.get_mut(&persona_id) {
+            map.remove(file_path);
+        }
+        Ok(())
+    }
+
+    async fn add_persona_function(
+        &self,
+        persona_id: Uuid,
+        function_id: &str,
+        weight: f64,
+    ) -> Result<()> {
+        self.persona_functions
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(function_id.to_string(), weight);
+        Ok(())
+    }
+
+    async fn remove_persona_function(&self, persona_id: Uuid, function_id: &str) -> Result<()> {
+        if let Some(map) = self.persona_functions.write().await.get_mut(&persona_id) {
+            map.remove(function_id);
+        }
+        Ok(())
+    }
+
+    async fn add_persona_note(&self, persona_id: Uuid, note_id: Uuid, weight: f64) -> Result<()> {
+        self.persona_notes
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(note_id, weight);
+        Ok(())
+    }
+
+    async fn remove_persona_note(&self, persona_id: Uuid, note_id: Uuid) -> Result<()> {
+        if let Some(map) = self.persona_notes.write().await.get_mut(&persona_id) {
+            map.remove(&note_id);
+        }
+        Ok(())
+    }
+
+    async fn add_persona_decision(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
+    ) -> Result<()> {
+        self.persona_decisions
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(decision_id, weight);
+        Ok(())
+    }
+
+    async fn remove_persona_decision(&self, persona_id: Uuid, decision_id: Uuid) -> Result<()> {
+        if let Some(map) = self.persona_decisions.write().await.get_mut(&persona_id) {
+            map.remove(&decision_id);
+        }
+        Ok(())
+    }
+
+    async fn add_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()> {
+        self.persona_extends
+            .write()
+            .await
+            .entry(child_id)
+            .or_default()
+            .push(parent_id);
+        Ok(())
+    }
+
+    async fn remove_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()> {
+        if let Some(vec) = self.persona_extends.write().await.get_mut(&child_id) {
+            vec.retain(|&id| id != parent_id);
+        }
+        Ok(())
+    }
+
+    async fn get_persona_subgraph(&self, persona_id: Uuid) -> Result<PersonaSubgraph> {
+        let persona = self
+            .get_persona(persona_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Persona {} not found", persona_id))?;
+
+        let files: Vec<PersonaWeightedRelation> = self
+            .persona_files
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|m| {
+                m.iter()
+                    .map(|(path, &w)| PersonaWeightedRelation {
+                        entity_type: "file".to_string(),
+                        entity_id: path.clone(),
+                        weight: w,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let functions: Vec<PersonaWeightedRelation> = self
+            .persona_functions
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|m| {
+                m.iter()
+                    .map(|(fid, &w)| PersonaWeightedRelation {
+                        entity_type: "function".to_string(),
+                        entity_id: fid.clone(),
+                        weight: w,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let notes: Vec<PersonaWeightedRelation> = self
+            .persona_notes
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|m| {
+                m.iter()
+                    .map(|(nid, &w)| PersonaWeightedRelation {
+                        entity_type: "note".to_string(),
+                        entity_id: nid.to_string(),
+                        weight: w,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let decisions: Vec<PersonaWeightedRelation> = self
+            .persona_decisions
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|m| {
+                m.iter()
+                    .map(|(did, &w)| PersonaWeightedRelation {
+                        entity_type: "decision".to_string(),
+                        entity_id: did.to_string(),
+                        weight: w,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let skills: Vec<PersonaWeightedRelation> = self
+            .persona_skills
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|s| {
+                s.iter()
+                    .map(|sid| PersonaWeightedRelation {
+                        entity_type: "skill".to_string(),
+                        entity_id: sid.to_string(),
+                        weight: 1.0,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let protocols: Vec<PersonaWeightedRelation> = self
+            .persona_protocols
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|s| {
+                s.iter()
+                    .map(|pid| PersonaWeightedRelation {
+                        entity_type: "protocol".to_string(),
+                        entity_id: pid.to_string(),
+                        weight: 1.0,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let feature_graph_id = self
+            .persona_feature_graph
+            .read()
+            .await
+            .get(&persona_id)
+            .copied();
+
+        let parents: Vec<PersonaWeightedRelation> = self
+            .persona_extends
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|ids| {
+                ids.iter()
+                    .map(|pid| PersonaWeightedRelation {
+                        entity_type: "persona".to_string(),
+                        entity_id: pid.to_string(),
+                        weight: 1.0,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let children: Vec<PersonaWeightedRelation> = Vec::new(); // Mock doesn't track reverse extends
+
+        let total_entities = files.len()
+            + functions.len()
+            + notes.len()
+            + decisions.len()
+            + skills.len()
+            + protocols.len()
+            + if feature_graph_id.is_some() { 1 } else { 0 };
+
+        Ok(PersonaSubgraph {
+            persona_id,
+            persona_name: persona.name,
+            files,
+            functions,
+            notes,
+            decisions,
+            skills,
+            protocols,
+            feature_graph_id,
+            parents,
+            children,
+            stats: PersonaSubgraphStats {
+                total_entities,
+                coverage_score: 0.0,
+                freshness: 0.0,
+            },
+        })
+    }
+
+    async fn find_personas_for_file(
+        &self,
+        file_path: &str,
+        project_id: Uuid,
+    ) -> Result<Vec<(PersonaNode, f64)>> {
+        let personas = self.personas.read().await;
+        let files = self.persona_files.read().await;
+        let mut results: Vec<(PersonaNode, f64)> = Vec::new();
+        for persona in personas.values() {
+            if persona.project_id != Some(project_id) {
+                continue;
+            }
+            if let Some(file_map) = files.get(&persona.id) {
+                if let Some(&weight) = file_map.get(file_path) {
+                    results.push((persona.clone(), weight));
+                }
+            }
+        }
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(results)
+    }
+
+    async fn get_all_persona_knows(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(PersonaNode, String, f64)>> {
+        let personas = self.personas.read().await;
+        let files = self.persona_files.read().await;
+        let mut results: Vec<(PersonaNode, String, f64)> = Vec::new();
+        for persona in personas.values() {
+            if persona.project_id != Some(project_id) {
+                continue;
+            }
+            if let Some(file_map) = files.get(&persona.id) {
+                for (path, &weight) in file_map {
+                    results.push((persona.clone(), path.clone(), weight));
+                }
+            }
+        }
+        results.sort_by(|a, b| {
+            a.0.name
+                .cmp(&b.0.name)
+                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        Ok(results)
+    }
+
+    async fn auto_scope_to_feature_graphs(&self, _project_id: Uuid) -> Result<usize> {
+        // Mock: no-op, return 0 scoped
+        Ok(0)
+    }
+
+    async fn compute_adaptive_thresholds(
+        &self,
+        _project_id: Uuid,
+    ) -> Result<crate::neo4j::persona::AdaptivePersonaThresholds> {
+        // Mock: compute from in-memory persona KNOWS weights
+        use crate::analytics::distribution::{adaptive_threshold, detect_outliers};
+
+        let personas = self.personas.read().await;
+        let persona_files = self.persona_files.read().await;
+
+        let mut weights: Vec<f64> = Vec::new();
+        for (pid, _) in personas.iter() {
+            if let Some(files) = persona_files.get(pid) {
+                for w in files.values() {
+                    weights.push(*w);
+                }
+            }
+        }
+
+        if weights.len() < 10 {
+            return Ok(crate::neo4j::persona::AdaptivePersonaThresholds {
+                sample_size: weights.len(),
+                ..Default::default()
+            });
+        }
+
+        let prune_cutoff = adaptive_threshold(&weights, 0.05, 0.1);
+        let outliers = detect_outliers(&weights, 1.5);
+
+        Ok(crate::neo4j::persona::AdaptivePersonaThresholds {
+            prune_cutoff,
+            confidence_p90: 20.0, // Mock: no community data
+            weight_outlier_count: outliers.len(),
+            sample_size: weights.len(),
+            lower_fence: 0.0,
+        })
+    }
+
+    async fn maintain_personas(&self, _project_id: Uuid) -> Result<(usize, usize, usize)> {
+        Ok((0, 0, 0))
+    }
+
+    async fn detect_personas(
+        &self,
+        _project_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::persona::PersonaProposal>> {
+        Ok(vec![])
+    }
+
+    async fn find_adjacent_personas(
+        &self,
+        _file_path: &str,
+        _project_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>> {
+        Ok(vec![])
+    }
+
+    async fn auto_grow_file_knows(
+        &self,
+        _persona_id: Uuid,
+        _file_path: &str,
+        _weight: f64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn find_relevant_personas_for_note(
+        &self,
+        _file_paths: &[String],
+        _project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>> {
+        Ok(vec![])
+    }
+
+    async fn find_relevant_personas_for_decision(
+        &self,
+        _decision_id: Uuid,
+        _project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>> {
+        Ok(vec![])
+    }
+
+    async fn auto_link_note_to_persona(
+        &self,
+        _persona_id: Uuid,
+        _note_id: Uuid,
+        _weight: f64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn auto_link_decision_to_persona(
+        &self,
+        _persona_id: Uuid,
+        _decision_id: Uuid,
+        _weight: f64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn auto_link_file_to_persona(
+        &self,
+        _persona_id: Uuid,
+        _file_path: &str,
+        _weight: f64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    // ========================================================================
+    // Persona learning methods (mock stubs)
+    // ========================================================================
+
+    async fn propagate_knows_via_co_change(
+        &self,
+        _persona_id: Uuid,
+        _file_path: &str,
+        _base_weight: f64,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn compute_persona_affinity(
+        &self,
+        _persona_a: Uuid,
+        _persona_b: Uuid,
+    ) -> Result<crate::neo4j::persona::PersonaAffinityScore> {
+        Ok(crate::neo4j::persona::PersonaAffinityScore {
+            persona_a_id: _persona_a,
+            persona_b_id: _persona_b,
+            jaccard_files: 0.0,
+            synapse_density: 0.0,
+            combined: 0.0,
+        })
+    }
+
+    async fn merge_personas(&self, _keep_id: Uuid, _merge_id: Uuid) -> Result<()> {
+        Ok(())
+    }
+
+    async fn find_synapse_linked_personas(
+        &self,
+        _persona_id: Uuid,
+    ) -> Result<Vec<(Uuid, String, f64)>> {
+        Ok(vec![])
+    }
+
+    async fn rate_limited_energy_boost(
+        &self,
+        _persona_id: Uuid,
+        _boost: f64,
+        _max_per_cycle: f64,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn get_learning_health(
+        &self,
+        _project_id: Uuid,
+    ) -> Result<crate::neo4j::analytics::LearningHealthReport> {
+        Ok(crate::neo4j::analytics::LearningHealthReport {
+            knows_convergence: 0.0,
+            knows_coverage: 0.0,
+            decay_rate: 0.0,
+            synapse_health: 0.0,
+            co_change_coverage: 0.0,
+            persona_count: 0,
+            total_knows: 0,
+        })
+    }
+
+    // ========================================================================
+    // Analysis Profile operations
+    // ========================================================================
+
+    async fn create_analysis_profile(
+        &self,
+        profile: &crate::graph::models::AnalysisProfile,
+    ) -> anyhow::Result<()> {
+        let mut profiles = self.analysis_profiles.write().await;
+        profiles.insert(profile.id.clone(), profile.clone());
+        Ok(())
+    }
+
+    async fn list_analysis_profiles(
+        &self,
+        project_id: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::graph::models::AnalysisProfile>> {
+        let profiles = self.analysis_profiles.read().await;
+        let mut result: Vec<_> = profiles
+            .values()
+            .filter(|p| {
+                // Include global profiles (no project_id)
+                if p.project_id.is_none() {
+                    return true;
+                }
+                // Include project-specific profiles if matching
+                if let Some(pid) = project_id {
+                    if p.project_id.as_deref() == Some(pid) {
+                        return true;
+                    }
+                }
+                false
+            })
+            .cloned()
+            .collect();
+        // Sort: built-in first, then by name
+        result.sort_by(|a, b| {
+            b.is_builtin
+                .cmp(&a.is_builtin)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Ok(result)
+    }
+
+    async fn get_analysis_profile(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<crate::graph::models::AnalysisProfile>> {
+        let profiles = self.analysis_profiles.read().await;
+        Ok(profiles.get(id).cloned())
+    }
+
+    async fn delete_analysis_profile(&self, id: &str) -> anyhow::Result<()> {
+        let mut profiles = self.analysis_profiles.write().await;
+        if let Some(profile) = profiles.get(id) {
+            if profile.is_builtin {
+                anyhow::bail!("Cannot delete built-in profile '{}'", profile.name);
+            }
+        }
+        profiles.remove(id);
+        Ok(())
+    }
+
+    // ========================================================================
+    // Multi-signal impact queries
+    // ========================================================================
+
+    async fn get_knowledge_density(
+        &self,
+        file_path: &str,
+        _project_id: &str,
+    ) -> anyhow::Result<f64> {
+        // In mock: count notes linked to this file path via anchors
+        let notes = self.notes.read().await;
+        let count = notes
+            .values()
+            .filter(|n| {
+                n.anchors.iter().any(|a| {
+                    a.entity_type == crate::notes::EntityType::File && a.entity_id == file_path
+                })
+            })
+            .count();
+        // Simple normalization: max 10 => density 1.0
+        Ok((count as f64 / 10.0).min(1.0))
+    }
+
+    async fn get_node_pagerank(&self, _file_path: &str, _project_id: &str) -> anyhow::Result<f64> {
+        // Mock: return 0.0 (no GDS in tests)
+        Ok(0.0)
+    }
+
+    async fn get_bridge_proximity(
+        &self,
+        _file_path: &str,
+        _project_id: &str,
+    ) -> anyhow::Result<Vec<(String, f64)>> {
+        // Mock: return empty (no graph traversal in tests)
+        Ok(Vec::new())
+    }
+
+    async fn get_avg_multi_signal_score(&self, _project_id: Uuid) -> anyhow::Result<f64> {
+        // Mock: no GDS metrics in tests, return 0.0
+        Ok(0.0)
+    }
+
+    async fn find_bridge_subgraph(
+        &self,
+        source: &str,
+        target: &str,
+        _max_hops: u32,
+        _relation_types: &[String],
+        _project_id: &str,
+    ) -> anyhow::Result<(
+        Vec<crate::graph::models::BridgeRawNode>,
+        Vec<crate::graph::models::BridgeRawEdge>,
+    )> {
+        use crate::graph::models::{BridgeRawEdge, BridgeRawNode};
+
+        // Mock: return source and target as nodes with a direct IMPORTS edge
+        let nodes = vec![
+            BridgeRawNode {
+                path: source.to_string(),
+                node_type: "File".to_string(),
+            },
+            BridgeRawNode {
+                path: target.to_string(),
+                node_type: "File".to_string(),
+            },
+        ];
+        let edges = vec![BridgeRawEdge {
+            from_path: source.to_string(),
+            to_path: target.to_string(),
+            rel_type: "IMPORTS".to_string(),
+        }];
+        Ok((nodes, edges))
+    }
+
+    // ========================================================================
+    // Skill operations (Neural Skills)
+    // ========================================================================
+
+    async fn create_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
+        // Validate project exists (only if projects map is populated, for backward compatibility)
+        // A transverse skill has no project, by design: nothing to validate.
+        if let Some(pid) = skill.project_id {
+            let projects = self.projects.read().await;
+            if !projects.is_empty() && !projects.contains_key(&pid) {
+                anyhow::bail!(
+                    "Project not found: {}. Cannot create skill in non-existent project.",
+                    pid
+                );
+            }
+        }
+        self.skills.write().await.insert(skill.id, skill.clone());
+        Ok(())
+    }
+
+    async fn get_skill(&self, id: Uuid) -> anyhow::Result<Option<crate::skills::SkillNode>> {
+        Ok(self.skills.read().await.get(&id).cloned())
+    }
+
+    async fn update_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
+        let mut store = self.skills.write().await;
+        if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(skill.id) {
+            e.insert(skill.clone());
+            Ok(())
+        } else {
+            anyhow::bail!("Skill not found: {}", skill.id)
+        }
+    }
+
+    async fn delete_skill(&self, id: Uuid) -> anyhow::Result<bool> {
+        let existed = self.skills.write().await.remove(&id).is_some();
+        if existed {
+            self.skill_members.write().await.remove(&id);
+        }
+        Ok(existed)
+    }
+
+    async fn rescope_skill(&self, skill_id: Uuid, project_id: Option<Uuid>) -> anyhow::Result<()> {
+        let mut skills = self.skills.write().await;
+        match skills.values_mut().find(|s| s.id == skill_id) {
+            Some(skill) => {
+                skill.project_id = project_id;
+                Ok(())
+            }
+            None => anyhow::bail!("skill {} not found", skill_id),
+        }
+    }
+
+    async fn rescope_protocol(
+        &self,
+        protocol_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<()> {
+        let mut protocols = self.protocols.write().await;
+        match protocols.values_mut().find(|p| p.id == protocol_id) {
+            Some(protocol) => {
+                protocol.project_id = project_id;
+                Ok(())
+            }
+            None => anyhow::bail!("protocol {} not found", protocol_id),
+        }
+    }
+
+    async fn list_skills(
+        &self,
+        project_id: Option<Uuid>,
+        status: Option<crate::skills::SkillStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::skills::SkillNode>, usize)> {
+        let store = self.skills.read().await;
+        let mut filtered: Vec<_> = store
+            .values()
+            .filter(|s| match project_id {
+                Some(pid) => s.project_id == Some(pid) || s.project_id.is_none(),
+                None => s.project_id.is_none(),
+            })
+            .filter(|s| status.is_none_or(|st| s.status == st))
+            .cloned()
+            .collect();
+        // Sort by energy DESC, name ASC (consistent with Neo4j query)
+        filtered.sort_by(|a, b| {
+            b.energy
+                .partial_cmp(&a.energy)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        let total = filtered.len();
+        let page = filtered.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
+    async fn get_skill_members(
+        &self,
+        skill_id: Uuid,
+    ) -> anyhow::Result<(Vec<crate::notes::Note>, Vec<DecisionNode>)> {
+        let members = self.skill_members.read().await;
+        let entries = members.get(&skill_id).cloned().unwrap_or_default();
+        let notes_store = self.notes.read().await;
+        let decisions_store = self.decisions.read().await;
+        let mut notes = Vec::new();
+        let mut decisions = Vec::new();
+        for (entity_type, entity_id) in &entries {
+            match entity_type.as_str() {
+                "note" => {
+                    if let Some(n) = notes_store.get(entity_id) {
+                        notes.push(n.clone());
+                    }
+                }
+                "decision" => {
+                    if let Some(d) = decisions_store.get(entity_id) {
+                        decisions.push(d.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok((notes, decisions))
+    }
+
+    async fn add_skill_member(
+        &self,
+        skill_id: Uuid,
+        entity_type: &str,
+        entity_id: Uuid,
+    ) -> anyhow::Result<()> {
+        let entry = (entity_type.to_string(), entity_id);
+        let mut members = self.skill_members.write().await;
+        let list = members.entry(skill_id).or_default();
+        if !list.contains(&entry) {
+            list.push(entry);
+            // Update counters on the skill (consistent with Neo4j behavior)
+            drop(members);
+            let mut skills = self.skills.write().await;
+            if let Some(skill) = skills.get_mut(&skill_id) {
+                match entity_type {
+                    "note" => skill.note_count += 1,
+                    "decision" => skill.decision_count += 1,
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn remove_skill_member(
+        &self,
+        skill_id: Uuid,
+        entity_type: &str,
+        entity_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        let entry = (entity_type.to_string(), entity_id);
+        let mut members = self.skill_members.write().await;
+        if let Some(list) = members.get_mut(&skill_id) {
+            let len_before = list.len();
+            list.retain(|e| e != &entry);
+            Ok(list.len() < len_before)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn remove_all_skill_members(&self, skill_id: Uuid) -> anyhow::Result<i64> {
+        let mut members = self.skill_members.write().await;
+        if let Some(list) = members.remove(&skill_id) {
+            Ok(list.len() as i64)
+        } else {
+            Ok(0)
+        }
+    }
+
+    async fn get_skills_for_note(
+        &self,
+        note_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
+        let members = self.skill_members.read().await;
+        let skills_store = self.skills.read().await;
+        let mut result = Vec::new();
+        for (skill_id, entries) in members.iter() {
+            if entries.iter().any(|(t, id)| t == "note" && *id == note_id) {
+                if let Some(s) = skills_store.get(skill_id) {
+                    result.push(s.clone());
+                }
+            }
+        }
+        // Sort by energy DESC for consistency with Neo4j query
+        result.sort_by(|a, b| {
+            b.energy
+                .partial_cmp(&a.energy)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(result)
+    }
+
+    async fn get_skills_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
+        let store = self.skills.read().await;
+        Ok(store
+            .values()
+            .filter(|s| s.project_id == Some(project_id))
+            .cloned()
+            .collect())
+    }
+
+    async fn activate_skill(
+        &self,
+        skill_id: Uuid,
+        _query: &str,
+    ) -> anyhow::Result<crate::skills::ActivatedSkillContext> {
+        let skill = self
+            .get_skill(skill_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Skill not found: {}", skill_id))?;
+        // Return actual member notes/decisions (consistent with Neo4j behavior)
+        let (member_notes, relevant_decisions) = self.get_skill_members(skill_id).await?;
+        // Wrap notes as ActivatedNote
+        let activated_notes: Vec<crate::neurons::activation::ActivatedNote> = member_notes
+            .iter()
+            .map(|n| crate::neurons::activation::ActivatedNote {
+                note: n.clone(),
+                activation_score: 1.0,
+                source: crate::neurons::activation::ActivationSource::Direct,
+                entity_type: "note".to_string(),
+            })
+            .collect();
+        // Build context_text from note content
+        let context_text = if let Some(ref tpl) = skill.context_template {
+            tpl.clone()
+        } else {
+            member_notes
+                .iter()
+                .map(|n| n.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+        Ok(crate::skills::ActivatedSkillContext {
+            skill,
+            activated_notes,
+            relevant_decisions,
+            context_text,
+            confidence: 1.0,
+        })
+    }
+
+    async fn increment_skill_activation(&self, skill_id: Uuid) -> anyhow::Result<()> {
+        let mut store = self.skills.write().await;
+        if let Some(skill) = store.get_mut(&skill_id) {
+            skill.activation_count += 1;
+        }
+        Ok(())
+    }
+
+    async fn match_skills_by_trigger(
+        &self,
+        project_id: Option<Uuid>,
+        input: &str,
+    ) -> anyhow::Result<Vec<(crate::skills::SkillNode, f64)>> {
+        let store = self.skills.read().await;
+        let candidates: Vec<_> = store
+            .values()
+            .filter(|s| {
+                let in_scope = match project_id {
+                    Some(pid) => s.project_id == Some(pid) || s.project_id.is_none(),
+                    None => s.project_id.is_none(),
+                };
+                in_scope
+                    && matches!(
+                        s.status,
+                        crate::skills::SkillStatus::Active | crate::skills::SkillStatus::Emerging
+                    )
+            })
+            .cloned()
+            .collect();
+        drop(store);
+
+        let mut results = Vec::new();
+        for skill in candidates {
+            // Evaluate trigger_patterns against input (if skill has triggers)
+            let mut best_confidence = None;
+            for trigger in &skill.trigger_patterns {
+                let matched = match trigger.pattern_type {
+                    crate::skills::TriggerType::Regex => {
+                        regex::RegexBuilder::new(&format!("(?i){}", &trigger.pattern_value))
+                            .build()
+                            .map(|re| re.is_match(input))
+                            .unwrap_or(false)
+                    }
+                    crate::skills::TriggerType::FileGlob => {
+                        glob::Pattern::new(&trigger.pattern_value)
+                            .map(|g| g.matches(input))
+                            .unwrap_or(false)
+                    }
+                    crate::skills::TriggerType::Semantic => {
+                        // Semantic triggers can't be evaluated in mock
+                        false
+                    }
+                    crate::skills::TriggerType::McpAction => {
+                        crate::skills::activation::match_mcp_action_trigger(
+                            &trigger.pattern_value,
+                            input,
+                        )
+                    }
+                };
+                if matched {
+                    let c = trigger.confidence_threshold;
+                    best_confidence = Some(best_confidence.map_or(c, |prev: f64| prev.max(c)));
+                }
+            }
+            // If no triggers defined, fall back to matching all (backward compatibility)
+            let confidence = if skill.trigger_patterns.is_empty() {
+                1.0
+            } else if let Some(c) = best_confidence {
+                c
+            } else {
+                continue; // Has triggers but none matched → skip
+            };
+            // Emerging skills get 0.8x penalty
+            let final_confidence = if skill.status == crate::skills::SkillStatus::Emerging {
+                confidence * 0.8
+            } else {
+                confidence
+            };
+            results.push((skill, final_confidence));
+        }
+        // Sort by energy DESC for consistency with Neo4j
+        results.sort_by(|a, b| {
+            b.0.energy
+                .partial_cmp(&a.0.energy)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(results)
+    }
+
+    async fn get_synapse_graph(
+        &self,
+        _project_id: Uuid,
+        _min_weight: f64,
+    ) -> anyhow::Result<Vec<(String, String, f64)>> {
+        // Mock: return empty synapse graph (no synapses in mock store)
+        Ok(Vec::new())
+    }
+
+    // ========================================================================
+    // Context Cards persistence
+    // ========================================================================
+
+    async fn batch_save_context_cards(
+        &self,
+        _cards: &[crate::graph::models::ContextCard],
+    ) -> anyhow::Result<()> {
+        // Mock: no-op (context cards not persisted in mock store)
+        Ok(())
+    }
+
+    async fn invalidate_context_cards(
+        &self,
+        _paths: &[String],
+        _project_id: &str,
+    ) -> anyhow::Result<()> {
+        // Mock: no-op (no context cards to invalidate in mock store)
+        Ok(())
+    }
+
+    async fn get_context_card(
+        &self,
+        _path: &str,
+        _project_id: &str,
+    ) -> anyhow::Result<Option<crate::graph::models::ContextCard>> {
+        // Mock: no context cards stored
+        Ok(None)
+    }
+
+    async fn get_context_cards_batch(
+        &self,
+        _paths: &[String],
+        _project_id: &str,
+    ) -> anyhow::Result<Vec<crate::graph::models::ContextCard>> {
+        // Mock: no context cards stored
+        Ok(Vec::new())
+    }
+
+    async fn find_isomorphic_groups(
+        &self,
+        _project_id: &str,
+        _min_group_size: usize,
+    ) -> anyhow::Result<Vec<crate::graph::models::IsomorphicGroup>> {
+        // Mock: the groups declared with `isomorphic_groups` (none by default)
+        Ok(self.isomorphic_groups.read().await.clone())
+    }
+
+    async fn has_context_cards(&self, _project_id: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .mock_has_context_cards
+            .load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    async fn get_note_embeddings_for_project(
+        &self,
+        project_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::models::NoteEmbeddingPoint>> {
+        let notes = self.notes.read().await;
+        let embeddings = self.note_embeddings.read().await;
+        let mut points = Vec::new();
+        for note in notes.values() {
+            if note.project_id != Some(project_id) {
+                continue;
+            }
+            if let Some((emb, _model)) = embeddings.get(&note.id) {
+                points.push(crate::neo4j::models::NoteEmbeddingPoint {
+                    id: note.id,
+                    embedding: emb.clone(),
+                    note_type: note.note_type.to_string(),
+                    importance: note.importance.to_string(),
+                    energy: note.energy,
+                    tags: note.tags.clone(),
+                    content_preview: note.content.chars().take(120).collect(),
+                });
+            }
+        }
+        Ok(points)
+    }
+
+    // ========================================================================
+    // Protocol operations (Pattern Federation)
+    // ========================================================================
+
+    async fn upsert_protocol(&self, protocol: &crate::protocol::Protocol) -> anyhow::Result<()> {
+        // Validate project exists
+        let projects = self.projects.read().await;
+        // A transverse protocol has no project, by design: nothing to validate.
+        if !projects.is_empty()
+            && protocol
+                .project_id
+                .is_some_and(|pid| !projects.contains_key(&pid))
+        {
+            anyhow::bail!(
+                "Project not found: {}. Cannot create protocol in non-existent project.",
+                protocol
+                    .project_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default()
+            );
+        }
+        drop(projects);
+        self.protocols
+            .write()
+            .await
+            .insert(protocol.id, protocol.clone());
+        Ok(())
+    }
+
+    async fn get_protocol(&self, id: Uuid) -> anyhow::Result<Option<crate::protocol::Protocol>> {
+        Ok(self.protocols.read().await.get(&id).cloned())
+    }
+
+    async fn list_protocols(
+        &self,
+        project_id: Option<Uuid>,
+        category: Option<crate::protocol::ProtocolCategory>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::protocol::Protocol>, usize)> {
+        let store = self.protocols.read().await;
+        let mut filtered: Vec<_> = store
+            .values()
+            .filter(|p| {
+                // Same scope rule as skills: no project lists the transverse
+                // library alone, a project sees its own protocols and those.
+                let in_scope = match project_id {
+                    Some(pid) => p.project_id == Some(pid) || p.project_id.is_none(),
+                    None => p.project_id.is_none(),
+                };
+                in_scope && category.as_ref().is_none_or(|c| p.protocol_category == *c)
+            })
+            .cloned()
+            .collect();
+        filtered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let total = filtered.len();
+        let page = filtered.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
+    async fn delete_protocol(&self, id: Uuid) -> anyhow::Result<bool> {
+        let existed = self.protocols.write().await.remove(&id).is_some();
+        if existed {
+            // Remove associated states and transitions
+            self.protocol_states
+                .write()
+                .await
+                .retain(|_, s| s.protocol_id != id);
+            self.protocol_transitions
+                .write()
+                .await
+                .retain(|_, t| t.protocol_id != id);
+        }
+        Ok(existed)
+    }
+
+    async fn upsert_protocol_state(
+        &self,
+        state: &crate::protocol::ProtocolState,
+    ) -> anyhow::Result<()> {
+        self.protocol_states
+            .write()
+            .await
+            .insert(state.id, state.clone());
+        Ok(())
+    }
+
+    async fn get_protocol_states(
+        &self,
+        protocol_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::ProtocolState>> {
+        let store = self.protocol_states.read().await;
+        let mut states: Vec<_> = store
+            .values()
+            .filter(|s| s.protocol_id == protocol_id)
+            .cloned()
+            .collect();
+        states.sort_by(|a, b| a.state_type.to_string().cmp(&b.state_type.to_string()));
+        Ok(states)
+    }
+
+    async fn get_protocol_by_name_and_project(
+        &self,
+        name: &str,
+        project_id: Uuid,
+    ) -> anyhow::Result<Option<Uuid>> {
+        let store = self.protocols.read().await;
+        for proto in store.values() {
+            if proto.name == name && proto.project_id == Some(project_id) {
+                return Ok(Some(proto.id));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn delete_protocol_state(&self, state_id: Uuid) -> anyhow::Result<bool> {
+        Ok(self
+            .protocol_states
+            .write()
+            .await
+            .remove(&state_id)
+            .is_some())
+    }
+
+    async fn upsert_protocol_transition(
+        &self,
+        transition: &crate::protocol::ProtocolTransition,
+    ) -> anyhow::Result<()> {
+        self.protocol_transitions
+            .write()
+            .await
+            .insert(transition.id, transition.clone());
+        Ok(())
+    }
+
+    async fn get_protocol_transitions(
+        &self,
+        protocol_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::ProtocolTransition>> {
+        let store = self.protocol_transitions.read().await;
+        let mut transitions: Vec<_> = store
+            .values()
+            .filter(|t| t.protocol_id == protocol_id)
+            .cloned()
+            .collect();
+        transitions.sort_by(|a, b| a.trigger.cmp(&b.trigger));
+        Ok(transitions)
+    }
+
+    async fn delete_protocol_transition(&self, transition_id: Uuid) -> anyhow::Result<bool> {
+        Ok(self
+            .protocol_transitions
+            .write()
+            .await
+            .remove(&transition_id)
+            .is_some())
+    }
+
+    // ========================================================================
+    // ProtocolRun operations (FSM Runtime)
+    // ========================================================================
+
+    async fn create_protocol_run(&self, run: &crate::protocol::ProtocolRun) -> anyhow::Result<()> {
+        let mut store = self.protocol_runs.write().await;
+
+        // Atomic concurrency guard: reject if a Running run already exists
+        // for this protocol. Check and insert happen within the same write
+        // lock, so there's no TOCTOU window.
+        // Child runs (with parent_run_id) are exempt — the parent manages exclusion.
+        if run.parent_run_id.is_none() {
+            let has_running = store.values().any(|r| {
+                r.protocol_id == run.protocol_id
+                    && r.status == crate::protocol::RunStatus::Running
+                    && r.parent_run_id.is_none()
+            });
+            if has_running {
+                anyhow::bail!(
+                    "Skipped: concurrent run already running for protocol {}",
+                    run.protocol_id
+                );
+            }
+        }
+
+        store.insert(run.id, run.clone());
+        Ok(())
+    }
+
+    async fn get_protocol_run(
+        &self,
+        run_id: Uuid,
+    ) -> anyhow::Result<Option<crate::protocol::ProtocolRun>> {
+        Ok(self.protocol_runs.read().await.get(&run_id).cloned())
+    }
+
+    async fn update_protocol_run(
+        &self,
+        run: &mut crate::protocol::ProtocolRun,
+    ) -> anyhow::Result<()> {
+        let mut store = self.protocol_runs.write().await;
+        if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(run.id) {
+            let existing = e.get();
+            if existing.version != run.version {
+                anyhow::bail!(
+                    "OptimisticLockError: protocol run {} was modified concurrently (expected version {}, found {})",
+                    run.id,
+                    run.version,
+                    existing.version
+                );
+            }
+            let new_version = run.version + 1;
+            let mut updated = run.clone();
+            updated.version = new_version;
+            e.insert(updated);
+            // Bump version in-place so the caller's struct stays in sync
+            run.version = new_version;
+            Ok(())
+        } else {
+            anyhow::bail!("ProtocolRun not found: {}", run.id)
+        }
+    }
+
+    async fn list_all_protocol_runs(
+        &self,
+        status: Option<crate::protocol::RunStatus>,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::protocol::ProtocolRun>, usize)> {
+        self.log_read("list_all_protocol_runs")?;
+        let scope = self.scope_projects(project_id, workspace_slug).await;
+        let protocols = self.protocols.read().await;
+        let store = self.protocol_runs.read().await;
+        let mut filtered: Vec<_> = store
+            .values()
+            .filter(|r| status.as_ref().is_none_or(|s| r.status == *s))
+            .filter(|r| match scope {
+                Some(ref s) => protocols
+                    .get(&r.protocol_id)
+                    .is_some_and(|p| p.project_id.is_some_and(|pid| s.contains(&pid))),
+                None => true,
+            })
+            .cloned()
+            .collect();
+        filtered.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        let total = filtered.len();
+        let page = filtered.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
+    async fn list_protocol_runs(
+        &self,
+        protocol_id: Uuid,
+        status: Option<crate::protocol::RunStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::protocol::ProtocolRun>, usize)> {
+        let store = self.protocol_runs.read().await;
+        let mut filtered: Vec<_> = store
+            .values()
+            .filter(|r| {
+                r.protocol_id == protocol_id && status.as_ref().is_none_or(|s| r.status == *s)
+            })
+            .cloned()
+            .collect();
+        filtered.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        let total = filtered.len();
+        let page = filtered.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
+    async fn list_child_runs(
+        &self,
+        parent_run_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::ProtocolRun>> {
+        let store = self.protocol_runs.read().await;
+        let mut children: Vec<_> = store
+            .values()
+            .filter(|r| r.parent_run_id == Some(parent_run_id))
+            .cloned()
+            .collect();
+        children.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+        Ok(children)
+    }
+
+    async fn count_child_runs(&self, parent_run_id: Uuid) -> anyhow::Result<usize> {
+        let store = self.protocol_runs.read().await;
+        Ok(store
+            .values()
+            .filter(|r| r.parent_run_id == Some(parent_run_id))
+            .count())
+    }
+
+    async fn get_run_tree(
+        &self,
+        root_run_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::ProtocolRun>> {
+        let store = self.protocol_runs.read().await;
+
+        // Check root exists
+        let root = store.get(&root_run_id).cloned();
+        let Some(root) = root else {
+            return Ok(vec![]);
+        };
+
+        // BFS to collect all descendants (depth limit 5)
+        let mut result = vec![root];
+        let mut current_parents = vec![root_run_id];
+        for _depth in 0..5 {
+            let children: Vec<_> = store
+                .values()
+                .filter(|r| {
+                    r.parent_run_id
+                        .is_some_and(|pid| current_parents.contains(&pid))
+                })
+                .cloned()
+                .collect();
+            if children.is_empty() {
+                break;
+            }
+            current_parents = children.iter().map(|r| r.id).collect();
+            result.extend(children);
+        }
+
+        // Sort by depth then started_at
+        result.sort_by(|a, b| a.depth.cmp(&b.depth).then(a.started_at.cmp(&b.started_at)));
+        Ok(result)
+    }
+
+    async fn delete_protocol_run(&self, run_id: Uuid) -> anyhow::Result<bool> {
+        let existed = self.protocol_runs.write().await.remove(&run_id).is_some();
+        if existed {
+            // Cascade delete runtime states for this run
+            self.runtime_states
+                .write()
+                .await
+                .retain(|_, rs| rs.run_id != run_id);
+        }
+        Ok(existed)
+    }
+
+    async fn create_produced_during(
+        &self,
+        _entity_type: &str,
+        _entity_id: Uuid,
+        _run_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        // Mock: always succeed
+        Ok(true)
+    }
+
+    async fn get_run_outcomes(
+        &self,
+        _run_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::protocol::ProducedArtefact>> {
+        // Mock: return empty
+        Ok(Vec::new())
+    }
+
+    async fn find_active_run_for_project(&self, _project_id: Uuid) -> anyhow::Result<Option<Uuid>> {
+        // Mock: no active run
+        Ok(None)
+    }
+
+    async fn persist_reasoning_tree(
+        &self,
+        tree: &crate::reasoning::ReasoningTree,
+        linked_entity_type: Option<&str>,
+        linked_entity_id: Option<Uuid>,
+    ) -> anyhow::Result<Uuid> {
+        if let (Some("run" | "ProtocolRun"), Some(run_id)) = (linked_entity_type, linked_entity_id)
+        {
+            self.run_reasoning_trees
+                .write()
+                .await
+                .insert(run_id, tree.id);
+        }
+        Ok(tree.id)
+    }
+
+    async fn get_run_reasoning_tree_id(&self, run_id: Uuid) -> anyhow::Result<Option<Uuid>> {
+        Ok(self.run_reasoning_trees.read().await.get(&run_id).copied())
+    }
+
+    async fn list_completed_runs_for_project(
+        &self,
+        _project_id: Uuid,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<crate::protocol::models::ProtocolRun>> {
+        // Mock: no completed runs
+        Ok(Vec::new())
+    }
+
+    // ========================================================================
+    // RuntimeState operations (Generator-produced dynamic states)
+    // ========================================================================
+
+    async fn create_runtime_state(
+        &self,
+        state: &crate::protocol::RuntimeState,
+    ) -> anyhow::Result<()> {
+        self.runtime_states
+            .write()
+            .await
+            .insert(state.id, state.clone());
+        Ok(())
+    }
+
+    async fn get_runtime_states(
+        &self,
+        run_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::protocol::RuntimeState>> {
+        let store = self.runtime_states.read().await;
+        let mut states: Vec<_> = store
+            .values()
+            .filter(|rs| rs.run_id == run_id)
+            .cloned()
+            .collect();
+        states.sort_by_key(|rs| rs.index);
+        Ok(states)
+    }
+
+    async fn delete_runtime_states(&self, run_id: Uuid) -> anyhow::Result<()> {
+        self.runtime_states
+            .write()
+            .await
+            .retain(|_, rs| rs.run_id != run_id);
+        Ok(())
+    }
+
+    // SI — System Inference: audit knowledge gaps
+    async fn audit_knowledge_gaps(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<crate::neo4j::models::AuditGapsReport> {
+        Ok(crate::neo4j::models::AuditGapsReport {
+            total_gaps: 0,
+            orphan_notes: vec![],
+            orphan_notes_total: 0,
+            decisions_without_affects: vec![],
+            decisions_without_affects_total: 0,
+            commits_without_touches: vec![],
+            commits_without_touches_total: 0,
+            skills_without_members: vec![],
+            skills_without_members_total: 0,
+            relationship_type_counts: vec![],
+        })
+    }
+
+    // ========================================================================
+    // Registry operations (Skill Registry)
+    // ========================================================================
+
+    async fn upsert_published_skill(
+        &self,
+        published: &crate::skills::registry::PublishedSkill,
+    ) -> anyhow::Result<()> {
+        self.published_skills
+            .write()
+            .await
+            .insert(published.id, published.clone());
+        Ok(())
+    }
+
+    async fn get_published_skill(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<crate::skills::registry::PublishedSkill>> {
+        Ok(self.published_skills.read().await.get(&id).cloned())
+    }
+
+    async fn search_published_skills(
+        &self,
+        search_query: Option<&str>,
+        min_trust: Option<f64>,
+        tags: Option<&[String]>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::skills::registry::PublishedSkill>, usize)> {
+        let store = self.published_skills.read().await;
+        let mut filtered: Vec<_> = store
+            .values()
+            .filter(|ps| {
+                // Search filter
+                if let Some(q) = search_query {
+                    let q_lower = q.to_lowercase();
+                    if !ps.name.to_lowercase().contains(&q_lower)
+                        && !ps.description.to_lowercase().contains(&q_lower)
+                    {
+                        return false;
+                    }
+                }
+                // Min trust filter
+                if let Some(mt) = min_trust {
+                    if ps.trust_score < mt {
+                        return false;
+                    }
+                }
+                // Tags filter (AND logic)
+                if let Some(t) = tags {
+                    for tag in t {
+                        if !ps.tags.contains(tag) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+
+        // Sort by trust_score DESC, then published_at DESC
+        filtered.sort_by(|a, b| {
+            b.trust_score
+                .partial_cmp(&a.trust_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.published_at.cmp(&a.published_at))
+        });
+
+        let total = filtered.len();
+        let page = filtered.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
+    async fn increment_published_skill_imports(&self, id: Uuid) -> anyhow::Result<()> {
+        let mut store = self.published_skills.write().await;
+        if let Some(ps) = store.get_mut(&id) {
+            ps.import_count += 1;
+            Ok(())
+        } else {
+            anyhow::bail!("PublishedSkill not found: {}", id)
+        }
+    }
+
+    // ========================================================================
+    // Graph visualization helpers
+    // ========================================================================
+
+    async fn list_project_symbols(
+        &self,
+        _project_id: Uuid,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<(String, String, String, String, Option<String>, Option<i64>)>> {
+        // Mock: return symbols from functions stored in mock
+        let functions = self.functions.read().await;
+        let mut symbols = Vec::new();
+        for (id, func) in functions.iter() {
+            symbols.push((
+                id.clone(),
+                func.name.clone(),
+                "function".to_string(),
+                func.file_path.clone(),
+                Some(format!("{:?}", func.visibility).to_lowercase()),
+                Some(func.line_start as i64),
+            ));
+        }
+        Ok(symbols)
+    }
+
+    async fn get_project_inheritance_edges(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String, String)>> {
+        Ok(vec![])
+    }
+
+    async fn get_project_constraints(
+        &self,
+        _project_id: Uuid,
+    ) -> anyhow::Result<Vec<(crate::neo4j::models::ConstraintNode, Uuid)>> {
+        Ok(vec![])
+    }
+
+    // ========================================================================
+    // PlanRun operations (Runner) — in-memory mock
+    // ========================================================================
+
+    async fn create_plan_run(&self, state: &crate::runner::RunnerState) -> anyhow::Result<()> {
+        let mut runs = self.plan_runs.write().await;
+        runs.insert(state.run_id, state.clone());
+        Ok(())
+    }
+
+    async fn update_plan_run(&self, state: &crate::runner::RunnerState) -> anyhow::Result<()> {
+        if self
+            .fail_plan_run_updates
+            .lock()
+            .is_ok_and(|f| f.contains(&state.run_id))
+        {
+            anyhow::bail!(
+                "mock: update_plan_run failure injected for {}",
+                state.run_id
+            );
+        }
+        let mut runs = self.plan_runs.write().await;
+        runs.insert(state.run_id, state.clone());
+        Ok(())
+    }
+
+    async fn get_plan_run(
+        &self,
+        run_id: Uuid,
+    ) -> anyhow::Result<Option<crate::runner::RunnerState>> {
+        let runs = self.plan_runs.read().await;
+        Ok(runs.get(&run_id).cloned())
+    }
+
+    async fn list_active_plan_runs(&self) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
+        if let Some(frozen) = self
+            .frozen_active_plan_runs
+            .lock()
+            .ok()
+            .and_then(|f| f.clone())
+        {
+            return Ok(frozen);
+        }
+        let runs = self.plan_runs.read().await;
+        let mut active: Vec<_> = runs
+            .values()
+            .filter(|s| s.status == crate::runner::PlanRunStatus::Running)
+            .cloned()
+            .collect();
+        // Same order as the Cypher (`ORDER BY r.started_at DESC`).
+        active.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        Ok(active)
+    }
+
+    async fn list_all_plan_runs(
+        &self,
+        limit: i64,
+        offset: i64,
+        status: Option<&str>,
+        _workspace_slug: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
+        self.log_read("list_all_plan_runs")?;
+        let runs = self.plan_runs.read().await;
+        let mut result: Vec<_> = runs
+            .values()
+            .filter(|s| {
+                if let Some(st) = status {
+                    format!("{:?}", s.status) == st
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        let start = (offset as usize).min(result.len());
+        result = result
+            .into_iter()
+            .skip(start)
+            .take(limit as usize)
+            .collect();
+        Ok(result)
+    }
+
+    async fn list_plan_runs(
+        &self,
+        plan_id: Uuid,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::runner::RunnerState>> {
+        let runs = self.plan_runs.read().await;
+        let mut result: Vec<_> = runs
+            .values()
+            .filter(|s| s.plan_id == plan_id)
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        result.truncate(limit as usize);
+        Ok(result)
+    }
+
+    // ── Triggers ──────────────────────────────────────────────────────────
+
+    async fn create_trigger(
+        &self,
+        trigger: &crate::runner::Trigger,
+    ) -> anyhow::Result<crate::runner::Trigger> {
+        // As the store does: the plan's mark is read in the same write.
+        let mut stored = trigger.clone();
+        stored.approved_mark = self
+            .plan_third_party_writes
+            .read()
+            .await
+            .get(&trigger.plan_id)
+            .copied();
+        let mut triggers = self.triggers.write().await;
+        triggers.insert(trigger.id, stored.clone());
+        Ok(stored)
+    }
+
+    async fn get_trigger(
+        &self,
+        trigger_id: Uuid,
+    ) -> anyhow::Result<Option<crate::runner::Trigger>> {
+        self.trigger_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let triggers = self.triggers.read().await;
+        Ok(triggers.get(&trigger_id).cloned())
+    }
+
+    async fn list_triggers(&self, plan_id: Uuid) -> anyhow::Result<Vec<crate::runner::Trigger>> {
+        let triggers = self.triggers.read().await;
+        Ok(triggers
+            .values()
+            .filter(|t| t.plan_id == plan_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_all_triggers(
+        &self,
+        trigger_type: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::runner::Trigger>> {
+        let triggers = self.triggers.read().await;
+        Ok(triggers
+            .values()
+            .filter(|t| trigger_type.is_none_or(|tt| t.trigger_type.to_string() == tt))
+            .cloned()
+            .collect())
+    }
+
+    async fn disable_trigger(
+        &self,
+        trigger_id: Uuid,
+        reason: Option<&str>,
+    ) -> anyhow::Result<Option<crate::runner::Trigger>> {
+        let mut triggers = self.triggers.write().await;
+        Ok(triggers.get_mut(&trigger_id).map(|t| {
+            t.enabled = false;
+            t.disabled_reason = reason.map(str::to_string);
+            t.clone()
+        }))
+    }
+
+    async fn mark_third_party_write(
+        &self,
+        content: crate::runner::PlanContent,
+    ) -> anyhow::Result<Option<Uuid>> {
+        use crate::runner::PlanContent;
+        let plan_of_task = |task_id: Uuid| async move {
+            self.plan_tasks
+                .read()
+                .await
+                .iter()
+                .find(|(_, tasks)| tasks.contains(&task_id))
+                .map(|(plan, _)| *plan)
+        };
+        let task_of = |map: &HashMap<Uuid, Vec<Uuid>>, id: Uuid| {
+            map.iter()
+                .find(|(_, children)| children.contains(&id))
+                .map(|(task, _)| *task)
+        };
+        let plan_id = match content {
+            PlanContent::Plan(id) => self.plans.read().await.contains_key(&id).then_some(id),
+            PlanContent::Task(id) => plan_of_task(id).await,
+            PlanContent::Step(id) => {
+                let task = task_of(&*self.task_steps.read().await, id);
+                match task {
+                    Some(task) => plan_of_task(task).await,
+                    None => None,
+                }
+            }
+            PlanContent::Decision(id) => {
+                let task = task_of(&*self.task_decisions.read().await, id);
+                match task {
+                    Some(task) => plan_of_task(task).await,
+                    None => None,
+                }
+            }
+            PlanContent::Constraint(id) => task_of(&*self.plan_constraints.read().await, id),
+        };
+        if let Some(plan_id) = plan_id {
+            self.plan_third_party_writes
+                .write()
+                .await
+                .insert(plan_id, chrono::Utc::now());
+        }
+        Ok(plan_id)
+    }
+
+    async fn plan_third_party_written_at(
+        &self,
+        plan_id: Uuid,
+    ) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
+        if self
+            .fail_mark_read
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("mark read failed (test)");
+        }
+        Ok(self
+            .plan_third_party_writes
+            .read()
+            .await
+            .get(&plan_id)
+            .copied())
+    }
+
+    async fn delete_trigger(&self, trigger_id: Uuid) -> anyhow::Result<()> {
+        let mut triggers = self.triggers.write().await;
+        triggers.remove(&trigger_id);
+        let mut firings = self.trigger_firings.write().await;
+        firings.remove(&trigger_id);
+        Ok(())
+    }
+
+    async fn record_trigger_firing(
+        &self,
+        firing: &crate::runner::TriggerFiring,
+    ) -> anyhow::Result<()> {
+        let mut firings = self.trigger_firings.write().await;
+        firings
+            .entry(firing.trigger_id)
+            .or_default()
+            .push(firing.clone());
+        // Update trigger fire_count and last_fired
+        let mut triggers = self.triggers.write().await;
+        if let Some(t) = triggers.get_mut(&firing.trigger_id) {
+            // `last_fired` belongs to the reservation (`reserve_trigger_signal`):
+            // a firing refused before it consumes no cooldown.
+            t.fire_count += 1;
+        }
+        Ok(())
+    }
+
+    async fn enable_trigger_as(
+        &self,
+        trigger_id: Uuid,
+        author: &crate::runner::TriggerAuthor,
+    ) -> anyhow::Result<Option<crate::runner::Trigger>> {
+        let marks = self.plan_third_party_writes.read().await;
+        let mut triggers = self.triggers.write().await;
+        Ok(triggers.get_mut(&trigger_id).map(|t| {
+            t.enabled = true;
+            t.author = Some(author.clone());
+            t.disabled_reason = None;
+            t.approved_mark = marks.get(&t.plan_id).copied();
+            t.clone()
+        }))
+    }
+
+    async fn reserve_trigger_signal(
+        &self,
+        trigger_id: Uuid,
+        key: &str,
+        cooldown_secs: u64,
+    ) -> anyhow::Result<crate::runner::SignalReservation> {
+        use crate::runner::SignalReservation;
+        // The trigger's write lock held across the reads and the writes, as
+        // the Cypher statement holds the Trigger node's.
+        let mut triggers = self.triggers.write().await;
+        let Some(trigger) = triggers.get_mut(&trigger_id) else {
+            return Ok(SignalReservation::Duplicate);
+        };
+        let now = chrono::Utc::now();
+        let mut reservations = self.trigger_reservations.write().await;
+        reservations.retain(|_, at| {
+            now - *at
+                < chrono::Duration::hours(crate::neo4j::trigger::TRIGGER_SIGNAL_RETENTION_HOURS)
+        });
+        if reservations.contains_key(&(trigger_id, key.to_string())) {
+            return Ok(SignalReservation::Duplicate);
+        }
+        if cooldown_secs > 0
+            && trigger
+                .last_fired
+                .is_some_and(|at| now - at < chrono::Duration::seconds(cooldown_secs as i64))
+        {
+            return Ok(SignalReservation::Cooldown);
+        }
+        reservations.insert((trigger_id, key.to_string()), now);
+        trigger.last_fired = Some(now);
+        Ok(SignalReservation::Reserved)
+    }
+
+    async fn list_trigger_firings(
+        &self,
+        trigger_id: Uuid,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::runner::TriggerFiring>> {
+        let firings = self.trigger_firings.read().await;
+        let mut result: Vec<_> = firings.get(&trigger_id).cloned().unwrap_or_default();
+        result.sort_by(|a, b| b.fired_at.cmp(&a.fired_at));
+        result.truncate(limit as usize);
+        Ok(result)
+    }
+
+    async fn record_external_event(
+        &self,
+        event: &crate::ingress::ExternalEvent,
+    ) -> anyhow::Result<()> {
+        if self
+            .fail_external_event_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("mock: external event journal write failed");
+        }
+        self.external_events.write().await.push(event.clone());
+        Ok(())
+    }
+
+    async fn list_external_events(
+        &self,
+        trigger_id: Uuid,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::ingress::ExternalEvent>> {
+        let events = self.external_events.read().await;
+        let mut result: Vec<_> = events
+            .iter()
+            .filter(|e| e.trigger_id == trigger_id)
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| b.received_at.cmp(&a.received_at));
+        result.truncate(limit.max(0) as usize);
+        Ok(result)
+    }
+
+    async fn claim_external_delivery(
+        &self,
+        trigger_id: Uuid,
+        delivery_key: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .external_deliveries
+            .write()
+            .await
+            .insert((trigger_id, delivery_key.to_string())))
+    }
+
+    async fn release_external_delivery(
+        &self,
+        trigger_id: Uuid,
+        delivery_key: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .external_deliveries
+            .write()
+            .await
+            .remove(&(trigger_id, delivery_key.to_string())))
+    }
+
+    async fn purge_external_events_before(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<u64> {
+        let mut events = self.external_events.write().await;
+        let len = events.len();
+        events.retain(|e| e.received_at >= before);
+        Ok((len - events.len()) as u64)
+    }
+
+    // ── Cognitive routing (in-memory mock) ──────────────────────────────────
+
+    async fn get_routing_arm(
+        &self,
+        key: &crate::chat::provider::cognitive::store::ArmKey,
+    ) -> anyhow::Result<Option<crate::chat::provider::cognitive::store::ArmStats>> {
+        use crate::chat::provider::cognitive::store::RoutingArmStore;
+        self.routing.arm(key).await
+    }
+
+    async fn list_routing_arms(
+        &self,
+        class: &str,
+    ) -> anyhow::Result<Vec<crate::chat::provider::cognitive::store::ArmStats>> {
+        use crate::chat::provider::cognitive::store::RoutingArmStore;
+        self.routing.arms_of_class(class).await
+    }
+
+    async fn observe_routing_arm(
+        &self,
+        key: &crate::chat::provider::cognitive::store::ArmKey,
+        observation: &crate::chat::provider::cognitive::store::ArmObservation,
+    ) -> anyhow::Result<crate::chat::provider::cognitive::store::ArmStats> {
+        use crate::chat::provider::cognitive::store::RoutingArmStore;
+        self.routing.observe(key, observation).await
+    }
+
+    async fn put_routing_decision(
+        &self,
+        decision: &crate::chat::provider::cognitive::decision::CognitiveDecision,
+    ) -> anyhow::Result<()> {
+        use crate::chat::provider::cognitive::store::RoutingArmStore;
+        self.routing.put_decision(decision).await
+    }
+
+    async fn get_routing_decision(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<crate::chat::provider::cognitive::decision::CognitiveDecision>> {
+        use crate::chat::provider::cognitive::store::RoutingArmStore;
+        self.routing.decision(id).await
+    }
+
+    async fn list_routing_decisions(
+        &self,
+        filter: &crate::chat::provider::cognitive::store::DecisionFilter,
+    ) -> anyhow::Result<Vec<crate::chat::provider::cognitive::decision::CognitiveDecision>> {
+        use crate::chat::provider::cognitive::store::RoutingArmStore;
+        self.routing.decisions(filter).await
+    }
+
+    async fn set_routing_decision_outcome(
+        &self,
+        id: Uuid,
+        outcome: crate::chat::provider::cognitive::decision::DecisionOutcome,
+    ) -> anyhow::Result<bool> {
+        use crate::chat::provider::cognitive::store::RoutingArmStore;
+        self.routing.set_outcome(id, outcome).await
+    }
+
+    // ── Conversation segments (in-memory mock) ──────────────────────────────
+
+    async fn put_segments(
+        &self,
+        conversation: &str,
+        segments: &[crate::chat::provider::cognitive::segment::Segment],
+    ) -> anyhow::Result<()> {
+        use crate::chat::provider::cognitive::segment_store::SegmentStore;
+        self.segments.put_segments(conversation, segments).await
+    }
+
+    async fn get_segments(
+        &self,
+        conversation: &str,
+    ) -> anyhow::Result<Vec<crate::chat::provider::cognitive::segment::Segment>> {
+        use crate::chat::provider::cognitive::segment_store::SegmentStore;
+        self.segments.segments(conversation).await
+    }
+
+    async fn put_boundaries(
+        &self,
+        conversation: &str,
+        boundaries: &[crate::chat::provider::cognitive::segment::Boundary],
+    ) -> anyhow::Result<()> {
+        use crate::chat::provider::cognitive::segment_store::SegmentStore;
+        self.segments.put_boundaries(conversation, boundaries).await
+    }
+
+    async fn get_boundaries(
+        &self,
+        conversation: &str,
+    ) -> anyhow::Result<Vec<crate::chat::provider::cognitive::segment::Boundary>> {
+        use crate::chat::provider::cognitive::segment_store::SegmentStore;
+        self.segments.boundaries(conversation).await
+    }
+
+    // ── AgentExecution (in-memory mock) ─────────────────────────────────────
+
+    async fn create_agent_execution(
+        &self,
+        ae: &crate::neo4j::agent_execution::AgentExecutionNode,
+    ) -> anyhow::Result<()> {
+        self.agent_executions
+            .write()
+            .await
+            .insert(ae.id, ae.clone());
+        Ok(())
+    }
+
+    async fn update_agent_execution(
+        &self,
+        ae: &crate::neo4j::agent_execution::AgentExecutionNode,
+    ) -> anyhow::Result<()> {
+        if self
+            .fail_agent_execution_updates
+            .lock()
+            .is_ok_and(|f| f.contains(&ae.id))
+        {
+            anyhow::bail!(
+                "mock: update_agent_execution failure injected for {}",
+                ae.id
+            );
+        }
+        // Like the Cypher `MATCH ... SET`: updating a node that is absent is a no-op.
+        if let Some(slot) = self.agent_executions.write().await.get_mut(&ae.id) {
+            *slot = ae.clone();
+        }
+        Ok(())
+    }
+
+    async fn get_agent_executions_for_run(
+        &self,
+        run_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>> {
+        let mut v: Vec<_> = self
+            .agent_executions
+            .read()
+            .await
+            .values()
+            .filter(|ae| ae.run_id == run_id)
+            .cloned()
+            .collect();
+        v.sort_by_key(|ae| ae.started_at);
+        Ok(v)
+    }
+
+    async fn list_running_agent_executions(
+        &self,
+    ) -> anyhow::Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>> {
+        let mut v: Vec<_> = self
+            .agent_executions
+            .read()
+            .await
+            .values()
+            .filter(|ae| ae.status == crate::neo4j::agent_execution::AgentExecutionStatus::Running)
+            .cloned()
+            .collect();
+        v.sort_by_key(|ae| ae.started_at);
+        Ok(v)
+    }
+
+    async fn record_agent_execution_verification(
+        &self,
+        agent_execution_id: Uuid,
+        verification_json: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(node) = self
+            .agent_executions
+            .write()
+            .await
+            .get_mut(&agent_execution_id)
+        {
+            node.verification_json = Some(verification_json.to_string());
+            if let Some(passed) =
+                crate::runner::routing::verification_passed(Some(verification_json))
+            {
+                node.verification_passed = Some(passed);
+            }
+        }
+        Ok(())
+    }
+
+    async fn agent_execution_cost_breakdown(
+        &self,
+        group_by: crate::neo4j::agent_execution::CostGroupBy,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<Vec<crate::neo4j::agent_execution::CostBreakdownRow>> {
+        use crate::neo4j::agent_execution::{breakdown, in_breakdown_window};
+        let store = self.agent_executions.read().await;
+        Ok(breakdown(
+            store
+                .values()
+                .filter(|ae| in_breakdown_window(ae, from, to)),
+            group_by,
+        ))
+    }
+
+    async fn create_used_skill_relation(
+        &self,
+        _agent_execution_id: Uuid,
+        _skill_id: Uuid,
+        _result: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn get_all_pagerank_values(&self, _project_id: Uuid) -> anyhow::Result<Vec<f64>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_community_risk_vectors(&self, _project_id: Uuid) -> anyhow::Result<Vec<Vec<f64>>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_all_risk_score_values(&self, _project_id: Uuid) -> anyhow::Result<Vec<f64>> {
+        Ok(Vec::new())
+    }
+
+    // ========================================================================
+    // Sharing & Privacy operations
+    // ========================================================================
+
+    async fn get_sharing_policy(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Option<crate::episodes::distill_models::SharingPolicy>> {
+        self.count_read();
+        Ok(self.sharing_policies.read().await.get(&project_id).cloned())
+    }
+
+    async fn update_sharing_policy(
+        &self,
+        project_id: Uuid,
+        policy: &crate::episodes::distill_models::SharingPolicy,
+    ) -> anyhow::Result<()> {
+        self.sharing_policies
+            .write()
+            .await
+            .insert(project_id, policy.clone());
+        Ok(())
+    }
+
+    async fn get_sharing_consent(
+        &self,
+        note_id: Uuid,
+    ) -> anyhow::Result<crate::episodes::distill_models::SharingConsent> {
+        Ok(self
+            .notes
+            .read()
+            .await
+            .get(&note_id)
+            .map(|n| n.sharing_consent)
+            .unwrap_or_default())
+    }
+
+    async fn update_sharing_consent(
+        &self,
+        note_id: Uuid,
+        consent: &crate::episodes::distill_models::SharingConsent,
+    ) -> anyhow::Result<()> {
+        if let Some(n) = self.notes.write().await.get_mut(&note_id) {
+            n.sharing_consent = *consent;
+        }
+        Ok(())
+    }
+
+    async fn update_decision_sharing_consent(
+        &self,
+        decision_id: Uuid,
+        consent: &crate::episodes::distill_models::SharingConsent,
+    ) -> anyhow::Result<()> {
+        if let Some(d) = self.decisions.write().await.get_mut(&decision_id) {
+            d.sharing_consent = *consent;
+        }
+        Ok(())
+    }
+
+    async fn count_notes_by_consent(
+        &self,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<crate::episodes::distill_models::ConsentCounts> {
+        let mut counts = crate::episodes::distill_models::ConsentCounts::default();
+        for n in self.notes.read().await.values() {
+            if project_id.is_none() || n.project_id == project_id {
+                counts.add(n.sharing_consent, 1);
+            }
+        }
+        Ok(counts)
+    }
+
+    async fn create_sharing_event(
+        &self,
+        _event: &crate::episodes::distill_models::SharingEvent,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn list_sharing_events(
+        &self,
+        _project_id: Uuid,
+        _limit: i64,
+        _offset: i64,
+    ) -> anyhow::Result<Vec<crate::episodes::distill_models::SharingEvent>> {
+        Ok(Vec::new())
+    }
+
+    async fn persist_tombstone(
+        &self,
+        _tombstone: &crate::reception::anchor::SignedTombstone,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn list_tombstones(
+        &self,
+    ) -> anyhow::Result<Vec<crate::reception::anchor::SignedTombstone>> {
+        Ok(Vec::new())
+    }
+
+    async fn is_tombstoned(&self, _content_hash: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    // ========================================================================
+    // UserProfile operations
+    // ========================================================================
+
+    async fn create_or_get_user_profile(
+        &self,
+        user_id: &str,
+    ) -> anyhow::Result<crate::profile::UserProfile> {
+        let mut profiles = self.user_profiles.write().await;
+        if let Some(profile) = profiles.get(user_id) {
+            return Ok(profile.clone());
+        }
+        let profile = crate::profile::UserProfile::new(user_id);
+        profiles.insert(user_id.to_string(), profile.clone());
+        Ok(profile)
+    }
+
+    async fn update_user_profile(
+        &self,
+        profile: &crate::profile::UserProfile,
+    ) -> anyhow::Result<()> {
+        let mut profiles = self.user_profiles.write().await;
+        profiles.insert(profile.user_id.clone(), profile.clone());
+        Ok(())
+    }
+
+    async fn get_user_profile(
+        &self,
+        user_id: &str,
+    ) -> anyhow::Result<Option<crate::profile::UserProfile>> {
+        let profiles = self.user_profiles.read().await;
+        Ok(profiles.get(user_id).cloned())
+    }
+
+    async fn upsert_works_on(&self, user_id: &str, project_id: Uuid) -> anyhow::Result<()> {
+        let mut works = self.works_on.write().await;
+        let key = (user_id.to_string(), project_id);
+        let entry = works
+            .entry(key)
+            .or_insert_with(|| crate::profile::WorksOnRelation {
+                user_id: user_id.to_string(),
+                project_id,
+                frequency: 0,
+                last_active: chrono::Utc::now(),
+            });
+        entry.frequency += 1;
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
+    async fn get_works_on(
+        &self,
+        user_id: &str,
+    ) -> anyhow::Result<Vec<crate::profile::WorksOnRelation>> {
+        let works = self.works_on.read().await;
+        let mut result: Vec<_> = works
+            .iter()
+            .filter(|((uid, _), _)| uid == user_id)
+            .map(|(_, rel)| rel.clone())
+            .collect();
+        result.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        Ok(result)
+    }
+
+    // ========================================================================
+    // Alert operations (Heartbeat Engine)
+    // ========================================================================
+
+    async fn create_alert(&self, alert: &AlertNode) -> anyhow::Result<()> {
+        self.alerts.write().await.insert(alert.id, alert.clone());
+        Ok(())
+    }
+
+    async fn list_pending_alerts(
+        &self,
+        project_id: Option<Uuid>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AlertNode>> {
+        let alerts = self.alerts.read().await;
+        let mut result: Vec<_> = alerts
+            .values()
+            .filter(|a| !a.acknowledged)
+            .filter(|a| match project_id {
+                Some(pid) => a.project_id == Some(pid),
+                None => true,
+            })
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        result.truncate(limit);
+        Ok(result)
+    }
+
+    async fn acknowledge_alert(&self, alert_id: Uuid, acknowledged_by: &str) -> anyhow::Result<()> {
+        let mut alerts = self.alerts.write().await;
+        if let Some(alert) = alerts.get_mut(&alert_id) {
+            alert.acknowledged = true;
+            alert.acknowledged_by = Some(acknowledged_by.to_string());
+            alert.acknowledged_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn get_alert(&self, alert_id: Uuid) -> anyhow::Result<Option<AlertNode>> {
+        Ok(self.alerts.read().await.get(&alert_id).cloned())
+    }
+
+    async fn list_alerts(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<AlertNode>, usize)> {
+        self.log_read("list_alerts")?;
+        let scope = self.scope_projects(project_id, workspace_slug).await;
+        let alerts = self.alerts.read().await;
+        let mut all: Vec<_> = alerts
+            .values()
+            .filter(|a| match scope {
+                Some(ref s) => a.project_id.is_some_and(|p| s.contains(&p)),
+                None => true,
+            })
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        let total = all.len();
+        let page = all.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
+    async fn list_event_triggers(
+        &self,
+        project_scope: Option<Uuid>,
+        enabled_only: bool,
+    ) -> Result<Vec<EventTrigger>> {
+        Ok(self
+            .event_triggers
+            .read()
+            .await
+            .values()
+            .filter(|t| !enabled_only || t.enabled)
+            .filter(|t| project_scope.is_none() || t.project_scope == project_scope)
+            .cloned()
+            .collect())
+    }
+
+    async fn create_event_trigger(&self, trigger: &EventTrigger) -> Result<Uuid> {
+        self.event_triggers
+            .write()
+            .await
+            .insert(trigger.id, trigger.clone());
+        Ok(trigger.id)
+    }
+
+    async fn get_event_trigger(&self, _id: Uuid) -> Result<Option<EventTrigger>> {
+        Ok(None)
+    }
+
+    async fn update_event_trigger(
+        &self,
+        _id: Uuid,
+        _enabled: Option<bool>,
+        _name: Option<String>,
+        _entity_type_pattern: Option<Option<String>>,
+        _action_pattern: Option<Option<String>>,
+        _payload_conditions: Option<Option<serde_json::Value>>,
+        _cooldown_secs: Option<u32>,
+        _project_scope: Option<Option<Uuid>>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    async fn delete_event_trigger(&self, _id: Uuid) -> Result<bool> {
+        Ok(false)
+    }
+
+    // ========================================================================
+    // LifecycleHook operations
+    // ========================================================================
+
+    async fn create_lifecycle_hook(&self, hook: &LifecycleHook) -> Result<()> {
+        self.lifecycle_hooks
+            .write()
+            .await
+            .insert(hook.id, hook.clone());
+        Ok(())
+    }
+
+    async fn get_lifecycle_hook(&self, id: Uuid) -> Result<Option<LifecycleHook>> {
+        Ok(self.lifecycle_hooks.read().await.get(&id).cloned())
+    }
+
+    async fn list_lifecycle_hooks(&self, project_id: Option<Uuid>) -> Result<Vec<LifecycleHook>> {
+        let hooks = self.lifecycle_hooks.read().await;
+        let mut result: Vec<LifecycleHook> = hooks
+            .values()
+            .filter(|h| match project_id {
+                Some(pid) => h.project_id == Some(pid) || h.project_id.is_none(),
+                None => true,
+            })
+            .cloned()
+            .collect();
+        result.sort_by_key(|h| h.priority);
+        Ok(result)
+    }
+
+    async fn update_lifecycle_hook(
+        &self,
+        id: Uuid,
+        updates: &UpdateLifecycleHookRequest,
+    ) -> Result<()> {
+        if let Some(h) = self.lifecycle_hooks.write().await.get_mut(&id) {
+            if let Some(name) = &updates.name {
+                h.name = name.clone();
+            }
+            if let Some(description) = &updates.description {
+                h.description = description.clone();
+            }
+            if let Some(on_status) = &updates.on_status {
+                h.on_status = on_status.clone();
+            }
+            if let Some(action_config) = &updates.action_config {
+                h.action_config = action_config.clone();
+            }
+            if let Some(priority) = &updates.priority {
+                h.priority = *priority;
+            }
+            if let Some(enabled) = &updates.enabled {
+                h.enabled = *enabled;
+            }
+            h.updated_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn delete_lifecycle_hook(&self, id: Uuid) -> Result<()> {
+        let hooks = self.lifecycle_hooks.read().await;
+        if let Some(h) = hooks.get(&id) {
+            if h.builtin {
+                anyhow::bail!("Cannot delete builtin lifecycle hook");
+            }
+        }
+        drop(hooks);
+        self.lifecycle_hooks.write().await.remove(&id);
+        Ok(())
+    }
+
+    async fn list_hooks_for_scope(
+        &self,
+        scope: &LifecycleScope,
+        on_status: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<LifecycleHook>> {
+        let hooks = self.lifecycle_hooks.read().await;
+        let mut result: Vec<LifecycleHook> = hooks
+            .values()
+            .filter(|h| {
+                h.scope == *scope
+                    && h.on_status == on_status
+                    && h.enabled
+                    && match project_id {
+                        Some(pid) => h.project_id == Some(pid) || h.project_id.is_none(),
+                        None => h.project_id.is_none(),
+                    }
+            })
+            .cloned()
+            .collect();
+        result.sort_by_key(|h| h.priority);
+        Ok(result)
+    }
+
+    // ========================================================================
+    // MCP Federation operations
+    // ========================================================================
+
+    async fn create_mcp_server(&self, server: &McpServerNode) -> Result<()> {
+        let sid = server.id;
+        self.mcp_project_servers
+            .write()
+            .await
+            .entry(server.project_id)
+            .or_default()
+            .push(sid);
+        self.mcp_servers.write().await.insert(sid, server.clone());
+        Ok(())
+    }
+
+    async fn get_mcp_server(&self, id: Uuid) -> Result<Option<McpServerNode>> {
+        Ok(self.mcp_servers.read().await.get(&id).cloned())
+    }
+
+    async fn list_mcp_servers(&self, project_id: Uuid) -> Result<Vec<McpServerNode>> {
+        let idx = self.mcp_project_servers.read().await;
+        let servers = self.mcp_servers.read().await;
+        let ids = idx.get(&project_id).cloned().unwrap_or_default();
+        let mut result: Vec<_> = ids
+            .iter()
+            .filter_map(|id| servers.get(id).cloned())
+            .collect();
+        result.sort_by(|a, b| a.server_id.cmp(&b.server_id));
+        Ok(result)
+    }
+
+    async fn list_all_mcp_servers(&self) -> Result<Vec<McpServerNode>> {
+        let servers = self.mcp_servers.read().await;
+        let mut result: Vec<_> = servers.values().cloned().collect();
+        result.sort_by(|a, b| a.server_id.cmp(&b.server_id));
+        Ok(result)
+    }
+
+    async fn delete_mcp_server(&self, id: Uuid) -> Result<()> {
+        if let Some(server) = self.mcp_servers.write().await.remove(&id) {
+            // Remove from project index
+            if let Some(ids) = self
+                .mcp_project_servers
+                .write()
+                .await
+                .get_mut(&server.project_id)
+            {
+                ids.retain(|i| *i != id);
+            }
+            // Remove associated tools
+            let server_id = server.server_id;
+            let tool_ids = self
+                .mcp_server_tools
+                .write()
+                .await
+                .remove(&server_id)
+                .unwrap_or_default();
+            let mut tools = self.mcp_tools.write().await;
+            for tid in tool_ids {
+                tools.remove(&tid);
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_mcp_server_by_server_id(&self, server_id: &str) -> Result<()> {
+        // Find the UUID for this server_id
+        let uuid = {
+            let servers = self.mcp_servers.read().await;
+            servers
+                .values()
+                .find(|s| s.server_id == server_id)
+                .map(|s| s.id)
+        };
+        if let Some(id) = uuid {
+            self.delete_mcp_server(id).await?;
+        }
+        Ok(())
+    }
+
+    async fn update_mcp_server_status(&self, id: Uuid, status: &str) -> Result<()> {
+        if let Some(s) = self.mcp_servers.write().await.get_mut(&id) {
+            s.status = status.to_string();
+            s.updated_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn create_mcp_tool(&self, tool: &McpToolNode) -> Result<()> {
+        let tid = tool.id;
+        self.mcp_server_tools
+            .write()
+            .await
+            .entry(tool.server_id.clone())
+            .or_default()
+            .push(tid);
+        self.mcp_tools.write().await.insert(tid, tool.clone());
+        Ok(())
+    }
+
+    async fn list_mcp_tools_for_server(&self, server_id: &str) -> Result<Vec<McpToolNode>> {
+        let idx = self.mcp_server_tools.read().await;
+        let tools = self.mcp_tools.read().await;
+        let ids = idx.get(server_id).cloned().unwrap_or_default();
+        let mut result: Vec<_> = ids.iter().filter_map(|id| tools.get(id).cloned()).collect();
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(result)
+    }
+
+    async fn delete_mcp_tools_for_server(&self, server_id: &str) -> Result<()> {
+        let tool_ids = self
+            .mcp_server_tools
+            .write()
+            .await
+            .remove(server_id)
+            .unwrap_or_default();
+        let mut tools = self.mcp_tools.write().await;
+        for tid in tool_ids {
+            tools.remove(&tid);
+        }
+        Ok(())
+    }
+
+    async fn create_mcp_similar_to(
+        &self,
+        tool_fqn: &str,
+        similar_to_fqn: &str,
+        score: f64,
+    ) -> Result<()> {
+        self.mcp_similar_to
+            .write()
+            .await
+            .insert((tool_fqn.to_string(), similar_to_fqn.to_string()), score);
+        Ok(())
+    }
+
+    async fn create_mcp_co_activated(
+        &self,
+        tool_fqn_a: &str,
+        tool_fqn_b: &str,
+        count: i64,
+    ) -> Result<()> {
+        self.mcp_co_activated
+            .write()
+            .await
+            .insert((tool_fqn_a.to_string(), tool_fqn_b.to_string()), count);
+        Ok(())
+    }
+
+    async fn create_mcp_often_follows(
+        &self,
+        tool_fqn_a: &str,
+        tool_fqn_b: &str,
+        count: i64,
+        avg_delta_ms: f64,
+    ) -> Result<()> {
+        self.mcp_often_follows.write().await.insert(
+            (tool_fqn_a.to_string(), tool_fqn_b.to_string()),
+            (count, avg_delta_ms),
+        );
+        Ok(())
+    }
+
+    async fn backfill_co_activated_with(&self) -> Result<usize> {
+        // Mock: no chat event records to scan, return 0
+        Ok(0)
+    }
+
+    async fn backfill_often_follows(&self) -> Result<usize> {
+        // Mock: no chat event records to scan, return 0
+        Ok(0)
+    }
+
+    async fn get_entity_neighborhood(
+        &self,
+        center_type: &str,
+        center_id: &str,
+        params: &crate::graph::neighborhood::NeighborhoodParams,
+    ) -> Result<Option<crate::graph::neighborhood::RawNeighborhood>> {
+        let graph = self.neighborhood_graph.read().await;
+        Ok(crate::graph::neighborhood::expand_in_memory(
+            &graph,
+            center_type,
+            center_id,
+            params,
+        ))
+    }
+
+    async fn get_scoped_entity_neighborhood(
+        &self,
+        center_type: &str,
+        center_id: &str,
+        params: &crate::graph::neighborhood::NeighborhoodParams,
+        filter: &crate::graph::neighborhood::ProjectFilter,
+    ) -> Result<Option<crate::graph::neighborhood::ScopedNeighborhood>> {
+        self.count_read();
+        let graph = self.neighborhood_graph.read().await;
+        let ownership = self.neighborhood_ownership.read().await;
+        Ok(crate::graph::neighborhood::expand_in_memory_scoped(
+            &graph,
+            &ownership,
+            center_type,
+            center_id,
+            params,
+            filter,
+        ))
     }
 }

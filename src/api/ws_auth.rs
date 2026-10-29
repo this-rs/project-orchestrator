@@ -22,6 +22,10 @@
 use crate::auth::jwt::Claims;
 use crate::auth::refresh;
 use crate::neo4j::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::AuthConfig;
 use axum::extract::ws::{Message, WebSocket};
 use std::collections::HashMap;
@@ -380,6 +384,10 @@ pub async fn wait_ready_then_auth_ok(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use crate::test_helpers::test_auth_config;
     use axum::http::HeaderMap;
 

@@ -17,6 +17,10 @@ use crate::chat::manager::{test_support, ChatManager};
 use crate::chat::types::ChatEvent;
 use crate::neo4j::models::ChatEventRecord;
 use crate::neo4j::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::test_helpers::{mock_app_state_with_graph, test_chat_session};
 
 const WAIT: Duration = Duration::from_secs(10);

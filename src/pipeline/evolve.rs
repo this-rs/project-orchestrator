@@ -33,6 +33,10 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::pipeline::critic::{
     CriticMode, CriticScore, GraphBasedCritic, LearningConfig, MutationCandidate, MutationCritic,
 };
@@ -733,6 +737,10 @@ fn compute_failure_rate(runs: &[crate::protocol::models::ProtocolRun]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
 
     fn make_pattern(
         pattern_type: PatternType,
@@ -1039,7 +1047,7 @@ mod tests {
         let task_id = Uuid::new_v4();
         let mut parent = crate::test_helpers::test_task();
         parent.id = task_id;
-        crate::neo4j::GraphStore::create_task(store.as_ref(), Uuid::new_v4(), &parent)
+        crate::neo4j::PlanStore::create_task(store.as_ref(), Uuid::new_v4(), &parent)
             .await
             .unwrap();
         let result = evolver

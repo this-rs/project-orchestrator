@@ -32,6 +32,10 @@ use crate::chat::provider::settings::{
     INSTANCE_PREFIX, POLICY_KEY, ROLES_KEY,
 };
 use crate::neo4j::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use std::sync::Arc;
 
 pub(crate) fn require_human(state: &OrchestratorState, claims: &Claims) -> Result<(), AppError> {
@@ -1560,6 +1564,10 @@ mod agent_surface_tests {
     //! The agent surface the MCP `provider` mega-tool calls: THE SAME answers as
     //! the person's settings routes (no second set of validations), plus the two
     //! grants an agent may not give itself.
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
 
     use super::*;
     use axum::body::Body;

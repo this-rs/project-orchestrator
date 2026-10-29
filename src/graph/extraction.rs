@@ -11,8 +11,6 @@
 //!
 //! - **File graph**: nodes = files, edges = IMPORTS relationships
 //! - **Function graph**: nodes = functions, edges = CALLS relationships
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 use crate::neo4j::GraphStore;
 use anyhow::Result;
@@ -20,6 +18,10 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use super::models::{CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType, FabricWeights};
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 
 /// Parse a qualified function ID of the form `"file_path:function_name:index"`
 /// into `(Some(file_path), function_name)`.
@@ -378,6 +380,10 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{FunctionNode, Visibility};
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use crate::test_helpers::test_project;
 
     /// The per-file SYNAPSE cap defaults to a BOUNDED value: `0` (unbounded) was the

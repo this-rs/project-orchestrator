@@ -40,6 +40,10 @@ use super::ws_chat_handler;
 use super::ws_handlers;
 use super::ws_run_handler;
 use crate::auth::middleware::require_auth;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use axum::extract::DefaultBodyLimit;
 use axum::http::{header, Method};
 use axum::{
@@ -2387,6 +2391,10 @@ fn protected_routes() -> Router<OrchestratorState> {
 mod tests {
     use super::*;
     use crate::events::EventBus;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
 
     #[test]
     fn static_assets_detected_but_spa_routes_with_dots_are_not() {

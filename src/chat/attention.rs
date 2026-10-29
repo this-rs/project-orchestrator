@@ -30,9 +30,9 @@
 //!
 //! `input_request` is a dead type (never emitted in production): it is
 //! ignored on purpose, counting it would invent phantom requests. The grouped
-//! read ([`GraphStore::get_attention_events`]) does not even fetch it.
+//! read ([`AnalyticsStore::get_attention_events`]) does not even fetch it.
 //!
-//! [`GraphStore::get_attention_events`]: crate::neo4j::traits::GraphStore::get_attention_events
+//! [`AnalyticsStore::get_attention_events`]: crate::neo4j::traits::AnalyticsStore::get_attention_events
 
 use std::collections::{HashMap, HashSet};
 
@@ -42,6 +42,10 @@ use uuid::Uuid;
 use crate::api::attention::{OrphanRequest, QuestionOption, RequestKind, WaitingRequest};
 use crate::chat::types::ChatEvent;
 use crate::neo4j::models::ChatEventRecord;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 
 /// Everything the derivation needs to know about one session, except its
 /// events (passed separately so the grouped read can be split per session).
@@ -367,6 +371,10 @@ fn question_text_and_options(questions: &serde_json::Value) -> (String, Vec<Ques
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use chrono::TimeZone;
     use serde_json::json;
 

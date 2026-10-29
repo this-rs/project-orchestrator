@@ -6,8 +6,6 @@
 //!
 //! If no lifecycle protocol exists (project without seeds), returns None
 //! for graceful fallback to the existing runner behavior.
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -16,6 +14,10 @@ use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
 
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::protocol::engine;
 use crate::protocol::routing::{rank_protocols, ContextVector, DimensionWeights};
 
@@ -170,6 +172,10 @@ pub async fn route_lifecycle_protocol(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use crate::test_helpers::test_project;
 
     /// Helper: create a plan in the mock store with a project.

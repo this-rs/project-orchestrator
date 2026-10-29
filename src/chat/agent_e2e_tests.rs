@@ -28,8 +28,10 @@ use super::provider::settings::{
 use super::types::{ChatEvent, ChatRequest};
 use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::GraphStore;
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::test_helpers::mock_app_state;
 use crate::vault::grants::{GrantScope, SecretSelector};
 use crate::vault::VaultService;
@@ -1299,6 +1301,10 @@ mod cognitive_routing {
     use crate::chat::provider::cognitive::store::{DecisionFilter, RoutingArmStore};
     use crate::chat::provider::resolver::{ProviderChoice, RoutedBy};
     use crate::neo4j::routing::Neo4jRoutingStore;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
 
     struct NoBuiltin;
 
@@ -4842,6 +4848,10 @@ mod provider_switch {
         };
         use crate::chat::provider::cognitive::{LearningStage, ProviderRoutingMode, ROUTING_KEY};
         use crate::chat::types::{RoutingPoolEntry, SessionRoutingRequest};
+        use crate::neo4j::{
+            AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore,
+            ProjectStore, ReleaseStore, WorkspaceStore,
+        };
         use std::collections::VecDeque;
         use std::sync::Mutex as StdMutex;
 

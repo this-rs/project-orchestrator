@@ -5,6 +5,10 @@ use super::*;
 use crate::chat::anchor::{AnchorActor, AnchorOp, NewAnchor};
 use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::models::TaskStatus;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::notes::{Note, NoteType};
 use chrono::TimeZone;
 

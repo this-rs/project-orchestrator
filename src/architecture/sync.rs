@@ -9,8 +9,6 @@
 //! derived, and may add what nobody recorded, but it never overwrites what a
 //! person wrote. Descriptions and tags already present are left alone, and
 //! components nobody derived are left in place.
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,6 +20,10 @@ use crate::neo4j::traits::GraphStore;
 
 use super::derive::{derive_topology, ProjectInput};
 use super::DERIVED_CONFIG_KEY;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 
 /// What a derivation run changed, for logs and for the API response.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -177,6 +179,10 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{ComponentType, ProjectNode, WorkspaceNode};
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
 
     fn temp_root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(

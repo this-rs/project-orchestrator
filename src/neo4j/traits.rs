@@ -98,6 +98,8 @@ pub trait GraphStore:
     + DecisionStore
     + CommitStore
     + ReleaseStore
+    + NoteStore
+    + AnalyticsStore
     + Send
     + Sync
 {
@@ -108,6 +110,1637 @@ pub trait GraphStore:
     /// flattering manifest by accident.
     fn capabilities(&self) -> StoreCapabilities;
 
+    /// Task counters for many entities at once (one round trip for list cards).
+    ///
+    /// The default implementation loops over the per-entity task getters so
+    /// every store (including mocks) supports it; `Neo4jClient` overrides it
+    /// with a single aggregated query.
+    async fn get_progress_batch(
+        &self,
+        kind: ProgressKind,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, TaskCounts>> {
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        for id in ids {
+            let tasks = match kind {
+                ProgressKind::Plan => self.get_plan_tasks(*id).await?,
+                ProgressKind::Project => self.get_project_tasks(*id).await?,
+                ProgressKind::Milestone => self.get_milestone_tasks(*id).await?,
+            };
+            out.insert(*id, TaskCounts::from_tasks(&tasks));
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StoreCapabilities;
+
+    /// The ten capabilities the manifest exposes, in declaration order. A field
+    /// added to `StoreCapabilities` without updating this list (or a field
+    /// renamed) is caught by `capabilities_manifest_serializes_all_keys`.
+    const EXPECTED_KEYS: [&str; 10] = [
+        "vector_search",
+        "vector_filter",
+        "unique_constraints",
+        "composite_unique",
+        "variable_length_paths",
+        "shortest_path",
+        "subqueries",
+        "datetime_arithmetic",
+        "relationship_property_index",
+        "explicit_transactions",
+    ];
+
+    #[test]
+    fn capabilities_manifest_serializes_all_keys() {
+        let json = serde_json::to_value(StoreCapabilities::default()).expect("serialize");
+        let obj = json.as_object().expect("object");
+        assert_eq!(
+            obj.len(),
+            EXPECTED_KEYS.len(),
+            "manifest key set changed (added or removed a capability): {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        for key in EXPECTED_KEYS {
+            assert!(obj.contains_key(key), "missing manifest key `{key}`");
+        }
+    }
+
+    #[test]
+    fn neo4j_adapter_declares_core_capabilities() {
+        let caps = crate::neo4j::client::Neo4jClient::storage_capabilities();
+        assert!(caps.unique_constraints, "unique_constraints must be true");
+        assert!(caps.vector_search, "vector_search must be true");
+        assert!(
+            caps.variable_length_paths,
+            "variable_length_paths must be true"
+        );
+    }
+
+    #[test]
+    fn default_is_conservative_and_exhaustive() {
+        let default = StoreCapabilities::default();
+        // Exhaustive literal: a field added to `StoreCapabilities` without being
+        // listed here (and in the `Default` impl) fails to compile, so a
+        // capability can never slip in with a silent implicit value.
+        let exhaustive = StoreCapabilities {
+            vector_search: false,
+            vector_filter: false,
+            unique_constraints: false,
+            composite_unique: false,
+            variable_length_paths: false,
+            shortest_path: false,
+            subqueries: false,
+            datetime_arithmetic: false,
+            relationship_property_index: false,
+            explicit_transactions: false,
+        };
+        assert_eq!(
+            default, exhaustive,
+            "Default must list every capability explicitly"
+        );
+        // The conservative default advertises nothing at all.
+        for key in EXPECTED_KEYS {
+            let v = serde_json::to_value(default).expect("serialize")[key]
+                .as_bool()
+                .expect("bool");
+            assert!(!v, "default capability `{key}` must be false");
+        }
+    }
+}
+
+// ============================================================================
+// Project management domain
+// ============================================================================
+
+/// The project-management domain: the project entity and its lifecycle.
+///
+/// `GraphStore` is its supertrait, so a consumer keeps calling these methods
+/// on a `dyn GraphStore` without knowing the domain exists.
+#[async_trait]
+pub trait ProjectStore: Send + Sync {
+    // ========================================================================
+    // Project operations
+    // ========================================================================
+
+    /// Create a new project
+    async fn create_project(&self, project: &ProjectNode) -> Result<()>;
+
+    /// Get a project by ID
+    async fn get_project(&self, id: Uuid) -> Result<Option<ProjectNode>>;
+
+    /// Get a project by slug
+    async fn get_project_by_slug(&self, slug: &str) -> Result<Option<ProjectNode>>;
+
+    /// List all projects
+    async fn list_projects(&self) -> Result<Vec<ProjectNode>>;
+
+    /// Update project fields (name, description, root_path)
+    async fn update_project(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<Option<String>>,
+        root_path: Option<String>,
+        profile: Option<ProjectProfile>,
+    ) -> Result<()>;
+
+    /// Update project last_synced timestamp
+    async fn update_project_synced(&self, id: Uuid) -> Result<()>;
+
+    /// Update project analytics_computed_at timestamp
+    async fn update_project_analytics_timestamp(&self, id: Uuid) -> Result<()>;
+
+    /// Delete a project and all its data.
+    /// `project_name` is used to tag archived notes/decisions with the source project.
+    async fn delete_project(&self, id: Uuid, project_name: &str) -> Result<()>;
+}
+
+// ============================================================================
+// Workspace domain
+// ============================================================================
+
+/// The workspace domain: workspaces, their milestones, resources and components.
+///
+/// `GraphStore` is its supertrait: a consumer keeps calling these methods on a
+/// `dyn GraphStore` without knowing the domain exists.
+#[async_trait]
+pub trait WorkspaceStore: Send + Sync {
+    // ========================================================================
+    // Workspace operations
+    // ========================================================================
+
+    /// Create a new workspace
+    async fn create_workspace(&self, workspace: &WorkspaceNode) -> Result<()>;
+
+    /// Get a workspace by ID
+    async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceNode>>;
+
+    /// Get a workspace by slug
+    async fn get_workspace_by_slug(&self, slug: &str) -> Result<Option<WorkspaceNode>>;
+
+    /// List all workspaces
+    async fn list_workspaces(&self) -> Result<Vec<WorkspaceNode>>;
+
+    /// Update a workspace
+    async fn update_workspace(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<String>,
+        metadata: Option<serde_json::Value>,
+        slug: Option<String>,
+    ) -> Result<()>;
+
+    /// Delete a workspace and all its data
+    async fn delete_workspace(&self, id: Uuid) -> Result<()>;
+
+    /// Add a project to a workspace
+    async fn add_project_to_workspace(&self, workspace_id: Uuid, project_id: Uuid) -> Result<()>;
+
+    /// Remove a project from a workspace
+    async fn remove_project_from_workspace(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<()>;
+
+    /// List all projects in a workspace
+    async fn list_workspace_projects(&self, workspace_id: Uuid) -> Result<Vec<ProjectNode>>;
+
+    /// Get the workspace a project belongs to
+    async fn get_project_workspace(&self, project_id: Uuid) -> Result<Option<WorkspaceNode>>;
+
+    /// Compute the P2P coupling matrix for all projects in a workspace.
+    async fn compute_coupling_matrix(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<crate::neo4j::models::CouplingMatrix>;
+    // ========================================================================
+    // Workspace Milestone operations
+    // ========================================================================
+
+    /// Create a workspace milestone
+    async fn create_workspace_milestone(&self, milestone: &WorkspaceMilestoneNode) -> Result<()>;
+
+    /// Get a workspace milestone by ID
+    async fn get_workspace_milestone(&self, id: Uuid) -> Result<Option<WorkspaceMilestoneNode>>;
+
+    /// List workspace milestones (unpaginated, used internally)
+    async fn list_workspace_milestones(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Vec<WorkspaceMilestoneNode>>;
+
+    /// List workspace milestones with pagination and status filter
+    ///
+    /// Returns (milestones, total_count)
+    async fn list_workspace_milestones_filtered(
+        &self,
+        workspace_id: Uuid,
+        status: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<WorkspaceMilestoneNode>, usize)>;
+
+    /// List all workspace milestones across all workspaces with filters and pagination
+    ///
+    /// Returns (milestones_with_workspace_info, total_count)
+    async fn list_all_workspace_milestones_filtered(
+        &self,
+        workspace_id: Option<Uuid>,
+        status: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<(WorkspaceMilestoneNode, String, String, String)>>;
+
+    /// Count all workspace milestones across workspaces with optional filters
+    async fn count_all_workspace_milestones(
+        &self,
+        workspace_id: Option<Uuid>,
+        status: Option<&str>,
+    ) -> Result<usize>;
+
+    /// Update a workspace milestone
+    ///
+    /// Returns `false` when no milestone has this id (nothing was written).
+    async fn update_workspace_milestone(
+        &self,
+        id: Uuid,
+        title: Option<String>,
+        description: Option<String>,
+        status: Option<MilestoneStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool>;
+
+    /// Delete a workspace milestone
+    async fn delete_workspace_milestone(&self, id: Uuid) -> Result<()>;
+
+    /// Add a task to a workspace milestone
+    async fn add_task_to_workspace_milestone(
+        &self,
+        milestone_id: Uuid,
+        task_id: Uuid,
+    ) -> Result<()>;
+
+    /// Remove a task from a workspace milestone
+    async fn remove_task_from_workspace_milestone(
+        &self,
+        milestone_id: Uuid,
+        task_id: Uuid,
+    ) -> Result<()>;
+
+    /// Link a plan to a workspace milestone
+    async fn link_plan_to_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> Result<()>;
+
+    /// Unlink a plan from a workspace milestone
+    async fn unlink_plan_from_workspace_milestone(
+        &self,
+        plan_id: Uuid,
+        milestone_id: Uuid,
+    ) -> Result<()>;
+
+    /// Get workspace milestone progress
+    async fn get_workspace_milestone_progress(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<(u32, u32, u32, u32)>;
+
+    /// Get tasks linked to a workspace milestone (with plan info)
+    async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskWithPlan>>;
+
+    /// Get all steps for all tasks linked to a workspace milestone (batch)
+    async fn get_workspace_milestone_steps(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>>;
+
+    // ========================================================================
+    // Resource operations
+    // ========================================================================
+
+    /// Create a resource
+    async fn create_resource(&self, resource: &ResourceNode) -> Result<()>;
+
+    /// Get a resource by ID
+    async fn get_resource(&self, id: Uuid) -> Result<Option<ResourceNode>>;
+
+    /// List workspace resources
+    async fn list_workspace_resources(&self, workspace_id: Uuid) -> Result<Vec<ResourceNode>>;
+
+    /// Update a resource
+    ///
+    /// Returns `false` when no resource has this id (nothing was written).
+    async fn update_resource(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        file_path: Option<String>,
+        url: Option<String>,
+        version: Option<String>,
+        description: Option<String>,
+    ) -> Result<bool>;
+
+    /// Delete a resource
+    async fn delete_resource(&self, id: Uuid) -> Result<()>;
+
+    /// Link a project as implementing a resource
+    async fn link_project_implements_resource(
+        &self,
+        project_id: Uuid,
+        resource_id: Uuid,
+    ) -> Result<()>;
+
+    /// Link a project as using a resource
+    async fn link_project_uses_resource(&self, project_id: Uuid, resource_id: Uuid) -> Result<()>;
+
+    /// Get projects that implement a resource
+    async fn get_resource_implementers(&self, resource_id: Uuid) -> Result<Vec<ProjectNode>>;
+
+    /// Get projects that use a resource
+    async fn get_resource_consumers(&self, resource_id: Uuid) -> Result<Vec<ProjectNode>>;
+
+    // ========================================================================
+    // Component operations (Topology)
+    // ========================================================================
+
+    /// Create a component
+    async fn create_component(&self, component: &ComponentNode) -> Result<()>;
+
+    /// Get a component by ID
+    async fn get_component(&self, id: Uuid) -> Result<Option<ComponentNode>>;
+
+    /// List components in a workspace
+    async fn list_components(&self, workspace_id: Uuid) -> Result<Vec<ComponentNode>>;
+
+    /// Update a component
+    ///
+    /// Returns `false` when no component has this id (nothing was written).
+    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<bool>;
+
+    /// Create the component if absent, refresh it if present, and return its id.
+    /// Identity is (workspace, name). Used by architecture derivation, which runs
+    /// on every sync and must not stack duplicates the way `create_component` would.
+    async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> Result<Uuid>;
+
+    /// Delete a component
+    async fn delete_component(&self, id: Uuid) -> Result<()>;
+
+    /// Add a dependency between components
+    async fn add_component_dependency(
+        &self,
+        component_id: Uuid,
+        depends_on_id: Uuid,
+        protocol: Option<String>,
+        required: bool,
+    ) -> Result<()>;
+
+    /// Remove a dependency between components
+    async fn remove_component_dependency(
+        &self,
+        component_id: Uuid,
+        depends_on_id: Uuid,
+    ) -> Result<()>;
+
+    /// Map a component to a project
+    async fn map_component_to_project(&self, component_id: Uuid, project_id: Uuid) -> Result<()>;
+
+    /// Get the workspace topology (all components with their dependencies)
+    async fn get_workspace_topology(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Vec<(ComponentNode, Option<String>, Vec<ComponentDependency>)>>;
+}
+
+// ============================================================================
+// Code domain
+// ============================================================================
+
+/// The code domain: files, symbols, their batch ingestion, heritage, processes
+/// and the exploration queries built on top of them.
+///
+/// `GraphStore` is its supertrait: a consumer keeps calling these methods on a
+/// `dyn GraphStore` without knowing the domain exists.
+#[async_trait]
+pub trait CodeStore: Send + Sync {
+    // ========================================================================
+    // File operations
+    // ========================================================================
+
+    /// Get all file paths for a project
+    async fn get_project_file_paths(&self, project_id: Uuid) -> Result<Vec<String>>;
+
+    /// Delete a file and all its symbols
+    async fn delete_file(&self, path: &str) -> Result<()>;
+
+    /// Delete files that are no longer on the filesystem.
+    /// Returns `(files_deleted, symbols_deleted, deleted_paths)`.
+    async fn delete_stale_files(
+        &self,
+        project_id: Uuid,
+        valid_paths: &[String],
+    ) -> Result<(usize, usize, Vec<String>)>;
+
+    /// Link a file to a project (create CONTAINS relationship)
+    async fn link_file_to_project(&self, file_path: &str, project_id: Uuid) -> Result<()>;
+
+    /// Create or update a file node
+    async fn upsert_file(&self, file: &FileNode) -> Result<()>;
+
+    /// Batch create or update file nodes (UNWIND)
+    async fn batch_upsert_files(&self, files: &[FileNode]) -> Result<()>;
+
+    /// Get a file by path
+    async fn get_file(&self, path: &str) -> Result<Option<FileNode>>;
+
+    /// `(path, project_id)` of the files whose path ends with `suffix` (at most
+    /// `limit`). Used to resolve a relative file path to its owning project(s).
+    /// Defaults to no match for stores without file storage.
+    async fn find_files_by_path_suffix(
+        &self,
+        _suffix: &str,
+        _limit: usize,
+    ) -> Result<Vec<(String, Option<Uuid>)>> {
+        Ok(Vec::new())
+    }
+
+    /// List files for a project
+    async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>>;
+
+    /// Count files for a project (lightweight, no data transfer)
+    async fn count_project_files(&self, project_id: Uuid) -> Result<i64>;
+
+    /// Count orphan files for a project (lightweight — avoids the full health
+    /// report and its distribution fitting). Used by the real-time overview.
+    async fn count_orphan_files(&self, project_id: Uuid) -> Result<i64>;
+
+    /// Count CO_CHANGED pairs for a project (lightweight — no row transfer).
+    async fn count_co_change_pairs(&self, project_id: Uuid, min_count: i64) -> Result<i64>;
+
+    /// Count total protocol states and transitions across a project's protocols
+    /// in a single query (replaces the per-protocol N+1 in the overview).
+    async fn count_protocol_states_transitions(&self, project_id: Uuid) -> Result<(i64, i64)>;
+
+    /// Invalidate pre-computed GraIL properties on changed files and their neighbors.
+    ///
+    /// Sets `*_version = -1` on:
+    /// - Direct files: `cc_version`, `structural_dna_version`, `wl_hash_version`
+    /// - 1-2 hop neighbors: `cc_version` (1-hop), `wl_hash_version` (2-hop)
+    ///
+    /// Returns the total number of File nodes marked as stale.
+    async fn invalidate_computed_properties(
+        &self,
+        project_id: Uuid,
+        paths: &[String],
+    ) -> Result<u64>;
+
+    // ========================================================================
+    // Symbol operations
+    // ========================================================================
+
+    /// Create or update a function node
+    async fn upsert_function(&self, func: &FunctionNode) -> Result<()>;
+
+    /// Create or update a struct node
+    async fn upsert_struct(&self, s: &StructNode) -> Result<()>;
+
+    /// Create or update a trait node
+    async fn upsert_trait(&self, t: &TraitNode) -> Result<()>;
+
+    /// Find a trait by name (searches across all files)
+    async fn find_trait_by_name(&self, name: &str) -> Result<Option<String>>;
+
+    /// Create or update an enum node
+    async fn upsert_enum(&self, e: &EnumNode) -> Result<()>;
+
+    /// Create or update an impl block node
+    async fn upsert_impl(&self, impl_node: &ImplNode) -> Result<()>;
+
+    /// Create an import relationship between files
+    async fn create_import_relationship(
+        &self,
+        from_file: &str,
+        to_file: &str,
+        import_path: &str,
+    ) -> Result<()>;
+
+    /// Store an import node (for tracking even unresolved imports)
+    async fn upsert_import(&self, import: &ImportNode) -> Result<()>;
+
+    /// Create an IMPORTS_SYMBOL relationship from an Import to a matching Struct/Enum/Trait
+    async fn create_imports_symbol_relationship(
+        &self,
+        import_id: &str,
+        symbol_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<()>;
+
+    /// Create a CALLS relationship between functions, scoped to the same project.
+    /// When project_id is provided, the callee is matched only within the same project
+    /// to prevent cross-project CALLS pollution.
+    /// Sets `confidence` (0.0-1.0) and `reason` properties on the CALLS relationship.
+    async fn create_call_relationship(
+        &self,
+        caller_id: &str,
+        callee_name: &str,
+        project_id: Option<Uuid>,
+        confidence: f64,
+        reason: &str,
+    ) -> Result<()>;
+
+    // ========================================================================
+    // Batch upsert operations (UNWIND)
+    // ========================================================================
+
+    /// Batch upsert functions using UNWIND for a single Neo4j transaction per call.
+    async fn batch_upsert_functions(&self, functions: &[FunctionNode]) -> Result<()>;
+
+    /// Batch upsert structs using UNWIND.
+    async fn batch_upsert_structs(&self, structs: &[StructNode]) -> Result<()>;
+
+    /// Batch upsert traits using UNWIND.
+    async fn batch_upsert_traits(&self, traits: &[TraitNode]) -> Result<()>;
+
+    /// Batch upsert enums using UNWIND.
+    async fn batch_upsert_enums(&self, enums: &[EnumNode]) -> Result<()>;
+
+    /// Batch upsert impl blocks using UNWIND — 3 phases matching upsert_impl behavior.
+    async fn batch_upsert_impls(&self, impls: &[ImplNode]) -> Result<()>;
+
+    /// Batch upsert imports using UNWIND.
+    async fn batch_upsert_imports(&self, imports: &[ImportNode]) -> Result<()>;
+
+    /// Batch create File→IMPORTS→File relationships using UNWIND.
+    async fn batch_create_import_relationships(
+        &self,
+        relationships: &[(String, String, String)],
+    ) -> Result<()>;
+
+    /// Batch create Import→IMPORTS_SYMBOL→(Struct|Enum|Trait) relationships using UNWIND.
+    async fn batch_create_imports_symbol_relationships(
+        &self,
+        relationships: &[(String, String, Option<Uuid>)],
+    ) -> Result<()>;
+
+    /// Batch create CALLS relationships using UNWIND — 2-phase strategy.
+    async fn batch_create_call_relationships(
+        &self,
+        calls: &[FunctionCall],
+        project_id: Option<Uuid>,
+    ) -> Result<()>;
+
+    /// Batch create EXTENDS relationships (class inheritance) using UNWIND.
+    /// Takes (child_name, child_file_path, parent_name, project_id) tuples.
+    /// Phase 1: same-file match. Phase 2: project-scoped fallback.
+    async fn batch_create_extends_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()>;
+
+    /// Batch create IMPLEMENTS relationships (interface/protocol implementation) using UNWIND.
+    /// Takes (struct_name, struct_file_path, interface_name, project_id) tuples.
+    async fn batch_create_implements_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()>;
+
+    /// Delete all CALLS relationships where caller and callee belong to different projects.
+    /// Returns the number of deleted relationships.
+    async fn cleanup_cross_project_calls(&self) -> Result<i64>;
+
+    /// Delete all CALLS relationships where the callee function name is a known built-in.
+    /// Returns the number of deleted relationships.
+    async fn cleanup_builtin_calls(&self) -> Result<i64>;
+
+    /// Migrate existing CALLS: set default confidence=0.50 and reason='fuzzy-global'
+    /// for relationships missing these properties.
+    async fn migrate_calls_confidence(&self) -> Result<i64>;
+
+    /// Clean up ALL sync-generated data (File, Function, Struct, Trait, Enum, Impl, Import, FeatureGraph).
+    /// Returns the total number of deleted entities/relationships.
+    async fn cleanup_sync_data(&self) -> Result<i64>;
+
+    /// Get all functions called by a function
+    async fn get_callees(&self, function_id: &str, depth: u32) -> Result<Vec<FunctionNode>>;
+
+    /// Create a USES_TYPE relationship from a function to a type
+    async fn create_uses_type_relationship(&self, function_id: &str, type_name: &str)
+        -> Result<()>;
+
+    /// Find types that implement a specific trait
+    async fn find_trait_implementors(&self, trait_name: &str) -> Result<Vec<String>>;
+
+    /// Get all traits implemented by a type
+    async fn get_type_traits(&self, type_name: &str) -> Result<Vec<String>>;
+
+    /// Get all impl blocks for a type
+    async fn get_impl_blocks(&self, type_name: &str) -> Result<Vec<serde_json::Value>>;
+
+    // ========================================================================
+    // Heritage navigation queries (EXTENDS + IMPLEMENTS)
+    // ========================================================================
+
+    /// Get the full class hierarchy (parents + children) for a type
+    async fn get_class_hierarchy(
+        &self,
+        type_name: &str,
+        max_depth: u32,
+    ) -> Result<serde_json::Value>;
+
+    /// Find all subclasses of a given class (via EXTENDS)
+    async fn find_subclasses(&self, class_name: &str) -> Result<Vec<serde_json::Value>>;
+
+    /// Find all classes that implement a given interface (via IMPLEMENTS)
+    async fn find_interface_implementors(
+        &self,
+        interface_name: &str,
+    ) -> Result<Vec<serde_json::Value>>;
+
+    // ========================================================================
+    // Process queries
+    // ========================================================================
+
+    /// List all detected processes for a project
+    async fn list_processes(&self, project_id: uuid::Uuid) -> Result<Vec<serde_json::Value>>;
+
+    /// Get details of a specific process including ordered steps
+    async fn get_process_detail(&self, process_id: &str) -> Result<Option<serde_json::Value>>;
+
+    /// Get scored entry points for a project
+    async fn get_entry_points(
+        &self,
+        project_id: uuid::Uuid,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>>;
+
+    // ========================================================================
+    // Code exploration queries
+    // ========================================================================
+
+    /// Get the language of a file by path
+    async fn get_file_language(&self, path: &str) -> Result<Option<String>>;
+
+    /// Get function summaries for a file
+    async fn get_file_functions_summary(&self, path: &str) -> Result<Vec<FunctionSummaryNode>>;
+
+    /// Get struct summaries for a file
+    async fn get_file_structs_summary(&self, path: &str) -> Result<Vec<StructSummaryNode>>;
+
+    /// Get import paths for a file
+    async fn get_file_import_paths_list(&self, path: &str) -> Result<Vec<String>>;
+
+    /// Find references to a symbol (function callers, struct importers, file importers).
+    /// When project_id is provided, results are scoped to the same project.
+    async fn find_symbol_references(
+        &self,
+        symbol: &str,
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<SymbolReferenceNode>>;
+
+    /// Get files directly imported by a file
+    async fn get_file_direct_imports(&self, path: &str) -> Result<Vec<FileImportNode>>;
+
+    /// Get callers chain for a function name (by name, variable depth).
+    /// When project_id is provided, scopes start/end to the same project.
+    async fn get_function_callers_by_name(
+        &self,
+        function_name: &str,
+        depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>>;
+
+    /// Get callees chain for a function name (by name, variable depth).
+    /// When project_id is provided, scopes start/end to the same project.
+    async fn get_function_callees_by_name(
+        &self,
+        function_name: &str,
+        depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>>;
+
+    /// Get direct callers with confidence scores (depth 1 only).
+    /// Returns (name, file_path, confidence, reason) tuples.
+    async fn get_callers_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>>;
+
+    /// Get direct callees with confidence scores (depth 1 only).
+    async fn get_callees_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>>;
+
+    /// Get language statistics across all files
+    async fn get_language_stats(&self) -> Result<Vec<LanguageStatsNode>>;
+
+    /// Get language statistics for a specific project
+    async fn get_language_stats_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<LanguageStatsNode>>;
+
+    /// Get most connected files (highest in-degree from imports)
+    async fn get_most_connected_files(&self, limit: usize) -> Result<Vec<String>>;
+
+    /// Get most connected files with import/dependent counts
+    async fn get_most_connected_files_detailed(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ConnectedFileNode>>;
+
+    /// Get most connected files with import/dependent counts for a specific project
+    async fn get_most_connected_files_for_project(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<ConnectedFileNode>>;
+
+    /// Get distinct communities for a project (from graph analytics Louvain clustering)
+    async fn get_project_communities(&self, project_id: Uuid) -> Result<Vec<CommunityRow>>;
+
+    /// Get GDS analytics properties for a node (File by path, or Function by name).
+    /// Returns None if the node doesn't exist or has no analytics properties.
+    async fn get_node_analytics(
+        &self,
+        identifier: &str,
+        node_type: &str,
+    ) -> Result<Option<NodeAnalyticsRow>>;
+
+    /// Get distinct community labels for a list of file paths.
+    /// Returns only non-null community_label values.
+    async fn get_affected_communities(&self, file_paths: &[String]) -> Result<Vec<String>>;
+
+    /// Get a structural health report: god functions, orphan files, coupling metrics.
+    async fn get_code_health_report(
+        &self,
+        project_id: Uuid,
+        god_function_threshold: usize,
+    ) -> Result<crate::neo4j::models::CodeHealthReport>;
+
+    /// Capture a lightweight maintenance snapshot (biomimicry T11).
+    async fn compute_maintenance_snapshot(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::models::MaintenanceSnapshot>;
+
+    /// Compute scaffolding level for adaptive task complexity (biomimicry T8).
+    async fn compute_scaffolding_level(
+        &self,
+        project_id: Uuid,
+        scaffolding_override: Option<u8>,
+    ) -> Result<crate::neo4j::models::ScaffoldingLevel>;
+
+    /// Set or clear the scaffolding level override on a project (biomimicry T8).
+    async fn set_scaffolding_override(&self, project_id: Uuid, level: Option<u8>) -> Result<()>;
+
+    /// Set the watch_enabled flag on a project.
+    async fn set_watch_enabled(&self, project_id: Uuid, enabled: bool) -> Result<()>;
+
+    /// Set or clear the default note energy on a project (homeostasis).
+    /// When `Some(energy)`, new notes created in this project start at this energy.
+    /// When `None`, new notes start at the default energy (1.0).
+    async fn set_default_note_energy(&self, project_id: Uuid, energy: Option<f64>) -> Result<()>;
+
+    /// Detect global stagnation across a project (biomimicry T12).
+    async fn detect_global_stagnation(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::models::StagnationReport>;
+
+    /// Detect circular dependencies between files (import cycles).
+    async fn get_circular_dependencies(&self, project_id: Uuid) -> Result<Vec<Vec<String>>>;
+
+    /// Get GDS metrics for a specific node (file or function) in a project.
+    async fn get_node_gds_metrics(
+        &self,
+        node_path: &str,
+        node_type: &str,
+        project_id: Uuid,
+    ) -> Result<Option<NodeGdsMetrics>>;
+
+    /// Get statistical percentiles for GDS metrics across all nodes in a project.
+    async fn get_project_percentiles(&self, project_id: Uuid) -> Result<ProjectPercentiles>;
+
+    /// Get top N files by betweenness centrality (bridge files).
+    async fn get_top_bridges_by_betweenness(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<BridgeFile>>;
+
+    /// Get aggregated symbol names for a file (functions, structs, traits, enums)
+    async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode>;
+
+    /// Get the number of callers for a function by name.
+    /// When project_id is provided, only counts callers from the same project.
+    async fn get_function_caller_count(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<i64>;
+
+    /// Get trait info (is_external, source)
+    async fn get_trait_info(&self, trait_name: &str) -> Result<Option<TraitInfoNode>>;
+
+    /// Get trait implementors with file locations
+    async fn get_trait_implementors_detailed(
+        &self,
+        trait_name: &str,
+    ) -> Result<Vec<TraitImplementorNode>>;
+
+    /// Get all traits implemented by a type, with details
+    async fn get_type_trait_implementations(
+        &self,
+        type_name: &str,
+    ) -> Result<Vec<TypeTraitInfoNode>>;
+
+    /// Get all impl blocks for a type with methods
+    async fn get_type_impl_blocks_detailed(
+        &self,
+        type_name: &str,
+    ) -> Result<Vec<ImplBlockDetailNode>>;
+}
+
+// ============================================================================
+// Plan domain
+// ============================================================================
+
+/// The planning domain: plans and their tasks, steps, day plan and constraints.
+///
+/// `GraphStore` is its supertrait: a consumer keeps calling these methods on a
+/// `dyn GraphStore` without knowing the domain exists.
+#[async_trait]
+pub trait PlanStore: Send + Sync {
+    // ========================================================================
+    // Plan operations
+    // ========================================================================
+
+    /// Create a new plan
+    async fn create_plan(&self, plan: &PlanNode) -> Result<()>;
+
+    /// Get a plan by ID
+    async fn get_plan(&self, id: Uuid) -> Result<Option<PlanNode>>;
+
+    /// List all active plans
+    async fn list_active_plans(&self) -> Result<Vec<PlanNode>>;
+
+    /// List active plans for a specific project
+    async fn list_project_plans(&self, project_id: Uuid) -> Result<Vec<PlanNode>>;
+
+    /// Count plans for a project (lightweight, no data transfer)
+    async fn count_project_plans(&self, project_id: Uuid) -> Result<i64>;
+
+    /// List plans for a project with filters
+    async fn list_plans_for_project(
+        &self,
+        project_id: Uuid,
+        status_filter: Option<Vec<String>>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<PlanNode>, usize)>;
+
+    /// Update plan fields (title, description, priority)
+    async fn update_plan(&self, id: Uuid, updates: &UpdatePlanRequest) -> Result<()>;
+
+    /// Update plan status
+    async fn update_plan_status(&self, id: Uuid, status: PlanStatus) -> Result<()>;
+
+    /// Link a plan to a project (creates HAS_PLAN relationship)
+    async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> Result<()>;
+
+    /// Slugs of every project the plan belongs to (HAS_PLAN edges + plan.project_id).
+    /// Used to scope task-context retrieval to the plan's own projects.
+    async fn list_plan_project_slugs(&self, plan_id: Uuid) -> Result<Vec<String>>;
+
+    /// Unlink a plan from its project
+    async fn unlink_plan_from_project(&self, plan_id: Uuid) -> Result<()>;
+
+    /// Delete a plan and all its related data (tasks, steps, decisions, constraints)
+    async fn delete_plan(&self, plan_id: Uuid) -> Result<()>;
+
+    // ========================================================================
+    // Task operations
+    // ========================================================================
+
+    /// Create a task for a plan
+    async fn create_task(&self, plan_id: Uuid, task: &TaskNode) -> Result<()>;
+
+    /// Get tasks for a plan
+    async fn get_plan_tasks(&self, plan_id: Uuid) -> Result<Vec<TaskNode>>;
+
+    /// Get full task details including steps, decisions, dependencies, and modified files
+    async fn get_task_with_full_details(&self, task_id: Uuid) -> Result<Option<TaskDetails>>;
+
+    /// Analyze the impact of a task on the codebase (files it modifies + their dependents)
+    async fn analyze_task_impact(&self, task_id: Uuid) -> Result<Vec<String>>;
+
+    /// Find pending tasks in a plan that are blocked by uncompleted dependencies
+    async fn find_blocked_tasks(&self, plan_id: Uuid) -> Result<Vec<(TaskNode, Vec<TaskNode>)>>;
+
+    /// Update task status
+    async fn update_task_status(&self, task_id: Uuid, status: TaskStatus) -> Result<()>;
+
+    /// Marks a task `Interrupted` with a reason. Finished work (completed, failed) is left alone:
+    /// the answer says whether anything changed.
+    async fn interrupt_task(&self, task_id: Uuid, reason: &str) -> Result<bool>;
+
+    /// Assign task to an agent
+    async fn assign_task(&self, task_id: Uuid, agent_id: &str) -> Result<()>;
+
+    /// Add task dependency
+    async fn add_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()>;
+
+    /// Remove task dependency
+    async fn remove_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()>;
+
+    /// Get tasks that block this task (dependencies that are not completed)
+    async fn get_task_blockers(&self, task_id: Uuid) -> Result<Vec<TaskNode>>;
+
+    /// Get tasks blocked by this task (tasks depending on this one)
+    async fn get_tasks_blocked_by(&self, task_id: Uuid) -> Result<Vec<TaskNode>>;
+
+    /// Get all dependencies for a task (all tasks it depends on, regardless of status)
+    async fn get_task_dependencies(&self, task_id: Uuid) -> Result<Vec<TaskNode>>;
+
+    /// Get dependency graph for a plan (all tasks and their dependencies)
+    async fn get_plan_dependency_graph(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<(Vec<TaskNode>, Vec<(Uuid, Uuid)>)>;
+
+    /// Batch-fetch step counts, note counts, and decision counts for a list of task IDs.
+    async fn get_task_enrichment_counts(
+        &self,
+        task_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentCounts>>;
+
+    /// Batch-fetch full enrichment data (counts + individual step details) for dependency graph.
+    async fn get_task_enrichment_data(
+        &self,
+        task_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentData>>;
+
+    /// Find critical path in a plan (longest chain of dependencies)
+    async fn get_plan_critical_path(&self, plan_id: Uuid) -> Result<Vec<TaskNode>>;
+
+    /// Compute execution waves for a plan (topological sort + level grouping)
+    async fn compute_waves(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<crate::neo4j::plan::WaveComputationResult>;
+
+    /// Get next available task (no unfinished dependencies)
+    async fn get_next_available_task(&self, plan_id: Uuid) -> Result<Option<TaskNode>>;
+
+    /// Get a single task by ID
+    async fn get_task(&self, task_id: Uuid) -> Result<Option<TaskNode>>;
+
+    /// Update a task with new values
+    async fn update_task(&self, task_id: Uuid, updates: &UpdateTaskRequest) -> Result<()>;
+
+    /// Update pre-enrichment fields on a task (execution_context, persona, prompt_cache).
+    async fn update_task_enrichment(
+        &self,
+        task_id: Uuid,
+        execution_context: Option<&str>,
+        persona: Option<&str>,
+        prompt_cache: Option<&str>,
+    ) -> Result<()>;
+
+    /// Delete a task and all its related data (steps, decisions)
+    async fn delete_task(&self, task_id: Uuid) -> Result<()>;
+
+    /// Get the project that owns a task (via Task→Plan→Project chain).
+    ///
+    /// Traverses: `(Task)-[:PART_OF]->(Plan)-[:BELONGS_TO]->(Project)`
+    /// Returns `None` if the task doesn't exist or has no linked project.
+    async fn get_project_for_task(&self, task_id: Uuid) -> Result<Option<ProjectNode>>;
+
+    /// Get the plan UUID that owns a given task.
+    ///
+    /// Traverses: `(Plan)-[:HAS_TASK]->(Task {id: task_id})`
+    /// Returns `None` if the task doesn't exist or has no parent plan.
+    async fn get_plan_id_for_task(&self, task_id: Uuid) -> Result<Option<Uuid>>;
+
+    // ========================================================================
+    // Day plan operations
+    // ========================================================================
+
+    /// Read one user's ordered day plan as `(task_id, order)` pairs.
+    async fn get_day_plan(&self, user_id: Uuid, date: &str) -> Result<Vec<(Uuid, u32)>>;
+
+    /// Replace the whole day plan (idempotent). Position in `ids` = order.
+    async fn set_day_plan(&self, user_id: Uuid, date: &str, ids: &[Uuid]) -> Result<()>;
+
+    /// Append one task to the end of the day plan (no-op when already present).
+    async fn add_to_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()>;
+
+    /// Remove one task from the day plan (no-op when absent).
+    async fn remove_from_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()>;
+
+    // ========================================================================
+    // Step operations
+    // ========================================================================
+
+    /// Create a step for a task
+    async fn create_step(&self, task_id: Uuid, step: &StepNode) -> Result<()>;
+
+    /// Get steps for a task
+    async fn get_task_steps(&self, task_id: Uuid) -> Result<Vec<StepNode>>;
+
+    /// Update step fields (description, verification)
+    async fn update_step(&self, step_id: Uuid, updates: &UpdateStepRequest) -> Result<()>;
+
+    /// Update step status
+    async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> Result<()>;
+
+    /// Get count of completed steps for a task
+    async fn get_task_step_progress(&self, task_id: Uuid) -> Result<(u32, u32)>;
+
+    /// Get a single step by ID
+    async fn get_step(&self, step_id: Uuid) -> Result<Option<StepNode>>;
+
+    /// Delete a step
+    async fn delete_step(&self, step_id: Uuid) -> Result<()>;
+
+    /// Complete all pending/in_progress steps for a task (cascade on task completion)
+    async fn complete_pending_steps_for_task(&self, task_id: Uuid) -> Result<u32>;
+
+    // ========================================================================
+    // Constraint operations
+    // ========================================================================
+
+    /// Create a constraint for a plan
+    async fn create_constraint(&self, plan_id: Uuid, constraint: &ConstraintNode) -> Result<()>;
+
+    /// Get constraints for a plan
+    async fn get_plan_constraints(&self, plan_id: Uuid) -> Result<Vec<ConstraintNode>>;
+
+    /// Get a single constraint by ID
+    async fn get_constraint(&self, constraint_id: Uuid) -> Result<Option<ConstraintNode>>;
+
+    /// Update a constraint
+    async fn update_constraint(
+        &self,
+        constraint_id: Uuid,
+        description: Option<String>,
+        constraint_type: Option<ConstraintType>,
+        enforced_by: Option<String>,
+    ) -> Result<()>;
+
+    /// Delete a constraint
+    async fn delete_constraint(&self, constraint_id: Uuid) -> Result<()>;
+}
+
+// ============================================================================
+// Decision domain
+// ============================================================================
+
+/// The decision domain: architectural decisions and their links to the graph.
+#[async_trait]
+pub trait DecisionStore: Send + Sync {
+    // ========================================================================
+    // Decision operations
+    // ========================================================================
+
+    /// Record a decision
+    async fn create_decision(&self, task_id: Uuid, decision: &DecisionNode) -> Result<()>;
+
+    /// Get a single decision by ID
+    async fn get_decision(&self, decision_id: Uuid) -> Result<Option<DecisionNode>>;
+
+    /// Get the project ID for a decision (traverses Decision←Task←Plan←Project).
+    async fn get_decision_project_id(&self, decision_id: Uuid) -> Result<Option<String>>;
+
+    /// Project of each decision in one batched lookup (same traversal as
+    /// `get_decision_project_id`). Decisions whose project is not verifiable
+    /// (plan without project, unknown id) are absent from the map.
+    async fn get_decision_project_ids(
+        &self,
+        decision_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Uuid>>;
+
+    /// Update a decision
+    async fn update_decision(
+        &self,
+        decision_id: Uuid,
+        description: Option<String>,
+        rationale: Option<String>,
+        chosen_option: Option<String>,
+        status: Option<DecisionStatus>,
+    ) -> Result<()>;
+
+    /// Delete a decision
+    async fn delete_decision(&self, decision_id: Uuid) -> Result<()>;
+
+    /// Get decisions related to an entity (via AFFECTS or task linkage)
+    async fn get_decisions_for_entity(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        limit: u32,
+    ) -> Result<Vec<DecisionNode>>;
+
+    /// Store a vector embedding on a Decision node
+    async fn set_decision_embedding(
+        &self,
+        decision_id: Uuid,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()>;
+
+    /// Retrieve the stored vector embedding for a Decision node
+    async fn get_decision_embedding(&self, decision_id: Uuid) -> Result<Option<Vec<f32>>>;
+
+    /// Get all decisions with their linked task_id (for MeiliSearch reindex)
+    async fn get_all_decisions_with_task_id(&self) -> Result<Vec<(DecisionNode, Uuid)>>;
+
+    /// Get all Decision IDs that have no embedding yet (for backfill)
+    async fn get_decisions_without_embedding(&self) -> Result<Vec<(Uuid, String, String)>>;
+
+    /// Semantic search over Decision embeddings using Neo4j vector index.
+    /// When `project_id` is provided, filters results to that project (post-query).
+    async fn search_decisions_by_vector(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        project_id: Option<&str>,
+    ) -> Result<Vec<(DecisionNode, f64)>>;
+
+    /// Get decisions that AFFECT a given entity (reverse AFFECTS lookup)
+    async fn get_decisions_affecting(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<DecisionNode>>;
+
+    /// Create an AFFECTS relation from a Decision to any entity in the graph
+    async fn add_decision_affects(
+        &self,
+        decision_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+        impact_description: Option<&str>,
+    ) -> Result<()>;
+
+    /// Remove an AFFECTS relation from a Decision to an entity
+    async fn remove_decision_affects(
+        &self,
+        decision_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<()>;
+
+    /// List all entities affected by a Decision
+    async fn list_decision_affects(&self, decision_id: Uuid) -> Result<Vec<AffectsRelation>>;
+
+    /// Mark a decision as superseded by a newer decision
+    async fn supersede_decision(&self, new_decision_id: Uuid, old_decision_id: Uuid) -> Result<()>;
+
+    /// Get a timeline of decisions, optionally filtered by task and date range
+    async fn get_decision_timeline(
+        &self,
+        task_id: Option<Uuid>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<Vec<DecisionTimelineEntry>>;
+
+    /// List decisions having a given status, across all projects by default,
+    /// newest first. `project_id` wins over `workspace_slug`. Returns (page, total).
+    async fn list_decisions_by_status(
+        &self,
+        status: DecisionStatus,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DecisionListItem>, usize)>;
+}
+
+// ============================================================================
+// Commit domain
+// ============================================================================
+
+/// The commit domain: commits, what they touched and what changed together.
+#[async_trait]
+pub trait CommitStore: Send + Sync {
+    // ========================================================================
+    // Dependency analysis
+    // ========================================================================
+
+    /// Find all files that depend on a given file (IMPORTS-only traversal).
+    /// When project_id is provided, only return dependents from the same project.
+    async fn find_dependent_files(
+        &self,
+        file_path: &str,
+        depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>>;
+
+    /// Find all files impacted by a change to a given file.
+    /// Combines IMPORTS traversal (file→file) and CALLS traversal
+    /// (functions in target ← called by functions in other files).
+    /// When project_id is provided, only return files from the same project.
+    async fn find_impacted_files(
+        &self,
+        file_path: &str,
+        depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>>;
+
+    /// Find all functions that call a given function
+    /// When project_id is provided, only return callers from the same project.
+    async fn find_callers(
+        &self,
+        function_id: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<FunctionNode>>;
+
+    // ========================================================================
+    // Task-file linking
+    // ========================================================================
+
+    /// Link a task to files it modifies
+    async fn link_task_to_files(&self, task_id: Uuid, file_paths: &[String]) -> Result<()>;
+
+    // ========================================================================
+    // Commit operations
+    // ========================================================================
+
+    /// Create a commit node
+    async fn create_commit(&self, commit: &CommitNode) -> Result<()>;
+
+    /// Get a commit by hash
+    async fn get_commit(&self, hash: &str) -> Result<Option<CommitNode>>;
+
+    /// Link a commit to a task (RESOLVED_BY relationship)
+    async fn link_commit_to_task(&self, commit_hash: &str, task_id: Uuid) -> Result<()>;
+
+    /// Link a commit to a plan (RESULTED_IN relationship)
+    async fn link_commit_to_plan(&self, commit_hash: &str, plan_id: Uuid) -> Result<()>;
+
+    /// Get commits for a task
+    async fn get_task_commits(&self, task_id: Uuid) -> Result<Vec<CommitNode>>;
+
+    /// Get commits for a plan
+    async fn get_plan_commits(&self, plan_id: Uuid) -> Result<Vec<CommitNode>>;
+
+    /// Delete a commit
+    async fn delete_commit(&self, hash: &str) -> Result<()>;
+
+    // ========================================================================
+    // TOUCHES operations (Commit → File)
+    // ========================================================================
+
+    /// Create TOUCHES relations between a Commit and its changed Files (batch UNWIND).
+    /// Files that don't exist as nodes are silently skipped.
+    async fn create_commit_touches(
+        &self,
+        commit_hash: &str,
+        files: &[FileChangedInfo],
+    ) -> Result<()>;
+
+    /// Get all files touched by a commit
+    async fn get_commit_files(&self, commit_hash: &str) -> Result<Vec<CommitFileInfo>>;
+
+    /// Get the commit history for a specific file
+    async fn get_file_history(
+        &self,
+        file_path: &str,
+        limit: Option<i64>,
+    ) -> Result<Vec<FileHistoryEntry>>;
+
+    /// Ping freshness on all Notes LINKED_TO the given file paths.
+    /// Returns the number of distinct notes pinged.
+    async fn ping_freshness_for_files(&self, file_paths: &[String]) -> Result<usize>;
+
+    // ========================================================================
+    // CO_CHANGED operations (File ↔ File)
+    // ========================================================================
+
+    /// Compute CO_CHANGED relations from TOUCHES history (incremental).
+    /// Returns the number of relations created/updated.
+    async fn compute_co_changed(
+        &self,
+        project_id: Uuid,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        min_count: i64,
+        max_relations: i64,
+    ) -> Result<i64>;
+
+    /// Update project last_co_change_computed_at timestamp
+    async fn update_project_co_change_timestamp(&self, id: Uuid) -> Result<()>;
+
+    /// Get the co-change graph for a project
+    async fn get_co_change_graph(
+        &self,
+        project_id: Uuid,
+        min_count: i64,
+        limit: i64,
+    ) -> Result<Vec<CoChangePair>>;
+
+    /// Get files that co-change with a given file
+    async fn get_file_co_changers(
+        &self,
+        file_path: &str,
+        min_count: i64,
+        limit: i64,
+    ) -> Result<Vec<CoChanger>>;
+
+    /// Compute CO_CHANGED_TRANSITIVE relations via BFS on the CO_CHANGED graph.
+    ///
+    /// # References
+    /// - Rolfsnes et al. (2018) — "Detecting Evolutionary Coupling Using Transitive Association Rules"
+    async fn compute_co_changed_transitive(
+        &self,
+        project_id: Uuid,
+        max_depth: i64,
+        min_score: f64,
+    ) -> Result<i64>;
+
+    /// Get files that are transitively co-changed with a given file.
+    ///
+    /// # References
+    /// - Rolfsnes et al. (2018) — "Detecting Evolutionary Coupling Using Transitive Association Rules"
+    async fn get_file_transitive_co_changers(
+        &self,
+        file_path: &str,
+        min_score: f64,
+        limit: i64,
+    ) -> Result<Vec<TransitiveCoChanger>>;
+}
+
+// ============================================================================
+// Release domain
+// ============================================================================
+
+/// The release domain: releases, environments and their deployments.
+#[async_trait]
+pub trait ReleaseStore: Send + Sync {
+    // ========================================================================
+    // Release operations
+    // ========================================================================
+
+    /// Create a release
+    async fn create_release(&self, release: &ReleaseNode) -> Result<()>;
+
+    /// Get a release by ID
+    async fn get_release(&self, id: Uuid) -> Result<Option<ReleaseNode>>;
+
+    /// List releases for a project
+    async fn list_project_releases(&self, project_id: Uuid) -> Result<Vec<ReleaseNode>>;
+
+    /// Update a release
+    async fn update_release(
+        &self,
+        id: Uuid,
+        status: Option<ReleaseStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+        released_at: Option<chrono::DateTime<chrono::Utc>>,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<()>;
+
+    /// Add a task to a release
+    async fn add_task_to_release(&self, release_id: Uuid, task_id: Uuid) -> Result<()>;
+
+    /// Add a commit to a release
+    async fn add_commit_to_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()>;
+
+    /// Remove a commit from a release
+    async fn remove_commit_from_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()>;
+
+    /// Get release details with tasks and commits
+    async fn get_release_details(
+        &self,
+        release_id: Uuid,
+    ) -> Result<Option<(ReleaseNode, Vec<TaskNode>, Vec<CommitNode>)>>;
+
+    /// Delete a release
+    async fn delete_release(&self, release_id: Uuid) -> Result<()>;
+
+    // ========================================================================
+    // Environment & deployment operations
+    // ========================================================================
+
+    /// Create an environment. Errors when the project does not exist or when the
+    /// name is already used by another environment of the project.
+    async fn create_environment(&self, env: &EnvironmentNode) -> Result<()>;
+
+    /// Get an environment by ID
+    async fn get_environment(&self, id: Uuid) -> Result<Option<EnvironmentNode>>;
+
+    /// List the environments of a project (oldest first)
+    async fn list_project_environments(&self, project_id: Uuid) -> Result<Vec<EnvironmentNode>>;
+
+    /// Update an environment (empty string clears url/description/config)
+    async fn update_environment(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        kind: Option<EnvironmentKind>,
+        url: Option<String>,
+        description: Option<String>,
+        config: Option<String>,
+    ) -> Result<()>;
+
+    /// Delete an environment and its deployments
+    async fn delete_environment(&self, id: Uuid) -> Result<()>;
+
+    /// Record a deployment (linked to the Commit node with the same sha, if any)
+    async fn create_deployment(&self, deployment: &DeploymentNode) -> Result<()>;
+
+    /// Get a deployment by ID
+    async fn get_deployment(&self, id: Uuid) -> Result<Option<DeploymentNode>>;
+
+    /// List deployments of an environment, newest first, with the total count
+    async fn list_environment_deployments(
+        &self,
+        environment_id: Uuid,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DeploymentNode>, usize)>;
+
+    /// Update a deployment (status, finished_at, notes)
+    async fn update_deployment(
+        &self,
+        id: Uuid,
+        status: Option<DeploymentStatus>,
+        finished_at: Option<chrono::DateTime<chrono::Utc>>,
+        notes: Option<String>,
+    ) -> Result<()>;
+
+    /// Deployment matrix of a project: every environment with its latest
+    /// deployment and the statuses of its last 5 deployments (newest first)
+    async fn get_deployment_matrix(&self, project_id: Uuid) -> Result<Vec<DeploymentMatrixEntry>>;
+
+    // ========================================================================
+    // Milestone operations
+    // ========================================================================
+
+    /// Create a milestone
+    async fn create_milestone(&self, milestone: &MilestoneNode) -> Result<()>;
+
+    /// Get a milestone by ID
+    async fn get_milestone(&self, id: Uuid) -> Result<Option<MilestoneNode>>;
+
+    /// List milestones for a project
+    async fn list_project_milestones(&self, project_id: Uuid) -> Result<Vec<MilestoneNode>>;
+
+    /// Update a milestone
+    async fn update_milestone(
+        &self,
+        id: Uuid,
+        status: Option<MilestoneStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+        closed_at: Option<chrono::DateTime<chrono::Utc>>,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<()>;
+
+    /// Add a task to a milestone
+    async fn add_task_to_milestone(&self, milestone_id: Uuid, task_id: Uuid) -> Result<()>;
+
+    /// Link a plan to a project milestone
+    async fn link_plan_to_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()>;
+
+    /// Unlink a plan from a project milestone
+    async fn unlink_plan_from_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()>;
+
+    /// Get milestone details with tasks
+    async fn get_milestone_details(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<Option<(MilestoneNode, Vec<TaskNode>)>>;
+
+    /// Get milestone progress (total, completed, in_progress, pending)
+    async fn get_milestone_progress(&self, milestone_id: Uuid) -> Result<(u32, u32, u32, u32)>;
+
+    /// Get tasks linked to a project milestone (with plan info)
+    async fn get_milestone_tasks_with_plans(&self, milestone_id: Uuid)
+        -> Result<Vec<TaskWithPlan>>;
+
+    /// Get all steps for all tasks linked to a project milestone (batch)
+    async fn get_milestone_steps_batch(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>>;
+
+    /// Delete a milestone
+    async fn delete_milestone(&self, milestone_id: Uuid) -> Result<()>;
+
+    /// Get tasks for a milestone
+    async fn get_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskNode>>;
+
+    /// Get tasks for a release
+    async fn get_release_tasks(&self, release_id: Uuid) -> Result<Vec<TaskNode>>;
+
+    // ========================================================================
+    // Project stats
+    // ========================================================================
+
+    /// Get project progress stats
+    async fn get_project_progress(&self, project_id: Uuid) -> Result<(u32, u32, u32, u32)>;
+
+    /// Get all task dependencies for a project (across all plans)
+    async fn get_project_task_dependencies(&self, project_id: Uuid) -> Result<Vec<(Uuid, Uuid)>>;
+
+    /// Get all tasks for a project (across all plans)
+    async fn get_project_tasks(&self, project_id: Uuid) -> Result<Vec<TaskNode>>;
+
+    // ========================================================================
+    // Filtered list operations with pagination
+    // ========================================================================
+
+    /// List plans with filters and pagination
+    ///
+    /// Returns (plans, total_count)
+    #[allow(clippy::too_many_arguments)]
+    async fn list_plans_filtered(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        statuses: Option<Vec<String>>,
+        priority_min: Option<i32>,
+        priority_max: Option<i32>,
+        search: Option<&str>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> Result<(Vec<PlanNode>, usize)>;
+
+    /// List all tasks across all plans with filters and pagination
+    ///
+    /// Returns (tasks_with_plan_info, total_count)
+    #[allow(clippy::too_many_arguments)]
+    async fn list_all_tasks_filtered(
+        &self,
+        plan_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        statuses: Option<Vec<String>>,
+        priority_min: Option<i32>,
+        priority_max: Option<i32>,
+        tags: Option<Vec<String>>,
+        assigned_to: Option<&str>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> Result<(Vec<TaskWithPlan>, usize)>;
+
+    /// List project releases with filters and pagination
+    async fn list_releases_filtered(
+        &self,
+        project_id: Uuid,
+        statuses: Option<Vec<String>>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> Result<(Vec<ReleaseNode>, usize)>;
+
+    /// List project milestones with filters and pagination
+    async fn list_milestones_filtered(
+        &self,
+        project_id: Uuid,
+        statuses: Option<Vec<String>>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> Result<(Vec<MilestoneNode>, usize)>;
+
+    /// List projects with search and pagination
+    async fn list_projects_filtered(
+        &self,
+        search: Option<&str>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> Result<(Vec<ProjectNode>, usize)>;
+}
+
+// ============================================================================
+// Note domain
+// ============================================================================
+
+/// The note domain: documents, knowledge notes and what links them.
+#[async_trait]
+pub trait NoteStore: Send + Sync {
     // ========================================================================
     // Document operations
     // ========================================================================
@@ -386,7 +2019,16 @@ pub trait GraphStore:
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<Note>, usize)>;
+}
 
+// ============================================================================
+// Analytics and neural domain
+// ============================================================================
+
+/// The analytics domain: embeddings, synapses, energy and the visualisation
+/// batches built on top of them.
+#[async_trait]
+pub trait AnalyticsStore: Send + Sync {
     // ========================================================================
     // Code embedding operations (File & Function vector search)
     // ========================================================================
@@ -3077,1627 +4719,4 @@ pub trait GraphStore:
         params: &crate::graph::neighborhood::NeighborhoodParams,
         filter: &crate::graph::neighborhood::ProjectFilter,
     ) -> Result<Option<crate::graph::neighborhood::ScopedNeighborhood>>;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::StoreCapabilities;
-
-    /// The ten capabilities the manifest exposes, in declaration order. A field
-    /// added to `StoreCapabilities` without updating this list (or a field
-    /// renamed) is caught by `capabilities_manifest_serializes_all_keys`.
-    const EXPECTED_KEYS: [&str; 10] = [
-        "vector_search",
-        "vector_filter",
-        "unique_constraints",
-        "composite_unique",
-        "variable_length_paths",
-        "shortest_path",
-        "subqueries",
-        "datetime_arithmetic",
-        "relationship_property_index",
-        "explicit_transactions",
-    ];
-
-    #[test]
-    fn capabilities_manifest_serializes_all_keys() {
-        let json = serde_json::to_value(StoreCapabilities::default()).expect("serialize");
-        let obj = json.as_object().expect("object");
-        assert_eq!(
-            obj.len(),
-            EXPECTED_KEYS.len(),
-            "manifest key set changed (added or removed a capability): {:?}",
-            obj.keys().collect::<Vec<_>>()
-        );
-        for key in EXPECTED_KEYS {
-            assert!(obj.contains_key(key), "missing manifest key `{key}`");
-        }
-    }
-
-    #[test]
-    fn neo4j_adapter_declares_core_capabilities() {
-        let caps = crate::neo4j::client::Neo4jClient::storage_capabilities();
-        assert!(caps.unique_constraints, "unique_constraints must be true");
-        assert!(caps.vector_search, "vector_search must be true");
-        assert!(
-            caps.variable_length_paths,
-            "variable_length_paths must be true"
-        );
-    }
-
-    #[test]
-    fn default_is_conservative_and_exhaustive() {
-        let default = StoreCapabilities::default();
-        // Exhaustive literal: a field added to `StoreCapabilities` without being
-        // listed here (and in the `Default` impl) fails to compile, so a
-        // capability can never slip in with a silent implicit value.
-        let exhaustive = StoreCapabilities {
-            vector_search: false,
-            vector_filter: false,
-            unique_constraints: false,
-            composite_unique: false,
-            variable_length_paths: false,
-            shortest_path: false,
-            subqueries: false,
-            datetime_arithmetic: false,
-            relationship_property_index: false,
-            explicit_transactions: false,
-        };
-        assert_eq!(
-            default, exhaustive,
-            "Default must list every capability explicitly"
-        );
-        // The conservative default advertises nothing at all.
-        for key in EXPECTED_KEYS {
-            let v = serde_json::to_value(default).expect("serialize")[key]
-                .as_bool()
-                .expect("bool");
-            assert!(!v, "default capability `{key}` must be false");
-        }
-    }
-}
-
-// ============================================================================
-// Project management domain
-// ============================================================================
-
-/// The project-management domain: the project entity and its lifecycle.
-///
-/// `GraphStore` is its supertrait, so a consumer keeps calling these methods
-/// on a `dyn GraphStore` without knowing the domain exists.
-#[async_trait]
-pub trait ProjectStore: Send + Sync {
-    // ========================================================================
-    // Project operations
-    // ========================================================================
-
-    /// Create a new project
-    async fn create_project(&self, project: &ProjectNode) -> Result<()>;
-
-    /// Get a project by ID
-    async fn get_project(&self, id: Uuid) -> Result<Option<ProjectNode>>;
-
-    /// Get a project by slug
-    async fn get_project_by_slug(&self, slug: &str) -> Result<Option<ProjectNode>>;
-
-    /// List all projects
-    async fn list_projects(&self) -> Result<Vec<ProjectNode>>;
-
-    /// Update project fields (name, description, root_path)
-    async fn update_project(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<Option<String>>,
-        root_path: Option<String>,
-        profile: Option<ProjectProfile>,
-    ) -> Result<()>;
-
-    /// Update project last_synced timestamp
-    async fn update_project_synced(&self, id: Uuid) -> Result<()>;
-
-    /// Update project analytics_computed_at timestamp
-    async fn update_project_analytics_timestamp(&self, id: Uuid) -> Result<()>;
-
-    /// Delete a project and all its data.
-    /// `project_name` is used to tag archived notes/decisions with the source project.
-    async fn delete_project(&self, id: Uuid, project_name: &str) -> Result<()>;
-}
-
-// ============================================================================
-// Workspace domain
-// ============================================================================
-
-/// The workspace domain: workspaces, their milestones, resources and components.
-///
-/// `GraphStore` is its supertrait: a consumer keeps calling these methods on a
-/// `dyn GraphStore` without knowing the domain exists.
-#[async_trait]
-pub trait WorkspaceStore: Send + Sync {
-    // ========================================================================
-    // Workspace operations
-    // ========================================================================
-
-    /// Create a new workspace
-    async fn create_workspace(&self, workspace: &WorkspaceNode) -> Result<()>;
-
-    /// Get a workspace by ID
-    async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceNode>>;
-
-    /// Get a workspace by slug
-    async fn get_workspace_by_slug(&self, slug: &str) -> Result<Option<WorkspaceNode>>;
-
-    /// List all workspaces
-    async fn list_workspaces(&self) -> Result<Vec<WorkspaceNode>>;
-
-    /// Update a workspace
-    async fn update_workspace(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<String>,
-        metadata: Option<serde_json::Value>,
-        slug: Option<String>,
-    ) -> Result<()>;
-
-    /// Delete a workspace and all its data
-    async fn delete_workspace(&self, id: Uuid) -> Result<()>;
-
-    /// Add a project to a workspace
-    async fn add_project_to_workspace(&self, workspace_id: Uuid, project_id: Uuid) -> Result<()>;
-
-    /// Remove a project from a workspace
-    async fn remove_project_from_workspace(
-        &self,
-        workspace_id: Uuid,
-        project_id: Uuid,
-    ) -> Result<()>;
-
-    /// List all projects in a workspace
-    async fn list_workspace_projects(&self, workspace_id: Uuid) -> Result<Vec<ProjectNode>>;
-
-    /// Get the workspace a project belongs to
-    async fn get_project_workspace(&self, project_id: Uuid) -> Result<Option<WorkspaceNode>>;
-
-    /// Compute the P2P coupling matrix for all projects in a workspace.
-    async fn compute_coupling_matrix(
-        &self,
-        workspace_id: Uuid,
-    ) -> Result<crate::neo4j::models::CouplingMatrix>;
-    // ========================================================================
-    // Workspace Milestone operations
-    // ========================================================================
-
-    /// Create a workspace milestone
-    async fn create_workspace_milestone(&self, milestone: &WorkspaceMilestoneNode) -> Result<()>;
-
-    /// Get a workspace milestone by ID
-    async fn get_workspace_milestone(&self, id: Uuid) -> Result<Option<WorkspaceMilestoneNode>>;
-
-    /// List workspace milestones (unpaginated, used internally)
-    async fn list_workspace_milestones(
-        &self,
-        workspace_id: Uuid,
-    ) -> Result<Vec<WorkspaceMilestoneNode>>;
-
-    /// List workspace milestones with pagination and status filter
-    ///
-    /// Returns (milestones, total_count)
-    async fn list_workspace_milestones_filtered(
-        &self,
-        workspace_id: Uuid,
-        status: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<WorkspaceMilestoneNode>, usize)>;
-
-    /// List all workspace milestones across all workspaces with filters and pagination
-    ///
-    /// Returns (milestones_with_workspace_info, total_count)
-    async fn list_all_workspace_milestones_filtered(
-        &self,
-        workspace_id: Option<Uuid>,
-        status: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<(WorkspaceMilestoneNode, String, String, String)>>;
-
-    /// Count all workspace milestones across workspaces with optional filters
-    async fn count_all_workspace_milestones(
-        &self,
-        workspace_id: Option<Uuid>,
-        status: Option<&str>,
-    ) -> Result<usize>;
-
-    /// Update a workspace milestone
-    ///
-    /// Returns `false` when no milestone has this id (nothing was written).
-    async fn update_workspace_milestone(
-        &self,
-        id: Uuid,
-        title: Option<String>,
-        description: Option<String>,
-        status: Option<MilestoneStatus>,
-        target_date: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<bool>;
-
-    /// Delete a workspace milestone
-    async fn delete_workspace_milestone(&self, id: Uuid) -> Result<()>;
-
-    /// Add a task to a workspace milestone
-    async fn add_task_to_workspace_milestone(
-        &self,
-        milestone_id: Uuid,
-        task_id: Uuid,
-    ) -> Result<()>;
-
-    /// Remove a task from a workspace milestone
-    async fn remove_task_from_workspace_milestone(
-        &self,
-        milestone_id: Uuid,
-        task_id: Uuid,
-    ) -> Result<()>;
-
-    /// Link a plan to a workspace milestone
-    async fn link_plan_to_workspace_milestone(
-        &self,
-        plan_id: Uuid,
-        milestone_id: Uuid,
-    ) -> Result<()>;
-
-    /// Unlink a plan from a workspace milestone
-    async fn unlink_plan_from_workspace_milestone(
-        &self,
-        plan_id: Uuid,
-        milestone_id: Uuid,
-    ) -> Result<()>;
-
-    /// Get workspace milestone progress
-    async fn get_workspace_milestone_progress(
-        &self,
-        milestone_id: Uuid,
-    ) -> Result<(u32, u32, u32, u32)>;
-
-    /// Get tasks linked to a workspace milestone (with plan info)
-    async fn get_workspace_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskWithPlan>>;
-
-    /// Get all steps for all tasks linked to a workspace milestone (batch)
-    async fn get_workspace_milestone_steps(
-        &self,
-        milestone_id: Uuid,
-    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>>;
-
-    // ========================================================================
-    // Resource operations
-    // ========================================================================
-
-    /// Create a resource
-    async fn create_resource(&self, resource: &ResourceNode) -> Result<()>;
-
-    /// Get a resource by ID
-    async fn get_resource(&self, id: Uuid) -> Result<Option<ResourceNode>>;
-
-    /// List workspace resources
-    async fn list_workspace_resources(&self, workspace_id: Uuid) -> Result<Vec<ResourceNode>>;
-
-    /// Update a resource
-    ///
-    /// Returns `false` when no resource has this id (nothing was written).
-    async fn update_resource(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        file_path: Option<String>,
-        url: Option<String>,
-        version: Option<String>,
-        description: Option<String>,
-    ) -> Result<bool>;
-
-    /// Delete a resource
-    async fn delete_resource(&self, id: Uuid) -> Result<()>;
-
-    /// Link a project as implementing a resource
-    async fn link_project_implements_resource(
-        &self,
-        project_id: Uuid,
-        resource_id: Uuid,
-    ) -> Result<()>;
-
-    /// Link a project as using a resource
-    async fn link_project_uses_resource(&self, project_id: Uuid, resource_id: Uuid) -> Result<()>;
-
-    /// Get projects that implement a resource
-    async fn get_resource_implementers(&self, resource_id: Uuid) -> Result<Vec<ProjectNode>>;
-
-    /// Get projects that use a resource
-    async fn get_resource_consumers(&self, resource_id: Uuid) -> Result<Vec<ProjectNode>>;
-
-    // ========================================================================
-    // Component operations (Topology)
-    // ========================================================================
-
-    /// Create a component
-    async fn create_component(&self, component: &ComponentNode) -> Result<()>;
-
-    /// Get a component by ID
-    async fn get_component(&self, id: Uuid) -> Result<Option<ComponentNode>>;
-
-    /// List components in a workspace
-    async fn list_components(&self, workspace_id: Uuid) -> Result<Vec<ComponentNode>>;
-
-    /// Update a component
-    ///
-    /// Returns `false` when no component has this id (nothing was written).
-    async fn update_component(&self, id: Uuid, patch: ComponentUpdate) -> Result<bool>;
-
-    /// Create the component if absent, refresh it if present, and return its id.
-    /// Identity is (workspace, name). Used by architecture derivation, which runs
-    /// on every sync and must not stack duplicates the way `create_component` would.
-    async fn upsert_derived_component(&self, write: DerivedComponentWrite) -> Result<Uuid>;
-
-    /// Delete a component
-    async fn delete_component(&self, id: Uuid) -> Result<()>;
-
-    /// Add a dependency between components
-    async fn add_component_dependency(
-        &self,
-        component_id: Uuid,
-        depends_on_id: Uuid,
-        protocol: Option<String>,
-        required: bool,
-    ) -> Result<()>;
-
-    /// Remove a dependency between components
-    async fn remove_component_dependency(
-        &self,
-        component_id: Uuid,
-        depends_on_id: Uuid,
-    ) -> Result<()>;
-
-    /// Map a component to a project
-    async fn map_component_to_project(&self, component_id: Uuid, project_id: Uuid) -> Result<()>;
-
-    /// Get the workspace topology (all components with their dependencies)
-    async fn get_workspace_topology(
-        &self,
-        workspace_id: Uuid,
-    ) -> Result<Vec<(ComponentNode, Option<String>, Vec<ComponentDependency>)>>;
-}
-
-// ============================================================================
-// Code domain
-// ============================================================================
-
-/// The code domain: files, symbols, their batch ingestion, heritage, processes
-/// and the exploration queries built on top of them.
-///
-/// `GraphStore` is its supertrait: a consumer keeps calling these methods on a
-/// `dyn GraphStore` without knowing the domain exists.
-#[async_trait]
-pub trait CodeStore: Send + Sync {
-    // ========================================================================
-    // File operations
-    // ========================================================================
-
-    /// Get all file paths for a project
-    async fn get_project_file_paths(&self, project_id: Uuid) -> Result<Vec<String>>;
-
-    /// Delete a file and all its symbols
-    async fn delete_file(&self, path: &str) -> Result<()>;
-
-    /// Delete files that are no longer on the filesystem.
-    /// Returns `(files_deleted, symbols_deleted, deleted_paths)`.
-    async fn delete_stale_files(
-        &self,
-        project_id: Uuid,
-        valid_paths: &[String],
-    ) -> Result<(usize, usize, Vec<String>)>;
-
-    /// Link a file to a project (create CONTAINS relationship)
-    async fn link_file_to_project(&self, file_path: &str, project_id: Uuid) -> Result<()>;
-
-    /// Create or update a file node
-    async fn upsert_file(&self, file: &FileNode) -> Result<()>;
-
-    /// Batch create or update file nodes (UNWIND)
-    async fn batch_upsert_files(&self, files: &[FileNode]) -> Result<()>;
-
-    /// Get a file by path
-    async fn get_file(&self, path: &str) -> Result<Option<FileNode>>;
-
-    /// `(path, project_id)` of the files whose path ends with `suffix` (at most
-    /// `limit`). Used to resolve a relative file path to its owning project(s).
-    /// Defaults to no match for stores without file storage.
-    async fn find_files_by_path_suffix(
-        &self,
-        _suffix: &str,
-        _limit: usize,
-    ) -> Result<Vec<(String, Option<Uuid>)>> {
-        Ok(Vec::new())
-    }
-
-    /// List files for a project
-    async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>>;
-
-    /// Count files for a project (lightweight, no data transfer)
-    async fn count_project_files(&self, project_id: Uuid) -> Result<i64>;
-
-    /// Count orphan files for a project (lightweight — avoids the full health
-    /// report and its distribution fitting). Used by the real-time overview.
-    async fn count_orphan_files(&self, project_id: Uuid) -> Result<i64>;
-
-    /// Count CO_CHANGED pairs for a project (lightweight — no row transfer).
-    async fn count_co_change_pairs(&self, project_id: Uuid, min_count: i64) -> Result<i64>;
-
-    /// Count total protocol states and transitions across a project's protocols
-    /// in a single query (replaces the per-protocol N+1 in the overview).
-    async fn count_protocol_states_transitions(&self, project_id: Uuid) -> Result<(i64, i64)>;
-
-    /// Invalidate pre-computed GraIL properties on changed files and their neighbors.
-    ///
-    /// Sets `*_version = -1` on:
-    /// - Direct files: `cc_version`, `structural_dna_version`, `wl_hash_version`
-    /// - 1-2 hop neighbors: `cc_version` (1-hop), `wl_hash_version` (2-hop)
-    ///
-    /// Returns the total number of File nodes marked as stale.
-    async fn invalidate_computed_properties(
-        &self,
-        project_id: Uuid,
-        paths: &[String],
-    ) -> Result<u64>;
-
-    // ========================================================================
-    // Symbol operations
-    // ========================================================================
-
-    /// Create or update a function node
-    async fn upsert_function(&self, func: &FunctionNode) -> Result<()>;
-
-    /// Create or update a struct node
-    async fn upsert_struct(&self, s: &StructNode) -> Result<()>;
-
-    /// Create or update a trait node
-    async fn upsert_trait(&self, t: &TraitNode) -> Result<()>;
-
-    /// Find a trait by name (searches across all files)
-    async fn find_trait_by_name(&self, name: &str) -> Result<Option<String>>;
-
-    /// Create or update an enum node
-    async fn upsert_enum(&self, e: &EnumNode) -> Result<()>;
-
-    /// Create or update an impl block node
-    async fn upsert_impl(&self, impl_node: &ImplNode) -> Result<()>;
-
-    /// Create an import relationship between files
-    async fn create_import_relationship(
-        &self,
-        from_file: &str,
-        to_file: &str,
-        import_path: &str,
-    ) -> Result<()>;
-
-    /// Store an import node (for tracking even unresolved imports)
-    async fn upsert_import(&self, import: &ImportNode) -> Result<()>;
-
-    /// Create an IMPORTS_SYMBOL relationship from an Import to a matching Struct/Enum/Trait
-    async fn create_imports_symbol_relationship(
-        &self,
-        import_id: &str,
-        symbol_name: &str,
-        project_id: Option<Uuid>,
-    ) -> Result<()>;
-
-    /// Create a CALLS relationship between functions, scoped to the same project.
-    /// When project_id is provided, the callee is matched only within the same project
-    /// to prevent cross-project CALLS pollution.
-    /// Sets `confidence` (0.0-1.0) and `reason` properties on the CALLS relationship.
-    async fn create_call_relationship(
-        &self,
-        caller_id: &str,
-        callee_name: &str,
-        project_id: Option<Uuid>,
-        confidence: f64,
-        reason: &str,
-    ) -> Result<()>;
-
-    // ========================================================================
-    // Batch upsert operations (UNWIND)
-    // ========================================================================
-
-    /// Batch upsert functions using UNWIND for a single Neo4j transaction per call.
-    async fn batch_upsert_functions(&self, functions: &[FunctionNode]) -> Result<()>;
-
-    /// Batch upsert structs using UNWIND.
-    async fn batch_upsert_structs(&self, structs: &[StructNode]) -> Result<()>;
-
-    /// Batch upsert traits using UNWIND.
-    async fn batch_upsert_traits(&self, traits: &[TraitNode]) -> Result<()>;
-
-    /// Batch upsert enums using UNWIND.
-    async fn batch_upsert_enums(&self, enums: &[EnumNode]) -> Result<()>;
-
-    /// Batch upsert impl blocks using UNWIND — 3 phases matching upsert_impl behavior.
-    async fn batch_upsert_impls(&self, impls: &[ImplNode]) -> Result<()>;
-
-    /// Batch upsert imports using UNWIND.
-    async fn batch_upsert_imports(&self, imports: &[ImportNode]) -> Result<()>;
-
-    /// Batch create File→IMPORTS→File relationships using UNWIND.
-    async fn batch_create_import_relationships(
-        &self,
-        relationships: &[(String, String, String)],
-    ) -> Result<()>;
-
-    /// Batch create Import→IMPORTS_SYMBOL→(Struct|Enum|Trait) relationships using UNWIND.
-    async fn batch_create_imports_symbol_relationships(
-        &self,
-        relationships: &[(String, String, Option<Uuid>)],
-    ) -> Result<()>;
-
-    /// Batch create CALLS relationships using UNWIND — 2-phase strategy.
-    async fn batch_create_call_relationships(
-        &self,
-        calls: &[FunctionCall],
-        project_id: Option<Uuid>,
-    ) -> Result<()>;
-
-    /// Batch create EXTENDS relationships (class inheritance) using UNWIND.
-    /// Takes (child_name, child_file_path, parent_name, project_id) tuples.
-    /// Phase 1: same-file match. Phase 2: project-scoped fallback.
-    async fn batch_create_extends_relationships(
-        &self,
-        rels: &[(String, String, String, String)],
-    ) -> Result<()>;
-
-    /// Batch create IMPLEMENTS relationships (interface/protocol implementation) using UNWIND.
-    /// Takes (struct_name, struct_file_path, interface_name, project_id) tuples.
-    async fn batch_create_implements_relationships(
-        &self,
-        rels: &[(String, String, String, String)],
-    ) -> Result<()>;
-
-    /// Delete all CALLS relationships where caller and callee belong to different projects.
-    /// Returns the number of deleted relationships.
-    async fn cleanup_cross_project_calls(&self) -> Result<i64>;
-
-    /// Delete all CALLS relationships where the callee function name is a known built-in.
-    /// Returns the number of deleted relationships.
-    async fn cleanup_builtin_calls(&self) -> Result<i64>;
-
-    /// Migrate existing CALLS: set default confidence=0.50 and reason='fuzzy-global'
-    /// for relationships missing these properties.
-    async fn migrate_calls_confidence(&self) -> Result<i64>;
-
-    /// Clean up ALL sync-generated data (File, Function, Struct, Trait, Enum, Impl, Import, FeatureGraph).
-    /// Returns the total number of deleted entities/relationships.
-    async fn cleanup_sync_data(&self) -> Result<i64>;
-
-    /// Get all functions called by a function
-    async fn get_callees(&self, function_id: &str, depth: u32) -> Result<Vec<FunctionNode>>;
-
-    /// Create a USES_TYPE relationship from a function to a type
-    async fn create_uses_type_relationship(&self, function_id: &str, type_name: &str)
-        -> Result<()>;
-
-    /// Find types that implement a specific trait
-    async fn find_trait_implementors(&self, trait_name: &str) -> Result<Vec<String>>;
-
-    /// Get all traits implemented by a type
-    async fn get_type_traits(&self, type_name: &str) -> Result<Vec<String>>;
-
-    /// Get all impl blocks for a type
-    async fn get_impl_blocks(&self, type_name: &str) -> Result<Vec<serde_json::Value>>;
-
-    // ========================================================================
-    // Heritage navigation queries (EXTENDS + IMPLEMENTS)
-    // ========================================================================
-
-    /// Get the full class hierarchy (parents + children) for a type
-    async fn get_class_hierarchy(
-        &self,
-        type_name: &str,
-        max_depth: u32,
-    ) -> Result<serde_json::Value>;
-
-    /// Find all subclasses of a given class (via EXTENDS)
-    async fn find_subclasses(&self, class_name: &str) -> Result<Vec<serde_json::Value>>;
-
-    /// Find all classes that implement a given interface (via IMPLEMENTS)
-    async fn find_interface_implementors(
-        &self,
-        interface_name: &str,
-    ) -> Result<Vec<serde_json::Value>>;
-
-    // ========================================================================
-    // Process queries
-    // ========================================================================
-
-    /// List all detected processes for a project
-    async fn list_processes(&self, project_id: uuid::Uuid) -> Result<Vec<serde_json::Value>>;
-
-    /// Get details of a specific process including ordered steps
-    async fn get_process_detail(&self, process_id: &str) -> Result<Option<serde_json::Value>>;
-
-    /// Get scored entry points for a project
-    async fn get_entry_points(
-        &self,
-        project_id: uuid::Uuid,
-        limit: usize,
-    ) -> Result<Vec<serde_json::Value>>;
-
-    // ========================================================================
-    // Code exploration queries
-    // ========================================================================
-
-    /// Get the language of a file by path
-    async fn get_file_language(&self, path: &str) -> Result<Option<String>>;
-
-    /// Get function summaries for a file
-    async fn get_file_functions_summary(&self, path: &str) -> Result<Vec<FunctionSummaryNode>>;
-
-    /// Get struct summaries for a file
-    async fn get_file_structs_summary(&self, path: &str) -> Result<Vec<StructSummaryNode>>;
-
-    /// Get import paths for a file
-    async fn get_file_import_paths_list(&self, path: &str) -> Result<Vec<String>>;
-
-    /// Find references to a symbol (function callers, struct importers, file importers).
-    /// When project_id is provided, results are scoped to the same project.
-    async fn find_symbol_references(
-        &self,
-        symbol: &str,
-        limit: usize,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<SymbolReferenceNode>>;
-
-    /// Get files directly imported by a file
-    async fn get_file_direct_imports(&self, path: &str) -> Result<Vec<FileImportNode>>;
-
-    /// Get callers chain for a function name (by name, variable depth).
-    /// When project_id is provided, scopes start/end to the same project.
-    async fn get_function_callers_by_name(
-        &self,
-        function_name: &str,
-        depth: u32,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<String>>;
-
-    /// Get callees chain for a function name (by name, variable depth).
-    /// When project_id is provided, scopes start/end to the same project.
-    async fn get_function_callees_by_name(
-        &self,
-        function_name: &str,
-        depth: u32,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<String>>;
-
-    /// Get direct callers with confidence scores (depth 1 only).
-    /// Returns (name, file_path, confidence, reason) tuples.
-    async fn get_callers_with_confidence(
-        &self,
-        function_name: &str,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<(String, String, f64, String)>>;
-
-    /// Get direct callees with confidence scores (depth 1 only).
-    async fn get_callees_with_confidence(
-        &self,
-        function_name: &str,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<(String, String, f64, String)>>;
-
-    /// Get language statistics across all files
-    async fn get_language_stats(&self) -> Result<Vec<LanguageStatsNode>>;
-
-    /// Get language statistics for a specific project
-    async fn get_language_stats_for_project(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<LanguageStatsNode>>;
-
-    /// Get most connected files (highest in-degree from imports)
-    async fn get_most_connected_files(&self, limit: usize) -> Result<Vec<String>>;
-
-    /// Get most connected files with import/dependent counts
-    async fn get_most_connected_files_detailed(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<ConnectedFileNode>>;
-
-    /// Get most connected files with import/dependent counts for a specific project
-    async fn get_most_connected_files_for_project(
-        &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> Result<Vec<ConnectedFileNode>>;
-
-    /// Get distinct communities for a project (from graph analytics Louvain clustering)
-    async fn get_project_communities(&self, project_id: Uuid) -> Result<Vec<CommunityRow>>;
-
-    /// Get GDS analytics properties for a node (File by path, or Function by name).
-    /// Returns None if the node doesn't exist or has no analytics properties.
-    async fn get_node_analytics(
-        &self,
-        identifier: &str,
-        node_type: &str,
-    ) -> Result<Option<NodeAnalyticsRow>>;
-
-    /// Get distinct community labels for a list of file paths.
-    /// Returns only non-null community_label values.
-    async fn get_affected_communities(&self, file_paths: &[String]) -> Result<Vec<String>>;
-
-    /// Get a structural health report: god functions, orphan files, coupling metrics.
-    async fn get_code_health_report(
-        &self,
-        project_id: Uuid,
-        god_function_threshold: usize,
-    ) -> Result<crate::neo4j::models::CodeHealthReport>;
-
-    /// Capture a lightweight maintenance snapshot (biomimicry T11).
-    async fn compute_maintenance_snapshot(
-        &self,
-        project_id: Uuid,
-    ) -> Result<crate::neo4j::models::MaintenanceSnapshot>;
-
-    /// Compute scaffolding level for adaptive task complexity (biomimicry T8).
-    async fn compute_scaffolding_level(
-        &self,
-        project_id: Uuid,
-        scaffolding_override: Option<u8>,
-    ) -> Result<crate::neo4j::models::ScaffoldingLevel>;
-
-    /// Set or clear the scaffolding level override on a project (biomimicry T8).
-    async fn set_scaffolding_override(&self, project_id: Uuid, level: Option<u8>) -> Result<()>;
-
-    /// Set the watch_enabled flag on a project.
-    async fn set_watch_enabled(&self, project_id: Uuid, enabled: bool) -> Result<()>;
-
-    /// Set or clear the default note energy on a project (homeostasis).
-    /// When `Some(energy)`, new notes created in this project start at this energy.
-    /// When `None`, new notes start at the default energy (1.0).
-    async fn set_default_note_energy(&self, project_id: Uuid, energy: Option<f64>) -> Result<()>;
-
-    /// Detect global stagnation across a project (biomimicry T12).
-    async fn detect_global_stagnation(
-        &self,
-        project_id: Uuid,
-    ) -> Result<crate::neo4j::models::StagnationReport>;
-
-    /// Detect circular dependencies between files (import cycles).
-    async fn get_circular_dependencies(&self, project_id: Uuid) -> Result<Vec<Vec<String>>>;
-
-    /// Get GDS metrics for a specific node (file or function) in a project.
-    async fn get_node_gds_metrics(
-        &self,
-        node_path: &str,
-        node_type: &str,
-        project_id: Uuid,
-    ) -> Result<Option<NodeGdsMetrics>>;
-
-    /// Get statistical percentiles for GDS metrics across all nodes in a project.
-    async fn get_project_percentiles(&self, project_id: Uuid) -> Result<ProjectPercentiles>;
-
-    /// Get top N files by betweenness centrality (bridge files).
-    async fn get_top_bridges_by_betweenness(
-        &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> Result<Vec<BridgeFile>>;
-
-    /// Get aggregated symbol names for a file (functions, structs, traits, enums)
-    async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode>;
-
-    /// Get the number of callers for a function by name.
-    /// When project_id is provided, only counts callers from the same project.
-    async fn get_function_caller_count(
-        &self,
-        function_name: &str,
-        project_id: Option<Uuid>,
-    ) -> Result<i64>;
-
-    /// Get trait info (is_external, source)
-    async fn get_trait_info(&self, trait_name: &str) -> Result<Option<TraitInfoNode>>;
-
-    /// Get trait implementors with file locations
-    async fn get_trait_implementors_detailed(
-        &self,
-        trait_name: &str,
-    ) -> Result<Vec<TraitImplementorNode>>;
-
-    /// Get all traits implemented by a type, with details
-    async fn get_type_trait_implementations(
-        &self,
-        type_name: &str,
-    ) -> Result<Vec<TypeTraitInfoNode>>;
-
-    /// Get all impl blocks for a type with methods
-    async fn get_type_impl_blocks_detailed(
-        &self,
-        type_name: &str,
-    ) -> Result<Vec<ImplBlockDetailNode>>;
-}
-
-// ============================================================================
-// Plan domain
-// ============================================================================
-
-/// The planning domain: plans and their tasks, steps, day plan and constraints.
-///
-/// `GraphStore` is its supertrait: a consumer keeps calling these methods on a
-/// `dyn GraphStore` without knowing the domain exists.
-#[async_trait]
-pub trait PlanStore: Send + Sync {
-    // ========================================================================
-    // Plan operations
-    // ========================================================================
-
-    /// Create a new plan
-    async fn create_plan(&self, plan: &PlanNode) -> Result<()>;
-
-    /// Get a plan by ID
-    async fn get_plan(&self, id: Uuid) -> Result<Option<PlanNode>>;
-
-    /// List all active plans
-    async fn list_active_plans(&self) -> Result<Vec<PlanNode>>;
-
-    /// List active plans for a specific project
-    async fn list_project_plans(&self, project_id: Uuid) -> Result<Vec<PlanNode>>;
-
-    /// Count plans for a project (lightweight, no data transfer)
-    async fn count_project_plans(&self, project_id: Uuid) -> Result<i64>;
-
-    /// List plans for a project with filters
-    async fn list_plans_for_project(
-        &self,
-        project_id: Uuid,
-        status_filter: Option<Vec<String>>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<PlanNode>, usize)>;
-
-    /// Update plan fields (title, description, priority)
-    async fn update_plan(&self, id: Uuid, updates: &UpdatePlanRequest) -> Result<()>;
-
-    /// Update plan status
-    async fn update_plan_status(&self, id: Uuid, status: PlanStatus) -> Result<()>;
-
-    /// Link a plan to a project (creates HAS_PLAN relationship)
-    async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> Result<()>;
-
-    /// Slugs of every project the plan belongs to (HAS_PLAN edges + plan.project_id).
-    /// Used to scope task-context retrieval to the plan's own projects.
-    async fn list_plan_project_slugs(&self, plan_id: Uuid) -> Result<Vec<String>>;
-
-    /// Unlink a plan from its project
-    async fn unlink_plan_from_project(&self, plan_id: Uuid) -> Result<()>;
-
-    /// Delete a plan and all its related data (tasks, steps, decisions, constraints)
-    async fn delete_plan(&self, plan_id: Uuid) -> Result<()>;
-
-    // ========================================================================
-    // Task operations
-    // ========================================================================
-
-    /// Create a task for a plan
-    async fn create_task(&self, plan_id: Uuid, task: &TaskNode) -> Result<()>;
-
-    /// Get tasks for a plan
-    async fn get_plan_tasks(&self, plan_id: Uuid) -> Result<Vec<TaskNode>>;
-
-    /// Get full task details including steps, decisions, dependencies, and modified files
-    async fn get_task_with_full_details(&self, task_id: Uuid) -> Result<Option<TaskDetails>>;
-
-    /// Analyze the impact of a task on the codebase (files it modifies + their dependents)
-    async fn analyze_task_impact(&self, task_id: Uuid) -> Result<Vec<String>>;
-
-    /// Find pending tasks in a plan that are blocked by uncompleted dependencies
-    async fn find_blocked_tasks(&self, plan_id: Uuid) -> Result<Vec<(TaskNode, Vec<TaskNode>)>>;
-
-    /// Update task status
-    async fn update_task_status(&self, task_id: Uuid, status: TaskStatus) -> Result<()>;
-
-    /// Marks a task `Interrupted` with a reason. Finished work (completed, failed) is left alone:
-    /// the answer says whether anything changed.
-    async fn interrupt_task(&self, task_id: Uuid, reason: &str) -> Result<bool>;
-
-    /// Assign task to an agent
-    async fn assign_task(&self, task_id: Uuid, agent_id: &str) -> Result<()>;
-
-    /// Add task dependency
-    async fn add_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()>;
-
-    /// Remove task dependency
-    async fn remove_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()>;
-
-    /// Get tasks that block this task (dependencies that are not completed)
-    async fn get_task_blockers(&self, task_id: Uuid) -> Result<Vec<TaskNode>>;
-
-    /// Get tasks blocked by this task (tasks depending on this one)
-    async fn get_tasks_blocked_by(&self, task_id: Uuid) -> Result<Vec<TaskNode>>;
-
-    /// Get all dependencies for a task (all tasks it depends on, regardless of status)
-    async fn get_task_dependencies(&self, task_id: Uuid) -> Result<Vec<TaskNode>>;
-
-    /// Get dependency graph for a plan (all tasks and their dependencies)
-    async fn get_plan_dependency_graph(
-        &self,
-        plan_id: Uuid,
-    ) -> Result<(Vec<TaskNode>, Vec<(Uuid, Uuid)>)>;
-
-    /// Batch-fetch step counts, note counts, and decision counts for a list of task IDs.
-    async fn get_task_enrichment_counts(
-        &self,
-        task_ids: &[String],
-    ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentCounts>>;
-
-    /// Batch-fetch full enrichment data (counts + individual step details) for dependency graph.
-    async fn get_task_enrichment_data(
-        &self,
-        task_ids: &[String],
-    ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentData>>;
-
-    /// Find critical path in a plan (longest chain of dependencies)
-    async fn get_plan_critical_path(&self, plan_id: Uuid) -> Result<Vec<TaskNode>>;
-
-    /// Compute execution waves for a plan (topological sort + level grouping)
-    async fn compute_waves(
-        &self,
-        plan_id: Uuid,
-    ) -> Result<crate::neo4j::plan::WaveComputationResult>;
-
-    /// Get next available task (no unfinished dependencies)
-    async fn get_next_available_task(&self, plan_id: Uuid) -> Result<Option<TaskNode>>;
-
-    /// Get a single task by ID
-    async fn get_task(&self, task_id: Uuid) -> Result<Option<TaskNode>>;
-
-    /// Update a task with new values
-    async fn update_task(&self, task_id: Uuid, updates: &UpdateTaskRequest) -> Result<()>;
-
-    /// Update pre-enrichment fields on a task (execution_context, persona, prompt_cache).
-    async fn update_task_enrichment(
-        &self,
-        task_id: Uuid,
-        execution_context: Option<&str>,
-        persona: Option<&str>,
-        prompt_cache: Option<&str>,
-    ) -> Result<()>;
-
-    /// Delete a task and all its related data (steps, decisions)
-    async fn delete_task(&self, task_id: Uuid) -> Result<()>;
-
-    /// Get the project that owns a task (via Task→Plan→Project chain).
-    ///
-    /// Traverses: `(Task)-[:PART_OF]->(Plan)-[:BELONGS_TO]->(Project)`
-    /// Returns `None` if the task doesn't exist or has no linked project.
-    async fn get_project_for_task(&self, task_id: Uuid) -> Result<Option<ProjectNode>>;
-
-    /// Get the plan UUID that owns a given task.
-    ///
-    /// Traverses: `(Plan)-[:HAS_TASK]->(Task {id: task_id})`
-    /// Returns `None` if the task doesn't exist or has no parent plan.
-    async fn get_plan_id_for_task(&self, task_id: Uuid) -> Result<Option<Uuid>>;
-
-    // ========================================================================
-    // Day plan operations
-    // ========================================================================
-
-    /// Read one user's ordered day plan as `(task_id, order)` pairs.
-    async fn get_day_plan(&self, user_id: Uuid, date: &str) -> Result<Vec<(Uuid, u32)>>;
-
-    /// Replace the whole day plan (idempotent). Position in `ids` = order.
-    async fn set_day_plan(&self, user_id: Uuid, date: &str, ids: &[Uuid]) -> Result<()>;
-
-    /// Append one task to the end of the day plan (no-op when already present).
-    async fn add_to_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()>;
-
-    /// Remove one task from the day plan (no-op when absent).
-    async fn remove_from_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()>;
-
-    // ========================================================================
-    // Step operations
-    // ========================================================================
-
-    /// Create a step for a task
-    async fn create_step(&self, task_id: Uuid, step: &StepNode) -> Result<()>;
-
-    /// Get steps for a task
-    async fn get_task_steps(&self, task_id: Uuid) -> Result<Vec<StepNode>>;
-
-    /// Update step fields (description, verification)
-    async fn update_step(&self, step_id: Uuid, updates: &UpdateStepRequest) -> Result<()>;
-
-    /// Update step status
-    async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> Result<()>;
-
-    /// Get count of completed steps for a task
-    async fn get_task_step_progress(&self, task_id: Uuid) -> Result<(u32, u32)>;
-
-    /// Get a single step by ID
-    async fn get_step(&self, step_id: Uuid) -> Result<Option<StepNode>>;
-
-    /// Delete a step
-    async fn delete_step(&self, step_id: Uuid) -> Result<()>;
-
-    /// Complete all pending/in_progress steps for a task (cascade on task completion)
-    async fn complete_pending_steps_for_task(&self, task_id: Uuid) -> Result<u32>;
-
-    // ========================================================================
-    // Constraint operations
-    // ========================================================================
-
-    /// Create a constraint for a plan
-    async fn create_constraint(&self, plan_id: Uuid, constraint: &ConstraintNode) -> Result<()>;
-
-    /// Get constraints for a plan
-    async fn get_plan_constraints(&self, plan_id: Uuid) -> Result<Vec<ConstraintNode>>;
-
-    /// Get a single constraint by ID
-    async fn get_constraint(&self, constraint_id: Uuid) -> Result<Option<ConstraintNode>>;
-
-    /// Update a constraint
-    async fn update_constraint(
-        &self,
-        constraint_id: Uuid,
-        description: Option<String>,
-        constraint_type: Option<ConstraintType>,
-        enforced_by: Option<String>,
-    ) -> Result<()>;
-
-    /// Delete a constraint
-    async fn delete_constraint(&self, constraint_id: Uuid) -> Result<()>;
-}
-
-// ============================================================================
-// Decision domain
-// ============================================================================
-
-/// The decision domain: architectural decisions and their links to the graph.
-#[async_trait]
-pub trait DecisionStore: Send + Sync {
-    // ========================================================================
-    // Decision operations
-    // ========================================================================
-
-    /// Record a decision
-    async fn create_decision(&self, task_id: Uuid, decision: &DecisionNode) -> Result<()>;
-
-    /// Get a single decision by ID
-    async fn get_decision(&self, decision_id: Uuid) -> Result<Option<DecisionNode>>;
-
-    /// Get the project ID for a decision (traverses Decision←Task←Plan←Project).
-    async fn get_decision_project_id(&self, decision_id: Uuid) -> Result<Option<String>>;
-
-    /// Project of each decision in one batched lookup (same traversal as
-    /// `get_decision_project_id`). Decisions whose project is not verifiable
-    /// (plan without project, unknown id) are absent from the map.
-    async fn get_decision_project_ids(
-        &self,
-        decision_ids: &[Uuid],
-    ) -> Result<std::collections::HashMap<Uuid, Uuid>>;
-
-    /// Update a decision
-    async fn update_decision(
-        &self,
-        decision_id: Uuid,
-        description: Option<String>,
-        rationale: Option<String>,
-        chosen_option: Option<String>,
-        status: Option<DecisionStatus>,
-    ) -> Result<()>;
-
-    /// Delete a decision
-    async fn delete_decision(&self, decision_id: Uuid) -> Result<()>;
-
-    /// Get decisions related to an entity (via AFFECTS or task linkage)
-    async fn get_decisions_for_entity(
-        &self,
-        entity_type: &str,
-        entity_id: &str,
-        limit: u32,
-    ) -> Result<Vec<DecisionNode>>;
-
-    /// Store a vector embedding on a Decision node
-    async fn set_decision_embedding(
-        &self,
-        decision_id: Uuid,
-        embedding: &[f32],
-        model: &str,
-    ) -> Result<()>;
-
-    /// Retrieve the stored vector embedding for a Decision node
-    async fn get_decision_embedding(&self, decision_id: Uuid) -> Result<Option<Vec<f32>>>;
-
-    /// Get all decisions with their linked task_id (for MeiliSearch reindex)
-    async fn get_all_decisions_with_task_id(&self) -> Result<Vec<(DecisionNode, Uuid)>>;
-
-    /// Get all Decision IDs that have no embedding yet (for backfill)
-    async fn get_decisions_without_embedding(&self) -> Result<Vec<(Uuid, String, String)>>;
-
-    /// Semantic search over Decision embeddings using Neo4j vector index.
-    /// When `project_id` is provided, filters results to that project (post-query).
-    async fn search_decisions_by_vector(
-        &self,
-        query_embedding: &[f32],
-        limit: usize,
-        project_id: Option<&str>,
-    ) -> Result<Vec<(DecisionNode, f64)>>;
-
-    /// Get decisions that AFFECT a given entity (reverse AFFECTS lookup)
-    async fn get_decisions_affecting(
-        &self,
-        entity_type: &str,
-        entity_id: &str,
-        status_filter: Option<&str>,
-    ) -> Result<Vec<DecisionNode>>;
-
-    /// Create an AFFECTS relation from a Decision to any entity in the graph
-    async fn add_decision_affects(
-        &self,
-        decision_id: Uuid,
-        entity_type: &str,
-        entity_id: &str,
-        impact_description: Option<&str>,
-    ) -> Result<()>;
-
-    /// Remove an AFFECTS relation from a Decision to an entity
-    async fn remove_decision_affects(
-        &self,
-        decision_id: Uuid,
-        entity_type: &str,
-        entity_id: &str,
-    ) -> Result<()>;
-
-    /// List all entities affected by a Decision
-    async fn list_decision_affects(&self, decision_id: Uuid) -> Result<Vec<AffectsRelation>>;
-
-    /// Mark a decision as superseded by a newer decision
-    async fn supersede_decision(&self, new_decision_id: Uuid, old_decision_id: Uuid) -> Result<()>;
-
-    /// Get a timeline of decisions, optionally filtered by task and date range
-    async fn get_decision_timeline(
-        &self,
-        task_id: Option<Uuid>,
-        from: Option<&str>,
-        to: Option<&str>,
-    ) -> Result<Vec<DecisionTimelineEntry>>;
-
-    /// List decisions having a given status, across all projects by default,
-    /// newest first. `project_id` wins over `workspace_slug`. Returns (page, total).
-    async fn list_decisions_by_status(
-        &self,
-        status: DecisionStatus,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<DecisionListItem>, usize)>;
-}
-
-// ============================================================================
-// Commit domain
-// ============================================================================
-
-/// The commit domain: commits, what they touched and what changed together.
-#[async_trait]
-pub trait CommitStore: Send + Sync {
-    // ========================================================================
-    // Dependency analysis
-    // ========================================================================
-
-    /// Find all files that depend on a given file (IMPORTS-only traversal).
-    /// When project_id is provided, only return dependents from the same project.
-    async fn find_dependent_files(
-        &self,
-        file_path: &str,
-        depth: u32,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<String>>;
-
-    /// Find all files impacted by a change to a given file.
-    /// Combines IMPORTS traversal (file→file) and CALLS traversal
-    /// (functions in target ← called by functions in other files).
-    /// When project_id is provided, only return files from the same project.
-    async fn find_impacted_files(
-        &self,
-        file_path: &str,
-        depth: u32,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<String>>;
-
-    /// Find all functions that call a given function
-    /// When project_id is provided, only return callers from the same project.
-    async fn find_callers(
-        &self,
-        function_id: &str,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<FunctionNode>>;
-
-    // ========================================================================
-    // Task-file linking
-    // ========================================================================
-
-    /// Link a task to files it modifies
-    async fn link_task_to_files(&self, task_id: Uuid, file_paths: &[String]) -> Result<()>;
-
-    // ========================================================================
-    // Commit operations
-    // ========================================================================
-
-    /// Create a commit node
-    async fn create_commit(&self, commit: &CommitNode) -> Result<()>;
-
-    /// Get a commit by hash
-    async fn get_commit(&self, hash: &str) -> Result<Option<CommitNode>>;
-
-    /// Link a commit to a task (RESOLVED_BY relationship)
-    async fn link_commit_to_task(&self, commit_hash: &str, task_id: Uuid) -> Result<()>;
-
-    /// Link a commit to a plan (RESULTED_IN relationship)
-    async fn link_commit_to_plan(&self, commit_hash: &str, plan_id: Uuid) -> Result<()>;
-
-    /// Get commits for a task
-    async fn get_task_commits(&self, task_id: Uuid) -> Result<Vec<CommitNode>>;
-
-    /// Get commits for a plan
-    async fn get_plan_commits(&self, plan_id: Uuid) -> Result<Vec<CommitNode>>;
-
-    /// Delete a commit
-    async fn delete_commit(&self, hash: &str) -> Result<()>;
-
-    // ========================================================================
-    // TOUCHES operations (Commit → File)
-    // ========================================================================
-
-    /// Create TOUCHES relations between a Commit and its changed Files (batch UNWIND).
-    /// Files that don't exist as nodes are silently skipped.
-    async fn create_commit_touches(
-        &self,
-        commit_hash: &str,
-        files: &[FileChangedInfo],
-    ) -> Result<()>;
-
-    /// Get all files touched by a commit
-    async fn get_commit_files(&self, commit_hash: &str) -> Result<Vec<CommitFileInfo>>;
-
-    /// Get the commit history for a specific file
-    async fn get_file_history(
-        &self,
-        file_path: &str,
-        limit: Option<i64>,
-    ) -> Result<Vec<FileHistoryEntry>>;
-
-    /// Ping freshness on all Notes LINKED_TO the given file paths.
-    /// Returns the number of distinct notes pinged.
-    async fn ping_freshness_for_files(&self, file_paths: &[String]) -> Result<usize>;
-
-    // ========================================================================
-    // CO_CHANGED operations (File ↔ File)
-    // ========================================================================
-
-    /// Compute CO_CHANGED relations from TOUCHES history (incremental).
-    /// Returns the number of relations created/updated.
-    async fn compute_co_changed(
-        &self,
-        project_id: Uuid,
-        since: Option<chrono::DateTime<chrono::Utc>>,
-        min_count: i64,
-        max_relations: i64,
-    ) -> Result<i64>;
-
-    /// Update project last_co_change_computed_at timestamp
-    async fn update_project_co_change_timestamp(&self, id: Uuid) -> Result<()>;
-
-    /// Get the co-change graph for a project
-    async fn get_co_change_graph(
-        &self,
-        project_id: Uuid,
-        min_count: i64,
-        limit: i64,
-    ) -> Result<Vec<CoChangePair>>;
-
-    /// Get files that co-change with a given file
-    async fn get_file_co_changers(
-        &self,
-        file_path: &str,
-        min_count: i64,
-        limit: i64,
-    ) -> Result<Vec<CoChanger>>;
-
-    /// Compute CO_CHANGED_TRANSITIVE relations via BFS on the CO_CHANGED graph.
-    ///
-    /// # References
-    /// - Rolfsnes et al. (2018) — "Detecting Evolutionary Coupling Using Transitive Association Rules"
-    async fn compute_co_changed_transitive(
-        &self,
-        project_id: Uuid,
-        max_depth: i64,
-        min_score: f64,
-    ) -> Result<i64>;
-
-    /// Get files that are transitively co-changed with a given file.
-    ///
-    /// # References
-    /// - Rolfsnes et al. (2018) — "Detecting Evolutionary Coupling Using Transitive Association Rules"
-    async fn get_file_transitive_co_changers(
-        &self,
-        file_path: &str,
-        min_score: f64,
-        limit: i64,
-    ) -> Result<Vec<TransitiveCoChanger>>;
-}
-
-// ============================================================================
-// Release domain
-// ============================================================================
-
-/// The release domain: releases, environments and their deployments.
-#[async_trait]
-pub trait ReleaseStore: Send + Sync {
-    // ========================================================================
-    // Release operations
-    // ========================================================================
-
-    /// Create a release
-    async fn create_release(&self, release: &ReleaseNode) -> Result<()>;
-
-    /// Get a release by ID
-    async fn get_release(&self, id: Uuid) -> Result<Option<ReleaseNode>>;
-
-    /// List releases for a project
-    async fn list_project_releases(&self, project_id: Uuid) -> Result<Vec<ReleaseNode>>;
-
-    /// Update a release
-    async fn update_release(
-        &self,
-        id: Uuid,
-        status: Option<ReleaseStatus>,
-        target_date: Option<chrono::DateTime<chrono::Utc>>,
-        released_at: Option<chrono::DateTime<chrono::Utc>>,
-        title: Option<String>,
-        description: Option<String>,
-    ) -> Result<()>;
-
-    /// Add a task to a release
-    async fn add_task_to_release(&self, release_id: Uuid, task_id: Uuid) -> Result<()>;
-
-    /// Add a commit to a release
-    async fn add_commit_to_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()>;
-
-    /// Remove a commit from a release
-    async fn remove_commit_from_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()>;
-
-    /// Get release details with tasks and commits
-    async fn get_release_details(
-        &self,
-        release_id: Uuid,
-    ) -> Result<Option<(ReleaseNode, Vec<TaskNode>, Vec<CommitNode>)>>;
-
-    /// Delete a release
-    async fn delete_release(&self, release_id: Uuid) -> Result<()>;
-
-    // ========================================================================
-    // Environment & deployment operations
-    // ========================================================================
-
-    /// Create an environment. Errors when the project does not exist or when the
-    /// name is already used by another environment of the project.
-    async fn create_environment(&self, env: &EnvironmentNode) -> Result<()>;
-
-    /// Get an environment by ID
-    async fn get_environment(&self, id: Uuid) -> Result<Option<EnvironmentNode>>;
-
-    /// List the environments of a project (oldest first)
-    async fn list_project_environments(&self, project_id: Uuid) -> Result<Vec<EnvironmentNode>>;
-
-    /// Update an environment (empty string clears url/description/config)
-    async fn update_environment(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        kind: Option<EnvironmentKind>,
-        url: Option<String>,
-        description: Option<String>,
-        config: Option<String>,
-    ) -> Result<()>;
-
-    /// Delete an environment and its deployments
-    async fn delete_environment(&self, id: Uuid) -> Result<()>;
-
-    /// Record a deployment (linked to the Commit node with the same sha, if any)
-    async fn create_deployment(&self, deployment: &DeploymentNode) -> Result<()>;
-
-    /// Get a deployment by ID
-    async fn get_deployment(&self, id: Uuid) -> Result<Option<DeploymentNode>>;
-
-    /// List deployments of an environment, newest first, with the total count
-    async fn list_environment_deployments(
-        &self,
-        environment_id: Uuid,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<DeploymentNode>, usize)>;
-
-    /// Update a deployment (status, finished_at, notes)
-    async fn update_deployment(
-        &self,
-        id: Uuid,
-        status: Option<DeploymentStatus>,
-        finished_at: Option<chrono::DateTime<chrono::Utc>>,
-        notes: Option<String>,
-    ) -> Result<()>;
-
-    /// Deployment matrix of a project: every environment with its latest
-    /// deployment and the statuses of its last 5 deployments (newest first)
-    async fn get_deployment_matrix(&self, project_id: Uuid) -> Result<Vec<DeploymentMatrixEntry>>;
-
-    // ========================================================================
-    // Milestone operations
-    // ========================================================================
-
-    /// Create a milestone
-    async fn create_milestone(&self, milestone: &MilestoneNode) -> Result<()>;
-
-    /// Get a milestone by ID
-    async fn get_milestone(&self, id: Uuid) -> Result<Option<MilestoneNode>>;
-
-    /// List milestones for a project
-    async fn list_project_milestones(&self, project_id: Uuid) -> Result<Vec<MilestoneNode>>;
-
-    /// Update a milestone
-    async fn update_milestone(
-        &self,
-        id: Uuid,
-        status: Option<MilestoneStatus>,
-        target_date: Option<chrono::DateTime<chrono::Utc>>,
-        closed_at: Option<chrono::DateTime<chrono::Utc>>,
-        title: Option<String>,
-        description: Option<String>,
-    ) -> Result<()>;
-
-    /// Add a task to a milestone
-    async fn add_task_to_milestone(&self, milestone_id: Uuid, task_id: Uuid) -> Result<()>;
-
-    /// Link a plan to a project milestone
-    async fn link_plan_to_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()>;
-
-    /// Unlink a plan from a project milestone
-    async fn unlink_plan_from_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()>;
-
-    /// Get milestone details with tasks
-    async fn get_milestone_details(
-        &self,
-        milestone_id: Uuid,
-    ) -> Result<Option<(MilestoneNode, Vec<TaskNode>)>>;
-
-    /// Get milestone progress (total, completed, in_progress, pending)
-    async fn get_milestone_progress(&self, milestone_id: Uuid) -> Result<(u32, u32, u32, u32)>;
-
-    /// Get tasks linked to a project milestone (with plan info)
-    async fn get_milestone_tasks_with_plans(&self, milestone_id: Uuid)
-        -> Result<Vec<TaskWithPlan>>;
-
-    /// Get all steps for all tasks linked to a project milestone (batch)
-    async fn get_milestone_steps_batch(
-        &self,
-        milestone_id: Uuid,
-    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>>;
-
-    /// Delete a milestone
-    async fn delete_milestone(&self, milestone_id: Uuid) -> Result<()>;
-
-    /// Get tasks for a milestone
-    async fn get_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskNode>>;
-
-    /// Get tasks for a release
-    async fn get_release_tasks(&self, release_id: Uuid) -> Result<Vec<TaskNode>>;
-
-    // ========================================================================
-    // Project stats
-    // ========================================================================
-
-    /// Get project progress stats
-    async fn get_project_progress(&self, project_id: Uuid) -> Result<(u32, u32, u32, u32)>;
-
-    /// Task counters for many entities at once (one round trip for list cards).
-    ///
-    /// The default implementation loops over the per-entity task getters so
-    /// every store (including mocks) supports it; `Neo4jClient` overrides it
-    /// with a single aggregated query.
-    async fn get_progress_batch(
-        &self,
-        kind: ProgressKind,
-        ids: &[Uuid],
-    ) -> Result<std::collections::HashMap<Uuid, TaskCounts>> {
-        let mut out = std::collections::HashMap::with_capacity(ids.len());
-        for id in ids {
-            let tasks = match kind {
-                ProgressKind::Plan => self.get_plan_tasks(*id).await?,
-                ProgressKind::Project => self.get_project_tasks(*id).await?,
-                ProgressKind::Milestone => self.get_milestone_tasks(*id).await?,
-            };
-            out.insert(*id, TaskCounts::from_tasks(&tasks));
-        }
-        Ok(out)
-    }
-
-    /// Get all task dependencies for a project (across all plans)
-    async fn get_project_task_dependencies(&self, project_id: Uuid) -> Result<Vec<(Uuid, Uuid)>>;
-
-    /// Get all tasks for a project (across all plans)
-    async fn get_project_tasks(&self, project_id: Uuid) -> Result<Vec<TaskNode>>;
-
-    // ========================================================================
-    // Filtered list operations with pagination
-    // ========================================================================
-
-    /// List plans with filters and pagination
-    ///
-    /// Returns (plans, total_count)
-    #[allow(clippy::too_many_arguments)]
-    async fn list_plans_filtered(
-        &self,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        statuses: Option<Vec<String>>,
-        priority_min: Option<i32>,
-        priority_max: Option<i32>,
-        search: Option<&str>,
-        limit: usize,
-        offset: usize,
-        sort_by: Option<&str>,
-        sort_order: &str,
-    ) -> Result<(Vec<PlanNode>, usize)>;
-
-    /// List all tasks across all plans with filters and pagination
-    ///
-    /// Returns (tasks_with_plan_info, total_count)
-    #[allow(clippy::too_many_arguments)]
-    async fn list_all_tasks_filtered(
-        &self,
-        plan_id: Option<Uuid>,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        statuses: Option<Vec<String>>,
-        priority_min: Option<i32>,
-        priority_max: Option<i32>,
-        tags: Option<Vec<String>>,
-        assigned_to: Option<&str>,
-        limit: usize,
-        offset: usize,
-        sort_by: Option<&str>,
-        sort_order: &str,
-    ) -> Result<(Vec<TaskWithPlan>, usize)>;
-
-    /// List project releases with filters and pagination
-    async fn list_releases_filtered(
-        &self,
-        project_id: Uuid,
-        statuses: Option<Vec<String>>,
-        limit: usize,
-        offset: usize,
-        sort_by: Option<&str>,
-        sort_order: &str,
-    ) -> Result<(Vec<ReleaseNode>, usize)>;
-
-    /// List project milestones with filters and pagination
-    async fn list_milestones_filtered(
-        &self,
-        project_id: Uuid,
-        statuses: Option<Vec<String>>,
-        limit: usize,
-        offset: usize,
-        sort_by: Option<&str>,
-        sort_order: &str,
-    ) -> Result<(Vec<MilestoneNode>, usize)>;
-
-    /// List projects with search and pagination
-    async fn list_projects_filtered(
-        &self,
-        search: Option<&str>,
-        limit: usize,
-        offset: usize,
-        sort_by: Option<&str>,
-        sort_order: &str,
-    ) -> Result<(Vec<ProjectNode>, usize)>;
 }

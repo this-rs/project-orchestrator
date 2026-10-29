@@ -36,8 +36,6 @@
 //! read as a parity gap: a `fake_openai` that does not record request headers hides
 //! `anthropic-version`, and the cell then accused the harness on a `main` whose CI was
 //! green (28/10/2026, see [`anthropic_messages_verdict`]).
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -69,6 +67,10 @@ use crate::events::NatsEmitter;
 use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::GraphStore;
 
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::refs::types::{EntityRef, RefKind};
 use crate::test_helpers::mock_app_state;
 

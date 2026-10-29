@@ -9,6 +9,10 @@
 
 use super::{ExecutionResult, Executor};
 use crate::neo4j::traits::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::protocol::{Protocol, ProtocolRun, ProtocolState};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -302,6 +306,10 @@ impl Executor for SystemExecutor {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use crate::protocol::ProtocolTransition;
     use uuid::Uuid;
 

@@ -9,8 +9,6 @@
 //! - **Shrink**: Notes left the cluster (synapses broken) → remove members
 //!
 //! Evolutions are traced as observation Notes for auditability.
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 use std::collections::{HashMap, HashSet};
 
@@ -20,6 +18,10 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 use crate::notes::{MemoryHorizon, Note, NoteImportance, NoteScope, NoteStatus, NoteType};
 use crate::skills::detection::{jaccard_similarity, SkillCandidate};
 use crate::skills::models::SkillNode;

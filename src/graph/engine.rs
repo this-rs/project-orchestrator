@@ -8,8 +8,6 @@
 //! 3. **Persistence**: Write scores back to Neo4j via `AnalyticsWriter`
 //!
 //! The trait also enables mocking in downstream consumer tests.
-use crate::neo4j::ProjectStore;
-use crate::neo4j::WorkspaceStore;
 
 use crate::neo4j::GraphStore;
 use anyhow::Result;
@@ -28,6 +26,10 @@ use super::enrichment::{CommunityEnricher, NoopCommunityEnricher};
 use super::extraction::GraphExtractor;
 use super::models::{AnalyticsConfig, FabricWeights, GraphAnalytics};
 use super::writer::AnalyticsWriter;
+use crate::neo4j::{
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+    ReleaseStore, WorkspaceStore,
+};
 
 // ============================================================================
 // Output type
@@ -484,6 +486,10 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{FileNode, FunctionNode, Visibility};
+    use crate::neo4j::{
+        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
+        ReleaseStore, WorkspaceStore,
+    };
     use crate::test_helpers::test_project;
 
     /// Seed a project with files forming two clusters connected by one edge.
