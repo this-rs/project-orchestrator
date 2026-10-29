@@ -308,10 +308,26 @@ pub mod conformance {
         assert_eq!(ids(&blockers, |t| t.id), vec![t2.id]);
 
         let proto = Protocol::new(Some(p.id), "merge protocol", Uuid::new_v4());
+        // A conformance test shares its store with every other test binary of the CI job.
+        // `list_protocols(Some(project))` deliberately counts the GLOBAL protocols too — it
+        // is how a project finds the protocols it may trigger (`src/protocol/hooks.rs`) — so
+        // an absolute total says nothing about this upsert: one stray global protocol in the
+        // database made this cell read 2 and turned `main` red without a single code change
+        // (measured 28/10/2026). Measure the global floor, then assert the DELTA.
+        let (_, globals) = store.list_protocols(None, None, 1, 0).await.unwrap();
         store.upsert_protocol(&proto).await.unwrap();
         store.upsert_protocol(&proto).await.unwrap();
-        let (_, total) = store.list_protocols(Some(p.id), None, 10, 0).await.unwrap();
-        assert_eq!(total, 1, "one protocol after two upserts");
+        let (listed, total) = store.list_protocols(Some(p.id), None, 10, 0).await.unwrap();
+        assert_eq!(
+            total,
+            globals + 1,
+            "two upserts of one protocol add exactly ONE protocol to this project"
+        );
+        assert_eq!(
+            listed.iter().filter(|x| x.id == proto.id).count(),
+            1,
+            "the upserted protocol appears once in the list"
+        );
 
         assert!(store.delete_protocol(proto.id).await.unwrap());
         store.delete_project(p.id, &p.name).await.unwrap();
