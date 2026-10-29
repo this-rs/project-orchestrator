@@ -212,6 +212,14 @@ RETURN count(n) AS processed
 /// 29/10/2026, 96% of them onto `File` — must follow the file, not vanish with
 /// the copy.
 ///
+/// The scaffolding depth VARIES, and assuming one depth loses knowledge: a
+/// fixed two-level strip would have detached 14 282 edges under `.rlwt/src/`
+/// (the worktree root IS `.rlwt`) and 23 703 under `worktrees/tasks/<name>/`.
+/// The candidates are therefore generated at every depth and the first that
+/// names a real file wins; `elun`'s agent worktrees, nested under
+/// `src/.auto-claude/worktrees/tasks/<name>/`, need the `.auto-claude` rule —
+/// 651 of its 738 files have a canonical twin.
+///
 /// Each edge is re-pointed to the canonical twin (`File` by `path`, the symbols
 /// by `id`, all indexed) with `apoc.merge.relationship`: a note already linked
 /// to the twin keeps one edge (dedup), one linked only to the copy moves. The
@@ -227,14 +235,37 @@ WHERE (w:File OR w:Function OR w:Struct OR w:Trait)
 MATCH (k)-[r]->(w)
 WHERE type(r) IN ['LINKED_TO', 'AFFECTS', 'INCLUDES_ENTITY', 'DISCUSSED', 'STEP_IN_PROCESS']
 WITH k, r, w, split(coalesce(w.path, w.file_path), '/') AS parts
-WITH k, r, w, parts, [i IN range(0, size(parts)-1) WHERE parts[i] IN ['_wt', 'worktrees', '.wt', '.rlwt'] | i] AS hits
-WITH k, r, w, parts, hits[0] AS i
-WHERE i IS NOT NULL
-WITH k, r, w, parts, i
+WITH k, r, w, parts,
+     [i IN range(0, size(parts)-1) WHERE parts[i] IN ['_wt', 'worktrees', '.wt', '.rlwt'] | i] AS hits,
+     apoc.coll.indexOf(parts, '.auto-claude') AS ac,
+     apoc.coll.indexOf(parts, 'tasks') AS tk
+WITH k, r, w, parts, hits[0] AS d, ac, tk
+WHERE d IS NOT NULL
+WITH k, r, w, parts, d, ac, tk
 LIMIT $batch
+// The number of levels of scaffolding after the worktree directory is NOT
+// fixed: `_wt/<branch>/` keeps one, `worktrees/tasks/<name>/` keeps two,
+// `.rlwt/` keeps none (the worktree root IS `.rlwt`), and elun nests its
+// agent worktrees under `src/.auto-claude/worktrees/tasks/<name>/`. Measured
+// 29/10/2026: 14 282 knowledge edges under `.rlwt/src/` and 23 703 under
+// `worktrees/tasks/` would have been DETACHED by a fixed two-level strip.
+// So: try the shallower strips first, take the first that names a real file.
 WITH k, r, w,
-     apoc.text.join(parts[0..i] + parts[i+2..], '/') AS canon,
+     apoc.text.join(parts[0..d] + parts[d+1..], '/') AS c0,
+     apoc.text.join(parts[0..d] + parts[d+2..], '/') AS c1,
+     apoc.text.join(parts[0..d] + parts[d+3..], '/') AS c2,
+     apoc.text.join(parts[0..d] + parts[d+4..], '/') AS c3,
+     CASE WHEN ac >= 0 AND ac < d AND tk > ac
+          THEN apoc.text.join(parts[0..ac] + parts[tk+2..], '/') ELSE null END AS ca,
      CASE WHEN w:File THEN '' ELSE substring(coalesce(w.id, ''), size(coalesce(w.file_path, ''))) END AS rest
+WITH k, r, w, rest,
+     CASE
+       WHEN EXISTS { MATCH (:File {path: c0}) } THEN c0
+       WHEN EXISTS { MATCH (:File {path: c1}) } THEN c1
+       WHEN EXISTS { MATCH (:File {path: c2}) } THEN c2
+       WHEN EXISTS { MATCH (:File {path: c3}) } THEN c3
+       WHEN ca IS NOT NULL AND EXISTS { MATCH (:File {path: ca}) } THEN ca
+       ELSE null END AS canon
 OPTIONAL MATCH (cf:File {path: canon})
 OPTIONAL MATCH (cFn:Function {id: canon + rest})
 OPTIONAL MATCH (cSt:Struct {id: canon + rest})
