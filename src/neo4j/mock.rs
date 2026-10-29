@@ -13487,243 +13487,6 @@ impl AnalyticsStore for MockGraphStore {
         Ok((Vec::new(), Vec::new()))
     }
 
-    // ========================================================================
-    // User / Auth operations
-    // ========================================================================
-
-    async fn upsert_user(&self, user: &UserNode) -> Result<UserNode> {
-        use crate::neo4j::models::AuthProvider;
-
-        let mut users = self.users.write().await;
-
-        // Find existing user based on auth provider strategy
-        let existing_id = match user.auth_provider {
-            AuthProvider::Oidc => {
-                // OIDC: match on auth_provider + external_id
-                let ext_id = user.external_id.as_deref().unwrap_or_default();
-                users
-                    .values()
-                    .find(|u| {
-                        u.auth_provider == AuthProvider::Oidc
-                            && u.external_id.as_deref() == Some(ext_id)
-                    })
-                    .map(|u| u.id)
-            }
-            AuthProvider::Password => {
-                // Password: match on auth_provider + email
-                users
-                    .values()
-                    .find(|u| u.auth_provider == AuthProvider::Password && u.email == user.email)
-                    .map(|u| u.id)
-            }
-        };
-
-        if let Some(id) = existing_id {
-            // Update existing user
-            let existing = users.get_mut(&id).unwrap();
-            existing.email = user.email.clone();
-            existing.name = user.name.clone();
-            existing.picture_url = user.picture_url.clone();
-            existing.last_login_at = user.last_login_at;
-            Ok(existing.clone())
-        } else {
-            // Insert new user
-            users.insert(user.id, user.clone());
-            Ok(user.clone())
-        }
-    }
-
-    async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserNode>> {
-        Ok(self.users.read().await.get(&id).cloned())
-    }
-
-    async fn get_user_by_provider_id(
-        &self,
-        provider: &str,
-        external_id: &str,
-    ) -> Result<Option<UserNode>> {
-        let provider_parsed: crate::neo4j::models::AuthProvider =
-            provider.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-        Ok(self
-            .users
-            .read()
-            .await
-            .values()
-            .find(|u| {
-                u.auth_provider == provider_parsed && u.external_id.as_deref() == Some(external_id)
-            })
-            .cloned())
-    }
-
-    async fn get_user_by_email_and_provider(
-        &self,
-        email: &str,
-        provider: &str,
-    ) -> Result<Option<UserNode>> {
-        let provider_parsed: crate::neo4j::models::AuthProvider =
-            provider.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-        Ok(self
-            .users
-            .read()
-            .await
-            .values()
-            .find(|u| u.email == email && u.auth_provider == provider_parsed)
-            .cloned())
-    }
-
-    async fn get_user_by_email(&self, email: &str) -> Result<Option<UserNode>> {
-        Ok(self
-            .users
-            .read()
-            .await
-            .values()
-            .find(|u| u.email == email)
-            .cloned())
-    }
-
-    async fn create_password_user(
-        &self,
-        email: &str,
-        name: &str,
-        password_hash: &str,
-    ) -> Result<UserNode> {
-        let now = chrono::Utc::now();
-        let user = UserNode {
-            id: Uuid::new_v4(),
-            email: email.to_string(),
-            name: name.to_string(),
-            picture_url: None,
-            auth_provider: crate::neo4j::models::AuthProvider::Password,
-            external_id: None,
-            password_hash: Some(password_hash.to_string()),
-            created_at: now,
-            last_login_at: now,
-        };
-        self.upsert_user(&user).await
-    }
-
-    async fn list_users(&self) -> Result<Vec<UserNode>> {
-        Ok(self.users.read().await.values().cloned().collect())
-    }
-
-    // Refresh Tokens
-    async fn create_refresh_token(
-        &self,
-        user_id: Uuid,
-        token_hash: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<()> {
-        let token = crate::neo4j::models::RefreshTokenNode {
-            token_hash: token_hash.to_string(),
-            user_id,
-            expires_at,
-            created_at: chrono::Utc::now(),
-            revoked: false,
-        };
-        self.refresh_tokens
-            .write()
-            .await
-            .insert(token_hash.to_string(), token);
-        Ok(())
-    }
-
-    async fn validate_refresh_token(
-        &self,
-        token_hash: &str,
-    ) -> Result<Option<crate::neo4j::models::RefreshTokenNode>> {
-        let tokens = self.refresh_tokens.read().await;
-        match tokens.get(token_hash) {
-            Some(token) if !token.revoked && token.expires_at > chrono::Utc::now() => {
-                Ok(Some(token.clone()))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool> {
-        let mut tokens = self.refresh_tokens.write().await;
-        match tokens.get_mut(token_hash) {
-            Some(token) => {
-                token.revoked = true;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
-    async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64> {
-        let mut tokens = self.refresh_tokens.write().await;
-        let mut count = 0u64;
-        for token in tokens.values_mut() {
-            if token.user_id == user_id && !token.revoked {
-                token.revoked = true;
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-
-    // MCP Tokens
-    async fn create_mcp_token(
-        &self,
-        user_id: Uuid,
-        jti: &str,
-        label: &str,
-        scope: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<()> {
-        let token = crate::neo4j::models::McpTokenNode {
-            jti: jti.to_string(),
-            user_id,
-            label: label.to_string(),
-            scope: scope.to_string(),
-            expires_at,
-            created_at: chrono::Utc::now(),
-            revoked: false,
-        };
-        self.mcp_tokens.write().await.insert(jti.to_string(), token);
-        Ok(())
-    }
-
-    async fn is_mcp_token_active(&self, jti: &str) -> Result<bool> {
-        let tokens = self.mcp_tokens.read().await;
-        Ok(tokens
-            .get(jti)
-            .is_some_and(|t| !t.revoked && t.expires_at > chrono::Utc::now()))
-    }
-
-    async fn revoke_mcp_token(&self, user_id: Uuid, jti: &str) -> Result<bool> {
-        let mut tokens = self.mcp_tokens.write().await;
-        match tokens.get_mut(jti) {
-            Some(token) if token.user_id == user_id => {
-                token.revoked = true;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    async fn list_mcp_tokens(
-        &self,
-        user_id: Uuid,
-    ) -> Result<Vec<crate::neo4j::models::McpTokenNode>> {
-        let tokens = self.mcp_tokens.read().await;
-        Ok(tokens
-            .values()
-            .filter(|t| t.user_id == user_id)
-            .cloned()
-            .collect())
-    }
-
-    async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64> {
-        let mut tokens = self.mcp_tokens.write().await;
-        let now = chrono::Utc::now();
-        let before = tokens.len();
-        // Same predicate as the Cypher: owned by this user AND already dead.
-        tokens.retain(|_, t| !(t.user_id == user_id && (t.revoked || t.expires_at < now)));
-        Ok((before - tokens.len()) as u64)
-    }
-
     // Feature Graphs
     async fn create_feature_graph(&self, graph: &FeatureGraphNode) -> Result<()> {
         self.feature_graphs
@@ -19388,5 +19151,245 @@ impl ChatStore for MockGraphStore {
             .iter()
             .find(|(_, ids)| ids.contains(&task_id))
             .map(|(plan_id, _)| *plan_id))
+    }
+}
+
+#[async_trait]
+impl AuthStore for MockGraphStore {
+    // ========================================================================
+    // User / Auth operations
+    // ========================================================================
+
+    async fn upsert_user(&self, user: &UserNode) -> Result<UserNode> {
+        use crate::neo4j::models::AuthProvider;
+
+        let mut users = self.users.write().await;
+
+        // Find existing user based on auth provider strategy
+        let existing_id = match user.auth_provider {
+            AuthProvider::Oidc => {
+                // OIDC: match on auth_provider + external_id
+                let ext_id = user.external_id.as_deref().unwrap_or_default();
+                users
+                    .values()
+                    .find(|u| {
+                        u.auth_provider == AuthProvider::Oidc
+                            && u.external_id.as_deref() == Some(ext_id)
+                    })
+                    .map(|u| u.id)
+            }
+            AuthProvider::Password => {
+                // Password: match on auth_provider + email
+                users
+                    .values()
+                    .find(|u| u.auth_provider == AuthProvider::Password && u.email == user.email)
+                    .map(|u| u.id)
+            }
+        };
+
+        if let Some(id) = existing_id {
+            // Update existing user
+            let existing = users.get_mut(&id).unwrap();
+            existing.email = user.email.clone();
+            existing.name = user.name.clone();
+            existing.picture_url = user.picture_url.clone();
+            existing.last_login_at = user.last_login_at;
+            Ok(existing.clone())
+        } else {
+            // Insert new user
+            users.insert(user.id, user.clone());
+            Ok(user.clone())
+        }
+    }
+
+    async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserNode>> {
+        Ok(self.users.read().await.get(&id).cloned())
+    }
+
+    async fn get_user_by_provider_id(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<Option<UserNode>> {
+        let provider_parsed: crate::neo4j::models::AuthProvider =
+            provider.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+        Ok(self
+            .users
+            .read()
+            .await
+            .values()
+            .find(|u| {
+                u.auth_provider == provider_parsed && u.external_id.as_deref() == Some(external_id)
+            })
+            .cloned())
+    }
+
+    async fn get_user_by_email_and_provider(
+        &self,
+        email: &str,
+        provider: &str,
+    ) -> Result<Option<UserNode>> {
+        let provider_parsed: crate::neo4j::models::AuthProvider =
+            provider.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+        Ok(self
+            .users
+            .read()
+            .await
+            .values()
+            .find(|u| u.email == email && u.auth_provider == provider_parsed)
+            .cloned())
+    }
+
+    async fn get_user_by_email(&self, email: &str) -> Result<Option<UserNode>> {
+        Ok(self
+            .users
+            .read()
+            .await
+            .values()
+            .find(|u| u.email == email)
+            .cloned())
+    }
+
+    async fn create_password_user(
+        &self,
+        email: &str,
+        name: &str,
+        password_hash: &str,
+    ) -> Result<UserNode> {
+        let now = chrono::Utc::now();
+        let user = UserNode {
+            id: Uuid::new_v4(),
+            email: email.to_string(),
+            name: name.to_string(),
+            picture_url: None,
+            auth_provider: crate::neo4j::models::AuthProvider::Password,
+            external_id: None,
+            password_hash: Some(password_hash.to_string()),
+            created_at: now,
+            last_login_at: now,
+        };
+        self.upsert_user(&user).await
+    }
+
+    async fn list_users(&self) -> Result<Vec<UserNode>> {
+        Ok(self.users.read().await.values().cloned().collect())
+    }
+
+    // Refresh Tokens
+    async fn create_refresh_token(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let token = crate::neo4j::models::RefreshTokenNode {
+            token_hash: token_hash.to_string(),
+            user_id,
+            expires_at,
+            created_at: chrono::Utc::now(),
+            revoked: false,
+        };
+        self.refresh_tokens
+            .write()
+            .await
+            .insert(token_hash.to_string(), token);
+        Ok(())
+    }
+
+    async fn validate_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<crate::neo4j::models::RefreshTokenNode>> {
+        let tokens = self.refresh_tokens.read().await;
+        match tokens.get(token_hash) {
+            Some(token) if !token.revoked && token.expires_at > chrono::Utc::now() => {
+                Ok(Some(token.clone()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool> {
+        let mut tokens = self.refresh_tokens.write().await;
+        match tokens.get_mut(token_hash) {
+            Some(token) => {
+                token.revoked = true;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64> {
+        let mut tokens = self.refresh_tokens.write().await;
+        let mut count = 0u64;
+        for token in tokens.values_mut() {
+            if token.user_id == user_id && !token.revoked {
+                token.revoked = true;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    // MCP Tokens
+    async fn create_mcp_token(
+        &self,
+        user_id: Uuid,
+        jti: &str,
+        label: &str,
+        scope: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let token = crate::neo4j::models::McpTokenNode {
+            jti: jti.to_string(),
+            user_id,
+            label: label.to_string(),
+            scope: scope.to_string(),
+            expires_at,
+            created_at: chrono::Utc::now(),
+            revoked: false,
+        };
+        self.mcp_tokens.write().await.insert(jti.to_string(), token);
+        Ok(())
+    }
+
+    async fn is_mcp_token_active(&self, jti: &str) -> Result<bool> {
+        let tokens = self.mcp_tokens.read().await;
+        Ok(tokens
+            .get(jti)
+            .is_some_and(|t| !t.revoked && t.expires_at > chrono::Utc::now()))
+    }
+
+    async fn revoke_mcp_token(&self, user_id: Uuid, jti: &str) -> Result<bool> {
+        let mut tokens = self.mcp_tokens.write().await;
+        match tokens.get_mut(jti) {
+            Some(token) if token.user_id == user_id => {
+                token.revoked = true;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn list_mcp_tokens(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::models::McpTokenNode>> {
+        let tokens = self.mcp_tokens.read().await;
+        Ok(tokens
+            .values()
+            .filter(|t| t.user_id == user_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64> {
+        let mut tokens = self.mcp_tokens.write().await;
+        let now = chrono::Utc::now();
+        let before = tokens.len();
+        // Same predicate as the Cypher: owned by this user AND already dead.
+        tokens.retain(|_, t| !(t.user_id == user_id && (t.revoked || t.expires_at < now)));
+        Ok((before - tokens.len()) as u64)
     }
 }

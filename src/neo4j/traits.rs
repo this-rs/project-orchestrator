@@ -100,6 +100,7 @@ pub trait GraphStore:
     + ReleaseStore
     + NoteStore
     + AnalyticsStore
+    + AuthStore
     + ChatStore
     + Send
     + Sync
@@ -2300,103 +2301,6 @@ pub trait AnalyticsStore: Send + Sync {
         project_id: Uuid,
         limit: usize,
     ) -> Result<(Vec<ChatGraphSession>, Vec<ChatGraphDiscussed>)>;
-
-    // ========================================================================
-    // User / Auth operations
-    // ========================================================================
-
-    /// Upsert a user (create or update). Returns the resulting UserNode.
-    ///
-    /// For OIDC users: MERGE on (auth_provider + external_id).
-    /// For password users: MERGE on (auth_provider + email).
-    async fn upsert_user(&self, user: &UserNode) -> Result<UserNode>;
-
-    /// Get a user by internal ID
-    async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserNode>>;
-
-    /// Get a user by provider and external ID (for OIDC lookups)
-    async fn get_user_by_provider_id(
-        &self,
-        provider: &str,
-        external_id: &str,
-    ) -> Result<Option<UserNode>>;
-
-    /// Get a user by email and auth provider
-    async fn get_user_by_email_and_provider(
-        &self,
-        email: &str,
-        provider: &str,
-    ) -> Result<Option<UserNode>>;
-
-    /// Get a user by email (any provider)
-    async fn get_user_by_email(&self, email: &str) -> Result<Option<UserNode>>;
-
-    /// Create a password-authenticated user
-    async fn create_password_user(
-        &self,
-        email: &str,
-        name: &str,
-        password_hash: &str,
-    ) -> Result<UserNode>;
-
-    /// List all users
-    async fn list_users(&self) -> Result<Vec<UserNode>>;
-
-    // ================================================================
-    // Refresh Tokens
-    // ================================================================
-
-    /// Store a new refresh token (hashed) linked to a user.
-    async fn create_refresh_token(
-        &self,
-        user_id: Uuid,
-        token_hash: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<()>;
-
-    /// Validate a refresh token by its hash. Returns the token if valid
-    /// (not expired, not revoked).
-    async fn validate_refresh_token(
-        &self,
-        token_hash: &str,
-    ) -> Result<Option<crate::neo4j::models::RefreshTokenNode>>;
-
-    /// Revoke a single refresh token by its hash.
-    async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool>;
-
-    /// Revoke all refresh tokens for a given user (e.g. on password change).
-    async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64>;
-
-    // ================================================================
-    // MCP Tokens (long-lived, revocable, scoped — remote MCP transport)
-    // ================================================================
-
-    /// Record a newly issued MCP token (keyed by its JWT `jti` claim).
-    async fn create_mcp_token(
-        &self,
-        user_id: Uuid,
-        jti: &str,
-        label: &str,
-        scope: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<()>;
-
-    /// Check whether an MCP token (by `jti`) exists, is not revoked, and is
-    /// not expired.
-    async fn is_mcp_token_active(&self, jti: &str) -> Result<bool>;
-
-    /// Revoke a single MCP token by `jti` (scoped to its owning user).
-    async fn revoke_mcp_token(&self, user_id: Uuid, jti: &str) -> Result<bool>;
-
-    /// List all MCP tokens for a user (inventory; includes revoked/expired).
-    async fn list_mcp_tokens(
-        &self,
-        user_id: Uuid,
-    ) -> Result<Vec<crate::neo4j::models::McpTokenNode>>;
-
-    /// Permanently remove a user's dead MCP token records (revoked or
-    /// expired). Never removes an active token. Returns the count removed.
-    async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64>;
 
     // ================================================================
     // Feature Graphs
@@ -4736,4 +4640,110 @@ pub trait ChatStore: Send + Sync {
     ) -> Result<Vec<(crate::episodes::models::Episode, f64)>> {
         Ok(Vec::new())
     }
+}
+
+// ============================================================================
+// Auth domain
+// ============================================================================
+
+/// The auth domain: users and works-on relations, refresh tokens, and the
+/// long-lived scoped tokens used by the remote MCP transport.
+#[async_trait]
+pub trait AuthStore: Send + Sync {
+    // ========================================================================
+    // User / Auth operations
+    // ========================================================================
+
+    /// Upsert a user (create or update). Returns the resulting UserNode.
+    ///
+    /// For OIDC users: MERGE on (auth_provider + external_id).
+    /// For password users: MERGE on (auth_provider + email).
+    async fn upsert_user(&self, user: &UserNode) -> Result<UserNode>;
+
+    /// Get a user by internal ID
+    async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserNode>>;
+
+    /// Get a user by provider and external ID (for OIDC lookups)
+    async fn get_user_by_provider_id(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> Result<Option<UserNode>>;
+
+    /// Get a user by email and auth provider
+    async fn get_user_by_email_and_provider(
+        &self,
+        email: &str,
+        provider: &str,
+    ) -> Result<Option<UserNode>>;
+
+    /// Get a user by email (any provider)
+    async fn get_user_by_email(&self, email: &str) -> Result<Option<UserNode>>;
+
+    /// Create a password-authenticated user
+    async fn create_password_user(
+        &self,
+        email: &str,
+        name: &str,
+        password_hash: &str,
+    ) -> Result<UserNode>;
+
+    /// List all users
+    async fn list_users(&self) -> Result<Vec<UserNode>>;
+
+    // ================================================================
+    // Refresh Tokens
+    // ================================================================
+
+    /// Store a new refresh token (hashed) linked to a user.
+    async fn create_refresh_token(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()>;
+
+    /// Validate a refresh token by its hash. Returns the token if valid
+    /// (not expired, not revoked).
+    async fn validate_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<crate::neo4j::models::RefreshTokenNode>>;
+
+    /// Revoke a single refresh token by its hash.
+    async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool>;
+
+    /// Revoke all refresh tokens for a given user (e.g. on password change).
+    async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64>;
+
+    // ================================================================
+    // MCP Tokens (long-lived, revocable, scoped — remote MCP transport)
+    // ================================================================
+
+    /// Record a newly issued MCP token (keyed by its JWT `jti` claim).
+    async fn create_mcp_token(
+        &self,
+        user_id: Uuid,
+        jti: &str,
+        label: &str,
+        scope: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()>;
+
+    /// Check whether an MCP token (by `jti`) exists, is not revoked, and is
+    /// not expired.
+    async fn is_mcp_token_active(&self, jti: &str) -> Result<bool>;
+
+    /// Revoke a single MCP token by `jti` (scoped to its owning user).
+    async fn revoke_mcp_token(&self, user_id: Uuid, jti: &str) -> Result<bool>;
+
+    /// List all MCP tokens for a user (inventory; includes revoked/expired).
+    async fn list_mcp_tokens(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::models::McpTokenNode>>;
+
+    /// Permanently remove a user's dead MCP token records (revoked or
+    /// expired). Never removes an active token. Returns the count removed.
+    async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64>;
 }
