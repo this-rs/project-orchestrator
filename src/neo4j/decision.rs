@@ -1009,10 +1009,10 @@ impl Neo4jClient {
 
 #[cfg(test)]
 mod parent_existence_tests {
-    use crate::neo4j::traits::*;
     use super::super::models::{DecisionNode, DecisionStatus};
     use super::super::traits::GraphStore;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
     use uuid::Uuid;
 
     fn dummy_decision(task_id: Uuid) -> DecisionNode {
@@ -1087,8 +1087,8 @@ mod parent_existence_tests {
 
 #[cfg(test)]
 mod injection_tests {
-    use crate::neo4j::traits::*;
     use super::safe_entity_label;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn entity_label_is_whitelisted() {

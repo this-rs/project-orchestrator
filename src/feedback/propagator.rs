@@ -481,7 +481,7 @@ async fn handle_high_activation(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     #[tokio::test]
     async fn test_propagate_positive_feedback() {

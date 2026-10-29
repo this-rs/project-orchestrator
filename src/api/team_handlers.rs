@@ -195,7 +195,7 @@ pub async fn get_team(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     fn req(kind: Option<&str>) -> TeamMessageRequest {
         TeamMessageRequest {

@@ -412,10 +412,10 @@ impl Neo4jClient {
 
 #[cfg(test)]
 mod parent_existence_tests {
-    use crate::neo4j::traits::*;
     use super::super::models::{ReleaseNode, ReleaseStatus};
     use super::super::traits::GraphStore;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
     use uuid::Uuid;
 
     fn dummy_release(project_id: Uuid) -> ReleaseNode {

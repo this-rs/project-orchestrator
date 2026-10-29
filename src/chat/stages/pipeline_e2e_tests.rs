@@ -15,7 +15,7 @@ use crate::neo4j::traits::*;
 
 #[cfg(test)]
 mod tests {
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use std::sync::Arc;
     use std::time::Instant;
 

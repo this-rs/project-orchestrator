@@ -38,8 +38,8 @@ use crate::chat::provider::settings::{
 use crate::chat::provider::store as provider_store;
 use crate::events::{EntityType, EventEmitter};
 use crate::neo4j::models::{AlertNode, AlertSeverity};
-use crate::neo4j::GraphStore;
 use crate::neo4j::traits::*;
+use crate::neo4j::GraphStore;
 use crate::vault::VaultService;
 
 /// `alert_type` under which a newly released model is recorded. Doubles as
@@ -1136,7 +1136,7 @@ pub(crate) fn live_snapshot_from_listing(page: serde_json::Value) -> CatalogSnap
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_derive_family_version_known_families() {

@@ -373,7 +373,7 @@ pub fn render_context(nonce: &str, resolved: &[RefResolution]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::refs::access::{RefMeta, ScopeRule};
     use crate::refs::test_support::{store_with_document, world};
     use async_trait::async_trait;

@@ -129,7 +129,7 @@ mod tests {
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::WorkspaceNode;
     use crate::neo4j::traits::GraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use std::sync::Arc;
     use uuid::Uuid;
 

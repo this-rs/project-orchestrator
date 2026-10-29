@@ -1806,7 +1806,7 @@ pub fn rank_skills(
 #[cfg(test)]
 mod rank_tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::skills::{SkillNode, SkillStatus};
 
     fn skill(name: &str, project_id: Option<Uuid>) -> SkillNode {
@@ -1884,8 +1884,8 @@ use crate::neo4j::traits::*;
 }
 #[cfg(test)]
 mod tests {
-    use crate::neo4j::traits::*;
     use super::*;
+    use crate::neo4j::traits::*;
     use crate::notes::models::{NoteImportance, NoteScope, NoteStatus, NoteType};
     use crate::skills::models::{SkillNode, SkillStatus, SkillTrigger};
     use chrono::Utc;

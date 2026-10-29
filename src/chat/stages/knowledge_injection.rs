@@ -1827,7 +1827,7 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     // ── currency check: newer knowledge wins ────────────────────────────
 
@@ -3638,10 +3638,10 @@ use crate::neo4j::traits::*;
 /// from being injected twice or where it has no business.
 #[cfg(test)]
 mod pinned_settings_tests {
-    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::enrichment::ParallelEnrichmentStage;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
     use crate::notes::{Note, NoteType};
 
     fn stage(graph: Arc<MockGraphStore>, configured: Vec<Uuid>) -> KnowledgeInjectionStage {

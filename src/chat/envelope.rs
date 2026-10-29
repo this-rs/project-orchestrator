@@ -777,7 +777,7 @@ pub fn conversation_spawned_by(parent_session_id: Uuid) -> String {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::test_helpers::test_chat_session;
 
     struct FakeLive {

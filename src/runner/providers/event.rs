@@ -334,10 +334,10 @@ async fn plan_of_event(graph: &dyn GraphStore, event: &CrudEvent) -> Option<uuid
 
 #[cfg(test)]
 mod tests {
-    use crate::neo4j::traits::*;
     use super::*;
     use crate::events::{CrudAction, EntityType};
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
     use crate::runner::dispatch::tests::{runnable_plan, trigger_of, RecordingStarter};
     use crate::runner::models::Trigger;
     use crate::runner::trigger::TriggerEngine;

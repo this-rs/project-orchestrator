@@ -737,7 +737,7 @@ pub async fn update_skill_lifecycle(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     fn make_skill(status: SkillStatus, energy: f64, cohesion: f64) -> SkillNode {
         let mut skill = SkillNode::new(Some(Uuid::new_v4()), "Test Skill");

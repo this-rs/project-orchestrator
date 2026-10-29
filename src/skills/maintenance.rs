@@ -884,7 +884,7 @@ async fn count_stuck_tasks(graph_store: &dyn GraphStore, project_id: Uuid) -> us
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_default_config() {

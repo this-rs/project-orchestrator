@@ -12745,8 +12745,8 @@ pub(crate) mod tests {
 mod retry_plan_task_tests {
     use super::*;
     use crate::neo4j::models::TaskStatus;
+    use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
-use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_auth_config, test_bearer_token, test_task};
     use axum::body::Body;
@@ -13331,8 +13331,8 @@ use crate::neo4j::traits::*;
 
 #[cfg(test)]
 mod fabric_emit_tests {
-    use crate::neo4j::traits::*;
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn fabric_refresh_helpers_emit_the_expected_graph_events() {
@@ -13370,9 +13370,9 @@ fn transport_label(state: Option<crate::events::TransportState>) -> &'static str
 
 #[cfg(test)]
 mod transport_label_tests {
-    use crate::neo4j::traits::*;
     use super::transport_label;
     use crate::events::TransportState;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn a_live_connection_is_the_only_thing_that_reads_connected() {

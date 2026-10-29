@@ -345,9 +345,9 @@ fn sanitize_paths(content: &str, project_root: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::neo4j::traits::*;
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
 
     #[tokio::test]
     async fn test_export_skill_basic() {

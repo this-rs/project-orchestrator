@@ -74,7 +74,7 @@ pub async fn load_routing(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     #[tokio::test]
     async fn load_routing_reads_project_over_global_over_default() {

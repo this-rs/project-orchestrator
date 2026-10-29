@@ -367,7 +367,7 @@ pub async fn promote_battle_tested_notes(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn metrics_defaults_to_zero() {

@@ -618,7 +618,7 @@ pub async fn list_execution_place_events(
 mod tests {
     use super::*;
     use crate::api::handlers::{delegate_task, DelegateTaskRequest};
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use std::sync::Arc;
 
     const OWNER: &str = "22222222-2222-2222-2222-222222222222";

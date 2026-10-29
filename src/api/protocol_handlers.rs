@@ -2206,7 +2206,7 @@ pub async fn validate_all_protocols(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::protocol::StateType;
 
     /// Helper: build a minimal ProtocolState for testing.

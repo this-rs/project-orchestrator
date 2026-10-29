@@ -819,11 +819,11 @@ impl Neo4jClient {
 
 #[cfg(test)]
 mod tests {
-    use crate::neo4j::traits::*;
     use super::*;
     use crate::neo4j::batch::BATCH_SIZE;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::GraphStore;
+    use crate::neo4j::traits::*;
 
     fn a_document(project_id: Option<Uuid>) -> Document {
         Document {

@@ -1118,8 +1118,8 @@ flag for human attention via a high-importance gotcha note.",
 
 #[cfg(test)]
 mod tests {
-    use crate::neo4j::traits::*;
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_runner_protocol_defs_count() {

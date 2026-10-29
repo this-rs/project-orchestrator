@@ -1414,7 +1414,6 @@ pub async fn collect_transverse_graph(
 
 #[cfg(test)]
 mod transverse_graph_tests {
-    use crate::neo4j::traits::*;
     //! The transverse layer is the answer to "what belongs to no project, and
     //! where has it been used". Both halves are pinned here: the shape (real
     //! node types, every node marked global, carriers carrying their count) and
@@ -1422,7 +1421,8 @@ mod transverse_graph_tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::GraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::protocol::Protocol;
     use crate::skills::{SkillNode, SkillStatus};
     use crate::test_helpers::{test_note, test_project};
@@ -1505,13 +1505,13 @@ use crate::neo4j::traits::*;
 
 #[cfg(test)]
 mod knowledge_layer_tests {
-    use crate::neo4j::traits::*;
     //! The knowledge layer used to stop at 50 notes whatever `limit` said:
     //! `NoteFilters::limit` was left empty, so `list_notes` applied its own
     //! default and the caller's limit never applied. A project with 60 notes
     //! showed 50 and said nothing.
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
     use crate::test_helpers::{test_note, test_project};
 
     #[tokio::test]

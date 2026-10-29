@@ -378,7 +378,7 @@ fn slug_desc(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::episodes::models::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use chrono::Utc;
 
     fn sample_episode() -> Episode {

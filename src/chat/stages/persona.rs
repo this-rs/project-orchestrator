@@ -168,7 +168,7 @@ mod tests {
     use crate::chat::enrichment::ParallelEnrichmentStage;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{PersonaNode, PersonaStatus};
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use uuid::Uuid;
 
     fn make_input(message: &str, project_id: Option<Uuid>) -> EnrichmentInput {

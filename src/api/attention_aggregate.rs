@@ -1218,7 +1218,7 @@ mod tests {
     use crate::chat::types::ChatEvent;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{AlertNode, AlertSeverity, SessionLinkKind, SessionLinkRow};
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::notes::{NoteImportance, NoteScope};
     use crate::protocol::{Protocol, ProtocolRun};
     use crate::runner::models::TriggerSource;

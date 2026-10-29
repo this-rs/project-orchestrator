@@ -1209,7 +1209,7 @@ mod tests {
         ConstraintNode, ConstraintType, DecisionNode, DecisionStatus, StepNode, StepStatus,
         TaskNode, TaskStatus,
     };
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::notes::NoteScope;
     use crate::plan::models::{AgentContext, CodeReference, ContextNote, FileContext};
 

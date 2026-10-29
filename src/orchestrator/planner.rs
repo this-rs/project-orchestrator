@@ -1788,7 +1788,7 @@ impl ImplementationPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_plan_request_serde_roundtrip() {

@@ -118,7 +118,7 @@ impl ParallelEnrichmentStage for UserProfileStage {
 mod tests {
     use super::*;
     use crate::chat::enrichment::EnrichmentInput;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use std::sync::Arc;
     use uuid::Uuid;
 

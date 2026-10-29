@@ -380,7 +380,7 @@ pub async fn wait_ready_then_auth_ok(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::test_helpers::test_auth_config;
     use axum::http::HeaderMap;
 

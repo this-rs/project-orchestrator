@@ -424,14 +424,14 @@ pub async fn get_deployment_matrix(
 
 #[cfg(test)]
 mod tests {
-    use crate::neo4j::traits::*;
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
     use crate::events::CrudAction;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::GraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::orchestrator::watcher::FileWatcher;
     use crate::orchestrator::Orchestrator;
     use crate::test_helpers::{

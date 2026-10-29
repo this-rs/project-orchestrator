@@ -303,7 +303,7 @@ impl Executor for SystemExecutor {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::protocol::ProtocolTransition;
     use uuid::Uuid;
 

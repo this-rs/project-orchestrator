@@ -2288,7 +2288,7 @@ mod tests {
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_bearer_token, test_chat_session};
     use axum::body::Body;
@@ -6056,9 +6056,9 @@ fn switch_error(error: anyhow::Error, session_id: &str) -> AppError {
 
 #[cfg(test)]
 mod switch_provider_tests {
-    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::types::SwitchProviderError;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn an_unknown_session_is_a_404_that_names_it() {
@@ -6160,11 +6160,11 @@ pub(crate) fn cancel_error(error: anyhow::Error) -> AppError {
 
 #[cfg(test)]
 mod file_scope_lift_tests {
-    use crate::neo4j::traits::*;
     use super::person_lifts_file_scope;
     use crate::auth::jwt::{Claims, TOKEN_TYPE_AGENT_SESSION, TOKEN_TYPE_MCP};
     use crate::chat::envelope::SpawnCaller;
     use crate::chat::types::ChatRequest;
+    use crate::neo4j::traits::*;
 
     fn person() -> Claims {
         Claims {
@@ -6849,8 +6849,8 @@ pub mod anchors {
         use crate::chat::anchor_resolver::resolve_session_scope;
         use crate::graph::neighborhood::RawNode;
         use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::*;
         use crate::neo4j::GraphStore;
-use crate::neo4j::traits::*;
         use crate::test_helpers::{
             router_with_auth_and_events, test_bearer_token, test_chat_session, test_project_named,
         };

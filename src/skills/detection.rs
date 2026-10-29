@@ -977,7 +977,7 @@ pub async fn generate_triggers_for_skills(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     /// Helper: create a set of SYNAPSE edges forming 3 distinct clusters.
     fn make_3_clusters() -> Vec<(String, String, f64)> {

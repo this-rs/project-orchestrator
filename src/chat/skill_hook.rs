@@ -776,7 +776,7 @@ impl nexus_claude::HookCallback for SkillActivationHook {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use nexus_claude::{HookCallback, HookContext, HookInput};
 
     /// Helper to create a minimal HookContext for tests

@@ -425,7 +425,7 @@ pub async fn execute_actions(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     /// Helper to build metrics with defaults.
     fn healthy_metrics() -> HomeostasisMetrics {

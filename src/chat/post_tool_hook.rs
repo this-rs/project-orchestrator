@@ -324,7 +324,7 @@ impl nexus_claude::HookCallback for PostToolUseRedirectHook {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use nexus_claude::{HookCallback, HookContext};
 
     fn test_context() -> HookContext {

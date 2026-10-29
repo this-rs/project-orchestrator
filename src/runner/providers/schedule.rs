@@ -283,9 +283,9 @@ fn field_matches(field: &str, value: u32, min: u32, max: u32) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use crate::neo4j::traits::*;
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
     use crate::runner::dispatch::tests::{runnable_plan, trigger_of, RecordingStarter};
     use crate::runner::trigger::TriggerEngine;
     use chrono::TimeZone;

@@ -353,7 +353,7 @@ mod tests {
     use crate::api::handlers::ServerState;
     use crate::ingress::{IngressConfig, IngressRuntime};
     use crate::neo4j::mock::MockGraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::runner::{Trigger, TriggerType};
     use crate::vault::grants::{GrantScope, SecretSelector};
     use axum::http::Request;

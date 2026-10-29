@@ -2266,7 +2266,7 @@ fn fuse_dense_and_lexical(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::test_helpers::*;
 
     // -- Hybrid ranking: dense ∪ lexical, fused by RRF ----------------------

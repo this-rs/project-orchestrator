@@ -5885,7 +5885,7 @@ impl Clone for PlanRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::runner::models::TriggerSource;
 
     /// Mutex to serialize tests that touch global RUNNER_STATE / RUNNER_CANCEL

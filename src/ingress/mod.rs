@@ -31,8 +31,8 @@ pub async fn purge_expired(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
-use crate::neo4j::traits::*;
 
     fn event(trigger_id: uuid::Uuid, received_at: chrono::DateTime<chrono::Utc>) -> ExternalEvent {
         ExternalEvent {

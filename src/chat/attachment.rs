@@ -308,7 +308,7 @@ mod tests {
     use super::*;
     use crate::api::attention::RequestKind;
     use crate::neo4j::mock::MockGraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::test_helpers::test_chat_session;
     use std::sync::atomic::Ordering;
 

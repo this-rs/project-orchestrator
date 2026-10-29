@@ -1065,7 +1065,7 @@ fn user_message_source(m: &UserMessage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use nexus_claude::{TextContent, ToolResultContent};
     use serde_json::json;
 

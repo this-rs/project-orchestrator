@@ -346,7 +346,7 @@ mod tests {
     use crate::lifecycle::models::{LifecycleActionType, LifecycleHook, LifecycleScope};
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::GraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::orchestrator::Orchestrator;
 
     // ── entity_type_to_scope ──

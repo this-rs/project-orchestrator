@@ -23,8 +23,8 @@ use crate::chat::provider::cognitive::load_routing;
 use crate::chat::provider::cognitive::signature::TaskSignature;
 use crate::chat::provider::cognitive::store::RoutingArmStore;
 use crate::neo4j::agent_execution::{AgentExecutionNode, AgentExecutionStatus};
-use crate::neo4j::GraphStore;
 use crate::neo4j::traits::*;
+use crate::neo4j::GraphStore;
 
 /// Every (instance, model) a project could use, with its facts. The scorer's
 /// wiring supplies the real one; tests supply a fixed list.
@@ -364,8 +364,8 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use crate::neo4j::traits::*;
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[tokio::test]
     async fn the_chat_pool_is_the_managers_pool_and_empty_when_no_router_is_wired() {
@@ -392,7 +392,6 @@ mod tests {
     /// B-R3: the manager's pool takes Claude Code's models from the live Anthropic
     /// catalog, each with the window the Models API reports (`max_input_tokens`).
     mod claude_code_window {
-        use crate::neo4j::traits::*;
         use super::*;
         use crate::chat::model_catalog::{refreshed_cache_for_test, ModelCatalogCache};
         use crate::chat::provider::cognitive::candidates::{
@@ -402,7 +401,8 @@ mod tests {
         use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
         use crate::chat::provider::cognitive::store::InMemoryRoutingStore;
         use crate::chat::provider::resolver::CLAUDE_CODE;
-use crate::neo4j::traits::*;
+        use crate::neo4j::traits::*;
+        use crate::neo4j::traits::*;
 
         /// The Claude Code part of the pool of a manager routed over `catalog`,
         /// Claude Code measured healthy (no CLI is needed for the pool itself).

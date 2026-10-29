@@ -37,8 +37,8 @@ use super::provider::settings::{GLOBAL, ROLES_KEY};
 use super::types::{ChatEvent, ChatRequest, SessionRoutingRequest};
 use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::routing::Neo4jRoutingStore;
-use crate::neo4j::GraphStore;
 use crate::neo4j::traits::*;
+use crate::neo4j::GraphStore;
 use crate::test_helpers::mock_app_state;
 
 const SIMPLE: &str = "rename this variable";

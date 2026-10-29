@@ -169,7 +169,7 @@ pub async fn route_lifecycle_protocol(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::test_helpers::test_project;
 
     /// Helper: create a plan in the mock store with a project.

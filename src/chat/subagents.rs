@@ -1478,7 +1478,7 @@ pub(crate) mod panic_injection {
 mod tests {
     use super::*;
     use crate::neo4j::traits::GraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     fn bare_manager() -> (Arc<crate::neo4j::mock::MockGraphStore>, Arc<ChatManager>) {
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());

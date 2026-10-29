@@ -311,13 +311,13 @@ fn snake_case_from_debug(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::neo4j::traits::*;
     use super::*;
     use crate::lifecycle::{
         LifecycleActionType, LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest,
     };
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::GraphStore;
+    use crate::neo4j::traits::*;
 
     fn make_hook(name: &str, scope: LifecycleScope, on_status: &str) -> LifecycleHook {
         LifecycleHook::new(

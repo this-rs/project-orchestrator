@@ -2387,7 +2387,7 @@ fn protected_routes() -> Router<OrchestratorState> {
 mod tests {
     use super::*;
     use crate::events::EventBus;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn static_assets_detected_but_spa_routes_with_dots_are_not() {

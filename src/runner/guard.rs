@@ -480,7 +480,7 @@ fn hash_tool_call(tool: &str, input: &serde_json::Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_guard_config_default() {

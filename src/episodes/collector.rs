@@ -14,8 +14,8 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::episodes::models::*;
-use crate::neo4j::GraphStore;
 use crate::neo4j::traits::*;
+use crate::neo4j::GraphStore;
 
 /// Collect a complete Episode from a completed ProtocolRun.
 ///
@@ -379,7 +379,7 @@ impl DistillationBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use chrono::Utc;
 
     fn sample_episode() -> Episode {

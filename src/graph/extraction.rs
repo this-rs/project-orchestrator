@@ -377,7 +377,7 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{FunctionNode, Visibility};
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::test_helpers::test_project;
 
     /// The per-file SYNAPSE cap defaults to a BOUNDED value: `0` (unbounded) was the

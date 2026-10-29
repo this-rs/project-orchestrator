@@ -392,7 +392,7 @@ pub async fn reason_feedback(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use serde_json::json;
 
     #[test]

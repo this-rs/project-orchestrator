@@ -734,7 +734,7 @@ fn compute_failure_rate(runs: &[crate::protocol::models::ProtocolRun]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     fn make_pattern(
         pattern_type: PatternType,

@@ -5895,7 +5895,7 @@ pub struct SyncResult {
 mod tests {
     use super::*;
     use crate::events::{CrudAction, EntityType as EventEntityType, EventBus, HybridEmitter};
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::parser::FunctionCall;
     use crate::test_helpers::*;
 

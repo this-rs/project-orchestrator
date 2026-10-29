@@ -59,8 +59,8 @@ use sha2::Sha256;
 
 use super::endpoint_guard::{origin_of, validate_endpoint, EndpointPolicy};
 use super::settings::project_scope;
-use crate::neo4j::GraphStore;
 use crate::neo4j::traits::*;
+use crate::neo4j::GraphStore;
 use crate::vault::grants::Denied;
 use crate::vault::service::ServiceError;
 use crate::vault::VaultService;
@@ -1717,7 +1717,7 @@ pub async fn attach(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::vault::grants::{GrantScope, SecretSelector};
     use chrono::Duration;
     use nexus_claude::agent::{PolicyMode, ToolCategory};

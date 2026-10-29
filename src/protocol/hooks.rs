@@ -711,7 +711,7 @@ async fn run_scheduled_protocols(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::protocol::{
         Protocol, ProtocolCategory, ProtocolState, ProtocolTransition, TriggerConfig, TriggerMode,
     };

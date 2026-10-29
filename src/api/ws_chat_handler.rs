@@ -1710,7 +1710,7 @@ fn control_frame(event: &crate::chat::types::ChatEvent) -> Option<String> {
 mod tests {
     use super::*;
     use crate::chat::types::ChatEvent;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use std::collections::HashSet;
     use tokio::sync::broadcast;
 

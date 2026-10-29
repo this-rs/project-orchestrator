@@ -464,7 +464,7 @@ async fn boost_skill_member_notes(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     /// T0f-bis: an activated skill warms its member notes of the session's
     /// project only.

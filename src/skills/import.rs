@@ -813,10 +813,10 @@ async fn create_import_synapses(graph_store: &dyn GraphStore, note_ids: &[Uuid])
 
 #[cfg(test)]
 mod tests {
-    use crate::neo4j::traits::*;
     use super::*;
     use crate::identity::InstanceIdentity;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
     use crate::skills::models::SkillTrigger;
     use crate::skills::package::*;
 

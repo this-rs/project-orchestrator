@@ -907,7 +907,7 @@ pub async fn cited_refs_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     #[tokio::test]
     async fn test_session_cache_dedup() {
@@ -1521,8 +1521,8 @@ use crate::neo4j::traits::*;
 
 #[cfg(test)]
 mod cited_tests {
-    use crate::neo4j::traits::*;
     use super::*;
+    use crate::neo4j::traits::*;
     use crate::refs::test_support::world;
 
     #[tokio::test]

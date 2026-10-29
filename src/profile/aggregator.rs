@@ -256,7 +256,7 @@ fn apply_ema_updates(profile: &mut UserProfile, updates: &PendingUpdates) {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::profile::collector::create_signal_channel;
 
     #[test]

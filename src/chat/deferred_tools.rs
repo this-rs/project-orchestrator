@@ -235,7 +235,7 @@ mod tests {
     use super::*;
     use crate::mcp::tools::all_tools;
     use crate::neo4j::mock::MockGraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()

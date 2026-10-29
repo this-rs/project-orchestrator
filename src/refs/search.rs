@@ -321,8 +321,8 @@ where
 mod tests {
     use super::*;
     use crate::neo4j::models::PlanNode;
+    use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
-use crate::neo4j::traits::*;
     use crate::refs::access::Disclosure;
     use crate::refs::test_support::{task_titled, user, world, Spy, World};
     use crate::refs::wire::ScopeLabel;
@@ -827,8 +827,8 @@ use crate::neo4j::traits::*;
 
 #[cfg(test)]
 mod fan_out_tests {
-    use crate::neo4j::traits::*;
     use super::*;
+    use crate::neo4j::traits::*;
     use crate::refs::resolvers::Candidates;
     use crate::refs::test_support::{user, world};
     use crate::refs::types::RefId;
@@ -971,8 +971,8 @@ mod fan_out_tests {
 
 #[cfg(test)]
 mod pushdown_tests {
-    use crate::neo4j::traits::*;
     use super::*;
+    use crate::neo4j::traits::*;
     use crate::refs::test_support::{note_with, user, world};
 
     /// The mock honours `workspace_slug` for notes (not for plans or tasks),

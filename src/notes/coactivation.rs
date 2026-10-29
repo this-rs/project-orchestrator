@@ -121,7 +121,7 @@ pub async fn session_project_id(graph: &dyn GraphStore, session_id: Uuid) -> Opt
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::notes::models::NoteType;
 
     fn note(project: Option<Uuid>) -> Note {

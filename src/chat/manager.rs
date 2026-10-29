@@ -19230,7 +19230,7 @@ pub(crate) fn session_is_expired(
 #[cfg(test)]
 mod idle_expiry_tests {
     use super::{background_task_is_idle_dead, process_alive, session_is_expired};
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use std::time::Duration;
 
     const T: Duration = Duration::from_secs(1800);
@@ -19681,8 +19681,8 @@ pub(crate) fn is_runner_spawned(spawned_by: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod runner_spawn_tests {
-    use crate::neo4j::traits::*;
     use super::is_runner_spawned;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn detects_runner_sessions() {
@@ -19704,8 +19704,8 @@ mod runner_spawn_tests {
 
 #[cfg(test)]
 mod tests {
-    use crate::neo4j::traits::*;
     use super::*;
+    use crate::neo4j::traits::*;
 
     /// The review of #688 at 60a277e7 (finding D): a provider kind that does not
     /// serialize to a name falls back to `unknown` (no session grant), never to a
@@ -29299,7 +29299,7 @@ mod tests {
     mod activity {
         use super::super::{count_background_tasks, LiveSessionSnapshot};
         use crate::chat::types::{BackgroundTaskInfo, BackgroundTaskKind};
-use crate::neo4j::traits::*;
+        use crate::neo4j::traits::*;
         use uuid::Uuid;
 
         fn task(kind: BackgroundTaskKind, dying: bool) -> BackgroundTaskInfo {
@@ -36846,8 +36846,8 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod agent_env_tests {
-    use crate::neo4j::traits::*;
     use super::server_secrets_to_hide;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn only_the_server_secrets_that_exist_are_hidden() {
@@ -36891,13 +36891,13 @@ mod agent_env_tests {
 /// a turn whose message carries `#` references (H3 enrichment + refs_v1).
 #[cfg(test)]
 mod refs_turn_services_tests {
-    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::agent_runtime::TurnServices;
     use crate::chat::enrichment::{
         EnrichmentConfig, EnrichmentInput, EnrichmentPipeline, EnrichmentSource,
         ParallelEnrichmentStage, StageOutput,
     };
+    use crate::neo4j::traits::*;
     use crate::refs::types::{EntityRef, RefKind};
     use std::sync::Mutex as StdMutex;
 
@@ -36986,12 +36986,12 @@ mod refs_turn_services_tests {
 
 #[cfg(test)]
 mod auto_open_bounds_tests {
-    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::provider::cognitive::ProviderRoutingMode;
     use crate::chat::provider::resolver::REMOTE_PREFIX;
     use crate::chat::provider::settings::InstanceRecord;
     use crate::chat::types::RoutingPoolEntry;
+    use crate::neo4j::traits::*;
 
     fn instance(id: &str, credential_ref: &str) -> InstanceRecord {
         InstanceRecord {
@@ -37332,8 +37332,8 @@ mod auto_open_bounds_tests {
 /// slow re-injection lost the memory and the feedback too).
 #[cfg(test)]
 mod agent_step_budget_tests {
-    use crate::neo4j::traits::*;
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[tokio::test]
     async fn a_step_past_its_budget_is_said_and_the_next_one_still_runs() {
@@ -37368,9 +37368,9 @@ mod agent_step_budget_tests {
 /// window; and the end-of-turn steps each under their own budget.
 #[cfg(test)]
 mod held_context_tests {
-    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::agent_runtime::{TurnOutcome, TurnServices};
+    use crate::neo4j::traits::*;
 
     fn test_config() -> ChatConfig {
         ChatConfig {
@@ -37890,7 +37890,6 @@ mod held_context_tests {
 /// reads it. Played with the REAL services and the real decision.
 #[cfg(test)]
 mod image_turn_services_tests {
-    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::agent_hooks::{PoolSource, TurnRouter, TurnRouterSpec, TurnRouting};
     use crate::chat::agent_runtime::TurnServices;
@@ -37900,6 +37899,7 @@ mod image_turn_services_tests {
     use crate::chat::provider::cognitive::decision::{CognitiveDecision, DecideRequest, Decider};
     use crate::chat::provider::cognitive::scorer::PriorHints;
     use crate::chat::provider::cognitive::{LearningStage, ProviderRoutingMode, RoutingSettings};
+    use crate::neo4j::traits::*;
 
     struct Real;
 
@@ -38104,11 +38104,11 @@ pub(crate) mod answer_probe {
 /// the rest of the answer (the lasting rule's write) is done (FLAKY-PARITE-ALWAYS).
 #[cfg(test)]
 mod grant_before_the_cli_tests {
-    use crate::neo4j::traits::*;
     use super::super::lasting_rules::{LastingRuleStore, LastingScope};
     use super::super::session_grants::{cover, AskedCall, Asker, Cover, SessionGrants};
     use super::super::types::PermissionAnswerScope;
     use super::*;
+    use crate::neo4j::traits::*;
 
     /// The call the session's pending `req-1` asks (`test_support`).
     fn ls() -> AskedCall {
@@ -38310,10 +38310,10 @@ mod grant_before_the_cli_tests {
 /// like an answer of the user (Claude Code engine).
 #[cfg(test)]
 mod granted_answer_clock_tests {
-    use crate::neo4j::traits::*;
     use super::super::session_grants::{AskedCall, Asker, SessionGrants};
     use super::super::tool_clock::ToolClock;
     use super::*;
+    use crate::neo4j::traits::*;
     use serde_json::json;
 
     fn granted() -> std::sync::Mutex<SessionGrants> {

@@ -175,7 +175,7 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{ComponentType, ProjectNode, WorkspaceNode};
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     fn temp_root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(

@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use super::envelope::MAX_LIVE_CHILDREN;
 use super::manager::ChatManager;
 use super::provider::settings::GLOBAL;
-use crate::neo4j::GraphStore;
 use crate::neo4j::traits::*;
+use crate::neo4j::GraphStore;
 
 /// Key of the stored document, under the [`GLOBAL`] scope.
 pub const DELEGATION_LIMITS_KEY: &str = "delegation_limits";
@@ -143,7 +143,7 @@ impl ChatManager {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn only_a_cap_between_one_and_the_ceiling_is_allowed() {

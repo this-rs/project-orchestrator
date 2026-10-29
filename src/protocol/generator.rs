@@ -138,7 +138,7 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::GraphStore;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::protocol::{
         GeneratorConfig, LinkingStrategy, Protocol, ProtocolCategory, ProtocolState,
         ProtocolTransition, StateType,

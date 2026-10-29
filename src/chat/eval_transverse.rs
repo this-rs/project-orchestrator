@@ -1584,7 +1584,7 @@ fn gate(run: &Run) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     /// The run of the CI: the whole fixture set, the 10 000-resolution replay,
     /// the report written, then the gate.

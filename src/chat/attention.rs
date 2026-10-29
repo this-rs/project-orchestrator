@@ -368,7 +368,7 @@ fn question_text_and_options(questions: &serde_json::Value) -> (String, Vec<Ques
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use chrono::TimeZone;
     use serde_json::json;
 

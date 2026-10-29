@@ -42,8 +42,8 @@ use super::types::{
     BackgroundTaskInfo, ChatEvent, PendingMessage, PendingMessageKind, PermissionAnswerScope,
 };
 use crate::neo4j::models::ChatEventRecord;
-use crate::neo4j::GraphStore;
 use crate::neo4j::traits::*;
+use crate::neo4j::GraphStore;
 
 const BROADCAST_BUFFER: usize = 1024;
 
@@ -3490,7 +3490,7 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod mask_tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::vault::mask::Masker;
     use nexus_claude::agent::ToolOutput;
 
@@ -3918,9 +3918,9 @@ use crate::neo4j::traits::*;
 /// session meanwhile.
 #[cfg(test)]
 mod turn_race_tests {
-    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
+    use crate::neo4j::traits::*;
     use std::sync::atomic::AtomicBool as StdAtomicBool;
     use tokio::sync::Notify;
 
@@ -4040,9 +4040,9 @@ mod turn_race_tests {
 /// racing for one session).
 #[cfg(test)]
 mod adopt_tests {
-    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
+    use crate::neo4j::traits::*;
 
     /// The handle replaced is ended: its listeners (NATS) stop, its provider
     /// session is closed. Otherwise both handles answer the same NATS subjects and
@@ -4945,8 +4945,8 @@ mod adopt_tests {
 
 #[cfg(test)]
 mod image_tests {
-    use crate::neo4j::traits::*;
     use super::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn the_turn_input_is_the_text_then_the_images_in_order() {
@@ -5155,10 +5155,10 @@ mod image_tests {
 /// of the Claude Code engine (`chat::session_record`).
 #[cfg(test)]
 mod session_record_tests {
-    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
     use nexus_claude::agent::{Cost, CostBasis};
 
     fn done(usd: Option<f64>) -> AgentEvent {
@@ -5497,9 +5497,9 @@ mod session_record_tests {
 /// constant of its own.
 #[cfg(test)]
 mod retry_config_tests {
-    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
+    use crate::neo4j::traits::*;
 
     fn overloaded() -> AgentEvent {
         AgentEvent::Done {
@@ -5581,9 +5581,9 @@ mod retry_config_tests {
 /// the instance answers — without replaying anything the turn had already run.
 #[cfg(test)]
 mod outage_hold_tests {
-    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
+    use crate::neo4j::traits::*;
 
     fn unreachable() -> ProviderError {
         ProviderError::EndpointUnreachable {
@@ -5774,9 +5774,9 @@ mod outage_hold_tests {
 /// `after_turn` sees what the turn did, its events go out and its hints are played.
 #[cfg(test)]
 mod after_turn_tests {
-    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
+    use crate::neo4j::traits::*;
     use std::sync::Mutex as StdMutex;
 
     fn done() -> AgentEvent {
@@ -6137,9 +6137,9 @@ mod after_turn_tests {
 
 #[cfg(test)]
 mod retry_stop_tests {
-    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
+    use crate::neo4j::traits::*;
 
     /// A Stop during the pause before a retry ends the turn at once: no ten-second
     /// wait, no retry sent after the Stop.
@@ -6215,9 +6215,9 @@ mod retry_stop_tests {
 /// re-failing on a dead process.
 #[cfg(test)]
 mod process_exit_tests {
-    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
+    use crate::neo4j::traits::*;
 
     /// A `ProcessExited` terminal event ends the turn, is said as a session error,
     /// and removes the handle from the runtime: the next message takes the resume
@@ -6277,9 +6277,9 @@ mod process_exit_tests {
 /// retries ran out, not one stopped during the pause before a retry.
 #[cfg(test)]
 mod answered_tests {
-    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
+    use crate::neo4j::traits::*;
     use std::sync::Mutex as StdMutex;
 
     /// The terminal-result fields of one turn, captured for assertions.
@@ -6833,7 +6833,7 @@ mod tool_timing_tests {
     use super::fake::FakeProvider;
     use super::*;
     use crate::neo4j::traits::GraphStore as _;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use serde_json::json;
 
     /// The provider is slow to take the answer and the tool is fast: its result is
@@ -7195,10 +7195,10 @@ use crate::neo4j::traits::*;
 /// keeps the provider's form (the runner and the sub-agents read `is_error` there).
 #[cfg(test)]
 mod stored_interrupted_result_tests {
-    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
 
     #[tokio::test]
     async fn a_stopped_turn_is_stored_neutral_and_broadcast_as_the_provider_said() {

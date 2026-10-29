@@ -18,8 +18,8 @@ use anyhow::Result;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::neo4j::GraphStore;
 use crate::neo4j::traits::*;
+use crate::neo4j::GraphStore;
 use crate::notes::models::{
     MemoryHorizon, Note, NoteFilters, NoteImportance, NoteScope, NoteStatus, NoteType,
 };
@@ -321,7 +321,7 @@ async fn count_auto_learned_notes(graph: &dyn GraphStore, project_id: Uuid) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn maps_pattern_types_correctly() {

@@ -36,8 +36,8 @@ use super::label;
 use super::types::{EntityRef, RefId, RefKind};
 use super::wire::ScopeLabel;
 use crate::neo4j::models::{DecisionNode, DecisionStatus, PlanNode, TaskWithPlan};
-use crate::neo4j::GraphStore;
 use crate::neo4j::traits::*;
+use crate::neo4j::GraphStore;
 use crate::notes::{Note, NoteFilters, NoteType};
 
 /// Most rows a text filter done in memory looks at, per kind.
@@ -704,8 +704,8 @@ impl RefSource for GraphRefSource {
 
 #[cfg(test)]
 mod tests {
-    use crate::neo4j::traits::*;
     use super::*;
+    use crate::neo4j::traits::*;
     use crate::refs::access::{AccessPolicy, Disclosure, Resolution};
     use crate::refs::test_support::{note_with, task_titled, user, world, Spy, World};
     use crate::refs::wire::RefStatus;

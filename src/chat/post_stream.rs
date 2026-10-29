@@ -1366,7 +1366,7 @@ pub(crate) async fn continuation_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     fn base_input() -> ObjectiveCheckInput {
         ObjectiveCheckInput {
@@ -1651,11 +1651,11 @@ use crate::neo4j::traits::*;
 
 #[cfg(test)]
 mod integration_tests {
-    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::types::PendingMessageKind;
     use crate::meilisearch::mock::MockSearchStore;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
     use crate::test_helpers::{test_project_named, test_task_titled};
     use std::collections::HashMap;
@@ -2377,8 +2377,8 @@ mod integration_tests {
 
 #[cfg(test)]
 mod bounded_step_tests {
-    use crate::neo4j::traits::*;
     use super::bounded;
+    use crate::neo4j::traits::*;
     use std::time::Duration;
 
     #[tokio::test]

@@ -482,7 +482,7 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::{FileNode, FunctionNode, Visibility};
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::test_helpers::test_project;
 
     /// Seed a project with files forming two clusters connected by one edge.

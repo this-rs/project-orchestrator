@@ -345,7 +345,7 @@ pub async fn export_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use serde_json::{json, Value};
 
     #[test]

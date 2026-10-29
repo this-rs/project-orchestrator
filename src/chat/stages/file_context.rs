@@ -257,7 +257,7 @@ impl ParallelEnrichmentStage for FileContextStage {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
 
     #[test]
     fn test_extract_file_paths() {

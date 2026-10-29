@@ -184,9 +184,9 @@ impl TriggerEngine {
 
 #[cfg(test)]
 mod tests {
-    use crate::neo4j::traits::*;
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
 
     fn make_trigger(plan_id: Uuid, enabled: bool, cooldown_secs: u64) -> Trigger {
         Trigger {

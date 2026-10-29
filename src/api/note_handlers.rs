@@ -1922,7 +1922,7 @@ mod tests {
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
     use crate::events::EventBus;
-use crate::neo4j::traits::*;
+    use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_bearer_token};
     use axum::body::Body;
@@ -3136,9 +3136,9 @@ use crate::neo4j::traits::*;
 
 #[cfg(test)]
 mod human_confirmation_tests {
-    use crate::neo4j::traits::*;
     use super::confirmed_by_a_person;
     use crate::auth::jwt::{Claims, TOKEN_TYPE_AGENT_SESSION, TOKEN_TYPE_MCP};
+    use crate::neo4j::traits::*;
 
     fn person() -> Claims {
         Claims {
