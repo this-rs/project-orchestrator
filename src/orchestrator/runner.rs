@@ -28,6 +28,7 @@ use walkdir::WalkDir;
 
 use super::context::ContextBuilder;
 use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 /// Normalize a file path to an absolute canonical form.
 /// - Resolves `~` to home directory

@@ -8,6 +8,8 @@ use crate::chat::enrichment::{EnrichmentInput, EnrichmentPipeline};
 use crate::meilisearch::SearchStore;
 use crate::neo4j::models::*;
 use crate::neo4j::GraphStore;
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 use crate::notes::{EntityType, Note, NoteManager};
 use crate::plan::models::*;
 use crate::plan::PlanManager;
@@ -16,7 +18,6 @@ use anyhow::Result;
 use std::sync::Arc;
 use tracing::debug;
 use uuid::Uuid;
-use crate::neo4j::ProjectStore;
 
 /// Builder for creating rich agent context
 pub struct ContextBuilder {

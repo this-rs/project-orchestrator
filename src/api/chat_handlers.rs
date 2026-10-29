@@ -7,13 +7,14 @@ use crate::chat::types::{
     MessageSearchResult, SessionActivity,
 };
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 use axum::{
     extract::{Path, Query, State},
     Json,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::neo4j::ProjectStore;
 
 // ============================================================================
 // Create session + send first message

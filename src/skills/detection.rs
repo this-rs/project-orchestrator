@@ -6,11 +6,12 @@
 
 use crate::graph::algorithms::{compute_cohesion, louvain_communities};
 use crate::graph::{AnalyticsConfig, CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType};
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 use crate::notes::NoteManager;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
-use crate::neo4j::ProjectStore;
 
 /// Notes processed per self-heal backfill batch when the SYNAPSE graph is
 /// found to be under `min_notes_for_detection`. Kept small and single-batch

@@ -9,7 +9,7 @@ use crate::events::trigger::EventTrigger;
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
 use crate::neo4j::document::{Document, DocumentChunk, DocumentChunkHit};
 use crate::neo4j::models::*;
-use crate::neo4j::traits::{GraphStore, ProjectStore, StoreCapabilities};
+use crate::neo4j::traits::{GraphStore, ProjectStore, StoreCapabilities, WorkspaceStore};
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
 };
@@ -882,145 +882,6 @@ impl GraphStore for MockGraphStore {
             // (mock.rs:22) with no begin / commit / rollback.
             explicit_transactions: false,
         }
-    }
-
-    // ========================================================================
-    // Workspace operations
-    // ========================================================================
-
-    async fn create_workspace(&self, workspace: &WorkspaceNode) -> Result<()> {
-        self.workspaces
-            .write()
-            .await
-            .insert(workspace.id, workspace.clone());
-        Ok(())
-    }
-
-    async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceNode>> {
-        self.count_read();
-        Ok(self.workspaces.read().await.get(&id).cloned())
-    }
-
-    async fn get_workspace_by_slug(&self, slug: &str) -> Result<Option<WorkspaceNode>> {
-        Ok(self
-            .workspaces
-            .read()
-            .await
-            .values()
-            .find(|w| w.slug == slug)
-            .cloned())
-    }
-
-    async fn list_workspaces(&self) -> Result<Vec<WorkspaceNode>> {
-        self.log_read("list_workspaces")?;
-        Ok(self.workspaces.read().await.values().cloned().collect())
-    }
-
-    async fn update_workspace(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<String>,
-        metadata: Option<serde_json::Value>,
-        slug: Option<String>,
-    ) -> Result<()> {
-        // Validate slug format + uniqueness if provided
-        if let Some(ref new_slug) = slug {
-            // Format validation
-            let slug_re = regex::Regex::new(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$").unwrap();
-            if new_slug.len() < 2 || new_slug.len() > 64 || !slug_re.is_match(new_slug) {
-                anyhow::bail!(
-                    "Invalid slug '{}'. Slugs must match ^[a-z0-9][a-z0-9-]*[a-z0-9]$ (2-64 chars)",
-                    new_slug
-                );
-            }
-            // Uniqueness check
-            let workspaces = self.workspaces.read().await;
-            for (wid, w) in workspaces.iter() {
-                if *wid != id && w.slug == *new_slug {
-                    anyhow::bail!("Slug '{}' is already taken by another workspace", new_slug);
-                }
-            }
-            drop(workspaces);
-        }
-
-        if let Some(w) = self.workspaces.write().await.get_mut(&id) {
-            if let Some(n) = name {
-                w.name = n;
-            }
-            if let Some(d) = description {
-                w.description = Some(d);
-            }
-            if let Some(m) = metadata {
-                w.metadata = m;
-            }
-            if let Some(s) = slug {
-                w.slug = s;
-            }
-            w.updated_at = Some(Utc::now());
-        }
-        Ok(())
-    }
-
-    async fn delete_workspace(&self, id: Uuid) -> Result<()> {
-        self.workspaces.write().await.remove(&id);
-        self.workspace_projects.write().await.remove(&id);
-        self.workspace_ws_milestones.write().await.remove(&id);
-        self.workspace_resources.write().await.remove(&id);
-        self.workspace_components.write().await.remove(&id);
-        Ok(())
-    }
-
-    async fn add_project_to_workspace(&self, workspace_id: Uuid, project_id: Uuid) -> Result<()> {
-        self.workspace_projects
-            .write()
-            .await
-            .entry(workspace_id)
-            .or_default()
-            .push(project_id);
-        Ok(())
-    }
-
-    async fn remove_project_from_workspace(
-        &self,
-        workspace_id: Uuid,
-        project_id: Uuid,
-    ) -> Result<()> {
-        if let Some(projects) = self.workspace_projects.write().await.get_mut(&workspace_id) {
-            projects.retain(|p| *p != project_id);
-        }
-        Ok(())
-    }
-
-    async fn list_workspace_projects(&self, workspace_id: Uuid) -> Result<Vec<ProjectNode>> {
-        self.count_read();
-        let wp = self.workspace_projects.read().await;
-        let projects = self.projects.read().await;
-        let ids = wp.get(&workspace_id).cloned().unwrap_or_default();
-        Ok(ids
-            .iter()
-            .filter_map(|id| projects.get(id).cloned())
-            .collect())
-    }
-
-    async fn get_project_workspace(&self, project_id: Uuid) -> Result<Option<WorkspaceNode>> {
-        let wp = self.workspace_projects.read().await;
-        let workspaces = self.workspaces.read().await;
-        for (ws_id, proj_ids) in wp.iter() {
-            if proj_ids.contains(&project_id) {
-                return Ok(workspaces.get(ws_id).cloned());
-            }
-        }
-        Ok(None)
-    }
-
-    async fn compute_coupling_matrix(&self, workspace_id: Uuid) -> Result<CouplingMatrix> {
-        let projects = self.list_workspace_projects(workspace_id).await?;
-        Ok(CouplingMatrix {
-            workspace_id,
-            entries: Vec::new(),
-            project_count: projects.len(),
-        })
     }
 
     // ========================================================================
@@ -19344,5 +19205,146 @@ impl ProjectStore for MockGraphStore {
         }
         Ok(())
     }
+}
 
+#[async_trait]
+impl WorkspaceStore for MockGraphStore {
+    // ========================================================================
+    // Workspace operations
+    // ========================================================================
+
+    async fn create_workspace(&self, workspace: &WorkspaceNode) -> Result<()> {
+        self.workspaces
+            .write()
+            .await
+            .insert(workspace.id, workspace.clone());
+        Ok(())
+    }
+
+    async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceNode>> {
+        self.count_read();
+        Ok(self.workspaces.read().await.get(&id).cloned())
+    }
+
+    async fn get_workspace_by_slug(&self, slug: &str) -> Result<Option<WorkspaceNode>> {
+        Ok(self
+            .workspaces
+            .read()
+            .await
+            .values()
+            .find(|w| w.slug == slug)
+            .cloned())
+    }
+
+    async fn list_workspaces(&self) -> Result<Vec<WorkspaceNode>> {
+        self.log_read("list_workspaces")?;
+        Ok(self.workspaces.read().await.values().cloned().collect())
+    }
+
+    async fn update_workspace(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<String>,
+        metadata: Option<serde_json::Value>,
+        slug: Option<String>,
+    ) -> Result<()> {
+        // Validate slug format + uniqueness if provided
+        if let Some(ref new_slug) = slug {
+            // Format validation
+            let slug_re = regex::Regex::new(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$").unwrap();
+            if new_slug.len() < 2 || new_slug.len() > 64 || !slug_re.is_match(new_slug) {
+                anyhow::bail!(
+                    "Invalid slug '{}'. Slugs must match ^[a-z0-9][a-z0-9-]*[a-z0-9]$ (2-64 chars)",
+                    new_slug
+                );
+            }
+            // Uniqueness check
+            let workspaces = self.workspaces.read().await;
+            for (wid, w) in workspaces.iter() {
+                if *wid != id && w.slug == *new_slug {
+                    anyhow::bail!("Slug '{}' is already taken by another workspace", new_slug);
+                }
+            }
+            drop(workspaces);
+        }
+
+        if let Some(w) = self.workspaces.write().await.get_mut(&id) {
+            if let Some(n) = name {
+                w.name = n;
+            }
+            if let Some(d) = description {
+                w.description = Some(d);
+            }
+            if let Some(m) = metadata {
+                w.metadata = m;
+            }
+            if let Some(s) = slug {
+                w.slug = s;
+            }
+            w.updated_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn delete_workspace(&self, id: Uuid) -> Result<()> {
+        self.workspaces.write().await.remove(&id);
+        self.workspace_projects.write().await.remove(&id);
+        self.workspace_ws_milestones.write().await.remove(&id);
+        self.workspace_resources.write().await.remove(&id);
+        self.workspace_components.write().await.remove(&id);
+        Ok(())
+    }
+
+    async fn add_project_to_workspace(&self, workspace_id: Uuid, project_id: Uuid) -> Result<()> {
+        self.workspace_projects
+            .write()
+            .await
+            .entry(workspace_id)
+            .or_default()
+            .push(project_id);
+        Ok(())
+    }
+
+    async fn remove_project_from_workspace(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<()> {
+        if let Some(projects) = self.workspace_projects.write().await.get_mut(&workspace_id) {
+            projects.retain(|p| *p != project_id);
+        }
+        Ok(())
+    }
+
+    async fn list_workspace_projects(&self, workspace_id: Uuid) -> Result<Vec<ProjectNode>> {
+        self.count_read();
+        let wp = self.workspace_projects.read().await;
+        let projects = self.projects.read().await;
+        let ids = wp.get(&workspace_id).cloned().unwrap_or_default();
+        Ok(ids
+            .iter()
+            .filter_map(|id| projects.get(id).cloned())
+            .collect())
+    }
+
+    async fn get_project_workspace(&self, project_id: Uuid) -> Result<Option<WorkspaceNode>> {
+        let wp = self.workspace_projects.read().await;
+        let workspaces = self.workspaces.read().await;
+        for (ws_id, proj_ids) in wp.iter() {
+            if proj_ids.contains(&project_id) {
+                return Ok(workspaces.get(ws_id).cloned());
+            }
+        }
+        Ok(None)
+    }
+
+    async fn compute_coupling_matrix(&self, workspace_id: Uuid) -> Result<CouplingMatrix> {
+        let projects = self.list_workspace_projects(workspace_id).await?;
+        Ok(CouplingMatrix {
+            workspace_id,
+            entries: Vec::new(),
+            project_count: projects.len(),
+        })
+    }
 }

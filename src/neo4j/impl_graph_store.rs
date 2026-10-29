@@ -8,7 +8,7 @@ use uuid::Uuid;
 use super::client::Neo4jClient;
 use super::document::{Document, DocumentChunk, DocumentChunkHit};
 use super::models::*;
-use super::traits::{GraphStore, ProjectStore, StoreCapabilities};
+use super::traits::{GraphStore, ProjectStore, StoreCapabilities, WorkspaceStore};
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
@@ -19,81 +19,6 @@ use crate::plan::models::{TaskDetails, UpdatePlanRequest, UpdateStepRequest, Upd
 impl GraphStore for Neo4jClient {
     fn capabilities(&self) -> StoreCapabilities {
         Neo4jClient::storage_capabilities()
-    }
-
-    // ========================================================================
-    // Workspace operations
-    // ========================================================================
-
-    async fn create_workspace(&self, workspace: &WorkspaceNode) -> anyhow::Result<()> {
-        self.create_workspace(workspace).await
-    }
-
-    async fn get_workspace(&self, id: Uuid) -> anyhow::Result<Option<WorkspaceNode>> {
-        self.get_workspace(id).await
-    }
-
-    async fn get_workspace_by_slug(&self, slug: &str) -> anyhow::Result<Option<WorkspaceNode>> {
-        self.get_workspace_by_slug(slug).await
-    }
-
-    async fn list_workspaces(&self) -> anyhow::Result<Vec<WorkspaceNode>> {
-        self.list_workspaces().await
-    }
-
-    async fn update_workspace(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<String>,
-        metadata: Option<serde_json::Value>,
-        slug: Option<String>,
-    ) -> anyhow::Result<()> {
-        self.update_workspace(id, name, description, metadata, slug)
-            .await
-    }
-
-    async fn delete_workspace(&self, id: Uuid) -> anyhow::Result<()> {
-        self.delete_workspace(id).await
-    }
-
-    async fn add_project_to_workspace(
-        &self,
-        workspace_id: Uuid,
-        project_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.add_project_to_workspace(workspace_id, project_id)
-            .await
-    }
-
-    async fn remove_project_from_workspace(
-        &self,
-        workspace_id: Uuid,
-        project_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.remove_project_from_workspace(workspace_id, project_id)
-            .await
-    }
-
-    async fn list_workspace_projects(
-        &self,
-        workspace_id: Uuid,
-    ) -> anyhow::Result<Vec<ProjectNode>> {
-        self.list_workspace_projects(workspace_id).await
-    }
-
-    async fn get_project_workspace(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Option<WorkspaceNode>> {
-        self.get_project_workspace(project_id).await
-    }
-
-    async fn compute_coupling_matrix(
-        &self,
-        workspace_id: Uuid,
-    ) -> anyhow::Result<crate::neo4j::models::CouplingMatrix> {
-        self.compute_coupling_matrix(workspace_id).await
     }
 
     // ========================================================================
@@ -4947,5 +4872,82 @@ impl ProjectStore for Neo4jClient {
     async fn delete_project(&self, id: Uuid, project_name: &str) -> anyhow::Result<()> {
         self.delete_project(id, project_name).await
     }
+}
 
+#[async_trait]
+impl WorkspaceStore for Neo4jClient {
+    // ========================================================================
+    // Workspace operations
+    // ========================================================================
+
+    async fn create_workspace(&self, workspace: &WorkspaceNode) -> anyhow::Result<()> {
+        self.create_workspace(workspace).await
+    }
+
+    async fn get_workspace(&self, id: Uuid) -> anyhow::Result<Option<WorkspaceNode>> {
+        self.get_workspace(id).await
+    }
+
+    async fn get_workspace_by_slug(&self, slug: &str) -> anyhow::Result<Option<WorkspaceNode>> {
+        self.get_workspace_by_slug(slug).await
+    }
+
+    async fn list_workspaces(&self) -> anyhow::Result<Vec<WorkspaceNode>> {
+        self.list_workspaces().await
+    }
+
+    async fn update_workspace(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<String>,
+        metadata: Option<serde_json::Value>,
+        slug: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.update_workspace(id, name, description, metadata, slug)
+            .await
+    }
+
+    async fn delete_workspace(&self, id: Uuid) -> anyhow::Result<()> {
+        self.delete_workspace(id).await
+    }
+
+    async fn add_project_to_workspace(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.add_project_to_workspace(workspace_id, project_id)
+            .await
+    }
+
+    async fn remove_project_from_workspace(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.remove_project_from_workspace(workspace_id, project_id)
+            .await
+    }
+
+    async fn list_workspace_projects(
+        &self,
+        workspace_id: Uuid,
+    ) -> anyhow::Result<Vec<ProjectNode>> {
+        self.list_workspace_projects(workspace_id).await
+    }
+
+    async fn get_project_workspace(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Option<WorkspaceNode>> {
+        self.get_project_workspace(project_id).await
+    }
+
+    async fn compute_coupling_matrix(
+        &self,
+        workspace_id: Uuid,
+    ) -> anyhow::Result<crate::neo4j::models::CouplingMatrix> {
+        self.compute_coupling_matrix(workspace_id).await
+    }
 }

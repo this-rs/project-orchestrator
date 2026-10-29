@@ -13,6 +13,8 @@
 use crate::chat::manager::ChatManager;
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 use crate::neo4j::traits::GraphStore;
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 use crate::protocol::engine;
 use crate::protocol::executor::agent::AgentExecutor;
 use crate::protocol::executor::system::SystemExecutor;
@@ -24,7 +26,6 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-use crate::neo4j::ProjectStore;
 
 /// Base backoff delay for retries (1 second).
 const BASE_BACKOFF_MS: u64 = 1000;

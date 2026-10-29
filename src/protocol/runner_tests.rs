@@ -1,4 +1,3 @@
-use crate::neo4j::ProjectStore;
 //! Integration tests for the Protocol Runner.
 //!
 //! Covers 4 E2E scenarios:
@@ -6,6 +5,8 @@ use crate::neo4j::ProjectStore;
 //! 2. Backward compatibility — manual fire_transition works without runner
 //! 3. Server restart mid-run — resume from last state (not from scratch)
 //! 4. Cancel during execution — clean shutdown, no orphan tasks
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 #[cfg(test)]
 mod tests {

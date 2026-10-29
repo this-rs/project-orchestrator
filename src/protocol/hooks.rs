@@ -25,12 +25,13 @@
 use crate::chat::manager::ChatManager;
 use crate::events::EventEmitter;
 use crate::neo4j::traits::GraphStore;
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 use crate::protocol::engine;
 use dashmap::DashMap;
 use std::sync::{Arc, LazyLock};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use crate::neo4j::ProjectStore;
 
 /// Global registry of active protocol runner tasks.
 ///

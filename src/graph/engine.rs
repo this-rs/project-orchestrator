@@ -27,6 +27,7 @@ use super::extraction::GraphExtractor;
 use super::models::{AnalyticsConfig, FabricWeights, GraphAnalytics};
 use super::writer::AnalyticsWriter;
 use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 // ============================================================================
 // Output type

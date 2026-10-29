@@ -16,6 +16,8 @@ use crate::events::{EntityType, EventEmitter};
 use crate::neo4j::models::{
     DeploymentMatrixEntry, DeploymentNode, DeploymentStatus, EnvironmentKind, EnvironmentNode,
 };
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -24,7 +26,6 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use uuid::Uuid;
-use crate::neo4j::ProjectStore;
 
 // ============================================================================
 // Helpers

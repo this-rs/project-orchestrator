@@ -28,10 +28,11 @@ use super::provider::settings::{
 use super::types::{ChatEvent, ChatRequest};
 use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::GraphStore;
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 use crate::test_helpers::mock_app_state;
 use crate::vault::grants::{GrantScope, SecretSelector};
 use crate::vault::VaultService;
-use crate::neo4j::ProjectStore;
 
 pub(super) fn fakes_dir() -> PathBuf {
     std::env::var_os("NEXUS_FAKES_DIR")

@@ -4,6 +4,8 @@ use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams, SearchFilter};
 use crate::events::graph::GraphEvent;
 use crate::graph::algorithms::add_thermal_noise;
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 use crate::notes::{
     BackfillProgress, CreateAnchorRequest, CreateNoteRequest, EntityType, LinkNoteRequest, Note,
     NoteContextResponse, NoteFilters, NoteImportance, NoteScope, NoteSearchHit, NoteStatus,
@@ -19,7 +21,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::RwLock;
 use uuid::Uuid;
-use crate::neo4j::ProjectStore;
 
 // ============================================================================
 // Query Parameters

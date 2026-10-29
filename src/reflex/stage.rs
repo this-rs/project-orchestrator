@@ -15,6 +15,7 @@ use crate::chat::enrichment::{
 };
 use crate::neo4j::traits::GraphStore;
 use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 /// Enrichment stage that injects reflex suggestions (co-change, episode recall, scar warnings).
 pub struct ReflexStage {

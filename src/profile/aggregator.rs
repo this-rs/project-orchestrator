@@ -19,6 +19,7 @@ use super::signals::BehaviorSignal;
 use super::UserProfile;
 use crate::neo4j::traits::GraphStore;
 use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 
 /// EMA smoothing factor — controls adaptation speed.
 /// 0.3 = moderate adaptation (balances stability and responsiveness).

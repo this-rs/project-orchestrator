@@ -19,13 +19,14 @@
 //! 5. Only `Running` runs can accept transitions
 
 use crate::neo4j::traits::GraphStore;
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 use crate::protocol::{
     ChildCompletionInfo, CompletionStrategy, OnFailureStrategy, ProtocolRun, RunStatus, StateType,
     TransitionResult,
 };
 use anyhow::{bail, Context, Result};
 use uuid::Uuid;
-use crate::neo4j::ProjectStore;
 
 /// Maximum nesting depth for hierarchical protocol runs.
 /// Prevents infinite recursion when protocols reference each other.

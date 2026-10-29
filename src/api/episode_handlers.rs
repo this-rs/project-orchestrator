@@ -9,13 +9,14 @@
 use crate::api::handlers::{AppError, OrchestratorState};
 use crate::episodes::collector;
 use crate::events::EventEmitter;
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 use axum::{
     extract::{Query, State},
     Json,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::neo4j::ProjectStore;
 
 // ============================================================================
 // Request / Response types

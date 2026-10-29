@@ -90,64 +90,13 @@ impl Default for StoreCapabilities {
 /// Every public async method of `Neo4jClient` (excluding `new`, `init_schema`,
 /// `execute`, `execute_with_params`, and private helpers) is represented here.
 #[async_trait]
-pub trait GraphStore: ProjectStore + Send + Sync {
+pub trait GraphStore: ProjectStore + WorkspaceStore + Send + Sync {
     /// Manifest of what this store actually supports.
     ///
     /// Every adapter states it explicitly, with the values its own code proves;
     /// there is deliberately no default, so a new adapter cannot inherit a
     /// flattering manifest by accident.
     fn capabilities(&self) -> StoreCapabilities;
-
-    // ========================================================================
-    // Workspace operations
-    // ========================================================================
-
-    /// Create a new workspace
-    async fn create_workspace(&self, workspace: &WorkspaceNode) -> Result<()>;
-
-    /// Get a workspace by ID
-    async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceNode>>;
-
-    /// Get a workspace by slug
-    async fn get_workspace_by_slug(&self, slug: &str) -> Result<Option<WorkspaceNode>>;
-
-    /// List all workspaces
-    async fn list_workspaces(&self) -> Result<Vec<WorkspaceNode>>;
-
-    /// Update a workspace
-    async fn update_workspace(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        description: Option<String>,
-        metadata: Option<serde_json::Value>,
-        slug: Option<String>,
-    ) -> Result<()>;
-
-    /// Delete a workspace and all its data
-    async fn delete_workspace(&self, id: Uuid) -> Result<()>;
-
-    /// Add a project to a workspace
-    async fn add_project_to_workspace(&self, workspace_id: Uuid, project_id: Uuid) -> Result<()>;
-
-    /// Remove a project from a workspace
-    async fn remove_project_from_workspace(
-        &self,
-        workspace_id: Uuid,
-        project_id: Uuid,
-    ) -> Result<()>;
-
-    /// List all projects in a workspace
-    async fn list_workspace_projects(&self, workspace_id: Uuid) -> Result<Vec<ProjectNode>>;
-
-    /// Get the workspace a project belongs to
-    async fn get_project_workspace(&self, project_id: Uuid) -> Result<Option<WorkspaceNode>>;
-
-    /// Compute the P2P coupling matrix for all projects in a workspace.
-    async fn compute_coupling_matrix(
-        &self,
-        workspace_id: Uuid,
-    ) -> Result<crate::neo4j::models::CouplingMatrix>;
 
     // ========================================================================
     // Workspace Milestone operations
@@ -4633,5 +4582,66 @@ pub trait ProjectStore: Send + Sync {
     /// Delete a project and all its data.
     /// `project_name` is used to tag archived notes/decisions with the source project.
     async fn delete_project(&self, id: Uuid, project_name: &str) -> Result<()>;
+}
 
+// ============================================================================
+// Workspace domain
+// ============================================================================
+
+/// The workspace domain: workspaces, their milestones, resources and components.
+///
+/// `GraphStore` is its supertrait: a consumer keeps calling these methods on a
+/// `dyn GraphStore` without knowing the domain exists.
+#[async_trait]
+pub trait WorkspaceStore: Send + Sync {
+    // ========================================================================
+    // Workspace operations
+    // ========================================================================
+
+    /// Create a new workspace
+    async fn create_workspace(&self, workspace: &WorkspaceNode) -> Result<()>;
+
+    /// Get a workspace by ID
+    async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceNode>>;
+
+    /// Get a workspace by slug
+    async fn get_workspace_by_slug(&self, slug: &str) -> Result<Option<WorkspaceNode>>;
+
+    /// List all workspaces
+    async fn list_workspaces(&self) -> Result<Vec<WorkspaceNode>>;
+
+    /// Update a workspace
+    async fn update_workspace(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<String>,
+        metadata: Option<serde_json::Value>,
+        slug: Option<String>,
+    ) -> Result<()>;
+
+    /// Delete a workspace and all its data
+    async fn delete_workspace(&self, id: Uuid) -> Result<()>;
+
+    /// Add a project to a workspace
+    async fn add_project_to_workspace(&self, workspace_id: Uuid, project_id: Uuid) -> Result<()>;
+
+    /// Remove a project from a workspace
+    async fn remove_project_from_workspace(
+        &self,
+        workspace_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<()>;
+
+    /// List all projects in a workspace
+    async fn list_workspace_projects(&self, workspace_id: Uuid) -> Result<Vec<ProjectNode>>;
+
+    /// Get the workspace a project belongs to
+    async fn get_project_workspace(&self, project_id: Uuid) -> Result<Option<WorkspaceNode>>;
+
+    /// Compute the P2P coupling matrix for all projects in a workspace.
+    async fn compute_coupling_matrix(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<crate::neo4j::models::CouplingMatrix>;
 }

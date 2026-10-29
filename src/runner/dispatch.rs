@@ -16,6 +16,8 @@ use crate::auth::jwt::Claims;
 use crate::chat::manager::ChatManager;
 use crate::events::EventEmitter;
 use crate::neo4j::traits::GraphStore;
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 use crate::orchestrator::context::ContextBuilder;
 use crate::runner::models::{
     RunnerConfig, SignalReservation, Trigger, TriggerFiring, TriggerSource,
@@ -27,7 +29,6 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use crate::neo4j::ProjectStore;
 
 // ============================================================================
 // Building a PlanRunner

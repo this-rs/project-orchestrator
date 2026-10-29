@@ -12,6 +12,8 @@ use super::handlers::{AppError, OrchestratorState};
 use super::ws_auth::CookieAuthResult;
 use crate::auth::jwt::Claims;
 use crate::chat::manager::{DeliveryRoute, MessageDeliveryError};
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -26,7 +28,6 @@ use std::collections::HashSet;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-use crate::neo4j::ProjectStore;
 
 /// Query parameters for the chat WebSocket
 #[derive(Debug, Deserialize, Default)]

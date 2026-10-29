@@ -6,6 +6,8 @@ use crate::api::routes::create_router;
 use crate::chat::provider::nexus_tools::{GraphConsents, ToolConsents};
 use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::GraphStore;
+use crate::neo4j::ProjectStore;
+use crate::neo4j::WorkspaceStore;
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::test_helpers::{mock_app_state_with_graph, test_bearer_token, test_project_named};
 use axum::body::Body;
@@ -14,7 +16,6 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
-use crate::neo4j::ProjectStore;
 
 const PROJECT: &str = "proj";
 
