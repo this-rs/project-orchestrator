@@ -4648,7 +4648,6 @@ mod tests {
     use super::StoreCapabilities;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
-    #[allow(unused_imports)]
     /// The ten capabilities the manifest exposes, in declaration order. A field
     /// added to `StoreCapabilities` without updating this list (or a field
     /// renamed) is caught by `capabilities_manifest_serializes_all_keys`.

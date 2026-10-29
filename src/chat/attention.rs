@@ -44,7 +44,6 @@ use uuid::Uuid;
 use crate::api::attention::{OrphanRequest, QuestionOption, RequestKind, WaitingRequest};
 use crate::chat::types::ChatEvent;
 use crate::neo4j::models::ChatEventRecord;
-#[allow(unused_imports)]
 /// Everything the derivation needs to know about one session, except its
 /// events (passed separately so the grouped read can be split per session).
 #[derive(Debug, Clone)]

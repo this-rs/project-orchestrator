@@ -3938,7 +3938,6 @@ mod staleness_parity_tests {
 #[cfg(test)]
 mod injection_tests {
     use super::*;
-    #[allow(unused_imports)]
     const PAYLOADS: &[&str] = &[
         "a' OR 1=1 //",
         "x\\",

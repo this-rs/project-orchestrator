@@ -4045,7 +4045,6 @@ mod turn_race_tests {
 mod adopt_tests {
     use super::fake::FakeProvider;
     use super::*;
-    #[allow(unused_imports)]
     /// The handle replaced is ended: its listeners (NATS) stop, its provider
     /// session is closed. Otherwise both handles answer the same NATS subjects and
     /// a message from another instance is played twice.
@@ -4948,7 +4947,6 @@ mod adopt_tests {
 #[cfg(test)]
 mod image_tests {
     use super::*;
-    #[allow(unused_imports)]
     #[test]
     fn the_turn_input_is_the_text_then_the_images_in_order() {
         let images = [
@@ -5500,7 +5498,6 @@ mod session_record_tests {
 mod retry_config_tests {
     use super::fake::FakeProvider;
     use super::*;
-    #[allow(unused_imports)]
     fn overloaded() -> AgentEvent {
         AgentEvent::Done {
             stop_reason: nexus_claude::agent::StopReason::Error,
@@ -5583,7 +5580,6 @@ mod retry_config_tests {
 mod outage_hold_tests {
     use super::fake::FakeProvider;
     use super::*;
-    #[allow(unused_imports)]
     fn unreachable() -> ProviderError {
         ProviderError::EndpointUnreachable {
             detail: "connection failed: Connection refused (os error 61)".to_string(),
@@ -6138,7 +6134,6 @@ mod after_turn_tests {
 mod retry_stop_tests {
     use super::fake::FakeProvider;
     use super::*;
-    #[allow(unused_imports)]
     /// A Stop during the pause before a retry ends the turn at once: no ten-second
     /// wait, no retry sent after the Stop.
     #[tokio::test]
@@ -6215,7 +6210,6 @@ mod retry_stop_tests {
 mod process_exit_tests {
     use super::fake::FakeProvider;
     use super::*;
-    #[allow(unused_imports)]
     /// A `ProcessExited` terminal event ends the turn, is said as a session error,
     /// and removes the handle from the runtime: the next message takes the resume
     /// path rather than re-failing on the dead process.
@@ -7194,7 +7188,6 @@ mod stored_interrupted_result_tests {
     use super::fake::FakeProvider;
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-    #[allow(unused_imports)]
     #[tokio::test]
     async fn a_stopped_turn_is_stored_neutral_and_broadcast_as_the_provider_said() {
         let graph = Arc::new(MockGraphStore::new());

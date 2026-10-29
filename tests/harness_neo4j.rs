@@ -1107,7 +1107,6 @@ mod synapse_scope {
 mod anchor_followups {
     use super::*;
     use project_orchestrator::chat::types::SpawnedBy;
-    #[allow(unused_imports)]
     fn spawned(parent: Uuid) -> String {
         SpawnedBy::Conversation {
             parent_session_id: parent,

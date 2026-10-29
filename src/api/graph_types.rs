@@ -1425,7 +1425,6 @@ mod transverse_graph_tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    #[allow(unused_imports)]
     use crate::protocol::Protocol;
     use crate::skills::{SkillNode, SkillStatus};
     use crate::test_helpers::{test_note, test_project};
@@ -1514,7 +1513,6 @@ mod knowledge_layer_tests {
     //! showed 50 and said nothing.
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-    #[allow(unused_imports)]
     #[allow(unused_imports)]
     use crate::test_helpers::{test_note, test_project};
 

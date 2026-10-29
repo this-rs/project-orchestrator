@@ -2363,7 +2363,6 @@ mod tests {
     /// `assets`. A `scene3d` block may still carry a v1 payload (`version: "1"` — migration tier 2), which
     /// delegates to [`iso_scene_problems`]. The exact bounds are `scene3d_contract` (spec §3).
     mod scene3d_contract {
-        #[allow(unused_imports)]
         pub const V1_KEYS: &[&str] = &[
             "layout",
             "stations",

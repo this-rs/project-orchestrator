@@ -16,7 +16,6 @@ use uuid::Uuid;
 
 use super::models::Note;
 use crate::neo4j::traits::GraphStore;
-#[allow(unused_imports)]
 /// Note ids grouped by owning project. Duplicates are merged; notes without a
 /// `project_id` belong to no group (they cannot be reinforced).
 pub fn group_by_project(notes: &[Note]) -> BTreeMap<Uuid, Vec<Uuid>> {

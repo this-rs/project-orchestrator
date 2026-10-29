@@ -1659,7 +1659,6 @@ mod integration_tests {
     use crate::meilisearch::mock::MockSearchStore;
     use crate::neo4j::mock::MockGraphStore;
     #[allow(unused_imports)]
-    #[allow(unused_imports)]
     use crate::neo4j::GraphStore;
     use crate::test_helpers::{test_project_named, test_task_titled};
     use std::collections::HashMap;

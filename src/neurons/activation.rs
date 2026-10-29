@@ -461,7 +461,6 @@ mod pure_ranking_tests {
 #[cfg(test)]
 mod pure_rule_tests {
     use super::*;
-    #[allow(unused_imports)]
     fn node(energy: f64) -> SpreadNode {
         SpreadNode {
             energy,

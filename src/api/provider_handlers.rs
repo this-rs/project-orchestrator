@@ -2134,7 +2134,6 @@ mod agent_surface_tests {
 #[cfg(test)]
 mod listed_models_tests {
     use super::merge_listed_models;
-    #[allow(unused_imports)]
     fn v(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|x| x.to_string()).collect()
     }

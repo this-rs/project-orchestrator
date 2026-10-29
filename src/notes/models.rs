@@ -1364,7 +1364,6 @@ mod search_scope_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[allow(unused_imports)]
     #[test]
     fn test_propagation_scope_rule_for_global_and_foreign_notes() {
         let (me, other) = (Uuid::new_v4(), Uuid::new_v4());

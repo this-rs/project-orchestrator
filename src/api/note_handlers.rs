@@ -3137,7 +3137,6 @@ mod tests {
 mod human_confirmation_tests {
     use super::confirmed_by_a_person;
     use crate::auth::jwt::{Claims, TOKEN_TYPE_AGENT_SESSION, TOKEN_TYPE_MCP};
-    #[allow(unused_imports)]
     fn person() -> Claims {
         Claims {
             sub: uuid::Uuid::new_v4().to_string(),

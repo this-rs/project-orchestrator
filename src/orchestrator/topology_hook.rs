@@ -182,7 +182,6 @@ mod tests {
     use crate::neo4j::mock::MockGraphStore;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
-    #[allow(unused_imports)]
     #[tokio::test]
     async fn test_no_violations_returns_empty() {
         let mock = Arc::new(MockGraphStore::new());

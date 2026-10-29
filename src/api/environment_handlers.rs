@@ -434,7 +434,6 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    #[allow(unused_imports)]
     use crate::orchestrator::watcher::FileWatcher;
     use crate::orchestrator::Orchestrator;
     use crate::test_helpers::{

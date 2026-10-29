@@ -18,7 +18,6 @@ use crate::events::EventEmitter;
 use crate::graph::algorithms::into_ranked;
 use crate::graph::models::{FusionWeights, MultiSignalImpact, MultiSignalScore, RankedList};
 use crate::neo4j::models::{ConnectedFileNode, DecisionNode};
-#[allow(unused_imports)]
 // ============================================================================
 // Code Search (Meilisearch)
 // ============================================================================

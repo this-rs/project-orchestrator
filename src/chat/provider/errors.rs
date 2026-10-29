@@ -1426,7 +1426,6 @@ mod tests {
 #[cfg(test)]
 mod auto_vault_locked_tests {
     use super::*;
-    #[allow(unused_imports)]
     #[test]
     fn auto_on_a_locked_vault_is_credentials_locked_with_its_fallbacks() {
         let err = anyhow::Error::new(AutoVaultLocked {

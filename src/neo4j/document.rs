@@ -826,7 +826,6 @@ mod tests {
     use crate::neo4j::mock::MockGraphStore;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
-    #[allow(unused_imports)]
     fn a_document(project_id: Option<Uuid>) -> Document {
         Document {
             id: Uuid::new_v4(),

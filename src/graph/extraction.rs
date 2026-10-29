@@ -20,7 +20,6 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use super::models::{CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType, FabricWeights};
-#[allow(unused_imports)]
 /// Parse a qualified function ID of the form `"file_path:function_name:index"`
 /// into `(Some(file_path), function_name)`.
 ///

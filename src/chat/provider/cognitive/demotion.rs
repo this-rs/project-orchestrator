@@ -243,7 +243,6 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    #[allow(unused_imports)]
     use uuid::Uuid;
 
     const CLASS: &str = "simple";

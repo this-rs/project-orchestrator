@@ -644,7 +644,6 @@ mod tests {
     use crate::neo4j::models::PlanStatus;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
-    #[allow(unused_imports)]
     // ── Config tests ────────────────────────────────────────────────────
     #[test]
     fn test_config_default() {

@@ -467,7 +467,6 @@ mod tests {
     use super::*;
     use crate::chat::provider::cognitive::signature::TaskClass;
     use crate::chat::provider::cognitive::store::ArmKey;
-    #[allow(unused_imports)]
     fn decision() -> CognitiveDecision {
         CognitiveDecision {
             snapshot: None,

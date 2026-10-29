@@ -13323,7 +13323,6 @@ mod retry_plan_task_tests {
 #[cfg(test)]
 mod fabric_emit_tests {
     use super::*;
-    #[allow(unused_imports)]
     #[test]
     fn fabric_refresh_helpers_emit_the_expected_graph_events() {
         let bus = HybridEmitter::new(Arc::new(crate::events::EventBus::default()));
@@ -13362,7 +13361,6 @@ fn transport_label(state: Option<crate::events::TransportState>) -> &'static str
 mod transport_label_tests {
     use super::transport_label;
     use crate::events::TransportState;
-    #[allow(unused_imports)]
     #[test]
     fn a_live_connection_is_the_only_thing_that_reads_connected() {
         assert_eq!(transport_label(None), "disabled");

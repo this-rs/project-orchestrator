@@ -6061,7 +6061,6 @@ fn switch_error(error: anyhow::Error, session_id: &str) -> AppError {
 mod switch_provider_tests {
     use super::*;
     use crate::chat::types::SwitchProviderError;
-    #[allow(unused_imports)]
     #[test]
     fn an_unknown_session_is_a_404_that_names_it() {
         let err = switch_error(anyhow::Error::new(SwitchProviderError::NotFound), "abc");
@@ -6166,8 +6165,6 @@ mod file_scope_lift_tests {
     use crate::auth::jwt::{Claims, TOKEN_TYPE_AGENT_SESSION, TOKEN_TYPE_MCP};
     use crate::chat::envelope::SpawnCaller;
     use crate::chat::types::ChatRequest;
-    #[allow(unused_imports)]
-    #[allow(unused_imports)]
     fn person() -> Claims {
         Claims {
             sub: uuid::Uuid::new_v4().to_string(),
