@@ -90,543 +90,23 @@ impl Default for StoreCapabilities {
 /// Every public async method of `Neo4jClient` (excluding `new`, `init_schema`,
 /// `execute`, `execute_with_params`, and private helpers) is represented here.
 #[async_trait]
-pub trait GraphStore: ProjectStore + WorkspaceStore + CodeStore + PlanStore + Send + Sync {
+pub trait GraphStore:
+    ProjectStore
+    + WorkspaceStore
+    + CodeStore
+    + PlanStore
+    + DecisionStore
+    + CommitStore
+    + ReleaseStore
+    + Send
+    + Sync
+{
     /// Manifest of what this store actually supports.
     ///
     /// Every adapter states it explicitly, with the values its own code proves;
     /// there is deliberately no default, so a new adapter cannot inherit a
     /// flattering manifest by accident.
     fn capabilities(&self) -> StoreCapabilities;
-
-    // ========================================================================
-    // Decision operations
-    // ========================================================================
-
-    /// Record a decision
-    async fn create_decision(&self, task_id: Uuid, decision: &DecisionNode) -> Result<()>;
-
-    /// Get a single decision by ID
-    async fn get_decision(&self, decision_id: Uuid) -> Result<Option<DecisionNode>>;
-
-    /// Get the project ID for a decision (traverses Decision←Task←Plan←Project).
-    async fn get_decision_project_id(&self, decision_id: Uuid) -> Result<Option<String>>;
-
-    /// Project of each decision in one batched lookup (same traversal as
-    /// `get_decision_project_id`). Decisions whose project is not verifiable
-    /// (plan without project, unknown id) are absent from the map.
-    async fn get_decision_project_ids(
-        &self,
-        decision_ids: &[Uuid],
-    ) -> Result<std::collections::HashMap<Uuid, Uuid>>;
-
-    /// Update a decision
-    async fn update_decision(
-        &self,
-        decision_id: Uuid,
-        description: Option<String>,
-        rationale: Option<String>,
-        chosen_option: Option<String>,
-        status: Option<DecisionStatus>,
-    ) -> Result<()>;
-
-    /// Delete a decision
-    async fn delete_decision(&self, decision_id: Uuid) -> Result<()>;
-
-    /// Get decisions related to an entity (via AFFECTS or task linkage)
-    async fn get_decisions_for_entity(
-        &self,
-        entity_type: &str,
-        entity_id: &str,
-        limit: u32,
-    ) -> Result<Vec<DecisionNode>>;
-
-    /// Store a vector embedding on a Decision node
-    async fn set_decision_embedding(
-        &self,
-        decision_id: Uuid,
-        embedding: &[f32],
-        model: &str,
-    ) -> Result<()>;
-
-    /// Retrieve the stored vector embedding for a Decision node
-    async fn get_decision_embedding(&self, decision_id: Uuid) -> Result<Option<Vec<f32>>>;
-
-    /// Get all decisions with their linked task_id (for MeiliSearch reindex)
-    async fn get_all_decisions_with_task_id(&self) -> Result<Vec<(DecisionNode, Uuid)>>;
-
-    /// Get all Decision IDs that have no embedding yet (for backfill)
-    async fn get_decisions_without_embedding(&self) -> Result<Vec<(Uuid, String, String)>>;
-
-    /// Semantic search over Decision embeddings using Neo4j vector index.
-    /// When `project_id` is provided, filters results to that project (post-query).
-    async fn search_decisions_by_vector(
-        &self,
-        query_embedding: &[f32],
-        limit: usize,
-        project_id: Option<&str>,
-    ) -> Result<Vec<(DecisionNode, f64)>>;
-
-    /// Get decisions that AFFECT a given entity (reverse AFFECTS lookup)
-    async fn get_decisions_affecting(
-        &self,
-        entity_type: &str,
-        entity_id: &str,
-        status_filter: Option<&str>,
-    ) -> Result<Vec<DecisionNode>>;
-
-    /// Create an AFFECTS relation from a Decision to any entity in the graph
-    async fn add_decision_affects(
-        &self,
-        decision_id: Uuid,
-        entity_type: &str,
-        entity_id: &str,
-        impact_description: Option<&str>,
-    ) -> Result<()>;
-
-    /// Remove an AFFECTS relation from a Decision to an entity
-    async fn remove_decision_affects(
-        &self,
-        decision_id: Uuid,
-        entity_type: &str,
-        entity_id: &str,
-    ) -> Result<()>;
-
-    /// List all entities affected by a Decision
-    async fn list_decision_affects(&self, decision_id: Uuid) -> Result<Vec<AffectsRelation>>;
-
-    /// Mark a decision as superseded by a newer decision
-    async fn supersede_decision(&self, new_decision_id: Uuid, old_decision_id: Uuid) -> Result<()>;
-
-    /// Get a timeline of decisions, optionally filtered by task and date range
-    async fn get_decision_timeline(
-        &self,
-        task_id: Option<Uuid>,
-        from: Option<&str>,
-        to: Option<&str>,
-    ) -> Result<Vec<DecisionTimelineEntry>>;
-
-    /// List decisions having a given status, across all projects by default,
-    /// newest first. `project_id` wins over `workspace_slug`. Returns (page, total).
-    async fn list_decisions_by_status(
-        &self,
-        status: DecisionStatus,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<DecisionListItem>, usize)>;
-
-    // ========================================================================
-    // Dependency analysis
-    // ========================================================================
-
-    /// Find all files that depend on a given file (IMPORTS-only traversal).
-    /// When project_id is provided, only return dependents from the same project.
-    async fn find_dependent_files(
-        &self,
-        file_path: &str,
-        depth: u32,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<String>>;
-
-    /// Find all files impacted by a change to a given file.
-    /// Combines IMPORTS traversal (file→file) and CALLS traversal
-    /// (functions in target ← called by functions in other files).
-    /// When project_id is provided, only return files from the same project.
-    async fn find_impacted_files(
-        &self,
-        file_path: &str,
-        depth: u32,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<String>>;
-
-    /// Find all functions that call a given function
-    /// When project_id is provided, only return callers from the same project.
-    async fn find_callers(
-        &self,
-        function_id: &str,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<FunctionNode>>;
-
-    // ========================================================================
-    // Task-file linking
-    // ========================================================================
-
-    /// Link a task to files it modifies
-    async fn link_task_to_files(&self, task_id: Uuid, file_paths: &[String]) -> Result<()>;
-
-    // ========================================================================
-    // Commit operations
-    // ========================================================================
-
-    /// Create a commit node
-    async fn create_commit(&self, commit: &CommitNode) -> Result<()>;
-
-    /// Get a commit by hash
-    async fn get_commit(&self, hash: &str) -> Result<Option<CommitNode>>;
-
-    /// Link a commit to a task (RESOLVED_BY relationship)
-    async fn link_commit_to_task(&self, commit_hash: &str, task_id: Uuid) -> Result<()>;
-
-    /// Link a commit to a plan (RESULTED_IN relationship)
-    async fn link_commit_to_plan(&self, commit_hash: &str, plan_id: Uuid) -> Result<()>;
-
-    /// Get commits for a task
-    async fn get_task_commits(&self, task_id: Uuid) -> Result<Vec<CommitNode>>;
-
-    /// Get commits for a plan
-    async fn get_plan_commits(&self, plan_id: Uuid) -> Result<Vec<CommitNode>>;
-
-    /// Delete a commit
-    async fn delete_commit(&self, hash: &str) -> Result<()>;
-
-    // ========================================================================
-    // TOUCHES operations (Commit → File)
-    // ========================================================================
-
-    /// Create TOUCHES relations between a Commit and its changed Files (batch UNWIND).
-    /// Files that don't exist as nodes are silently skipped.
-    async fn create_commit_touches(
-        &self,
-        commit_hash: &str,
-        files: &[FileChangedInfo],
-    ) -> Result<()>;
-
-    /// Get all files touched by a commit
-    async fn get_commit_files(&self, commit_hash: &str) -> Result<Vec<CommitFileInfo>>;
-
-    /// Get the commit history for a specific file
-    async fn get_file_history(
-        &self,
-        file_path: &str,
-        limit: Option<i64>,
-    ) -> Result<Vec<FileHistoryEntry>>;
-
-    /// Ping freshness on all Notes LINKED_TO the given file paths.
-    /// Returns the number of distinct notes pinged.
-    async fn ping_freshness_for_files(&self, file_paths: &[String]) -> Result<usize>;
-
-    // ========================================================================
-    // CO_CHANGED operations (File ↔ File)
-    // ========================================================================
-
-    /// Compute CO_CHANGED relations from TOUCHES history (incremental).
-    /// Returns the number of relations created/updated.
-    async fn compute_co_changed(
-        &self,
-        project_id: Uuid,
-        since: Option<chrono::DateTime<chrono::Utc>>,
-        min_count: i64,
-        max_relations: i64,
-    ) -> Result<i64>;
-
-    /// Update project last_co_change_computed_at timestamp
-    async fn update_project_co_change_timestamp(&self, id: Uuid) -> Result<()>;
-
-    /// Get the co-change graph for a project
-    async fn get_co_change_graph(
-        &self,
-        project_id: Uuid,
-        min_count: i64,
-        limit: i64,
-    ) -> Result<Vec<CoChangePair>>;
-
-    /// Get files that co-change with a given file
-    async fn get_file_co_changers(
-        &self,
-        file_path: &str,
-        min_count: i64,
-        limit: i64,
-    ) -> Result<Vec<CoChanger>>;
-
-    /// Compute CO_CHANGED_TRANSITIVE relations via BFS on the CO_CHANGED graph.
-    ///
-    /// # References
-    /// - Rolfsnes et al. (2018) — "Detecting Evolutionary Coupling Using Transitive Association Rules"
-    async fn compute_co_changed_transitive(
-        &self,
-        project_id: Uuid,
-        max_depth: i64,
-        min_score: f64,
-    ) -> Result<i64>;
-
-    /// Get files that are transitively co-changed with a given file.
-    ///
-    /// # References
-    /// - Rolfsnes et al. (2018) — "Detecting Evolutionary Coupling Using Transitive Association Rules"
-    async fn get_file_transitive_co_changers(
-        &self,
-        file_path: &str,
-        min_score: f64,
-        limit: i64,
-    ) -> Result<Vec<TransitiveCoChanger>>;
-
-    // ========================================================================
-    // Release operations
-    // ========================================================================
-
-    /// Create a release
-    async fn create_release(&self, release: &ReleaseNode) -> Result<()>;
-
-    /// Get a release by ID
-    async fn get_release(&self, id: Uuid) -> Result<Option<ReleaseNode>>;
-
-    /// List releases for a project
-    async fn list_project_releases(&self, project_id: Uuid) -> Result<Vec<ReleaseNode>>;
-
-    /// Update a release
-    async fn update_release(
-        &self,
-        id: Uuid,
-        status: Option<ReleaseStatus>,
-        target_date: Option<chrono::DateTime<chrono::Utc>>,
-        released_at: Option<chrono::DateTime<chrono::Utc>>,
-        title: Option<String>,
-        description: Option<String>,
-    ) -> Result<()>;
-
-    /// Add a task to a release
-    async fn add_task_to_release(&self, release_id: Uuid, task_id: Uuid) -> Result<()>;
-
-    /// Add a commit to a release
-    async fn add_commit_to_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()>;
-
-    /// Remove a commit from a release
-    async fn remove_commit_from_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()>;
-
-    /// Get release details with tasks and commits
-    async fn get_release_details(
-        &self,
-        release_id: Uuid,
-    ) -> Result<Option<(ReleaseNode, Vec<TaskNode>, Vec<CommitNode>)>>;
-
-    /// Delete a release
-    async fn delete_release(&self, release_id: Uuid) -> Result<()>;
-
-    // ========================================================================
-    // Environment & deployment operations
-    // ========================================================================
-
-    /// Create an environment. Errors when the project does not exist or when the
-    /// name is already used by another environment of the project.
-    async fn create_environment(&self, env: &EnvironmentNode) -> Result<()>;
-
-    /// Get an environment by ID
-    async fn get_environment(&self, id: Uuid) -> Result<Option<EnvironmentNode>>;
-
-    /// List the environments of a project (oldest first)
-    async fn list_project_environments(&self, project_id: Uuid) -> Result<Vec<EnvironmentNode>>;
-
-    /// Update an environment (empty string clears url/description/config)
-    async fn update_environment(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        kind: Option<EnvironmentKind>,
-        url: Option<String>,
-        description: Option<String>,
-        config: Option<String>,
-    ) -> Result<()>;
-
-    /// Delete an environment and its deployments
-    async fn delete_environment(&self, id: Uuid) -> Result<()>;
-
-    /// Record a deployment (linked to the Commit node with the same sha, if any)
-    async fn create_deployment(&self, deployment: &DeploymentNode) -> Result<()>;
-
-    /// Get a deployment by ID
-    async fn get_deployment(&self, id: Uuid) -> Result<Option<DeploymentNode>>;
-
-    /// List deployments of an environment, newest first, with the total count
-    async fn list_environment_deployments(
-        &self,
-        environment_id: Uuid,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<DeploymentNode>, usize)>;
-
-    /// Update a deployment (status, finished_at, notes)
-    async fn update_deployment(
-        &self,
-        id: Uuid,
-        status: Option<DeploymentStatus>,
-        finished_at: Option<chrono::DateTime<chrono::Utc>>,
-        notes: Option<String>,
-    ) -> Result<()>;
-
-    /// Deployment matrix of a project: every environment with its latest
-    /// deployment and the statuses of its last 5 deployments (newest first)
-    async fn get_deployment_matrix(&self, project_id: Uuid) -> Result<Vec<DeploymentMatrixEntry>>;
-
-    // ========================================================================
-    // Milestone operations
-    // ========================================================================
-
-    /// Create a milestone
-    async fn create_milestone(&self, milestone: &MilestoneNode) -> Result<()>;
-
-    /// Get a milestone by ID
-    async fn get_milestone(&self, id: Uuid) -> Result<Option<MilestoneNode>>;
-
-    /// List milestones for a project
-    async fn list_project_milestones(&self, project_id: Uuid) -> Result<Vec<MilestoneNode>>;
-
-    /// Update a milestone
-    async fn update_milestone(
-        &self,
-        id: Uuid,
-        status: Option<MilestoneStatus>,
-        target_date: Option<chrono::DateTime<chrono::Utc>>,
-        closed_at: Option<chrono::DateTime<chrono::Utc>>,
-        title: Option<String>,
-        description: Option<String>,
-    ) -> Result<()>;
-
-    /// Add a task to a milestone
-    async fn add_task_to_milestone(&self, milestone_id: Uuid, task_id: Uuid) -> Result<()>;
-
-    /// Link a plan to a project milestone
-    async fn link_plan_to_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()>;
-
-    /// Unlink a plan from a project milestone
-    async fn unlink_plan_from_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()>;
-
-    /// Get milestone details with tasks
-    async fn get_milestone_details(
-        &self,
-        milestone_id: Uuid,
-    ) -> Result<Option<(MilestoneNode, Vec<TaskNode>)>>;
-
-    /// Get milestone progress (total, completed, in_progress, pending)
-    async fn get_milestone_progress(&self, milestone_id: Uuid) -> Result<(u32, u32, u32, u32)>;
-
-    /// Get tasks linked to a project milestone (with plan info)
-    async fn get_milestone_tasks_with_plans(&self, milestone_id: Uuid)
-        -> Result<Vec<TaskWithPlan>>;
-
-    /// Get all steps for all tasks linked to a project milestone (batch)
-    async fn get_milestone_steps_batch(
-        &self,
-        milestone_id: Uuid,
-    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>>;
-
-    /// Delete a milestone
-    async fn delete_milestone(&self, milestone_id: Uuid) -> Result<()>;
-
-    /// Get tasks for a milestone
-    async fn get_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskNode>>;
-
-    /// Get tasks for a release
-    async fn get_release_tasks(&self, release_id: Uuid) -> Result<Vec<TaskNode>>;
-
-    // ========================================================================
-    // Project stats
-    // ========================================================================
-
-    /// Get project progress stats
-    async fn get_project_progress(&self, project_id: Uuid) -> Result<(u32, u32, u32, u32)>;
-
-    /// Task counters for many entities at once (one round trip for list cards).
-    ///
-    /// The default implementation loops over the per-entity task getters so
-    /// every store (including mocks) supports it; `Neo4jClient` overrides it
-    /// with a single aggregated query.
-    async fn get_progress_batch(
-        &self,
-        kind: ProgressKind,
-        ids: &[Uuid],
-    ) -> Result<std::collections::HashMap<Uuid, TaskCounts>> {
-        let mut out = std::collections::HashMap::with_capacity(ids.len());
-        for id in ids {
-            let tasks = match kind {
-                ProgressKind::Plan => self.get_plan_tasks(*id).await?,
-                ProgressKind::Project => self.get_project_tasks(*id).await?,
-                ProgressKind::Milestone => self.get_milestone_tasks(*id).await?,
-            };
-            out.insert(*id, TaskCounts::from_tasks(&tasks));
-        }
-        Ok(out)
-    }
-
-    /// Get all task dependencies for a project (across all plans)
-    async fn get_project_task_dependencies(&self, project_id: Uuid) -> Result<Vec<(Uuid, Uuid)>>;
-
-    /// Get all tasks for a project (across all plans)
-    async fn get_project_tasks(&self, project_id: Uuid) -> Result<Vec<TaskNode>>;
-
-    // ========================================================================
-    // Filtered list operations with pagination
-    // ========================================================================
-
-    /// List plans with filters and pagination
-    ///
-    /// Returns (plans, total_count)
-    #[allow(clippy::too_many_arguments)]
-    async fn list_plans_filtered(
-        &self,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        statuses: Option<Vec<String>>,
-        priority_min: Option<i32>,
-        priority_max: Option<i32>,
-        search: Option<&str>,
-        limit: usize,
-        offset: usize,
-        sort_by: Option<&str>,
-        sort_order: &str,
-    ) -> Result<(Vec<PlanNode>, usize)>;
-
-    /// List all tasks across all plans with filters and pagination
-    ///
-    /// Returns (tasks_with_plan_info, total_count)
-    #[allow(clippy::too_many_arguments)]
-    async fn list_all_tasks_filtered(
-        &self,
-        plan_id: Option<Uuid>,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        statuses: Option<Vec<String>>,
-        priority_min: Option<i32>,
-        priority_max: Option<i32>,
-        tags: Option<Vec<String>>,
-        assigned_to: Option<&str>,
-        limit: usize,
-        offset: usize,
-        sort_by: Option<&str>,
-        sort_order: &str,
-    ) -> Result<(Vec<TaskWithPlan>, usize)>;
-
-    /// List project releases with filters and pagination
-    async fn list_releases_filtered(
-        &self,
-        project_id: Uuid,
-        statuses: Option<Vec<String>>,
-        limit: usize,
-        offset: usize,
-        sort_by: Option<&str>,
-        sort_order: &str,
-    ) -> Result<(Vec<ReleaseNode>, usize)>;
-
-    /// List project milestones with filters and pagination
-    async fn list_milestones_filtered(
-        &self,
-        project_id: Uuid,
-        statuses: Option<Vec<String>>,
-        limit: usize,
-        offset: usize,
-        sort_by: Option<&str>,
-        sort_order: &str,
-    ) -> Result<(Vec<MilestoneNode>, usize)>;
-
-    /// List projects with search and pagination
-    async fn list_projects_filtered(
-        &self,
-        search: Option<&str>,
-        limit: usize,
-        offset: usize,
-        sort_by: Option<&str>,
-        sort_order: &str,
-    ) -> Result<(Vec<ProjectNode>, usize)>;
 
     // ========================================================================
     // Document operations
@@ -4666,4 +4146,558 @@ pub trait PlanStore: Send + Sync {
 
     /// Delete a constraint
     async fn delete_constraint(&self, constraint_id: Uuid) -> Result<()>;
+}
+
+// ============================================================================
+// Decision domain
+// ============================================================================
+
+/// The decision domain: architectural decisions and their links to the graph.
+#[async_trait]
+pub trait DecisionStore: Send + Sync {
+    // ========================================================================
+    // Decision operations
+    // ========================================================================
+
+    /// Record a decision
+    async fn create_decision(&self, task_id: Uuid, decision: &DecisionNode) -> Result<()>;
+
+    /// Get a single decision by ID
+    async fn get_decision(&self, decision_id: Uuid) -> Result<Option<DecisionNode>>;
+
+    /// Get the project ID for a decision (traverses Decision←Task←Plan←Project).
+    async fn get_decision_project_id(&self, decision_id: Uuid) -> Result<Option<String>>;
+
+    /// Project of each decision in one batched lookup (same traversal as
+    /// `get_decision_project_id`). Decisions whose project is not verifiable
+    /// (plan without project, unknown id) are absent from the map.
+    async fn get_decision_project_ids(
+        &self,
+        decision_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Uuid>>;
+
+    /// Update a decision
+    async fn update_decision(
+        &self,
+        decision_id: Uuid,
+        description: Option<String>,
+        rationale: Option<String>,
+        chosen_option: Option<String>,
+        status: Option<DecisionStatus>,
+    ) -> Result<()>;
+
+    /// Delete a decision
+    async fn delete_decision(&self, decision_id: Uuid) -> Result<()>;
+
+    /// Get decisions related to an entity (via AFFECTS or task linkage)
+    async fn get_decisions_for_entity(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        limit: u32,
+    ) -> Result<Vec<DecisionNode>>;
+
+    /// Store a vector embedding on a Decision node
+    async fn set_decision_embedding(
+        &self,
+        decision_id: Uuid,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()>;
+
+    /// Retrieve the stored vector embedding for a Decision node
+    async fn get_decision_embedding(&self, decision_id: Uuid) -> Result<Option<Vec<f32>>>;
+
+    /// Get all decisions with their linked task_id (for MeiliSearch reindex)
+    async fn get_all_decisions_with_task_id(&self) -> Result<Vec<(DecisionNode, Uuid)>>;
+
+    /// Get all Decision IDs that have no embedding yet (for backfill)
+    async fn get_decisions_without_embedding(&self) -> Result<Vec<(Uuid, String, String)>>;
+
+    /// Semantic search over Decision embeddings using Neo4j vector index.
+    /// When `project_id` is provided, filters results to that project (post-query).
+    async fn search_decisions_by_vector(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        project_id: Option<&str>,
+    ) -> Result<Vec<(DecisionNode, f64)>>;
+
+    /// Get decisions that AFFECT a given entity (reverse AFFECTS lookup)
+    async fn get_decisions_affecting(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<DecisionNode>>;
+
+    /// Create an AFFECTS relation from a Decision to any entity in the graph
+    async fn add_decision_affects(
+        &self,
+        decision_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+        impact_description: Option<&str>,
+    ) -> Result<()>;
+
+    /// Remove an AFFECTS relation from a Decision to an entity
+    async fn remove_decision_affects(
+        &self,
+        decision_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<()>;
+
+    /// List all entities affected by a Decision
+    async fn list_decision_affects(&self, decision_id: Uuid) -> Result<Vec<AffectsRelation>>;
+
+    /// Mark a decision as superseded by a newer decision
+    async fn supersede_decision(&self, new_decision_id: Uuid, old_decision_id: Uuid) -> Result<()>;
+
+    /// Get a timeline of decisions, optionally filtered by task and date range
+    async fn get_decision_timeline(
+        &self,
+        task_id: Option<Uuid>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<Vec<DecisionTimelineEntry>>;
+
+    /// List decisions having a given status, across all projects by default,
+    /// newest first. `project_id` wins over `workspace_slug`. Returns (page, total).
+    async fn list_decisions_by_status(
+        &self,
+        status: DecisionStatus,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DecisionListItem>, usize)>;
+}
+
+// ============================================================================
+// Commit domain
+// ============================================================================
+
+/// The commit domain: commits, what they touched and what changed together.
+#[async_trait]
+pub trait CommitStore: Send + Sync {
+    // ========================================================================
+    // Dependency analysis
+    // ========================================================================
+
+    /// Find all files that depend on a given file (IMPORTS-only traversal).
+    /// When project_id is provided, only return dependents from the same project.
+    async fn find_dependent_files(
+        &self,
+        file_path: &str,
+        depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>>;
+
+    /// Find all files impacted by a change to a given file.
+    /// Combines IMPORTS traversal (file→file) and CALLS traversal
+    /// (functions in target ← called by functions in other files).
+    /// When project_id is provided, only return files from the same project.
+    async fn find_impacted_files(
+        &self,
+        file_path: &str,
+        depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>>;
+
+    /// Find all functions that call a given function
+    /// When project_id is provided, only return callers from the same project.
+    async fn find_callers(
+        &self,
+        function_id: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<FunctionNode>>;
+
+    // ========================================================================
+    // Task-file linking
+    // ========================================================================
+
+    /// Link a task to files it modifies
+    async fn link_task_to_files(&self, task_id: Uuid, file_paths: &[String]) -> Result<()>;
+
+    // ========================================================================
+    // Commit operations
+    // ========================================================================
+
+    /// Create a commit node
+    async fn create_commit(&self, commit: &CommitNode) -> Result<()>;
+
+    /// Get a commit by hash
+    async fn get_commit(&self, hash: &str) -> Result<Option<CommitNode>>;
+
+    /// Link a commit to a task (RESOLVED_BY relationship)
+    async fn link_commit_to_task(&self, commit_hash: &str, task_id: Uuid) -> Result<()>;
+
+    /// Link a commit to a plan (RESULTED_IN relationship)
+    async fn link_commit_to_plan(&self, commit_hash: &str, plan_id: Uuid) -> Result<()>;
+
+    /// Get commits for a task
+    async fn get_task_commits(&self, task_id: Uuid) -> Result<Vec<CommitNode>>;
+
+    /// Get commits for a plan
+    async fn get_plan_commits(&self, plan_id: Uuid) -> Result<Vec<CommitNode>>;
+
+    /// Delete a commit
+    async fn delete_commit(&self, hash: &str) -> Result<()>;
+
+    // ========================================================================
+    // TOUCHES operations (Commit → File)
+    // ========================================================================
+
+    /// Create TOUCHES relations between a Commit and its changed Files (batch UNWIND).
+    /// Files that don't exist as nodes are silently skipped.
+    async fn create_commit_touches(
+        &self,
+        commit_hash: &str,
+        files: &[FileChangedInfo],
+    ) -> Result<()>;
+
+    /// Get all files touched by a commit
+    async fn get_commit_files(&self, commit_hash: &str) -> Result<Vec<CommitFileInfo>>;
+
+    /// Get the commit history for a specific file
+    async fn get_file_history(
+        &self,
+        file_path: &str,
+        limit: Option<i64>,
+    ) -> Result<Vec<FileHistoryEntry>>;
+
+    /// Ping freshness on all Notes LINKED_TO the given file paths.
+    /// Returns the number of distinct notes pinged.
+    async fn ping_freshness_for_files(&self, file_paths: &[String]) -> Result<usize>;
+
+    // ========================================================================
+    // CO_CHANGED operations (File ↔ File)
+    // ========================================================================
+
+    /// Compute CO_CHANGED relations from TOUCHES history (incremental).
+    /// Returns the number of relations created/updated.
+    async fn compute_co_changed(
+        &self,
+        project_id: Uuid,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        min_count: i64,
+        max_relations: i64,
+    ) -> Result<i64>;
+
+    /// Update project last_co_change_computed_at timestamp
+    async fn update_project_co_change_timestamp(&self, id: Uuid) -> Result<()>;
+
+    /// Get the co-change graph for a project
+    async fn get_co_change_graph(
+        &self,
+        project_id: Uuid,
+        min_count: i64,
+        limit: i64,
+    ) -> Result<Vec<CoChangePair>>;
+
+    /// Get files that co-change with a given file
+    async fn get_file_co_changers(
+        &self,
+        file_path: &str,
+        min_count: i64,
+        limit: i64,
+    ) -> Result<Vec<CoChanger>>;
+
+    /// Compute CO_CHANGED_TRANSITIVE relations via BFS on the CO_CHANGED graph.
+    ///
+    /// # References
+    /// - Rolfsnes et al. (2018) — "Detecting Evolutionary Coupling Using Transitive Association Rules"
+    async fn compute_co_changed_transitive(
+        &self,
+        project_id: Uuid,
+        max_depth: i64,
+        min_score: f64,
+    ) -> Result<i64>;
+
+    /// Get files that are transitively co-changed with a given file.
+    ///
+    /// # References
+    /// - Rolfsnes et al. (2018) — "Detecting Evolutionary Coupling Using Transitive Association Rules"
+    async fn get_file_transitive_co_changers(
+        &self,
+        file_path: &str,
+        min_score: f64,
+        limit: i64,
+    ) -> Result<Vec<TransitiveCoChanger>>;
+}
+
+// ============================================================================
+// Release domain
+// ============================================================================
+
+/// The release domain: releases, environments and their deployments.
+#[async_trait]
+pub trait ReleaseStore: Send + Sync {
+    // ========================================================================
+    // Release operations
+    // ========================================================================
+
+    /// Create a release
+    async fn create_release(&self, release: &ReleaseNode) -> Result<()>;
+
+    /// Get a release by ID
+    async fn get_release(&self, id: Uuid) -> Result<Option<ReleaseNode>>;
+
+    /// List releases for a project
+    async fn list_project_releases(&self, project_id: Uuid) -> Result<Vec<ReleaseNode>>;
+
+    /// Update a release
+    async fn update_release(
+        &self,
+        id: Uuid,
+        status: Option<ReleaseStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+        released_at: Option<chrono::DateTime<chrono::Utc>>,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<()>;
+
+    /// Add a task to a release
+    async fn add_task_to_release(&self, release_id: Uuid, task_id: Uuid) -> Result<()>;
+
+    /// Add a commit to a release
+    async fn add_commit_to_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()>;
+
+    /// Remove a commit from a release
+    async fn remove_commit_from_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()>;
+
+    /// Get release details with tasks and commits
+    async fn get_release_details(
+        &self,
+        release_id: Uuid,
+    ) -> Result<Option<(ReleaseNode, Vec<TaskNode>, Vec<CommitNode>)>>;
+
+    /// Delete a release
+    async fn delete_release(&self, release_id: Uuid) -> Result<()>;
+
+    // ========================================================================
+    // Environment & deployment operations
+    // ========================================================================
+
+    /// Create an environment. Errors when the project does not exist or when the
+    /// name is already used by another environment of the project.
+    async fn create_environment(&self, env: &EnvironmentNode) -> Result<()>;
+
+    /// Get an environment by ID
+    async fn get_environment(&self, id: Uuid) -> Result<Option<EnvironmentNode>>;
+
+    /// List the environments of a project (oldest first)
+    async fn list_project_environments(&self, project_id: Uuid) -> Result<Vec<EnvironmentNode>>;
+
+    /// Update an environment (empty string clears url/description/config)
+    async fn update_environment(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        kind: Option<EnvironmentKind>,
+        url: Option<String>,
+        description: Option<String>,
+        config: Option<String>,
+    ) -> Result<()>;
+
+    /// Delete an environment and its deployments
+    async fn delete_environment(&self, id: Uuid) -> Result<()>;
+
+    /// Record a deployment (linked to the Commit node with the same sha, if any)
+    async fn create_deployment(&self, deployment: &DeploymentNode) -> Result<()>;
+
+    /// Get a deployment by ID
+    async fn get_deployment(&self, id: Uuid) -> Result<Option<DeploymentNode>>;
+
+    /// List deployments of an environment, newest first, with the total count
+    async fn list_environment_deployments(
+        &self,
+        environment_id: Uuid,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DeploymentNode>, usize)>;
+
+    /// Update a deployment (status, finished_at, notes)
+    async fn update_deployment(
+        &self,
+        id: Uuid,
+        status: Option<DeploymentStatus>,
+        finished_at: Option<chrono::DateTime<chrono::Utc>>,
+        notes: Option<String>,
+    ) -> Result<()>;
+
+    /// Deployment matrix of a project: every environment with its latest
+    /// deployment and the statuses of its last 5 deployments (newest first)
+    async fn get_deployment_matrix(&self, project_id: Uuid) -> Result<Vec<DeploymentMatrixEntry>>;
+
+    // ========================================================================
+    // Milestone operations
+    // ========================================================================
+
+    /// Create a milestone
+    async fn create_milestone(&self, milestone: &MilestoneNode) -> Result<()>;
+
+    /// Get a milestone by ID
+    async fn get_milestone(&self, id: Uuid) -> Result<Option<MilestoneNode>>;
+
+    /// List milestones for a project
+    async fn list_project_milestones(&self, project_id: Uuid) -> Result<Vec<MilestoneNode>>;
+
+    /// Update a milestone
+    async fn update_milestone(
+        &self,
+        id: Uuid,
+        status: Option<MilestoneStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+        closed_at: Option<chrono::DateTime<chrono::Utc>>,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<()>;
+
+    /// Add a task to a milestone
+    async fn add_task_to_milestone(&self, milestone_id: Uuid, task_id: Uuid) -> Result<()>;
+
+    /// Link a plan to a project milestone
+    async fn link_plan_to_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()>;
+
+    /// Unlink a plan from a project milestone
+    async fn unlink_plan_from_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()>;
+
+    /// Get milestone details with tasks
+    async fn get_milestone_details(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<Option<(MilestoneNode, Vec<TaskNode>)>>;
+
+    /// Get milestone progress (total, completed, in_progress, pending)
+    async fn get_milestone_progress(&self, milestone_id: Uuid) -> Result<(u32, u32, u32, u32)>;
+
+    /// Get tasks linked to a project milestone (with plan info)
+    async fn get_milestone_tasks_with_plans(&self, milestone_id: Uuid)
+        -> Result<Vec<TaskWithPlan>>;
+
+    /// Get all steps for all tasks linked to a project milestone (batch)
+    async fn get_milestone_steps_batch(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>>;
+
+    /// Delete a milestone
+    async fn delete_milestone(&self, milestone_id: Uuid) -> Result<()>;
+
+    /// Get tasks for a milestone
+    async fn get_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskNode>>;
+
+    /// Get tasks for a release
+    async fn get_release_tasks(&self, release_id: Uuid) -> Result<Vec<TaskNode>>;
+
+    // ========================================================================
+    // Project stats
+    // ========================================================================
+
+    /// Get project progress stats
+    async fn get_project_progress(&self, project_id: Uuid) -> Result<(u32, u32, u32, u32)>;
+
+    /// Task counters for many entities at once (one round trip for list cards).
+    ///
+    /// The default implementation loops over the per-entity task getters so
+    /// every store (including mocks) supports it; `Neo4jClient` overrides it
+    /// with a single aggregated query.
+    async fn get_progress_batch(
+        &self,
+        kind: ProgressKind,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, TaskCounts>> {
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        for id in ids {
+            let tasks = match kind {
+                ProgressKind::Plan => self.get_plan_tasks(*id).await?,
+                ProgressKind::Project => self.get_project_tasks(*id).await?,
+                ProgressKind::Milestone => self.get_milestone_tasks(*id).await?,
+            };
+            out.insert(*id, TaskCounts::from_tasks(&tasks));
+        }
+        Ok(out)
+    }
+
+    /// Get all task dependencies for a project (across all plans)
+    async fn get_project_task_dependencies(&self, project_id: Uuid) -> Result<Vec<(Uuid, Uuid)>>;
+
+    /// Get all tasks for a project (across all plans)
+    async fn get_project_tasks(&self, project_id: Uuid) -> Result<Vec<TaskNode>>;
+
+    // ========================================================================
+    // Filtered list operations with pagination
+    // ========================================================================
+
+    /// List plans with filters and pagination
+    ///
+    /// Returns (plans, total_count)
+    #[allow(clippy::too_many_arguments)]
+    async fn list_plans_filtered(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        statuses: Option<Vec<String>>,
+        priority_min: Option<i32>,
+        priority_max: Option<i32>,
+        search: Option<&str>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> Result<(Vec<PlanNode>, usize)>;
+
+    /// List all tasks across all plans with filters and pagination
+    ///
+    /// Returns (tasks_with_plan_info, total_count)
+    #[allow(clippy::too_many_arguments)]
+    async fn list_all_tasks_filtered(
+        &self,
+        plan_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        statuses: Option<Vec<String>>,
+        priority_min: Option<i32>,
+        priority_max: Option<i32>,
+        tags: Option<Vec<String>>,
+        assigned_to: Option<&str>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> Result<(Vec<TaskWithPlan>, usize)>;
+
+    /// List project releases with filters and pagination
+    async fn list_releases_filtered(
+        &self,
+        project_id: Uuid,
+        statuses: Option<Vec<String>>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> Result<(Vec<ReleaseNode>, usize)>;
+
+    /// List project milestones with filters and pagination
+    async fn list_milestones_filtered(
+        &self,
+        project_id: Uuid,
+        statuses: Option<Vec<String>>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> Result<(Vec<MilestoneNode>, usize)>;
+
+    /// List projects with search and pagination
+    async fn list_projects_filtered(
+        &self,
+        search: Option<&str>,
+        limit: usize,
+        offset: usize,
+        sort_by: Option<&str>,
+        sort_order: &str,
+    ) -> Result<(Vec<ProjectNode>, usize)>;
 }

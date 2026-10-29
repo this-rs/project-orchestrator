@@ -10,7 +10,8 @@ use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest
 use crate::neo4j::document::{Document, DocumentChunk, DocumentChunkHit};
 use crate::neo4j::models::*;
 use crate::neo4j::traits::{
-    CodeStore, GraphStore, PlanStore, ProjectStore, StoreCapabilities, WorkspaceStore,
+    CodeStore, CommitStore, DecisionStore, GraphStore, PlanStore, ProjectStore, ReleaseStore,
+    StoreCapabilities, WorkspaceStore,
 };
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
@@ -884,1479 +885,6 @@ impl GraphStore for MockGraphStore {
             // (mock.rs:22) with no begin / commit / rollback.
             explicit_transactions: false,
         }
-    }
-
-    // ========================================================================
-    // Decision operations
-    // ========================================================================
-
-    async fn create_decision(&self, task_id: Uuid, decision: &DecisionNode) -> Result<()> {
-        if !self.tasks.read().await.contains_key(&task_id) {
-            anyhow::bail!(
-                "Failed to create decision: Task {} not found in Neo4j",
-                task_id
-            );
-        }
-        let did = decision.id;
-        self.task_decisions
-            .write()
-            .await
-            .entry(task_id)
-            .or_default()
-            .push(did);
-        self.decisions.write().await.insert(did, decision.clone());
-        Ok(())
-    }
-
-    async fn get_decision(&self, decision_id: Uuid) -> Result<Option<DecisionNode>> {
-        Ok(self.decisions.read().await.get(&decision_id).cloned())
-    }
-
-    async fn list_decisions_by_status(
-        &self,
-        status: DecisionStatus,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<DecisionListItem>, usize)> {
-        self.log_read("list_decisions_by_status")?;
-        let scope = self.scope_projects(project_id, workspace_slug).await;
-        let decisions = self.decisions.read().await;
-        let task_decisions = self.task_decisions.read().await;
-        let plan_tasks = self.plan_tasks.read().await;
-        let project_plans = self.project_plans.read().await;
-
-        let mut items: Vec<DecisionListItem> = decisions
-            .values()
-            .filter(|d| d.status == status)
-            .map(|d| {
-                let task_id = task_decisions
-                    .iter()
-                    .find(|(_, ds)| ds.contains(&d.id))
-                    .map(|(t, _)| *t);
-                let project_id = task_id.and_then(|t| {
-                    let plan = plan_tasks
-                        .iter()
-                        .find(|(_, ts)| ts.contains(&t))
-                        .map(|(p, _)| *p)?;
-                    project_plans
-                        .iter()
-                        .find(|(_, ps)| ps.contains(&plan))
-                        .map(|(pr, _)| *pr)
-                });
-                DecisionListItem {
-                    decision: d.clone(),
-                    task_id,
-                    project_id,
-                }
-            })
-            .filter(|i| match scope {
-                Some(ref s) => i.project_id.is_some_and(|p| s.contains(&p)),
-                None => true,
-            })
-            .collect();
-        items.sort_by(|a, b| b.decision.decided_at.cmp(&a.decision.decided_at));
-        let total = items.len();
-        let page = items.into_iter().skip(offset).take(limit).collect();
-        Ok((page, total))
-    }
-
-    async fn get_decision_project_id(&self, decision_id: Uuid) -> Result<Option<String>> {
-        Ok(self
-            .get_decision_project_ids(&[decision_id])
-            .await?
-            .remove(&decision_id)
-            .map(|p| p.to_string()))
-    }
-
-    async fn get_decision_project_ids(&self, decision_ids: &[Uuid]) -> Result<HashMap<Uuid, Uuid>> {
-        // Same chain as the Cypher (Project→Plan→Task→Decision); several
-        // projects → the smallest id, like `min(proj.id)`.
-        let task_decisions = self.task_decisions.read().await;
-        let plan_tasks = self.plan_tasks.read().await;
-        let project_plans = self.project_plans.read().await;
-        let mut out = HashMap::new();
-        for did in decision_ids {
-            let project = task_decisions
-                .iter()
-                .filter(|(_, ds)| ds.contains(did))
-                .flat_map(|(t, _)| {
-                    plan_tasks
-                        .iter()
-                        .filter(move |(_, ts)| ts.contains(t))
-                        .map(|(p, _)| *p)
-                })
-                .flat_map(|plan| {
-                    project_plans
-                        .iter()
-                        .filter(move |(_, ps)| ps.contains(&plan))
-                        .map(|(pr, _)| *pr)
-                })
-                .min_by_key(|p| p.to_string());
-            if let Some(p) = project {
-                out.insert(*did, p);
-            }
-        }
-        Ok(out)
-    }
-
-    async fn update_decision(
-        &self,
-        decision_id: Uuid,
-        description: Option<String>,
-        rationale: Option<String>,
-        chosen_option: Option<String>,
-        status: Option<DecisionStatus>,
-    ) -> Result<()> {
-        if let Some(d) = self.decisions.write().await.get_mut(&decision_id) {
-            if let Some(desc) = description {
-                d.description = desc;
-            }
-            if let Some(rat) = rationale {
-                d.rationale = rat;
-            }
-            if let Some(co) = chosen_option {
-                d.chosen_option = Some(co);
-            }
-            if let Some(st) = status {
-                d.status = st;
-            }
-        }
-        Ok(())
-    }
-
-    async fn delete_decision(&self, decision_id: Uuid) -> Result<()> {
-        self.decisions.write().await.remove(&decision_id);
-        let mut td = self.task_decisions.write().await;
-        for ids in td.values_mut() {
-            ids.retain(|id| *id != decision_id);
-        }
-        Ok(())
-    }
-
-    async fn get_decisions_for_entity(
-        &self,
-        entity_type: &str,
-        entity_id: &str,
-        limit: u32,
-    ) -> Result<Vec<DecisionNode>> {
-        // For tasks, look up via task_decisions mapping
-        if entity_type.eq_ignore_ascii_case("task") {
-            if let Ok(task_id) = Uuid::parse_str(entity_id) {
-                let task_decisions = self.task_decisions.read().await;
-                let decisions = self.decisions.read().await;
-                if let Some(decision_ids) = task_decisions.get(&task_id) {
-                    let result: Vec<DecisionNode> = decision_ids
-                        .iter()
-                        .filter_map(|did| decisions.get(did).cloned())
-                        .take(limit as usize)
-                        .collect();
-                    return Ok(result);
-                }
-            }
-        }
-        Ok(vec![])
-    }
-
-    async fn set_decision_embedding(
-        &self,
-        decision_id: Uuid,
-        _embedding: &[f32],
-        model: &str,
-    ) -> Result<()> {
-        if let Some(d) = self.decisions.write().await.get_mut(&decision_id) {
-            d.embedding_model = Some(model.to_string());
-        }
-        Ok(())
-    }
-
-    async fn get_decision_embedding(&self, decision_id: Uuid) -> Result<Option<Vec<f32>>> {
-        let decisions = self.decisions.read().await;
-        Ok(decisions
-            .get(&decision_id)
-            .and_then(|d| d.embedding.as_ref())
-            .map(|emb| emb.iter().map(|&x| x as f32).collect()))
-    }
-
-    async fn get_all_decisions_with_task_id(&self) -> Result<Vec<(DecisionNode, Uuid)>> {
-        let decisions = self.decisions.read().await;
-        let td = self.task_decisions.read().await;
-        let mut result = Vec::new();
-        for (&task_id, decision_ids) in td.iter() {
-            for did in decision_ids {
-                if let Some(d) = decisions.get(did) {
-                    result.push((d.clone(), task_id));
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    async fn get_decisions_without_embedding(&self) -> Result<Vec<(Uuid, String, String)>> {
-        let decisions = self.decisions.read().await;
-        Ok(decisions
-            .values()
-            .filter(|d| d.embedding.is_none())
-            .map(|d| (d.id, d.description.clone(), d.rationale.clone()))
-            .collect())
-    }
-
-    async fn search_decisions_by_vector(
-        &self,
-        _query_embedding: &[f32],
-        _limit: usize,
-        _project_id: Option<&str>,
-    ) -> Result<Vec<(DecisionNode, f64)>> {
-        // Mock: return empty — vector search requires real Neo4j index
-        Ok(vec![])
-    }
-
-    async fn get_decisions_affecting(
-        &self,
-        _entity_type: &str,
-        _entity_id: &str,
-        _status_filter: Option<&str>,
-    ) -> Result<Vec<DecisionNode>> {
-        Ok(vec![])
-    }
-
-    async fn add_decision_affects(
-        &self,
-        decision_id: Uuid,
-        entity_type: &str,
-        entity_id: &str,
-        impact_description: Option<&str>,
-    ) -> Result<()> {
-        // Mirror the real implementation's validation: reject unknown
-        // entity_types up front. The mock has no graph to MATCH against, so it
-        // cannot reproduce the "entity not found" error — but it CAN catch the
-        // case-mismatch / typo class of bug (gotcha e3f9a882), which is the
-        // regression this method previously hid by accepting anything.
-        let etype = crate::notes::models::EntityType::from_str(entity_type)
-            .map_err(|e| anyhow::anyhow!("add_decision_affects: invalid entity_type: {e}"))?;
-        let relation = AffectsRelation {
-            // Normalize to the canonical snake_case form so stored relations are
-            // consistent regardless of input casing.
-            entity_type: etype.to_string(),
-            entity_id: entity_id.to_string(),
-            entity_name: None,
-            impact_description: impact_description.map(|s| s.to_string()),
-        };
-        self.decision_affects
-            .write()
-            .await
-            .entry(decision_id)
-            .or_default()
-            .push(relation);
-        Ok(())
-    }
-
-    async fn remove_decision_affects(
-        &self,
-        decision_id: Uuid,
-        entity_type: &str,
-        entity_id: &str,
-    ) -> Result<()> {
-        // Validate entity_type for symmetry with add_decision_affects.
-        crate::notes::models::EntityType::from_str(entity_type)
-            .map_err(|e| anyhow::anyhow!("remove_decision_affects: invalid entity_type: {e}"))?;
-        if let Some(affects) = self.decision_affects.write().await.get_mut(&decision_id) {
-            affects.retain(|a| a.entity_id != entity_id);
-        }
-        Ok(())
-    }
-
-    async fn list_decision_affects(&self, decision_id: Uuid) -> Result<Vec<AffectsRelation>> {
-        Ok(self
-            .decision_affects
-            .read()
-            .await
-            .get(&decision_id)
-            .cloned()
-            .unwrap_or_default())
-    }
-
-    async fn supersede_decision(
-        &self,
-        _new_decision_id: Uuid,
-        _old_decision_id: Uuid,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn get_decision_timeline(
-        &self,
-        _task_id: Option<Uuid>,
-        _from: Option<&str>,
-        _to: Option<&str>,
-    ) -> Result<Vec<DecisionTimelineEntry>> {
-        Ok(vec![])
-    }
-
-    // ========================================================================
-    // Dependency analysis
-    // ========================================================================
-
-    async fn find_dependent_files(
-        &self,
-        file_path: &str,
-        _depth: u32,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<String>> {
-        let ir = self.import_relationships.read().await;
-        let mut dependents = Vec::new();
-        for (from, tos) in ir.iter() {
-            if tos.contains(&file_path.to_string()) {
-                dependents.push(from.clone());
-            }
-        }
-
-        // Filter by project if project_id is provided
-        if let Some(pid) = project_id {
-            let pf = self.project_files.read().await;
-            if let Some(project_paths) = pf.get(&pid) {
-                dependents.retain(|p| project_paths.contains(p));
-            } else {
-                dependents.clear();
-            }
-        }
-
-        Ok(dependents)
-    }
-
-    async fn find_impacted_files(
-        &self,
-        file_path: &str,
-        _depth: u32,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<String>> {
-        let mut impacted: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        // Axis 1: files that import the target (same as find_dependent_files)
-        let ir = self.import_relationships.read().await;
-        for (from, tos) in ir.iter() {
-            if tos.contains(&file_path.to_string()) {
-                impacted.insert(from.clone());
-            }
-        }
-
-        // Axis 2: files whose functions call functions defined in the target file
-        let functions = self.functions.read().await;
-        let cr = self.call_relationships.read().await;
-
-        // Collect function names defined in the target file
-        let target_func_names: Vec<String> = functions
-            .values()
-            .filter(|f| f.file_path == file_path)
-            .map(|f| f.name.clone())
-            .collect();
-
-        // Find callers of those functions and their files
-        for (caller_id, callees) in cr.iter() {
-            if callees.iter().any(|c| target_func_names.contains(c)) {
-                if let Some(caller_fn) = functions.get(caller_id) {
-                    if caller_fn.file_path != file_path {
-                        impacted.insert(caller_fn.file_path.clone());
-                    }
-                }
-            }
-        }
-
-        // Filter by project if project_id is provided
-        let mut result: Vec<String> = impacted.into_iter().collect();
-        if let Some(pid) = project_id {
-            let pf = self.project_files.read().await;
-            if let Some(project_paths) = pf.get(&pid) {
-                result.retain(|p| project_paths.contains(p));
-            } else {
-                result.clear();
-            }
-        }
-
-        Ok(result)
-    }
-
-    async fn find_callers(
-        &self,
-        function_id: &str,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<FunctionNode>> {
-        let cr = self.call_relationships.read().await;
-        let functions = self.functions.read().await;
-        // Extract function name from id
-        let func_name = function_id.rsplit("::").next().unwrap_or(function_id);
-
-        // If project_id provided, get the set of file paths belonging to this project
-        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
-            let pf = self.project_files.read().await;
-            Some(pf.get(&pid).cloned().unwrap_or_default())
-        } else {
-            None
-        };
-
-        let mut callers = Vec::new();
-        for (caller_id, callees) in cr.iter() {
-            if callees.contains(&func_name.to_string()) {
-                if let Some(f) = functions.get(caller_id) {
-                    // If scoped by project, only include callers whose file is in the project
-                    if let Some(ref paths) = project_file_paths {
-                        if !paths.contains(&f.file_path) {
-                            continue;
-                        }
-                    }
-                    callers.push(f.clone());
-                }
-            }
-        }
-        Ok(callers)
-    }
-
-    // ========================================================================
-    // Task-file linking
-    // ========================================================================
-
-    async fn link_task_to_files(&self, task_id: Uuid, file_paths: &[String]) -> Result<()> {
-        self.task_files
-            .write()
-            .await
-            .entry(task_id)
-            .or_default()
-            .extend(file_paths.iter().cloned());
-        Ok(())
-    }
-
-    // ========================================================================
-    // Commit operations
-    // ========================================================================
-
-    async fn create_commit(&self, commit: &CommitNode) -> Result<()> {
-        self.commits
-            .write()
-            .await
-            .insert(commit.hash.clone(), commit.clone());
-        Ok(())
-    }
-
-    async fn get_commit(&self, hash: &str) -> Result<Option<CommitNode>> {
-        Ok(self.commits.read().await.get(hash).cloned())
-    }
-
-    async fn link_commit_to_task(&self, commit_hash: &str, task_id: Uuid) -> Result<()> {
-        self.task_commits
-            .write()
-            .await
-            .entry(task_id)
-            .or_default()
-            .push(commit_hash.to_string());
-        Ok(())
-    }
-
-    async fn link_commit_to_plan(&self, commit_hash: &str, plan_id: Uuid) -> Result<()> {
-        self.plan_commits
-            .write()
-            .await
-            .entry(plan_id)
-            .or_default()
-            .push(commit_hash.to_string());
-        Ok(())
-    }
-
-    async fn get_task_commits(&self, task_id: Uuid) -> Result<Vec<CommitNode>> {
-        let tc = self.task_commits.read().await;
-        let commits = self.commits.read().await;
-        let hashes = tc.get(&task_id).cloned().unwrap_or_default();
-        Ok(hashes
-            .iter()
-            .filter_map(|h| commits.get(h).cloned())
-            .collect())
-    }
-
-    async fn get_plan_commits(&self, plan_id: Uuid) -> Result<Vec<CommitNode>> {
-        let pc = self.plan_commits.read().await;
-        let commits = self.commits.read().await;
-        let hashes = pc.get(&plan_id).cloned().unwrap_or_default();
-        Ok(hashes
-            .iter()
-            .filter_map(|h| commits.get(h).cloned())
-            .collect())
-    }
-
-    async fn delete_commit(&self, hash: &str) -> Result<()> {
-        self.commits.write().await.remove(hash);
-        let mut tc = self.task_commits.write().await;
-        for hashes in tc.values_mut() {
-            hashes.retain(|h| h != hash);
-        }
-        let mut pc = self.plan_commits.write().await;
-        for hashes in pc.values_mut() {
-            hashes.retain(|h| h != hash);
-        }
-        Ok(())
-    }
-
-    // ========================================================================
-    // TOUCHES operations (Commit → File) — mock stubs
-    // ========================================================================
-
-    async fn create_commit_touches(
-        &self,
-        _commit_hash: &str,
-        _files: &[FileChangedInfo],
-    ) -> Result<()> {
-        // Mock: no-op (TOUCHES relations not tracked in mock)
-        Ok(())
-    }
-
-    async fn get_commit_files(&self, _commit_hash: &str) -> Result<Vec<CommitFileInfo>> {
-        Ok(vec![])
-    }
-
-    async fn get_file_history(
-        &self,
-        _file_path: &str,
-        _limit: Option<i64>,
-    ) -> Result<Vec<FileHistoryEntry>> {
-        Ok(vec![])
-    }
-
-    async fn ping_freshness_for_files(&self, file_paths: &[String]) -> Result<usize> {
-        let anchors = self.note_anchors.read().await;
-        let mut notes = self.notes.write().await;
-        let mut pinged_ids = std::collections::HashSet::new();
-
-        for (note_id, note_anchors) in anchors.iter() {
-            for anchor in note_anchors {
-                if file_paths.contains(&anchor.entity_id) {
-                    pinged_ids.insert(*note_id);
-                }
-            }
-        }
-
-        let now = chrono::Utc::now();
-        for note_id in &pinged_ids {
-            if let Some(note) = notes.get_mut(note_id) {
-                note.freshness_pinged_at = Some(now);
-            }
-        }
-
-        Ok(pinged_ids.len())
-    }
-
-    // ========================================================================
-    // CO_CHANGED operations (File ↔ File) — mock stubs
-    // ========================================================================
-
-    async fn compute_co_changed(
-        &self,
-        _project_id: Uuid,
-        _since: Option<chrono::DateTime<chrono::Utc>>,
-        _min_count: i64,
-        _max_relations: i64,
-    ) -> Result<i64> {
-        Ok(0)
-    }
-
-    async fn update_project_co_change_timestamp(&self, id: Uuid) -> Result<()> {
-        if let Some(p) = self.projects.write().await.get_mut(&id) {
-            p.last_co_change_computed_at = Some(Utc::now());
-        }
-        Ok(())
-    }
-
-    async fn get_co_change_graph(
-        &self,
-        _project_id: Uuid,
-        _min_count: i64,
-        _limit: i64,
-    ) -> Result<Vec<CoChangePair>> {
-        Ok(vec![])
-    }
-
-    async fn get_file_co_changers(
-        &self,
-        _file_path: &str,
-        _min_count: i64,
-        _limit: i64,
-    ) -> Result<Vec<CoChanger>> {
-        Ok(vec![])
-    }
-
-    async fn compute_co_changed_transitive(
-        &self,
-        _project_id: Uuid,
-        _max_depth: i64,
-        _min_score: f64,
-    ) -> Result<i64> {
-        Ok(0)
-    }
-
-    async fn get_file_transitive_co_changers(
-        &self,
-        _file_path: &str,
-        _min_score: f64,
-        _limit: i64,
-    ) -> Result<Vec<TransitiveCoChanger>> {
-        Ok(vec![])
-    }
-
-    // ========================================================================
-    // Release operations
-    // ========================================================================
-
-    async fn create_release(&self, release: &ReleaseNode) -> Result<()> {
-        let pid = release.project_id;
-        if !self.projects.read().await.contains_key(&pid) {
-            anyhow::bail!(
-                "Failed to create release: Project {} not found in Neo4j",
-                pid
-            );
-        }
-        let rid = release.id;
-        self.project_releases
-            .write()
-            .await
-            .entry(pid)
-            .or_default()
-            .push(rid);
-        self.releases.write().await.insert(rid, release.clone());
-        Ok(())
-    }
-
-    async fn get_release(&self, id: Uuid) -> Result<Option<ReleaseNode>> {
-        Ok(self.releases.read().await.get(&id).cloned())
-    }
-
-    async fn list_project_releases(&self, project_id: Uuid) -> Result<Vec<ReleaseNode>> {
-        let pr = self.project_releases.read().await;
-        let releases = self.releases.read().await;
-        let ids = pr.get(&project_id).cloned().unwrap_or_default();
-        Ok(ids
-            .iter()
-            .filter_map(|id| releases.get(id).cloned())
-            .collect())
-    }
-
-    async fn update_release(
-        &self,
-        id: Uuid,
-        status: Option<ReleaseStatus>,
-        target_date: Option<chrono::DateTime<chrono::Utc>>,
-        released_at: Option<chrono::DateTime<chrono::Utc>>,
-        title: Option<String>,
-        description: Option<String>,
-    ) -> Result<()> {
-        if let Some(r) = self.releases.write().await.get_mut(&id) {
-            if let Some(s) = status {
-                r.status = s;
-            }
-            if let Some(td) = target_date {
-                r.target_date = Some(td);
-            }
-            if let Some(ra) = released_at {
-                r.released_at = Some(ra);
-            }
-            if let Some(t) = title {
-                r.title = Some(t);
-            }
-            if let Some(d) = description {
-                r.description = Some(d);
-            }
-        }
-        Ok(())
-    }
-
-    async fn add_task_to_release(&self, release_id: Uuid, task_id: Uuid) -> Result<()> {
-        self.release_tasks
-            .write()
-            .await
-            .entry(release_id)
-            .or_default()
-            .push(task_id);
-        Ok(())
-    }
-
-    async fn add_commit_to_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()> {
-        self.release_commits
-            .write()
-            .await
-            .entry(release_id)
-            .or_default()
-            .push(commit_hash.to_string());
-        Ok(())
-    }
-
-    async fn remove_commit_from_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()> {
-        self.release_commits
-            .write()
-            .await
-            .entry(release_id)
-            .or_default()
-            .retain(|h| h != commit_hash);
-        Ok(())
-    }
-
-    async fn get_release_details(
-        &self,
-        release_id: Uuid,
-    ) -> Result<Option<(ReleaseNode, Vec<TaskNode>, Vec<CommitNode>)>> {
-        let release = match self.releases.read().await.get(&release_id).cloned() {
-            Some(r) => r,
-            None => return Ok(None),
-        };
-        let task_ids = self
-            .release_tasks
-            .read()
-            .await
-            .get(&release_id)
-            .cloned()
-            .unwrap_or_default();
-        let tasks_map = self.tasks.read().await;
-        let tasks: Vec<TaskNode> = task_ids
-            .iter()
-            .filter_map(|id| tasks_map.get(id).cloned())
-            .collect();
-        let commit_hashes = self
-            .release_commits
-            .read()
-            .await
-            .get(&release_id)
-            .cloned()
-            .unwrap_or_default();
-        let commits_map = self.commits.read().await;
-        let commits: Vec<CommitNode> = commit_hashes
-            .iter()
-            .filter_map(|h| commits_map.get(h).cloned())
-            .collect();
-        Ok(Some((release, tasks, commits)))
-    }
-
-    async fn delete_release(&self, release_id: Uuid) -> Result<()> {
-        if let Some(r) = self.releases.write().await.remove(&release_id) {
-            if let Some(ids) = self.project_releases.write().await.get_mut(&r.project_id) {
-                ids.retain(|id| *id != release_id);
-            }
-        }
-        self.release_tasks.write().await.remove(&release_id);
-        self.release_commits.write().await.remove(&release_id);
-        Ok(())
-    }
-
-    // ========================================================================
-    // Environment & deployment operations
-    // ========================================================================
-
-    async fn create_environment(&self, env: &EnvironmentNode) -> Result<()> {
-        let mut envs = self.environments.write().await;
-        if envs
-            .values()
-            .any(|e| e.project_id == env.project_id && e.name == env.name)
-        {
-            anyhow::bail!(
-                "Cannot create environment '{}': project not found or name already used",
-                env.name
-            );
-        }
-        envs.insert(env.id, env.clone());
-        Ok(())
-    }
-
-    async fn get_environment(&self, id: Uuid) -> Result<Option<EnvironmentNode>> {
-        Ok(self.environments.read().await.get(&id).cloned())
-    }
-
-    async fn list_project_environments(&self, project_id: Uuid) -> Result<Vec<EnvironmentNode>> {
-        let mut envs: Vec<EnvironmentNode> = self
-            .environments
-            .read()
-            .await
-            .values()
-            .filter(|e| e.project_id == project_id)
-            .cloned()
-            .collect();
-        envs.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        Ok(envs)
-    }
-
-    async fn update_environment(
-        &self,
-        id: Uuid,
-        name: Option<String>,
-        kind: Option<EnvironmentKind>,
-        url: Option<String>,
-        description: Option<String>,
-        config: Option<String>,
-    ) -> Result<()> {
-        // Empty string clears an optional field (mirrors the Neo4j store)
-        fn opt(v: String) -> Option<String> {
-            if v.is_empty() {
-                None
-            } else {
-                Some(v)
-            }
-        }
-        if let Some(e) = self.environments.write().await.get_mut(&id) {
-            if let Some(n) = name {
-                e.name = n;
-            }
-            if let Some(k) = kind {
-                e.kind = k;
-            }
-            if let Some(u) = url {
-                e.url = opt(u);
-            }
-            if let Some(d) = description {
-                e.description = opt(d);
-            }
-            if let Some(c) = config {
-                e.config = opt(c);
-            }
-        }
-        Ok(())
-    }
-
-    async fn delete_environment(&self, id: Uuid) -> Result<()> {
-        self.environments.write().await.remove(&id);
-        self.deployments
-            .write()
-            .await
-            .retain(|_, d| d.environment_id != id);
-        Ok(())
-    }
-
-    async fn create_deployment(&self, deployment: &DeploymentNode) -> Result<()> {
-        if !self
-            .environments
-            .read()
-            .await
-            .contains_key(&deployment.environment_id)
-        {
-            anyhow::bail!(
-                "Cannot create deployment: environment {} not found",
-                deployment.environment_id
-            );
-        }
-        self.deployments
-            .write()
-            .await
-            .insert(deployment.id, deployment.clone());
-        Ok(())
-    }
-
-    async fn get_deployment(&self, id: Uuid) -> Result<Option<DeploymentNode>> {
-        Ok(self.deployments.read().await.get(&id).cloned())
-    }
-
-    async fn list_environment_deployments(
-        &self,
-        environment_id: Uuid,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<DeploymentNode>, usize)> {
-        let mut all: Vec<DeploymentNode> = self
-            .deployments
-            .read()
-            .await
-            .values()
-            .filter(|d| d.environment_id == environment_id)
-            .cloned()
-            .collect();
-        // Newest first (same ordering as the Neo4j store)
-        all.sort_by(|a, b| {
-            b.started_at
-                .cmp(&a.started_at)
-                .then_with(|| b.id.cmp(&a.id))
-        });
-        let total = all.len();
-        Ok((all.into_iter().skip(offset).take(limit).collect(), total))
-    }
-
-    async fn update_deployment(
-        &self,
-        id: Uuid,
-        status: Option<DeploymentStatus>,
-        finished_at: Option<chrono::DateTime<chrono::Utc>>,
-        notes: Option<String>,
-    ) -> Result<()> {
-        if let Some(d) = self.deployments.write().await.get_mut(&id) {
-            if let Some(s) = status {
-                d.status = s;
-            }
-            if let Some(f) = finished_at {
-                d.finished_at = Some(f);
-            }
-            if let Some(n) = notes {
-                d.notes = if n.is_empty() { None } else { Some(n) };
-            }
-        }
-        Ok(())
-    }
-
-    async fn get_deployment_matrix(&self, project_id: Uuid) -> Result<Vec<DeploymentMatrixEntry>> {
-        // The mock may loop (the Neo4j store does this in one aggregate query)
-        let mut matrix = Vec::new();
-        for environment in self.list_project_environments(project_id).await? {
-            let (recent, _) = self
-                .list_environment_deployments(environment.id, DEPLOYMENT_MATRIX_RECENT, 0)
-                .await?;
-            matrix.push(DeploymentMatrixEntry {
-                environment,
-                recent_statuses: recent.iter().map(|d| d.status).collect(),
-                latest_deployment: recent.into_iter().next(),
-            });
-        }
-        Ok(matrix)
-    }
-
-    // ========================================================================
-    // Milestone operations
-    // ========================================================================
-
-    async fn create_milestone(&self, milestone: &MilestoneNode) -> Result<()> {
-        let mid = milestone.id;
-        let pid = milestone.project_id;
-        // Verify project exists (mirrors Neo4j MATCH behavior)
-        if !self.projects.read().await.contains_key(&pid) {
-            anyhow::bail!("Failed to create milestone: Project {} not found", pid);
-        }
-        self.project_milestones
-            .write()
-            .await
-            .entry(pid)
-            .or_default()
-            .push(mid);
-        self.milestones.write().await.insert(mid, milestone.clone());
-        Ok(())
-    }
-
-    async fn get_milestone(&self, id: Uuid) -> Result<Option<MilestoneNode>> {
-        Ok(self.milestones.read().await.get(&id).cloned())
-    }
-
-    async fn list_project_milestones(&self, project_id: Uuid) -> Result<Vec<MilestoneNode>> {
-        let pm = self.project_milestones.read().await;
-        let milestones = self.milestones.read().await;
-        let ids = pm.get(&project_id).cloned().unwrap_or_default();
-        Ok(ids
-            .iter()
-            .filter_map(|id| milestones.get(id).cloned())
-            .collect())
-    }
-
-    async fn update_milestone(
-        &self,
-        id: Uuid,
-        status: Option<MilestoneStatus>,
-        target_date: Option<chrono::DateTime<chrono::Utc>>,
-        closed_at: Option<chrono::DateTime<chrono::Utc>>,
-        title: Option<String>,
-        description: Option<String>,
-    ) -> Result<()> {
-        if let Some(m) = self.milestones.write().await.get_mut(&id) {
-            if let Some(s) = status {
-                m.status = s;
-            }
-            if let Some(td) = target_date {
-                m.target_date = Some(td);
-            }
-            if let Some(ca) = closed_at {
-                m.closed_at = Some(ca);
-            }
-            if let Some(t) = title {
-                m.title = t;
-            }
-            if let Some(d) = description {
-                m.description = Some(d);
-            }
-        }
-        Ok(())
-    }
-
-    async fn add_task_to_milestone(&self, milestone_id: Uuid, task_id: Uuid) -> Result<()> {
-        self.milestone_tasks
-            .write()
-            .await
-            .entry(milestone_id)
-            .or_default()
-            .push(task_id);
-        Ok(())
-    }
-
-    async fn link_plan_to_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()> {
-        let mut map = self.milestone_plans.write().await;
-        let plans = map.entry(milestone_id).or_default();
-        if !plans.contains(&plan_id) {
-            plans.push(plan_id);
-        }
-        Ok(())
-    }
-
-    async fn unlink_plan_from_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()> {
-        if let Some(plans) = self.milestone_plans.write().await.get_mut(&milestone_id) {
-            plans.retain(|p| *p != plan_id);
-        }
-        Ok(())
-    }
-
-    async fn get_milestone_details(
-        &self,
-        milestone_id: Uuid,
-    ) -> Result<Option<(MilestoneNode, Vec<TaskNode>)>> {
-        let milestone = match self.milestones.read().await.get(&milestone_id).cloned() {
-            Some(m) => m,
-            None => return Ok(None),
-        };
-        let tasks = self.get_milestone_tasks(milestone_id).await?;
-        Ok(Some((milestone, tasks)))
-    }
-
-    async fn get_milestone_progress(&self, milestone_id: Uuid) -> Result<(u32, u32, u32, u32)> {
-        let tasks = self.get_milestone_tasks(milestone_id).await?;
-        let total = tasks.len() as u32;
-        let completed = tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Completed)
-            .count() as u32;
-        let in_progress = tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::InProgress)
-            .count() as u32;
-        let pending = tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Pending)
-            .count() as u32;
-        Ok((total, completed, in_progress, pending))
-    }
-
-    async fn get_milestone_tasks_with_plans(
-        &self,
-        milestone_id: Uuid,
-    ) -> Result<Vec<TaskWithPlan>> {
-        let task_ids = self
-            .milestone_tasks
-            .read()
-            .await
-            .get(&milestone_id)
-            .cloned()
-            .unwrap_or_default();
-        let tasks = self.tasks.read().await;
-        let plan_tasks = self.plan_tasks.read().await;
-        let plans = self.plans.read().await;
-
-        Ok(task_ids
-            .iter()
-            .filter_map(|id| {
-                let task = tasks.get(id)?.clone();
-                // Find which plan owns this task
-                let (plan_id, plan_title) = plan_tasks
-                    .iter()
-                    .find_map(|(pid, tids)| {
-                        if tids.contains(id) {
-                            let title = plans.get(pid).map(|p| p.title.clone()).unwrap_or_default();
-                            Some((*pid, title))
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-                let plan_status = plans.get(&plan_id).map(|p| {
-                    serde_json::to_value(&p.status)
-                        .unwrap()
-                        .as_str()
-                        .unwrap()
-                        .to_string()
-                });
-                Some(TaskWithPlan {
-                    task,
-                    plan_id,
-                    plan_title,
-                    plan_status,
-                })
-            })
-            .collect())
-    }
-
-    async fn get_milestone_steps_batch(
-        &self,
-        milestone_id: Uuid,
-    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>> {
-        let task_ids = self
-            .milestone_tasks
-            .read()
-            .await
-            .get(&milestone_id)
-            .cloned()
-            .unwrap_or_default();
-        let steps = self.steps.read().await;
-        let task_steps = self.task_steps.read().await;
-
-        let mut map: std::collections::HashMap<Uuid, Vec<StepNode>> =
-            std::collections::HashMap::new();
-        for tid in &task_ids {
-            if let Some(step_ids) = task_steps.get(tid) {
-                let mut task_step_list: Vec<StepNode> = step_ids
-                    .iter()
-                    .filter_map(|sid| steps.get(sid).cloned())
-                    .collect();
-                task_step_list.sort_by_key(|s| s.order);
-                map.insert(*tid, task_step_list);
-            }
-        }
-        Ok(map)
-    }
-
-    async fn delete_milestone(&self, milestone_id: Uuid) -> Result<()> {
-        if let Some(m) = self.milestones.write().await.remove(&milestone_id) {
-            if let Some(ids) = self.project_milestones.write().await.get_mut(&m.project_id) {
-                ids.retain(|id| *id != milestone_id);
-            }
-        }
-        self.milestone_tasks.write().await.remove(&milestone_id);
-        Ok(())
-    }
-
-    async fn get_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskNode>> {
-        let mt = self.milestone_tasks.read().await;
-        let tasks = self.tasks.read().await;
-        let ids = mt.get(&milestone_id).cloned().unwrap_or_default();
-        Ok(ids.iter().filter_map(|id| tasks.get(id).cloned()).collect())
-    }
-
-    async fn get_release_tasks(&self, release_id: Uuid) -> Result<Vec<TaskNode>> {
-        let rt = self.release_tasks.read().await;
-        let tasks = self.tasks.read().await;
-        let ids = rt.get(&release_id).cloned().unwrap_or_default();
-        Ok(ids.iter().filter_map(|id| tasks.get(id).cloned()).collect())
-    }
-
-    // ========================================================================
-    // Project stats
-    // ========================================================================
-
-    async fn get_project_progress(&self, project_id: Uuid) -> Result<(u32, u32, u32, u32)> {
-        let tasks = self.get_project_tasks(project_id).await?;
-        let total = tasks.len() as u32;
-        let completed = tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Completed)
-            .count() as u32;
-        let in_progress = tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::InProgress)
-            .count() as u32;
-        let pending = tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Pending)
-            .count() as u32;
-        Ok((total, completed, in_progress, pending))
-    }
-
-    async fn get_project_task_dependencies(&self, project_id: Uuid) -> Result<Vec<(Uuid, Uuid)>> {
-        let plan_ids = self
-            .project_plans
-            .read()
-            .await
-            .get(&project_id)
-            .cloned()
-            .unwrap_or_default();
-        let pt = self.plan_tasks.read().await;
-        let deps = self.task_dependencies.read().await;
-
-        let mut result = Vec::new();
-        for plan_id in &plan_ids {
-            let task_ids = pt.get(plan_id).cloned().unwrap_or_default();
-            for tid in &task_ids {
-                if let Some(dep_ids) = deps.get(tid) {
-                    for did in dep_ids {
-                        result.push((*tid, *did));
-                    }
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    async fn get_project_tasks(&self, project_id: Uuid) -> Result<Vec<TaskNode>> {
-        let plan_ids = self
-            .project_plans
-            .read()
-            .await
-            .get(&project_id)
-            .cloned()
-            .unwrap_or_default();
-        let pt = self.plan_tasks.read().await;
-        let tasks = self.tasks.read().await;
-
-        let mut result = Vec::new();
-        for plan_id in &plan_ids {
-            let task_ids = pt.get(plan_id).cloned().unwrap_or_default();
-            for tid in &task_ids {
-                if let Some(t) = tasks.get(tid) {
-                    result.push(t.clone());
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    // ========================================================================
-    // Filtered list operations with pagination
-    // ========================================================================
-
-    #[allow(clippy::too_many_arguments)]
-    async fn list_plans_filtered(
-        &self,
-        project_id: Option<Uuid>,
-        _workspace_slug: Option<&str>,
-        statuses: Option<Vec<String>>,
-        priority_min: Option<i32>,
-        priority_max: Option<i32>,
-        search: Option<&str>,
-        limit: usize,
-        offset: usize,
-        _sort_by: Option<&str>,
-        _sort_order: &str,
-    ) -> Result<(Vec<PlanNode>, usize)> {
-        self.log_read("list_plans_filtered")?;
-        let plans = self.plans.read().await;
-        let pp = self.project_plans.read().await;
-
-        let plan_ids_for_project: Option<Vec<Uuid>> =
-            project_id.map(|pid| pp.get(&pid).cloned().unwrap_or_default());
-
-        let filtered: Vec<PlanNode> = plans
-            .values()
-            .filter(|p| {
-                if let Some(ref ids) = plan_ids_for_project {
-                    if !ids.contains(&p.id) {
-                        return false;
-                    }
-                }
-                if let Some(ref sts) = statuses {
-                    let ps = serde_json::to_string(&p.status)
-                        .unwrap_or_default()
-                        .trim_matches('"')
-                        .to_string();
-                    if !sts.contains(&ps) {
-                        return false;
-                    }
-                }
-                if let Some(min) = priority_min {
-                    if p.priority < min {
-                        return false;
-                    }
-                }
-                if let Some(max) = priority_max {
-                    if p.priority > max {
-                        return false;
-                    }
-                }
-                if let Some(q) = search {
-                    let q = q.to_lowercase();
-                    if !p.title.to_lowercase().contains(&q)
-                        && !p.description.to_lowercase().contains(&q)
-                    {
-                        return false;
-                    }
-                }
-                true
-            })
-            .cloned()
-            .collect();
-
-        let total = filtered.len();
-        Ok((paginate(&filtered, limit, offset), total))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn list_all_tasks_filtered(
-        &self,
-        plan_id: Option<Uuid>,
-        project_id: Option<Uuid>,
-        _workspace_slug: Option<&str>,
-        statuses: Option<Vec<String>>,
-        priority_min: Option<i32>,
-        priority_max: Option<i32>,
-        tags: Option<Vec<String>>,
-        assigned_to: Option<&str>,
-        limit: usize,
-        offset: usize,
-        _sort_by: Option<&str>,
-        _sort_order: &str,
-    ) -> Result<(Vec<TaskWithPlan>, usize)> {
-        self.log_read("list_all_tasks_filtered")?;
-        let pt = self.plan_tasks.read().await;
-        let tasks = self.tasks.read().await;
-        let plans = self.plans.read().await;
-        let pp = self.project_plans.read().await;
-
-        // Build task_id -> plan_id mapping
-        let mut task_plan_map: HashMap<Uuid, Uuid> = HashMap::new();
-        for (pid, tids) in pt.iter() {
-            for tid in tids {
-                task_plan_map.insert(*tid, *pid);
-            }
-        }
-
-        let filtered: Vec<TaskWithPlan> = tasks
-            .values()
-            .filter(|t| {
-                if let Some(pid) = plan_id {
-                    if task_plan_map.get(&t.id) != Some(&pid) {
-                        return false;
-                    }
-                }
-                if let Some(pid) = project_id {
-                    // Filter tasks whose plan belongs to this project
-                    if let Some(plan_id) = task_plan_map.get(&t.id) {
-                        if !pp.get(&pid).is_some_and(|plans| plans.contains(plan_id)) {
-                            return false;
-                        }
-                    } else {
-                        return false;
-                    }
-                }
-                if let Some(ref sts) = statuses {
-                    let ts = serde_json::to_string(&t.status)
-                        .unwrap_or_default()
-                        .trim_matches('"')
-                        .to_string();
-                    if !sts.contains(&ts) {
-                        return false;
-                    }
-                }
-                if let Some(min) = priority_min {
-                    if t.priority.unwrap_or(0) < min {
-                        return false;
-                    }
-                }
-                if let Some(max) = priority_max {
-                    if t.priority.unwrap_or(0) > max {
-                        return false;
-                    }
-                }
-                if let Some(ref tag_filter) = tags {
-                    if !tag_filter.iter().any(|tg| t.tags.contains(tg)) {
-                        return false;
-                    }
-                }
-                if let Some(agent) = assigned_to {
-                    if t.assigned_to.as_deref() != Some(agent) {
-                        return false;
-                    }
-                }
-                true
-            })
-            .filter_map(|t| {
-                let pid = task_plan_map.get(&t.id)?;
-                let plan = plans.get(pid)?;
-                let plan_status = serde_json::to_value(&plan.status)
-                    .unwrap()
-                    .as_str()
-                    .unwrap()
-                    .to_string();
-                Some(TaskWithPlan {
-                    task: t.clone(),
-                    plan_id: *pid,
-                    plan_title: plan.title.clone(),
-                    plan_status: Some(plan_status),
-                })
-            })
-            .collect();
-
-        let total = filtered.len();
-        Ok((paginate(&filtered, limit, offset), total))
-    }
-
-    async fn list_releases_filtered(
-        &self,
-        project_id: Uuid,
-        statuses: Option<Vec<String>>,
-        limit: usize,
-        offset: usize,
-        _sort_by: Option<&str>,
-        _sort_order: &str,
-    ) -> Result<(Vec<ReleaseNode>, usize)> {
-        let all = self.list_project_releases(project_id).await?;
-        let filtered: Vec<ReleaseNode> = all
-            .into_iter()
-            .filter(|r| {
-                if let Some(ref sts) = statuses {
-                    let rs = serde_json::to_string(&r.status)
-                        .unwrap_or_default()
-                        .trim_matches('"')
-                        .to_string();
-                    sts.contains(&rs)
-                } else {
-                    true
-                }
-            })
-            .collect();
-        let total = filtered.len();
-        Ok((paginate(&filtered, limit, offset), total))
-    }
-
-    async fn list_milestones_filtered(
-        &self,
-        project_id: Uuid,
-        statuses: Option<Vec<String>>,
-        limit: usize,
-        offset: usize,
-        _sort_by: Option<&str>,
-        _sort_order: &str,
-    ) -> Result<(Vec<MilestoneNode>, usize)> {
-        let all = self.list_project_milestones(project_id).await?;
-        let filtered: Vec<MilestoneNode> = all
-            .into_iter()
-            .filter(|m| {
-                if let Some(ref sts) = statuses {
-                    let ms = serde_json::to_string(&m.status)
-                        .unwrap_or_default()
-                        .trim_matches('"')
-                        .to_string();
-                    sts.contains(&ms)
-                } else {
-                    true
-                }
-            })
-            .collect();
-        let total = filtered.len();
-        Ok((paginate(&filtered, limit, offset), total))
-    }
-
-    async fn list_projects_filtered(
-        &self,
-        search: Option<&str>,
-        limit: usize,
-        offset: usize,
-        _sort_by: Option<&str>,
-        _sort_order: &str,
-    ) -> Result<(Vec<ProjectNode>, usize)> {
-        let projects = self.projects.read().await;
-        let filtered: Vec<ProjectNode> = projects
-            .values()
-            .filter(|p| {
-                if let Some(q) = search {
-                    let q = q.to_lowercase();
-                    p.name.to_lowercase().contains(&q)
-                        || p.slug.to_lowercase().contains(&q)
-                        || p.description
-                            .as_deref()
-                            .unwrap_or("")
-                            .to_lowercase()
-                            .contains(&q)
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .collect();
-        let total = filtered.len();
-        Ok((paginate(&filtered, limit, offset), total))
     }
 
     // ========================================================================
@@ -19353,5 +17881,1487 @@ impl PlanStore for MockGraphStore {
             ids.retain(|id| *id != constraint_id);
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl DecisionStore for MockGraphStore {
+    // ========================================================================
+    // Decision operations
+    // ========================================================================
+
+    async fn create_decision(&self, task_id: Uuid, decision: &DecisionNode) -> Result<()> {
+        if !self.tasks.read().await.contains_key(&task_id) {
+            anyhow::bail!(
+                "Failed to create decision: Task {} not found in Neo4j",
+                task_id
+            );
+        }
+        let did = decision.id;
+        self.task_decisions
+            .write()
+            .await
+            .entry(task_id)
+            .or_default()
+            .push(did);
+        self.decisions.write().await.insert(did, decision.clone());
+        Ok(())
+    }
+
+    async fn get_decision(&self, decision_id: Uuid) -> Result<Option<DecisionNode>> {
+        Ok(self.decisions.read().await.get(&decision_id).cloned())
+    }
+
+    async fn list_decisions_by_status(
+        &self,
+        status: DecisionStatus,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DecisionListItem>, usize)> {
+        self.log_read("list_decisions_by_status")?;
+        let scope = self.scope_projects(project_id, workspace_slug).await;
+        let decisions = self.decisions.read().await;
+        let task_decisions = self.task_decisions.read().await;
+        let plan_tasks = self.plan_tasks.read().await;
+        let project_plans = self.project_plans.read().await;
+
+        let mut items: Vec<DecisionListItem> = decisions
+            .values()
+            .filter(|d| d.status == status)
+            .map(|d| {
+                let task_id = task_decisions
+                    .iter()
+                    .find(|(_, ds)| ds.contains(&d.id))
+                    .map(|(t, _)| *t);
+                let project_id = task_id.and_then(|t| {
+                    let plan = plan_tasks
+                        .iter()
+                        .find(|(_, ts)| ts.contains(&t))
+                        .map(|(p, _)| *p)?;
+                    project_plans
+                        .iter()
+                        .find(|(_, ps)| ps.contains(&plan))
+                        .map(|(pr, _)| *pr)
+                });
+                DecisionListItem {
+                    decision: d.clone(),
+                    task_id,
+                    project_id,
+                }
+            })
+            .filter(|i| match scope {
+                Some(ref s) => i.project_id.is_some_and(|p| s.contains(&p)),
+                None => true,
+            })
+            .collect();
+        items.sort_by(|a, b| b.decision.decided_at.cmp(&a.decision.decided_at));
+        let total = items.len();
+        let page = items.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
+    async fn get_decision_project_id(&self, decision_id: Uuid) -> Result<Option<String>> {
+        Ok(self
+            .get_decision_project_ids(&[decision_id])
+            .await?
+            .remove(&decision_id)
+            .map(|p| p.to_string()))
+    }
+
+    async fn get_decision_project_ids(&self, decision_ids: &[Uuid]) -> Result<HashMap<Uuid, Uuid>> {
+        // Same chain as the Cypher (Project→Plan→Task→Decision); several
+        // projects → the smallest id, like `min(proj.id)`.
+        let task_decisions = self.task_decisions.read().await;
+        let plan_tasks = self.plan_tasks.read().await;
+        let project_plans = self.project_plans.read().await;
+        let mut out = HashMap::new();
+        for did in decision_ids {
+            let project = task_decisions
+                .iter()
+                .filter(|(_, ds)| ds.contains(did))
+                .flat_map(|(t, _)| {
+                    plan_tasks
+                        .iter()
+                        .filter(move |(_, ts)| ts.contains(t))
+                        .map(|(p, _)| *p)
+                })
+                .flat_map(|plan| {
+                    project_plans
+                        .iter()
+                        .filter(move |(_, ps)| ps.contains(&plan))
+                        .map(|(pr, _)| *pr)
+                })
+                .min_by_key(|p| p.to_string());
+            if let Some(p) = project {
+                out.insert(*did, p);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn update_decision(
+        &self,
+        decision_id: Uuid,
+        description: Option<String>,
+        rationale: Option<String>,
+        chosen_option: Option<String>,
+        status: Option<DecisionStatus>,
+    ) -> Result<()> {
+        if let Some(d) = self.decisions.write().await.get_mut(&decision_id) {
+            if let Some(desc) = description {
+                d.description = desc;
+            }
+            if let Some(rat) = rationale {
+                d.rationale = rat;
+            }
+            if let Some(co) = chosen_option {
+                d.chosen_option = Some(co);
+            }
+            if let Some(st) = status {
+                d.status = st;
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_decision(&self, decision_id: Uuid) -> Result<()> {
+        self.decisions.write().await.remove(&decision_id);
+        let mut td = self.task_decisions.write().await;
+        for ids in td.values_mut() {
+            ids.retain(|id| *id != decision_id);
+        }
+        Ok(())
+    }
+
+    async fn get_decisions_for_entity(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        limit: u32,
+    ) -> Result<Vec<DecisionNode>> {
+        // For tasks, look up via task_decisions mapping
+        if entity_type.eq_ignore_ascii_case("task") {
+            if let Ok(task_id) = Uuid::parse_str(entity_id) {
+                let task_decisions = self.task_decisions.read().await;
+                let decisions = self.decisions.read().await;
+                if let Some(decision_ids) = task_decisions.get(&task_id) {
+                    let result: Vec<DecisionNode> = decision_ids
+                        .iter()
+                        .filter_map(|did| decisions.get(did).cloned())
+                        .take(limit as usize)
+                        .collect();
+                    return Ok(result);
+                }
+            }
+        }
+        Ok(vec![])
+    }
+
+    async fn set_decision_embedding(
+        &self,
+        decision_id: Uuid,
+        _embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        if let Some(d) = self.decisions.write().await.get_mut(&decision_id) {
+            d.embedding_model = Some(model.to_string());
+        }
+        Ok(())
+    }
+
+    async fn get_decision_embedding(&self, decision_id: Uuid) -> Result<Option<Vec<f32>>> {
+        let decisions = self.decisions.read().await;
+        Ok(decisions
+            .get(&decision_id)
+            .and_then(|d| d.embedding.as_ref())
+            .map(|emb| emb.iter().map(|&x| x as f32).collect()))
+    }
+
+    async fn get_all_decisions_with_task_id(&self) -> Result<Vec<(DecisionNode, Uuid)>> {
+        let decisions = self.decisions.read().await;
+        let td = self.task_decisions.read().await;
+        let mut result = Vec::new();
+        for (&task_id, decision_ids) in td.iter() {
+            for did in decision_ids {
+                if let Some(d) = decisions.get(did) {
+                    result.push((d.clone(), task_id));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_decisions_without_embedding(&self) -> Result<Vec<(Uuid, String, String)>> {
+        let decisions = self.decisions.read().await;
+        Ok(decisions
+            .values()
+            .filter(|d| d.embedding.is_none())
+            .map(|d| (d.id, d.description.clone(), d.rationale.clone()))
+            .collect())
+    }
+
+    async fn search_decisions_by_vector(
+        &self,
+        _query_embedding: &[f32],
+        _limit: usize,
+        _project_id: Option<&str>,
+    ) -> Result<Vec<(DecisionNode, f64)>> {
+        // Mock: return empty — vector search requires real Neo4j index
+        Ok(vec![])
+    }
+
+    async fn get_decisions_affecting(
+        &self,
+        _entity_type: &str,
+        _entity_id: &str,
+        _status_filter: Option<&str>,
+    ) -> Result<Vec<DecisionNode>> {
+        Ok(vec![])
+    }
+
+    async fn add_decision_affects(
+        &self,
+        decision_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+        impact_description: Option<&str>,
+    ) -> Result<()> {
+        // Mirror the real implementation's validation: reject unknown
+        // entity_types up front. The mock has no graph to MATCH against, so it
+        // cannot reproduce the "entity not found" error — but it CAN catch the
+        // case-mismatch / typo class of bug (gotcha e3f9a882), which is the
+        // regression this method previously hid by accepting anything.
+        let etype = crate::notes::models::EntityType::from_str(entity_type)
+            .map_err(|e| anyhow::anyhow!("add_decision_affects: invalid entity_type: {e}"))?;
+        let relation = AffectsRelation {
+            // Normalize to the canonical snake_case form so stored relations are
+            // consistent regardless of input casing.
+            entity_type: etype.to_string(),
+            entity_id: entity_id.to_string(),
+            entity_name: None,
+            impact_description: impact_description.map(|s| s.to_string()),
+        };
+        self.decision_affects
+            .write()
+            .await
+            .entry(decision_id)
+            .or_default()
+            .push(relation);
+        Ok(())
+    }
+
+    async fn remove_decision_affects(
+        &self,
+        decision_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<()> {
+        // Validate entity_type for symmetry with add_decision_affects.
+        crate::notes::models::EntityType::from_str(entity_type)
+            .map_err(|e| anyhow::anyhow!("remove_decision_affects: invalid entity_type: {e}"))?;
+        if let Some(affects) = self.decision_affects.write().await.get_mut(&decision_id) {
+            affects.retain(|a| a.entity_id != entity_id);
+        }
+        Ok(())
+    }
+
+    async fn list_decision_affects(&self, decision_id: Uuid) -> Result<Vec<AffectsRelation>> {
+        Ok(self
+            .decision_affects
+            .read()
+            .await
+            .get(&decision_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn supersede_decision(
+        &self,
+        _new_decision_id: Uuid,
+        _old_decision_id: Uuid,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn get_decision_timeline(
+        &self,
+        _task_id: Option<Uuid>,
+        _from: Option<&str>,
+        _to: Option<&str>,
+    ) -> Result<Vec<DecisionTimelineEntry>> {
+        Ok(vec![])
+    }
+}
+
+#[async_trait]
+impl CommitStore for MockGraphStore {
+    // ========================================================================
+    // Dependency analysis
+    // ========================================================================
+
+    async fn find_dependent_files(
+        &self,
+        file_path: &str,
+        _depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>> {
+        let ir = self.import_relationships.read().await;
+        let mut dependents = Vec::new();
+        for (from, tos) in ir.iter() {
+            if tos.contains(&file_path.to_string()) {
+                dependents.push(from.clone());
+            }
+        }
+
+        // Filter by project if project_id is provided
+        if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            if let Some(project_paths) = pf.get(&pid) {
+                dependents.retain(|p| project_paths.contains(p));
+            } else {
+                dependents.clear();
+            }
+        }
+
+        Ok(dependents)
+    }
+
+    async fn find_impacted_files(
+        &self,
+        file_path: &str,
+        _depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>> {
+        let mut impacted: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Axis 1: files that import the target (same as find_dependent_files)
+        let ir = self.import_relationships.read().await;
+        for (from, tos) in ir.iter() {
+            if tos.contains(&file_path.to_string()) {
+                impacted.insert(from.clone());
+            }
+        }
+
+        // Axis 2: files whose functions call functions defined in the target file
+        let functions = self.functions.read().await;
+        let cr = self.call_relationships.read().await;
+
+        // Collect function names defined in the target file
+        let target_func_names: Vec<String> = functions
+            .values()
+            .filter(|f| f.file_path == file_path)
+            .map(|f| f.name.clone())
+            .collect();
+
+        // Find callers of those functions and their files
+        for (caller_id, callees) in cr.iter() {
+            if callees.iter().any(|c| target_func_names.contains(c)) {
+                if let Some(caller_fn) = functions.get(caller_id) {
+                    if caller_fn.file_path != file_path {
+                        impacted.insert(caller_fn.file_path.clone());
+                    }
+                }
+            }
+        }
+
+        // Filter by project if project_id is provided
+        let mut result: Vec<String> = impacted.into_iter().collect();
+        if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            if let Some(project_paths) = pf.get(&pid) {
+                result.retain(|p| project_paths.contains(p));
+            } else {
+                result.clear();
+            }
+        }
+
+        Ok(result)
+    }
+
+    async fn find_callers(
+        &self,
+        function_id: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<FunctionNode>> {
+        let cr = self.call_relationships.read().await;
+        let functions = self.functions.read().await;
+        // Extract function name from id
+        let func_name = function_id.rsplit("::").next().unwrap_or(function_id);
+
+        // If project_id provided, get the set of file paths belonging to this project
+        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            Some(pf.get(&pid).cloned().unwrap_or_default())
+        } else {
+            None
+        };
+
+        let mut callers = Vec::new();
+        for (caller_id, callees) in cr.iter() {
+            if callees.contains(&func_name.to_string()) {
+                if let Some(f) = functions.get(caller_id) {
+                    // If scoped by project, only include callers whose file is in the project
+                    if let Some(ref paths) = project_file_paths {
+                        if !paths.contains(&f.file_path) {
+                            continue;
+                        }
+                    }
+                    callers.push(f.clone());
+                }
+            }
+        }
+        Ok(callers)
+    }
+
+    // ========================================================================
+    // Task-file linking
+    // ========================================================================
+
+    async fn link_task_to_files(&self, task_id: Uuid, file_paths: &[String]) -> Result<()> {
+        self.task_files
+            .write()
+            .await
+            .entry(task_id)
+            .or_default()
+            .extend(file_paths.iter().cloned());
+        Ok(())
+    }
+
+    // ========================================================================
+    // Commit operations
+    // ========================================================================
+
+    async fn create_commit(&self, commit: &CommitNode) -> Result<()> {
+        self.commits
+            .write()
+            .await
+            .insert(commit.hash.clone(), commit.clone());
+        Ok(())
+    }
+
+    async fn get_commit(&self, hash: &str) -> Result<Option<CommitNode>> {
+        Ok(self.commits.read().await.get(hash).cloned())
+    }
+
+    async fn link_commit_to_task(&self, commit_hash: &str, task_id: Uuid) -> Result<()> {
+        self.task_commits
+            .write()
+            .await
+            .entry(task_id)
+            .or_default()
+            .push(commit_hash.to_string());
+        Ok(())
+    }
+
+    async fn link_commit_to_plan(&self, commit_hash: &str, plan_id: Uuid) -> Result<()> {
+        self.plan_commits
+            .write()
+            .await
+            .entry(plan_id)
+            .or_default()
+            .push(commit_hash.to_string());
+        Ok(())
+    }
+
+    async fn get_task_commits(&self, task_id: Uuid) -> Result<Vec<CommitNode>> {
+        let tc = self.task_commits.read().await;
+        let commits = self.commits.read().await;
+        let hashes = tc.get(&task_id).cloned().unwrap_or_default();
+        Ok(hashes
+            .iter()
+            .filter_map(|h| commits.get(h).cloned())
+            .collect())
+    }
+
+    async fn get_plan_commits(&self, plan_id: Uuid) -> Result<Vec<CommitNode>> {
+        let pc = self.plan_commits.read().await;
+        let commits = self.commits.read().await;
+        let hashes = pc.get(&plan_id).cloned().unwrap_or_default();
+        Ok(hashes
+            .iter()
+            .filter_map(|h| commits.get(h).cloned())
+            .collect())
+    }
+
+    async fn delete_commit(&self, hash: &str) -> Result<()> {
+        self.commits.write().await.remove(hash);
+        let mut tc = self.task_commits.write().await;
+        for hashes in tc.values_mut() {
+            hashes.retain(|h| h != hash);
+        }
+        let mut pc = self.plan_commits.write().await;
+        for hashes in pc.values_mut() {
+            hashes.retain(|h| h != hash);
+        }
+        Ok(())
+    }
+
+    // ========================================================================
+    // TOUCHES operations (Commit → File) — mock stubs
+    // ========================================================================
+
+    async fn create_commit_touches(
+        &self,
+        _commit_hash: &str,
+        _files: &[FileChangedInfo],
+    ) -> Result<()> {
+        // Mock: no-op (TOUCHES relations not tracked in mock)
+        Ok(())
+    }
+
+    async fn get_commit_files(&self, _commit_hash: &str) -> Result<Vec<CommitFileInfo>> {
+        Ok(vec![])
+    }
+
+    async fn get_file_history(
+        &self,
+        _file_path: &str,
+        _limit: Option<i64>,
+    ) -> Result<Vec<FileHistoryEntry>> {
+        Ok(vec![])
+    }
+
+    async fn ping_freshness_for_files(&self, file_paths: &[String]) -> Result<usize> {
+        let anchors = self.note_anchors.read().await;
+        let mut notes = self.notes.write().await;
+        let mut pinged_ids = std::collections::HashSet::new();
+
+        for (note_id, note_anchors) in anchors.iter() {
+            for anchor in note_anchors {
+                if file_paths.contains(&anchor.entity_id) {
+                    pinged_ids.insert(*note_id);
+                }
+            }
+        }
+
+        let now = chrono::Utc::now();
+        for note_id in &pinged_ids {
+            if let Some(note) = notes.get_mut(note_id) {
+                note.freshness_pinged_at = Some(now);
+            }
+        }
+
+        Ok(pinged_ids.len())
+    }
+
+    // ========================================================================
+    // CO_CHANGED operations (File ↔ File) — mock stubs
+    // ========================================================================
+
+    async fn compute_co_changed(
+        &self,
+        _project_id: Uuid,
+        _since: Option<chrono::DateTime<chrono::Utc>>,
+        _min_count: i64,
+        _max_relations: i64,
+    ) -> Result<i64> {
+        Ok(0)
+    }
+
+    async fn update_project_co_change_timestamp(&self, id: Uuid) -> Result<()> {
+        if let Some(p) = self.projects.write().await.get_mut(&id) {
+            p.last_co_change_computed_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn get_co_change_graph(
+        &self,
+        _project_id: Uuid,
+        _min_count: i64,
+        _limit: i64,
+    ) -> Result<Vec<CoChangePair>> {
+        Ok(vec![])
+    }
+
+    async fn get_file_co_changers(
+        &self,
+        _file_path: &str,
+        _min_count: i64,
+        _limit: i64,
+    ) -> Result<Vec<CoChanger>> {
+        Ok(vec![])
+    }
+
+    async fn compute_co_changed_transitive(
+        &self,
+        _project_id: Uuid,
+        _max_depth: i64,
+        _min_score: f64,
+    ) -> Result<i64> {
+        Ok(0)
+    }
+
+    async fn get_file_transitive_co_changers(
+        &self,
+        _file_path: &str,
+        _min_score: f64,
+        _limit: i64,
+    ) -> Result<Vec<TransitiveCoChanger>> {
+        Ok(vec![])
+    }
+}
+
+#[async_trait]
+impl ReleaseStore for MockGraphStore {
+    // ========================================================================
+    // Release operations
+    // ========================================================================
+
+    async fn create_release(&self, release: &ReleaseNode) -> Result<()> {
+        let pid = release.project_id;
+        if !self.projects.read().await.contains_key(&pid) {
+            anyhow::bail!(
+                "Failed to create release: Project {} not found in Neo4j",
+                pid
+            );
+        }
+        let rid = release.id;
+        self.project_releases
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .push(rid);
+        self.releases.write().await.insert(rid, release.clone());
+        Ok(())
+    }
+
+    async fn get_release(&self, id: Uuid) -> Result<Option<ReleaseNode>> {
+        Ok(self.releases.read().await.get(&id).cloned())
+    }
+
+    async fn list_project_releases(&self, project_id: Uuid) -> Result<Vec<ReleaseNode>> {
+        let pr = self.project_releases.read().await;
+        let releases = self.releases.read().await;
+        let ids = pr.get(&project_id).cloned().unwrap_or_default();
+        Ok(ids
+            .iter()
+            .filter_map(|id| releases.get(id).cloned())
+            .collect())
+    }
+
+    async fn update_release(
+        &self,
+        id: Uuid,
+        status: Option<ReleaseStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+        released_at: Option<chrono::DateTime<chrono::Utc>>,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<()> {
+        if let Some(r) = self.releases.write().await.get_mut(&id) {
+            if let Some(s) = status {
+                r.status = s;
+            }
+            if let Some(td) = target_date {
+                r.target_date = Some(td);
+            }
+            if let Some(ra) = released_at {
+                r.released_at = Some(ra);
+            }
+            if let Some(t) = title {
+                r.title = Some(t);
+            }
+            if let Some(d) = description {
+                r.description = Some(d);
+            }
+        }
+        Ok(())
+    }
+
+    async fn add_task_to_release(&self, release_id: Uuid, task_id: Uuid) -> Result<()> {
+        self.release_tasks
+            .write()
+            .await
+            .entry(release_id)
+            .or_default()
+            .push(task_id);
+        Ok(())
+    }
+
+    async fn add_commit_to_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()> {
+        self.release_commits
+            .write()
+            .await
+            .entry(release_id)
+            .or_default()
+            .push(commit_hash.to_string());
+        Ok(())
+    }
+
+    async fn remove_commit_from_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()> {
+        self.release_commits
+            .write()
+            .await
+            .entry(release_id)
+            .or_default()
+            .retain(|h| h != commit_hash);
+        Ok(())
+    }
+
+    async fn get_release_details(
+        &self,
+        release_id: Uuid,
+    ) -> Result<Option<(ReleaseNode, Vec<TaskNode>, Vec<CommitNode>)>> {
+        let release = match self.releases.read().await.get(&release_id).cloned() {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let task_ids = self
+            .release_tasks
+            .read()
+            .await
+            .get(&release_id)
+            .cloned()
+            .unwrap_or_default();
+        let tasks_map = self.tasks.read().await;
+        let tasks: Vec<TaskNode> = task_ids
+            .iter()
+            .filter_map(|id| tasks_map.get(id).cloned())
+            .collect();
+        let commit_hashes = self
+            .release_commits
+            .read()
+            .await
+            .get(&release_id)
+            .cloned()
+            .unwrap_or_default();
+        let commits_map = self.commits.read().await;
+        let commits: Vec<CommitNode> = commit_hashes
+            .iter()
+            .filter_map(|h| commits_map.get(h).cloned())
+            .collect();
+        Ok(Some((release, tasks, commits)))
+    }
+
+    async fn delete_release(&self, release_id: Uuid) -> Result<()> {
+        if let Some(r) = self.releases.write().await.remove(&release_id) {
+            if let Some(ids) = self.project_releases.write().await.get_mut(&r.project_id) {
+                ids.retain(|id| *id != release_id);
+            }
+        }
+        self.release_tasks.write().await.remove(&release_id);
+        self.release_commits.write().await.remove(&release_id);
+        Ok(())
+    }
+
+    // ========================================================================
+    // Environment & deployment operations
+    // ========================================================================
+
+    async fn create_environment(&self, env: &EnvironmentNode) -> Result<()> {
+        let mut envs = self.environments.write().await;
+        if envs
+            .values()
+            .any(|e| e.project_id == env.project_id && e.name == env.name)
+        {
+            anyhow::bail!(
+                "Cannot create environment '{}': project not found or name already used",
+                env.name
+            );
+        }
+        envs.insert(env.id, env.clone());
+        Ok(())
+    }
+
+    async fn get_environment(&self, id: Uuid) -> Result<Option<EnvironmentNode>> {
+        Ok(self.environments.read().await.get(&id).cloned())
+    }
+
+    async fn list_project_environments(&self, project_id: Uuid) -> Result<Vec<EnvironmentNode>> {
+        let mut envs: Vec<EnvironmentNode> = self
+            .environments
+            .read()
+            .await
+            .values()
+            .filter(|e| e.project_id == project_id)
+            .cloned()
+            .collect();
+        envs.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Ok(envs)
+    }
+
+    async fn update_environment(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        kind: Option<EnvironmentKind>,
+        url: Option<String>,
+        description: Option<String>,
+        config: Option<String>,
+    ) -> Result<()> {
+        // Empty string clears an optional field (mirrors the Neo4j store)
+        fn opt(v: String) -> Option<String> {
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        }
+        if let Some(e) = self.environments.write().await.get_mut(&id) {
+            if let Some(n) = name {
+                e.name = n;
+            }
+            if let Some(k) = kind {
+                e.kind = k;
+            }
+            if let Some(u) = url {
+                e.url = opt(u);
+            }
+            if let Some(d) = description {
+                e.description = opt(d);
+            }
+            if let Some(c) = config {
+                e.config = opt(c);
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_environment(&self, id: Uuid) -> Result<()> {
+        self.environments.write().await.remove(&id);
+        self.deployments
+            .write()
+            .await
+            .retain(|_, d| d.environment_id != id);
+        Ok(())
+    }
+
+    async fn create_deployment(&self, deployment: &DeploymentNode) -> Result<()> {
+        if !self
+            .environments
+            .read()
+            .await
+            .contains_key(&deployment.environment_id)
+        {
+            anyhow::bail!(
+                "Cannot create deployment: environment {} not found",
+                deployment.environment_id
+            );
+        }
+        self.deployments
+            .write()
+            .await
+            .insert(deployment.id, deployment.clone());
+        Ok(())
+    }
+
+    async fn get_deployment(&self, id: Uuid) -> Result<Option<DeploymentNode>> {
+        Ok(self.deployments.read().await.get(&id).cloned())
+    }
+
+    async fn list_environment_deployments(
+        &self,
+        environment_id: Uuid,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<DeploymentNode>, usize)> {
+        let mut all: Vec<DeploymentNode> = self
+            .deployments
+            .read()
+            .await
+            .values()
+            .filter(|d| d.environment_id == environment_id)
+            .cloned()
+            .collect();
+        // Newest first (same ordering as the Neo4j store)
+        all.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        let total = all.len();
+        Ok((all.into_iter().skip(offset).take(limit).collect(), total))
+    }
+
+    async fn update_deployment(
+        &self,
+        id: Uuid,
+        status: Option<DeploymentStatus>,
+        finished_at: Option<chrono::DateTime<chrono::Utc>>,
+        notes: Option<String>,
+    ) -> Result<()> {
+        if let Some(d) = self.deployments.write().await.get_mut(&id) {
+            if let Some(s) = status {
+                d.status = s;
+            }
+            if let Some(f) = finished_at {
+                d.finished_at = Some(f);
+            }
+            if let Some(n) = notes {
+                d.notes = if n.is_empty() { None } else { Some(n) };
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_deployment_matrix(&self, project_id: Uuid) -> Result<Vec<DeploymentMatrixEntry>> {
+        // The mock may loop (the Neo4j store does this in one aggregate query)
+        let mut matrix = Vec::new();
+        for environment in self.list_project_environments(project_id).await? {
+            let (recent, _) = self
+                .list_environment_deployments(environment.id, DEPLOYMENT_MATRIX_RECENT, 0)
+                .await?;
+            matrix.push(DeploymentMatrixEntry {
+                environment,
+                recent_statuses: recent.iter().map(|d| d.status).collect(),
+                latest_deployment: recent.into_iter().next(),
+            });
+        }
+        Ok(matrix)
+    }
+
+    // ========================================================================
+    // Milestone operations
+    // ========================================================================
+
+    async fn create_milestone(&self, milestone: &MilestoneNode) -> Result<()> {
+        let mid = milestone.id;
+        let pid = milestone.project_id;
+        // Verify project exists (mirrors Neo4j MATCH behavior)
+        if !self.projects.read().await.contains_key(&pid) {
+            anyhow::bail!("Failed to create milestone: Project {} not found", pid);
+        }
+        self.project_milestones
+            .write()
+            .await
+            .entry(pid)
+            .or_default()
+            .push(mid);
+        self.milestones.write().await.insert(mid, milestone.clone());
+        Ok(())
+    }
+
+    async fn get_milestone(&self, id: Uuid) -> Result<Option<MilestoneNode>> {
+        Ok(self.milestones.read().await.get(&id).cloned())
+    }
+
+    async fn list_project_milestones(&self, project_id: Uuid) -> Result<Vec<MilestoneNode>> {
+        let pm = self.project_milestones.read().await;
+        let milestones = self.milestones.read().await;
+        let ids = pm.get(&project_id).cloned().unwrap_or_default();
+        Ok(ids
+            .iter()
+            .filter_map(|id| milestones.get(id).cloned())
+            .collect())
+    }
+
+    async fn update_milestone(
+        &self,
+        id: Uuid,
+        status: Option<MilestoneStatus>,
+        target_date: Option<chrono::DateTime<chrono::Utc>>,
+        closed_at: Option<chrono::DateTime<chrono::Utc>>,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<()> {
+        if let Some(m) = self.milestones.write().await.get_mut(&id) {
+            if let Some(s) = status {
+                m.status = s;
+            }
+            if let Some(td) = target_date {
+                m.target_date = Some(td);
+            }
+            if let Some(ca) = closed_at {
+                m.closed_at = Some(ca);
+            }
+            if let Some(t) = title {
+                m.title = t;
+            }
+            if let Some(d) = description {
+                m.description = Some(d);
+            }
+        }
+        Ok(())
+    }
+
+    async fn add_task_to_milestone(&self, milestone_id: Uuid, task_id: Uuid) -> Result<()> {
+        self.milestone_tasks
+            .write()
+            .await
+            .entry(milestone_id)
+            .or_default()
+            .push(task_id);
+        Ok(())
+    }
+
+    async fn link_plan_to_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()> {
+        let mut map = self.milestone_plans.write().await;
+        let plans = map.entry(milestone_id).or_default();
+        if !plans.contains(&plan_id) {
+            plans.push(plan_id);
+        }
+        Ok(())
+    }
+
+    async fn unlink_plan_from_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()> {
+        if let Some(plans) = self.milestone_plans.write().await.get_mut(&milestone_id) {
+            plans.retain(|p| *p != plan_id);
+        }
+        Ok(())
+    }
+
+    async fn get_milestone_details(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<Option<(MilestoneNode, Vec<TaskNode>)>> {
+        let milestone = match self.milestones.read().await.get(&milestone_id).cloned() {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let tasks = self.get_milestone_tasks(milestone_id).await?;
+        Ok(Some((milestone, tasks)))
+    }
+
+    async fn get_milestone_progress(&self, milestone_id: Uuid) -> Result<(u32, u32, u32, u32)> {
+        let tasks = self.get_milestone_tasks(milestone_id).await?;
+        let total = tasks.len() as u32;
+        let completed = tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Completed)
+            .count() as u32;
+        let in_progress = tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::InProgress)
+            .count() as u32;
+        let pending = tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Pending)
+            .count() as u32;
+        Ok((total, completed, in_progress, pending))
+    }
+
+    async fn get_milestone_tasks_with_plans(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<Vec<TaskWithPlan>> {
+        let task_ids = self
+            .milestone_tasks
+            .read()
+            .await
+            .get(&milestone_id)
+            .cloned()
+            .unwrap_or_default();
+        let tasks = self.tasks.read().await;
+        let plan_tasks = self.plan_tasks.read().await;
+        let plans = self.plans.read().await;
+
+        Ok(task_ids
+            .iter()
+            .filter_map(|id| {
+                let task = tasks.get(id)?.clone();
+                // Find which plan owns this task
+                let (plan_id, plan_title) = plan_tasks
+                    .iter()
+                    .find_map(|(pid, tids)| {
+                        if tids.contains(id) {
+                            let title = plans.get(pid).map(|p| p.title.clone()).unwrap_or_default();
+                            Some((*pid, title))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                let plan_status = plans.get(&plan_id).map(|p| {
+                    serde_json::to_value(&p.status)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                });
+                Some(TaskWithPlan {
+                    task,
+                    plan_id,
+                    plan_title,
+                    plan_status,
+                })
+            })
+            .collect())
+    }
+
+    async fn get_milestone_steps_batch(
+        &self,
+        milestone_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<StepNode>>> {
+        let task_ids = self
+            .milestone_tasks
+            .read()
+            .await
+            .get(&milestone_id)
+            .cloned()
+            .unwrap_or_default();
+        let steps = self.steps.read().await;
+        let task_steps = self.task_steps.read().await;
+
+        let mut map: std::collections::HashMap<Uuid, Vec<StepNode>> =
+            std::collections::HashMap::new();
+        for tid in &task_ids {
+            if let Some(step_ids) = task_steps.get(tid) {
+                let mut task_step_list: Vec<StepNode> = step_ids
+                    .iter()
+                    .filter_map(|sid| steps.get(sid).cloned())
+                    .collect();
+                task_step_list.sort_by_key(|s| s.order);
+                map.insert(*tid, task_step_list);
+            }
+        }
+        Ok(map)
+    }
+
+    async fn delete_milestone(&self, milestone_id: Uuid) -> Result<()> {
+        if let Some(m) = self.milestones.write().await.remove(&milestone_id) {
+            if let Some(ids) = self.project_milestones.write().await.get_mut(&m.project_id) {
+                ids.retain(|id| *id != milestone_id);
+            }
+        }
+        self.milestone_tasks.write().await.remove(&milestone_id);
+        Ok(())
+    }
+
+    async fn get_milestone_tasks(&self, milestone_id: Uuid) -> Result<Vec<TaskNode>> {
+        let mt = self.milestone_tasks.read().await;
+        let tasks = self.tasks.read().await;
+        let ids = mt.get(&milestone_id).cloned().unwrap_or_default();
+        Ok(ids.iter().filter_map(|id| tasks.get(id).cloned()).collect())
+    }
+
+    async fn get_release_tasks(&self, release_id: Uuid) -> Result<Vec<TaskNode>> {
+        let rt = self.release_tasks.read().await;
+        let tasks = self.tasks.read().await;
+        let ids = rt.get(&release_id).cloned().unwrap_or_default();
+        Ok(ids.iter().filter_map(|id| tasks.get(id).cloned()).collect())
+    }
+
+    // ========================================================================
+    // Project stats
+    // ========================================================================
+
+    async fn get_project_progress(&self, project_id: Uuid) -> Result<(u32, u32, u32, u32)> {
+        let tasks = self.get_project_tasks(project_id).await?;
+        let total = tasks.len() as u32;
+        let completed = tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Completed)
+            .count() as u32;
+        let in_progress = tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::InProgress)
+            .count() as u32;
+        let pending = tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Pending)
+            .count() as u32;
+        Ok((total, completed, in_progress, pending))
+    }
+
+    async fn get_project_task_dependencies(&self, project_id: Uuid) -> Result<Vec<(Uuid, Uuid)>> {
+        let plan_ids = self
+            .project_plans
+            .read()
+            .await
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_default();
+        let pt = self.plan_tasks.read().await;
+        let deps = self.task_dependencies.read().await;
+
+        let mut result = Vec::new();
+        for plan_id in &plan_ids {
+            let task_ids = pt.get(plan_id).cloned().unwrap_or_default();
+            for tid in &task_ids {
+                if let Some(dep_ids) = deps.get(tid) {
+                    for did in dep_ids {
+                        result.push((*tid, *did));
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_project_tasks(&self, project_id: Uuid) -> Result<Vec<TaskNode>> {
+        let plan_ids = self
+            .project_plans
+            .read()
+            .await
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_default();
+        let pt = self.plan_tasks.read().await;
+        let tasks = self.tasks.read().await;
+
+        let mut result = Vec::new();
+        for plan_id in &plan_ids {
+            let task_ids = pt.get(plan_id).cloned().unwrap_or_default();
+            for tid in &task_ids {
+                if let Some(t) = tasks.get(tid) {
+                    result.push(t.clone());
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    // ========================================================================
+    // Filtered list operations with pagination
+    // ========================================================================
+
+    #[allow(clippy::too_many_arguments)]
+    async fn list_plans_filtered(
+        &self,
+        project_id: Option<Uuid>,
+        _workspace_slug: Option<&str>,
+        statuses: Option<Vec<String>>,
+        priority_min: Option<i32>,
+        priority_max: Option<i32>,
+        search: Option<&str>,
+        limit: usize,
+        offset: usize,
+        _sort_by: Option<&str>,
+        _sort_order: &str,
+    ) -> Result<(Vec<PlanNode>, usize)> {
+        self.log_read("list_plans_filtered")?;
+        let plans = self.plans.read().await;
+        let pp = self.project_plans.read().await;
+
+        let plan_ids_for_project: Option<Vec<Uuid>> =
+            project_id.map(|pid| pp.get(&pid).cloned().unwrap_or_default());
+
+        let filtered: Vec<PlanNode> = plans
+            .values()
+            .filter(|p| {
+                if let Some(ref ids) = plan_ids_for_project {
+                    if !ids.contains(&p.id) {
+                        return false;
+                    }
+                }
+                if let Some(ref sts) = statuses {
+                    let ps = serde_json::to_string(&p.status)
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_string();
+                    if !sts.contains(&ps) {
+                        return false;
+                    }
+                }
+                if let Some(min) = priority_min {
+                    if p.priority < min {
+                        return false;
+                    }
+                }
+                if let Some(max) = priority_max {
+                    if p.priority > max {
+                        return false;
+                    }
+                }
+                if let Some(q) = search {
+                    let q = q.to_lowercase();
+                    if !p.title.to_lowercase().contains(&q)
+                        && !p.description.to_lowercase().contains(&q)
+                    {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+
+        let total = filtered.len();
+        Ok((paginate(&filtered, limit, offset), total))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn list_all_tasks_filtered(
+        &self,
+        plan_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        _workspace_slug: Option<&str>,
+        statuses: Option<Vec<String>>,
+        priority_min: Option<i32>,
+        priority_max: Option<i32>,
+        tags: Option<Vec<String>>,
+        assigned_to: Option<&str>,
+        limit: usize,
+        offset: usize,
+        _sort_by: Option<&str>,
+        _sort_order: &str,
+    ) -> Result<(Vec<TaskWithPlan>, usize)> {
+        self.log_read("list_all_tasks_filtered")?;
+        let pt = self.plan_tasks.read().await;
+        let tasks = self.tasks.read().await;
+        let plans = self.plans.read().await;
+        let pp = self.project_plans.read().await;
+
+        // Build task_id -> plan_id mapping
+        let mut task_plan_map: HashMap<Uuid, Uuid> = HashMap::new();
+        for (pid, tids) in pt.iter() {
+            for tid in tids {
+                task_plan_map.insert(*tid, *pid);
+            }
+        }
+
+        let filtered: Vec<TaskWithPlan> = tasks
+            .values()
+            .filter(|t| {
+                if let Some(pid) = plan_id {
+                    if task_plan_map.get(&t.id) != Some(&pid) {
+                        return false;
+                    }
+                }
+                if let Some(pid) = project_id {
+                    // Filter tasks whose plan belongs to this project
+                    if let Some(plan_id) = task_plan_map.get(&t.id) {
+                        if !pp.get(&pid).is_some_and(|plans| plans.contains(plan_id)) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                if let Some(ref sts) = statuses {
+                    let ts = serde_json::to_string(&t.status)
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_string();
+                    if !sts.contains(&ts) {
+                        return false;
+                    }
+                }
+                if let Some(min) = priority_min {
+                    if t.priority.unwrap_or(0) < min {
+                        return false;
+                    }
+                }
+                if let Some(max) = priority_max {
+                    if t.priority.unwrap_or(0) > max {
+                        return false;
+                    }
+                }
+                if let Some(ref tag_filter) = tags {
+                    if !tag_filter.iter().any(|tg| t.tags.contains(tg)) {
+                        return false;
+                    }
+                }
+                if let Some(agent) = assigned_to {
+                    if t.assigned_to.as_deref() != Some(agent) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .filter_map(|t| {
+                let pid = task_plan_map.get(&t.id)?;
+                let plan = plans.get(pid)?;
+                let plan_status = serde_json::to_value(&plan.status)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                Some(TaskWithPlan {
+                    task: t.clone(),
+                    plan_id: *pid,
+                    plan_title: plan.title.clone(),
+                    plan_status: Some(plan_status),
+                })
+            })
+            .collect();
+
+        let total = filtered.len();
+        Ok((paginate(&filtered, limit, offset), total))
+    }
+
+    async fn list_releases_filtered(
+        &self,
+        project_id: Uuid,
+        statuses: Option<Vec<String>>,
+        limit: usize,
+        offset: usize,
+        _sort_by: Option<&str>,
+        _sort_order: &str,
+    ) -> Result<(Vec<ReleaseNode>, usize)> {
+        let all = self.list_project_releases(project_id).await?;
+        let filtered: Vec<ReleaseNode> = all
+            .into_iter()
+            .filter(|r| {
+                if let Some(ref sts) = statuses {
+                    let rs = serde_json::to_string(&r.status)
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_string();
+                    sts.contains(&rs)
+                } else {
+                    true
+                }
+            })
+            .collect();
+        let total = filtered.len();
+        Ok((paginate(&filtered, limit, offset), total))
+    }
+
+    async fn list_milestones_filtered(
+        &self,
+        project_id: Uuid,
+        statuses: Option<Vec<String>>,
+        limit: usize,
+        offset: usize,
+        _sort_by: Option<&str>,
+        _sort_order: &str,
+    ) -> Result<(Vec<MilestoneNode>, usize)> {
+        let all = self.list_project_milestones(project_id).await?;
+        let filtered: Vec<MilestoneNode> = all
+            .into_iter()
+            .filter(|m| {
+                if let Some(ref sts) = statuses {
+                    let ms = serde_json::to_string(&m.status)
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_string();
+                    sts.contains(&ms)
+                } else {
+                    true
+                }
+            })
+            .collect();
+        let total = filtered.len();
+        Ok((paginate(&filtered, limit, offset), total))
+    }
+
+    async fn list_projects_filtered(
+        &self,
+        search: Option<&str>,
+        limit: usize,
+        offset: usize,
+        _sort_by: Option<&str>,
+        _sort_order: &str,
+    ) -> Result<(Vec<ProjectNode>, usize)> {
+        let projects = self.projects.read().await;
+        let filtered: Vec<ProjectNode> = projects
+            .values()
+            .filter(|p| {
+                if let Some(q) = search {
+                    let q = q.to_lowercase();
+                    p.name.to_lowercase().contains(&q)
+                        || p.slug.to_lowercase().contains(&q)
+                        || p.description
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_lowercase()
+                            .contains(&q)
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        let total = filtered.len();
+        Ok((paginate(&filtered, limit, offset), total))
     }
 }
