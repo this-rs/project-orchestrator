@@ -199,6 +199,10 @@ pub struct InstanceDraft {
     /// the behaviour is then exactly what it was before this field existed.
     #[serde(default)]
     pub rate_limit: Vec<RateLimit>,
+    /// Whether this instance bypasses per-project consent (B30). An operator
+    /// who configures a local gateway (NIM, vLLM) trusts it implicitly.
+    #[serde(default)]
+    pub auto_consent: Option<bool>,
 }
 
 /// Body of `PUT|PATCH /chat/providers/{id}`: the id and the kind never change.
@@ -245,6 +249,10 @@ pub struct InstancePatch {
     /// = remove every limit. The field is never a secret.
     #[serde(default)]
     pub rate_limit: Option<Vec<RateLimit>>,
+    /// Whether this instance bypasses per-project consent (B30). `None` = leave
+    /// the stored value untouched.
+    #[serde(default)]
+    pub auto_consent: Option<bool>,
 }
 
 /// A stored provider instance.
@@ -293,6 +301,12 @@ pub struct InstanceRecord {
     /// existed reads back with an empty list, without any migration.
     #[serde(default)]
     pub rate_limit: Vec<RateLimit>,
+    /// Whether the instance is automatically consented for every project (B30).
+    /// An operator-configured instance (NIM, a local gateway) may bypass
+    /// per-project consent: the user trusts it by creating it.  A remote machine
+    /// still needs explicit consent because it receives the project's files.
+    #[serde(default)]
+    pub auto_consent: bool,
 }
 
 impl InstanceRecord {
@@ -1360,6 +1374,7 @@ pub fn record_from_draft(
         remote_cwd: remote.then(|| draft.remote_cwd.clone()).flatten(),
         allow_trust: remote && draft.allow_trust.unwrap_or(false),
         rate_limit: draft.rate_limit.clone(),
+        auto_consent: !remote && draft.auto_consent.unwrap_or(false),
     })
 }
 
@@ -1510,6 +1525,10 @@ pub fn apply_patch(
     if let Some(limits) = patch.rate_limit.as_ref() {
         validate_rate_limits(limits, env_allow)?;
         next.rate_limit = limits.clone();
+    }
+    // B30: auto_consent. A remote machine never auto-consents (it receives files).
+    if let Some(ac) = patch.auto_consent {
+        next.auto_consent = !remote && ac;
     }
     // A consent is tied to the origin AND to the credential reference: changing
     // either sends the project's content somewhere or with something it did not

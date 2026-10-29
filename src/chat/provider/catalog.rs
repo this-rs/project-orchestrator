@@ -74,7 +74,12 @@ impl InstanceCatalog for StoreCatalog {
     }
 
     fn is_allowed_for_project(&self, provider_id: &str) -> bool {
-        provider_id == CLAUDE_CODE || self.consented.contains(provider_id)
+        provider_id == CLAUDE_CODE
+            || self.consented.contains(provider_id)
+            || self
+                .instances
+                .get(provider_id)
+                .is_some_and(|i| i.auto_consent)
     }
 
     fn claude_code_installed(&self) -> bool {
@@ -489,5 +494,29 @@ mod tests {
         );
         // A rule naming an undefined alias matches nothing.
         assert_eq!(policy_pick(&policy, Role::Pilot, None, &[]), None);
+    }
+
+    #[test]
+    fn auto_consent_bypasses_per_project_consent() {
+        let mut nim = instance("nim", "https://nim.example.com");
+        nim.auto_consent = true;
+        let regular = instance("ds", "https://a.example.com");
+        let catalog = StoreCatalog::new(vec![nim, regular], &[]);
+        // An auto-consent instance is allowed without a consent record.
+        assert!(catalog.is_allowed_for_project("nim"));
+        // A normal instance without consent is NOT allowed.
+        assert!(!catalog.is_allowed_for_project("ds"));
+        // claude-code is always allowed regardless.
+        assert!(catalog.is_allowed_for_project(CLAUDE_CODE));
+    }
+
+    #[test]
+    fn auto_consent_false_still_needs_consent() {
+        let regular = instance("ds", "https://a.example.com");
+        assert!(!regular.auto_consent); // default is false
+        let without = StoreCatalog::new(vec![regular.clone()], &[]);
+        assert!(!without.is_allowed_for_project("ds"));
+        let with = StoreCatalog::new(vec![regular], &[consent("ds", "https://a.example.com")]);
+        assert!(with.is_allowed_for_project("ds"));
     }
 }

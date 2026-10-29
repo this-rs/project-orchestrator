@@ -133,16 +133,33 @@ const KNOWN_FAMILIES: &[&str] = &["opus", "sonnet", "haiku", "fable", "mythos"];
 /// is worth a tuple field. Adding a model is one line, and it carries no
 /// presentation decision.
 ///
+/// One row of the curated table: `(id, family, version, tier, description,
+/// max_input_tokens)`.
+type CuratedEntry = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<u64>,
+);
+
 /// Models absent from this table (including brand-new ones the live API
 /// returns) still show up — see `resolve_model` — with a derived label and
 /// no description, until someone curates them.
-const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
+///
+/// The context window is Anthropic's published value: every Claude model since
+/// the 3.5 generation accepts 200 000 input tokens. Carrying it here means the
+/// static fallback (catalog offline) still passes the routing filter's window
+/// check, instead of rejecting every model as `WindowUnknown(CatalogOffline)`.
+const CURATED_ORDER: &[CuratedEntry] = &[
     (
         "claude-opus-5-5",
         "opus",
         "5.5",
         TIER_CURRENT,
         "Recommended default — long-running agentic coding & knowledge work",
+        Some(200_000),
     ),
     (
         "claude-fable-5-1",
@@ -150,6 +167,7 @@ const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
         "5.1",
         TIER_CURRENT,
         "Most capable — demanding reasoning & long-horizon agentic work",
+        Some(200_000),
     ),
     (
         "claude-sonnet-5-5",
@@ -157,6 +175,7 @@ const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
         "5.5",
         TIER_CURRENT,
         "Best balance of speed and intelligence",
+        Some(200_000),
     ),
     (
         "claude-haiku-5-5",
@@ -164,6 +183,7 @@ const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
         "5.5",
         TIER_CURRENT,
         "Fastest — near-frontier intelligence, latest generation",
+        Some(200_000),
     ),
     (
         "claude-haiku-4-5",
@@ -171,6 +191,7 @@ const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
         "4.5",
         TIER_CURRENT,
         "Fastest — near-frontier intelligence",
+        Some(200_000),
     ),
     (
         "claude-opus-5",
@@ -178,6 +199,7 @@ const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
         "5",
         TIER_LEGACY,
         "Legacy — superseded by Opus 5.5",
+        Some(200_000),
     ),
     (
         "claude-fable-5",
@@ -185,6 +207,7 @@ const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
         "5",
         TIER_LEGACY,
         "Legacy — superseded by Fable 5.1",
+        Some(200_000),
     ),
     (
         "claude-sonnet-5",
@@ -192,6 +215,7 @@ const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
         "5",
         TIER_LEGACY,
         "Legacy — superseded by Sonnet 5.5",
+        Some(200_000),
     ),
     (
         "claude-opus-4-8",
@@ -199,6 +223,7 @@ const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
         "4.8",
         TIER_LEGACY,
         "Legacy Opus — complex reasoning",
+        Some(200_000),
     ),
     (
         "claude-opus-4-7",
@@ -206,6 +231,7 @@ const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
         "4.7",
         TIER_LEGACY,
         "Legacy Opus — complex reasoning",
+        Some(200_000),
     ),
     (
         "claude-opus-4-6",
@@ -213,6 +239,7 @@ const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
         "4.6",
         TIER_LEGACY,
         "Legacy Opus — complex reasoning",
+        Some(200_000),
     ),
     (
         "claude-sonnet-4-6",
@@ -220,6 +247,7 @@ const CURATED_ORDER: &[(&str, &str, &str, &str, &str)] = &[
         "4.6",
         TIER_LEGACY,
         "Legacy Sonnet — fast & capable",
+        Some(200_000),
     ),
 ];
 
@@ -250,6 +278,7 @@ fn build_definition(
     tier: &str,
     description: &str,
     full_label_override: Option<&str>,
+    max_input_tokens: Option<u64>,
 ) -> ModelDefinition {
     let short_label = compose_short_label(family, version);
     ModelDefinition {
@@ -262,15 +291,23 @@ fn build_definition(
             .unwrap_or_else(|| format!("Claude {short_label}")),
         short_label,
         description: description.to_string(),
-        max_input_tokens: None,
+        max_input_tokens,
         max_tokens: None,
     }
 }
 
 fn curated_lookup(id: &str) -> Option<ModelDefinition> {
     CURATED_ORDER.iter().find(|(cid, ..)| *cid == id).map(
-        |(id, family, version, tier, description)| {
-            build_definition(id, family, version, tier, description, None)
+        |(id, family, version, tier, description, max_input_tokens)| {
+            build_definition(
+                id,
+                family,
+                version,
+                tier,
+                description,
+                None,
+                *max_input_tokens,
+            )
         },
     )
 }
@@ -331,15 +368,27 @@ fn resolve_model(id: &str, api_display_name: Option<&str>) -> ModelDefinition {
         return curated;
     }
     let (family, version) = derive_family_version(id);
-    build_definition(id, &family, &version, TIER_CURRENT, "", api_display_name)
+    // Unknown model from the live API: its window comes from the API response
+    // (`max_input_tokens` on the entry), not from the curated table.
+    build_definition(
+        id,
+        &family,
+        &version,
+        TIER_CURRENT,
+        "",
+        api_display_name,
+        None,
+    )
 }
 
 /// The static list used when no API key is configured, or the live fetch
 /// fails and nothing has ever been cached yet. Order matches `CURATED_ORDER`.
 ///
-/// It carries no window: the curated table holds no context window from a
-/// cited source, and a window is never invented. Offline, every model's
-/// `max_input_tokens` is `None`, and the router says so ("catalog offline").
+/// Each entry carries Anthropic's published context window (200 000 input
+/// tokens for every Claude model since the 3.5 generation), so the cognitive
+/// router's filter does not reject them as `WindowUnknown(CatalogOffline)`
+/// when the live catalog is unreachable. The live catalog's value still wins
+/// when it is available (see `claude_code_facts`).
 fn static_fallback_models() -> Vec<ModelDefinition> {
     CURATED_ORDER
         .iter()
@@ -1193,7 +1242,7 @@ mod tests {
 
     #[test]
     fn test_every_curated_entry_is_self_consistent() {
-        for (id, family, version, tier, _) in CURATED_ORDER {
+        for (id, family, version, tier, _, _) in CURATED_ORDER {
             assert!(
                 KNOWN_FAMILIES.contains(family),
                 "{id}: unknown family {family}"
@@ -1697,6 +1746,7 @@ mod tests {
             remote_cwd: None,
             allow_trust: false,
             rate_limit: Vec::new(),
+            auto_consent: false,
         };
         let graph = crate::neo4j::mock::MockGraphStore::new();
         graph

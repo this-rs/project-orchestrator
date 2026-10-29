@@ -223,6 +223,8 @@ fn instance_view(i: &InstanceRecord) -> Value {
     // without limits has always had; nothing here is a secret (a credential
     // scope names a reference).
     view["rate_limit"] = serde_json::to_value(&i.rate_limit).unwrap_or_else(|_| json!([]));
+    // B30: auto_consent bypasses per-project consent for trusted local instances.
+    view["auto_consent"] = json!(i.auto_consent);
     // Additive: only a remote instance carries the machine fields. The pinned key
     // is public; its fingerprint is what a human compares. The SSH private key is
     // only ever referenced (`credential_ref`), never present.
