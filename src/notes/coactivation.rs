@@ -17,7 +17,6 @@ use uuid::Uuid;
 use super::models::Note;
 use crate::neo4j::traits::GraphStore;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 
 /// Note ids grouped by owning project. Duplicates are merged; notes without a
 /// `project_id` belong to no group (they cannot be reinforced).

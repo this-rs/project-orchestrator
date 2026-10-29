@@ -17,7 +17,6 @@ use uuid::Uuid;
 use crate::neo4j::traits::GraphStore;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::protocol::engine;
 use crate::protocol::routing::{rank_protocols, ContextVector, DimensionWeights};
 

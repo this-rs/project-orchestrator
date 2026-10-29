@@ -17,7 +17,6 @@ use uuid::Uuid;
 
 use crate::episodes::models::*;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 
 /// Collect a complete Episode from a completed ProtocolRun.

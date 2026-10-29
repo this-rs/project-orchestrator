@@ -321,7 +321,6 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn make_hook(name: &str, scope: LifecycleScope, on_status: &str) -> LifecycleHook {
         LifecycleHook::new(

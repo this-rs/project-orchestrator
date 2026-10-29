@@ -41,7 +41,6 @@ use uuid::Uuid;
 use super::trigger::EventTrigger;
 use super::types::{CrudAction, CrudEvent, EntityType, EventEmitter};
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 
 /// Type alias for async reaction handler functions.

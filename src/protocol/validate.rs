@@ -339,7 +339,6 @@ mod tests {
 mod real_graph {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     /// Validate ALL stored protocols against the real Neo4j graph.
     ///

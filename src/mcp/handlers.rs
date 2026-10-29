@@ -6630,7 +6630,6 @@ mod update_body_tests {
 mod tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use serde_json::json;
 
     // ========================================================================
@@ -12981,7 +12980,6 @@ mod tests {
 mod schema_drift_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use std::collections::{BTreeMap, BTreeSet};
 
     /// Published keys that no explicit handler arm reads, because the arm forwards

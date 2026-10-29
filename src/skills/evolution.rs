@@ -21,7 +21,6 @@ use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::notes::{MemoryHorizon, Note, NoteImportance, NoteScope, NoteStatus, NoteType};
 use crate::skills::detection::{jaccard_similarity, SkillCandidate};
 use crate::skills::models::SkillNode;

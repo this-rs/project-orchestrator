@@ -11,7 +11,6 @@ use uuid::Uuid;
 
 use crate::graph::models::TopologySeverity;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::notes::models::{Note, NoteFilters, NoteImportance, NoteType};
 
@@ -184,8 +183,6 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
-
     #[tokio::test]
     async fn test_no_violations_returns_empty() {
         let mock = Arc::new(MockGraphStore::new());

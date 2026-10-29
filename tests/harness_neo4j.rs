@@ -18,7 +18,6 @@ use neo4rs::{query, Graph};
 use project_orchestrator::neo4j::client::Neo4jClient;
 use project_orchestrator::neo4j::models::ChatSessionNode;
 #[allow(unused_imports)]
-use project_orchestrator::neo4j::traits::*;
 use project_orchestrator::neo4j::GraphStore;
 use uuid::Uuid;
 
@@ -811,7 +810,6 @@ mod synapse_scope {
     use super::*;
     use project_orchestrator::episodes::distill_models::SharingConsent;
     #[allow(unused_imports)]
-    use project_orchestrator::neo4j::traits::*;
     use project_orchestrator::notes::{EntityType, Note, NoteImportance, NoteType};
 
     fn note(project: Uuid, importance: NoteImportance, consent: SharingConsent) -> Note {
@@ -1110,7 +1108,6 @@ mod anchor_followups {
     use super::*;
     use project_orchestrator::chat::types::SpawnedBy;
     #[allow(unused_imports)]
-    use project_orchestrator::neo4j::traits::*;
 
     fn spawned(parent: Uuid) -> String {
         SpawnedBy::Conversation {
@@ -1477,7 +1474,6 @@ mod anchor_scope {
     };
     use project_orchestrator::neo4j::models::ProjectNode;
     #[allow(unused_imports)]
-    use project_orchestrator::neo4j::traits::*;
     use project_orchestrator::notes::{Note, NoteType};
     use project_orchestrator::sharing::consent_gate::ReadDenial;
     use std::collections::{BTreeSet, HashMap};

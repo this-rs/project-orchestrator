@@ -2364,7 +2364,6 @@ mod tests {
     /// delegates to [`iso_scene_problems`]. The exact bounds are `scene3d_contract` (spec §3).
     mod scene3d_contract {
         #[allow(unused_imports)]
-        use crate::neo4j::traits::*;
         pub const V1_KEYS: &[&str] = &[
             "layout",
             "stations",

@@ -2442,7 +2442,6 @@ mod provider_move_tests {
     use super::*;
     use crate::chat::provider::cognitive::decision::DecisionAlternative;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use chrono::Utc;
     use nexus_claude::agent::CostBasis;
     use std::sync::Mutex as StdMutex;
@@ -3516,7 +3515,6 @@ mod image_routing_tests {
     use crate::chat::provider::cognitive::decider::decide_with;
     use crate::chat::provider::cognitive::scorer::PriorHints;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use chrono::Utc;
     use nexus_claude::agent::CostBasis;
     use std::sync::Mutex as StdMutex;
@@ -4117,7 +4115,6 @@ mod segment_tests {
     use crate::chat::provider::cognitive::segment::BoundaryReason;
     use crate::chat::provider::cognitive::segment_store::{InMemorySegmentStore, SegmentStore};
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use chrono::Utc;
     use nexus_claude::agent::CostBasis;
     use std::sync::Mutex as StdMutex;

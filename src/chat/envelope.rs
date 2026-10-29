@@ -28,7 +28,6 @@ use crate::chat::types::{ChatRequest, SpawnedBy};
 use crate::neo4j::traits::GraphStore;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 

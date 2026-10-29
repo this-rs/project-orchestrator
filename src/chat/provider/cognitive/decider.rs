@@ -930,7 +930,6 @@ mod tests {
     use crate::chat::provider::cognitive::signature::{ContextHints, TaskClass};
     use crate::chat::provider::cognitive::store::{ArmKey, InMemoryRoutingStore};
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use nexus_claude::agent::{CostBasis, ModelPrice};
 
     fn facts(provider: &str, model: &str, price: f64) -> ModelFacts {

@@ -41,7 +41,6 @@ use crate::chat::provider::store as provider_store;
 use crate::events::{EntityType, EventEmitter};
 use crate::neo4j::models::{AlertNode, AlertSeverity};
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::vault::VaultService;
 

@@ -21,7 +21,6 @@ use crate::neo4j::plan::{compute_file_conflicts, WaveComputationResult};
 use crate::neo4j::StoreCapabilities;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::plan::models::*;
 use crate::AuthConfig;
@@ -13325,8 +13324,6 @@ mod retry_plan_task_tests {
 mod fabric_emit_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
-
     #[test]
     fn fabric_refresh_helpers_emit_the_expected_graph_events() {
         let bus = HybridEmitter::new(Arc::new(crate::events::EventBus::default()));
@@ -13366,8 +13363,6 @@ mod transport_label_tests {
     use super::transport_label;
     use crate::events::TransportState;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
-
     #[test]
     fn a_live_connection_is_the_only_thing_that_reads_connected() {
         assert_eq!(transport_label(None), "disabled");

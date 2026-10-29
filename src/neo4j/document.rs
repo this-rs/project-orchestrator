@@ -827,7 +827,6 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn a_document(project_id: Option<Uuid>) -> Document {
         Document {

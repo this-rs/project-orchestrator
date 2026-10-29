@@ -21,7 +21,6 @@ use super::config::ChatConfig;
 use super::manager::{test_support, ChatManager};
 use super::types::{ChatEvent, PendingQueueEntry};
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::refs::compose::compose_user_message;
 use crate::refs::test_support::{world, World};

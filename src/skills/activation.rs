@@ -29,7 +29,6 @@ use crate::neo4j::models::DecisionNode;
 use crate::neo4j::traits::GraphStore;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::neurons::AutoReinforcementConfig;
 use crate::notes::models::Note;
 use crate::skills::cache::{evaluate_cached_skill, SkillCache};
@@ -1890,7 +1889,6 @@ mod rank_tests {
 mod tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::notes::models::{NoteImportance, NoteScope, NoteStatus, NoteType};
     use crate::skills::models::{SkillNode, SkillStatus, SkillTrigger};
     use chrono::Utc;

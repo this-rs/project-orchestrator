@@ -36,7 +36,6 @@ use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::pipeline::critic::{
     CriticMode, CriticScore, GraphBasedCritic, LearningConfig, MutationCandidate, MutationCritic,
 };

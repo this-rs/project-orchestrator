@@ -170,7 +170,6 @@ async fn resolve_single_protocol_name(
 // ─── Synthetic Episode Generation (T3 — Replay Génératif) ──────────────────
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::notes::models::{Note, NoteType};
 
 /// Generate synthetic episodes from detected patterns and knowledge notes.

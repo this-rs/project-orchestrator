@@ -564,7 +564,6 @@ mod safe {
 mod safe {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     pub(super) fn dir_is_safe(_dir: &Path, _create: bool) -> Result<bool, StoreError> {
         Err(StoreError::Unsupported)
@@ -584,7 +583,6 @@ mod safe {
 mod tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
 

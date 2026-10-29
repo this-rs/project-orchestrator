@@ -1138,7 +1138,6 @@ mod read_retry_tests {
 mod where_builder_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     const EVIL: &str = "a' OR 1=1 //";
 
@@ -1339,7 +1338,6 @@ mod where_builder_tests {
 mod schema_expectation_tests {
     use super::EXPECTED_CONSTRAINTS;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     /// Every `CREATE CONSTRAINT <name>` of this file must be in the list that
     /// `verify_schema` checks, or a constraint that silently failed to be

@@ -1427,8 +1427,6 @@ mod tests {
 mod auto_vault_locked_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
-
     #[test]
     fn auto_on_a_locked_vault_is_credentials_locked_with_its_fallbacks() {
         let err = anyhow::Error::new(AutoVaultLocked {

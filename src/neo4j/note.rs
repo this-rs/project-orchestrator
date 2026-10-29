@@ -3939,7 +3939,6 @@ mod staleness_parity_tests {
 mod injection_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     const PAYLOADS: &[&str] = &[
         "a' OR 1=1 //",
@@ -4019,7 +4018,6 @@ mod injection_tests {
 mod synapse_param_tests {
     use super::synapse_bind_params;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use uuid::Uuid;
 
     #[test]
@@ -4045,7 +4043,6 @@ mod project_param_tests {
     //! `IS NULL` predicate misses, which is how 3 319 notes ended up stranded.
     use super::note_project_param;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use uuid::Uuid;
 
     #[test]

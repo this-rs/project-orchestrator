@@ -45,7 +45,6 @@ use super::types::{
 };
 use crate::neo4j::models::ChatEventRecord;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 
 const BROADCAST_BUFFER: usize = 1024;
@@ -3925,7 +3924,6 @@ mod turn_race_tests {
     use super::fake::FakeProvider;
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use std::sync::atomic::AtomicBool as StdAtomicBool;
     use tokio::sync::Notify;
 
@@ -4048,7 +4046,6 @@ mod adopt_tests {
     use super::fake::FakeProvider;
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     /// The handle replaced is ended: its listeners (NATS) stop, its provider
     /// session is closed. Otherwise both handles answer the same NATS subjects and
@@ -4953,8 +4950,6 @@ mod adopt_tests {
 mod image_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
-
     #[test]
     fn the_turn_input_is_the_text_then_the_images_in_order() {
         let images = [
@@ -5166,7 +5161,6 @@ mod session_record_tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use nexus_claude::agent::{Cost, CostBasis};
 
     fn done(usd: Option<f64>) -> AgentEvent {
@@ -5508,7 +5502,6 @@ mod retry_config_tests {
     use super::fake::FakeProvider;
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn overloaded() -> AgentEvent {
         AgentEvent::Done {
@@ -5593,7 +5586,6 @@ mod outage_hold_tests {
     use super::fake::FakeProvider;
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn unreachable() -> ProviderError {
         ProviderError::EndpointUnreachable {
@@ -5787,7 +5779,6 @@ mod after_turn_tests {
     use super::fake::FakeProvider;
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use std::sync::Mutex as StdMutex;
 
     fn done() -> AgentEvent {
@@ -6151,7 +6142,6 @@ mod retry_stop_tests {
     use super::fake::FakeProvider;
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     /// A Stop during the pause before a retry ends the turn at once: no ten-second
     /// wait, no retry sent after the Stop.
@@ -6230,7 +6220,6 @@ mod process_exit_tests {
     use super::fake::FakeProvider;
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     /// A `ProcessExited` terminal event ends the turn, is said as a session error,
     /// and removes the handle from the runtime: the next message takes the resume
@@ -6293,7 +6282,6 @@ mod answered_tests {
     use super::fake::FakeProvider;
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use std::sync::Mutex as StdMutex;
 
     /// The terminal-result fields of one turn, captured for assertions.
@@ -6847,7 +6835,6 @@ mod tool_timing_tests {
     use super::fake::FakeProvider;
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use serde_json::json;
 
     /// The provider is slow to take the answer and the tool is fast: its result is
@@ -7213,8 +7200,6 @@ mod stored_interrupted_result_tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
-
     #[tokio::test]
     async fn a_stopped_turn_is_stored_neutral_and_broadcast_as_the_provider_said() {
         let graph = Arc::new(MockGraphStore::new());

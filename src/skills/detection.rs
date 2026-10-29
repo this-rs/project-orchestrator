@@ -10,7 +10,6 @@ use crate::graph::algorithms::{compute_cohesion, louvain_communities};
 use crate::graph::{AnalyticsConfig, CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType};
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::notes::NoteManager;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

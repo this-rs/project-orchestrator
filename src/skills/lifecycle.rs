@@ -15,7 +15,6 @@ use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::skills::models::{SkillNode, SkillStatus};
 
 // ============================================================================

@@ -21,7 +21,6 @@ use crate::api::hook_handlers::skill_cache;
 use crate::chat::hook_ledger::{cap_chars, HookLedger, InjectionKey, MAX_HOOK_CONTEXT_CHARS};
 use crate::neo4j::traits::GraphStore;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::neurons::AutoReinforcementConfig;
 use crate::skills::activation::{
     activate_for_hook_cached, spawn_activation_increment, spawn_hook_reinforcement,

@@ -462,7 +462,6 @@ mod pure_ranking_tests {
 mod pure_rule_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn node(energy: f64) -> SpreadNode {
         SpreadNode {
@@ -1118,7 +1117,6 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
     use crate::notes::{NoteImportance, NoteType};
 

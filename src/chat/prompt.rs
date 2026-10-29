@@ -1837,7 +1837,6 @@ use crate::neo4j::models::{
 use crate::neo4j::GraphStore;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::notes::models::{Note, NoteFilters, NoteImportance, NoteStatus, NoteType};
 
 // ============================================================================

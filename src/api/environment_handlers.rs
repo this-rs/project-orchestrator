@@ -20,7 +20,6 @@ use crate::neo4j::models::{
 };
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -435,9 +434,7 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::orchestrator::watcher::FileWatcher;
     use crate::orchestrator::Orchestrator;
     use crate::test_helpers::{

@@ -15,7 +15,6 @@ use uuid::Uuid;
 
 use crate::chat::manager::{test_support, ChatManager};
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::refs::test_support::{task_titled, world};
 use crate::test_helpers::{mock_app_state_with_graph, test_chat_session};
 

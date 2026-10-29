@@ -12,7 +12,6 @@ use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest
 use crate::neo4j::document::{Document, DocumentChunk, DocumentChunkHit};
 use crate::neo4j::models::*;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
 };
@@ -5143,7 +5142,6 @@ mod anchor_tests {
     use super::*;
     use crate::chat::anchor::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::test_helpers::{test_chat_session, test_project_named};
 
     async fn session(store: &MockGraphStore, slug: Option<&str>) -> Uuid {
@@ -5594,9 +5592,7 @@ mod cross_project_parity {
     use crate::neo4j::client::Neo4jClient;
     use crate::neo4j::traits::GraphStore;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::notes::{EntityType, Note, NoteImportance, NoteType};
     use uuid::Uuid;
 
@@ -5770,9 +5766,7 @@ mod session_tree_tests {
     //! the session alone (tree) and the session itself (root) whatever the parents.
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use chrono::{DateTime, Utc};
 
     fn session(
@@ -5960,9 +5954,7 @@ mod bind_project_tests {
     //! `/api/agents/live` although every turn resolved its project from the cwd.
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::test_helpers::test_chat_session;
 
     async fn session(store: &MockGraphStore, slug: Option<&str>) -> Uuid {
@@ -6048,9 +6040,7 @@ mod transverse_skill_tests {
     //! here instead of only in a query string.
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::skills::{SkillNode, SkillStatus};
     use crate::test_helpers::test_project;
 
@@ -6131,9 +6121,7 @@ mod rescope_tests {
     //! without losing its members, states, transitions or runs).
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::skills::{SkillNode, SkillStatus};
     use crate::test_helpers::test_project;
 

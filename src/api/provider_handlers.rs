@@ -2135,7 +2135,6 @@ mod agent_surface_tests {
 mod listed_models_tests {
     use super::merge_listed_models;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn v(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|x| x.to_string()).collect()
@@ -2167,7 +2166,6 @@ mod listed_models_tests {
 mod tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 

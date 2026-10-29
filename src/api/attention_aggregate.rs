@@ -49,7 +49,6 @@ use crate::neo4j::models::{
 use crate::neo4j::traits::GraphStore;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::notes::{Note, NoteFilters, NoteStatus, NoteType};
 use crate::runner::eligibility::{resume_breakdown, runner_occupancy};
 use crate::runner::models::PlanRunStatus;
@@ -1224,7 +1223,6 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::notes::{NoteImportance, NoteScope};
     use crate::protocol::{Protocol, ProtocolRun};
     use crate::runner::models::TriggerSource;

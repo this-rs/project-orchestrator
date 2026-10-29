@@ -22,7 +22,6 @@ use super::resolver::{self, Candidate, ResolveError, ResolveInput, Role, RoutedB
 use super::{catalog, native_factory, settings, store};
 use crate::chat::agent_runtime::ProviderSource;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 
 /// How long the health preflight of a one-shot may take.
@@ -212,9 +211,7 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     async fn stored(graph: &MockGraphStore, id: &str) -> InstanceRecord {
         let record = InstanceRecord {

@@ -26,7 +26,6 @@ use crate::chat::provider::cognitive::signature::TaskSignature;
 use crate::chat::provider::cognitive::store::RoutingArmStore;
 use crate::neo4j::agent_execution::{AgentExecutionNode, AgentExecutionStatus};
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 
 /// Every (instance, model) a project could use, with its facts. The scorer's
@@ -408,9 +407,7 @@ mod tests {
         #[allow(unused_imports)]
         use crate::neo4j::traits::*;
         #[allow(unused_imports)]
-        use crate::neo4j::traits::*;
         #[allow(unused_imports)]
-        use crate::neo4j::traits::*;
 
         /// The Claude Code part of the pool of a manager routed over `catalog`,
         /// Claude Code measured healthy (no CLI is needed for the pool itself).

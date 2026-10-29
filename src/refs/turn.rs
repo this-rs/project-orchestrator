@@ -36,7 +36,6 @@ use crate::chat::message_attachments;
 use crate::chat::types::ChatEvent;
 use crate::neo4j::traits::GraphStore;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 
 /// Time the whole turn may spend resolving its references. A reference still
 /// unresolved when it runs out reads as unavailable: a slow store delays a

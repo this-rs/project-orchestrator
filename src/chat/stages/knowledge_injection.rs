@@ -71,7 +71,6 @@ use crate::embeddings::EmbeddingProvider;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::neurons::intent::{IntentDetector, QueryIntentMode};
 use crate::notes::models::EntityType as NoteEntityType;
 use crate::sharing::consent_gate::ConsentReader;
@@ -3646,7 +3645,6 @@ mod pinned_settings_tests {
     use crate::chat::enrichment::ParallelEnrichmentStage;
     use crate::neo4j::mock::MockGraphStore;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::notes::{Note, NoteType};
 
     fn stage(graph: Arc<MockGraphStore>, configured: Vec<Uuid>) -> KnowledgeInjectionStage {

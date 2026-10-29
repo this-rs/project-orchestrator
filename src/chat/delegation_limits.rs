@@ -26,7 +26,6 @@ use super::envelope::MAX_LIVE_CHILDREN;
 use super::manager::ChatManager;
 use super::provider::settings::GLOBAL;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 
 /// Key of the stored document, under the [`GLOBAL`] scope.

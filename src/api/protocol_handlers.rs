@@ -6,7 +6,6 @@ use super::handlers::{AppError, OrchestratorState};
 use super::{PaginatedResponse, PaginationParams};
 use crate::events::EventEmitter;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::protocol::{
     self, validate_protocol_structure, Protocol, ProtocolCategory, ProtocolRun, ProtocolState,
     ProtocolTransition, RunStatus, TransitionResult, ValidatableState, ValidatableTransition,

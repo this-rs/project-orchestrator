@@ -1844,7 +1844,6 @@ mod agent_path_tests {
     use super::super::types::ChatEvent;
     use crate::neo4j::mock::MockGraphStore;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
     use nexus_claude::agent::{
         AgentEvent, BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus,

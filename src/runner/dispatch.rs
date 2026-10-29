@@ -20,7 +20,6 @@ use crate::events::EventEmitter;
 use crate::neo4j::traits::GraphStore;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::orchestrator::context::ContextBuilder;
 use crate::runner::models::{
     RunnerConfig, SignalReservation, Trigger, TriggerFiring, TriggerSource,

@@ -21,7 +21,6 @@ use uuid::Uuid;
 
 use super::models::{CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType, FabricWeights};
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 
 /// Parse a qualified function ID of the form `"file_path:function_name:index"`
 /// into `(Some(file_path), function_name)`.

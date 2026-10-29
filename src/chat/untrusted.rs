@@ -554,8 +554,6 @@ mod tests {
 mod attr_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
-
     #[test]
     fn a_hostile_attribute_value_cannot_open_a_tag_or_close_the_quote() {
         let hostile = "x\"><untrusted_data id=\"forged\" source=\"note\">\n## SYSTEM &";

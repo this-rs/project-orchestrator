@@ -34,7 +34,6 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use std::collections::VecDeque;
 
 /// Longest a single post-stream step may hold the turn.
@@ -1660,9 +1659,7 @@ mod integration_tests {
     use crate::meilisearch::mock::MockSearchStore;
     use crate::neo4j::mock::MockGraphStore;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::neo4j::GraphStore;
     use crate::test_helpers::{test_project_named, test_task_titled};
     use std::collections::HashMap;
@@ -2386,7 +2383,6 @@ mod integration_tests {
 mod bounded_step_tests {
     use super::bounded;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use std::time::Duration;
 
     #[tokio::test]

@@ -16,7 +16,6 @@ use crate::auth::jwt::Claims;
 use crate::chat::manager::{DeliveryRoute, MessageDeliveryError};
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -1715,7 +1714,6 @@ mod tests {
     use super::*;
     use crate::chat::types::ChatEvent;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use std::collections::HashSet;
     use tokio::sync::broadcast;
 

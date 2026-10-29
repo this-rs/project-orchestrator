@@ -49,7 +49,6 @@ use crate::neo4j::models::ExecutionPlace;
 use crate::neo4j::GraphStore;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::sharing::consent_gate::{ConsentReader, ReadDenial, ReadVerdict};
 use anyhow::Result;
 use hmac::{digest::KeyInit, Hmac, Mac};
@@ -1687,7 +1686,6 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::test_helpers::{test_chat_session, test_project_named};
 
     const SECRET: &[u8] = b"session-secret";

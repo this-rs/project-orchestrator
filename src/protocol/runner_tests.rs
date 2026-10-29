@@ -17,7 +17,6 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::protocol::engine;
     use crate::protocol::runner::run_protocol;
     use crate::protocol::{

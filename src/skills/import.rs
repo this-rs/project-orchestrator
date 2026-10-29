@@ -22,7 +22,6 @@ use uuid::Uuid;
 use crate::episodes::PortableEpisode;
 use crate::neo4j::traits::GraphStore;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::notes::models::{MemoryHorizon, Note, NoteImportance, NoteScope, NoteStatus, NoteType};
 use crate::protocol::models::{
     Protocol, ProtocolCategory, ProtocolState, ProtocolTransition, StateType,

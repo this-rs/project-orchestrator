@@ -12,7 +12,6 @@ use crate::neo4j::traits::*;
 use super::{ExecutionResult, Executor};
 use crate::neo4j::traits::GraphStore;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::protocol::{Protocol, ProtocolRun, ProtocolState};
 use anyhow::{Context, Result};
 use async_trait::async_trait;

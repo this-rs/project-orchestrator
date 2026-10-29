@@ -4240,7 +4240,6 @@ mod tests {
 mod pool_spans_providers_tests {
     use super::{pool_spans_providers, RoutingPoolEntry};
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn entry(provider: &str, model: &str) -> RoutingPoolEntry {
         RoutingPoolEntry {

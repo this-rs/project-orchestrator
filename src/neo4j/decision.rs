@@ -1091,8 +1091,6 @@ mod parent_existence_tests {
 mod injection_tests {
     use super::safe_entity_label;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
-
     #[test]
     fn entity_label_is_whitelisted() {
         assert_eq!(safe_entity_label("File").unwrap(), "File");

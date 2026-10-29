@@ -404,7 +404,6 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::protocol::{Protocol, ProtocolCategory, ProtocolRun, ProtocolState, RunStatus};
     use std::sync::Arc;
     use uuid::Uuid;

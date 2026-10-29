@@ -831,7 +831,6 @@ mod tests {
 mod fan_out_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::refs::resolvers::Candidates;
     use crate::refs::test_support::{user, world};
     use crate::refs::types::RefId;
@@ -976,7 +975,6 @@ mod fan_out_tests {
 mod pushdown_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::refs::test_support::{note_with, user, world};
 
     /// The mock honours `workspace_slug` for notes (not for plans or tasks),

@@ -21,7 +21,6 @@ use crate::events::{CrudEvent, EntityType};
 use crate::lifecycle::models::{LifecycleActionType, LifecycleHook, LifecycleScope};
 use crate::neo4j::models::{AlertNode, AlertSeverity};
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::notes::{Note, NoteImportance, NoteType};
 
 /// Map [`CrudEvent`] [`EntityType`] to [`LifecycleScope`].
@@ -351,7 +350,6 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::orchestrator::Orchestrator;
 
     // ── entity_type_to_scope ──

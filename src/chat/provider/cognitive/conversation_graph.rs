@@ -485,7 +485,6 @@ fn jacobi_eigen(
 mod spectral_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn t(turn: u32, labels: &[&str], tools: &[&str]) -> TurnNode {
         TurnNode {
@@ -669,7 +668,6 @@ impl ConversationGraph {
 mod partition_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use std::collections::BTreeSet;
 
     fn t(turn: u32, labels: &[&str]) -> TurnNode {
@@ -729,7 +727,6 @@ mod parity_tests {
         Dimension, Fingerprint, Observation, SegmentPolicy, Segmenter,
     };
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use std::collections::{BTreeMap, BTreeSet};
 
     fn topic_observation(turn: u32, label: &str) -> Observation {

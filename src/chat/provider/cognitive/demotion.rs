@@ -29,7 +29,6 @@ use super::{load_routing, stored_routing, ROUTING_KEY};
 use crate::chat::provider::settings::{project_scope, GLOBAL};
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::notes::{Note, NoteImportance, NoteType};
 
@@ -244,9 +243,7 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use uuid::Uuid;
 
     const CLASS: &str = "simple";

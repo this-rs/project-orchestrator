@@ -2739,7 +2739,6 @@ mod anonymous_warning_tests {
 mod config_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use std::io::Write;
 
     /// Serialises the tests below that read or write process-global environment

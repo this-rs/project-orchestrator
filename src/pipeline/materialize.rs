@@ -21,7 +21,6 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::notes::models::{
     MemoryHorizon, Note, NoteFilters, NoteImportance, NoteScope, NoteStatus, NoteType,

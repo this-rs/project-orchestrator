@@ -45,7 +45,6 @@ use crate::api::attention::{OrphanRequest, QuestionOption, RequestKind, WaitingR
 use crate::chat::types::ChatEvent;
 use crate::neo4j::models::ChatEventRecord;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 
 /// Everything the derivation needs to know about one session, except its
 /// events (passed separately so the grouped read can be split per session).

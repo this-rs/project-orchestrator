@@ -4246,7 +4246,6 @@ mod tests {
 mod status_display_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     /// Regression: status Display must use snake_case (matching serde), not
     /// Debug (PascalCase). Before the fix, `format!("{:?}", TaskStatus::Failed)`

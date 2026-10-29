@@ -18,7 +18,6 @@ use uuid::Uuid;
 use crate::neo4j::traits::GraphStore;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::notes::NoteManager;
 use crate::skills::detection::{ensure_synapse_graph_health, SkillDetectionConfig};
 use crate::skills::evolution::{analyze_evolution, execute_evolution, EvolutionResult};

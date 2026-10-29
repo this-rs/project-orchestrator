@@ -61,7 +61,6 @@ use crate::documents::{
 use crate::embeddings::EmbeddingProvider;
 use crate::neo4j::document::{Document, DocumentChunk};
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::notes::EntityType;
 use axum::{

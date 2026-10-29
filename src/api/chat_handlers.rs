@@ -11,7 +11,6 @@ use crate::chat::types::{
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -6063,8 +6062,6 @@ mod switch_provider_tests {
     use super::*;
     use crate::chat::types::SwitchProviderError;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
-
     #[test]
     fn an_unknown_session_is_a_404_that_names_it() {
         let err = switch_error(anyhow::Error::new(SwitchProviderError::NotFound), "abc");
@@ -6170,9 +6167,7 @@ mod file_scope_lift_tests {
     use crate::chat::envelope::SpawnCaller;
     use crate::chat::types::ChatRequest;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn person() -> Claims {
         Claims {
@@ -6860,7 +6855,6 @@ pub mod anchors {
         #[allow(unused_imports)]
         use crate::neo4j::traits::*;
         #[allow(unused_imports)]
-        use crate::neo4j::traits::*;
         use crate::test_helpers::{
             router_with_auth_and_events, test_bearer_token, test_chat_session, test_project_named,
         };

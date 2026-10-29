@@ -19,12 +19,9 @@ use crate::graph::algorithms::into_ranked;
 use crate::graph::models::{FusionWeights, MultiSignalImpact, MultiSignalScore, RankedList};
 use crate::neo4j::models::{ConnectedFileNode, DecisionNode};
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
-
 // ============================================================================
 // Code Search (Meilisearch)
 // ============================================================================
-
 #[derive(Deserialize)]
 pub struct CodeSearchQuery {
     /// Search query (semantic search across code content, symbols, comments)
@@ -4352,7 +4349,6 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_bearer_token};
     use axum::body::Body;

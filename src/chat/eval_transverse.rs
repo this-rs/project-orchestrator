@@ -57,7 +57,6 @@ use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::models::ExecutionPlace;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::skills::project_resolver::{entries_for_projects, infer_project_slug, ResolvedProject};
 use serde::Deserialize;
 use serde_json::{json, Value};

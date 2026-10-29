@@ -323,7 +323,6 @@ mod tests {
 mod cited_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::refs::RefKind;
 
     const ID: &str = "57cf05c9-25b6-495d-ab07-de4b11d64736";
@@ -472,7 +471,6 @@ mod cited_tests {
 mod guard_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::refs::access::{Disclosure, SessionScope};
     use crate::refs::resolvers::GraphRefSource;
     use crate::refs::test_support::{user, world, Spy, World};
@@ -619,7 +617,6 @@ mod guard_tests {
 mod neutralize_value_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use serde_json::json;
 
     const ID: &str = "57cf05c9-25b6-495d-ab07-de4b11d64736";

@@ -40,7 +40,6 @@ use crate::events::EventEmitter;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::notes::models::{MemoryHorizon, Note, NoteImportance, NoteType};
 
 // ============================================================================
@@ -1527,7 +1526,6 @@ mod tests {
 mod cited_tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::refs::test_support::world;
 
     #[tokio::test]

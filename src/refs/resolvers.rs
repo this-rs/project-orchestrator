@@ -39,7 +39,6 @@ use super::types::{EntityRef, RefId, RefKind};
 use super::wire::ScopeLabel;
 use crate::neo4j::models::{DecisionNode, DecisionStatus, PlanNode, TaskWithPlan};
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::notes::{Note, NoteFilters, NoteType};
 

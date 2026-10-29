@@ -12,7 +12,6 @@ use crate::neo4j::models::*;
 use crate::neo4j::GraphStore;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::notes::{EntityType, Note, NoteManager};
 use crate::plan::models::*;
 use crate::plan::PlanManager;
@@ -1215,7 +1214,6 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::notes::NoteScope;
     use crate::plan::models::{AgentContext, CodeReference, ContextNote, FileContext};
 

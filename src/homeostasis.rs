@@ -27,7 +27,6 @@ use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::notes::manager::NoteManager;
 
 /// Maximum number of corrective actions per evaluation cycle.

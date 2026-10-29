@@ -30,7 +30,6 @@ use walkdir::WalkDir;
 
 use super::context::ContextBuilder;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 
 /// Normalize a file path to an absolute canonical form.
 /// - Resolves `~` to home directory

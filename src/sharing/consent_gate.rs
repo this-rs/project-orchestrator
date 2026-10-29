@@ -11,7 +11,6 @@ use crate::episodes::distill_models::{
     SharingPolicy,
 };
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::notes::models::Note;
 use std::collections::HashMap;
 use uuid::Uuid;

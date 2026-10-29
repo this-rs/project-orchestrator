@@ -35,7 +35,6 @@ use crate::neo4j::models::TaskStatus;
 use crate::neo4j::traits::GraphStore;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::reasoning::{ReasoningTree, ReasoningTreeConfig, ReasoningTreeEngine};
 
 // ============================================================================
@@ -646,10 +645,7 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
-
     // ── Config tests ────────────────────────────────────────────────────
-
     #[test]
     fn test_config_default() {
         let config = StatusInjectionConfig::default();

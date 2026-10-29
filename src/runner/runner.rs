@@ -31,7 +31,6 @@ use crate::runner::vector::VectorCollector;
 use crate::runner::verifier::TaskVerifier;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};

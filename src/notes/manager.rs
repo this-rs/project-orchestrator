@@ -14,7 +14,6 @@ use crate::meilisearch::SearchStore;
 use crate::neo4j::GraphStore;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::utils::reciprocal_rank_fusion;
 use anyhow::Result;
 use std::collections::HashMap;

@@ -8,7 +8,6 @@ use crate::neo4j::models::{StepNode as StepNodeModel, StepStatus};
 use crate::neo4j::GraphStore;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::notes::models::EntityType;
 use crate::notes::NoteManager;
 use crate::plan::models::CreatePlanRequest;

@@ -70,7 +70,6 @@ use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::GraphStore;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::refs::types::{EntityRef, RefKind};
 use crate::test_helpers::mock_app_state;
 

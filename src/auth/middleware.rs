@@ -532,7 +532,6 @@ mod tests {
     use crate::auth::jwt::{encode_jwt, Claims};
     use crate::events::EventBus;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::mock_app_state;
     use crate::AuthConfig;

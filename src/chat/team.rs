@@ -594,7 +594,6 @@ mod team2_tests {
 #[cfg(test)]
 mod tests {
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use std::sync::atomic::Ordering;
     use uuid::Uuid;
 

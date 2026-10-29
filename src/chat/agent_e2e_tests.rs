@@ -30,7 +30,6 @@ use super::provider::settings::{
 use super::types::{ChatEvent, ChatRequest};
 use crate::neo4j::mock::MockGraphStore;
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use crate::neo4j::GraphStore;
 use crate::test_helpers::mock_app_state;
 use crate::vault::grants::{GrantScope, SecretSelector};
@@ -1304,9 +1303,7 @@ mod cognitive_routing {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     struct NoBuiltin;
 
@@ -2676,9 +2673,7 @@ mod auto_on_a_locked_vault {
     use crate::chat::provider::resolver::ProviderChoice;
     use crate::neo4j::routing::Neo4jRoutingStore;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     const PASS: &str = "correct horse battery staple";
 
@@ -3018,7 +3013,6 @@ mod auto_on_a_locked_vault {
 /// with an answer, not how a scorer would choose.
 mod turn_routing {
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
 
@@ -3977,7 +3971,6 @@ mod provider_switch {
     use super::*;
     use crate::chat::types::SwitchProviderError;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn two_turn_script() -> Value {
         json!([
@@ -4861,9 +4854,7 @@ mod provider_switch {
         #[allow(unused_imports)]
         use crate::neo4j::traits::*;
         #[allow(unused_imports)]
-        use crate::neo4j::traits::*;
         #[allow(unused_imports)]
-        use crate::neo4j::traits::*;
         use std::collections::VecDeque;
         use std::sync::Mutex as StdMutex;
 
@@ -5653,7 +5644,6 @@ mod provider_switch {
 mod refs_native {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use crate::refs::compose::compose_user_message;
     use crate::refs::test_support::{world, World};
 
@@ -5838,7 +5828,6 @@ mod refs_native {
 
 mod parity {
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use std::sync::Mutex as StdMutex;
 
     use async_trait::async_trait;
@@ -7193,7 +7182,6 @@ mod parity {
 /// must give the CLI `--resume <that id>` — not open a blank conversation.
 mod claude_code_resume_token {
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use async_trait::async_trait;
     use nexus_claude::agent::{
         AgentProvider, AgentSession, Capabilities, ModelInfo, ProviderError, ProviderHealth,
@@ -7396,7 +7384,6 @@ mod claude_code_resume_token {
 mod legacy_conversation_after_the_switch {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     const CLI_SESSION: &str = "legacy-cli-session-1";
 
@@ -7560,9 +7547,7 @@ mod legacy_nats_permission {
     use crate::events::nats_broker_test::TestBroker;
     use crate::events::NatsEmitter;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn emit(v: Value) -> Value {
         json!({"op": "emit_json", "json": v})
@@ -7876,7 +7861,6 @@ mod legacy_nats_permission {
 /// of the Claude Code engine.
 mod cancel_tools {
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use nexus_claude::agent::{CancelScope, ProviderKind};
     use nexus_claude::testkit::scripted::steps;
     use nexus_claude::testkit::{RecordedCall, Step};
@@ -8244,7 +8228,6 @@ mod cancel_tools {
 /// model without vision refuses them on the wire, nothing sent.
 mod attached_images {
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
 
     use super::claude_code_resume_token::FakeCli;
@@ -8626,7 +8609,6 @@ mod attached_images {
     mod legacy_engine {
         use super::*;
         #[allow(unused_imports)]
-        use crate::neo4j::traits::*;
 
         struct LegacyCli {
             dir: tempfile::TempDir,
@@ -8964,7 +8946,6 @@ mod attached_images {
 mod legacy_session_record {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn turn(text: &str, cost: f64) -> [Value; 3] {
         [
@@ -9128,7 +9109,6 @@ mod legacy_session_record {
     mod stuck_after_result {
         use super::*;
         #[allow(unused_imports)]
-        use crate::neo4j::traits::*;
         use std::sync::atomic::Ordering;
 
         async fn is_streaming(manager: &ChatManager, sid: &str) -> bool {
@@ -9360,7 +9340,6 @@ mod legacy_session_record {
 mod native_transcripts {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn answer(key: &str) -> Value {
         sse_route(
@@ -9606,7 +9585,6 @@ mod native_transcripts {
 mod legacy_interrupt_stale_result {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn emit(v: Value) -> Value {
         json!({"op": "emit_json", "json": v})
@@ -9811,7 +9789,6 @@ mod legacy_interrupt_stale_result {
 mod legacy_oob_lag {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn emit(v: Value) -> Value {
         json!({"op": "emit_json", "json": v})
@@ -9988,7 +9965,6 @@ mod permission_scopes {
     use crate::chat::manager::PermissionDeliveryError;
     use crate::chat::types::PermissionAnswerScope;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn emit(v: Value) -> Value {
         json!({"op": "emit_json", "json": v})
@@ -11464,7 +11440,6 @@ mod permission_scopes {
 /// refusal, never a success.
 mod background_tasks {
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use nexus_claude::agent::{
         AgentEvent, BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ProviderError,
         ProviderKind,
@@ -12401,7 +12376,6 @@ mod background_tasks {
 mod native_session_record {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn answer(key: &str) -> Value {
         sse_route(
@@ -12510,7 +12484,6 @@ mod native_session_record {
 mod agent_lifecycle {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn configured(
         graph: Arc<MockGraphStore>,
@@ -12656,7 +12629,6 @@ mod post_turn {
     use super::parity::{caps, rig};
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use nexus_claude::agent::{AgentEvent, CompactionPhase, ProviderKind};
     use nexus_claude::testkit::scripted::steps;
     use nexus_claude::testkit::Step;
@@ -13074,7 +13046,6 @@ mod post_turn {
 mod compaction_loop {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     const SUMMARY_PROMPT: &str = "You are compacting the history";
     const TURNS: [&str; 5] = [
@@ -13207,7 +13178,6 @@ mod openclaw_delegation {
     use super::super::provider::settings::{process_origin, AcpCommand};
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     const INIT: &str = r#"{"op": "expect", "method": "initialize", "reply": {"protocolVersion": 1, "agentCapabilities": {"loadSession": true, "promptCapabilities": {"image": true, "audio": false, "embeddedContext": true}, "mcpCapabilities": {"http": false, "sse": false}}, "agentInfo": {"name": "openclaw-acp", "version": "2026.9.9"}, "authMethods": []}}"#;
 
@@ -13831,7 +13801,6 @@ mod codex_switch {
     use super::super::provider::settings::process_origin;
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     /// Shell wrapper around `fake_codex` that hard-codes `FAKE_CODEX_TRANSCRIPT`
     /// so the backend never touches the test's process environment.
@@ -14097,7 +14066,6 @@ mod native_subagents {
     use super::parity::{caps, Tapped};
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use nexus_claude::agent::{
         AgentEvent, AgentProvider, AgentSession, CancelOutcome, CancelScope, Capabilities,
         EventStream, InterruptOutcome, InterruptScope, ModelInfo, PermissionDecision, PolicyMode,
@@ -15563,7 +15531,6 @@ mod native_subagents {
 mod legacy_turn_end_at_boot {
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     fn emit(v: Value) -> Value {
         json!({"op": "emit_json", "json": v})
@@ -15853,7 +15820,6 @@ mod file_scope_lift {
     use super::*;
     use crate::chat::provider::nexus_tools as nt;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use nexus_claude::agent::{McpServerSpec, PolicyMode, ToolPolicy};
     use std::io::{BufRead, BufReader, Write};
     use std::process::Stdio;
@@ -15986,7 +15952,6 @@ mod file_scope_lift {
 /// (whose sub-agents are real children) gets no mirror; nothing can be sent to a mirror.
 mod claude_code_mirror {
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use nexus_claude::agent::{AgentEvent, ProviderKind};
     use nexus_claude::testkit::scripted::steps;
     use nexus_claude::testkit::Step;
@@ -16618,7 +16583,6 @@ mod claude_code_recovery_at_boot {
     use super::claude_code_resume_token::FakeCli;
     use super::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
 
     const CLI_SESSION: &str = "cli-session-recovered";
@@ -17130,7 +17094,6 @@ mod claude_code_recovery_at_boot {
 /// `<defunct>` left: `kill(pid, 0)` answers ESRCH), within 30 seconds.
 mod zombie_cli_real_kill {
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
     use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
 
     use super::claude_code_resume_token::FakeCli;

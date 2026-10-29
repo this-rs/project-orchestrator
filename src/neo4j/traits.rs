@@ -4649,7 +4649,6 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
 
     /// The ten capabilities the manifest exposes, in declaration order. A field
     /// added to `StoreCapabilities` without updating this list (or a field

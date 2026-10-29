@@ -13,7 +13,6 @@ use crate::episodes::collector;
 use crate::events::EventEmitter;
 
 #[allow(unused_imports)]
-use crate::neo4j::traits::*;
 use axum::{
     extract::{Query, State},
     Json,
