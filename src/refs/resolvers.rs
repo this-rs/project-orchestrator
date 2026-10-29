@@ -704,6 +704,7 @@ impl RefSource for GraphRefSource {
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::refs::access::{AccessPolicy, Disclosure, Resolution};
     use crate::refs::test_support::{note_with, task_titled, user, world, Spy, World};

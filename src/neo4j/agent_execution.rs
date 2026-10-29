@@ -874,6 +874,7 @@ impl Neo4jClient {
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use chrono::Utc;
 

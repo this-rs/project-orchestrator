@@ -819,6 +819,7 @@ impl Neo4jClient {
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::neo4j::batch::BATCH_SIZE;
     use crate::neo4j::mock::MockGraphStore;

@@ -13331,6 +13331,7 @@ use crate::neo4j::traits::*;
 
 #[cfg(test)]
 mod fabric_emit_tests {
+    use crate::neo4j::traits::*;
     use super::*;
 
     #[test]
@@ -13369,6 +13370,7 @@ fn transport_label(state: Option<crate::events::TransportState>) -> &'static str
 
 #[cfg(test)]
 mod transport_label_tests {
+    use crate::neo4j::traits::*;
     use super::transport_label;
     use crate::events::TransportState;
 

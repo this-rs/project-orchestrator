@@ -1238,6 +1238,7 @@ fn live_frame(
 /// Allows at most `MAX_BOOSTS_PER_MINUTE` reinforcement batches per minute
 /// to avoid runaway energy inflation during rapid conversations.
 mod chat_reinforcement_limiter {
+    use crate::neo4j::traits::*;
 
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 

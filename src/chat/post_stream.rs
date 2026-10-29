@@ -1651,6 +1651,7 @@ use crate::neo4j::traits::*;
 
 #[cfg(test)]
 mod integration_tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::types::PendingMessageKind;
     use crate::meilisearch::mock::MockSearchStore;
@@ -2376,6 +2377,7 @@ mod integration_tests {
 
 #[cfg(test)]
 mod bounded_step_tests {
+    use crate::neo4j::traits::*;
     use super::bounded;
     use std::time::Duration;
 

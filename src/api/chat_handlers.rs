@@ -6056,6 +6056,7 @@ fn switch_error(error: anyhow::Error, session_id: &str) -> AppError {
 
 #[cfg(test)]
 mod switch_provider_tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::types::SwitchProviderError;
 
@@ -6159,6 +6160,7 @@ pub(crate) fn cancel_error(error: anyhow::Error) -> AppError {
 
 #[cfg(test)]
 mod file_scope_lift_tests {
+    use crate::neo4j::traits::*;
     use super::person_lifts_file_scope;
     use crate::auth::jwt::{Claims, TOKEN_TYPE_AGENT_SESSION, TOKEN_TYPE_MCP};
     use crate::chat::envelope::SpawnCaller;

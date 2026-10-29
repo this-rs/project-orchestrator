@@ -311,6 +311,7 @@ fn snake_case_from_debug(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::lifecycle::{
         LifecycleActionType, LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest,

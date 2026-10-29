@@ -1292,6 +1292,7 @@ fn only_a_remote_machine_that_does_not_allow_it_holds_trust_back() {
 // choice does not depend on what is installed on the machine.
 
 mod cognitive_routing {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::agent_runtime::ProviderSource;
     use crate::chat::provider::cognitive::decider::CognitiveRouting;
@@ -2657,6 +2658,7 @@ use crate::neo4j::traits::*;
 /// Auto refused on a locked vault, through `resolve_provider_choice` with the router
 /// wired (review of #689, finding 5: the refusal had only pure-function tests).
 mod auto_on_a_locked_vault {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::agent_runtime::ProviderSource;
     use crate::chat::model_catalog::ModelCatalogCache;
@@ -3005,6 +3007,7 @@ mod auto_on_a_locked_vault {
 /// decider is a fake that answers by turn, so the tests pin WHAT the hook does
 /// with an answer, not how a scorer would choose.
 mod turn_routing {
+    use crate::neo4j::traits::*;
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
 
@@ -3960,6 +3963,7 @@ mod turn_routing {
 // closes, and a refusal leaves the old one untouched.
 
 mod provider_switch {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::types::SwitchProviderError;
 
@@ -4834,6 +4838,7 @@ mod provider_switch {
     // `moved_by: auto`, and the turn's message is answered by the new provider only.
 
     mod auto_move {
+        use crate::neo4j::traits::*;
         use super::*;
         use crate::chat::agent_hooks::PoolSource;
         use crate::chat::provider::cognitive::candidates::ModelFacts;
@@ -5630,6 +5635,7 @@ use crate::neo4j::traits::*;
 // the model there too, as pointers, against the real wire of the fake server.
 
 mod refs_native {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::refs::compose::compose_user_message;
     use crate::refs::test_support::{world, World};
@@ -5814,6 +5820,7 @@ mod refs_native {
 // ============================================================================
 
 mod parity {
+    use crate::neo4j::traits::*;
     use std::sync::Mutex as StdMutex;
 
     use async_trait::async_trait;
@@ -7167,6 +7174,7 @@ mod parity {
 /// open. The token must still reach the graph, and a session resumed after a restart
 /// must give the CLI `--resume <that id>` — not open a blank conversation.
 mod claude_code_resume_token {
+    use crate::neo4j::traits::*;
     use async_trait::async_trait;
     use nexus_claude::agent::{
         AgentProvider, AgentSession, Capabilities, ModelInfo, ProviderError, ProviderHealth,
@@ -7367,6 +7375,7 @@ mod claude_code_resume_token {
 /// the same CLI session (`--resume`), never handed to the agent engine. The CLI is
 /// `fake_claude`, one transcript per spawn.
 mod legacy_conversation_after_the_switch {
+    use crate::neo4j::traits::*;
     use super::*;
 
     const CLI_SESSION: &str = "legacy-cli-session-1";
@@ -7526,6 +7535,7 @@ mod legacy_conversation_after_the_switch {
 /// (NATS RPC) reaches the CLI as the same `control_response` as a local answer —
 /// subtype, request_id, behavior —, exactly once, while the turn waits for it.
 mod legacy_nats_permission {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::manager::{DeliveryRoute, PermissionDeliveryError};
     use crate::events::nats_broker_test::TestBroker;
@@ -7842,6 +7852,7 @@ mod legacy_nats_permission {
 /// `cancel_running_tools`), from another instance over NATS, and under the cap
 /// of the Claude Code engine.
 mod cancel_tools {
+    use crate::neo4j::traits::*;
     use nexus_claude::agent::{CancelScope, ProviderKind};
     use nexus_claude::testkit::scripted::steps;
     use nexus_claude::testkit::{RecordedCall, Step};
@@ -8208,6 +8219,7 @@ mod cancel_tools {
 /// `image_url` part), Claude Code (an `image` block on the CLI's stdin) — and a
 /// model without vision refuses them on the wire, nothing sent.
 mod attached_images {
+    use crate::neo4j::traits::*;
     use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
 
     use super::claude_code_resume_token::FakeCli;
@@ -8587,6 +8599,7 @@ mod attached_images {
     /// nexus' `fake_claude` behind a wrapper that plays `transcript` and records
     /// every line it reads on stdin.
     mod legacy_engine {
+        use crate::neo4j::traits::*;
         use super::*;
 
         struct LegacyCli {
@@ -8923,6 +8936,7 @@ mod attached_images {
 /// The session record of a conversation on the legacy Claude Code engine (P15): the
 /// counter of user messages survives every turn of the CLI.
 mod legacy_session_record {
+    use crate::neo4j::traits::*;
     use super::*;
 
     fn turn(text: &str, cost: f64) -> [Value; 3] {
@@ -9085,6 +9099,7 @@ mod legacy_session_record {
     /// 2026-10-09 (session b4c28b9f): the turn stayed "streaming" for hours and
     /// every Stop was delivered to nothing.
     mod stuck_after_result {
+        use crate::neo4j::traits::*;
         use super::*;
         use std::sync::atomic::Ordering;
 
@@ -9315,6 +9330,7 @@ mod legacy_session_record {
 /// names. Kept on disk (owner-only), the session resumes after a restart with its
 /// whole history; a deletion of the session removes it.
 mod native_transcripts {
+    use crate::neo4j::traits::*;
     use super::*;
 
     fn answer(key: &str) -> Value {
@@ -9559,6 +9575,7 @@ mod native_transcripts {
 /// once, its real answer arrived with no turn to read it, and every later turn was
 /// one `result` behind — the parity matrix saw it under CI load).
 mod legacy_interrupt_stale_result {
+    use crate::neo4j::traits::*;
     use super::*;
 
     fn emit(v: Value) -> Value {
@@ -9762,6 +9779,7 @@ mod legacy_interrupt_stale_result {
 /// turn was then one `result` behind. Seen by the parity matrix on main (cancel_tools
 /// and nats.cancel_tools, "tour poursuivi=false").
 mod legacy_oob_lag {
+    use crate::neo4j::traits::*;
     use super::*;
 
     fn emit(v: Value) -> Value {
@@ -9935,6 +9953,7 @@ mod legacy_oob_lag {
 /// to the provider as a rule. `always` (P11b): kept by the backend for a person and a project,
 /// never by the provider; refused, typed, elsewhere.
 mod permission_scopes {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::manager::PermissionDeliveryError;
     use crate::chat::types::PermissionAnswerScope;
@@ -11412,6 +11431,7 @@ mod permission_scopes {
 /// that cannot stop it (Claude Code over SSH: no `tool_cancel`) is a typed
 /// refusal, never a success.
 mod background_tasks {
+    use crate::neo4j::traits::*;
     use nexus_claude::agent::{
         AgentEvent, BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ProviderError,
         ProviderKind,
@@ -12346,6 +12366,7 @@ mod background_tasks {
 /// engine keeps its own (`chat::session_record`): before, it stayed at what the
 /// creation wrote (`message_count: 1`, no cost, no title) whatever the conversation did.
 mod native_session_record {
+    use crate::neo4j::traits::*;
     use super::*;
 
     fn answer(key: &str) -> Value {
@@ -12453,6 +12474,7 @@ mod native_session_record {
 /// count in `max_sessions` / `active_session_count`, and their retries follow
 /// `RetryConfig`. Before, they were invisible to all three.
 mod agent_lifecycle {
+    use crate::neo4j::traits::*;
     use super::*;
 
     fn configured(
@@ -12596,6 +12618,7 @@ mod agent_lifecycle {
 /// re-injected after a compaction, the objective reminder, and `cancel_task`
 /// refused, typed, instead of a silent success.
 mod post_turn {
+    use crate::neo4j::traits::*;
     use super::parity::{caps, rig};
     use super::*;
     use nexus_claude::agent::{AgentEvent, CompactionPhase, ProviderKind};
@@ -13013,6 +13036,7 @@ mod post_turn {
 /// turn compacts at most once. Nexus may still compact between the tool steps of
 /// one turn: that is its own policy, not bounded here.
 mod compaction_loop {
+    use crate::neo4j::traits::*;
     use super::*;
 
     const SUMMARY_PROMPT: &str = "You are compacting the history";
@@ -13143,6 +13167,7 @@ mod compaction_loop {
 /// process environment (`with_acp_commands`), nothing is written in the user's real
 /// data directory.
 mod openclaw_delegation {
+    use crate::neo4j::traits::*;
     use super::super::provider::settings::{process_origin, AcpCommand};
     use super::*;
 
@@ -13765,6 +13790,7 @@ mod openclaw_delegation {
 /// parity scenario; every other Codex cell in the matrix that needs a dedicated
 /// transcript is declared `not_measured` in EXPECTED (ISO4).
 mod codex_switch {
+    use crate::neo4j::traits::*;
     use super::super::provider::settings::process_origin;
     use super::*;
 
@@ -14029,6 +14055,7 @@ mod codex_switch {
 // under parallel calls, the child closed whatever the end. Scripted provider, no fakes.
 // ============================================================================
 mod native_subagents {
+    use crate::neo4j::traits::*;
     use super::parity::{caps, Tapped};
     use super::*;
     use nexus_claude::agent::{
@@ -15494,6 +15521,7 @@ mod native_subagents {
 /// not look cut, or the recovery closes an idle session with a false "the server
 /// restarted".
 mod legacy_turn_end_at_boot {
+    use crate::neo4j::traits::*;
     use super::*;
 
     fn emit(v: Value) -> Value {
@@ -15781,6 +15809,7 @@ mod legacy_turn_end_at_boot {
 /// directories but never into a denied place; the launch line of a session nobody lifted
 /// stays scoped.
 mod file_scope_lift {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::provider::nexus_tools as nt;
     use nexus_claude::agent::{McpServerSpec, PolicyMode, ToolPolicy};
@@ -15914,6 +15943,7 @@ mod file_scope_lift {
 /// read-only child (`chat::mirror`), the parent's thread left as it was; a native session
 /// (whose sub-agents are real children) gets no mirror; nothing can be sent to a mirror.
 mod claude_code_mirror {
+    use crate::neo4j::traits::*;
     use nexus_claude::agent::{AgentEvent, ProviderKind};
     use nexus_claude::testkit::scripted::steps;
     use nexus_claude::testkit::Step;
@@ -16542,6 +16572,7 @@ mod claude_code_mirror {
 /// or when the CLI is gone or refuses the conversation, it is closed with an `error` event.
 /// The CLI is nexus' `fake_claude`; the restart is a second manager over the same graph.
 mod claude_code_recovery_at_boot {
+    use crate::neo4j::traits::*;
     use super::claude_code_resume_token::FakeCli;
     use super::*;
     use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
@@ -17054,6 +17085,7 @@ mod claude_code_recovery_at_boot {
 /// closes the session with `process_died`; the killed process must then be REAPED (no
 /// `<defunct>` left: `kill(pid, 0)` answers ESRCH), within 30 seconds.
 mod zombie_cli_real_kill {
+    use crate::neo4j::traits::*;
     use nexus_claude::providers::claude_code::{ClaudeCodeConfig, ClaudeCodeProvider};
 
     use super::claude_code_resume_token::FakeCli;

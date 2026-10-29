@@ -2131,6 +2131,7 @@ use crate::neo4j::traits::*;
 
 #[cfg(test)]
 mod listed_models_tests {
+    use crate::neo4j::traits::*;
     use super::merge_listed_models;
 
     fn v(xs: &[&str]) -> Vec<String> {
@@ -2161,6 +2162,7 @@ mod listed_models_tests {
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};

@@ -199,6 +199,7 @@ fn child_env_inherit_names() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::agent_runtime::fake::FakeProvider;
     use crate::chat::provider::settings::{

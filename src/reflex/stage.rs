@@ -144,6 +144,7 @@ fn extract_file_paths(message: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::enrichment::{EnrichmentContext, ParallelEnrichmentStage};
     use std::collections::HashSet;

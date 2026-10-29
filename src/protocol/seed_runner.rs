@@ -1118,6 +1118,7 @@ flag for human attention via a high-importance gotcha note.",
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use super::*;
 
     #[test]

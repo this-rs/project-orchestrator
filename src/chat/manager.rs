@@ -19681,6 +19681,7 @@ pub(crate) fn is_runner_spawned(spawned_by: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod runner_spawn_tests {
+    use crate::neo4j::traits::*;
     use super::is_runner_spawned;
 
     #[test]
@@ -19703,6 +19704,7 @@ mod runner_spawn_tests {
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use super::*;
 
     /// The review of #688 at 60a277e7 (finding D): a provider kind that does not
@@ -36844,6 +36846,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod agent_env_tests {
+    use crate::neo4j::traits::*;
     use super::server_secrets_to_hide;
 
     #[test]
@@ -36888,6 +36891,7 @@ mod agent_env_tests {
 /// a turn whose message carries `#` references (H3 enrichment + refs_v1).
 #[cfg(test)]
 mod refs_turn_services_tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::agent_runtime::TurnServices;
     use crate::chat::enrichment::{
@@ -36982,6 +36986,7 @@ mod refs_turn_services_tests {
 
 #[cfg(test)]
 mod auto_open_bounds_tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::provider::cognitive::ProviderRoutingMode;
     use crate::chat::provider::resolver::REMOTE_PREFIX;
@@ -37327,6 +37332,7 @@ mod auto_open_bounds_tests {
 /// slow re-injection lost the memory and the feedback too).
 #[cfg(test)]
 mod agent_step_budget_tests {
+    use crate::neo4j::traits::*;
     use super::*;
 
     #[tokio::test]
@@ -37362,6 +37368,7 @@ mod agent_step_budget_tests {
 /// window; and the end-of-turn steps each under their own budget.
 #[cfg(test)]
 mod held_context_tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::agent_runtime::{TurnOutcome, TurnServices};
 
@@ -37883,6 +37890,7 @@ mod held_context_tests {
 /// reads it. Played with the REAL services and the real decision.
 #[cfg(test)]
 mod image_turn_services_tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::agent_hooks::{PoolSource, TurnRouter, TurnRouterSpec, TurnRouting};
     use crate::chat::agent_runtime::TurnServices;
@@ -38096,6 +38104,7 @@ pub(crate) mod answer_probe {
 /// the rest of the answer (the lasting rule's write) is done (FLAKY-PARITE-ALWAYS).
 #[cfg(test)]
 mod grant_before_the_cli_tests {
+    use crate::neo4j::traits::*;
     use super::super::lasting_rules::{LastingRuleStore, LastingScope};
     use super::super::session_grants::{cover, AskedCall, Asker, Cover, SessionGrants};
     use super::super::types::PermissionAnswerScope;
@@ -38301,6 +38310,7 @@ mod grant_before_the_cli_tests {
 /// like an answer of the user (Claude Code engine).
 #[cfg(test)]
 mod granted_answer_clock_tests {
+    use crate::neo4j::traits::*;
     use super::super::session_grants::{AskedCall, Asker, SessionGrants};
     use super::super::tool_clock::ToolClock;
     use super::*;

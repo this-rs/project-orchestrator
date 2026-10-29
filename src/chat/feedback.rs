@@ -1521,6 +1521,7 @@ use crate::neo4j::traits::*;
 
 #[cfg(test)]
 mod cited_tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::refs::test_support::world;
 

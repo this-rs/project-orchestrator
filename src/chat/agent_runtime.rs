@@ -3918,6 +3918,7 @@ use crate::neo4j::traits::*;
 /// session meanwhile.
 #[cfg(test)]
 mod turn_race_tests {
+    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
     use std::sync::atomic::AtomicBool as StdAtomicBool;
@@ -4039,6 +4040,7 @@ mod turn_race_tests {
 /// racing for one session).
 #[cfg(test)]
 mod adopt_tests {
+    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
 
@@ -4943,6 +4945,7 @@ mod adopt_tests {
 
 #[cfg(test)]
 mod image_tests {
+    use crate::neo4j::traits::*;
     use super::*;
 
     #[test]
@@ -5152,6 +5155,7 @@ mod image_tests {
 /// of the Claude Code engine (`chat::session_record`).
 #[cfg(test)]
 mod session_record_tests {
+    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
@@ -5493,6 +5497,7 @@ mod session_record_tests {
 /// constant of its own.
 #[cfg(test)]
 mod retry_config_tests {
+    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
 
@@ -5576,6 +5581,7 @@ mod retry_config_tests {
 /// the instance answers — without replaying anything the turn had already run.
 #[cfg(test)]
 mod outage_hold_tests {
+    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
 
@@ -5768,6 +5774,7 @@ mod outage_hold_tests {
 /// `after_turn` sees what the turn did, its events go out and its hints are played.
 #[cfg(test)]
 mod after_turn_tests {
+    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
     use std::sync::Mutex as StdMutex;
@@ -6130,6 +6137,7 @@ mod after_turn_tests {
 
 #[cfg(test)]
 mod retry_stop_tests {
+    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
 
@@ -6207,6 +6215,7 @@ mod retry_stop_tests {
 /// re-failing on a dead process.
 #[cfg(test)]
 mod process_exit_tests {
+    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
 
@@ -6268,6 +6277,7 @@ mod process_exit_tests {
 /// retries ran out, not one stopped during the pause before a retry.
 #[cfg(test)]
 mod answered_tests {
+    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
     use std::sync::Mutex as StdMutex;
@@ -7185,6 +7195,7 @@ use crate::neo4j::traits::*;
 /// keeps the provider's form (the runner and the sub-agents read `is_error` there).
 #[cfg(test)]
 mod stored_interrupted_result_tests {
+    use crate::neo4j::traits::*;
     use super::fake::FakeProvider;
     use super::*;
     use crate::neo4j::mock::MockGraphStore;

@@ -1884,6 +1884,7 @@ use crate::neo4j::traits::*;
 }
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::notes::models::{NoteImportance, NoteScope, NoteStatus, NoteType};
     use crate::skills::models::{SkillNode, SkillStatus, SkillTrigger};

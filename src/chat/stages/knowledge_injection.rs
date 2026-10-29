@@ -3638,6 +3638,7 @@ use crate::neo4j::traits::*;
 /// from being injected twice or where it has no business.
 #[cfg(test)]
 mod pinned_settings_tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::enrichment::ParallelEnrichmentStage;
     use crate::neo4j::mock::MockGraphStore;

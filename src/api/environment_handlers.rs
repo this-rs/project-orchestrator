@@ -424,6 +424,7 @@ pub async fn get_deployment_matrix(
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;

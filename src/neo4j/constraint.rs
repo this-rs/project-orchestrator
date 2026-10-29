@@ -224,6 +224,7 @@ impl Neo4jClient {
 
 #[cfg(test)]
 mod parent_existence_tests {
+    use crate::neo4j::traits::*;
     use super::super::models::{ConstraintNode, ConstraintType};
     use super::super::traits::GraphStore;
     use crate::neo4j::mock::MockGraphStore;

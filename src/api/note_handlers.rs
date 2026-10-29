@@ -3136,6 +3136,7 @@ use crate::neo4j::traits::*;
 
 #[cfg(test)]
 mod human_confirmation_tests {
+    use crate::neo4j::traits::*;
     use super::confirmed_by_a_person;
     use crate::auth::jwt::{Claims, TOKEN_TYPE_AGENT_SESSION, TOKEN_TYPE_MCP};
 

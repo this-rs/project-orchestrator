@@ -915,6 +915,7 @@ pub async fn execute_evolution(
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use super::*;
 
     fn make_candidate(id: u32, members: Vec<&str>) -> SkillCandidate {

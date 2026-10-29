@@ -591,6 +591,7 @@ use crate::neo4j::traits::*;
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use std::sync::atomic::Ordering;
     use uuid::Uuid;
 

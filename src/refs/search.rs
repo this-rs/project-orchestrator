@@ -827,6 +827,7 @@ use crate::neo4j::traits::*;
 
 #[cfg(test)]
 mod fan_out_tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::refs::resolvers::Candidates;
     use crate::refs::test_support::{user, world};
@@ -970,6 +971,7 @@ mod fan_out_tests {
 
 #[cfg(test)]
 mod pushdown_tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::refs::test_support::{note_with, user, world};
 

@@ -364,6 +364,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use super::*;
 
     #[tokio::test]
@@ -391,6 +392,7 @@ mod tests {
     /// B-R3: the manager's pool takes Claude Code's models from the live Anthropic
     /// catalog, each with the window the Models API reports (`max_input_tokens`).
     mod claude_code_window {
+        use crate::neo4j::traits::*;
         use super::*;
         use crate::chat::model_catalog::{refreshed_cache_for_test, ModelCatalogCache};
         use crate::chat::provider::cognitive::candidates::{

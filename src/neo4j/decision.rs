@@ -1009,6 +1009,7 @@ impl Neo4jClient {
 
 #[cfg(test)]
 mod parent_existence_tests {
+    use crate::neo4j::traits::*;
     use super::super::models::{DecisionNode, DecisionStatus};
     use super::super::traits::GraphStore;
     use crate::neo4j::mock::MockGraphStore;
@@ -1086,6 +1087,7 @@ mod parent_existence_tests {
 
 #[cfg(test)]
 mod injection_tests {
+    use crate::neo4j::traits::*;
     use super::safe_entity_label;
 
     #[test]

@@ -2251,6 +2251,7 @@ impl Neo4jClient {
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::*;
     use crate::neo4j::traits::GraphStore;

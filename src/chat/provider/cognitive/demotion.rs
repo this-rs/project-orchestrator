@@ -232,6 +232,7 @@ async fn leave_note(
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::chat::provider::cognitive::decision::{DecisionOutcome, Pick};
     use crate::chat::provider::cognitive::mode::ProviderRoutingMode;

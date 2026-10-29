@@ -135,6 +135,7 @@ pub trait GraphStore:
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use super::StoreCapabilities;
 
     /// The ten capabilities the manifest exposes, in declaration order. A field

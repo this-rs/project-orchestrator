@@ -345,6 +345,7 @@ fn sanitize_paths(content: &str, project_root: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::neo4j::traits::*;
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
 

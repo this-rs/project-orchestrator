@@ -1414,6 +1414,7 @@ pub async fn collect_transverse_graph(
 
 #[cfg(test)]
 mod transverse_graph_tests {
+    use crate::neo4j::traits::*;
     //! The transverse layer is the answer to "what belongs to no project, and
     //! where has it been used". Both halves are pinned here: the shape (real
     //! node types, every node marked global, carriers carrying their count) and
@@ -1504,6 +1505,7 @@ use crate::neo4j::traits::*;
 
 #[cfg(test)]
 mod knowledge_layer_tests {
+    use crate::neo4j::traits::*;
     //! The knowledge layer used to stop at 50 notes whatever `limit` said:
     //! `NoteFilters::limit` was left empty, so `list_notes` applied its own
     //! default and the caller's limit never applied. A project with 60 notes
