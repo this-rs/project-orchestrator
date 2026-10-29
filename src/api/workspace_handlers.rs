@@ -1672,6 +1672,10 @@ pub async fn get_workspace_graph(
 
     let requested_layers = parse_layers(&params.layers);
     let limit = params.limit.unwrap_or(5000);
+    let live: Vec<_> = match state.chat_manager.as_ref() {
+        Some(cm) => cm.live_session_snapshot().await.live.into_iter().collect(),
+        None => Vec::new(),
+    };
 
     // Build graph data for each project in parallel
     let graph_futures: Vec<_> = projects
@@ -1681,9 +1685,10 @@ pub async fn get_workspace_graph(
             let layers = requested_layers.clone();
             let community = params.community;
             let project = project.clone();
+            let live = live.clone();
             async move {
                 let result = super::graph_types::build_project_graph_data(
-                    &*neo4j, &project, &layers, limit, community,
+                    &*neo4j, &project, &layers, limit, community, &live,
                 )
                 .await;
                 (project, result)
