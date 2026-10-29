@@ -1078,6 +1078,14 @@ pub struct LiveAgent {
     pub skills: Vec<crate::chat::activation_registry::ActivatedRef>,
     /// Personas injected into this session so far (most recent first, at most 8).
     pub personas: Vec<crate::chat::activation_registry::ActivatedRef>,
+    /// Tasks this session is associated with (`ASSOCIATED_WITH`, set when the agent
+    /// moves a task to `in_progress`). A chat agent has no `task_id` from its origin;
+    /// this is how it is tied to the work it declared. Several are possible over a
+    /// session's life: the client keeps the one still `in_progress`.
+    pub associated_task_ids: Vec<String>,
+    /// Plans this session is associated with (directly, or as the plan of an
+    /// associated task).
+    pub associated_plan_ids: Vec<String>,
 }
 
 /// How many background subprocesses a live session currently owns.
@@ -1122,6 +1130,38 @@ pub async fn build_live_agents(
     snap: &crate::chat::manager::LiveSessionSnapshot,
 ) -> LiveAgentsResponse {
     let mut agents = Vec::with_capacity(snap.live.len());
+    // ONE grouped read of the stored links of every live session (never one per session).
+    let live_ids: Vec<Uuid> = snap.live.iter().copied().collect();
+    let mut assoc: HashMap<Uuid, (Vec<String>, Vec<String>)> = HashMap::new();
+    for row in store
+        .get_session_link_rows(&live_ids)
+        .await
+        .unwrap_or_default()
+    {
+        let e = assoc.entry(row.session_id).or_default();
+        match row.kind {
+            crate::neo4j::models::SessionLinkKind::TaskAssociation => {
+                if let Some(t) = row.task_id {
+                    e.0.push(t.to_string());
+                }
+                if let Some(p) = row.thread_plan_id {
+                    e.1.push(p.to_string());
+                }
+            }
+            crate::neo4j::models::SessionLinkKind::PlanAssociation => {
+                if let Some(p) = row.plan_id {
+                    e.1.push(p.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    for v in assoc.values_mut() {
+        v.0.sort();
+        v.0.dedup();
+        v.1.sort();
+        v.1.dedup();
+    }
     for id in &snap.live {
         let node = store.get_chat_session(*id).await.ok().flatten();
         let pending = snap.pending_permissions.get(id).map_or(0, |p| p.len());
@@ -1160,6 +1200,8 @@ pub async fn build_live_agents(
             idle_secs: (now - updated_at).num_seconds().max(0),
             message_count: node.as_ref().map_or(0, |n| n.message_count),
             total_cost_usd: node.as_ref().and_then(|n| n.total_cost_usd),
+            associated_task_ids: assoc.get(id).map(|a| a.0.clone()).unwrap_or_default(),
+            associated_plan_ids: assoc.get(id).map(|a| a.1.clone()).unwrap_or_default(),
             background_tasks: snap
                 .background_tasks
                 .get(id)
@@ -2198,6 +2240,58 @@ mod tests {
             .find(|a| a.session_id == id.to_string())
             .expect("listed");
         assert!(a.skills.is_empty() && a.personas.is_empty());
+    }
+
+    /// A chat agent that moved a task to `in_progress` is tied to it by
+    /// `ASSOCIATED_WITH` — the view carries it, read for ALL live sessions in one go.
+    #[tokio::test]
+    async fn live_agent_carries_its_associated_tasks_and_plans_in_one_read() {
+        use crate::neo4j::models::{SessionLinkKind, SessionLinkRow};
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (t1, p1, p2) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let store = live_store(vec![]).await;
+        {
+            let mut rows = store.session_link_rows.write().await;
+            rows.push(SessionLinkRow {
+                session_id: a,
+                kind: SessionLinkKind::TaskAssociation,
+                run_id: None,
+                task_id: Some(t1),
+                plan_id: None,
+                thread_plan_id: Some(p1),
+            });
+            rows.push(SessionLinkRow {
+                session_id: a,
+                kind: SessionLinkKind::PlanAssociation,
+                run_id: None,
+                task_id: None,
+                plan_id: Some(p2),
+                thread_plan_id: Some(p2),
+            });
+        }
+        let r = build_live_agents(&store, now(), &snapshot(&[a, b], &[], &[])).await;
+        let ga = r
+            .agents
+            .iter()
+            .find(|x| x.session_id == a.to_string())
+            .expect("a");
+        let gb = r
+            .agents
+            .iter()
+            .find(|x| x.session_id == b.to_string())
+            .expect("b");
+        assert_eq!(ga.associated_task_ids, vec![t1.to_string()]);
+        let mut want = vec![p1.to_string(), p2.to_string()];
+        want.sort();
+        assert_eq!(ga.associated_plan_ids, want);
+        assert!(gb.associated_task_ids.is_empty() && gb.associated_plan_ids.is_empty());
+        assert_eq!(
+            store
+                .session_link_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one grouped read, never one per session"
+        );
     }
 
     #[tokio::test]
