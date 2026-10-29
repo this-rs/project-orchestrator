@@ -4005,85 +4005,6 @@ pub trait AnalyticsStore: Send + Sync {
     ) -> Result<Option<crate::graph::neighborhood::ScopedNeighborhood>>;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::StoreCapabilities;
-    #[allow(unused_imports)]
-    use crate::neo4j::traits::*;
-    /// The ten capabilities the manifest exposes, in declaration order. A field
-    /// added to `StoreCapabilities` without updating this list (or a field
-    /// renamed) is caught by `capabilities_manifest_serializes_all_keys`.
-    const EXPECTED_KEYS: [&str; 10] = [
-        "vector_search",
-        "vector_filter",
-        "unique_constraints",
-        "composite_unique",
-        "variable_length_paths",
-        "shortest_path",
-        "subqueries",
-        "datetime_arithmetic",
-        "relationship_property_index",
-        "explicit_transactions",
-    ];
-
-    #[test]
-    fn capabilities_manifest_serializes_all_keys() {
-        let json = serde_json::to_value(StoreCapabilities::default()).expect("serialize");
-        let obj = json.as_object().expect("object");
-        assert_eq!(
-            obj.len(),
-            EXPECTED_KEYS.len(),
-            "manifest key set changed (added or removed a capability): {:?}",
-            obj.keys().collect::<Vec<_>>()
-        );
-        for key in EXPECTED_KEYS {
-            assert!(obj.contains_key(key), "missing manifest key `{key}`");
-        }
-    }
-
-    #[test]
-    fn neo4j_adapter_declares_core_capabilities() {
-        let caps = crate::neo4j::client::Neo4jClient::storage_capabilities();
-        assert!(caps.unique_constraints, "unique_constraints must be true");
-        assert!(caps.vector_search, "vector_search must be true");
-        assert!(
-            caps.variable_length_paths,
-            "variable_length_paths must be true"
-        );
-    }
-
-    #[test]
-    fn default_is_conservative_and_exhaustive() {
-        let default = StoreCapabilities::default();
-        // Exhaustive literal: a field added to `StoreCapabilities` without being
-        // listed here (and in the `Default` impl) fails to compile, so a
-        // capability can never slip in with a silent implicit value.
-        let exhaustive = StoreCapabilities {
-            vector_search: false,
-            vector_filter: false,
-            unique_constraints: false,
-            composite_unique: false,
-            variable_length_paths: false,
-            shortest_path: false,
-            subqueries: false,
-            datetime_arithmetic: false,
-            relationship_property_index: false,
-            explicit_transactions: false,
-        };
-        assert_eq!(
-            default, exhaustive,
-            "Default must list every capability explicitly"
-        );
-        // The conservative default advertises nothing at all.
-        for key in EXPECTED_KEYS {
-            let v = serde_json::to_value(default).expect("serialize")[key]
-                .as_bool()
-                .expect("bool");
-            assert!(!v, "default capability `{key}` must be false");
-        }
-    }
-}
-
 // ============================================================================
 // Chat domain
 // ============================================================================
@@ -4746,4 +4667,83 @@ pub trait AuthStore: Send + Sync {
     /// Permanently remove a user's dead MCP token records (revoked or
     /// expired). Never removes an active token. Returns the count removed.
     async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StoreCapabilities;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    /// The ten capabilities the manifest exposes, in declaration order. A field
+    /// added to `StoreCapabilities` without updating this list (or a field
+    /// renamed) is caught by `capabilities_manifest_serializes_all_keys`.
+    const EXPECTED_KEYS: [&str; 10] = [
+        "vector_search",
+        "vector_filter",
+        "unique_constraints",
+        "composite_unique",
+        "variable_length_paths",
+        "shortest_path",
+        "subqueries",
+        "datetime_arithmetic",
+        "relationship_property_index",
+        "explicit_transactions",
+    ];
+
+    #[test]
+    fn capabilities_manifest_serializes_all_keys() {
+        let json = serde_json::to_value(StoreCapabilities::default()).expect("serialize");
+        let obj = json.as_object().expect("object");
+        assert_eq!(
+            obj.len(),
+            EXPECTED_KEYS.len(),
+            "manifest key set changed (added or removed a capability): {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        for key in EXPECTED_KEYS {
+            assert!(obj.contains_key(key), "missing manifest key `{key}`");
+        }
+    }
+
+    #[test]
+    fn neo4j_adapter_declares_core_capabilities() {
+        let caps = crate::neo4j::client::Neo4jClient::storage_capabilities();
+        assert!(caps.unique_constraints, "unique_constraints must be true");
+        assert!(caps.vector_search, "vector_search must be true");
+        assert!(
+            caps.variable_length_paths,
+            "variable_length_paths must be true"
+        );
+    }
+
+    #[test]
+    fn default_is_conservative_and_exhaustive() {
+        let default = StoreCapabilities::default();
+        // Exhaustive literal: a field added to `StoreCapabilities` without being
+        // listed here (and in the `Default` impl) fails to compile, so a
+        // capability can never slip in with a silent implicit value.
+        let exhaustive = StoreCapabilities {
+            vector_search: false,
+            vector_filter: false,
+            unique_constraints: false,
+            composite_unique: false,
+            variable_length_paths: false,
+            shortest_path: false,
+            subqueries: false,
+            datetime_arithmetic: false,
+            relationship_property_index: false,
+            explicit_transactions: false,
+        };
+        assert_eq!(
+            default, exhaustive,
+            "Default must list every capability explicitly"
+        );
+        // The conservative default advertises nothing at all.
+        for key in EXPECTED_KEYS {
+            let v = serde_json::to_value(default).expect("serialize")[key]
+                .as_bool()
+                .expect("bool");
+            assert!(!v, "default capability `{key}` must be false");
+        }
+    }
 }
