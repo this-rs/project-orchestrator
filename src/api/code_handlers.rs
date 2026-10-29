@@ -17,8 +17,7 @@ use crate::graph::algorithms::into_ranked;
 use crate::graph::models::{FusionWeights, MultiSignalImpact, MultiSignalScore, RankedList};
 use crate::neo4j::models::{ConnectedFileNode, DecisionNode};
 use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
+    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, ProjectStore, WorkspaceStore,
 };
 
 // ============================================================================

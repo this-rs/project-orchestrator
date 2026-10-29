@@ -4,10 +4,7 @@
 //! firings in Neo4j. `runner::dispatch::TriggerDispatcher` starts the run.
 
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::AnalyticsStore;
 use crate::runner::models::{Trigger, TriggerFiring, TriggerSource, TriggerType};
 use anyhow::Result;
 use chrono::Utc;

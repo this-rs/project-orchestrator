@@ -37,10 +37,7 @@ use crate::chat::place_confirmation::{
 use crate::neo4j::models::{ExecutionPlaceEvent, ExecutionPlaceEventKind};
 use crate::neo4j::GraphStore;
 
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::AnalyticsStore;
 use crate::runner::ephemeral_worktree::{self, EphemeralWorktree, PlannedWorktree, ReleaseOutcome};
 
 /// The value of `execution_place` that asks for an ephemeral worktree.

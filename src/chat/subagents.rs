@@ -101,10 +101,7 @@ use super::provider::cognitive::signature::TaskClass;
 use super::provider::policy::SessionAccess;
 use super::session_pool::{WarmFacts, WarmKey};
 use super::types::{ChatEvent, ChatRequest, SpawnedBy};
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::AnalyticsStore;
 
 // ── Sub-agent type registry (ISO2) ──────────────────────────────────────────
 

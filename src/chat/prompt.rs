@@ -1835,8 +1835,7 @@ use crate::neo4j::models::{
 use crate::neo4j::GraphStore;
 
 use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
+    AnalyticsStore, CodeStore, NoteStore, PlanStore, ProjectStore, ReleaseStore, WorkspaceStore,
 };
 use crate::notes::models::{Note, NoteFilters, NoteImportance, NoteStatus, NoteType};
 

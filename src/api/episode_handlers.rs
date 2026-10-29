@@ -10,10 +10,7 @@ use crate::api::handlers::{AppError, OrchestratorState};
 use crate::episodes::collector;
 use crate::events::EventEmitter;
 
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::{AnalyticsStore, CommitStore, ProjectStore};
 use axum::{
     extract::{Query, State},
     Json,

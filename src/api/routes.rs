@@ -40,10 +40,6 @@ use super::ws_chat_handler;
 use super::ws_handlers;
 use super::ws_run_handler;
 use crate::auth::middleware::require_auth;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 use axum::extract::DefaultBodyLimit;
 use axum::http::{header, Method};
 use axum::{

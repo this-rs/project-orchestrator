@@ -27,10 +27,7 @@ use super::{load_routing, stored_routing, ROUTING_KEY};
 use crate::chat::provider::settings::{project_scope, GLOBAL};
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
 use crate::neo4j::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::{AnalyticsStore, NoteStore, ProjectStore};
 use crate::notes::{Note, NoteImportance, NoteType};
 
 /// How far below the baseline the applied mean must fall to demote.

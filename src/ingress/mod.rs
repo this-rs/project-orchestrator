@@ -5,10 +5,7 @@
 //! l'authentification ne sont comptés qu'en mémoire (`guard`). Ce module ne
 //! contient aucun secret (la règle ne porte qu'une référence `vault:<nom>`) et ne
 //! journalise jamais le corps de la requête.
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::AnalyticsStore;
 
 pub mod guard;
 pub mod model;

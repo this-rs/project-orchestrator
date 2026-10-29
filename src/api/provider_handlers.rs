@@ -31,11 +31,8 @@ use crate::chat::provider::settings::{
     ModelPolicy, RoleAssignments, SettingsError, ALIASES_KEY, CONSENT_PREFIX, GLOBAL,
     INSTANCE_PREFIX, POLICY_KEY, ROLES_KEY,
 };
+use crate::neo4j::AnalyticsStore;
 use crate::neo4j::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 use std::sync::Arc;
 
 pub(crate) fn require_human(state: &OrchestratorState, claims: &Claims) -> Result<(), AppError> {

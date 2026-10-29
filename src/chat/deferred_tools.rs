@@ -36,11 +36,8 @@ use serde::{Deserialize, Serialize};
 
 use super::manager::ChatManager;
 use super::provider::settings::GLOBAL;
+use crate::neo4j::AnalyticsStore;
 use crate::neo4j::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 
 /// Key of the stored document, under the [`GLOBAL`] scope.
 pub const DEFERRED_TOOLS_KEY: &str = "deferred_tools";

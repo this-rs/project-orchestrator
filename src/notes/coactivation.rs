@@ -14,10 +14,7 @@ use uuid::Uuid;
 
 use super::models::Note;
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::{AnalyticsStore, NoteStore, ProjectStore};
 
 /// Note ids grouped by owning project. Duplicates are merged; notes without a
 /// `project_id` belong to no group (they cannot be reinforced).

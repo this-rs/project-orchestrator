@@ -9,10 +9,7 @@ use uuid::Uuid;
 
 use crate::graph::models::TopologySeverity;
 use crate::neo4j::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::{AnalyticsStore, NoteStore};
 use crate::notes::models::{Note, NoteFilters, NoteImportance, NoteType};
 
 /// Result of a post-sync topology check.

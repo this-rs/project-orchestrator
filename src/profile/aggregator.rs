@@ -18,10 +18,7 @@ use super::collector::SignalReceiver;
 use super::signals::BehaviorSignal;
 use super::UserProfile;
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::AnalyticsStore;
 
 /// EMA smoothing factor — controls adaptation speed.
 /// 0.3 = moderate adaptation (balances stability and responsiveness).

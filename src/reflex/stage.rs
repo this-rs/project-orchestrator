@@ -14,10 +14,6 @@ use crate::chat::enrichment::{
     EnrichmentConfig, EnrichmentInput, ParallelEnrichmentStage, StageOutput,
 };
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 
 /// Enrichment stage that injects reflex suggestions (co-change, episode recall, scar warnings).
 pub struct ReflexStage {

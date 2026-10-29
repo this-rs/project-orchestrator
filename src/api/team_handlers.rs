@@ -16,10 +16,6 @@ use crate::chat::envelope::{self, SpawnCaller};
 use crate::chat::team::{
     render_team_message, resolve_targets, team_of, Team, TeamMember, TeamMessageKind,
 };
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 
 /// Body of `POST /api/chat/team/message`.
 #[derive(Debug, Clone, Deserialize)]

@@ -26,10 +26,7 @@ use super::enrichment::{CommunityEnricher, NoopCommunityEnricher};
 use super::extraction::GraphExtractor;
 use super::models::{AnalyticsConfig, FabricWeights, GraphAnalytics};
 use super::writer::AnalyticsWriter;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::AnalyticsStore;
 
 // ============================================================================
 // Output type

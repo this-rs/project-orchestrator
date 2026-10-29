@@ -10,10 +10,7 @@
 //! **NEVER block tool execution.** Any error → passthrough (continue_: true).
 
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::AnalyticsStore;
 use crate::neurons::AutoReinforcementConfig;
 use crate::skills::hook_extractor::{
     enrich_redirect_with_context_card, extract_file_context, generate_redirect_suggestion,

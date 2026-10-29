@@ -18,10 +18,7 @@ use crate::api::handlers::ServerState;
 use crate::events::{CrudEvent, EntityType};
 use crate::lifecycle::models::{LifecycleActionType, LifecycleHook, LifecycleScope};
 use crate::neo4j::models::{AlertNode, AlertSeverity};
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::{AnalyticsStore, NoteStore, PlanStore};
 use crate::notes::{Note, NoteImportance, NoteType};
 
 /// Map [`CrudEvent`] [`EntityType`] to [`LifecycleScope`].

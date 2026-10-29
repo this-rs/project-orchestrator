@@ -40,10 +40,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::manager::ChatManager;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::AnalyticsStore;
 
 pub(crate) struct TeamHooks {
     /// Inner hooks (SubagentHooks or GraphSessionHooks), if any.

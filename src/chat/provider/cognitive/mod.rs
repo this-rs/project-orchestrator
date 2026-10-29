@@ -34,11 +34,8 @@ pub use mode::{
 };
 
 use crate::chat::provider::settings::{project_scope, GLOBAL};
+use crate::neo4j::AnalyticsStore;
 use crate::neo4j::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 
 /// The routing document stored for one scope, `None` when there is none. A
 /// document that no longer parses is logged and read as absent: a setting is

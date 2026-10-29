@@ -13,10 +13,7 @@ use super::ws_auth::CookieAuthResult;
 use crate::auth::jwt::Claims;
 use crate::chat::manager::{DeliveryRoute, MessageDeliveryError};
 
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::{AnalyticsStore, NoteStore};
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -1241,10 +1238,7 @@ fn live_frame(
 /// Allows at most `MAX_BOOSTS_PER_MINUTE` reinforcement batches per minute
 /// to avoid runaway energy inflation during rapid conversations.
 mod chat_reinforcement_limiter {
-    use crate::neo4j::{
-        AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-        ReleaseStore, WorkspaceStore,
-    };
+
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     /// Maximum reinforcement batches per minute window.

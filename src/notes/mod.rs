@@ -5,10 +5,6 @@
 //!
 //! Notes can be linked to code entities and automatically surfaced to agents
 //! based on relevance and graph propagation.
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
 
 pub mod coactivation;
 pub mod hashing;

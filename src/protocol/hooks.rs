@@ -26,10 +26,7 @@ use crate::chat::manager::ChatManager;
 use crate::events::EventEmitter;
 use crate::neo4j::traits::GraphStore;
 
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::{AnalyticsStore, ProjectStore};
 use crate::protocol::engine;
 use dashmap::DashMap;
 use std::sync::{Arc, LazyLock};

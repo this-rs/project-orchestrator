@@ -9,10 +9,7 @@
 
 use super::{ExecutionResult, Executor};
 use crate::neo4j::traits::GraphStore;
-use crate::neo4j::{
-    AnalyticsStore, CodeStore, CommitStore, DecisionStore, NoteStore, PlanStore, ProjectStore,
-    ReleaseStore, WorkspaceStore,
-};
+use crate::neo4j::{AnalyticsStore, NoteStore};
 use crate::protocol::{Protocol, ProtocolRun, ProtocolState};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
