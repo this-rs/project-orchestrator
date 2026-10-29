@@ -348,7 +348,6 @@ mod tests {
     use crate::events::{CrudAction, EntityType};
     use crate::lifecycle::models::{LifecycleActionType, LifecycleHook, LifecycleScope};
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::traits::GraphStore;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]

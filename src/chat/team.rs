@@ -483,7 +483,6 @@ mod team2_tests {
     use crate::neo4j::mock::MockGraphStore;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
-    use crate::neo4j::GraphStore;
     use crate::test_helpers::test_chat_session;
 
     fn member(id: &str, name: &str) -> TeamMember {

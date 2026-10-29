@@ -1850,7 +1850,6 @@ mod tests {
     /// and anyone's on a session nobody owns go through.
     #[tokio::test]
     async fn only_the_owner_answers_on_the_websocket() {
-        use crate::neo4j::traits::GraphStore;
         let mock = crate::neo4j::mock::MockGraphStore::new();
         let owner = uuid::Uuid::new_v4().to_string();
         let owned = crate::neo4j::models::ChatSessionNode {
@@ -1893,7 +1892,6 @@ mod tests {
     /// local routing does not check the owner again.
     #[tokio::test]
     async fn a_websocket_answer_is_refused_when_the_owner_cannot_be_read() {
-        use crate::neo4j::traits::GraphStore;
         let mock = crate::neo4j::mock::MockGraphStore::new();
         let free = crate::test_helpers::test_chat_session(None);
         mock.create_chat_session(&free).await.unwrap();
@@ -2138,7 +2136,6 @@ mod tests {
         project: Uuid,
         path: &str,
     ) -> Uuid {
-        use crate::neo4j::traits::GraphStore;
         let mut n = crate::notes::Note::new(
             Some(project),
             crate::notes::NoteType::Guideline,
@@ -2156,7 +2153,6 @@ mod tests {
 
     #[tokio::test]
     async fn neural_reinforcement_boosts_only_the_session_project() {
-        use crate::neo4j::traits::GraphStore;
         let mock = crate::neo4j::mock::MockGraphStore::new();
         let mut project = crate::test_helpers::test_project();
         project.slug = "mine".into();
@@ -2195,7 +2191,6 @@ mod tests {
 
     #[tokio::test]
     async fn neural_reinforcement_without_session_project_boosts_nothing() {
-        use crate::neo4j::traits::GraphStore;
         let mock = crate::neo4j::mock::MockGraphStore::new();
         let session = crate::test_helpers::test_chat_session(None);
         mock.create_chat_session(&session).await.unwrap();

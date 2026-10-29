@@ -7191,7 +7191,6 @@ mod tests {
     #[tokio::test]
     async fn test_analyze_project_safe_computes_and_emits() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::GraphStore;
 
         // Build custom state with a shared MockGraphStore reference
         let mock_store = Arc::new(MockGraphStore::new());
@@ -10144,7 +10143,6 @@ mod tests {
     #[tokio::test]
     async fn test_sync_add_file_creates_all_entities() {
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
@@ -10228,7 +10226,6 @@ mod tests {
     #[tokio::test]
     async fn test_sync_delete_file_cleans_all() {
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
@@ -10307,7 +10304,6 @@ mod tests {
     #[tokio::test]
     async fn test_sync_rename_file_old_deleted_new_created() {
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
@@ -10426,7 +10422,6 @@ mod tests {
         // EXTENDS/IMPLEMENTS don't exist yet (Plans 5/6).
         // This test validates that the cleanup_sync_data handles them as no-ops
         // and that the pattern documentation exists for future implementation.
-        use crate::neo4j::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with_stores;
 
         let (state, neo4j, _meili) = mock_app_state_with_stores();
@@ -10450,7 +10445,6 @@ mod tests {
     async fn test_sync_bulk_delete_triggers_full_sync_path() {
         use crate::meilisearch::traits::SearchStore;
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with_stores;
 
         let (state, neo4j, meili) = mock_app_state_with_stores();
@@ -10505,7 +10499,6 @@ mod tests {
     #[tokio::test]
     async fn test_sync_empty_scan_does_not_purge_project() {
         use crate::neo4j::models::FileNode;
-        use crate::neo4j::GraphStore;
         use crate::test_helpers::mock_app_state_with_stores;
 
         let (state, neo4j, _meili) = mock_app_state_with_stores();
@@ -10544,7 +10537,6 @@ mod tests {
     #[tokio::test]
     async fn test_sync_add_delete_same_window_consistent() {
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
@@ -10671,7 +10663,6 @@ mod tests {
     #[tokio::test]
     async fn test_sync_delete_import_source_cleans_relations() {
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
@@ -10771,7 +10762,6 @@ mod tests {
     #[tokio::test]
     async fn test_sync_meilisearch_no_phantom_after_deletion() {
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
@@ -10862,7 +10852,6 @@ mod tests {
         // chunking logic). The actual Neo4j UNWIND is tested via integration tests.
         use crate::neo4j::batch::{BoltMap, BATCH_SIZE};
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
         use crate::parser::FunctionCall;
 
         let start = std::time::Instant::now();
@@ -11012,7 +11001,6 @@ mod tests {
         // Validates that the cleanup LIMIT loop pattern scales correctly
         // with the mock store's cleanup_sync_data implementation.
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
 
         let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
 
@@ -11329,7 +11317,6 @@ mod tests {
     async fn the_feature_graph_proposal_opens_its_one_shot_through_the_provider_registry() {
         use nexus_claude::agent::{AgentEvent, Cost, CostBasis, PolicyMode, StopReason};
         let graph = crate::neo4j::mock::MockGraphStore::new();
-        use crate::neo4j::GraphStore as _;
         let project = crate::test_helpers::test_project();
         graph.create_project(&project).await.unwrap();
         let fake = crate::chat::agent_runtime::fake::FakeProvider::new();

@@ -20,7 +20,6 @@ use crate::chat::types::ChatEvent;
 use crate::neo4j::models::ChatEventRecord;
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
-use crate::neo4j::GraphStore;
 use crate::test_helpers::{mock_app_state_with_graph, test_chat_session};
 
 const WAIT: Duration = Duration::from_secs(10);

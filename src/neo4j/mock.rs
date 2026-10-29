@@ -891,7 +891,6 @@ impl GraphStore for MockGraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::traits::GraphStore;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::test_helpers::{test_project, test_project_named};
@@ -5143,7 +5142,6 @@ mod tests {
 mod anchor_tests {
     use super::*;
     use crate::chat::anchor::*;
-    use crate::neo4j::traits::GraphStore;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::test_helpers::{test_chat_session, test_project_named};
@@ -5961,7 +5959,6 @@ mod bind_project_tests {
     //! it, a session opened without `project_slug` stayed anonymous in
     //! `/api/agents/live` although every turn resolved its project from the cwd.
     use super::*;
-    use crate::neo4j::traits::GraphStore;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]

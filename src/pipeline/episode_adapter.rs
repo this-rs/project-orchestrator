@@ -609,7 +609,6 @@ mod tests {
     #[tokio::test]
     async fn resolve_protocol_names_from_run() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
         use crate::protocol::models::{Protocol, ProtocolRun, ProtocolState};
 
         let store = MockGraphStore::new();

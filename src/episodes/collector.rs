@@ -606,7 +606,6 @@ mod tests {
         project: Option<&str>,
         preview: Option<&str>,
     ) -> (crate::neo4j::mock::MockGraphStore, Uuid, Option<Uuid>) {
-        use crate::neo4j::GraphStore;
         let store = crate::neo4j::mock::MockGraphStore::new();
         let project_id = match project {
             Some(slug) => {
@@ -629,7 +628,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_closed_session_gives_an_episode_of_its_first_message_and_its_end() {
-        use crate::neo4j::GraphStore;
         let (store, sid, project_id) =
             store_with_session(Some("alpha"), Some("  Fix the login bug  ")).await;
         let episode = collect_session_episode(&store, sid, "process_died")
@@ -666,7 +664,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_spawned_session_is_not_a_user_request() {
-        use crate::neo4j::GraphStore;
         let (store, sid, _) = store_with_session(Some("alpha"), Some("delegated work")).await;
         let mut node = store.get_chat_session(sid).await.unwrap().unwrap();
         node.spawned_by = Some(r#"{"type":"runner"}"#.into());
@@ -720,7 +717,6 @@ mod tests {
     /// count); a session of a plan run that leaves no run episode keeps its own.
     #[tokio::test]
     async fn a_session_is_counted_once_with_its_run() {
-        use crate::neo4j::GraphStore;
         let with_lifecycle = Uuid::new_v4();
         let without_lifecycle = Uuid::new_v4();
         let cases = [
@@ -784,7 +780,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_episode_is_stored_once_per_session_and_goes_with_the_session() {
-        use crate::neo4j::GraphStore;
         let (store, sid, project_id) = store_with_session(Some("alpha"), Some("first")).await;
         let project_id = project_id.unwrap();
         let first = collect_session_episode(&store, sid, "closed")
@@ -830,7 +825,6 @@ mod tests {
     /// project, never an episode without a vector, the closest first, `limit` kept.
     #[tokio::test]
     async fn a_closed_session_is_recalled_by_the_vector_of_its_first_message() {
-        use crate::neo4j::GraphStore;
         let store = crate::neo4j::mock::MockGraphStore::new();
         let project = crate::test_helpers::test_project_named("alpha");
         store.create_project(&project).await.unwrap();

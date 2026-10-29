@@ -229,7 +229,6 @@ mod tests {
         crate::neo4j::models::ChatSessionNode,
         crate::neo4j::models::ChatSessionNode,
     ) {
-        use crate::neo4j::GraphStore;
         use std::sync::Arc;
 
         let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());

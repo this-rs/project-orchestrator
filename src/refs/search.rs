@@ -325,7 +325,6 @@ mod tests {
     use crate::neo4j::models::PlanNode;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
-    use crate::neo4j::GraphStore;
     use crate::refs::access::Disclosure;
     use crate::refs::test_support::{task_titled, user, world, Spy, World};
     use crate::refs::wire::ScopeLabel;

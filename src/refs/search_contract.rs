@@ -20,7 +20,6 @@ use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::models::{PlanNode, PlanStatus, TaskStatus};
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
-use crate::neo4j::GraphStore;
 use crate::notes::NoteType;
 use crate::test_helpers::{test_project, test_workspace};
 

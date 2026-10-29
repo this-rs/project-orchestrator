@@ -834,7 +834,6 @@ mod tests {
         let _env = crate::chat::stages::intent_weights::lock_env();
         use crate::chat::stages::PersonaStage;
         use crate::neo4j::models::{PersonaNode, PersonaStatus};
-        use crate::neo4j::traits::GraphStore;
 
         let graph = Arc::new(MockGraphStore::new());
         let search = Arc::new(MockSearchStore::new());

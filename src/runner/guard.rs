@@ -788,7 +788,6 @@ mod tests {
     async fn test_guard_compaction_reinjects_context() {
         use crate::neo4j::mock::MockGraphStore;
         use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
         use crate::test_helpers::{test_plan, test_step, test_task_titled};
         use std::sync::atomic::{AtomicUsize, Ordering};
 

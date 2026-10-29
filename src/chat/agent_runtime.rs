@@ -6846,7 +6846,6 @@ mod answered_tests {
 mod tool_timing_tests {
     use super::fake::FakeProvider;
     use super::*;
-    use crate::neo4j::traits::GraphStore as _;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use serde_json::json;

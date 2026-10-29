@@ -671,7 +671,6 @@ mod tests {
     async fn grouped_store_read_returns_all_sessions_without_non_attention_events_and_blank_user_data(
     ) {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
         let store = MockGraphStore::new();
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
         store

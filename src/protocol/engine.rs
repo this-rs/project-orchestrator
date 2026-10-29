@@ -575,7 +575,6 @@ fn last_state_name(run: &ProtocolRun) -> String {
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::traits::GraphStore;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::protocol::{

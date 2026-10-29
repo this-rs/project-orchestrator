@@ -7,7 +7,6 @@ use crate::api::handlers::{OrchestratorState, ServerState};
 use crate::api::routes::create_router;
 use crate::chat::provider::nexus_tools::{GraphConsents, ToolConsents};
 use crate::neo4j::mock::MockGraphStore;
-use crate::neo4j::GraphStore;
 
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;

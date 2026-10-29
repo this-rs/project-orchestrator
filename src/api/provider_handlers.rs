@@ -1593,7 +1593,6 @@ mod agent_surface_tests {
     #[tokio::test]
     async fn deleting_an_instance_forgets_its_quota_so_a_new_one_starts_clean() {
         use crate::chat::provider::quota::QUOTA_PREFIX;
-        use crate::neo4j::GraphStore;
 
         let (app, graph) = app().await;
         let id = "deepseek-spent";

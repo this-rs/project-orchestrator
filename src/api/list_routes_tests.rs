@@ -15,7 +15,6 @@ use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::models::*;
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
-use crate::neo4j::GraphStore;
 use crate::notes::{Note, NoteImportance, NoteScope, NoteStatus, NoteType};
 use crate::orchestrator::{FileWatcher, Orchestrator};
 use crate::protocol::{Protocol, ProtocolRun, RunStatus};

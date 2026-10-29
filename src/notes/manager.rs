@@ -3889,7 +3889,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_relative_path_resolves_to_its_single_project() {
-        use crate::neo4j::traits::GraphStore;
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let (p, q) = (Uuid::new_v4(), Uuid::new_v4());
         graph
@@ -3941,7 +3940,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_ambiguous_relative_path_never_widens_the_scope() {
-        use crate::neo4j::traits::GraphStore;
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let (p, q, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         graph

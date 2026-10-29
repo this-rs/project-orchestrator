@@ -2255,7 +2255,6 @@ impl Neo4jClient {
 mod tests {
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::models::*;
-    use crate::neo4j::traits::GraphStore;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use chrono::Utc;

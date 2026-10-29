@@ -1012,7 +1012,6 @@ impl Neo4jClient {
 #[cfg(test)]
 mod parent_existence_tests {
     use super::super::models::{DecisionNode, DecisionStatus};
-    use super::super::traits::GraphStore;
     use crate::neo4j::mock::MockGraphStore;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;

@@ -631,7 +631,6 @@ mod tests {
     #[tokio::test]
     async fn test_feedback_success_links_tree_to_run() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
         use std::sync::Arc;
 
         let graph = Arc::new(MockGraphStore::new());
@@ -692,7 +691,6 @@ mod tests {
     #[tokio::test]
     async fn test_feedback_refuses_nodes_of_another_project() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
         use std::sync::Arc;
 
         let graph = Arc::new(MockGraphStore::new());
@@ -736,7 +734,6 @@ mod tests {
     #[tokio::test]
     async fn test_feedback_checks_the_project_of_followed_decisions() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
         use std::sync::Arc;
 
         let graph = Arc::new(MockGraphStore::new());
@@ -806,7 +803,6 @@ mod tests {
     #[tokio::test]
     async fn test_feedback_same_project_nodes_are_reinforced() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
         use std::sync::Arc;
 
         let graph = Arc::new(MockGraphStore::new());

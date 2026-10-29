@@ -432,7 +432,6 @@ mod tests {
     use crate::api::routes::create_router;
     use crate::events::CrudAction;
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::traits::GraphStore;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     #[allow(unused_imports)]

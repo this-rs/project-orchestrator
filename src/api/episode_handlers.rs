@@ -575,7 +575,6 @@ mod tests {
     /// `source=session` and `source=all`, never by default (run episodes only).
     #[tokio::test]
     async fn session_episodes_are_listed_only_when_asked_for() {
-        use crate::neo4j::GraphStore;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
         use tower::ServiceExt;

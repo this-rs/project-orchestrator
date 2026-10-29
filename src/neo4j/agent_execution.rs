@@ -1072,7 +1072,6 @@ mod tests {
     #[tokio::test]
     async fn test_agent_execution_record_fields_mock_roundtrip() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
 
         let g = MockGraphStore::new();
         let ae = make_fully_recorded_execution();
@@ -1491,7 +1490,6 @@ mod tests {
     #[tokio::test]
     async fn recording_a_verification_sets_the_flat_verdict_on_the_mock() {
         use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::traits::GraphStore;
         let g = MockGraphStore::new();
         let ae = make_agent_execution(None, None);
         g.create_agent_execution(&ae).await.unwrap();

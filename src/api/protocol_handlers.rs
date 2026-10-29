@@ -2832,8 +2832,6 @@ mod tests {
     // schedule validation (REST)
     // ----------------------------------------------------------------
 
-    use crate::neo4j::GraphStore;
-
     async fn send(
         app: &axum::Router,
         method: &str,

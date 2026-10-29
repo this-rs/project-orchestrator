@@ -35,7 +35,6 @@ mod tests {
     use crate::neo4j::mock::MockGraphStore;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
-    use crate::neo4j::GraphStore;
 
     fn event(trigger_id: uuid::Uuid, received_at: chrono::DateTime<chrono::Utc>) -> ExternalEvent {
         ExternalEvent {

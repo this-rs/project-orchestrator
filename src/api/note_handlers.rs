@@ -1943,7 +1943,6 @@ mod tests {
     async fn test_app_with_notes(
         projects: &[Option<uuid::Uuid>],
     ) -> (axum::Router, Vec<uuid::Uuid>) {
-        use crate::neo4j::traits::GraphStore;
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let mut ids = Vec::new();
         for p in projects {
@@ -2115,7 +2114,6 @@ mod tests {
     /// person writes keeps `api`, as every note did before. Superseding stamps it too.
     #[tokio::test]
     async fn a_note_written_by_a_chat_session_names_its_agent() {
-        use crate::neo4j::traits::GraphStore;
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let mut sessions = Vec::new();
         for model in ["claude-opus-5-5", "claude-opus-5-5", "deepseek-v4"] {
@@ -2191,7 +2189,6 @@ mod tests {
     /// global pins, which reach everyone's chats, need the root account.
     #[tokio::test]
     async fn only_a_person_pins_notes_and_only_notes_of_the_scope() {
-        use crate::neo4j::traits::GraphStore;
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let alpha = crate::test_helpers::test_project_named("alpha");
         graph.create_project(&alpha).await.unwrap();
@@ -2293,7 +2290,6 @@ mod tests {
     /// a confirmation and an invalidation. A person keeps the author each had before.
     #[tokio::test]
     async fn rfcs_decisions_confirmations_and_invalidations_name_the_agent() {
-        use crate::neo4j::traits::GraphStore;
         let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
         let mut session = crate::test_helpers::test_chat_session(None);
         session.model = "claude-opus-5-5".into();

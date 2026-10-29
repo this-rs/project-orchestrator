@@ -867,7 +867,6 @@ mod tests {
     // ── Async tests with MockGraphStore ──────────────────────────────────
 
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::traits::GraphStore;
     use crate::protocol::models::{Protocol, ProtocolState};
 
     /// Helper: set up a mock store with a protocol and start/implement/done states.

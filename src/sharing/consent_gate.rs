@@ -708,7 +708,6 @@ mod tests {
     // ------------------------------------------------------------------
 
     use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::GraphStore;
 
     fn policy(enabled: bool, mode: SharingMode) -> SharingPolicy {
         SharingPolicy {

@@ -4846,7 +4846,6 @@ mod tests {
         use crate::meilisearch::mock::MockSearchStore;
         use crate::neo4j::mock::MockGraphStore;
         use crate::neo4j::models::{FunctionNode, ProjectNode, Visibility};
-        use crate::neo4j::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with;
 
         let graph = MockGraphStore::new();
@@ -5045,7 +5044,6 @@ mod tests {
         use crate::meilisearch::mock::MockSearchStore;
         use crate::neo4j::mock::MockGraphStore;
         use crate::neo4j::models::ProjectNode;
-        use crate::neo4j::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with;
 
         let graph = MockGraphStore::new();
@@ -5263,7 +5261,6 @@ mod tests {
         use crate::meilisearch::mock::MockSearchStore;
         use crate::neo4j::mock::MockGraphStore;
         use crate::neo4j::models::ProjectNode;
-        use crate::neo4j::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with;
 
         let graph = MockGraphStore::new();
@@ -5420,7 +5417,6 @@ mod tests {
         use crate::meilisearch::mock::MockSearchStore;
         use crate::neo4j::mock::MockGraphStore;
         use crate::neo4j::models::ProjectNode;
-        use crate::neo4j::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with;
 
         let graph = MockGraphStore::new();
@@ -5747,7 +5743,6 @@ mod tests {
         use crate::meilisearch::mock::MockSearchStore;
         use crate::neo4j::mock::MockGraphStore;
         use crate::neo4j::models::{FunctionNode, ImportNode, Parameter, StructNode, Visibility};
-        use crate::neo4j::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with;
 
         let graph = MockGraphStore::new();
@@ -5920,7 +5915,6 @@ mod tests {
         use crate::meilisearch::mock::MockSearchStore;
         use crate::neo4j::mock::MockGraphStore;
         use crate::neo4j::models::{FunctionNode, Visibility};
-        use crate::neo4j::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with;
 
         let graph = MockGraphStore::new();
@@ -6116,7 +6110,6 @@ mod tests {
         use crate::meilisearch::mock::MockSearchStore;
         use crate::neo4j::mock::MockGraphStore;
         use crate::neo4j::models::{FunctionNode, Visibility};
-        use crate::neo4j::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with;
 
         let graph = MockGraphStore::new();
@@ -6287,7 +6280,6 @@ mod tests {
         use crate::meilisearch::mock::MockSearchStore;
         use crate::neo4j::mock::MockGraphStore;
         use crate::neo4j::models::{FunctionNode, Visibility};
-        use crate::neo4j::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with;
 
         let graph = MockGraphStore::new();

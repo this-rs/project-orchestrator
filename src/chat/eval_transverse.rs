@@ -55,7 +55,6 @@ use crate::episodes::distill_models::SharingConsent;
 use crate::graph::neighborhood::RawNode;
 use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::models::ExecutionPlace;
-use crate::neo4j::GraphStore;
 
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
