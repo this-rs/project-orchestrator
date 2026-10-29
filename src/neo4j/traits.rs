@@ -133,7 +133,6 @@ pub trait GraphStore:
     }
 }
 
-#[cfg(test)]
 // ============================================================================
 // Project management domain
 // ============================================================================
@@ -4644,6 +4643,7 @@ pub trait AnalyticsStore: Send + Sync {
     ) -> Result<Option<crate::graph::neighborhood::ScopedNeighborhood>>;
 }
 
+#[cfg(test)]
 mod tests {
     use super::StoreCapabilities;
     #[allow(unused_imports)]
