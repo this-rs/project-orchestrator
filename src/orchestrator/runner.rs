@@ -7211,7 +7211,7 @@ mod tests {
                 last_parsed: chrono::Utc::now(),
                 project_id: Some(project.id),
             };
-            GraphStore::upsert_file(&*mock_store, &file).await.unwrap();
+            CodeStore::upsert_file(&*mock_store, &file).await.unwrap();
         }
         // Register files as project files and add imports
         {
@@ -10456,7 +10456,7 @@ mod tests {
         // Create 60 files (> BULK_SYNC_THRESHOLD = 50)
         for i in 0..60 {
             let path = format!("/tmp/bulk-test/src/file_{}.rs", i);
-            GraphStore::upsert_file(
+            CodeStore::upsert_file(
                 neo4j.as_ref(),
                 &FileNode {
                     path: path.clone(),
@@ -10469,7 +10469,7 @@ mod tests {
             .await
             .unwrap();
             // Link to project (mock uses project_files for delete_stale_files)
-            GraphStore::link_file_to_project(neo4j.as_ref(), &path, project_id)
+            CodeStore::link_file_to_project(neo4j.as_ref(), &path, project_id)
                 .await
                 .unwrap();
         }
@@ -10508,7 +10508,7 @@ mod tests {
         let project_id = Uuid::new_v4();
         for i in 0..3 {
             let path = format!("/tmp/empty-scan-test/src/file_{}.rs", i);
-            GraphStore::upsert_file(
+            CodeStore::upsert_file(
                 neo4j.as_ref(),
                 &FileNode {
                     path: path.clone(),
@@ -10520,7 +10520,7 @@ mod tests {
             )
             .await
             .unwrap();
-            GraphStore::link_file_to_project(neo4j.as_ref(), &path, project_id)
+            CodeStore::link_file_to_project(neo4j.as_ref(), &path, project_id)
                 .await
                 .unwrap();
         }
@@ -11019,7 +11019,7 @@ mod tests {
             let file_path = format!("{}/file_{}.rs", file_base, file_idx);
 
             // First create the file node
-            GraphStore::upsert_file(
+            CodeStore::upsert_file(
                 mock_store.as_ref(),
                 &FileNode {
                     path: file_path.clone(),
