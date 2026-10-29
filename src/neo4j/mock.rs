@@ -15041,434 +15041,6 @@ impl AnalyticsStore for MockGraphStore {
     // Persona operations (Living Personas)
     // ========================================================================
 
-    async fn create_persona(&self, persona: &PersonaNode) -> Result<()> {
-        self.personas
-            .write()
-            .await
-            .insert(persona.id, persona.clone());
-        Ok(())
-    }
-
-    async fn get_persona(&self, id: Uuid) -> Result<Option<PersonaNode>> {
-        Ok(self.personas.read().await.get(&id).cloned())
-    }
-
-    async fn update_persona(&self, persona: &PersonaNode) -> Result<()> {
-        let mut store = self.personas.write().await;
-        if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(persona.id) {
-            e.insert(persona.clone());
-            Ok(())
-        } else {
-            anyhow::bail!("Persona {} not found", persona.id)
-        }
-    }
-
-    async fn delete_persona(&self, id: Uuid) -> Result<bool> {
-        let existed = self.personas.write().await.remove(&id).is_some();
-        if existed {
-            // Clean up relations
-            self.persona_skills.write().await.remove(&id);
-            self.persona_protocols.write().await.remove(&id);
-            self.persona_feature_graph.write().await.remove(&id);
-            self.persona_files.write().await.remove(&id);
-            self.persona_functions.write().await.remove(&id);
-            self.persona_notes.write().await.remove(&id);
-            self.persona_decisions.write().await.remove(&id);
-            self.persona_extends.write().await.remove(&id);
-        }
-        Ok(existed)
-    }
-
-    async fn list_personas(
-        &self,
-        project_id: Uuid,
-        status: Option<PersonaStatus>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<PersonaNode>, usize)> {
-        let store = self.personas.read().await;
-        let mut all: Vec<PersonaNode> = store
-            .values()
-            .filter(|p| p.project_id == Some(project_id))
-            .filter(|p| status.is_none_or(|s| p.status == s))
-            .cloned()
-            .collect();
-        all.sort_by(|a, b| {
-            b.energy
-                .partial_cmp(&a.energy)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let total = all.len();
-        let page = all.into_iter().skip(offset).take(limit).collect();
-        Ok((page, total))
-    }
-
-    async fn list_global_personas(&self) -> Result<Vec<PersonaNode>> {
-        let store = self.personas.read().await;
-        Ok(store
-            .values()
-            .filter(|p| p.project_id.is_none())
-            .cloned()
-            .collect())
-    }
-
-    async fn add_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()> {
-        self.persona_skills
-            .write()
-            .await
-            .entry(persona_id)
-            .or_default()
-            .insert(skill_id);
-        Ok(())
-    }
-
-    async fn remove_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()> {
-        if let Some(set) = self.persona_skills.write().await.get_mut(&persona_id) {
-            set.remove(&skill_id);
-        }
-        Ok(())
-    }
-
-    async fn add_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()> {
-        self.persona_protocols
-            .write()
-            .await
-            .entry(persona_id)
-            .or_default()
-            .insert(protocol_id);
-        Ok(())
-    }
-
-    async fn remove_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()> {
-        if let Some(set) = self.persona_protocols.write().await.get_mut(&persona_id) {
-            set.remove(&protocol_id);
-        }
-        Ok(())
-    }
-
-    async fn increment_persona_activation(&self, persona_id: Uuid) -> Result<()> {
-        let mut personas = self.personas.write().await;
-        if let Some(persona) = personas.get_mut(&persona_id) {
-            persona.activation_count += 1;
-            persona.last_activated = Some(chrono::Utc::now());
-        }
-        Ok(())
-    }
-
-    async fn set_persona_feature_graph(
-        &self,
-        persona_id: Uuid,
-        feature_graph_id: Uuid,
-    ) -> Result<()> {
-        self.persona_feature_graph
-            .write()
-            .await
-            .insert(persona_id, feature_graph_id);
-        Ok(())
-    }
-
-    async fn remove_persona_feature_graph(&self, persona_id: Uuid) -> Result<()> {
-        self.persona_feature_graph.write().await.remove(&persona_id);
-        Ok(())
-    }
-
-    async fn add_persona_file(&self, persona_id: Uuid, file_path: &str, weight: f64) -> Result<()> {
-        self.persona_files
-            .write()
-            .await
-            .entry(persona_id)
-            .or_default()
-            .insert(file_path.to_string(), weight);
-        Ok(())
-    }
-
-    async fn remove_persona_file(&self, persona_id: Uuid, file_path: &str) -> Result<()> {
-        if let Some(map) = self.persona_files.write().await.get_mut(&persona_id) {
-            map.remove(file_path);
-        }
-        Ok(())
-    }
-
-    async fn add_persona_function(
-        &self,
-        persona_id: Uuid,
-        function_id: &str,
-        weight: f64,
-    ) -> Result<()> {
-        self.persona_functions
-            .write()
-            .await
-            .entry(persona_id)
-            .or_default()
-            .insert(function_id.to_string(), weight);
-        Ok(())
-    }
-
-    async fn remove_persona_function(&self, persona_id: Uuid, function_id: &str) -> Result<()> {
-        if let Some(map) = self.persona_functions.write().await.get_mut(&persona_id) {
-            map.remove(function_id);
-        }
-        Ok(())
-    }
-
-    async fn add_persona_note(&self, persona_id: Uuid, note_id: Uuid, weight: f64) -> Result<()> {
-        self.persona_notes
-            .write()
-            .await
-            .entry(persona_id)
-            .or_default()
-            .insert(note_id, weight);
-        Ok(())
-    }
-
-    async fn remove_persona_note(&self, persona_id: Uuid, note_id: Uuid) -> Result<()> {
-        if let Some(map) = self.persona_notes.write().await.get_mut(&persona_id) {
-            map.remove(&note_id);
-        }
-        Ok(())
-    }
-
-    async fn add_persona_decision(
-        &self,
-        persona_id: Uuid,
-        decision_id: Uuid,
-        weight: f64,
-    ) -> Result<()> {
-        self.persona_decisions
-            .write()
-            .await
-            .entry(persona_id)
-            .or_default()
-            .insert(decision_id, weight);
-        Ok(())
-    }
-
-    async fn remove_persona_decision(&self, persona_id: Uuid, decision_id: Uuid) -> Result<()> {
-        if let Some(map) = self.persona_decisions.write().await.get_mut(&persona_id) {
-            map.remove(&decision_id);
-        }
-        Ok(())
-    }
-
-    async fn add_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()> {
-        self.persona_extends
-            .write()
-            .await
-            .entry(child_id)
-            .or_default()
-            .push(parent_id);
-        Ok(())
-    }
-
-    async fn remove_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()> {
-        if let Some(vec) = self.persona_extends.write().await.get_mut(&child_id) {
-            vec.retain(|&id| id != parent_id);
-        }
-        Ok(())
-    }
-
-    async fn get_persona_subgraph(&self, persona_id: Uuid) -> Result<PersonaSubgraph> {
-        let persona = self
-            .get_persona(persona_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Persona {} not found", persona_id))?;
-
-        let files: Vec<PersonaWeightedRelation> = self
-            .persona_files
-            .read()
-            .await
-            .get(&persona_id)
-            .map(|m| {
-                m.iter()
-                    .map(|(path, &w)| PersonaWeightedRelation {
-                        entity_type: "file".to_string(),
-                        entity_id: path.clone(),
-                        weight: w,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let functions: Vec<PersonaWeightedRelation> = self
-            .persona_functions
-            .read()
-            .await
-            .get(&persona_id)
-            .map(|m| {
-                m.iter()
-                    .map(|(fid, &w)| PersonaWeightedRelation {
-                        entity_type: "function".to_string(),
-                        entity_id: fid.clone(),
-                        weight: w,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let notes: Vec<PersonaWeightedRelation> = self
-            .persona_notes
-            .read()
-            .await
-            .get(&persona_id)
-            .map(|m| {
-                m.iter()
-                    .map(|(nid, &w)| PersonaWeightedRelation {
-                        entity_type: "note".to_string(),
-                        entity_id: nid.to_string(),
-                        weight: w,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let decisions: Vec<PersonaWeightedRelation> = self
-            .persona_decisions
-            .read()
-            .await
-            .get(&persona_id)
-            .map(|m| {
-                m.iter()
-                    .map(|(did, &w)| PersonaWeightedRelation {
-                        entity_type: "decision".to_string(),
-                        entity_id: did.to_string(),
-                        weight: w,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let skills: Vec<PersonaWeightedRelation> = self
-            .persona_skills
-            .read()
-            .await
-            .get(&persona_id)
-            .map(|s| {
-                s.iter()
-                    .map(|sid| PersonaWeightedRelation {
-                        entity_type: "skill".to_string(),
-                        entity_id: sid.to_string(),
-                        weight: 1.0,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let protocols: Vec<PersonaWeightedRelation> = self
-            .persona_protocols
-            .read()
-            .await
-            .get(&persona_id)
-            .map(|s| {
-                s.iter()
-                    .map(|pid| PersonaWeightedRelation {
-                        entity_type: "protocol".to_string(),
-                        entity_id: pid.to_string(),
-                        weight: 1.0,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let feature_graph_id = self
-            .persona_feature_graph
-            .read()
-            .await
-            .get(&persona_id)
-            .copied();
-
-        let parents: Vec<PersonaWeightedRelation> = self
-            .persona_extends
-            .read()
-            .await
-            .get(&persona_id)
-            .map(|ids| {
-                ids.iter()
-                    .map(|pid| PersonaWeightedRelation {
-                        entity_type: "persona".to_string(),
-                        entity_id: pid.to_string(),
-                        weight: 1.0,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let children: Vec<PersonaWeightedRelation> = Vec::new(); // Mock doesn't track reverse extends
-
-        let total_entities = files.len()
-            + functions.len()
-            + notes.len()
-            + decisions.len()
-            + skills.len()
-            + protocols.len()
-            + if feature_graph_id.is_some() { 1 } else { 0 };
-
-        Ok(PersonaSubgraph {
-            persona_id,
-            persona_name: persona.name,
-            files,
-            functions,
-            notes,
-            decisions,
-            skills,
-            protocols,
-            feature_graph_id,
-            parents,
-            children,
-            stats: PersonaSubgraphStats {
-                total_entities,
-                coverage_score: 0.0,
-                freshness: 0.0,
-            },
-        })
-    }
-
-    async fn find_personas_for_file(
-        &self,
-        file_path: &str,
-        project_id: Uuid,
-    ) -> Result<Vec<(PersonaNode, f64)>> {
-        let personas = self.personas.read().await;
-        let files = self.persona_files.read().await;
-        let mut results: Vec<(PersonaNode, f64)> = Vec::new();
-        for persona in personas.values() {
-            if persona.project_id != Some(project_id) {
-                continue;
-            }
-            if let Some(file_map) = files.get(&persona.id) {
-                if let Some(&weight) = file_map.get(file_path) {
-                    results.push((persona.clone(), weight));
-                }
-            }
-        }
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(results)
-    }
-
-    async fn get_all_persona_knows(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<(PersonaNode, String, f64)>> {
-        let personas = self.personas.read().await;
-        let files = self.persona_files.read().await;
-        let mut results: Vec<(PersonaNode, String, f64)> = Vec::new();
-        for persona in personas.values() {
-            if persona.project_id != Some(project_id) {
-                continue;
-            }
-            if let Some(file_map) = files.get(&persona.id) {
-                for (path, &weight) in file_map {
-                    results.push((persona.clone(), path.clone(), weight));
-                }
-            }
-        }
-        results.sort_by(|a, b| {
-            a.0.name
-                .cmp(&b.0.name)
-                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-        });
-        Ok(results)
-    }
-
     async fn auto_scope_to_feature_graphs(&self, _project_id: Uuid) -> Result<usize> {
         // Mock: no-op, return 0 scoped
         Ok(0)
@@ -15512,69 +15084,7 @@ impl AnalyticsStore for MockGraphStore {
         })
     }
 
-    async fn maintain_personas(&self, _project_id: Uuid) -> Result<(usize, usize, usize)> {
-        Ok((0, 0, 0))
-    }
-
-    async fn detect_personas(
-        &self,
-        _project_id: Uuid,
-    ) -> Result<Vec<crate::neo4j::persona::PersonaProposal>> {
-        Ok(vec![])
-    }
-
-    async fn find_adjacent_personas(
-        &self,
-        _file_path: &str,
-        _project_id: Uuid,
-    ) -> Result<Vec<(Uuid, String)>> {
-        Ok(vec![])
-    }
-
     async fn auto_grow_file_knows(
-        &self,
-        _persona_id: Uuid,
-        _file_path: &str,
-        _weight: f64,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn find_relevant_personas_for_note(
-        &self,
-        _file_paths: &[String],
-        _project_id: Uuid,
-    ) -> Result<Vec<(Uuid, f64)>> {
-        Ok(vec![])
-    }
-
-    async fn find_relevant_personas_for_decision(
-        &self,
-        _decision_id: Uuid,
-        _project_id: Uuid,
-    ) -> Result<Vec<(Uuid, f64)>> {
-        Ok(vec![])
-    }
-
-    async fn auto_link_note_to_persona(
-        &self,
-        _persona_id: Uuid,
-        _note_id: Uuid,
-        _weight: f64,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn auto_link_decision_to_persona(
-        &self,
-        _persona_id: Uuid,
-        _decision_id: Uuid,
-        _weight: f64,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn auto_link_file_to_persona(
         &self,
         _persona_id: Uuid,
         _file_path: &str,
@@ -15594,31 +15104,6 @@ impl AnalyticsStore for MockGraphStore {
         _base_weight: f64,
     ) -> Result<usize> {
         Ok(0)
-    }
-
-    async fn compute_persona_affinity(
-        &self,
-        _persona_a: Uuid,
-        _persona_b: Uuid,
-    ) -> Result<crate::neo4j::persona::PersonaAffinityScore> {
-        Ok(crate::neo4j::persona::PersonaAffinityScore {
-            persona_a_id: _persona_a,
-            persona_b_id: _persona_b,
-            jaccard_files: 0.0,
-            synapse_density: 0.0,
-            combined: 0.0,
-        })
-    }
-
-    async fn merge_personas(&self, _keep_id: Uuid, _merge_id: Uuid) -> Result<()> {
-        Ok(())
-    }
-
-    async fn find_synapse_linked_personas(
-        &self,
-        _persona_id: Uuid,
-    ) -> Result<Vec<(Uuid, String, f64)>> {
-        Ok(vec![])
     }
 
     async fn rate_limited_energy_boost(
@@ -15786,55 +15271,6 @@ impl AnalyticsStore for MockGraphStore {
     // Skill operations (Neural Skills)
     // ========================================================================
 
-    async fn create_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
-        // Validate project exists (only if projects map is populated, for backward compatibility)
-        // A transverse skill has no project, by design: nothing to validate.
-        if let Some(pid) = skill.project_id {
-            let projects = self.projects.read().await;
-            if !projects.is_empty() && !projects.contains_key(&pid) {
-                anyhow::bail!(
-                    "Project not found: {}. Cannot create skill in non-existent project.",
-                    pid
-                );
-            }
-        }
-        self.skills.write().await.insert(skill.id, skill.clone());
-        Ok(())
-    }
-
-    async fn get_skill(&self, id: Uuid) -> anyhow::Result<Option<crate::skills::SkillNode>> {
-        Ok(self.skills.read().await.get(&id).cloned())
-    }
-
-    async fn update_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
-        let mut store = self.skills.write().await;
-        if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(skill.id) {
-            e.insert(skill.clone());
-            Ok(())
-        } else {
-            anyhow::bail!("Skill not found: {}", skill.id)
-        }
-    }
-
-    async fn delete_skill(&self, id: Uuid) -> anyhow::Result<bool> {
-        let existed = self.skills.write().await.remove(&id).is_some();
-        if existed {
-            self.skill_members.write().await.remove(&id);
-        }
-        Ok(existed)
-    }
-
-    async fn rescope_skill(&self, skill_id: Uuid, project_id: Option<Uuid>) -> anyhow::Result<()> {
-        let mut skills = self.skills.write().await;
-        match skills.values_mut().find(|s| s.id == skill_id) {
-            Some(skill) => {
-                skill.project_id = project_id;
-                Ok(())
-            }
-            None => anyhow::bail!("skill {} not found", skill_id),
-        }
-    }
-
     async fn rescope_protocol(
         &self,
         protocol_id: Uuid,
@@ -15848,278 +15284,6 @@ impl AnalyticsStore for MockGraphStore {
             }
             None => anyhow::bail!("protocol {} not found", protocol_id),
         }
-    }
-
-    async fn list_skills(
-        &self,
-        project_id: Option<Uuid>,
-        status: Option<crate::skills::SkillStatus>,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<(Vec<crate::skills::SkillNode>, usize)> {
-        let store = self.skills.read().await;
-        let mut filtered: Vec<_> = store
-            .values()
-            .filter(|s| match project_id {
-                Some(pid) => s.project_id == Some(pid) || s.project_id.is_none(),
-                None => s.project_id.is_none(),
-            })
-            .filter(|s| status.is_none_or(|st| s.status == st))
-            .cloned()
-            .collect();
-        // Sort by energy DESC, name ASC (consistent with Neo4j query)
-        filtered.sort_by(|a, b| {
-            b.energy
-                .partial_cmp(&a.energy)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        let total = filtered.len();
-        let page = filtered.into_iter().skip(offset).take(limit).collect();
-        Ok((page, total))
-    }
-
-    async fn get_skill_members(
-        &self,
-        skill_id: Uuid,
-    ) -> anyhow::Result<(Vec<crate::notes::Note>, Vec<DecisionNode>)> {
-        let members = self.skill_members.read().await;
-        let entries = members.get(&skill_id).cloned().unwrap_or_default();
-        let notes_store = self.notes.read().await;
-        let decisions_store = self.decisions.read().await;
-        let mut notes = Vec::new();
-        let mut decisions = Vec::new();
-        for (entity_type, entity_id) in &entries {
-            match entity_type.as_str() {
-                "note" => {
-                    if let Some(n) = notes_store.get(entity_id) {
-                        notes.push(n.clone());
-                    }
-                }
-                "decision" => {
-                    if let Some(d) = decisions_store.get(entity_id) {
-                        decisions.push(d.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok((notes, decisions))
-    }
-
-    async fn add_skill_member(
-        &self,
-        skill_id: Uuid,
-        entity_type: &str,
-        entity_id: Uuid,
-    ) -> anyhow::Result<()> {
-        let entry = (entity_type.to_string(), entity_id);
-        let mut members = self.skill_members.write().await;
-        let list = members.entry(skill_id).or_default();
-        if !list.contains(&entry) {
-            list.push(entry);
-            // Update counters on the skill (consistent with Neo4j behavior)
-            drop(members);
-            let mut skills = self.skills.write().await;
-            if let Some(skill) = skills.get_mut(&skill_id) {
-                match entity_type {
-                    "note" => skill.note_count += 1,
-                    "decision" => skill.decision_count += 1,
-                    _ => {}
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn remove_skill_member(
-        &self,
-        skill_id: Uuid,
-        entity_type: &str,
-        entity_id: Uuid,
-    ) -> anyhow::Result<bool> {
-        let entry = (entity_type.to_string(), entity_id);
-        let mut members = self.skill_members.write().await;
-        if let Some(list) = members.get_mut(&skill_id) {
-            let len_before = list.len();
-            list.retain(|e| e != &entry);
-            Ok(list.len() < len_before)
-        } else {
-            Ok(false)
-        }
-    }
-
-    async fn remove_all_skill_members(&self, skill_id: Uuid) -> anyhow::Result<i64> {
-        let mut members = self.skill_members.write().await;
-        if let Some(list) = members.remove(&skill_id) {
-            Ok(list.len() as i64)
-        } else {
-            Ok(0)
-        }
-    }
-
-    async fn get_skills_for_note(
-        &self,
-        note_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
-        let members = self.skill_members.read().await;
-        let skills_store = self.skills.read().await;
-        let mut result = Vec::new();
-        for (skill_id, entries) in members.iter() {
-            if entries.iter().any(|(t, id)| t == "note" && *id == note_id) {
-                if let Some(s) = skills_store.get(skill_id) {
-                    result.push(s.clone());
-                }
-            }
-        }
-        // Sort by energy DESC for consistency with Neo4j query
-        result.sort_by(|a, b| {
-            b.energy
-                .partial_cmp(&a.energy)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        Ok(result)
-    }
-
-    async fn get_skills_for_project(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
-        let store = self.skills.read().await;
-        Ok(store
-            .values()
-            .filter(|s| s.project_id == Some(project_id))
-            .cloned()
-            .collect())
-    }
-
-    async fn activate_skill(
-        &self,
-        skill_id: Uuid,
-        _query: &str,
-    ) -> anyhow::Result<crate::skills::ActivatedSkillContext> {
-        let skill = self
-            .get_skill(skill_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Skill not found: {}", skill_id))?;
-        // Return actual member notes/decisions (consistent with Neo4j behavior)
-        let (member_notes, relevant_decisions) = self.get_skill_members(skill_id).await?;
-        // Wrap notes as ActivatedNote
-        let activated_notes: Vec<crate::neurons::activation::ActivatedNote> = member_notes
-            .iter()
-            .map(|n| crate::neurons::activation::ActivatedNote {
-                note: n.clone(),
-                activation_score: 1.0,
-                source: crate::neurons::activation::ActivationSource::Direct,
-                entity_type: "note".to_string(),
-            })
-            .collect();
-        // Build context_text from note content
-        let context_text = if let Some(ref tpl) = skill.context_template {
-            tpl.clone()
-        } else {
-            member_notes
-                .iter()
-                .map(|n| n.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        };
-        Ok(crate::skills::ActivatedSkillContext {
-            skill,
-            activated_notes,
-            relevant_decisions,
-            context_text,
-            confidence: 1.0,
-        })
-    }
-
-    async fn increment_skill_activation(&self, skill_id: Uuid) -> anyhow::Result<()> {
-        let mut store = self.skills.write().await;
-        if let Some(skill) = store.get_mut(&skill_id) {
-            skill.activation_count += 1;
-        }
-        Ok(())
-    }
-
-    async fn match_skills_by_trigger(
-        &self,
-        project_id: Option<Uuid>,
-        input: &str,
-    ) -> anyhow::Result<Vec<(crate::skills::SkillNode, f64)>> {
-        let store = self.skills.read().await;
-        let candidates: Vec<_> = store
-            .values()
-            .filter(|s| {
-                let in_scope = match project_id {
-                    Some(pid) => s.project_id == Some(pid) || s.project_id.is_none(),
-                    None => s.project_id.is_none(),
-                };
-                in_scope
-                    && matches!(
-                        s.status,
-                        crate::skills::SkillStatus::Active | crate::skills::SkillStatus::Emerging
-                    )
-            })
-            .cloned()
-            .collect();
-        drop(store);
-
-        let mut results = Vec::new();
-        for skill in candidates {
-            // Evaluate trigger_patterns against input (if skill has triggers)
-            let mut best_confidence = None;
-            for trigger in &skill.trigger_patterns {
-                let matched = match trigger.pattern_type {
-                    crate::skills::TriggerType::Regex => {
-                        regex::RegexBuilder::new(&format!("(?i){}", &trigger.pattern_value))
-                            .build()
-                            .map(|re| re.is_match(input))
-                            .unwrap_or(false)
-                    }
-                    crate::skills::TriggerType::FileGlob => {
-                        glob::Pattern::new(&trigger.pattern_value)
-                            .map(|g| g.matches(input))
-                            .unwrap_or(false)
-                    }
-                    crate::skills::TriggerType::Semantic => {
-                        // Semantic triggers can't be evaluated in mock
-                        false
-                    }
-                    crate::skills::TriggerType::McpAction => {
-                        crate::skills::activation::match_mcp_action_trigger(
-                            &trigger.pattern_value,
-                            input,
-                        )
-                    }
-                };
-                if matched {
-                    let c = trigger.confidence_threshold;
-                    best_confidence = Some(best_confidence.map_or(c, |prev: f64| prev.max(c)));
-                }
-            }
-            // If no triggers defined, fall back to matching all (backward compatibility)
-            let confidence = if skill.trigger_patterns.is_empty() {
-                1.0
-            } else if let Some(c) = best_confidence {
-                c
-            } else {
-                continue; // Has triggers but none matched → skip
-            };
-            // Emerging skills get 0.8x penalty
-            let final_confidence = if skill.status == crate::skills::SkillStatus::Emerging {
-                confidence * 0.8
-            } else {
-                confidence
-            };
-            results.push((skill, final_confidence));
-        }
-        // Sort by energy DESC for consistency with Neo4j
-        results.sort_by(|a, b| {
-            b.0.energy
-                .partial_cmp(&a.0.energy)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        Ok(results)
     }
 
     async fn get_synapse_graph(
@@ -16663,87 +15827,6 @@ impl AnalyticsStore for MockGraphStore {
     // ========================================================================
     // Registry operations (Skill Registry)
     // ========================================================================
-
-    async fn upsert_published_skill(
-        &self,
-        published: &crate::skills::registry::PublishedSkill,
-    ) -> anyhow::Result<()> {
-        self.published_skills
-            .write()
-            .await
-            .insert(published.id, published.clone());
-        Ok(())
-    }
-
-    async fn get_published_skill(
-        &self,
-        id: Uuid,
-    ) -> anyhow::Result<Option<crate::skills::registry::PublishedSkill>> {
-        Ok(self.published_skills.read().await.get(&id).cloned())
-    }
-
-    async fn search_published_skills(
-        &self,
-        search_query: Option<&str>,
-        min_trust: Option<f64>,
-        tags: Option<&[String]>,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<(Vec<crate::skills::registry::PublishedSkill>, usize)> {
-        let store = self.published_skills.read().await;
-        let mut filtered: Vec<_> = store
-            .values()
-            .filter(|ps| {
-                // Search filter
-                if let Some(q) = search_query {
-                    let q_lower = q.to_lowercase();
-                    if !ps.name.to_lowercase().contains(&q_lower)
-                        && !ps.description.to_lowercase().contains(&q_lower)
-                    {
-                        return false;
-                    }
-                }
-                // Min trust filter
-                if let Some(mt) = min_trust {
-                    if ps.trust_score < mt {
-                        return false;
-                    }
-                }
-                // Tags filter (AND logic)
-                if let Some(t) = tags {
-                    for tag in t {
-                        if !ps.tags.contains(tag) {
-                            return false;
-                        }
-                    }
-                }
-                true
-            })
-            .cloned()
-            .collect();
-
-        // Sort by trust_score DESC, then published_at DESC
-        filtered.sort_by(|a, b| {
-            b.trust_score
-                .partial_cmp(&a.trust_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.published_at.cmp(&a.published_at))
-        });
-
-        let total = filtered.len();
-        let page = filtered.into_iter().skip(offset).take(limit).collect();
-        Ok((page, total))
-    }
-
-    async fn increment_published_skill_imports(&self, id: Uuid) -> anyhow::Result<()> {
-        let mut store = self.published_skills.write().await;
-        if let Some(ps) = store.get_mut(&id) {
-            ps.import_count += 1;
-            Ok(())
-        } else {
-            anyhow::bail!("PublishedSkill not found: {}", id)
-        }
-    }
 
     // ========================================================================
     // Graph visualization helpers
@@ -17360,15 +16443,6 @@ impl AnalyticsStore for MockGraphStore {
                 .filter(|ae| in_breakdown_window(ae, from, to)),
             group_by,
         ))
-    }
-
-    async fn create_used_skill_relation(
-        &self,
-        _agent_execution_id: Uuid,
-        _skill_id: Uuid,
-        _result: &str,
-    ) -> anyhow::Result<()> {
-        Ok(())
     }
 
     async fn get_all_pagerank_values(&self, _project_id: Uuid) -> anyhow::Result<Vec<f64>> {
@@ -19391,5 +18465,882 @@ impl AuthStore for MockGraphStore {
         // Same predicate as the Cypher: owned by this user AND already dead.
         tokens.retain(|_, t| !(t.user_id == user_id && (t.revoked || t.expires_at < now)));
         Ok((before - tokens.len()) as u64)
+    }
+}
+
+#[async_trait]
+impl PersonaStore for MockGraphStore {
+    async fn create_persona(&self, persona: &PersonaNode) -> Result<()> {
+        self.personas
+            .write()
+            .await
+            .insert(persona.id, persona.clone());
+        Ok(())
+    }
+    async fn get_persona(&self, id: Uuid) -> Result<Option<PersonaNode>> {
+        Ok(self.personas.read().await.get(&id).cloned())
+    }
+    async fn update_persona(&self, persona: &PersonaNode) -> Result<()> {
+        let mut store = self.personas.write().await;
+        if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(persona.id) {
+            e.insert(persona.clone());
+            Ok(())
+        } else {
+            anyhow::bail!("Persona {} not found", persona.id)
+        }
+    }
+    async fn delete_persona(&self, id: Uuid) -> Result<bool> {
+        let existed = self.personas.write().await.remove(&id).is_some();
+        if existed {
+            // Clean up relations
+            self.persona_skills.write().await.remove(&id);
+            self.persona_protocols.write().await.remove(&id);
+            self.persona_feature_graph.write().await.remove(&id);
+            self.persona_files.write().await.remove(&id);
+            self.persona_functions.write().await.remove(&id);
+            self.persona_notes.write().await.remove(&id);
+            self.persona_decisions.write().await.remove(&id);
+            self.persona_extends.write().await.remove(&id);
+        }
+        Ok(existed)
+    }
+    async fn list_personas(
+        &self,
+        project_id: Uuid,
+        status: Option<PersonaStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<PersonaNode>, usize)> {
+        let store = self.personas.read().await;
+        let mut all: Vec<PersonaNode> = store
+            .values()
+            .filter(|p| p.project_id == Some(project_id))
+            .filter(|p| status.is_none_or(|s| p.status == s))
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| {
+            b.energy
+                .partial_cmp(&a.energy)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let total = all.len();
+        let page = all.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+    async fn list_global_personas(&self) -> Result<Vec<PersonaNode>> {
+        let store = self.personas.read().await;
+        Ok(store
+            .values()
+            .filter(|p| p.project_id.is_none())
+            .cloned()
+            .collect())
+    }
+    async fn add_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()> {
+        self.persona_skills
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(skill_id);
+        Ok(())
+    }
+    async fn remove_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()> {
+        if let Some(set) = self.persona_skills.write().await.get_mut(&persona_id) {
+            set.remove(&skill_id);
+        }
+        Ok(())
+    }
+    async fn add_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()> {
+        self.persona_protocols
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(protocol_id);
+        Ok(())
+    }
+    async fn remove_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()> {
+        if let Some(set) = self.persona_protocols.write().await.get_mut(&persona_id) {
+            set.remove(&protocol_id);
+        }
+        Ok(())
+    }
+    async fn increment_persona_activation(&self, persona_id: Uuid) -> Result<()> {
+        let mut personas = self.personas.write().await;
+        if let Some(persona) = personas.get_mut(&persona_id) {
+            persona.activation_count += 1;
+            persona.last_activated = Some(chrono::Utc::now());
+        }
+        Ok(())
+    }
+    async fn set_persona_feature_graph(
+        &self,
+        persona_id: Uuid,
+        feature_graph_id: Uuid,
+    ) -> Result<()> {
+        self.persona_feature_graph
+            .write()
+            .await
+            .insert(persona_id, feature_graph_id);
+        Ok(())
+    }
+    async fn remove_persona_feature_graph(&self, persona_id: Uuid) -> Result<()> {
+        self.persona_feature_graph.write().await.remove(&persona_id);
+        Ok(())
+    }
+    async fn add_persona_file(&self, persona_id: Uuid, file_path: &str, weight: f64) -> Result<()> {
+        self.persona_files
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(file_path.to_string(), weight);
+        Ok(())
+    }
+    async fn remove_persona_file(&self, persona_id: Uuid, file_path: &str) -> Result<()> {
+        if let Some(map) = self.persona_files.write().await.get_mut(&persona_id) {
+            map.remove(file_path);
+        }
+        Ok(())
+    }
+    async fn add_persona_function(
+        &self,
+        persona_id: Uuid,
+        function_id: &str,
+        weight: f64,
+    ) -> Result<()> {
+        self.persona_functions
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(function_id.to_string(), weight);
+        Ok(())
+    }
+    async fn remove_persona_function(&self, persona_id: Uuid, function_id: &str) -> Result<()> {
+        if let Some(map) = self.persona_functions.write().await.get_mut(&persona_id) {
+            map.remove(function_id);
+        }
+        Ok(())
+    }
+    async fn add_persona_note(&self, persona_id: Uuid, note_id: Uuid, weight: f64) -> Result<()> {
+        self.persona_notes
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(note_id, weight);
+        Ok(())
+    }
+    async fn remove_persona_note(&self, persona_id: Uuid, note_id: Uuid) -> Result<()> {
+        if let Some(map) = self.persona_notes.write().await.get_mut(&persona_id) {
+            map.remove(&note_id);
+        }
+        Ok(())
+    }
+    async fn add_persona_decision(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
+    ) -> Result<()> {
+        self.persona_decisions
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(decision_id, weight);
+        Ok(())
+    }
+    async fn remove_persona_decision(&self, persona_id: Uuid, decision_id: Uuid) -> Result<()> {
+        if let Some(map) = self.persona_decisions.write().await.get_mut(&persona_id) {
+            map.remove(&decision_id);
+        }
+        Ok(())
+    }
+    async fn add_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()> {
+        self.persona_extends
+            .write()
+            .await
+            .entry(child_id)
+            .or_default()
+            .push(parent_id);
+        Ok(())
+    }
+    async fn remove_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()> {
+        if let Some(vec) = self.persona_extends.write().await.get_mut(&child_id) {
+            vec.retain(|&id| id != parent_id);
+        }
+        Ok(())
+    }
+    async fn get_persona_subgraph(&self, persona_id: Uuid) -> Result<PersonaSubgraph> {
+        let persona = self
+            .get_persona(persona_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Persona {} not found", persona_id))?;
+
+        let files: Vec<PersonaWeightedRelation> = self
+            .persona_files
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|m| {
+                m.iter()
+                    .map(|(path, &w)| PersonaWeightedRelation {
+                        entity_type: "file".to_string(),
+                        entity_id: path.clone(),
+                        weight: w,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let functions: Vec<PersonaWeightedRelation> = self
+            .persona_functions
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|m| {
+                m.iter()
+                    .map(|(fid, &w)| PersonaWeightedRelation {
+                        entity_type: "function".to_string(),
+                        entity_id: fid.clone(),
+                        weight: w,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let notes: Vec<PersonaWeightedRelation> = self
+            .persona_notes
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|m| {
+                m.iter()
+                    .map(|(nid, &w)| PersonaWeightedRelation {
+                        entity_type: "note".to_string(),
+                        entity_id: nid.to_string(),
+                        weight: w,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let decisions: Vec<PersonaWeightedRelation> = self
+            .persona_decisions
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|m| {
+                m.iter()
+                    .map(|(did, &w)| PersonaWeightedRelation {
+                        entity_type: "decision".to_string(),
+                        entity_id: did.to_string(),
+                        weight: w,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let skills: Vec<PersonaWeightedRelation> = self
+            .persona_skills
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|s| {
+                s.iter()
+                    .map(|sid| PersonaWeightedRelation {
+                        entity_type: "skill".to_string(),
+                        entity_id: sid.to_string(),
+                        weight: 1.0,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let protocols: Vec<PersonaWeightedRelation> = self
+            .persona_protocols
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|s| {
+                s.iter()
+                    .map(|pid| PersonaWeightedRelation {
+                        entity_type: "protocol".to_string(),
+                        entity_id: pid.to_string(),
+                        weight: 1.0,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let feature_graph_id = self
+            .persona_feature_graph
+            .read()
+            .await
+            .get(&persona_id)
+            .copied();
+
+        let parents: Vec<PersonaWeightedRelation> = self
+            .persona_extends
+            .read()
+            .await
+            .get(&persona_id)
+            .map(|ids| {
+                ids.iter()
+                    .map(|pid| PersonaWeightedRelation {
+                        entity_type: "persona".to_string(),
+                        entity_id: pid.to_string(),
+                        weight: 1.0,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let children: Vec<PersonaWeightedRelation> = Vec::new(); // Mock doesn't track reverse extends
+
+        let total_entities = files.len()
+            + functions.len()
+            + notes.len()
+            + decisions.len()
+            + skills.len()
+            + protocols.len()
+            + if feature_graph_id.is_some() { 1 } else { 0 };
+
+        Ok(PersonaSubgraph {
+            persona_id,
+            persona_name: persona.name,
+            files,
+            functions,
+            notes,
+            decisions,
+            skills,
+            protocols,
+            feature_graph_id,
+            parents,
+            children,
+            stats: PersonaSubgraphStats {
+                total_entities,
+                coverage_score: 0.0,
+                freshness: 0.0,
+            },
+        })
+    }
+    async fn find_personas_for_file(
+        &self,
+        file_path: &str,
+        project_id: Uuid,
+    ) -> Result<Vec<(PersonaNode, f64)>> {
+        let personas = self.personas.read().await;
+        let files = self.persona_files.read().await;
+        let mut results: Vec<(PersonaNode, f64)> = Vec::new();
+        for persona in personas.values() {
+            if persona.project_id != Some(project_id) {
+                continue;
+            }
+            if let Some(file_map) = files.get(&persona.id) {
+                if let Some(&weight) = file_map.get(file_path) {
+                    results.push((persona.clone(), weight));
+                }
+            }
+        }
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(results)
+    }
+    async fn get_all_persona_knows(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(PersonaNode, String, f64)>> {
+        let personas = self.personas.read().await;
+        let files = self.persona_files.read().await;
+        let mut results: Vec<(PersonaNode, String, f64)> = Vec::new();
+        for persona in personas.values() {
+            if persona.project_id != Some(project_id) {
+                continue;
+            }
+            if let Some(file_map) = files.get(&persona.id) {
+                for (path, &weight) in file_map {
+                    results.push((persona.clone(), path.clone(), weight));
+                }
+            }
+        }
+        results.sort_by(|a, b| {
+            a.0.name
+                .cmp(&b.0.name)
+                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        Ok(results)
+    }
+    async fn maintain_personas(&self, _project_id: Uuid) -> Result<(usize, usize, usize)> {
+        Ok((0, 0, 0))
+    }
+    async fn detect_personas(
+        &self,
+        _project_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::persona::PersonaProposal>> {
+        Ok(vec![])
+    }
+    async fn find_adjacent_personas(
+        &self,
+        _file_path: &str,
+        _project_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>> {
+        Ok(vec![])
+    }
+    async fn find_relevant_personas_for_note(
+        &self,
+        _file_paths: &[String],
+        _project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>> {
+        Ok(vec![])
+    }
+    async fn find_relevant_personas_for_decision(
+        &self,
+        _decision_id: Uuid,
+        _project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>> {
+        Ok(vec![])
+    }
+    async fn auto_link_note_to_persona(
+        &self,
+        _persona_id: Uuid,
+        _note_id: Uuid,
+        _weight: f64,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn auto_link_decision_to_persona(
+        &self,
+        _persona_id: Uuid,
+        _decision_id: Uuid,
+        _weight: f64,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn auto_link_file_to_persona(
+        &self,
+        _persona_id: Uuid,
+        _file_path: &str,
+        _weight: f64,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn compute_persona_affinity(
+        &self,
+        _persona_a: Uuid,
+        _persona_b: Uuid,
+    ) -> Result<crate::neo4j::persona::PersonaAffinityScore> {
+        Ok(crate::neo4j::persona::PersonaAffinityScore {
+            persona_a_id: _persona_a,
+            persona_b_id: _persona_b,
+            jaccard_files: 0.0,
+            synapse_density: 0.0,
+            combined: 0.0,
+        })
+    }
+    async fn merge_personas(&self, _keep_id: Uuid, _merge_id: Uuid) -> Result<()> {
+        Ok(())
+    }
+    async fn find_synapse_linked_personas(
+        &self,
+        _persona_id: Uuid,
+    ) -> Result<Vec<(Uuid, String, f64)>> {
+        Ok(vec![])
+    }
+}
+
+#[async_trait]
+impl SkillStore for MockGraphStore {
+    async fn create_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
+        // Validate project exists (only if projects map is populated, for backward compatibility)
+        // A transverse skill has no project, by design: nothing to validate.
+        if let Some(pid) = skill.project_id {
+            let projects = self.projects.read().await;
+            if !projects.is_empty() && !projects.contains_key(&pid) {
+                anyhow::bail!(
+                    "Project not found: {}. Cannot create skill in non-existent project.",
+                    pid
+                );
+            }
+        }
+        self.skills.write().await.insert(skill.id, skill.clone());
+        Ok(())
+    }
+    async fn get_skill(&self, id: Uuid) -> anyhow::Result<Option<crate::skills::SkillNode>> {
+        Ok(self.skills.read().await.get(&id).cloned())
+    }
+    async fn update_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
+        let mut store = self.skills.write().await;
+        if let std::collections::hash_map::Entry::Occupied(mut e) = store.entry(skill.id) {
+            e.insert(skill.clone());
+            Ok(())
+        } else {
+            anyhow::bail!("Skill not found: {}", skill.id)
+        }
+    }
+    async fn delete_skill(&self, id: Uuid) -> anyhow::Result<bool> {
+        let existed = self.skills.write().await.remove(&id).is_some();
+        if existed {
+            self.skill_members.write().await.remove(&id);
+        }
+        Ok(existed)
+    }
+    async fn rescope_skill(&self, skill_id: Uuid, project_id: Option<Uuid>) -> anyhow::Result<()> {
+        let mut skills = self.skills.write().await;
+        match skills.values_mut().find(|s| s.id == skill_id) {
+            Some(skill) => {
+                skill.project_id = project_id;
+                Ok(())
+            }
+            None => anyhow::bail!("skill {} not found", skill_id),
+        }
+    }
+    async fn list_skills(
+        &self,
+        project_id: Option<Uuid>,
+        status: Option<crate::skills::SkillStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::skills::SkillNode>, usize)> {
+        let store = self.skills.read().await;
+        let mut filtered: Vec<_> = store
+            .values()
+            .filter(|s| match project_id {
+                Some(pid) => s.project_id == Some(pid) || s.project_id.is_none(),
+                None => s.project_id.is_none(),
+            })
+            .filter(|s| status.is_none_or(|st| s.status == st))
+            .cloned()
+            .collect();
+        // Sort by energy DESC, name ASC (consistent with Neo4j query)
+        filtered.sort_by(|a, b| {
+            b.energy
+                .partial_cmp(&a.energy)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        let total = filtered.len();
+        let page = filtered.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+    async fn get_skill_members(
+        &self,
+        skill_id: Uuid,
+    ) -> anyhow::Result<(Vec<crate::notes::Note>, Vec<DecisionNode>)> {
+        let members = self.skill_members.read().await;
+        let entries = members.get(&skill_id).cloned().unwrap_or_default();
+        let notes_store = self.notes.read().await;
+        let decisions_store = self.decisions.read().await;
+        let mut notes = Vec::new();
+        let mut decisions = Vec::new();
+        for (entity_type, entity_id) in &entries {
+            match entity_type.as_str() {
+                "note" => {
+                    if let Some(n) = notes_store.get(entity_id) {
+                        notes.push(n.clone());
+                    }
+                }
+                "decision" => {
+                    if let Some(d) = decisions_store.get(entity_id) {
+                        decisions.push(d.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok((notes, decisions))
+    }
+    async fn add_skill_member(
+        &self,
+        skill_id: Uuid,
+        entity_type: &str,
+        entity_id: Uuid,
+    ) -> anyhow::Result<()> {
+        let entry = (entity_type.to_string(), entity_id);
+        let mut members = self.skill_members.write().await;
+        let list = members.entry(skill_id).or_default();
+        if !list.contains(&entry) {
+            list.push(entry);
+            // Update counters on the skill (consistent with Neo4j behavior)
+            drop(members);
+            let mut skills = self.skills.write().await;
+            if let Some(skill) = skills.get_mut(&skill_id) {
+                match entity_type {
+                    "note" => skill.note_count += 1,
+                    "decision" => skill.decision_count += 1,
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+    async fn remove_skill_member(
+        &self,
+        skill_id: Uuid,
+        entity_type: &str,
+        entity_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        let entry = (entity_type.to_string(), entity_id);
+        let mut members = self.skill_members.write().await;
+        if let Some(list) = members.get_mut(&skill_id) {
+            let len_before = list.len();
+            list.retain(|e| e != &entry);
+            Ok(list.len() < len_before)
+        } else {
+            Ok(false)
+        }
+    }
+    async fn remove_all_skill_members(&self, skill_id: Uuid) -> anyhow::Result<i64> {
+        let mut members = self.skill_members.write().await;
+        if let Some(list) = members.remove(&skill_id) {
+            Ok(list.len() as i64)
+        } else {
+            Ok(0)
+        }
+    }
+    async fn get_skills_for_note(
+        &self,
+        note_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
+        let members = self.skill_members.read().await;
+        let skills_store = self.skills.read().await;
+        let mut result = Vec::new();
+        for (skill_id, entries) in members.iter() {
+            if entries.iter().any(|(t, id)| t == "note" && *id == note_id) {
+                if let Some(s) = skills_store.get(skill_id) {
+                    result.push(s.clone());
+                }
+            }
+        }
+        // Sort by energy DESC for consistency with Neo4j query
+        result.sort_by(|a, b| {
+            b.energy
+                .partial_cmp(&a.energy)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(result)
+    }
+    async fn get_skills_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
+        let store = self.skills.read().await;
+        Ok(store
+            .values()
+            .filter(|s| s.project_id == Some(project_id))
+            .cloned()
+            .collect())
+    }
+    async fn activate_skill(
+        &self,
+        skill_id: Uuid,
+        _query: &str,
+    ) -> anyhow::Result<crate::skills::ActivatedSkillContext> {
+        let skill = self
+            .get_skill(skill_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Skill not found: {}", skill_id))?;
+        // Return actual member notes/decisions (consistent with Neo4j behavior)
+        let (member_notes, relevant_decisions) = self.get_skill_members(skill_id).await?;
+        // Wrap notes as ActivatedNote
+        let activated_notes: Vec<crate::neurons::activation::ActivatedNote> = member_notes
+            .iter()
+            .map(|n| crate::neurons::activation::ActivatedNote {
+                note: n.clone(),
+                activation_score: 1.0,
+                source: crate::neurons::activation::ActivationSource::Direct,
+                entity_type: "note".to_string(),
+            })
+            .collect();
+        // Build context_text from note content
+        let context_text = if let Some(ref tpl) = skill.context_template {
+            tpl.clone()
+        } else {
+            member_notes
+                .iter()
+                .map(|n| n.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+        Ok(crate::skills::ActivatedSkillContext {
+            skill,
+            activated_notes,
+            relevant_decisions,
+            context_text,
+            confidence: 1.0,
+        })
+    }
+    async fn increment_skill_activation(&self, skill_id: Uuid) -> anyhow::Result<()> {
+        let mut store = self.skills.write().await;
+        if let Some(skill) = store.get_mut(&skill_id) {
+            skill.activation_count += 1;
+        }
+        Ok(())
+    }
+    async fn match_skills_by_trigger(
+        &self,
+        project_id: Option<Uuid>,
+        input: &str,
+    ) -> anyhow::Result<Vec<(crate::skills::SkillNode, f64)>> {
+        let store = self.skills.read().await;
+        let candidates: Vec<_> = store
+            .values()
+            .filter(|s| {
+                let in_scope = match project_id {
+                    Some(pid) => s.project_id == Some(pid) || s.project_id.is_none(),
+                    None => s.project_id.is_none(),
+                };
+                in_scope
+                    && matches!(
+                        s.status,
+                        crate::skills::SkillStatus::Active | crate::skills::SkillStatus::Emerging
+                    )
+            })
+            .cloned()
+            .collect();
+        drop(store);
+
+        let mut results = Vec::new();
+        for skill in candidates {
+            // Evaluate trigger_patterns against input (if skill has triggers)
+            let mut best_confidence = None;
+            for trigger in &skill.trigger_patterns {
+                let matched = match trigger.pattern_type {
+                    crate::skills::TriggerType::Regex => {
+                        regex::RegexBuilder::new(&format!("(?i){}", &trigger.pattern_value))
+                            .build()
+                            .map(|re| re.is_match(input))
+                            .unwrap_or(false)
+                    }
+                    crate::skills::TriggerType::FileGlob => {
+                        glob::Pattern::new(&trigger.pattern_value)
+                            .map(|g| g.matches(input))
+                            .unwrap_or(false)
+                    }
+                    crate::skills::TriggerType::Semantic => {
+                        // Semantic triggers can't be evaluated in mock
+                        false
+                    }
+                    crate::skills::TriggerType::McpAction => {
+                        crate::skills::activation::match_mcp_action_trigger(
+                            &trigger.pattern_value,
+                            input,
+                        )
+                    }
+                };
+                if matched {
+                    let c = trigger.confidence_threshold;
+                    best_confidence = Some(best_confidence.map_or(c, |prev: f64| prev.max(c)));
+                }
+            }
+            // If no triggers defined, fall back to matching all (backward compatibility)
+            let confidence = if skill.trigger_patterns.is_empty() {
+                1.0
+            } else if let Some(c) = best_confidence {
+                c
+            } else {
+                continue; // Has triggers but none matched → skip
+            };
+            // Emerging skills get 0.8x penalty
+            let final_confidence = if skill.status == crate::skills::SkillStatus::Emerging {
+                confidence * 0.8
+            } else {
+                confidence
+            };
+            results.push((skill, final_confidence));
+        }
+        // Sort by energy DESC for consistency with Neo4j
+        results.sort_by(|a, b| {
+            b.0.energy
+                .partial_cmp(&a.0.energy)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(results)
+    }
+    async fn upsert_published_skill(
+        &self,
+        published: &crate::skills::registry::PublishedSkill,
+    ) -> anyhow::Result<()> {
+        self.published_skills
+            .write()
+            .await
+            .insert(published.id, published.clone());
+        Ok(())
+    }
+    async fn get_published_skill(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<crate::skills::registry::PublishedSkill>> {
+        Ok(self.published_skills.read().await.get(&id).cloned())
+    }
+    async fn search_published_skills(
+        &self,
+        search_query: Option<&str>,
+        min_trust: Option<f64>,
+        tags: Option<&[String]>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::skills::registry::PublishedSkill>, usize)> {
+        let store = self.published_skills.read().await;
+        let mut filtered: Vec<_> = store
+            .values()
+            .filter(|ps| {
+                // Search filter
+                if let Some(q) = search_query {
+                    let q_lower = q.to_lowercase();
+                    if !ps.name.to_lowercase().contains(&q_lower)
+                        && !ps.description.to_lowercase().contains(&q_lower)
+                    {
+                        return false;
+                    }
+                }
+                // Min trust filter
+                if let Some(mt) = min_trust {
+                    if ps.trust_score < mt {
+                        return false;
+                    }
+                }
+                // Tags filter (AND logic)
+                if let Some(t) = tags {
+                    for tag in t {
+                        if !ps.tags.contains(tag) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+
+        // Sort by trust_score DESC, then published_at DESC
+        filtered.sort_by(|a, b| {
+            b.trust_score
+                .partial_cmp(&a.trust_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.published_at.cmp(&a.published_at))
+        });
+
+        let total = filtered.len();
+        let page = filtered.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+    async fn increment_published_skill_imports(&self, id: Uuid) -> anyhow::Result<()> {
+        let mut store = self.published_skills.write().await;
+        if let Some(ps) = store.get_mut(&id) {
+            ps.import_count += 1;
+            Ok(())
+        } else {
+            anyhow::bail!("PublishedSkill not found: {}", id)
+        }
+    }
+    async fn create_used_skill_relation(
+        &self,
+        _agent_execution_id: Uuid,
+        _skill_id: Uuid,
+        _result: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 }

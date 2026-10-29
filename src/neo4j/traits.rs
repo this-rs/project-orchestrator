@@ -100,6 +100,8 @@ pub trait GraphStore:
     + ReleaseStore
     + NoteStore
     + AnalyticsStore
+    + PersonaStore
+    + SkillStore
     + AuthStore
     + ChatStore
     + Send
@@ -2555,90 +2557,16 @@ pub trait AnalyticsStore: Send + Sync {
     // Skill operations (Neural Skills)
     // ========================================================================
 
-    /// Create a new skill node with its BELONGS_TO relationship to project.
-    async fn create_skill(&self, skill: &SkillNode) -> Result<()>;
-
-    /// Get a skill by ID.
-    async fn get_skill(&self, id: Uuid) -> Result<Option<SkillNode>>;
-
-    /// Update a skill node (replaces all mutable fields).
-    async fn update_skill(&self, skill: &SkillNode) -> Result<()>;
-
-    /// Re-scope a skill: `None` makes it transverse, `Some(pid)` attaches it.
-    ///
-    /// Moves the `BELONGS_TO` edge (never adds a second one) and writes
-    /// `project_id` in the same transaction, so a node is never left claiming a
-    /// project it is not attached to.
-    async fn rescope_skill(&self, skill_id: Uuid, project_id: Option<Uuid>) -> Result<()>;
-
     /// Re-scope a protocol: `None` makes it transverse, `Some(pid)` attaches it.
     async fn rescope_protocol(&self, protocol_id: Uuid, project_id: Option<Uuid>) -> Result<()>;
-
-    /// Delete a skill and all its relationships (CONTAINS, COVERS, BELONGS_TO).
-    /// Returns true if the skill existed and was deleted.
-    async fn delete_skill(&self, id: Uuid) -> Result<bool>;
-
-    /// List skills for a project with optional status filter and pagination.
-    /// Returns (skills, total_count).
-    async fn list_skills(
-        &self,
-        project_id: Option<Uuid>,
-        status: Option<SkillStatus>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<SkillNode>, usize)>;
 
     // ========================================================================
     // Skill membership operations
     // ========================================================================
 
-    /// Get all member notes and decisions for a skill.
-    async fn get_skill_members(&self, skill_id: Uuid) -> Result<(Vec<Note>, Vec<DecisionNode>)>;
-
-    /// Add a note or decision as a member of a skill.
-    /// `entity_type` must be "note" or "decision".
-    /// Uses MERGE for idempotence — calling twice is safe.
-    async fn add_skill_member(
-        &self,
-        skill_id: Uuid,
-        entity_type: &str,
-        entity_id: Uuid,
-    ) -> Result<()>;
-
-    /// Remove a member (note or decision) from a skill.
-    /// Returns true if the relationship existed and was removed.
-    async fn remove_skill_member(
-        &self,
-        skill_id: Uuid,
-        entity_type: &str,
-        entity_id: Uuid,
-    ) -> Result<bool>;
-
-    /// Remove all members (notes and decisions) from a skill.
-    /// Used during evolution to clean up relationships before archiving.
-    /// Returns the number of relationships removed.
-    async fn remove_all_skill_members(&self, skill_id: Uuid) -> Result<i64>;
-
     // ========================================================================
     // Skill query & activation operations
     // ========================================================================
-
-    /// Get all skills that contain a given note as member.
-    async fn get_skills_for_note(&self, note_id: Uuid) -> Result<Vec<SkillNode>>;
-
-    /// Get all skills belonging to a project (convenience for list without pagination).
-    async fn get_skills_for_project(&self, project_id: Uuid) -> Result<Vec<SkillNode>>;
-
-    /// Delete a project's archived skills that nothing references anymore
-    /// (no member, persona, protocol, execution…) and that were archived
-    /// before `archived_before`. Returns how many were deleted.
-    async fn purge_archived_empty_skills(
-        &self,
-        _project_id: Uuid,
-        _archived_before: chrono::DateTime<chrono::Utc>,
-    ) -> Result<i64> {
-        Ok(0)
-    }
 
     /// Run the pending one-time data migrations (see
     /// `neo4j::data_migrations`). Backends without migrations do nothing.
@@ -2683,100 +2611,6 @@ pub trait AnalyticsStore: Send + Sync {
         Ok(())
     }
 
-    /// Every non-archived skill of a project, uncapped.
-    ///
-    /// Skill evolution MUST compare new clusters against this set: the
-    /// capped, energy-ordered `get_skills_for_project` lets archived skills
-    /// crowd live ones out of the snapshot on large projects, and every
-    /// cluster then gets re-created as a New skill on each pass.
-    async fn get_live_skills_for_project(&self, project_id: Uuid) -> Result<Vec<SkillNode>> {
-        Ok(self
-            .get_skills_for_project(project_id)
-            .await?
-            .into_iter()
-            .filter(|s| s.status != crate::skills::SkillStatus::Archived)
-            .collect())
-    }
-
-    /// Activate a skill: collect member notes (above min energy) and relevant
-    /// decisions, assemble context text. Returns the full activation payload.
-    async fn activate_skill(&self, skill_id: Uuid, query: &str) -> Result<ActivatedSkillContext>;
-
-    /// Increment a skill's activation_count and update last_activated.
-    /// Used by hook activation paths (fire-and-forget, best-effort).
-    async fn increment_skill_activation(&self, skill_id: Uuid) -> Result<()>;
-
-    /// Match skills by evaluating trigger patterns against an input string.
-    /// Returns matching skills with their confidence scores, sorted descending.
-    /// Only matches Active/Emerging skills with reliable triggers.
-    /// Rank the competences that answer `query`, transverse library included.
-    ///
-    /// Default implementation, composed from two methods every store already
-    /// has — `list_skills` for the candidates, `match_skills_by_trigger` for the
-    /// trigger channel — and fused by [`crate::skills::activation::rank_skills`].
-    ///
-    /// Deliberately not implemented per store: the ordering is the whole
-    /// contract, so there is exactly one implementation, and the in-memory mock
-    /// exercises the very code the Neo4j path runs.
-    ///
-    /// `project_id` follows the listing convention: `None` ranks the transverse
-    /// library alone, `Some(pid)` ranks that project's competences **and** the
-    /// transverse ones.
-    async fn search_skills(
-        &self,
-        project_id: Option<Uuid>,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<crate::skills::activation::SkillMatch>> {
-        self.search_skills_with_affinity(
-            project_id,
-            query,
-            limit,
-            &std::collections::HashMap::new(),
-        )
-        .await
-    }
-
-    /// Same ranking, with the note-affinity channel supplied by the caller.
-    ///
-    /// `affinity` maps a skill id to how strongly the query matched that skill's
-    /// **member notes** (max over the matching notes, normalised to 0..1). It is a
-    /// parameter rather than something read here because it needs the note search,
-    /// which lives above the store: the store has no embedding provider.
-    ///
-    /// The channel matters for the transverse library: a competence whose name
-    /// says nothing about the question ("UI/UX — design front" for "flake de test
-    /// frontend") still scores, because its *notes* match.
-    async fn search_skills_with_affinity(
-        &self,
-        project_id: Option<Uuid>,
-        query: &str,
-        limit: usize,
-        affinity: &std::collections::HashMap<Uuid, f64>,
-    ) -> Result<Vec<crate::skills::activation::SkillMatch>> {
-        let (candidates, _) = self
-            .list_skills(
-                project_id,
-                Some(crate::skills::models::SkillStatus::Active),
-                500,
-                0,
-            )
-            .await?;
-        let triggered = self.match_skills_by_trigger(project_id, query).await?;
-        Ok(crate::skills::activation::rank_skills(
-            &candidates,
-            &triggered,
-            affinity,
-            limit,
-        ))
-    }
-
-    async fn match_skills_by_trigger(
-        &self,
-        project_id: Option<Uuid>,
-        input: &str,
-    ) -> Result<Vec<(SkillNode, f64)>>;
-
     // ========================================================================
     // Skill Detection — Graph Extraction
     // ========================================================================
@@ -2793,124 +2627,13 @@ pub trait AnalyticsStore: Send + Sync {
     // Persona operations (Living Personas)
     // ========================================================================
 
-    /// Create a new persona node. If project_id is Some, links it via BELONGS_TO.
-    async fn create_persona(&self, persona: &PersonaNode) -> Result<()>;
-
-    /// Get a persona by ID.
-    async fn get_persona(&self, id: Uuid) -> Result<Option<PersonaNode>>;
-
-    /// Update a persona node (replaces all mutable fields).
-    async fn update_persona(&self, persona: &PersonaNode) -> Result<()>;
-
-    /// Delete a persona and all its relationships.
-    /// Returns true if the persona existed and was deleted.
-    async fn delete_persona(&self, id: Uuid) -> Result<bool>;
-
-    /// List personas for a project with optional status filter and pagination.
-    /// Returns (personas, total_count).
-    async fn list_personas(
-        &self,
-        project_id: Uuid,
-        status: Option<PersonaStatus>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<PersonaNode>, usize)>;
-
-    /// List global personas (project_id IS NULL) — portable personas.
-    async fn list_global_personas(&self) -> Result<Vec<PersonaNode>>;
-
     // ========================================================================
     // Persona relation operations
     // ========================================================================
 
-    /// Add MASTERS relation: Persona -> Skill
-    async fn add_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()>;
-
-    /// Remove MASTERS relation: Persona -> Skill
-    async fn remove_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()>;
-
-    /// Add FOLLOWS relation: Persona -> Protocol
-    async fn add_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()>;
-
-    /// Remove FOLLOWS relation: Persona -> Protocol
-    async fn remove_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()>;
-
-    /// Increment activation_count and update last_activated for a Persona.
-    async fn increment_persona_activation(&self, persona_id: Uuid) -> Result<()>;
-
-    /// Add SCOPED_TO relation: Persona -> FeatureGraph
-    async fn set_persona_feature_graph(
-        &self,
-        persona_id: Uuid,
-        feature_graph_id: Uuid,
-    ) -> Result<()>;
-
-    /// Remove SCOPED_TO relation: Persona -> FeatureGraph
-    async fn remove_persona_feature_graph(&self, persona_id: Uuid) -> Result<()>;
-
-    /// Add KNOWS relation: Persona -> File (with weight)
-    async fn add_persona_file(&self, persona_id: Uuid, file_path: &str, weight: f64) -> Result<()>;
-
-    /// Remove KNOWS relation: Persona -> File
-    async fn remove_persona_file(&self, persona_id: Uuid, file_path: &str) -> Result<()>;
-
-    /// Add KNOWS relation: Persona -> Function (with weight)
-    async fn add_persona_function(
-        &self,
-        persona_id: Uuid,
-        function_id: &str,
-        weight: f64,
-    ) -> Result<()>;
-
-    /// Remove KNOWS relation: Persona -> Function
-    async fn remove_persona_function(&self, persona_id: Uuid, function_id: &str) -> Result<()>;
-
-    /// Add USES relation: Persona -> Note (with weight)
-    async fn add_persona_note(&self, persona_id: Uuid, note_id: Uuid, weight: f64) -> Result<()>;
-
-    /// Remove USES relation: Persona -> Note
-    async fn remove_persona_note(&self, persona_id: Uuid, note_id: Uuid) -> Result<()>;
-
-    /// Add USES relation: Persona -> Decision (with weight)
-    async fn add_persona_decision(
-        &self,
-        persona_id: Uuid,
-        decision_id: Uuid,
-        weight: f64,
-    ) -> Result<()>;
-
-    /// Remove USES relation: Persona -> Decision
-    async fn remove_persona_decision(&self, persona_id: Uuid, decision_id: Uuid) -> Result<()>;
-
-    /// Add EXTENDS relation: child Persona -> parent Persona
-    async fn add_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()>;
-
-    /// Remove EXTENDS relation: child Persona -> parent Persona
-    async fn remove_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()>;
-
     // ========================================================================
     // Persona subgraph (knowledge assembly)
     // ========================================================================
-
-    /// Assemble the full knowledge subgraph for a persona.
-    /// Includes all KNOWS, USES, MASTERS, FOLLOWS, SCOPED_TO, EXTENDS entities.
-    async fn get_persona_subgraph(&self, persona_id: Uuid) -> Result<PersonaSubgraph>;
-
-    /// Find personas that KNOW a given file (for activation by file match).
-    /// Returns (persona, weight) sorted by weight descending.
-    async fn find_personas_for_file(
-        &self,
-        file_path: &str,
-        project_id: Uuid,
-    ) -> Result<Vec<(PersonaNode, f64)>>;
-
-    /// Load ALL persona KNOWS relations for a project in a single query.
-    /// Returns Vec<(PersonaNode, file_path, weight)> for building a complete
-    /// PersonaFileIndex without cold-start issues.
-    async fn get_all_persona_knows(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<(PersonaNode, String, f64)>>;
 
     /// Auto-scope each persona to the FeatureGraph that best matches its KNOWS files.
     /// Returns the number of personas that were scoped.
@@ -2923,63 +2646,8 @@ pub trait AnalyticsStore: Send + Sync {
         project_id: Uuid,
     ) -> Result<crate::neo4j::persona::AdaptivePersonaThresholds>;
 
-    /// Maintain all personas for a project: decay weights, prune, recalculate cohesion.
-    /// Returns (decayed_count, pruned_count, personas_updated).
-    async fn maintain_personas(&self, project_id: Uuid) -> Result<(usize, usize, usize)>;
-
-    /// Detect potential personas from Louvain communities.
-    async fn detect_personas(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<crate::neo4j::persona::PersonaProposal>>;
-
-    /// Find personas adjacent to a file (same dir or 1-hop IMPORTS).
-    async fn find_adjacent_personas(
-        &self,
-        file_path: &str,
-        project_id: Uuid,
-    ) -> Result<Vec<(Uuid, String)>>;
-
     /// Auto-grow: create a weak KNOWS relation between persona and file.
     async fn auto_grow_file_knows(
-        &self,
-        persona_id: Uuid,
-        file_path: &str,
-        weight: f64,
-    ) -> Result<()>;
-
-    /// Find personas relevant to a note based on KNOWS file overlap.
-    async fn find_relevant_personas_for_note(
-        &self,
-        file_paths: &[String],
-        project_id: Uuid,
-    ) -> Result<Vec<(Uuid, f64)>>;
-
-    /// Find personas relevant to a decision based on KNOWS overlap with AFFECTS entities.
-    async fn find_relevant_personas_for_decision(
-        &self,
-        decision_id: Uuid,
-        project_id: Uuid,
-    ) -> Result<Vec<(Uuid, f64)>>;
-
-    /// Auto-link a note to an active persona (growth hook).
-    async fn auto_link_note_to_persona(
-        &self,
-        persona_id: Uuid,
-        note_id: Uuid,
-        weight: f64,
-    ) -> Result<()>;
-
-    /// Auto-link a decision to an active persona (growth hook).
-    async fn auto_link_decision_to_persona(
-        &self,
-        persona_id: Uuid,
-        decision_id: Uuid,
-        weight: f64,
-    ) -> Result<()>;
-
-    /// Auto-link a file to an active persona (growth hook).
-    async fn auto_link_file_to_persona(
         &self,
         persona_id: Uuid,
         file_path: &str,
@@ -2997,22 +2665,6 @@ pub trait AnalyticsStore: Send + Sync {
         file_path: &str,
         base_weight: f64,
     ) -> Result<usize>;
-
-    /// Compute affinity between two personas for merge detection.
-    async fn compute_persona_affinity(
-        &self,
-        persona_a: Uuid,
-        persona_b: Uuid,
-    ) -> Result<crate::neo4j::persona::PersonaAffinityScore>;
-
-    /// Merge persona B into persona A: transfer all KNOWS/USES, then delete B.
-    async fn merge_personas(&self, keep_id: Uuid, merge_id: Uuid) -> Result<()>;
-
-    /// Find personas linked via strong SYNAPSE connections between their USES notes.
-    async fn find_synapse_linked_personas(
-        &self,
-        persona_id: Uuid,
-    ) -> Result<Vec<(Uuid, String, f64)>>;
 
     /// Apply rate-limited energy boost to a persona. Returns true if applied.
     async fn rate_limited_energy_boost(
@@ -3458,32 +3110,6 @@ pub trait AnalyticsStore: Send + Sync {
     // Skill Registry
     // ========================================================================
 
-    /// Create or update a published skill in the registry.
-    async fn upsert_published_skill(
-        &self,
-        published: &crate::skills::registry::PublishedSkill,
-    ) -> Result<()>;
-
-    /// Get a published skill by ID.
-    async fn get_published_skill(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<crate::skills::registry::PublishedSkill>>;
-
-    /// Search published skills with optional filters.
-    /// Returns (matching entries, total count).
-    async fn search_published_skills(
-        &self,
-        query: Option<&str>,
-        min_trust: Option<f64>,
-        tags: Option<&[String]>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<crate::skills::registry::PublishedSkill>, usize)>;
-
-    /// Increment the import count for a published skill.
-    async fn increment_published_skill_imports(&self, id: Uuid) -> Result<()>;
-
     // ========================================================================
     // Graph visualization helpers (sub-file symbols, inheritance, constraints)
     // ========================================================================
@@ -3699,14 +3325,6 @@ pub trait AnalyticsStore: Send + Sync {
         from: chrono::DateTime<chrono::Utc>,
         to: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<crate::neo4j::agent_execution::CostBreakdownRow>>;
-
-    /// Create a USED_SKILL relationship from AgentExecution to Skill.
-    async fn create_used_skill_relation(
-        &self,
-        agent_execution_id: Uuid,
-        skill_id: Uuid,
-        result: &str,
-    ) -> Result<()>;
 
     // ========================================================================
     // rs-stats data providers — bulk metric retrieval for statistical analysis
@@ -4746,4 +4364,347 @@ mod tests {
             assert!(!v, "default capability `{key}` must be false");
         }
     }
+}
+
+// ============================================================================
+// Persona domain
+// ============================================================================
+
+/// The persona domain: the living personas, what they know, the files and
+/// notes they are attached to, and the matching that links them to new work.
+#[async_trait]
+pub trait PersonaStore: Send + Sync {
+    /// Create a new persona node. If project_id is Some, links it via BELONGS_TO.
+    async fn create_persona(&self, persona: &PersonaNode) -> Result<()>;
+    /// Get a persona by ID.
+    async fn get_persona(&self, id: Uuid) -> Result<Option<PersonaNode>>;
+    /// Update a persona node (replaces all mutable fields).
+    async fn update_persona(&self, persona: &PersonaNode) -> Result<()>;
+    /// Delete a persona and all its relationships.
+    /// Returns true if the persona existed and was deleted.
+    async fn delete_persona(&self, id: Uuid) -> Result<bool>;
+    /// List personas for a project with optional status filter and pagination.
+    /// Returns (personas, total_count).
+    async fn list_personas(
+        &self,
+        project_id: Uuid,
+        status: Option<PersonaStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<PersonaNode>, usize)>;
+    /// List global personas (project_id IS NULL) — portable personas.
+    async fn list_global_personas(&self) -> Result<Vec<PersonaNode>>;
+    /// Add MASTERS relation: Persona -> Skill
+    async fn add_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()>;
+    /// Remove MASTERS relation: Persona -> Skill
+    async fn remove_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()>;
+    /// Add FOLLOWS relation: Persona -> Protocol
+    async fn add_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()>;
+    /// Remove FOLLOWS relation: Persona -> Protocol
+    async fn remove_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()>;
+    /// Increment activation_count and update last_activated for a Persona.
+    async fn increment_persona_activation(&self, persona_id: Uuid) -> Result<()>;
+    /// Add SCOPED_TO relation: Persona -> FeatureGraph
+    async fn set_persona_feature_graph(
+        &self,
+        persona_id: Uuid,
+        feature_graph_id: Uuid,
+    ) -> Result<()>;
+    /// Remove SCOPED_TO relation: Persona -> FeatureGraph
+    async fn remove_persona_feature_graph(&self, persona_id: Uuid) -> Result<()>;
+    /// Add KNOWS relation: Persona -> File (with weight)
+    async fn add_persona_file(&self, persona_id: Uuid, file_path: &str, weight: f64) -> Result<()>;
+    /// Remove KNOWS relation: Persona -> File
+    async fn remove_persona_file(&self, persona_id: Uuid, file_path: &str) -> Result<()>;
+    /// Add KNOWS relation: Persona -> Function (with weight)
+    async fn add_persona_function(
+        &self,
+        persona_id: Uuid,
+        function_id: &str,
+        weight: f64,
+    ) -> Result<()>;
+    /// Remove KNOWS relation: Persona -> Function
+    async fn remove_persona_function(&self, persona_id: Uuid, function_id: &str) -> Result<()>;
+    /// Add USES relation: Persona -> Note (with weight)
+    async fn add_persona_note(&self, persona_id: Uuid, note_id: Uuid, weight: f64) -> Result<()>;
+    /// Remove USES relation: Persona -> Note
+    async fn remove_persona_note(&self, persona_id: Uuid, note_id: Uuid) -> Result<()>;
+    /// Add USES relation: Persona -> Decision (with weight)
+    async fn add_persona_decision(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
+    ) -> Result<()>;
+    /// Remove USES relation: Persona -> Decision
+    async fn remove_persona_decision(&self, persona_id: Uuid, decision_id: Uuid) -> Result<()>;
+    /// Add EXTENDS relation: child Persona -> parent Persona
+    async fn add_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()>;
+    /// Remove EXTENDS relation: child Persona -> parent Persona
+    async fn remove_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()>;
+    /// Assemble the full knowledge subgraph for a persona.
+    /// Includes all KNOWS, USES, MASTERS, FOLLOWS, SCOPED_TO, EXTENDS entities.
+    async fn get_persona_subgraph(&self, persona_id: Uuid) -> Result<PersonaSubgraph>;
+    /// Find personas that KNOW a given file (for activation by file match).
+    /// Returns (persona, weight) sorted by weight descending.
+    async fn find_personas_for_file(
+        &self,
+        file_path: &str,
+        project_id: Uuid,
+    ) -> Result<Vec<(PersonaNode, f64)>>;
+    /// Load ALL persona KNOWS relations for a project in a single query.
+    /// Returns Vec<(PersonaNode, file_path, weight)> for building a complete
+    /// PersonaFileIndex without cold-start issues.
+    async fn get_all_persona_knows(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(PersonaNode, String, f64)>>;
+    /// Maintain all personas for a project: decay weights, prune, recalculate cohesion.
+    /// Returns (decayed_count, pruned_count, personas_updated).
+    async fn maintain_personas(&self, project_id: Uuid) -> Result<(usize, usize, usize)>;
+    /// Detect potential personas from Louvain communities.
+    async fn detect_personas(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::persona::PersonaProposal>>;
+    /// Find personas adjacent to a file (same dir or 1-hop IMPORTS).
+    async fn find_adjacent_personas(
+        &self,
+        file_path: &str,
+        project_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>>;
+    /// Find personas relevant to a note based on KNOWS file overlap.
+    async fn find_relevant_personas_for_note(
+        &self,
+        file_paths: &[String],
+        project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>>;
+    /// Find personas relevant to a decision based on KNOWS overlap with AFFECTS entities.
+    async fn find_relevant_personas_for_decision(
+        &self,
+        decision_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>>;
+    /// Auto-link a note to an active persona (growth hook).
+    async fn auto_link_note_to_persona(
+        &self,
+        persona_id: Uuid,
+        note_id: Uuid,
+        weight: f64,
+    ) -> Result<()>;
+    /// Auto-link a decision to an active persona (growth hook).
+    async fn auto_link_decision_to_persona(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
+    ) -> Result<()>;
+    /// Auto-link a file to an active persona (growth hook).
+    async fn auto_link_file_to_persona(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        weight: f64,
+    ) -> Result<()>;
+    /// Compute affinity between two personas for merge detection.
+    async fn compute_persona_affinity(
+        &self,
+        persona_a: Uuid,
+        persona_b: Uuid,
+    ) -> Result<crate::neo4j::persona::PersonaAffinityScore>;
+    /// Merge persona B into persona A: transfer all KNOWS/USES, then delete B.
+    async fn merge_personas(&self, keep_id: Uuid, merge_id: Uuid) -> Result<()>;
+    /// Find personas linked via strong SYNAPSE connections between their USES notes.
+    async fn find_synapse_linked_personas(
+        &self,
+        persona_id: Uuid,
+    ) -> Result<Vec<(Uuid, String, f64)>>;
+}
+
+// ============================================================================
+// Skill domain
+// ============================================================================
+
+/// The skill domain: skills, their members and activations, and the published
+/// skills other projects can import.
+#[async_trait]
+pub trait SkillStore: Send + Sync {
+    /// Create a new skill node with its BELONGS_TO relationship to project.
+    async fn create_skill(&self, skill: &SkillNode) -> Result<()>;
+    /// Get a skill by ID.
+    async fn get_skill(&self, id: Uuid) -> Result<Option<SkillNode>>;
+    /// Update a skill node (replaces all mutable fields).
+    async fn update_skill(&self, skill: &SkillNode) -> Result<()>;
+    /// Re-scope a skill: `None` makes it transverse, `Some(pid)` attaches it.
+    ///
+    /// Moves the `BELONGS_TO` edge (never adds a second one) and writes
+    /// `project_id` in the same transaction, so a node is never left claiming a
+    /// project it is not attached to.
+    async fn rescope_skill(&self, skill_id: Uuid, project_id: Option<Uuid>) -> Result<()>;
+    /// Delete a skill and all its relationships (CONTAINS, COVERS, BELONGS_TO).
+    /// Returns true if the skill existed and was deleted.
+    async fn delete_skill(&self, id: Uuid) -> Result<bool>;
+    /// List skills for a project with optional status filter and pagination.
+    /// Returns (skills, total_count).
+    async fn list_skills(
+        &self,
+        project_id: Option<Uuid>,
+        status: Option<SkillStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<SkillNode>, usize)>;
+    /// Get all member notes and decisions for a skill.
+    async fn get_skill_members(&self, skill_id: Uuid) -> Result<(Vec<Note>, Vec<DecisionNode>)>;
+    /// Add a note or decision as a member of a skill.
+    /// `entity_type` must be "note" or "decision".
+    /// Uses MERGE for idempotence — calling twice is safe.
+    async fn add_skill_member(
+        &self,
+        skill_id: Uuid,
+        entity_type: &str,
+        entity_id: Uuid,
+    ) -> Result<()>;
+    /// Remove a member (note or decision) from a skill.
+    /// Returns true if the relationship existed and was removed.
+    async fn remove_skill_member(
+        &self,
+        skill_id: Uuid,
+        entity_type: &str,
+        entity_id: Uuid,
+    ) -> Result<bool>;
+    /// Remove all members (notes and decisions) from a skill.
+    /// Used during evolution to clean up relationships before archiving.
+    /// Returns the number of relationships removed.
+    async fn remove_all_skill_members(&self, skill_id: Uuid) -> Result<i64>;
+    /// Get all skills that contain a given note as member.
+    async fn get_skills_for_note(&self, note_id: Uuid) -> Result<Vec<SkillNode>>;
+    /// Get all skills belonging to a project (convenience for list without pagination).
+    async fn get_skills_for_project(&self, project_id: Uuid) -> Result<Vec<SkillNode>>;
+    /// Delete a project's archived skills that nothing references anymore
+    /// (no member, persona, protocol, execution…) and that were archived
+    /// before `archived_before`. Returns how many were deleted.
+    async fn purge_archived_empty_skills(
+        &self,
+        _project_id: Uuid,
+        _archived_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<i64> {
+        Ok(0)
+    }
+    /// Every non-archived skill of a project, uncapped.
+    ///
+    /// Skill evolution MUST compare new clusters against this set: the
+    /// capped, energy-ordered `get_skills_for_project` lets archived skills
+    /// crowd live ones out of the snapshot on large projects, and every
+    /// cluster then gets re-created as a New skill on each pass.
+    async fn get_live_skills_for_project(&self, project_id: Uuid) -> Result<Vec<SkillNode>> {
+        Ok(self
+            .get_skills_for_project(project_id)
+            .await?
+            .into_iter()
+            .filter(|s| s.status != crate::skills::SkillStatus::Archived)
+            .collect())
+    }
+    /// Activate a skill: collect member notes (above min energy) and relevant
+    /// decisions, assemble context text. Returns the full activation payload.
+    async fn activate_skill(&self, skill_id: Uuid, query: &str) -> Result<ActivatedSkillContext>;
+    /// Increment a skill's activation_count and update last_activated.
+    /// Used by hook activation paths (fire-and-forget, best-effort).
+    async fn increment_skill_activation(&self, skill_id: Uuid) -> Result<()>;
+    /// Match skills by evaluating trigger patterns against an input string.
+    /// Returns matching skills with their confidence scores, sorted descending.
+    /// Only matches Active/Emerging skills with reliable triggers.
+    /// Rank the competences that answer `query`, transverse library included.
+    ///
+    /// Default implementation, composed from two methods every store already
+    /// has — `list_skills` for the candidates, `match_skills_by_trigger` for the
+    /// trigger channel — and fused by [`crate::skills::activation::rank_skills`].
+    ///
+    /// Deliberately not implemented per store: the ordering is the whole
+    /// contract, so there is exactly one implementation, and the in-memory mock
+    /// exercises the very code the Neo4j path runs.
+    ///
+    /// `project_id` follows the listing convention: `None` ranks the transverse
+    /// library alone, `Some(pid)` ranks that project's competences **and** the
+    /// transverse ones.
+    async fn search_skills(
+        &self,
+        project_id: Option<Uuid>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::skills::activation::SkillMatch>> {
+        self.search_skills_with_affinity(
+            project_id,
+            query,
+            limit,
+            &std::collections::HashMap::new(),
+        )
+        .await
+    }
+    /// Same ranking, with the note-affinity channel supplied by the caller.
+    ///
+    /// `affinity` maps a skill id to how strongly the query matched that skill's
+    /// **member notes** (max over the matching notes, normalised to 0..1). It is a
+    /// parameter rather than something read here because it needs the note search,
+    /// which lives above the store: the store has no embedding provider.
+    ///
+    /// The channel matters for the transverse library: a competence whose name
+    /// says nothing about the question ("UI/UX — design front" for "flake de test
+    /// frontend") still scores, because its *notes* match.
+    async fn search_skills_with_affinity(
+        &self,
+        project_id: Option<Uuid>,
+        query: &str,
+        limit: usize,
+        affinity: &std::collections::HashMap<Uuid, f64>,
+    ) -> Result<Vec<crate::skills::activation::SkillMatch>> {
+        let (candidates, _) = self
+            .list_skills(
+                project_id,
+                Some(crate::skills::models::SkillStatus::Active),
+                500,
+                0,
+            )
+            .await?;
+        let triggered = self.match_skills_by_trigger(project_id, query).await?;
+        Ok(crate::skills::activation::rank_skills(
+            &candidates,
+            &triggered,
+            affinity,
+            limit,
+        ))
+    }
+    async fn match_skills_by_trigger(
+        &self,
+        project_id: Option<Uuid>,
+        input: &str,
+    ) -> Result<Vec<(SkillNode, f64)>>;
+    /// Create or update a published skill in the registry.
+    async fn upsert_published_skill(
+        &self,
+        published: &crate::skills::registry::PublishedSkill,
+    ) -> Result<()>;
+    /// Get a published skill by ID.
+    async fn get_published_skill(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<crate::skills::registry::PublishedSkill>>;
+    /// Search published skills with optional filters.
+    /// Returns (matching entries, total count).
+    async fn search_published_skills(
+        &self,
+        query: Option<&str>,
+        min_trust: Option<f64>,
+        tags: Option<&[String]>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<crate::skills::registry::PublishedSkill>, usize)>;
+    /// Increment the import count for a published skill.
+    async fn increment_published_skill_imports(&self, id: Uuid) -> Result<()>;
+    /// Create a USED_SKILL relationship from AgentExecution to Skill.
+    async fn create_used_skill_relation(
+        &self,
+        agent_execution_id: Uuid,
+        skill_id: Uuid,
+        result: &str,
+    ) -> Result<()>;
 }

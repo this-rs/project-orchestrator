@@ -2808,166 +2808,6 @@ impl AnalyticsStore for Neo4jClient {
     // Persona operations (delegates to neo4j/persona.rs)
     // ========================================================================
 
-    async fn create_persona(&self, persona: &PersonaNode) -> anyhow::Result<()> {
-        self.create_persona(persona).await
-    }
-
-    async fn get_persona(&self, id: Uuid) -> anyhow::Result<Option<PersonaNode>> {
-        self.get_persona(id).await
-    }
-
-    async fn update_persona(&self, persona: &PersonaNode) -> anyhow::Result<()> {
-        self.update_persona(persona).await
-    }
-
-    async fn delete_persona(&self, id: Uuid) -> anyhow::Result<bool> {
-        self.delete_persona(id).await
-    }
-
-    async fn list_personas(
-        &self,
-        project_id: Uuid,
-        status: Option<PersonaStatus>,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<(Vec<PersonaNode>, usize)> {
-        self.list_personas(project_id, status, limit, offset).await
-    }
-
-    async fn list_global_personas(&self) -> anyhow::Result<Vec<PersonaNode>> {
-        self.list_global_personas().await
-    }
-
-    async fn add_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> anyhow::Result<()> {
-        self.add_persona_skill(persona_id, skill_id).await
-    }
-
-    async fn remove_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> anyhow::Result<()> {
-        self.remove_persona_skill(persona_id, skill_id).await
-    }
-
-    async fn add_persona_protocol(
-        &self,
-        persona_id: Uuid,
-        protocol_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.add_persona_protocol(persona_id, protocol_id).await
-    }
-
-    async fn remove_persona_protocol(
-        &self,
-        persona_id: Uuid,
-        protocol_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.remove_persona_protocol(persona_id, protocol_id).await
-    }
-
-    async fn increment_persona_activation(&self, persona_id: Uuid) -> anyhow::Result<()> {
-        self.increment_persona_activation(persona_id).await
-    }
-
-    async fn set_persona_feature_graph(
-        &self,
-        persona_id: Uuid,
-        feature_graph_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.set_persona_feature_graph(persona_id, feature_graph_id)
-            .await
-    }
-
-    async fn remove_persona_feature_graph(&self, persona_id: Uuid) -> anyhow::Result<()> {
-        self.remove_persona_feature_graph(persona_id).await
-    }
-
-    async fn add_persona_file(
-        &self,
-        persona_id: Uuid,
-        file_path: &str,
-        weight: f64,
-    ) -> anyhow::Result<()> {
-        self.add_persona_file(persona_id, file_path, weight).await
-    }
-
-    async fn remove_persona_file(&self, persona_id: Uuid, file_path: &str) -> anyhow::Result<()> {
-        self.remove_persona_file(persona_id, file_path).await
-    }
-
-    async fn add_persona_function(
-        &self,
-        persona_id: Uuid,
-        function_id: &str,
-        weight: f64,
-    ) -> anyhow::Result<()> {
-        self.add_persona_function(persona_id, function_id, weight)
-            .await
-    }
-
-    async fn remove_persona_function(
-        &self,
-        persona_id: Uuid,
-        function_id: &str,
-    ) -> anyhow::Result<()> {
-        self.remove_persona_function(persona_id, function_id).await
-    }
-
-    async fn add_persona_note(
-        &self,
-        persona_id: Uuid,
-        note_id: Uuid,
-        weight: f64,
-    ) -> anyhow::Result<()> {
-        self.add_persona_note(persona_id, note_id, weight).await
-    }
-
-    async fn remove_persona_note(&self, persona_id: Uuid, note_id: Uuid) -> anyhow::Result<()> {
-        self.remove_persona_note(persona_id, note_id).await
-    }
-
-    async fn add_persona_decision(
-        &self,
-        persona_id: Uuid,
-        decision_id: Uuid,
-        weight: f64,
-    ) -> anyhow::Result<()> {
-        self.add_persona_decision(persona_id, decision_id, weight)
-            .await
-    }
-
-    async fn remove_persona_decision(
-        &self,
-        persona_id: Uuid,
-        decision_id: Uuid,
-    ) -> anyhow::Result<()> {
-        self.remove_persona_decision(persona_id, decision_id).await
-    }
-
-    async fn add_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> anyhow::Result<()> {
-        self.add_persona_extends(child_id, parent_id).await
-    }
-
-    async fn remove_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> anyhow::Result<()> {
-        self.remove_persona_extends(child_id, parent_id).await
-    }
-
-    async fn get_persona_subgraph(&self, persona_id: Uuid) -> anyhow::Result<PersonaSubgraph> {
-        self.get_persona_subgraph(persona_id).await
-    }
-
-    async fn find_personas_for_file(
-        &self,
-        file_path: &str,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<(PersonaNode, f64)>> {
-        self.find_personas_for_file(file_path, project_id).await
-    }
-
-    async fn get_all_persona_knows(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<(PersonaNode, String, f64)>> {
-        self.get_all_persona_knows(project_id).await
-    }
-
     async fn auto_scope_to_feature_graphs(&self, project_id: Uuid) -> anyhow::Result<usize> {
         self.auto_scope_to_feature_graphs(project_id).await
     }
@@ -2979,25 +2819,6 @@ impl AnalyticsStore for Neo4jClient {
         self.compute_adaptive_thresholds(project_id).await
     }
 
-    async fn maintain_personas(&self, project_id: Uuid) -> anyhow::Result<(usize, usize, usize)> {
-        self.maintain_personas(project_id).await
-    }
-
-    async fn detect_personas(
-        &self,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<crate::neo4j::persona::PersonaProposal>> {
-        self.detect_personas(project_id).await
-    }
-
-    async fn find_adjacent_personas(
-        &self,
-        file_path: &str,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<(Uuid, String)>> {
-        self.find_adjacent_personas(file_path, project_id).await
-    }
-
     async fn auto_grow_file_knows(
         &self,
         persona_id: Uuid,
@@ -3005,54 +2826,6 @@ impl AnalyticsStore for Neo4jClient {
         weight: f64,
     ) -> anyhow::Result<()> {
         self.auto_grow_file_knows(persona_id, file_path, weight)
-            .await
-    }
-
-    async fn find_relevant_personas_for_note(
-        &self,
-        file_paths: &[String],
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<(Uuid, f64)>> {
-        self.find_relevant_personas_for_note(file_paths, project_id)
-            .await
-    }
-
-    async fn find_relevant_personas_for_decision(
-        &self,
-        decision_id: Uuid,
-        project_id: Uuid,
-    ) -> anyhow::Result<Vec<(Uuid, f64)>> {
-        self.find_relevant_personas_for_decision(decision_id, project_id)
-            .await
-    }
-
-    async fn auto_link_note_to_persona(
-        &self,
-        persona_id: Uuid,
-        note_id: Uuid,
-        weight: f64,
-    ) -> anyhow::Result<()> {
-        self.auto_link_note_to_persona(persona_id, note_id, weight)
-            .await
-    }
-
-    async fn auto_link_decision_to_persona(
-        &self,
-        persona_id: Uuid,
-        decision_id: Uuid,
-        weight: f64,
-    ) -> anyhow::Result<()> {
-        self.auto_link_decision_to_persona(persona_id, decision_id, weight)
-            .await
-    }
-
-    async fn auto_link_file_to_persona(
-        &self,
-        persona_id: Uuid,
-        file_path: &str,
-        weight: f64,
-    ) -> anyhow::Result<()> {
-        self.auto_link_file_to_persona(persona_id, file_path, weight)
             .await
     }
 
@@ -3068,25 +2841,6 @@ impl AnalyticsStore for Neo4jClient {
     ) -> anyhow::Result<usize> {
         self.propagate_knows_via_co_change(persona_id, file_path, base_weight)
             .await
-    }
-
-    async fn compute_persona_affinity(
-        &self,
-        persona_a: Uuid,
-        persona_b: Uuid,
-    ) -> anyhow::Result<crate::neo4j::persona::PersonaAffinityScore> {
-        self.compute_persona_affinity(persona_a, persona_b).await
-    }
-
-    async fn merge_personas(&self, keep_id: Uuid, merge_id: Uuid) -> anyhow::Result<()> {
-        self.merge_personas(keep_id, merge_id).await
-    }
-
-    async fn find_synapse_linked_personas(
-        &self,
-        persona_id: Uuid,
-    ) -> anyhow::Result<Vec<(Uuid, String, f64)>> {
-        self.find_synapse_linked_personas(persona_id).await
     }
 
     async fn rate_limited_energy_boost(
@@ -3224,90 +2978,12 @@ impl AnalyticsStore for Neo4jClient {
     // Skill operations (delegates to neo4j/skill.rs)
     // ========================================================================
 
-    async fn create_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
-        self.create_skill(skill).await
-    }
-
-    async fn get_skill(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::skills::SkillNode>> {
-        self.get_skill(id).await
-    }
-
-    async fn update_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
-        self.update_skill(skill).await
-    }
-
-    async fn delete_skill(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
-        self.delete_skill(id).await
-    }
-
-    async fn rescope_skill(&self, skill_id: Uuid, project_id: Option<Uuid>) -> anyhow::Result<()> {
-        self.rescope_skill(skill_id, project_id).await
-    }
-
     async fn rescope_protocol(
         &self,
         protocol_id: Uuid,
         project_id: Option<Uuid>,
     ) -> anyhow::Result<()> {
         self.rescope_protocol(protocol_id, project_id).await
-    }
-
-    async fn list_skills(
-        &self,
-        project_id: Option<uuid::Uuid>,
-        status: Option<crate::skills::SkillStatus>,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<(Vec<crate::skills::SkillNode>, usize)> {
-        self.list_skills(project_id, status, limit, offset).await
-    }
-
-    async fn get_skill_members(
-        &self,
-        skill_id: uuid::Uuid,
-    ) -> anyhow::Result<(
-        Vec<crate::notes::Note>,
-        Vec<crate::neo4j::models::DecisionNode>,
-    )> {
-        self.get_skill_members(skill_id).await
-    }
-
-    async fn add_skill_member(
-        &self,
-        skill_id: uuid::Uuid,
-        entity_type: &str,
-        entity_id: uuid::Uuid,
-    ) -> anyhow::Result<()> {
-        self.add_skill_member(skill_id, entity_type, entity_id)
-            .await
-    }
-
-    async fn remove_skill_member(
-        &self,
-        skill_id: uuid::Uuid,
-        entity_type: &str,
-        entity_id: uuid::Uuid,
-    ) -> anyhow::Result<bool> {
-        self.remove_skill_member(skill_id, entity_type, entity_id)
-            .await
-    }
-
-    async fn remove_all_skill_members(&self, skill_id: uuid::Uuid) -> anyhow::Result<i64> {
-        self.remove_all_skill_members(skill_id).await
-    }
-
-    async fn get_skills_for_note(
-        &self,
-        note_id: uuid::Uuid,
-    ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
-        self.get_skills_for_note(note_id).await
-    }
-
-    async fn get_skills_for_project(
-        &self,
-        project_id: uuid::Uuid,
-    ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
-        self.get_skills_for_project(project_id).await
     }
 
     async fn weaken_node_synapses(
@@ -3340,44 +3016,8 @@ impl AnalyticsStore for Neo4jClient {
             .await
     }
 
-    async fn purge_archived_empty_skills(
-        &self,
-        project_id: uuid::Uuid,
-        archived_before: chrono::DateTime<chrono::Utc>,
-    ) -> anyhow::Result<i64> {
-        self.purge_archived_empty_skills(project_id, archived_before)
-            .await
-    }
-
     async fn run_data_migrations(&self) -> Vec<crate::neo4j::data_migrations::MigrationOutcome> {
         self.run_data_migrations().await
-    }
-
-    async fn get_live_skills_for_project(
-        &self,
-        project_id: uuid::Uuid,
-    ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
-        self.get_live_skills_for_project(project_id).await
-    }
-
-    async fn activate_skill(
-        &self,
-        skill_id: uuid::Uuid,
-        query: &str,
-    ) -> anyhow::Result<crate::skills::ActivatedSkillContext> {
-        self.activate_skill(skill_id, query).await
-    }
-
-    async fn increment_skill_activation(&self, skill_id: uuid::Uuid) -> anyhow::Result<()> {
-        self.increment_skill_activation(skill_id).await
-    }
-
-    async fn match_skills_by_trigger(
-        &self,
-        project_id: Option<uuid::Uuid>,
-        input: &str,
-    ) -> anyhow::Result<Vec<(crate::skills::SkillNode, f64)>> {
-        self.match_skills_by_trigger(project_id, input).await
     }
 
     async fn get_synapse_graph(
@@ -3664,36 +3304,6 @@ impl AnalyticsStore for Neo4jClient {
     // ========================================================================
     // Registry operations (Skill Registry)
     // ========================================================================
-
-    async fn upsert_published_skill(
-        &self,
-        published: &crate::skills::registry::PublishedSkill,
-    ) -> anyhow::Result<()> {
-        self.upsert_published_skill(published).await
-    }
-
-    async fn get_published_skill(
-        &self,
-        id: Uuid,
-    ) -> anyhow::Result<Option<crate::skills::registry::PublishedSkill>> {
-        self.get_published_skill(id).await
-    }
-
-    async fn search_published_skills(
-        &self,
-        search_query: Option<&str>,
-        min_trust: Option<f64>,
-        tags: Option<&[String]>,
-        limit: usize,
-        offset: usize,
-    ) -> anyhow::Result<(Vec<crate::skills::registry::PublishedSkill>, usize)> {
-        self.search_published_skills(search_query, min_trust, tags, limit, offset)
-            .await
-    }
-
-    async fn increment_published_skill_imports(&self, id: Uuid) -> anyhow::Result<()> {
-        self.increment_published_skill_imports(id).await
-    }
 
     // ========================================================================
     // Graph visualization helpers
@@ -4019,16 +3629,6 @@ impl AnalyticsStore for Neo4jClient {
         verification_json: &str,
     ) -> anyhow::Result<()> {
         self.record_agent_execution_verification_impl(agent_execution_id, verification_json)
-            .await
-    }
-
-    async fn create_used_skill_relation(
-        &self,
-        agent_execution_id: Uuid,
-        skill_id: Uuid,
-        result: &str,
-    ) -> anyhow::Result<()> {
-        self.create_used_skill_relation_impl(agent_execution_id, skill_id, result)
             .await
     }
 
@@ -4978,5 +4578,354 @@ impl AuthStore for Neo4jClient {
 
     async fn purge_mcp_tokens(&self, user_id: Uuid) -> anyhow::Result<u64> {
         self.purge_mcp_tokens(user_id).await
+    }
+}
+
+#[async_trait]
+impl PersonaStore for Neo4jClient {
+    async fn create_persona(&self, persona: &PersonaNode) -> anyhow::Result<()> {
+        self.create_persona(persona).await
+    }
+    async fn get_persona(&self, id: Uuid) -> anyhow::Result<Option<PersonaNode>> {
+        self.get_persona(id).await
+    }
+    async fn update_persona(&self, persona: &PersonaNode) -> anyhow::Result<()> {
+        self.update_persona(persona).await
+    }
+    async fn delete_persona(&self, id: Uuid) -> anyhow::Result<bool> {
+        self.delete_persona(id).await
+    }
+    async fn list_personas(
+        &self,
+        project_id: Uuid,
+        status: Option<PersonaStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<PersonaNode>, usize)> {
+        self.list_personas(project_id, status, limit, offset).await
+    }
+    async fn list_global_personas(&self) -> anyhow::Result<Vec<PersonaNode>> {
+        self.list_global_personas().await
+    }
+    async fn add_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> anyhow::Result<()> {
+        self.add_persona_skill(persona_id, skill_id).await
+    }
+    async fn remove_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> anyhow::Result<()> {
+        self.remove_persona_skill(persona_id, skill_id).await
+    }
+    async fn add_persona_protocol(
+        &self,
+        persona_id: Uuid,
+        protocol_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.add_persona_protocol(persona_id, protocol_id).await
+    }
+    async fn remove_persona_protocol(
+        &self,
+        persona_id: Uuid,
+        protocol_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.remove_persona_protocol(persona_id, protocol_id).await
+    }
+    async fn increment_persona_activation(&self, persona_id: Uuid) -> anyhow::Result<()> {
+        self.increment_persona_activation(persona_id).await
+    }
+    async fn set_persona_feature_graph(
+        &self,
+        persona_id: Uuid,
+        feature_graph_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.set_persona_feature_graph(persona_id, feature_graph_id)
+            .await
+    }
+    async fn remove_persona_feature_graph(&self, persona_id: Uuid) -> anyhow::Result<()> {
+        self.remove_persona_feature_graph(persona_id).await
+    }
+    async fn add_persona_file(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        weight: f64,
+    ) -> anyhow::Result<()> {
+        self.add_persona_file(persona_id, file_path, weight).await
+    }
+    async fn remove_persona_file(&self, persona_id: Uuid, file_path: &str) -> anyhow::Result<()> {
+        self.remove_persona_file(persona_id, file_path).await
+    }
+    async fn add_persona_function(
+        &self,
+        persona_id: Uuid,
+        function_id: &str,
+        weight: f64,
+    ) -> anyhow::Result<()> {
+        self.add_persona_function(persona_id, function_id, weight)
+            .await
+    }
+    async fn remove_persona_function(
+        &self,
+        persona_id: Uuid,
+        function_id: &str,
+    ) -> anyhow::Result<()> {
+        self.remove_persona_function(persona_id, function_id).await
+    }
+    async fn add_persona_note(
+        &self,
+        persona_id: Uuid,
+        note_id: Uuid,
+        weight: f64,
+    ) -> anyhow::Result<()> {
+        self.add_persona_note(persona_id, note_id, weight).await
+    }
+    async fn remove_persona_note(&self, persona_id: Uuid, note_id: Uuid) -> anyhow::Result<()> {
+        self.remove_persona_note(persona_id, note_id).await
+    }
+    async fn add_persona_decision(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
+    ) -> anyhow::Result<()> {
+        self.add_persona_decision(persona_id, decision_id, weight)
+            .await
+    }
+    async fn remove_persona_decision(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.remove_persona_decision(persona_id, decision_id).await
+    }
+    async fn add_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> anyhow::Result<()> {
+        self.add_persona_extends(child_id, parent_id).await
+    }
+    async fn remove_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> anyhow::Result<()> {
+        self.remove_persona_extends(child_id, parent_id).await
+    }
+    async fn get_persona_subgraph(&self, persona_id: Uuid) -> anyhow::Result<PersonaSubgraph> {
+        self.get_persona_subgraph(persona_id).await
+    }
+    async fn find_personas_for_file(
+        &self,
+        file_path: &str,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(PersonaNode, f64)>> {
+        self.find_personas_for_file(file_path, project_id).await
+    }
+    async fn get_all_persona_knows(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(PersonaNode, String, f64)>> {
+        self.get_all_persona_knows(project_id).await
+    }
+    async fn maintain_personas(&self, project_id: Uuid) -> anyhow::Result<(usize, usize, usize)> {
+        self.maintain_personas(project_id).await
+    }
+    async fn detect_personas(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::neo4j::persona::PersonaProposal>> {
+        self.detect_personas(project_id).await
+    }
+    async fn find_adjacent_personas(
+        &self,
+        file_path: &str,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(Uuid, String)>> {
+        self.find_adjacent_personas(file_path, project_id).await
+    }
+    async fn find_relevant_personas_for_note(
+        &self,
+        file_paths: &[String],
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(Uuid, f64)>> {
+        self.find_relevant_personas_for_note(file_paths, project_id)
+            .await
+    }
+    async fn find_relevant_personas_for_decision(
+        &self,
+        decision_id: Uuid,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(Uuid, f64)>> {
+        self.find_relevant_personas_for_decision(decision_id, project_id)
+            .await
+    }
+    async fn auto_link_note_to_persona(
+        &self,
+        persona_id: Uuid,
+        note_id: Uuid,
+        weight: f64,
+    ) -> anyhow::Result<()> {
+        self.auto_link_note_to_persona(persona_id, note_id, weight)
+            .await
+    }
+    async fn auto_link_decision_to_persona(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
+    ) -> anyhow::Result<()> {
+        self.auto_link_decision_to_persona(persona_id, decision_id, weight)
+            .await
+    }
+    async fn auto_link_file_to_persona(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        weight: f64,
+    ) -> anyhow::Result<()> {
+        self.auto_link_file_to_persona(persona_id, file_path, weight)
+            .await
+    }
+    async fn compute_persona_affinity(
+        &self,
+        persona_a: Uuid,
+        persona_b: Uuid,
+    ) -> anyhow::Result<crate::neo4j::persona::PersonaAffinityScore> {
+        self.compute_persona_affinity(persona_a, persona_b).await
+    }
+    async fn merge_personas(&self, keep_id: Uuid, merge_id: Uuid) -> anyhow::Result<()> {
+        self.merge_personas(keep_id, merge_id).await
+    }
+    async fn find_synapse_linked_personas(
+        &self,
+        persona_id: Uuid,
+    ) -> anyhow::Result<Vec<(Uuid, String, f64)>> {
+        self.find_synapse_linked_personas(persona_id).await
+    }
+}
+
+#[async_trait]
+impl SkillStore for Neo4jClient {
+    async fn create_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
+        self.create_skill(skill).await
+    }
+    async fn get_skill(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::skills::SkillNode>> {
+        self.get_skill(id).await
+    }
+    async fn update_skill(&self, skill: &crate::skills::SkillNode) -> anyhow::Result<()> {
+        self.update_skill(skill).await
+    }
+    async fn delete_skill(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+        self.delete_skill(id).await
+    }
+    async fn rescope_skill(&self, skill_id: Uuid, project_id: Option<Uuid>) -> anyhow::Result<()> {
+        self.rescope_skill(skill_id, project_id).await
+    }
+    async fn list_skills(
+        &self,
+        project_id: Option<uuid::Uuid>,
+        status: Option<crate::skills::SkillStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::skills::SkillNode>, usize)> {
+        self.list_skills(project_id, status, limit, offset).await
+    }
+    async fn get_skill_members(
+        &self,
+        skill_id: uuid::Uuid,
+    ) -> anyhow::Result<(
+        Vec<crate::notes::Note>,
+        Vec<crate::neo4j::models::DecisionNode>,
+    )> {
+        self.get_skill_members(skill_id).await
+    }
+    async fn add_skill_member(
+        &self,
+        skill_id: uuid::Uuid,
+        entity_type: &str,
+        entity_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        self.add_skill_member(skill_id, entity_type, entity_id)
+            .await
+    }
+    async fn remove_skill_member(
+        &self,
+        skill_id: uuid::Uuid,
+        entity_type: &str,
+        entity_id: uuid::Uuid,
+    ) -> anyhow::Result<bool> {
+        self.remove_skill_member(skill_id, entity_type, entity_id)
+            .await
+    }
+    async fn remove_all_skill_members(&self, skill_id: uuid::Uuid) -> anyhow::Result<i64> {
+        self.remove_all_skill_members(skill_id).await
+    }
+    async fn get_skills_for_note(
+        &self,
+        note_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
+        self.get_skills_for_note(note_id).await
+    }
+    async fn get_skills_for_project(
+        &self,
+        project_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
+        self.get_skills_for_project(project_id).await
+    }
+    async fn purge_archived_empty_skills(
+        &self,
+        project_id: uuid::Uuid,
+        archived_before: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<i64> {
+        self.purge_archived_empty_skills(project_id, archived_before)
+            .await
+    }
+    async fn get_live_skills_for_project(
+        &self,
+        project_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<crate::skills::SkillNode>> {
+        self.get_live_skills_for_project(project_id).await
+    }
+    async fn activate_skill(
+        &self,
+        skill_id: uuid::Uuid,
+        query: &str,
+    ) -> anyhow::Result<crate::skills::ActivatedSkillContext> {
+        self.activate_skill(skill_id, query).await
+    }
+    async fn increment_skill_activation(&self, skill_id: uuid::Uuid) -> anyhow::Result<()> {
+        self.increment_skill_activation(skill_id).await
+    }
+    async fn match_skills_by_trigger(
+        &self,
+        project_id: Option<uuid::Uuid>,
+        input: &str,
+    ) -> anyhow::Result<Vec<(crate::skills::SkillNode, f64)>> {
+        self.match_skills_by_trigger(project_id, input).await
+    }
+    async fn upsert_published_skill(
+        &self,
+        published: &crate::skills::registry::PublishedSkill,
+    ) -> anyhow::Result<()> {
+        self.upsert_published_skill(published).await
+    }
+    async fn get_published_skill(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<Option<crate::skills::registry::PublishedSkill>> {
+        self.get_published_skill(id).await
+    }
+    async fn search_published_skills(
+        &self,
+        search_query: Option<&str>,
+        min_trust: Option<f64>,
+        tags: Option<&[String]>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<crate::skills::registry::PublishedSkill>, usize)> {
+        self.search_published_skills(search_query, min_trust, tags, limit, offset)
+            .await
+    }
+    async fn increment_published_skill_imports(&self, id: Uuid) -> anyhow::Result<()> {
+        self.increment_published_skill_imports(id).await
+    }
+    async fn create_used_skill_relation(
+        &self,
+        agent_execution_id: Uuid,
+        skill_id: Uuid,
+        result: &str,
+    ) -> anyhow::Result<()> {
+        self.create_used_skill_relation_impl(agent_execution_id, skill_id, result)
+            .await
     }
 }
