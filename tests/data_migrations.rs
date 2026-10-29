@@ -799,7 +799,12 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         let store: &dyn GraphStore = &client;
         store.run_data_migrations().await
     };
-    assert_eq!(first.len(), 5);
+    // The runner must have run EVERY registered migration — compared to the
+    // registry, not to a frozen number. Hard-coding it turned a new migration
+    // into a CI failure that had nothing to do with the migration itself
+    // (measured 29/10/2026: adding one made this line fail with 6 != 5).
+    let registered = Neo4jClient::data_migrations().len();
+    assert_eq!(first.len(), registered, "{first:?}");
     assert!(
         first.iter().all(|o| o.completed && o.error.is_none()),
         "{first:?}"
