@@ -90,674 +90,13 @@ impl Default for StoreCapabilities {
 /// Every public async method of `Neo4jClient` (excluding `new`, `init_schema`,
 /// `execute`, `execute_with_params`, and private helpers) is represented here.
 #[async_trait]
-pub trait GraphStore: ProjectStore + WorkspaceStore + Send + Sync {
+pub trait GraphStore: ProjectStore + WorkspaceStore + CodeStore + PlanStore + Send + Sync {
     /// Manifest of what this store actually supports.
     ///
     /// Every adapter states it explicitly, with the values its own code proves;
     /// there is deliberately no default, so a new adapter cannot inherit a
     /// flattering manifest by accident.
     fn capabilities(&self) -> StoreCapabilities;
-
-    // ========================================================================
-    // File operations
-    // ========================================================================
-
-    /// Get all file paths for a project
-    async fn get_project_file_paths(&self, project_id: Uuid) -> Result<Vec<String>>;
-
-    /// Delete a file and all its symbols
-    async fn delete_file(&self, path: &str) -> Result<()>;
-
-    /// Delete files that are no longer on the filesystem.
-    /// Returns `(files_deleted, symbols_deleted, deleted_paths)`.
-    async fn delete_stale_files(
-        &self,
-        project_id: Uuid,
-        valid_paths: &[String],
-    ) -> Result<(usize, usize, Vec<String>)>;
-
-    /// Link a file to a project (create CONTAINS relationship)
-    async fn link_file_to_project(&self, file_path: &str, project_id: Uuid) -> Result<()>;
-
-    /// Create or update a file node
-    async fn upsert_file(&self, file: &FileNode) -> Result<()>;
-
-    /// Batch create or update file nodes (UNWIND)
-    async fn batch_upsert_files(&self, files: &[FileNode]) -> Result<()>;
-
-    /// Get a file by path
-    async fn get_file(&self, path: &str) -> Result<Option<FileNode>>;
-
-    /// `(path, project_id)` of the files whose path ends with `suffix` (at most
-    /// `limit`). Used to resolve a relative file path to its owning project(s).
-    /// Defaults to no match for stores without file storage.
-    async fn find_files_by_path_suffix(
-        &self,
-        _suffix: &str,
-        _limit: usize,
-    ) -> Result<Vec<(String, Option<Uuid>)>> {
-        Ok(Vec::new())
-    }
-
-    /// List files for a project
-    async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>>;
-
-    /// Count files for a project (lightweight, no data transfer)
-    async fn count_project_files(&self, project_id: Uuid) -> Result<i64>;
-
-    /// Count orphan files for a project (lightweight — avoids the full health
-    /// report and its distribution fitting). Used by the real-time overview.
-    async fn count_orphan_files(&self, project_id: Uuid) -> Result<i64>;
-
-    /// Count CO_CHANGED pairs for a project (lightweight — no row transfer).
-    async fn count_co_change_pairs(&self, project_id: Uuid, min_count: i64) -> Result<i64>;
-
-    /// Count total protocol states and transitions across a project's protocols
-    /// in a single query (replaces the per-protocol N+1 in the overview).
-    async fn count_protocol_states_transitions(&self, project_id: Uuid) -> Result<(i64, i64)>;
-
-    /// Invalidate pre-computed GraIL properties on changed files and their neighbors.
-    ///
-    /// Sets `*_version = -1` on:
-    /// - Direct files: `cc_version`, `structural_dna_version`, `wl_hash_version`
-    /// - 1-2 hop neighbors: `cc_version` (1-hop), `wl_hash_version` (2-hop)
-    ///
-    /// Returns the total number of File nodes marked as stale.
-    async fn invalidate_computed_properties(
-        &self,
-        project_id: Uuid,
-        paths: &[String],
-    ) -> Result<u64>;
-
-    // ========================================================================
-    // Symbol operations
-    // ========================================================================
-
-    /// Create or update a function node
-    async fn upsert_function(&self, func: &FunctionNode) -> Result<()>;
-
-    /// Create or update a struct node
-    async fn upsert_struct(&self, s: &StructNode) -> Result<()>;
-
-    /// Create or update a trait node
-    async fn upsert_trait(&self, t: &TraitNode) -> Result<()>;
-
-    /// Find a trait by name (searches across all files)
-    async fn find_trait_by_name(&self, name: &str) -> Result<Option<String>>;
-
-    /// Create or update an enum node
-    async fn upsert_enum(&self, e: &EnumNode) -> Result<()>;
-
-    /// Create or update an impl block node
-    async fn upsert_impl(&self, impl_node: &ImplNode) -> Result<()>;
-
-    /// Create an import relationship between files
-    async fn create_import_relationship(
-        &self,
-        from_file: &str,
-        to_file: &str,
-        import_path: &str,
-    ) -> Result<()>;
-
-    /// Store an import node (for tracking even unresolved imports)
-    async fn upsert_import(&self, import: &ImportNode) -> Result<()>;
-
-    /// Create an IMPORTS_SYMBOL relationship from an Import to a matching Struct/Enum/Trait
-    async fn create_imports_symbol_relationship(
-        &self,
-        import_id: &str,
-        symbol_name: &str,
-        project_id: Option<Uuid>,
-    ) -> Result<()>;
-
-    /// Create a CALLS relationship between functions, scoped to the same project.
-    /// When project_id is provided, the callee is matched only within the same project
-    /// to prevent cross-project CALLS pollution.
-    /// Sets `confidence` (0.0-1.0) and `reason` properties on the CALLS relationship.
-    async fn create_call_relationship(
-        &self,
-        caller_id: &str,
-        callee_name: &str,
-        project_id: Option<Uuid>,
-        confidence: f64,
-        reason: &str,
-    ) -> Result<()>;
-
-    // ========================================================================
-    // Batch upsert operations (UNWIND)
-    // ========================================================================
-
-    /// Batch upsert functions using UNWIND for a single Neo4j transaction per call.
-    async fn batch_upsert_functions(&self, functions: &[FunctionNode]) -> Result<()>;
-
-    /// Batch upsert structs using UNWIND.
-    async fn batch_upsert_structs(&self, structs: &[StructNode]) -> Result<()>;
-
-    /// Batch upsert traits using UNWIND.
-    async fn batch_upsert_traits(&self, traits: &[TraitNode]) -> Result<()>;
-
-    /// Batch upsert enums using UNWIND.
-    async fn batch_upsert_enums(&self, enums: &[EnumNode]) -> Result<()>;
-
-    /// Batch upsert impl blocks using UNWIND — 3 phases matching upsert_impl behavior.
-    async fn batch_upsert_impls(&self, impls: &[ImplNode]) -> Result<()>;
-
-    /// Batch upsert imports using UNWIND.
-    async fn batch_upsert_imports(&self, imports: &[ImportNode]) -> Result<()>;
-
-    /// Batch create File→IMPORTS→File relationships using UNWIND.
-    async fn batch_create_import_relationships(
-        &self,
-        relationships: &[(String, String, String)],
-    ) -> Result<()>;
-
-    /// Batch create Import→IMPORTS_SYMBOL→(Struct|Enum|Trait) relationships using UNWIND.
-    async fn batch_create_imports_symbol_relationships(
-        &self,
-        relationships: &[(String, String, Option<Uuid>)],
-    ) -> Result<()>;
-
-    /// Batch create CALLS relationships using UNWIND — 2-phase strategy.
-    async fn batch_create_call_relationships(
-        &self,
-        calls: &[FunctionCall],
-        project_id: Option<Uuid>,
-    ) -> Result<()>;
-
-    /// Batch create EXTENDS relationships (class inheritance) using UNWIND.
-    /// Takes (child_name, child_file_path, parent_name, project_id) tuples.
-    /// Phase 1: same-file match. Phase 2: project-scoped fallback.
-    async fn batch_create_extends_relationships(
-        &self,
-        rels: &[(String, String, String, String)],
-    ) -> Result<()>;
-
-    /// Batch create IMPLEMENTS relationships (interface/protocol implementation) using UNWIND.
-    /// Takes (struct_name, struct_file_path, interface_name, project_id) tuples.
-    async fn batch_create_implements_relationships(
-        &self,
-        rels: &[(String, String, String, String)],
-    ) -> Result<()>;
-
-    /// Delete all CALLS relationships where caller and callee belong to different projects.
-    /// Returns the number of deleted relationships.
-    async fn cleanup_cross_project_calls(&self) -> Result<i64>;
-
-    /// Delete all CALLS relationships where the callee function name is a known built-in.
-    /// Returns the number of deleted relationships.
-    async fn cleanup_builtin_calls(&self) -> Result<i64>;
-
-    /// Migrate existing CALLS: set default confidence=0.50 and reason='fuzzy-global'
-    /// for relationships missing these properties.
-    async fn migrate_calls_confidence(&self) -> Result<i64>;
-
-    /// Clean up ALL sync-generated data (File, Function, Struct, Trait, Enum, Impl, Import, FeatureGraph).
-    /// Returns the total number of deleted entities/relationships.
-    async fn cleanup_sync_data(&self) -> Result<i64>;
-
-    /// Get all functions called by a function
-    async fn get_callees(&self, function_id: &str, depth: u32) -> Result<Vec<FunctionNode>>;
-
-    /// Create a USES_TYPE relationship from a function to a type
-    async fn create_uses_type_relationship(&self, function_id: &str, type_name: &str)
-        -> Result<()>;
-
-    /// Find types that implement a specific trait
-    async fn find_trait_implementors(&self, trait_name: &str) -> Result<Vec<String>>;
-
-    /// Get all traits implemented by a type
-    async fn get_type_traits(&self, type_name: &str) -> Result<Vec<String>>;
-
-    /// Get all impl blocks for a type
-    async fn get_impl_blocks(&self, type_name: &str) -> Result<Vec<serde_json::Value>>;
-
-    // ========================================================================
-    // Heritage navigation queries (EXTENDS + IMPLEMENTS)
-    // ========================================================================
-
-    /// Get the full class hierarchy (parents + children) for a type
-    async fn get_class_hierarchy(
-        &self,
-        type_name: &str,
-        max_depth: u32,
-    ) -> Result<serde_json::Value>;
-
-    /// Find all subclasses of a given class (via EXTENDS)
-    async fn find_subclasses(&self, class_name: &str) -> Result<Vec<serde_json::Value>>;
-
-    /// Find all classes that implement a given interface (via IMPLEMENTS)
-    async fn find_interface_implementors(
-        &self,
-        interface_name: &str,
-    ) -> Result<Vec<serde_json::Value>>;
-
-    // ========================================================================
-    // Process queries
-    // ========================================================================
-
-    /// List all detected processes for a project
-    async fn list_processes(&self, project_id: uuid::Uuid) -> Result<Vec<serde_json::Value>>;
-
-    /// Get details of a specific process including ordered steps
-    async fn get_process_detail(&self, process_id: &str) -> Result<Option<serde_json::Value>>;
-
-    /// Get scored entry points for a project
-    async fn get_entry_points(
-        &self,
-        project_id: uuid::Uuid,
-        limit: usize,
-    ) -> Result<Vec<serde_json::Value>>;
-
-    // ========================================================================
-    // Code exploration queries
-    // ========================================================================
-
-    /// Get the language of a file by path
-    async fn get_file_language(&self, path: &str) -> Result<Option<String>>;
-
-    /// Get function summaries for a file
-    async fn get_file_functions_summary(&self, path: &str) -> Result<Vec<FunctionSummaryNode>>;
-
-    /// Get struct summaries for a file
-    async fn get_file_structs_summary(&self, path: &str) -> Result<Vec<StructSummaryNode>>;
-
-    /// Get import paths for a file
-    async fn get_file_import_paths_list(&self, path: &str) -> Result<Vec<String>>;
-
-    /// Find references to a symbol (function callers, struct importers, file importers).
-    /// When project_id is provided, results are scoped to the same project.
-    async fn find_symbol_references(
-        &self,
-        symbol: &str,
-        limit: usize,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<SymbolReferenceNode>>;
-
-    /// Get files directly imported by a file
-    async fn get_file_direct_imports(&self, path: &str) -> Result<Vec<FileImportNode>>;
-
-    /// Get callers chain for a function name (by name, variable depth).
-    /// When project_id is provided, scopes start/end to the same project.
-    async fn get_function_callers_by_name(
-        &self,
-        function_name: &str,
-        depth: u32,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<String>>;
-
-    /// Get callees chain for a function name (by name, variable depth).
-    /// When project_id is provided, scopes start/end to the same project.
-    async fn get_function_callees_by_name(
-        &self,
-        function_name: &str,
-        depth: u32,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<String>>;
-
-    /// Get direct callers with confidence scores (depth 1 only).
-    /// Returns (name, file_path, confidence, reason) tuples.
-    async fn get_callers_with_confidence(
-        &self,
-        function_name: &str,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<(String, String, f64, String)>>;
-
-    /// Get direct callees with confidence scores (depth 1 only).
-    async fn get_callees_with_confidence(
-        &self,
-        function_name: &str,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<(String, String, f64, String)>>;
-
-    /// Get language statistics across all files
-    async fn get_language_stats(&self) -> Result<Vec<LanguageStatsNode>>;
-
-    /// Get language statistics for a specific project
-    async fn get_language_stats_for_project(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<LanguageStatsNode>>;
-
-    /// Get most connected files (highest in-degree from imports)
-    async fn get_most_connected_files(&self, limit: usize) -> Result<Vec<String>>;
-
-    /// Get most connected files with import/dependent counts
-    async fn get_most_connected_files_detailed(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<ConnectedFileNode>>;
-
-    /// Get most connected files with import/dependent counts for a specific project
-    async fn get_most_connected_files_for_project(
-        &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> Result<Vec<ConnectedFileNode>>;
-
-    /// Get distinct communities for a project (from graph analytics Louvain clustering)
-    async fn get_project_communities(&self, project_id: Uuid) -> Result<Vec<CommunityRow>>;
-
-    /// Get GDS analytics properties for a node (File by path, or Function by name).
-    /// Returns None if the node doesn't exist or has no analytics properties.
-    async fn get_node_analytics(
-        &self,
-        identifier: &str,
-        node_type: &str,
-    ) -> Result<Option<NodeAnalyticsRow>>;
-
-    /// Get distinct community labels for a list of file paths.
-    /// Returns only non-null community_label values.
-    async fn get_affected_communities(&self, file_paths: &[String]) -> Result<Vec<String>>;
-
-    /// Get a structural health report: god functions, orphan files, coupling metrics.
-    async fn get_code_health_report(
-        &self,
-        project_id: Uuid,
-        god_function_threshold: usize,
-    ) -> Result<crate::neo4j::models::CodeHealthReport>;
-
-    /// Capture a lightweight maintenance snapshot (biomimicry T11).
-    async fn compute_maintenance_snapshot(
-        &self,
-        project_id: Uuid,
-    ) -> Result<crate::neo4j::models::MaintenanceSnapshot>;
-
-    /// Compute scaffolding level for adaptive task complexity (biomimicry T8).
-    async fn compute_scaffolding_level(
-        &self,
-        project_id: Uuid,
-        scaffolding_override: Option<u8>,
-    ) -> Result<crate::neo4j::models::ScaffoldingLevel>;
-
-    /// Set or clear the scaffolding level override on a project (biomimicry T8).
-    async fn set_scaffolding_override(&self, project_id: Uuid, level: Option<u8>) -> Result<()>;
-
-    /// Set the watch_enabled flag on a project.
-    async fn set_watch_enabled(&self, project_id: Uuid, enabled: bool) -> Result<()>;
-
-    /// Set or clear the default note energy on a project (homeostasis).
-    /// When `Some(energy)`, new notes created in this project start at this energy.
-    /// When `None`, new notes start at the default energy (1.0).
-    async fn set_default_note_energy(&self, project_id: Uuid, energy: Option<f64>) -> Result<()>;
-
-    /// Detect global stagnation across a project (biomimicry T12).
-    async fn detect_global_stagnation(
-        &self,
-        project_id: Uuid,
-    ) -> Result<crate::neo4j::models::StagnationReport>;
-
-    /// Detect circular dependencies between files (import cycles).
-    async fn get_circular_dependencies(&self, project_id: Uuid) -> Result<Vec<Vec<String>>>;
-
-    /// Get GDS metrics for a specific node (file or function) in a project.
-    async fn get_node_gds_metrics(
-        &self,
-        node_path: &str,
-        node_type: &str,
-        project_id: Uuid,
-    ) -> Result<Option<NodeGdsMetrics>>;
-
-    /// Get statistical percentiles for GDS metrics across all nodes in a project.
-    async fn get_project_percentiles(&self, project_id: Uuid) -> Result<ProjectPercentiles>;
-
-    /// Get top N files by betweenness centrality (bridge files).
-    async fn get_top_bridges_by_betweenness(
-        &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> Result<Vec<BridgeFile>>;
-
-    /// Get aggregated symbol names for a file (functions, structs, traits, enums)
-    async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode>;
-
-    /// Get the number of callers for a function by name.
-    /// When project_id is provided, only counts callers from the same project.
-    async fn get_function_caller_count(
-        &self,
-        function_name: &str,
-        project_id: Option<Uuid>,
-    ) -> Result<i64>;
-
-    /// Get trait info (is_external, source)
-    async fn get_trait_info(&self, trait_name: &str) -> Result<Option<TraitInfoNode>>;
-
-    /// Get trait implementors with file locations
-    async fn get_trait_implementors_detailed(
-        &self,
-        trait_name: &str,
-    ) -> Result<Vec<TraitImplementorNode>>;
-
-    /// Get all traits implemented by a type, with details
-    async fn get_type_trait_implementations(
-        &self,
-        type_name: &str,
-    ) -> Result<Vec<TypeTraitInfoNode>>;
-
-    /// Get all impl blocks for a type with methods
-    async fn get_type_impl_blocks_detailed(
-        &self,
-        type_name: &str,
-    ) -> Result<Vec<ImplBlockDetailNode>>;
-
-    // ========================================================================
-    // Plan operations
-    // ========================================================================
-
-    /// Create a new plan
-    async fn create_plan(&self, plan: &PlanNode) -> Result<()>;
-
-    /// Get a plan by ID
-    async fn get_plan(&self, id: Uuid) -> Result<Option<PlanNode>>;
-
-    /// List all active plans
-    async fn list_active_plans(&self) -> Result<Vec<PlanNode>>;
-
-    /// List active plans for a specific project
-    async fn list_project_plans(&self, project_id: Uuid) -> Result<Vec<PlanNode>>;
-
-    /// Count plans for a project (lightweight, no data transfer)
-    async fn count_project_plans(&self, project_id: Uuid) -> Result<i64>;
-
-    /// List plans for a project with filters
-    async fn list_plans_for_project(
-        &self,
-        project_id: Uuid,
-        status_filter: Option<Vec<String>>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<PlanNode>, usize)>;
-
-    /// Update plan fields (title, description, priority)
-    async fn update_plan(&self, id: Uuid, updates: &UpdatePlanRequest) -> Result<()>;
-
-    /// Update plan status
-    async fn update_plan_status(&self, id: Uuid, status: PlanStatus) -> Result<()>;
-
-    /// Link a plan to a project (creates HAS_PLAN relationship)
-    async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> Result<()>;
-
-    /// Slugs of every project the plan belongs to (HAS_PLAN edges + plan.project_id).
-    /// Used to scope task-context retrieval to the plan's own projects.
-    async fn list_plan_project_slugs(&self, plan_id: Uuid) -> Result<Vec<String>>;
-
-    /// Unlink a plan from its project
-    async fn unlink_plan_from_project(&self, plan_id: Uuid) -> Result<()>;
-
-    /// Delete a plan and all its related data (tasks, steps, decisions, constraints)
-    async fn delete_plan(&self, plan_id: Uuid) -> Result<()>;
-
-    // ========================================================================
-    // Task operations
-    // ========================================================================
-
-    /// Create a task for a plan
-    async fn create_task(&self, plan_id: Uuid, task: &TaskNode) -> Result<()>;
-
-    /// Get tasks for a plan
-    async fn get_plan_tasks(&self, plan_id: Uuid) -> Result<Vec<TaskNode>>;
-
-    /// Get full task details including steps, decisions, dependencies, and modified files
-    async fn get_task_with_full_details(&self, task_id: Uuid) -> Result<Option<TaskDetails>>;
-
-    /// Analyze the impact of a task on the codebase (files it modifies + their dependents)
-    async fn analyze_task_impact(&self, task_id: Uuid) -> Result<Vec<String>>;
-
-    /// Find pending tasks in a plan that are blocked by uncompleted dependencies
-    async fn find_blocked_tasks(&self, plan_id: Uuid) -> Result<Vec<(TaskNode, Vec<TaskNode>)>>;
-
-    /// Update task status
-    async fn update_task_status(&self, task_id: Uuid, status: TaskStatus) -> Result<()>;
-
-    /// Marks a task `Interrupted` with a reason. Finished work (completed, failed) is left alone:
-    /// the answer says whether anything changed.
-    async fn interrupt_task(&self, task_id: Uuid, reason: &str) -> Result<bool>;
-
-    /// Assign task to an agent
-    async fn assign_task(&self, task_id: Uuid, agent_id: &str) -> Result<()>;
-
-    /// Add task dependency
-    async fn add_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()>;
-
-    /// Remove task dependency
-    async fn remove_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()>;
-
-    /// Get tasks that block this task (dependencies that are not completed)
-    async fn get_task_blockers(&self, task_id: Uuid) -> Result<Vec<TaskNode>>;
-
-    /// Get tasks blocked by this task (tasks depending on this one)
-    async fn get_tasks_blocked_by(&self, task_id: Uuid) -> Result<Vec<TaskNode>>;
-
-    /// Get all dependencies for a task (all tasks it depends on, regardless of status)
-    async fn get_task_dependencies(&self, task_id: Uuid) -> Result<Vec<TaskNode>>;
-
-    /// Get dependency graph for a plan (all tasks and their dependencies)
-    async fn get_plan_dependency_graph(
-        &self,
-        plan_id: Uuid,
-    ) -> Result<(Vec<TaskNode>, Vec<(Uuid, Uuid)>)>;
-
-    /// Batch-fetch step counts, note counts, and decision counts for a list of task IDs.
-    async fn get_task_enrichment_counts(
-        &self,
-        task_ids: &[String],
-    ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentCounts>>;
-
-    /// Batch-fetch full enrichment data (counts + individual step details) for dependency graph.
-    async fn get_task_enrichment_data(
-        &self,
-        task_ids: &[String],
-    ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentData>>;
-
-    /// Find critical path in a plan (longest chain of dependencies)
-    async fn get_plan_critical_path(&self, plan_id: Uuid) -> Result<Vec<TaskNode>>;
-
-    /// Compute execution waves for a plan (topological sort + level grouping)
-    async fn compute_waves(
-        &self,
-        plan_id: Uuid,
-    ) -> Result<crate::neo4j::plan::WaveComputationResult>;
-
-    /// Get next available task (no unfinished dependencies)
-    async fn get_next_available_task(&self, plan_id: Uuid) -> Result<Option<TaskNode>>;
-
-    /// Get a single task by ID
-    async fn get_task(&self, task_id: Uuid) -> Result<Option<TaskNode>>;
-
-    /// Update a task with new values
-    async fn update_task(&self, task_id: Uuid, updates: &UpdateTaskRequest) -> Result<()>;
-
-    /// Update pre-enrichment fields on a task (execution_context, persona, prompt_cache).
-    async fn update_task_enrichment(
-        &self,
-        task_id: Uuid,
-        execution_context: Option<&str>,
-        persona: Option<&str>,
-        prompt_cache: Option<&str>,
-    ) -> Result<()>;
-
-    /// Delete a task and all its related data (steps, decisions)
-    async fn delete_task(&self, task_id: Uuid) -> Result<()>;
-
-    /// Get the project that owns a task (via Task→Plan→Project chain).
-    ///
-    /// Traverses: `(Task)-[:PART_OF]->(Plan)-[:BELONGS_TO]->(Project)`
-    /// Returns `None` if the task doesn't exist or has no linked project.
-    async fn get_project_for_task(&self, task_id: Uuid) -> Result<Option<ProjectNode>>;
-
-    /// Get the plan UUID that owns a given task.
-    ///
-    /// Traverses: `(Plan)-[:HAS_TASK]->(Task {id: task_id})`
-    /// Returns `None` if the task doesn't exist or has no parent plan.
-    async fn get_plan_id_for_task(&self, task_id: Uuid) -> Result<Option<Uuid>>;
-
-    // ========================================================================
-    // Day plan operations
-    // ========================================================================
-
-    /// Read one user's ordered day plan as `(task_id, order)` pairs.
-    async fn get_day_plan(&self, user_id: Uuid, date: &str) -> Result<Vec<(Uuid, u32)>>;
-
-    /// Replace the whole day plan (idempotent). Position in `ids` = order.
-    async fn set_day_plan(&self, user_id: Uuid, date: &str, ids: &[Uuid]) -> Result<()>;
-
-    /// Append one task to the end of the day plan (no-op when already present).
-    async fn add_to_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()>;
-
-    /// Remove one task from the day plan (no-op when absent).
-    async fn remove_from_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()>;
-
-    // ========================================================================
-    // Step operations
-    // ========================================================================
-
-    /// Create a step for a task
-    async fn create_step(&self, task_id: Uuid, step: &StepNode) -> Result<()>;
-
-    /// Get steps for a task
-    async fn get_task_steps(&self, task_id: Uuid) -> Result<Vec<StepNode>>;
-
-    /// Update step fields (description, verification)
-    async fn update_step(&self, step_id: Uuid, updates: &UpdateStepRequest) -> Result<()>;
-
-    /// Update step status
-    async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> Result<()>;
-
-    /// Get count of completed steps for a task
-    async fn get_task_step_progress(&self, task_id: Uuid) -> Result<(u32, u32)>;
-
-    /// Get a single step by ID
-    async fn get_step(&self, step_id: Uuid) -> Result<Option<StepNode>>;
-
-    /// Delete a step
-    async fn delete_step(&self, step_id: Uuid) -> Result<()>;
-
-    /// Complete all pending/in_progress steps for a task (cascade on task completion)
-    async fn complete_pending_steps_for_task(&self, task_id: Uuid) -> Result<u32>;
-
-    // ========================================================================
-    // Constraint operations
-    // ========================================================================
-
-    /// Create a constraint for a plan
-    async fn create_constraint(&self, plan_id: Uuid, constraint: &ConstraintNode) -> Result<()>;
-
-    /// Get constraints for a plan
-    async fn get_plan_constraints(&self, plan_id: Uuid) -> Result<Vec<ConstraintNode>>;
-
-    /// Get a single constraint by ID
-    async fn get_constraint(&self, constraint_id: Uuid) -> Result<Option<ConstraintNode>>;
-
-    /// Update a constraint
-    async fn update_constraint(
-        &self,
-        constraint_id: Uuid,
-        description: Option<String>,
-        constraint_type: Option<ConstraintType>,
-        enforced_by: Option<String>,
-    ) -> Result<()>;
-
-    /// Delete a constraint
-    async fn delete_constraint(&self, constraint_id: Uuid) -> Result<()>;
 
     // ========================================================================
     // Decision operations
@@ -4643,4 +3982,688 @@ pub trait WorkspaceStore: Send + Sync {
         &self,
         workspace_id: Uuid,
     ) -> Result<Vec<(ComponentNode, Option<String>, Vec<ComponentDependency>)>>;
+}
+
+// ============================================================================
+// Code domain
+// ============================================================================
+
+/// The code domain: files, symbols, their batch ingestion, heritage, processes
+/// and the exploration queries built on top of them.
+///
+/// `GraphStore` is its supertrait: a consumer keeps calling these methods on a
+/// `dyn GraphStore` without knowing the domain exists.
+#[async_trait]
+pub trait CodeStore: Send + Sync {
+    // ========================================================================
+    // File operations
+    // ========================================================================
+
+    /// Get all file paths for a project
+    async fn get_project_file_paths(&self, project_id: Uuid) -> Result<Vec<String>>;
+
+    /// Delete a file and all its symbols
+    async fn delete_file(&self, path: &str) -> Result<()>;
+
+    /// Delete files that are no longer on the filesystem.
+    /// Returns `(files_deleted, symbols_deleted, deleted_paths)`.
+    async fn delete_stale_files(
+        &self,
+        project_id: Uuid,
+        valid_paths: &[String],
+    ) -> Result<(usize, usize, Vec<String>)>;
+
+    /// Link a file to a project (create CONTAINS relationship)
+    async fn link_file_to_project(&self, file_path: &str, project_id: Uuid) -> Result<()>;
+
+    /// Create or update a file node
+    async fn upsert_file(&self, file: &FileNode) -> Result<()>;
+
+    /// Batch create or update file nodes (UNWIND)
+    async fn batch_upsert_files(&self, files: &[FileNode]) -> Result<()>;
+
+    /// Get a file by path
+    async fn get_file(&self, path: &str) -> Result<Option<FileNode>>;
+
+    /// `(path, project_id)` of the files whose path ends with `suffix` (at most
+    /// `limit`). Used to resolve a relative file path to its owning project(s).
+    /// Defaults to no match for stores without file storage.
+    async fn find_files_by_path_suffix(
+        &self,
+        _suffix: &str,
+        _limit: usize,
+    ) -> Result<Vec<(String, Option<Uuid>)>> {
+        Ok(Vec::new())
+    }
+
+    /// List files for a project
+    async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>>;
+
+    /// Count files for a project (lightweight, no data transfer)
+    async fn count_project_files(&self, project_id: Uuid) -> Result<i64>;
+
+    /// Count orphan files for a project (lightweight — avoids the full health
+    /// report and its distribution fitting). Used by the real-time overview.
+    async fn count_orphan_files(&self, project_id: Uuid) -> Result<i64>;
+
+    /// Count CO_CHANGED pairs for a project (lightweight — no row transfer).
+    async fn count_co_change_pairs(&self, project_id: Uuid, min_count: i64) -> Result<i64>;
+
+    /// Count total protocol states and transitions across a project's protocols
+    /// in a single query (replaces the per-protocol N+1 in the overview).
+    async fn count_protocol_states_transitions(&self, project_id: Uuid) -> Result<(i64, i64)>;
+
+    /// Invalidate pre-computed GraIL properties on changed files and their neighbors.
+    ///
+    /// Sets `*_version = -1` on:
+    /// - Direct files: `cc_version`, `structural_dna_version`, `wl_hash_version`
+    /// - 1-2 hop neighbors: `cc_version` (1-hop), `wl_hash_version` (2-hop)
+    ///
+    /// Returns the total number of File nodes marked as stale.
+    async fn invalidate_computed_properties(
+        &self,
+        project_id: Uuid,
+        paths: &[String],
+    ) -> Result<u64>;
+
+    // ========================================================================
+    // Symbol operations
+    // ========================================================================
+
+    /// Create or update a function node
+    async fn upsert_function(&self, func: &FunctionNode) -> Result<()>;
+
+    /// Create or update a struct node
+    async fn upsert_struct(&self, s: &StructNode) -> Result<()>;
+
+    /// Create or update a trait node
+    async fn upsert_trait(&self, t: &TraitNode) -> Result<()>;
+
+    /// Find a trait by name (searches across all files)
+    async fn find_trait_by_name(&self, name: &str) -> Result<Option<String>>;
+
+    /// Create or update an enum node
+    async fn upsert_enum(&self, e: &EnumNode) -> Result<()>;
+
+    /// Create or update an impl block node
+    async fn upsert_impl(&self, impl_node: &ImplNode) -> Result<()>;
+
+    /// Create an import relationship between files
+    async fn create_import_relationship(
+        &self,
+        from_file: &str,
+        to_file: &str,
+        import_path: &str,
+    ) -> Result<()>;
+
+    /// Store an import node (for tracking even unresolved imports)
+    async fn upsert_import(&self, import: &ImportNode) -> Result<()>;
+
+    /// Create an IMPORTS_SYMBOL relationship from an Import to a matching Struct/Enum/Trait
+    async fn create_imports_symbol_relationship(
+        &self,
+        import_id: &str,
+        symbol_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<()>;
+
+    /// Create a CALLS relationship between functions, scoped to the same project.
+    /// When project_id is provided, the callee is matched only within the same project
+    /// to prevent cross-project CALLS pollution.
+    /// Sets `confidence` (0.0-1.0) and `reason` properties on the CALLS relationship.
+    async fn create_call_relationship(
+        &self,
+        caller_id: &str,
+        callee_name: &str,
+        project_id: Option<Uuid>,
+        confidence: f64,
+        reason: &str,
+    ) -> Result<()>;
+
+    // ========================================================================
+    // Batch upsert operations (UNWIND)
+    // ========================================================================
+
+    /// Batch upsert functions using UNWIND for a single Neo4j transaction per call.
+    async fn batch_upsert_functions(&self, functions: &[FunctionNode]) -> Result<()>;
+
+    /// Batch upsert structs using UNWIND.
+    async fn batch_upsert_structs(&self, structs: &[StructNode]) -> Result<()>;
+
+    /// Batch upsert traits using UNWIND.
+    async fn batch_upsert_traits(&self, traits: &[TraitNode]) -> Result<()>;
+
+    /// Batch upsert enums using UNWIND.
+    async fn batch_upsert_enums(&self, enums: &[EnumNode]) -> Result<()>;
+
+    /// Batch upsert impl blocks using UNWIND — 3 phases matching upsert_impl behavior.
+    async fn batch_upsert_impls(&self, impls: &[ImplNode]) -> Result<()>;
+
+    /// Batch upsert imports using UNWIND.
+    async fn batch_upsert_imports(&self, imports: &[ImportNode]) -> Result<()>;
+
+    /// Batch create File→IMPORTS→File relationships using UNWIND.
+    async fn batch_create_import_relationships(
+        &self,
+        relationships: &[(String, String, String)],
+    ) -> Result<()>;
+
+    /// Batch create Import→IMPORTS_SYMBOL→(Struct|Enum|Trait) relationships using UNWIND.
+    async fn batch_create_imports_symbol_relationships(
+        &self,
+        relationships: &[(String, String, Option<Uuid>)],
+    ) -> Result<()>;
+
+    /// Batch create CALLS relationships using UNWIND — 2-phase strategy.
+    async fn batch_create_call_relationships(
+        &self,
+        calls: &[FunctionCall],
+        project_id: Option<Uuid>,
+    ) -> Result<()>;
+
+    /// Batch create EXTENDS relationships (class inheritance) using UNWIND.
+    /// Takes (child_name, child_file_path, parent_name, project_id) tuples.
+    /// Phase 1: same-file match. Phase 2: project-scoped fallback.
+    async fn batch_create_extends_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()>;
+
+    /// Batch create IMPLEMENTS relationships (interface/protocol implementation) using UNWIND.
+    /// Takes (struct_name, struct_file_path, interface_name, project_id) tuples.
+    async fn batch_create_implements_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()>;
+
+    /// Delete all CALLS relationships where caller and callee belong to different projects.
+    /// Returns the number of deleted relationships.
+    async fn cleanup_cross_project_calls(&self) -> Result<i64>;
+
+    /// Delete all CALLS relationships where the callee function name is a known built-in.
+    /// Returns the number of deleted relationships.
+    async fn cleanup_builtin_calls(&self) -> Result<i64>;
+
+    /// Migrate existing CALLS: set default confidence=0.50 and reason='fuzzy-global'
+    /// for relationships missing these properties.
+    async fn migrate_calls_confidence(&self) -> Result<i64>;
+
+    /// Clean up ALL sync-generated data (File, Function, Struct, Trait, Enum, Impl, Import, FeatureGraph).
+    /// Returns the total number of deleted entities/relationships.
+    async fn cleanup_sync_data(&self) -> Result<i64>;
+
+    /// Get all functions called by a function
+    async fn get_callees(&self, function_id: &str, depth: u32) -> Result<Vec<FunctionNode>>;
+
+    /// Create a USES_TYPE relationship from a function to a type
+    async fn create_uses_type_relationship(&self, function_id: &str, type_name: &str)
+        -> Result<()>;
+
+    /// Find types that implement a specific trait
+    async fn find_trait_implementors(&self, trait_name: &str) -> Result<Vec<String>>;
+
+    /// Get all traits implemented by a type
+    async fn get_type_traits(&self, type_name: &str) -> Result<Vec<String>>;
+
+    /// Get all impl blocks for a type
+    async fn get_impl_blocks(&self, type_name: &str) -> Result<Vec<serde_json::Value>>;
+
+    // ========================================================================
+    // Heritage navigation queries (EXTENDS + IMPLEMENTS)
+    // ========================================================================
+
+    /// Get the full class hierarchy (parents + children) for a type
+    async fn get_class_hierarchy(
+        &self,
+        type_name: &str,
+        max_depth: u32,
+    ) -> Result<serde_json::Value>;
+
+    /// Find all subclasses of a given class (via EXTENDS)
+    async fn find_subclasses(&self, class_name: &str) -> Result<Vec<serde_json::Value>>;
+
+    /// Find all classes that implement a given interface (via IMPLEMENTS)
+    async fn find_interface_implementors(
+        &self,
+        interface_name: &str,
+    ) -> Result<Vec<serde_json::Value>>;
+
+    // ========================================================================
+    // Process queries
+    // ========================================================================
+
+    /// List all detected processes for a project
+    async fn list_processes(&self, project_id: uuid::Uuid) -> Result<Vec<serde_json::Value>>;
+
+    /// Get details of a specific process including ordered steps
+    async fn get_process_detail(&self, process_id: &str) -> Result<Option<serde_json::Value>>;
+
+    /// Get scored entry points for a project
+    async fn get_entry_points(
+        &self,
+        project_id: uuid::Uuid,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>>;
+
+    // ========================================================================
+    // Code exploration queries
+    // ========================================================================
+
+    /// Get the language of a file by path
+    async fn get_file_language(&self, path: &str) -> Result<Option<String>>;
+
+    /// Get function summaries for a file
+    async fn get_file_functions_summary(&self, path: &str) -> Result<Vec<FunctionSummaryNode>>;
+
+    /// Get struct summaries for a file
+    async fn get_file_structs_summary(&self, path: &str) -> Result<Vec<StructSummaryNode>>;
+
+    /// Get import paths for a file
+    async fn get_file_import_paths_list(&self, path: &str) -> Result<Vec<String>>;
+
+    /// Find references to a symbol (function callers, struct importers, file importers).
+    /// When project_id is provided, results are scoped to the same project.
+    async fn find_symbol_references(
+        &self,
+        symbol: &str,
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<SymbolReferenceNode>>;
+
+    /// Get files directly imported by a file
+    async fn get_file_direct_imports(&self, path: &str) -> Result<Vec<FileImportNode>>;
+
+    /// Get callers chain for a function name (by name, variable depth).
+    /// When project_id is provided, scopes start/end to the same project.
+    async fn get_function_callers_by_name(
+        &self,
+        function_name: &str,
+        depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>>;
+
+    /// Get callees chain for a function name (by name, variable depth).
+    /// When project_id is provided, scopes start/end to the same project.
+    async fn get_function_callees_by_name(
+        &self,
+        function_name: &str,
+        depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>>;
+
+    /// Get direct callers with confidence scores (depth 1 only).
+    /// Returns (name, file_path, confidence, reason) tuples.
+    async fn get_callers_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>>;
+
+    /// Get direct callees with confidence scores (depth 1 only).
+    async fn get_callees_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>>;
+
+    /// Get language statistics across all files
+    async fn get_language_stats(&self) -> Result<Vec<LanguageStatsNode>>;
+
+    /// Get language statistics for a specific project
+    async fn get_language_stats_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<LanguageStatsNode>>;
+
+    /// Get most connected files (highest in-degree from imports)
+    async fn get_most_connected_files(&self, limit: usize) -> Result<Vec<String>>;
+
+    /// Get most connected files with import/dependent counts
+    async fn get_most_connected_files_detailed(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ConnectedFileNode>>;
+
+    /// Get most connected files with import/dependent counts for a specific project
+    async fn get_most_connected_files_for_project(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<ConnectedFileNode>>;
+
+    /// Get distinct communities for a project (from graph analytics Louvain clustering)
+    async fn get_project_communities(&self, project_id: Uuid) -> Result<Vec<CommunityRow>>;
+
+    /// Get GDS analytics properties for a node (File by path, or Function by name).
+    /// Returns None if the node doesn't exist or has no analytics properties.
+    async fn get_node_analytics(
+        &self,
+        identifier: &str,
+        node_type: &str,
+    ) -> Result<Option<NodeAnalyticsRow>>;
+
+    /// Get distinct community labels for a list of file paths.
+    /// Returns only non-null community_label values.
+    async fn get_affected_communities(&self, file_paths: &[String]) -> Result<Vec<String>>;
+
+    /// Get a structural health report: god functions, orphan files, coupling metrics.
+    async fn get_code_health_report(
+        &self,
+        project_id: Uuid,
+        god_function_threshold: usize,
+    ) -> Result<crate::neo4j::models::CodeHealthReport>;
+
+    /// Capture a lightweight maintenance snapshot (biomimicry T11).
+    async fn compute_maintenance_snapshot(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::models::MaintenanceSnapshot>;
+
+    /// Compute scaffolding level for adaptive task complexity (biomimicry T8).
+    async fn compute_scaffolding_level(
+        &self,
+        project_id: Uuid,
+        scaffolding_override: Option<u8>,
+    ) -> Result<crate::neo4j::models::ScaffoldingLevel>;
+
+    /// Set or clear the scaffolding level override on a project (biomimicry T8).
+    async fn set_scaffolding_override(&self, project_id: Uuid, level: Option<u8>) -> Result<()>;
+
+    /// Set the watch_enabled flag on a project.
+    async fn set_watch_enabled(&self, project_id: Uuid, enabled: bool) -> Result<()>;
+
+    /// Set or clear the default note energy on a project (homeostasis).
+    /// When `Some(energy)`, new notes created in this project start at this energy.
+    /// When `None`, new notes start at the default energy (1.0).
+    async fn set_default_note_energy(&self, project_id: Uuid, energy: Option<f64>) -> Result<()>;
+
+    /// Detect global stagnation across a project (biomimicry T12).
+    async fn detect_global_stagnation(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::models::StagnationReport>;
+
+    /// Detect circular dependencies between files (import cycles).
+    async fn get_circular_dependencies(&self, project_id: Uuid) -> Result<Vec<Vec<String>>>;
+
+    /// Get GDS metrics for a specific node (file or function) in a project.
+    async fn get_node_gds_metrics(
+        &self,
+        node_path: &str,
+        node_type: &str,
+        project_id: Uuid,
+    ) -> Result<Option<NodeGdsMetrics>>;
+
+    /// Get statistical percentiles for GDS metrics across all nodes in a project.
+    async fn get_project_percentiles(&self, project_id: Uuid) -> Result<ProjectPercentiles>;
+
+    /// Get top N files by betweenness centrality (bridge files).
+    async fn get_top_bridges_by_betweenness(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<BridgeFile>>;
+
+    /// Get aggregated symbol names for a file (functions, structs, traits, enums)
+    async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode>;
+
+    /// Get the number of callers for a function by name.
+    /// When project_id is provided, only counts callers from the same project.
+    async fn get_function_caller_count(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<i64>;
+
+    /// Get trait info (is_external, source)
+    async fn get_trait_info(&self, trait_name: &str) -> Result<Option<TraitInfoNode>>;
+
+    /// Get trait implementors with file locations
+    async fn get_trait_implementors_detailed(
+        &self,
+        trait_name: &str,
+    ) -> Result<Vec<TraitImplementorNode>>;
+
+    /// Get all traits implemented by a type, with details
+    async fn get_type_trait_implementations(
+        &self,
+        type_name: &str,
+    ) -> Result<Vec<TypeTraitInfoNode>>;
+
+    /// Get all impl blocks for a type with methods
+    async fn get_type_impl_blocks_detailed(
+        &self,
+        type_name: &str,
+    ) -> Result<Vec<ImplBlockDetailNode>>;
+}
+
+// ============================================================================
+// Plan domain
+// ============================================================================
+
+/// The planning domain: plans and their tasks, steps, day plan and constraints.
+///
+/// `GraphStore` is its supertrait: a consumer keeps calling these methods on a
+/// `dyn GraphStore` without knowing the domain exists.
+#[async_trait]
+pub trait PlanStore: Send + Sync {
+    // ========================================================================
+    // Plan operations
+    // ========================================================================
+
+    /// Create a new plan
+    async fn create_plan(&self, plan: &PlanNode) -> Result<()>;
+
+    /// Get a plan by ID
+    async fn get_plan(&self, id: Uuid) -> Result<Option<PlanNode>>;
+
+    /// List all active plans
+    async fn list_active_plans(&self) -> Result<Vec<PlanNode>>;
+
+    /// List active plans for a specific project
+    async fn list_project_plans(&self, project_id: Uuid) -> Result<Vec<PlanNode>>;
+
+    /// Count plans for a project (lightweight, no data transfer)
+    async fn count_project_plans(&self, project_id: Uuid) -> Result<i64>;
+
+    /// List plans for a project with filters
+    async fn list_plans_for_project(
+        &self,
+        project_id: Uuid,
+        status_filter: Option<Vec<String>>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<PlanNode>, usize)>;
+
+    /// Update plan fields (title, description, priority)
+    async fn update_plan(&self, id: Uuid, updates: &UpdatePlanRequest) -> Result<()>;
+
+    /// Update plan status
+    async fn update_plan_status(&self, id: Uuid, status: PlanStatus) -> Result<()>;
+
+    /// Link a plan to a project (creates HAS_PLAN relationship)
+    async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> Result<()>;
+
+    /// Slugs of every project the plan belongs to (HAS_PLAN edges + plan.project_id).
+    /// Used to scope task-context retrieval to the plan's own projects.
+    async fn list_plan_project_slugs(&self, plan_id: Uuid) -> Result<Vec<String>>;
+
+    /// Unlink a plan from its project
+    async fn unlink_plan_from_project(&self, plan_id: Uuid) -> Result<()>;
+
+    /// Delete a plan and all its related data (tasks, steps, decisions, constraints)
+    async fn delete_plan(&self, plan_id: Uuid) -> Result<()>;
+
+    // ========================================================================
+    // Task operations
+    // ========================================================================
+
+    /// Create a task for a plan
+    async fn create_task(&self, plan_id: Uuid, task: &TaskNode) -> Result<()>;
+
+    /// Get tasks for a plan
+    async fn get_plan_tasks(&self, plan_id: Uuid) -> Result<Vec<TaskNode>>;
+
+    /// Get full task details including steps, decisions, dependencies, and modified files
+    async fn get_task_with_full_details(&self, task_id: Uuid) -> Result<Option<TaskDetails>>;
+
+    /// Analyze the impact of a task on the codebase (files it modifies + their dependents)
+    async fn analyze_task_impact(&self, task_id: Uuid) -> Result<Vec<String>>;
+
+    /// Find pending tasks in a plan that are blocked by uncompleted dependencies
+    async fn find_blocked_tasks(&self, plan_id: Uuid) -> Result<Vec<(TaskNode, Vec<TaskNode>)>>;
+
+    /// Update task status
+    async fn update_task_status(&self, task_id: Uuid, status: TaskStatus) -> Result<()>;
+
+    /// Marks a task `Interrupted` with a reason. Finished work (completed, failed) is left alone:
+    /// the answer says whether anything changed.
+    async fn interrupt_task(&self, task_id: Uuid, reason: &str) -> Result<bool>;
+
+    /// Assign task to an agent
+    async fn assign_task(&self, task_id: Uuid, agent_id: &str) -> Result<()>;
+
+    /// Add task dependency
+    async fn add_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()>;
+
+    /// Remove task dependency
+    async fn remove_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()>;
+
+    /// Get tasks that block this task (dependencies that are not completed)
+    async fn get_task_blockers(&self, task_id: Uuid) -> Result<Vec<TaskNode>>;
+
+    /// Get tasks blocked by this task (tasks depending on this one)
+    async fn get_tasks_blocked_by(&self, task_id: Uuid) -> Result<Vec<TaskNode>>;
+
+    /// Get all dependencies for a task (all tasks it depends on, regardless of status)
+    async fn get_task_dependencies(&self, task_id: Uuid) -> Result<Vec<TaskNode>>;
+
+    /// Get dependency graph for a plan (all tasks and their dependencies)
+    async fn get_plan_dependency_graph(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<(Vec<TaskNode>, Vec<(Uuid, Uuid)>)>;
+
+    /// Batch-fetch step counts, note counts, and decision counts for a list of task IDs.
+    async fn get_task_enrichment_counts(
+        &self,
+        task_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentCounts>>;
+
+    /// Batch-fetch full enrichment data (counts + individual step details) for dependency graph.
+    async fn get_task_enrichment_data(
+        &self,
+        task_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentData>>;
+
+    /// Find critical path in a plan (longest chain of dependencies)
+    async fn get_plan_critical_path(&self, plan_id: Uuid) -> Result<Vec<TaskNode>>;
+
+    /// Compute execution waves for a plan (topological sort + level grouping)
+    async fn compute_waves(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<crate::neo4j::plan::WaveComputationResult>;
+
+    /// Get next available task (no unfinished dependencies)
+    async fn get_next_available_task(&self, plan_id: Uuid) -> Result<Option<TaskNode>>;
+
+    /// Get a single task by ID
+    async fn get_task(&self, task_id: Uuid) -> Result<Option<TaskNode>>;
+
+    /// Update a task with new values
+    async fn update_task(&self, task_id: Uuid, updates: &UpdateTaskRequest) -> Result<()>;
+
+    /// Update pre-enrichment fields on a task (execution_context, persona, prompt_cache).
+    async fn update_task_enrichment(
+        &self,
+        task_id: Uuid,
+        execution_context: Option<&str>,
+        persona: Option<&str>,
+        prompt_cache: Option<&str>,
+    ) -> Result<()>;
+
+    /// Delete a task and all its related data (steps, decisions)
+    async fn delete_task(&self, task_id: Uuid) -> Result<()>;
+
+    /// Get the project that owns a task (via Task→Plan→Project chain).
+    ///
+    /// Traverses: `(Task)-[:PART_OF]->(Plan)-[:BELONGS_TO]->(Project)`
+    /// Returns `None` if the task doesn't exist or has no linked project.
+    async fn get_project_for_task(&self, task_id: Uuid) -> Result<Option<ProjectNode>>;
+
+    /// Get the plan UUID that owns a given task.
+    ///
+    /// Traverses: `(Plan)-[:HAS_TASK]->(Task {id: task_id})`
+    /// Returns `None` if the task doesn't exist or has no parent plan.
+    async fn get_plan_id_for_task(&self, task_id: Uuid) -> Result<Option<Uuid>>;
+
+    // ========================================================================
+    // Day plan operations
+    // ========================================================================
+
+    /// Read one user's ordered day plan as `(task_id, order)` pairs.
+    async fn get_day_plan(&self, user_id: Uuid, date: &str) -> Result<Vec<(Uuid, u32)>>;
+
+    /// Replace the whole day plan (idempotent). Position in `ids` = order.
+    async fn set_day_plan(&self, user_id: Uuid, date: &str, ids: &[Uuid]) -> Result<()>;
+
+    /// Append one task to the end of the day plan (no-op when already present).
+    async fn add_to_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()>;
+
+    /// Remove one task from the day plan (no-op when absent).
+    async fn remove_from_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()>;
+
+    // ========================================================================
+    // Step operations
+    // ========================================================================
+
+    /// Create a step for a task
+    async fn create_step(&self, task_id: Uuid, step: &StepNode) -> Result<()>;
+
+    /// Get steps for a task
+    async fn get_task_steps(&self, task_id: Uuid) -> Result<Vec<StepNode>>;
+
+    /// Update step fields (description, verification)
+    async fn update_step(&self, step_id: Uuid, updates: &UpdateStepRequest) -> Result<()>;
+
+    /// Update step status
+    async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> Result<()>;
+
+    /// Get count of completed steps for a task
+    async fn get_task_step_progress(&self, task_id: Uuid) -> Result<(u32, u32)>;
+
+    /// Get a single step by ID
+    async fn get_step(&self, step_id: Uuid) -> Result<Option<StepNode>>;
+
+    /// Delete a step
+    async fn delete_step(&self, step_id: Uuid) -> Result<()>;
+
+    /// Complete all pending/in_progress steps for a task (cascade on task completion)
+    async fn complete_pending_steps_for_task(&self, task_id: Uuid) -> Result<u32>;
+
+    // ========================================================================
+    // Constraint operations
+    // ========================================================================
+
+    /// Create a constraint for a plan
+    async fn create_constraint(&self, plan_id: Uuid, constraint: &ConstraintNode) -> Result<()>;
+
+    /// Get constraints for a plan
+    async fn get_plan_constraints(&self, plan_id: Uuid) -> Result<Vec<ConstraintNode>>;
+
+    /// Get a single constraint by ID
+    async fn get_constraint(&self, constraint_id: Uuid) -> Result<Option<ConstraintNode>>;
+
+    /// Update a constraint
+    async fn update_constraint(
+        &self,
+        constraint_id: Uuid,
+        description: Option<String>,
+        constraint_type: Option<ConstraintType>,
+        enforced_by: Option<String>,
+    ) -> Result<()>;
+
+    /// Delete a constraint
+    async fn delete_constraint(&self, constraint_id: Uuid) -> Result<()>;
 }

@@ -9,7 +9,9 @@ use crate::events::trigger::EventTrigger;
 use crate::lifecycle::{LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest};
 use crate::neo4j::document::{Document, DocumentChunk, DocumentChunkHit};
 use crate::neo4j::models::*;
-use crate::neo4j::traits::{GraphStore, ProjectStore, StoreCapabilities, WorkspaceStore};
+use crate::neo4j::traits::{
+    CodeStore, GraphStore, PlanStore, ProjectStore, StoreCapabilities, WorkspaceStore,
+};
 use crate::notes::{
     EntityType, Note, NoteAnchor, NoteFilters, NoteImportance, NoteStatus, PropagatedNote,
 };
@@ -882,3108 +884,6 @@ impl GraphStore for MockGraphStore {
             // (mock.rs:22) with no begin / commit / rollback.
             explicit_transactions: false,
         }
-    }
-
-    // ========================================================================
-    // File operations
-    // ========================================================================
-
-    async fn get_project_file_paths(&self, project_id: Uuid) -> Result<Vec<String>> {
-        Ok(self
-            .project_files
-            .read()
-            .await
-            .get(&project_id)
-            .cloned()
-            .unwrap_or_default())
-    }
-
-    async fn delete_file(&self, path: &str) -> Result<()> {
-        self.files.write().await.remove(path);
-        // Remove from project_files
-        let mut pf = self.project_files.write().await;
-        for paths in pf.values_mut() {
-            paths.retain(|p| p != path);
-        }
-        // Remove symbols linked to this file (mirrors DETACH DELETE in Neo4j)
-        self.file_symbols.write().await.remove(path);
-        self.import_relationships.write().await.remove(path);
-        // Remove all entities whose file_path matches (DETACH DELETE cascade)
-        self.functions
-            .write()
-            .await
-            .retain(|_, f| f.file_path != path);
-        self.structs_map
-            .write()
-            .await
-            .retain(|_, s| s.file_path != path);
-        self.traits_map
-            .write()
-            .await
-            .retain(|_, t| t.file_path != path);
-        self.enums_map
-            .write()
-            .await
-            .retain(|_, e| e.file_path != path);
-        self.impls_map
-            .write()
-            .await
-            .retain(|_, i| i.file_path != path);
-        self.imports
-            .write()
-            .await
-            .retain(|_, i| i.file_path != path);
-        // Remove call relationships from deleted functions
-        {
-            let funcs = self.functions.read().await;
-            let valid_ids: std::collections::HashSet<&str> =
-                funcs.keys().map(|s| s.as_str()).collect();
-            self.call_relationships
-                .write()
-                .await
-                .retain(|caller, _| valid_ids.contains(caller.as_str()));
-        }
-        Ok(())
-    }
-
-    async fn delete_stale_files(
-        &self,
-        project_id: Uuid,
-        valid_paths: &[String],
-    ) -> Result<(usize, usize, Vec<String>)> {
-        let current_paths = self
-            .project_files
-            .read()
-            .await
-            .get(&project_id)
-            .cloned()
-            .unwrap_or_default();
-        let mut files_deleted = 0usize;
-        let mut symbols_deleted = 0usize;
-        let mut deleted_paths = Vec::new();
-        for path in &current_paths {
-            if !valid_paths.contains(path) {
-                self.files.write().await.remove(path);
-                if let Some(syms) = self.file_symbols.write().await.remove(path) {
-                    symbols_deleted += syms.len();
-                }
-                deleted_paths.push(path.clone());
-                files_deleted += 1;
-            }
-        }
-        if let Some(paths) = self.project_files.write().await.get_mut(&project_id) {
-            paths.retain(|p| valid_paths.contains(p));
-        }
-        Ok((files_deleted, symbols_deleted, deleted_paths))
-    }
-
-    async fn link_file_to_project(&self, file_path: &str, project_id: Uuid) -> Result<()> {
-        self.project_files
-            .write()
-            .await
-            .entry(project_id)
-            .or_default()
-            .push(file_path.to_string());
-        Ok(())
-    }
-
-    async fn upsert_file(&self, file: &FileNode) -> Result<()> {
-        self.files
-            .write()
-            .await
-            .insert(file.path.clone(), file.clone());
-        Ok(())
-    }
-
-    async fn batch_upsert_files(&self, files: &[FileNode]) -> Result<()> {
-        let mut store = self.files.write().await;
-        for file in files {
-            store.insert(file.path.clone(), file.clone());
-        }
-        Ok(())
-    }
-
-    async fn get_file(&self, path: &str) -> Result<Option<FileNode>> {
-        Ok(self.files.read().await.get(path).cloned())
-    }
-
-    async fn find_files_by_path_suffix(
-        &self,
-        suffix: &str,
-        limit: usize,
-    ) -> Result<Vec<(String, Option<Uuid>)>> {
-        let mut out: Vec<(String, Option<Uuid>)> = self
-            .files
-            .read()
-            .await
-            .values()
-            .filter(|f| f.path.ends_with(suffix))
-            .map(|f| (f.path.clone(), f.project_id))
-            .collect();
-        out.sort();
-        out.truncate(limit);
-        Ok(out)
-    }
-
-    async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>> {
-        let pf = self.project_files.read().await;
-        let files = self.files.read().await;
-        let paths = pf.get(&project_id).cloned().unwrap_or_default();
-        Ok(paths.iter().filter_map(|p| files.get(p).cloned()).collect())
-    }
-
-    async fn count_project_files(&self, project_id: Uuid) -> Result<i64> {
-        let pf = self.project_files.read().await;
-        Ok(pf.get(&project_id).map(|p| p.len() as i64).unwrap_or(0))
-    }
-
-    async fn count_orphan_files(&self, _project_id: Uuid) -> Result<i64> {
-        Ok(0)
-    }
-
-    async fn count_co_change_pairs(&self, _project_id: Uuid, _min_count: i64) -> Result<i64> {
-        Ok(0)
-    }
-
-    async fn count_protocol_states_transitions(&self, _project_id: Uuid) -> Result<(i64, i64)> {
-        Ok((0, 0))
-    }
-
-    async fn invalidate_computed_properties(
-        &self,
-        _project_id: Uuid,
-        paths: &[String],
-    ) -> Result<u64> {
-        // Mock: return the number of paths as stale count (simplified)
-        Ok(paths.len() as u64)
-    }
-
-    // ========================================================================
-    // Symbol operations
-    // ========================================================================
-
-    async fn upsert_function(&self, func: &FunctionNode) -> Result<()> {
-        let id = format!("{}::{}", func.file_path, func.name);
-        self.file_symbols
-            .write()
-            .await
-            .entry(func.file_path.clone())
-            .or_default()
-            .push(id.clone());
-        self.functions.write().await.insert(id, func.clone());
-        Ok(())
-    }
-
-    async fn upsert_struct(&self, s: &StructNode) -> Result<()> {
-        let id = format!("{}::{}", s.file_path, s.name);
-        self.file_symbols
-            .write()
-            .await
-            .entry(s.file_path.clone())
-            .or_default()
-            .push(id.clone());
-        self.structs_map.write().await.insert(id, s.clone());
-        Ok(())
-    }
-
-    async fn upsert_trait(&self, t: &TraitNode) -> Result<()> {
-        let id = format!("{}::{}", t.file_path, t.name);
-        self.file_symbols
-            .write()
-            .await
-            .entry(t.file_path.clone())
-            .or_default()
-            .push(id.clone());
-        self.traits_map.write().await.insert(id, t.clone());
-        Ok(())
-    }
-
-    async fn find_trait_by_name(&self, name: &str) -> Result<Option<String>> {
-        let traits = self.traits_map.read().await;
-        for (id, t) in traits.iter() {
-            if t.name == name {
-                return Ok(Some(id.clone()));
-            }
-        }
-        Ok(None)
-    }
-
-    async fn upsert_enum(&self, e: &EnumNode) -> Result<()> {
-        let id = format!("{}::{}", e.file_path, e.name);
-        self.file_symbols
-            .write()
-            .await
-            .entry(e.file_path.clone())
-            .or_default()
-            .push(id.clone());
-        self.enums_map.write().await.insert(id, e.clone());
-        Ok(())
-    }
-
-    async fn upsert_impl(&self, impl_node: &ImplNode) -> Result<()> {
-        let id = format!(
-            "{}::impl_{}{}",
-            impl_node.file_path,
-            impl_node.for_type,
-            impl_node
-                .trait_name
-                .as_ref()
-                .map(|t| format!("_{}", t))
-                .unwrap_or_default()
-        );
-        self.impls_map.write().await.insert(id, impl_node.clone());
-        Ok(())
-    }
-
-    async fn create_import_relationship(
-        &self,
-        from_file: &str,
-        to_file: &str,
-        _import_path: &str,
-    ) -> Result<()> {
-        self.import_relationships
-            .write()
-            .await
-            .entry(from_file.to_string())
-            .or_default()
-            .push(to_file.to_string());
-        Ok(())
-    }
-
-    async fn upsert_import(&self, import: &ImportNode) -> Result<()> {
-        let id = format!("{}::import_{}", import.file_path, import.path);
-        self.imports.write().await.insert(id, import.clone());
-        Ok(())
-    }
-
-    async fn create_imports_symbol_relationship(
-        &self,
-        _import_id: &str,
-        _symbol_name: &str,
-        _project_id: Option<Uuid>,
-    ) -> Result<()> {
-        // Mock: no-op, IMPORTS_SYMBOL relationships are not tracked in mock store
-        Ok(())
-    }
-
-    async fn create_call_relationship(
-        &self,
-        caller_id: &str,
-        callee_name: &str,
-        project_id: Option<Uuid>,
-        _confidence: f64,
-        _reason: &str,
-    ) -> Result<()> {
-        // When project_id is provided, only create the relationship if the callee
-        // belongs to a file in the same project (mirrors the Cypher join via File→Project)
-        if let Some(pid) = project_id {
-            let project_files = self.project_files.read().await;
-            let functions = self.functions.read().await;
-
-            let project_file_paths: Vec<&String> = project_files
-                .get(&pid)
-                .map(|files| files.iter().collect())
-                .unwrap_or_default();
-
-            // Check if any function with callee_name belongs to a file in this project
-            let callee_in_project = functions.values().any(|f| {
-                f.name == callee_name && project_file_paths.iter().any(|fp| **fp == f.file_path)
-            });
-
-            if !callee_in_project {
-                // Callee not found in this project — skip (same as Cypher MATCH not matching)
-                return Ok(());
-            }
-        }
-
-        self.call_relationships
-            .write()
-            .await
-            .entry(caller_id.to_string())
-            .or_default()
-            .push(callee_name.to_string());
-        Ok(())
-    }
-
-    // ========================================================================
-    // Batch upsert operations (delegates to individual methods)
-    // ========================================================================
-
-    async fn batch_upsert_functions(&self, functions: &[FunctionNode]) -> Result<()> {
-        for func in functions {
-            self.upsert_function(func).await?;
-        }
-        Ok(())
-    }
-
-    async fn batch_upsert_structs(&self, structs: &[StructNode]) -> Result<()> {
-        for s in structs {
-            self.upsert_struct(s).await?;
-        }
-        Ok(())
-    }
-
-    async fn batch_upsert_traits(&self, traits: &[TraitNode]) -> Result<()> {
-        for t in traits {
-            self.upsert_trait(t).await?;
-        }
-        Ok(())
-    }
-
-    async fn batch_upsert_enums(&self, enums: &[EnumNode]) -> Result<()> {
-        for e in enums {
-            self.upsert_enum(e).await?;
-        }
-        Ok(())
-    }
-
-    async fn batch_upsert_impls(&self, impls: &[ImplNode]) -> Result<()> {
-        for imp in impls {
-            self.upsert_impl(imp).await?;
-        }
-        Ok(())
-    }
-
-    async fn batch_upsert_imports(&self, imports: &[ImportNode]) -> Result<()> {
-        for imp in imports {
-            self.upsert_import(imp).await?;
-        }
-        Ok(())
-    }
-
-    async fn batch_create_import_relationships(
-        &self,
-        relationships: &[(String, String, String)],
-    ) -> Result<()> {
-        for (source, target, import_path) in relationships {
-            self.create_import_relationship(source, target, import_path)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn batch_create_imports_symbol_relationships(
-        &self,
-        relationships: &[(String, String, Option<Uuid>)],
-    ) -> Result<()> {
-        for (import_id, symbol_name, project_id) in relationships {
-            self.create_imports_symbol_relationship(import_id, symbol_name, *project_id)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn batch_create_call_relationships(
-        &self,
-        calls: &[crate::parser::FunctionCall],
-        project_id: Option<Uuid>,
-    ) -> Result<()> {
-        for call in calls {
-            self.create_call_relationship(
-                &call.caller_id,
-                &call.callee_name,
-                project_id,
-                call.confidence,
-                &call.reason,
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    async fn batch_create_extends_relationships(
-        &self,
-        rels: &[(String, String, String, String)],
-    ) -> Result<()> {
-        let mut cr = self.call_relationships.write().await;
-        for (child_name, _child_file, parent_name, _pid) in rels {
-            cr.entry(format!("extends:{}", child_name))
-                .or_default()
-                .push(parent_name.clone());
-        }
-        Ok(())
-    }
-
-    async fn batch_create_implements_relationships(
-        &self,
-        rels: &[(String, String, String, String)],
-    ) -> Result<()> {
-        let mut cr = self.call_relationships.write().await;
-        for (struct_name, _struct_file, iface_name, _pid) in rels {
-            cr.entry(format!("implements:{}", struct_name))
-                .or_default()
-                .push(iface_name.clone());
-        }
-        Ok(())
-    }
-
-    async fn cleanup_cross_project_calls(&self) -> Result<i64> {
-        let mut cr = self.call_relationships.write().await;
-        let functions = self.functions.read().await;
-        let project_files = self.project_files.read().await;
-        let mut deleted = 0i64;
-
-        // Build reverse map: file_path -> project_ids
-        let mut file_to_projects: std::collections::HashMap<&str, Vec<uuid::Uuid>> =
-            std::collections::HashMap::new();
-        for (&pid, paths) in project_files.iter() {
-            for path in paths {
-                file_to_projects.entry(path.as_str()).or_default().push(pid);
-            }
-        }
-
-        // For each caller → callees, check if they share a project
-        let mut to_remove: Vec<(String, Vec<String>)> = Vec::new();
-        for (caller_id, callees) in cr.iter() {
-            let caller_file = caller_id.rsplit_once("::").map(|(fp, _)| fp);
-            let caller_projects: Vec<uuid::Uuid> = caller_file
-                .and_then(|fp| file_to_projects.get(fp))
-                .cloned()
-                .unwrap_or_default();
-
-            if caller_projects.is_empty() {
-                continue;
-            }
-
-            let mut bad_callees = Vec::new();
-            for callee_name in callees {
-                let callee_shares_project = functions.values().any(|f| {
-                    if f.name != *callee_name {
-                        return false;
-                    }
-                    let callee_projects = file_to_projects
-                        .get(f.file_path.as_str())
-                        .cloned()
-                        .unwrap_or_default();
-                    callee_projects
-                        .iter()
-                        .any(|cp| caller_projects.contains(cp))
-                });
-                if !callee_shares_project {
-                    bad_callees.push(callee_name.clone());
-                }
-            }
-            if !bad_callees.is_empty() {
-                to_remove.push((caller_id.clone(), bad_callees));
-            }
-        }
-
-        for (caller_id, bad_callees) in to_remove {
-            if let Some(callees) = cr.get_mut(&caller_id) {
-                for bad in &bad_callees {
-                    callees.retain(|c| c != bad);
-                    deleted += 1;
-                }
-            }
-        }
-        Ok(deleted)
-    }
-
-    async fn cleanup_builtin_calls(&self) -> Result<i64> {
-        use crate::parser::noise_filter;
-
-        let builtins = noise_filter::builtin_names();
-        let mut cr = self.call_relationships.write().await;
-        let mut deleted = 0i64;
-
-        for (_caller_id, callees) in cr.iter_mut() {
-            let before = callees.len();
-            callees.retain(|callee_name| !builtins.contains(callee_name.as_str()));
-            deleted += (before - callees.len()) as i64;
-        }
-
-        Ok(deleted)
-    }
-
-    async fn migrate_calls_confidence(&self) -> Result<i64> {
-        // Mock: no-op, confidence is always set at creation time in tests
-        Ok(0)
-    }
-
-    async fn cleanup_sync_data(&self) -> Result<i64> {
-        let mut total = 0i64;
-        total += self.files.write().await.drain().count() as i64;
-        total += self.functions.write().await.drain().count() as i64;
-        total += self.structs_map.write().await.drain().count() as i64;
-        total += self.traits_map.write().await.drain().count() as i64;
-        total += self.enums_map.write().await.drain().count() as i64;
-        total += self.impls_map.write().await.drain().count() as i64;
-        total += self.imports.write().await.drain().count() as i64;
-        self.call_relationships.write().await.clear();
-        self.import_relationships.write().await.clear();
-        Ok(total)
-    }
-
-    async fn get_callees(&self, function_id: &str, _depth: u32) -> Result<Vec<FunctionNode>> {
-        let cr = self.call_relationships.read().await;
-        let functions = self.functions.read().await;
-        let callee_names = cr.get(function_id).cloned().unwrap_or_default();
-        let mut result = Vec::new();
-        for name in &callee_names {
-            for (_, f) in functions.iter() {
-                if f.name == *name {
-                    result.push(f.clone());
-                    break;
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    async fn create_uses_type_relationship(
-        &self,
-        _function_id: &str,
-        _type_name: &str,
-    ) -> Result<()> {
-        // Simplified: no-op for mock
-        Ok(())
-    }
-
-    async fn find_trait_implementors(&self, trait_name: &str) -> Result<Vec<String>> {
-        let impls = self.impls_map.read().await;
-        let mut result = Vec::new();
-        for imp in impls.values() {
-            if imp.trait_name.as_deref() == Some(trait_name) {
-                result.push(imp.for_type.clone());
-            }
-        }
-        Ok(result)
-    }
-
-    async fn get_type_traits(&self, type_name: &str) -> Result<Vec<String>> {
-        let impls = self.impls_map.read().await;
-        let mut result = Vec::new();
-        for imp in impls.values() {
-            if imp.for_type == type_name {
-                if let Some(t) = &imp.trait_name {
-                    result.push(t.clone());
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    async fn get_impl_blocks(&self, type_name: &str) -> Result<Vec<serde_json::Value>> {
-        let impls = self.impls_map.read().await;
-        let mut result = Vec::new();
-        for imp in impls.values() {
-            if imp.for_type == type_name {
-                result.push(serde_json::json!({
-                    "for_type": imp.for_type,
-                    "trait_name": imp.trait_name,
-                    "file_path": imp.file_path,
-                    "line_start": imp.line_start,
-                    "line_end": imp.line_end,
-                }));
-            }
-        }
-        Ok(result)
-    }
-
-    // ========================================================================
-    // Heritage navigation queries
-    // ========================================================================
-
-    async fn get_class_hierarchy(
-        &self,
-        type_name: &str,
-        _max_depth: u32,
-    ) -> Result<serde_json::Value> {
-        Ok(serde_json::json!({
-            "type_name": type_name,
-            "parents": [],
-            "children": [],
-        }))
-    }
-
-    async fn find_subclasses(&self, _class_name: &str) -> Result<Vec<serde_json::Value>> {
-        Ok(Vec::new())
-    }
-
-    async fn find_interface_implementors(
-        &self,
-        _interface_name: &str,
-    ) -> Result<Vec<serde_json::Value>> {
-        Ok(Vec::new())
-    }
-
-    // ========================================================================
-    // Process queries
-    // ========================================================================
-
-    async fn list_processes(&self, _project_id: uuid::Uuid) -> Result<Vec<serde_json::Value>> {
-        Ok(Vec::new())
-    }
-
-    async fn get_process_detail(&self, _process_id: &str) -> Result<Option<serde_json::Value>> {
-        Ok(None)
-    }
-
-    async fn get_entry_points(
-        &self,
-        _project_id: uuid::Uuid,
-        _limit: usize,
-    ) -> Result<Vec<serde_json::Value>> {
-        Ok(Vec::new())
-    }
-
-    // ========================================================================
-    // Code exploration queries
-    // ========================================================================
-
-    async fn get_file_language(&self, path: &str) -> Result<Option<String>> {
-        Ok(self
-            .files
-            .read()
-            .await
-            .get(path)
-            .map(|f| f.language.clone()))
-    }
-
-    async fn get_file_functions_summary(&self, path: &str) -> Result<Vec<FunctionSummaryNode>> {
-        let functions = self.functions.read().await;
-        let mut result = Vec::new();
-        for (id, f) in functions.iter() {
-            if id.starts_with(&format!("{}::", path)) || f.file_path == path {
-                let params_str = f
-                    .params
-                    .iter()
-                    .map(|p| {
-                        if let Some(t) = &p.type_name {
-                            format!("{}: {}", p.name, t)
-                        } else {
-                            p.name.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let ret = f
-                    .return_type
-                    .as_ref()
-                    .map(|r| format!(" -> {}", r))
-                    .unwrap_or_default();
-                let signature = format!("fn {}({}){}", f.name, params_str, ret);
-                result.push(FunctionSummaryNode {
-                    name: f.name.clone(),
-                    signature,
-                    line: f.line_start,
-                    is_async: f.is_async,
-                    is_public: f.visibility == Visibility::Public,
-                    complexity: f.complexity,
-                    docstring: f.docstring.clone(),
-                });
-            }
-        }
-        Ok(result)
-    }
-
-    async fn get_file_structs_summary(&self, path: &str) -> Result<Vec<StructSummaryNode>> {
-        let structs = self.structs_map.read().await;
-        let mut result = Vec::new();
-        for s in structs.values() {
-            if s.file_path == path {
-                result.push(StructSummaryNode {
-                    name: s.name.clone(),
-                    line: s.line_start,
-                    is_public: s.visibility == Visibility::Public,
-                    docstring: s.docstring.clone(),
-                });
-            }
-        }
-        Ok(result)
-    }
-
-    async fn get_file_import_paths_list(&self, path: &str) -> Result<Vec<String>> {
-        let imports = self.imports.read().await;
-        let mut result = Vec::new();
-        for imp in imports.values() {
-            if imp.file_path == path {
-                result.push(imp.path.clone());
-            }
-        }
-        Ok(result)
-    }
-
-    async fn find_symbol_references(
-        &self,
-        symbol: &str,
-        limit: usize,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<SymbolReferenceNode>> {
-        let mut references = Vec::new();
-
-        // If project_id provided, get the set of file paths belonging to this project
-        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
-            let pf = self.project_files.read().await;
-            Some(pf.get(&pid).cloned().unwrap_or_default())
-        } else {
-            None
-        };
-
-        // Find function callers (via call_relationships)
-        let cr = self.call_relationships.read().await;
-        let functions = self.functions.read().await;
-        for (caller_id, callees) in cr.iter() {
-            if callees.contains(&symbol.to_string()) {
-                if let Some(caller_fn) = functions.get(caller_id) {
-                    if let Some(ref paths) = project_file_paths {
-                        if !paths.contains(&caller_fn.file_path) {
-                            continue;
-                        }
-                    }
-                    references.push(SymbolReferenceNode {
-                        file_path: caller_fn.file_path.clone(),
-                        line: caller_fn.line_start,
-                        context: format!("called from {}", caller_fn.name),
-                        reference_type: "call".to_string(),
-                    });
-                    if references.len() >= limit {
-                        return Ok(references);
-                    }
-                }
-            }
-        }
-
-        // Find struct import usages (via imports)
-        let imports = self.imports.read().await;
-        let structs = self.structs_map.read().await;
-        let has_struct = structs.values().any(|s| s.name == symbol);
-        if has_struct {
-            for import in imports.values() {
-                if import.path.ends_with(symbol) {
-                    if let Some(ref paths) = project_file_paths {
-                        if !paths.contains(&import.file_path) {
-                            continue;
-                        }
-                    }
-                    references.push(SymbolReferenceNode {
-                        file_path: import.file_path.clone(),
-                        line: import.line,
-                        context: format!("imported via {}", import.path),
-                        reference_type: "import".to_string(),
-                    });
-                    if references.len() >= limit {
-                        return Ok(references);
-                    }
-                }
-            }
-        }
-
-        Ok(references)
-    }
-
-    async fn get_file_direct_imports(&self, path: &str) -> Result<Vec<FileImportNode>> {
-        let ir = self.import_relationships.read().await;
-        let files = self.files.read().await;
-        let imported = ir.get(path).cloned().unwrap_or_default();
-        Ok(imported
-            .iter()
-            .map(|p| {
-                let lang = files
-                    .get(p)
-                    .map(|f| f.language.clone())
-                    .unwrap_or_else(|| "unknown".to_string());
-                FileImportNode {
-                    path: p.clone(),
-                    language: lang,
-                }
-            })
-            .collect())
-    }
-
-    async fn get_function_callers_by_name(
-        &self,
-        function_name: &str,
-        _depth: u32,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<String>> {
-        let cr = self.call_relationships.read().await;
-        let functions = self.functions.read().await;
-
-        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
-            let pf = self.project_files.read().await;
-            Some(pf.get(&pid).cloned().unwrap_or_default())
-        } else {
-            None
-        };
-
-        let mut callers = Vec::new();
-        for (caller, callees) in cr.iter() {
-            if callees.contains(&function_name.to_string()) {
-                if let Some(ref paths) = project_file_paths {
-                    if let Some(caller_fn) = functions.get(caller) {
-                        if !paths.contains(&caller_fn.file_path) {
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    }
-                }
-                callers.push(caller.clone());
-            }
-        }
-        Ok(callers)
-    }
-
-    async fn get_function_callees_by_name(
-        &self,
-        function_name: &str,
-        _depth: u32,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<String>> {
-        let cr = self.call_relationships.read().await;
-        let functions = self.functions.read().await;
-
-        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
-            let pf = self.project_files.read().await;
-            Some(pf.get(&pid).cloned().unwrap_or_default())
-        } else {
-            None
-        };
-
-        let mut callees_result = Vec::new();
-        for (caller_id, callees) in cr.iter() {
-            if caller_id.ends_with(&format!("::{}", function_name)) {
-                // If scoped, check that the caller belongs to the project
-                if let Some(ref paths) = project_file_paths {
-                    if let Some(caller_fn) = functions.get(caller_id) {
-                        if !paths.contains(&caller_fn.file_path) {
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    }
-                }
-                callees_result.extend(callees.clone());
-            }
-        }
-        Ok(callees_result)
-    }
-
-    async fn get_callers_with_confidence(
-        &self,
-        function_name: &str,
-        _project_id: Option<Uuid>,
-    ) -> Result<Vec<(String, String, f64, String)>> {
-        // Mock: return callers with default confidence
-        let cr = self.call_relationships.read().await;
-        let mut result = Vec::new();
-        for (caller_id, callees) in cr.iter() {
-            if callees.iter().any(|c| c == function_name) {
-                let file = caller_id.rsplitn(3, ':').last().unwrap_or(caller_id);
-                result.push((
-                    caller_id.clone(),
-                    file.to_string(),
-                    0.50,
-                    "unscored".to_string(),
-                ));
-            }
-        }
-        Ok(result)
-    }
-
-    async fn get_callees_with_confidence(
-        &self,
-        function_name: &str,
-        _project_id: Option<Uuid>,
-    ) -> Result<Vec<(String, String, f64, String)>> {
-        let cr = self.call_relationships.read().await;
-        let mut result = Vec::new();
-        for (caller_id, callees) in cr.iter() {
-            if caller_id.ends_with(&format!("::{}", function_name))
-                || caller_id.ends_with(&format!(":{}", function_name))
-            {
-                for callee in callees {
-                    result.push((callee.clone(), String::new(), 0.50, "unscored".to_string()));
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    async fn get_language_stats(&self) -> Result<Vec<LanguageStatsNode>> {
-        let files = self.files.read().await;
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for f in files.values() {
-            *counts.entry(f.language.clone()).or_default() += 1;
-        }
-        Ok(counts
-            .into_iter()
-            .map(|(language, file_count)| LanguageStatsNode {
-                language,
-                file_count,
-            })
-            .collect())
-    }
-
-    async fn get_language_stats_for_project(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<LanguageStatsNode>> {
-        let files = self.files.read().await;
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for f in files.values() {
-            if f.project_id == Some(project_id) {
-                *counts.entry(f.language.clone()).or_default() += 1;
-            }
-        }
-        Ok(counts
-            .into_iter()
-            .map(|(language, file_count)| LanguageStatsNode {
-                language,
-                file_count,
-            })
-            .collect())
-    }
-
-    async fn get_most_connected_files(&self, limit: usize) -> Result<Vec<String>> {
-        let ir = self.import_relationships.read().await;
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for targets in ir.values() {
-            for target in targets {
-                *counts.entry(target.clone()).or_default() += 1;
-            }
-        }
-        let mut files: Vec<_> = counts.into_iter().collect();
-        files.sort_by(|a, b| b.1.cmp(&a.1));
-        Ok(files.into_iter().take(limit).map(|(f, _)| f).collect())
-    }
-
-    async fn get_most_connected_files_detailed(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<ConnectedFileNode>> {
-        let ir = self.import_relationships.read().await;
-        let fa = self.file_analytics.read().await;
-        let mut import_counts: HashMap<String, i64> = HashMap::new();
-        let mut dependent_counts: HashMap<String, i64> = HashMap::new();
-
-        for (from, tos) in ir.iter() {
-            *import_counts.entry(from.clone()).or_default() += tos.len() as i64;
-            for to in tos {
-                *dependent_counts.entry(to.clone()).or_default() += 1;
-            }
-        }
-
-        let all_files: std::collections::HashSet<_> = import_counts
-            .keys()
-            .chain(dependent_counts.keys())
-            .cloned()
-            .collect();
-
-        let mut result: Vec<ConnectedFileNode> = all_files
-            .into_iter()
-            .map(|path| {
-                let analytics = fa.get(&path);
-                ConnectedFileNode {
-                    imports: *import_counts.get(&path).unwrap_or(&0),
-                    dependents: *dependent_counts.get(&path).unwrap_or(&0),
-                    pagerank: analytics.map(|a| a.pagerank),
-                    betweenness: analytics.map(|a| a.betweenness),
-                    community_label: analytics.map(|a| a.community_label.clone()),
-                    community_id: analytics.map(|a| a.community_id as i64),
-                    path,
-                }
-            })
-            .collect();
-
-        // Sort by pagerank (descending) with fallback to degree
-        result.sort_by(|a, b| {
-            let pr_a = a.pagerank.unwrap_or(0.0);
-            let pr_b = b.pagerank.unwrap_or(0.0);
-            pr_b.partial_cmp(&pr_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| (b.imports + b.dependents).cmp(&(a.imports + a.dependents)))
-        });
-        result.truncate(limit);
-        Ok(result)
-    }
-
-    async fn get_most_connected_files_for_project(
-        &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> Result<Vec<ConnectedFileNode>> {
-        let files = self.files.read().await;
-        let project_paths: std::collections::HashSet<_> = files
-            .values()
-            .filter(|f| f.project_id == Some(project_id))
-            .map(|f| f.path.clone())
-            .collect();
-
-        let ir = self.import_relationships.read().await;
-        let fa = self.file_analytics.read().await;
-        let mut import_counts: HashMap<String, i64> = HashMap::new();
-        let mut dependent_counts: HashMap<String, i64> = HashMap::new();
-
-        for (from, tos) in ir.iter() {
-            if !project_paths.contains(from) {
-                continue;
-            }
-            *import_counts.entry(from.clone()).or_default() += tos.len() as i64;
-            for to in tos {
-                if project_paths.contains(to) {
-                    *dependent_counts.entry(to.clone()).or_default() += 1;
-                }
-            }
-        }
-
-        let all_files: std::collections::HashSet<_> = import_counts
-            .keys()
-            .chain(dependent_counts.keys())
-            .cloned()
-            .collect();
-
-        let mut result: Vec<ConnectedFileNode> = all_files
-            .into_iter()
-            .map(|path| {
-                let analytics = fa.get(&path);
-                ConnectedFileNode {
-                    imports: *import_counts.get(&path).unwrap_or(&0),
-                    dependents: *dependent_counts.get(&path).unwrap_or(&0),
-                    pagerank: analytics.map(|a| a.pagerank),
-                    betweenness: analytics.map(|a| a.betweenness),
-                    community_label: analytics.map(|a| a.community_label.clone()),
-                    community_id: analytics.map(|a| a.community_id as i64),
-                    path,
-                }
-            })
-            .collect();
-
-        // Sort by pagerank (descending) with fallback to degree
-        result.sort_by(|a, b| {
-            let pr_a = a.pagerank.unwrap_or(0.0);
-            let pr_b = b.pagerank.unwrap_or(0.0);
-            pr_b.partial_cmp(&pr_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| (b.imports + b.dependents).cmp(&(a.imports + a.dependents)))
-        });
-        result.truncate(limit);
-        Ok(result)
-    }
-
-    async fn get_project_communities(&self, project_id: Uuid) -> Result<Vec<CommunityRow>> {
-        let files = self.files.read().await;
-        let fa = self.file_analytics.read().await;
-
-        // Collect files belonging to this project that have analytics
-        let project_paths: Vec<String> = files
-            .values()
-            .filter(|f| f.project_id == Some(project_id))
-            .map(|f| f.path.clone())
-            .collect();
-
-        // Group by community_id
-        let mut communities: HashMap<u32, (String, Vec<String>)> = HashMap::new();
-        for path in &project_paths {
-            if let Some(analytics) = fa.get(path) {
-                let entry = communities
-                    .entry(analytics.community_id)
-                    .or_insert_with(|| (analytics.community_label.clone(), Vec::new()));
-                entry.1.push(path.clone());
-            }
-        }
-
-        // Build result sorted by file_count descending
-        let mut result: Vec<CommunityRow> = communities
-            .into_iter()
-            .map(|(cid, (label, paths))| {
-                let key_files: Vec<String> = paths.iter().take(3).cloned().collect();
-                CommunityRow {
-                    community_id: cid as i64,
-                    community_label: label,
-                    file_count: paths.len(),
-                    key_files,
-                    unique_fingerprints: 0,
-                }
-            })
-            .collect();
-
-        result.sort_by(|a, b| b.file_count.cmp(&a.file_count));
-        Ok(result)
-    }
-
-    async fn get_node_analytics(
-        &self,
-        identifier: &str,
-        node_type: &str,
-    ) -> Result<Option<NodeAnalyticsRow>> {
-        if node_type == "function" {
-            let fa = self.function_analytics.read().await;
-            if let Some(analytics) = fa.get(identifier) {
-                return Ok(Some(NodeAnalyticsRow {
-                    pagerank: Some(analytics.pagerank),
-                    betweenness: Some(analytics.betweenness),
-                    community_id: Some(analytics.community_id as i64),
-                    community_label: None, // FunctionAnalyticsUpdate has no label
-                }));
-            }
-            Ok(None)
-        } else {
-            let fa = self.file_analytics.read().await;
-            if let Some(analytics) = fa.get(identifier) {
-                return Ok(Some(NodeAnalyticsRow {
-                    pagerank: Some(analytics.pagerank),
-                    betweenness: Some(analytics.betweenness),
-                    community_id: Some(analytics.community_id as i64),
-                    community_label: Some(analytics.community_label.clone()),
-                }));
-            }
-            Ok(None)
-        }
-    }
-
-    async fn get_affected_communities(&self, file_paths: &[String]) -> Result<Vec<String>> {
-        let fa = self.file_analytics.read().await;
-        let mut labels: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for path in file_paths {
-            if let Some(analytics) = fa.get(path) {
-                labels.insert(analytics.community_label.clone());
-            }
-        }
-        Ok(labels.into_iter().collect())
-    }
-
-    async fn get_code_health_report(
-        &self,
-        project_id: Uuid,
-        god_function_threshold: usize,
-    ) -> Result<CodeHealthReport> {
-        let pf = self.project_files.read().await;
-        let project_paths: Vec<String> = pf.get(&project_id).cloned().unwrap_or_default();
-        let project_paths_set: std::collections::HashSet<&str> =
-            project_paths.iter().map(|s| s.as_str()).collect();
-
-        // --- God functions ---
-        let functions = self.functions.read().await;
-        let cr = self.call_relationships.read().await;
-
-        // Only consider functions that belong to project files
-        let project_functions: Vec<&FunctionNode> = functions
-            .values()
-            .filter(|f| project_paths_set.contains(f.file_path.as_str()))
-            .collect();
-
-        let mut god_functions = Vec::new();
-        for func in &project_functions {
-            // in_degree: how many other functions call this one
-            let in_degree = cr
-                .iter()
-                .filter(|(_, callees)| callees.contains(&func.name))
-                .count();
-            // out_degree: how many functions this one calls
-            let out_degree = cr.get(&func.name).map(|callees| callees.len()).unwrap_or(0);
-            if in_degree >= god_function_threshold {
-                god_functions.push(GodFunction {
-                    name: func.name.clone(),
-                    file: func.file_path.clone(),
-                    in_degree,
-                    out_degree,
-                });
-            }
-        }
-        god_functions.sort_by(|a, b| b.in_degree.cmp(&a.in_degree));
-
-        // --- Orphan files ---
-        let ir = self.import_relationships.read().await;
-        let mut orphan_files = Vec::new();
-        for path in &project_paths {
-            // Orphan = no imports AND no other file imports it AND no functions
-            let has_imports = ir.get(path).map(|v| !v.is_empty()).unwrap_or(false);
-            let is_imported = ir.values().any(|targets| targets.contains(path));
-            let has_functions = project_functions.iter().any(|f| f.file_path == *path);
-            if !has_imports && !is_imported && !has_functions {
-                orphan_files.push(path.clone());
-            }
-        }
-
-        // --- Coupling metrics ---
-        let fa = self.file_analytics.read().await;
-        let project_analytics: Vec<&crate::graph::models::FileAnalyticsUpdate> = fa
-            .values()
-            .filter(|a| project_paths_set.contains(a.path.as_str()))
-            .collect();
-
-        let coupling_metrics = if project_analytics.is_empty() {
-            None
-        } else {
-            let sum: f64 = project_analytics
-                .iter()
-                .map(|a| a.clustering_coefficient)
-                .sum();
-            let avg = sum / project_analytics.len() as f64;
-            let (max_cc, most_coupled) = project_analytics.iter().fold(
-                (0.0_f64, None::<String>),
-                |(max_val, max_file), a| {
-                    if a.clustering_coefficient > max_val {
-                        (a.clustering_coefficient, Some(a.path.clone()))
-                    } else {
-                        (max_val, max_file)
-                    }
-                },
-            );
-            Some(CouplingMetrics {
-                avg_clustering_coefficient: avg,
-                max_clustering_coefficient: max_cc,
-                most_coupled_file: most_coupled,
-            })
-        };
-
-        Ok(CodeHealthReport {
-            god_functions,
-            orphan_files,
-            coupling_metrics,
-            prediction_accuracy: None,
-        })
-    }
-
-    async fn compute_maintenance_snapshot(
-        &self,
-        _project_id: Uuid,
-    ) -> Result<crate::neo4j::models::MaintenanceSnapshot> {
-        use chrono::Utc;
-        let notes = self.notes.read().await;
-        let active_notes = notes
-            .values()
-            .filter(|n| n.status == crate::notes::NoteStatus::Active)
-            .count();
-        let mean_energy = if active_notes > 0 {
-            notes
-                .values()
-                .filter(|n| n.status == crate::notes::NoteStatus::Active)
-                .map(|n| n.energy)
-                .sum::<f64>()
-                / active_notes as f64
-        } else {
-            0.5
-        };
-        let skills = self.skills.read().await;
-        let skill_count = skills
-            .values()
-            .filter(|s| {
-                matches!(
-                    s.status,
-                    crate::skills::models::SkillStatus::Active
-                        | crate::skills::models::SkillStatus::Emerging
-                )
-            })
-            .count();
-        let synapses = self.note_synapses.read().await;
-        let active_synapses: usize = synapses
-            .values()
-            .map(|v| v.iter().filter(|(_, w)| *w > 0.0).count())
-            .sum();
-        Ok(crate::neo4j::models::MaintenanceSnapshot {
-            health_score: 0.8,
-            active_synapses: active_synapses as i64,
-            mean_energy,
-            skill_count: skill_count as i64,
-            note_count: active_notes as i64,
-            captured_at: Utc::now().to_rfc3339(),
-        })
-    }
-
-    async fn compute_scaffolding_level(
-        &self,
-        project_id: Uuid,
-        scaffolding_override: Option<u8>,
-    ) -> Result<crate::neo4j::models::ScaffoldingLevel> {
-        // Compute real values from mock data
-        let plans = self.plans.read().await;
-        let tasks = self.tasks.read().await;
-        let plan_tasks_map = self.plan_tasks.read().await;
-
-        let mut completed = 0u64;
-        let mut failed = 0u64;
-        let mut total_frustration = 0.0f64;
-        let mut frust_count = 0u64;
-
-        for (plan_id, plan) in plans.iter() {
-            if plan.project_id != Some(project_id) {
-                continue;
-            }
-            if let Some(task_ids) = plan_tasks_map.get(plan_id) {
-                for tid in task_ids {
-                    if let Some(t) = tasks.get(tid) {
-                        match t.status {
-                            crate::neo4j::models::TaskStatus::Completed => completed += 1,
-                            crate::neo4j::models::TaskStatus::Failed => failed += 1,
-                            _ => {}
-                        }
-                        total_frustration += t.frustration_score;
-                        frust_count += 1;
-                    }
-                }
-            }
-        }
-
-        let tasks_analyzed = (completed + failed) as i64;
-        let task_success_rate = if tasks_analyzed > 0 {
-            completed as f64 / tasks_analyzed as f64
-        } else {
-            1.0
-        };
-        let avg_frustration = if frust_count > 0 {
-            total_frustration / frust_count as f64
-        } else {
-            0.0
-        };
-
-        // Scar density from notes
-        let notes = self.notes.read().await;
-        let project_notes: Vec<_> = notes
-            .values()
-            .filter(|n| {
-                n.project_id == Some(project_id) && n.status == crate::notes::NoteStatus::Active
-            })
-            .collect();
-        let scar_density = if !project_notes.is_empty() {
-            project_notes.iter().map(|n| n.scar_intensity).sum::<f64>() / project_notes.len() as f64
-        } else {
-            0.0
-        };
-
-        let homeostasis_pain = 0.0; // Simplified for mock
-
-        let competence_score = (task_success_rate * 0.5
-            + (1.0 - avg_frustration) * 0.2
-            + (1.0 - scar_density) * 0.15
-            + (1.0 - homeostasis_pain) * 0.15)
-            .clamp(0.0, 1.0);
-
-        let (level, label, recommended_steps) = if let Some(ovr) = scaffolding_override {
-            let ovr = ovr.min(4);
-            crate::neo4j::analytics::level_info(ovr)
-        } else {
-            let auto_level = if competence_score >= 0.9 {
-                4
-            } else if competence_score >= 0.75 {
-                3
-            } else if competence_score >= 0.5 {
-                2
-            } else if competence_score >= 0.3 {
-                1
-            } else {
-                0
-            };
-            crate::neo4j::analytics::level_info(auto_level)
-        };
-
-        Ok(crate::neo4j::models::ScaffoldingLevel {
-            level,
-            label,
-            recommended_steps,
-            task_success_rate,
-            avg_frustration,
-            scar_density,
-            homeostasis_pain,
-            competence_score,
-            is_overridden: scaffolding_override.is_some(),
-            tasks_analyzed,
-        })
-    }
-
-    async fn set_scaffolding_override(&self, project_id: Uuid, level: Option<u8>) -> Result<()> {
-        let mut projects = self.projects.write().await;
-        if let Some(p) = projects.get_mut(&project_id) {
-            p.scaffolding_override = level.map(|l| l.min(4));
-        }
-        Ok(())
-    }
-
-    async fn set_watch_enabled(&self, project_id: Uuid, enabled: bool) -> Result<()> {
-        if self
-            .mock_fail_set_watch_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(anyhow::anyhow!("mock: set_watch_enabled forced failure"));
-        }
-        let mut projects = self.projects.write().await;
-        if let Some(p) = projects.get_mut(&project_id) {
-            p.watch_enabled = enabled;
-        }
-        Ok(())
-    }
-
-    async fn set_default_note_energy(&self, project_id: Uuid, energy: Option<f64>) -> Result<()> {
-        let mut projects = self.projects.write().await;
-        if let Some(p) = projects.get_mut(&project_id) {
-            p.default_note_energy = energy.map(|e| e.clamp(0.0, 1.0));
-        }
-        Ok(())
-    }
-
-    async fn detect_global_stagnation(
-        &self,
-        project_id: Uuid,
-    ) -> Result<crate::neo4j::models::StagnationReport> {
-        // Mock: check task statuses in this project's plans
-        let plans = self.plans.read().await;
-        let tasks = self.tasks.read().await;
-        let plan_tasks = self.plan_tasks.read().await;
-
-        let mut completed_recent = 0i64;
-        let mut total_frustration = 0.0f64;
-        let mut frustration_count = 0i64;
-
-        for (plan_id, plan) in plans.iter() {
-            if plan.project_id != Some(project_id) {
-                continue;
-            }
-            if let Some(task_ids) = plan_tasks.get(plan_id) {
-                for task_id in task_ids {
-                    if let Some(t) = tasks.get(task_id) {
-                        if t.status == crate::neo4j::models::TaskStatus::Completed {
-                            completed_recent += 1;
-                        }
-                        if t.status == crate::neo4j::models::TaskStatus::InProgress
-                            && t.frustration_score > 0.0
-                        {
-                            total_frustration += t.frustration_score;
-                            frustration_count += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        let avg_frustration = if frustration_count > 0 {
-            total_frustration / frustration_count as f64
-        } else {
-            0.0
-        };
-
-        let notes = self.notes.read().await;
-        let note_count = notes
-            .values()
-            .filter(|n| n.project_id == Some(project_id))
-            .count() as i64;
-        let mean_energy = if note_count > 0 {
-            notes
-                .values()
-                .filter(|n| n.project_id == Some(project_id))
-                .map(|n| n.energy)
-                .sum::<f64>()
-                / note_count as f64
-        } else {
-            1.0
-        };
-        let energy_trend = mean_energy - 0.5;
-
-        let mut signals: u8 = 0;
-        let mut recommendations = Vec::new();
-
-        if completed_recent == 0 {
-            signals += 1;
-            recommendations.push("No tasks completed recently.".to_string());
-        }
-        if avg_frustration > 0.6 {
-            signals += 1;
-            recommendations.push(format!("High frustration: {:.2}", avg_frustration));
-        }
-        if energy_trend < 0.0 {
-            signals += 1;
-            recommendations.push("Note energy declining.".to_string());
-        }
-        // Mock: no commit tracking, assume 0
-        signals += 1;
-        recommendations.push("No commits tracked in mock.".to_string());
-
-        let is_stagnating = signals >= 3;
-        if is_stagnating {
-            recommendations.push("⚠️ Global stagnation detected.".to_string());
-        }
-
-        Ok(crate::neo4j::models::StagnationReport {
-            is_stagnating,
-            tasks_completed_48h: completed_recent,
-            avg_frustration,
-            energy_trend,
-            commits_48h: 0,
-            signals_triggered: signals,
-            recommendations,
-        })
-    }
-
-    async fn get_circular_dependencies(&self, project_id: Uuid) -> Result<Vec<Vec<String>>> {
-        let pf = self.project_files.read().await;
-        let project_paths: Vec<String> = pf.get(&project_id).cloned().unwrap_or_default();
-        let project_paths_set: std::collections::HashSet<&str> =
-            project_paths.iter().map(|s| s.as_str()).collect();
-
-        let ir = self.import_relationships.read().await;
-
-        // DFS cycle detection
-        let mut cycles: Vec<Vec<String>> = Vec::new();
-        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for start in &project_paths {
-            if visited.contains(start) {
-                continue;
-            }
-            let mut stack: Vec<(String, Vec<String>)> = vec![(start.clone(), vec![start.clone()])];
-            let mut local_visited: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-
-            while let Some((current, path)) = stack.pop() {
-                if let Some(neighbors) = ir.get(&current) {
-                    for neighbor in neighbors {
-                        if !project_paths_set.contains(neighbor.as_str()) {
-                            continue;
-                        }
-                        if *neighbor == *start && path.len() >= 2 {
-                            // Found a cycle — canonicalize by sorting to deduplicate
-                            let mut cycle = path.clone();
-                            cycle.push(neighbor.clone());
-                            let min_idx = cycle
-                                .iter()
-                                .take(cycle.len() - 1)
-                                .enumerate()
-                                .min_by(|a, b| a.1.cmp(b.1))
-                                .map(|(i, _)| i)
-                                .unwrap_or(0);
-                            let mut canonical: Vec<String> =
-                                cycle[min_idx..cycle.len() - 1].to_vec();
-                            canonical.extend(cycle[..min_idx].to_vec());
-                            canonical.push(canonical[0].clone());
-                            if !cycles.iter().any(|c| c == &canonical) {
-                                cycles.push(canonical);
-                            }
-                        } else if !local_visited.contains(neighbor) && path.len() < 6 {
-                            local_visited.insert(neighbor.clone());
-                            let mut new_path = path.clone();
-                            new_path.push(neighbor.clone());
-                            stack.push((neighbor.clone(), new_path));
-                        }
-                    }
-                }
-            }
-            visited.insert(start.clone());
-        }
-
-        Ok(cycles)
-    }
-
-    async fn get_node_gds_metrics(
-        &self,
-        node_path: &str,
-        node_type: &str,
-        project_id: Uuid,
-    ) -> Result<Option<NodeGdsMetrics>> {
-        let pf = self.project_files.read().await;
-        let project_paths = pf.get(&project_id).cloned().unwrap_or_default();
-
-        match node_type {
-            "function" => {
-                let functions = self.functions.read().await;
-                // Functions are keyed by "file_path::name", so find by name
-                let func = functions
-                    .values()
-                    .find(|f| f.name == node_path && project_paths.contains(&f.file_path));
-                if func.is_none() {
-                    return Ok(None);
-                }
-
-                let fa = self.function_analytics.read().await;
-                let cr = self.call_relationships.read().await;
-
-                let in_degree = cr
-                    .iter()
-                    .filter(|(_, callees)| callees.contains(&node_path.to_string()))
-                    .count() as i64;
-                let out_degree = cr.get(node_path).map(|c| c.len()).unwrap_or(0) as i64;
-
-                if let Some(analytics) = fa.get(node_path) {
-                    Ok(Some(NodeGdsMetrics {
-                        node_path: node_path.to_string(),
-                        node_type: "function".to_string(),
-                        pagerank: Some(analytics.pagerank),
-                        betweenness: Some(analytics.betweenness),
-                        clustering_coefficient: Some(analytics.clustering_coefficient),
-                        community_id: Some(analytics.community_id as i64),
-                        community_label: None,
-                        in_degree,
-                        out_degree,
-                        fabric_pagerank: None,
-                        fabric_betweenness: None,
-                        fabric_community_id: None,
-                        fabric_community_label: None,
-                    }))
-                } else {
-                    // Node exists but no GDS metrics
-                    Ok(Some(NodeGdsMetrics {
-                        node_path: node_path.to_string(),
-                        node_type: "function".to_string(),
-                        pagerank: None,
-                        betweenness: None,
-                        clustering_coefficient: None,
-                        community_id: None,
-                        community_label: None,
-                        in_degree,
-                        out_degree,
-                        fabric_pagerank: None,
-                        fabric_betweenness: None,
-                        fabric_community_id: None,
-                        fabric_community_label: None,
-                    }))
-                }
-            }
-            _ => {
-                // File
-                if !project_paths.contains(&node_path.to_string()) {
-                    return Ok(None);
-                }
-
-                let fa = self.file_analytics.read().await;
-                let ir = self.import_relationships.read().await;
-
-                let in_degree = ir
-                    .iter()
-                    .filter(|(_, targets)| targets.contains(&node_path.to_string()))
-                    .count() as i64;
-                let out_degree = ir.get(node_path).map(|t| t.len()).unwrap_or(0) as i64;
-
-                if let Some(analytics) = fa.get(node_path) {
-                    Ok(Some(NodeGdsMetrics {
-                        node_path: node_path.to_string(),
-                        node_type: "file".to_string(),
-                        pagerank: Some(analytics.pagerank),
-                        betweenness: Some(analytics.betweenness),
-                        clustering_coefficient: Some(analytics.clustering_coefficient),
-                        community_id: Some(analytics.community_id as i64),
-                        community_label: Some(analytics.community_label.clone()),
-                        in_degree,
-                        out_degree,
-                        fabric_pagerank: None,
-                        fabric_betweenness: None,
-                        fabric_community_id: None,
-                        fabric_community_label: None,
-                    }))
-                } else {
-                    Ok(Some(NodeGdsMetrics {
-                        node_path: node_path.to_string(),
-                        node_type: "file".to_string(),
-                        pagerank: None,
-                        betweenness: None,
-                        clustering_coefficient: None,
-                        community_id: None,
-                        community_label: None,
-                        in_degree,
-                        out_degree,
-                        fabric_pagerank: None,
-                        fabric_betweenness: None,
-                        fabric_community_id: None,
-                        fabric_community_label: None,
-                    }))
-                }
-            }
-        }
-    }
-
-    async fn get_project_percentiles(&self, project_id: Uuid) -> Result<ProjectPercentiles> {
-        let pf = self.project_files.read().await;
-        let project_paths = pf.get(&project_id).cloned().unwrap_or_default();
-
-        let fa = self.file_analytics.read().await;
-        let fna = self.function_analytics.read().await;
-
-        let mut pageranks: Vec<f64> = Vec::new();
-        let mut betweennesses: Vec<f64> = Vec::new();
-
-        // Collect from file analytics
-        for path in &project_paths {
-            if let Some(a) = fa.get(path) {
-                pageranks.push(a.pagerank);
-                betweennesses.push(a.betweenness);
-            }
-        }
-
-        // Collect from function analytics (functions belonging to project files)
-        let functions = self.functions.read().await;
-        for func in functions.values() {
-            if project_paths.contains(&func.file_path) {
-                if let Some(a) = fna.get(&func.name) {
-                    pageranks.push(a.pagerank);
-                    betweennesses.push(a.betweenness);
-                }
-            }
-        }
-
-        if pageranks.is_empty() {
-            return Ok(ProjectPercentiles {
-                pagerank_p50: 0.0,
-                pagerank_p80: 0.0,
-                pagerank_p95: 0.0,
-                betweenness_p50: 0.0,
-                betweenness_p80: 0.0,
-                betweenness_p95: 0.0,
-                betweenness_mean: 0.0,
-                betweenness_stddev: 0.0,
-            });
-        }
-
-        pageranks.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        betweennesses.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-        let cnt = pageranks.len();
-        let percentile = |sorted: &[f64], p: f64| -> f64 {
-            let idx = ((cnt as f64 * p) as usize).min(cnt - 1);
-            sorted[idx]
-        };
-
-        let bw_mean: f64 = betweennesses.iter().sum::<f64>() / cnt as f64;
-        let bw_var: f64 = betweennesses
-            .iter()
-            .map(|x| (x - bw_mean).powi(2))
-            .sum::<f64>()
-            / cnt as f64;
-
-        Ok(ProjectPercentiles {
-            pagerank_p50: percentile(&pageranks, 0.5),
-            pagerank_p80: percentile(&pageranks, 0.8),
-            pagerank_p95: percentile(&pageranks, 0.95),
-            betweenness_p50: percentile(&betweennesses, 0.5),
-            betweenness_p80: percentile(&betweennesses, 0.8),
-            betweenness_p95: percentile(&betweennesses, 0.95),
-            betweenness_mean: bw_mean,
-            betweenness_stddev: bw_var.sqrt(),
-        })
-    }
-
-    async fn get_top_bridges_by_betweenness(
-        &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> Result<Vec<BridgeFile>> {
-        let pf = self.project_files.read().await;
-        let project_paths = pf.get(&project_id).cloned().unwrap_or_default();
-        let fa = self.file_analytics.read().await;
-
-        let mut bridges: Vec<BridgeFile> = project_paths
-            .iter()
-            .filter_map(|path| {
-                fa.get(path).map(|a| BridgeFile {
-                    path: path.clone(),
-                    betweenness: a.betweenness,
-                    community_label: Some(a.community_label.clone()),
-                })
-            })
-            .collect();
-
-        bridges.sort_by(|a, b| b.betweenness.partial_cmp(&a.betweenness).unwrap());
-        bridges.truncate(limit);
-        Ok(bridges)
-    }
-
-    async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode> {
-        let functions = self.functions.read().await;
-        let structs = self.structs_map.read().await;
-        let traits = self.traits_map.read().await;
-        let enums = self.enums_map.read().await;
-
-        let fn_names: Vec<String> = functions
-            .values()
-            .filter(|f| f.file_path == path)
-            .map(|f| f.name.clone())
-            .collect();
-        let struct_names: Vec<String> = structs
-            .values()
-            .filter(|s| s.file_path == path)
-            .map(|s| s.name.clone())
-            .collect();
-        let trait_names: Vec<String> = traits
-            .values()
-            .filter(|t| t.file_path == path)
-            .map(|t| t.name.clone())
-            .collect();
-        let enum_names: Vec<String> = enums
-            .values()
-            .filter(|e| e.file_path == path)
-            .map(|e| e.name.clone())
-            .collect();
-
-        Ok(FileSymbolNamesNode {
-            functions: fn_names,
-            structs: struct_names,
-            traits: trait_names,
-            enums: enum_names,
-        })
-    }
-
-    async fn get_function_caller_count(
-        &self,
-        function_name: &str,
-        project_id: Option<Uuid>,
-    ) -> Result<i64> {
-        let cr = self.call_relationships.read().await;
-        let functions = self.functions.read().await;
-
-        // If project_id provided, get the set of file paths belonging to this project
-        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
-            let pf = self.project_files.read().await;
-            Some(pf.get(&pid).cloned().unwrap_or_default())
-        } else {
-            None
-        };
-
-        let mut count = 0i64;
-        for (caller_id, callees) in cr.iter() {
-            if callees.contains(&function_name.to_string()) {
-                // If scoped by project, only count callers whose file is in the project
-                if let Some(ref paths) = project_file_paths {
-                    if let Some(caller_fn) = functions.get(caller_id) {
-                        if !paths.contains(&caller_fn.file_path) {
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    }
-                }
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-
-    async fn get_trait_info(&self, trait_name: &str) -> Result<Option<TraitInfoNode>> {
-        let traits = self.traits_map.read().await;
-        for t in traits.values() {
-            if t.name == trait_name {
-                return Ok(Some(TraitInfoNode {
-                    is_external: t.is_external,
-                    source: t.source.clone(),
-                }));
-            }
-        }
-        Ok(None)
-    }
-
-    async fn get_trait_implementors_detailed(
-        &self,
-        trait_name: &str,
-    ) -> Result<Vec<TraitImplementorNode>> {
-        let impls = self.impls_map.read().await;
-        let mut result = Vec::new();
-        for imp in impls.values() {
-            if imp.trait_name.as_deref() == Some(trait_name) {
-                result.push(TraitImplementorNode {
-                    type_name: imp.for_type.clone(),
-                    file_path: imp.file_path.clone(),
-                    line: imp.line_start,
-                });
-            }
-        }
-        Ok(result)
-    }
-
-    async fn get_type_trait_implementations(
-        &self,
-        type_name: &str,
-    ) -> Result<Vec<TypeTraitInfoNode>> {
-        let impls = self.impls_map.read().await;
-        let traits = self.traits_map.read().await;
-        let mut result = Vec::new();
-        for imp in impls.values() {
-            if imp.for_type == type_name {
-                if let Some(trait_name) = &imp.trait_name {
-                    let trait_node = traits.values().find(|t| t.name == *trait_name);
-                    result.push(TypeTraitInfoNode {
-                        name: trait_name.clone(),
-                        full_path: trait_node.map(|t| format!("{}::{}", t.file_path, t.name)),
-                        file_path: imp.file_path.clone(),
-                        is_external: trait_node.map(|t| t.is_external).unwrap_or(false),
-                        source: trait_node.and_then(|t| t.source.clone()),
-                    });
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    async fn get_type_impl_blocks_detailed(
-        &self,
-        type_name: &str,
-    ) -> Result<Vec<ImplBlockDetailNode>> {
-        let impls = self.impls_map.read().await;
-        let functions = self.functions.read().await;
-        let mut result = Vec::new();
-        for imp in impls.values() {
-            if imp.for_type == type_name {
-                // Find methods in this impl block by line range
-                let methods: Vec<String> = functions
-                    .values()
-                    .filter(|f| {
-                        f.file_path == imp.file_path
-                            && f.line_start >= imp.line_start
-                            && f.line_end <= imp.line_end
-                    })
-                    .map(|f| f.name.clone())
-                    .collect();
-                result.push(ImplBlockDetailNode {
-                    file_path: imp.file_path.clone(),
-                    line_start: imp.line_start,
-                    line_end: imp.line_end,
-                    trait_name: imp.trait_name.clone(),
-                    methods,
-                });
-            }
-        }
-        Ok(result)
-    }
-
-    // ========================================================================
-    // Plan operations
-    // ========================================================================
-
-    async fn create_plan(&self, plan: &PlanNode) -> Result<()> {
-        let plan_id = plan.id;
-        if let Some(project_id) = plan.project_id {
-            self.project_plans
-                .write()
-                .await
-                .entry(project_id)
-                .or_default()
-                .push(plan_id);
-        }
-        self.plans.write().await.insert(plan_id, plan.clone());
-        Ok(())
-    }
-
-    async fn get_plan(&self, id: Uuid) -> Result<Option<PlanNode>> {
-        if self.fail_get_plan.lock().is_ok_and(|f| f.contains(&id)) {
-            anyhow::bail!("mock: get_plan failure injected for {id}");
-        }
-        Ok(self.plans.read().await.get(&id).cloned())
-    }
-
-    async fn list_active_plans(&self) -> Result<Vec<PlanNode>> {
-        Ok(self
-            .plans
-            .read()
-            .await
-            .values()
-            .filter(|p| {
-                matches!(
-                    p.status,
-                    PlanStatus::Draft | PlanStatus::Approved | PlanStatus::InProgress
-                )
-            })
-            .cloned()
-            .collect())
-    }
-
-    async fn list_project_plans(&self, project_id: Uuid) -> Result<Vec<PlanNode>> {
-        let pp = self.project_plans.read().await;
-        let plans = self.plans.read().await;
-        let ids = pp.get(&project_id).cloned().unwrap_or_default();
-        Ok(ids
-            .iter()
-            .filter_map(|id| plans.get(id).cloned())
-            .filter(|p| {
-                matches!(
-                    p.status,
-                    PlanStatus::Draft | PlanStatus::Approved | PlanStatus::InProgress
-                )
-            })
-            .collect())
-    }
-
-    async fn count_project_plans(&self, project_id: Uuid) -> Result<i64> {
-        let pp = self.project_plans.read().await;
-        let plans = self.plans.read().await;
-        let ids = pp.get(&project_id).cloned().unwrap_or_default();
-        let count = ids
-            .iter()
-            .filter_map(|id| plans.get(id))
-            .filter(|p| {
-                matches!(
-                    p.status,
-                    PlanStatus::Draft | PlanStatus::Approved | PlanStatus::InProgress
-                )
-            })
-            .count();
-        Ok(count as i64)
-    }
-
-    async fn list_plans_for_project(
-        &self,
-        project_id: Uuid,
-        status_filter: Option<Vec<String>>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<PlanNode>, usize)> {
-        let pp = self.project_plans.read().await;
-        let plans = self.plans.read().await;
-        let ids = pp.get(&project_id).cloned().unwrap_or_default();
-        let mut filtered: Vec<PlanNode> = ids
-            .iter()
-            .filter_map(|id| plans.get(id).cloned())
-            .filter(|p| {
-                if let Some(ref statuses) = status_filter {
-                    let ps = serde_json::to_string(&p.status)
-                        .unwrap_or_default()
-                        .trim_matches('"')
-                        .to_string();
-                    statuses.contains(&ps)
-                } else {
-                    true
-                }
-            })
-            .collect();
-        filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        let total = filtered.len();
-        Ok((paginate(&filtered, limit, offset), total))
-    }
-
-    async fn update_plan(&self, id: Uuid, updates: &UpdatePlanRequest) -> Result<()> {
-        if let Some(p) = self.plans.write().await.get_mut(&id) {
-            if let Some(title) = &updates.title {
-                p.title = title.clone();
-            }
-            if let Some(description) = &updates.description {
-                p.description = description.clone();
-            }
-            if let Some(priority) = updates.priority {
-                p.priority = priority;
-            }
-        }
-        Ok(())
-    }
-
-    async fn update_plan_status(&self, id: Uuid, status: PlanStatus) -> Result<()> {
-        if let Some(p) = self.plans.write().await.get_mut(&id) {
-            p.status = status;
-        }
-        Ok(())
-    }
-
-    async fn list_plan_project_slugs(&self, plan_id: Uuid) -> Result<Vec<String>> {
-        let primary = self
-            .plans
-            .read()
-            .await
-            .get(&plan_id)
-            .and_then(|p| p.project_id);
-        let linked: Vec<Uuid> = self
-            .project_plans
-            .read()
-            .await
-            .iter()
-            .filter(|(_, plans)| plans.contains(&plan_id))
-            .map(|(pid, _)| *pid)
-            .collect();
-        let projects = self.projects.read().await;
-        let mut slugs: Vec<String> = linked
-            .into_iter()
-            .chain(primary)
-            .filter_map(|pid| projects.get(&pid).map(|p| p.slug.clone()))
-            .collect();
-        slugs.sort();
-        slugs.dedup();
-        Ok(slugs)
-    }
-
-    /// Mirrors Neo4j (`plan.rs` link_plan_to_project): `MATCH` project and
-    /// plan (no-op if either is missing), `SET plan.project_id`, then
-    /// `MERGE (project)-[:HAS_PLAN]->(plan)`. MERGE is additive and
-    /// idempotent: previous HAS_PLAN links are KEPT (this is not a move).
-    async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> Result<()> {
-        if !self.projects.read().await.contains_key(&project_id) {
-            return Ok(());
-        }
-        match self.plans.write().await.get_mut(&plan_id) {
-            Some(p) => p.project_id = Some(project_id),
-            None => return Ok(()),
-        }
-        let mut project_plans = self.project_plans.write().await;
-        let ids = project_plans.entry(project_id).or_default();
-        if !ids.contains(&plan_id) {
-            ids.push(plan_id);
-        }
-        Ok(())
-    }
-
-    /// Mirrors Neo4j: deletes EVERY HAS_PLAN pointing at the plan (not only
-    /// the one matching `plan.project_id`) and clears `project_id`.
-    async fn unlink_plan_from_project(&self, plan_id: Uuid) -> Result<()> {
-        let mut linked = false;
-        for ids in self.project_plans.write().await.values_mut() {
-            let before = ids.len();
-            ids.retain(|id| *id != plan_id);
-            linked |= ids.len() != before;
-        }
-        // Neo4j only reaches the SET when at least one HAS_PLAN matched.
-        if linked {
-            if let Some(p) = self.plans.write().await.get_mut(&plan_id) {
-                p.project_id = None;
-            }
-        }
-        Ok(())
-    }
-
-    async fn delete_plan(&self, plan_id: Uuid) -> Result<()> {
-        // Cascade: delete tasks, steps, decisions, constraints
-        if let Some(task_ids) = self.plan_tasks.write().await.remove(&plan_id) {
-            for tid in task_ids {
-                self.delete_task(tid).await?;
-            }
-        }
-        if let Some(constraint_ids) = self.plan_constraints.write().await.remove(&plan_id) {
-            let mut constraints = self.constraints.write().await;
-            for cid in constraint_ids {
-                constraints.remove(&cid);
-            }
-        }
-        self.plan_commits.write().await.remove(&plan_id);
-        if self.plans.write().await.remove(&plan_id).is_some() {
-            // DETACH DELETE drops every HAS_PLAN, not only plan.project_id's.
-            for ids in self.project_plans.write().await.values_mut() {
-                ids.retain(|id| *id != plan_id);
-            }
-        }
-        Ok(())
-    }
-
-    // ========================================================================
-    // Task operations
-    // ========================================================================
-
-    async fn create_task(&self, plan_id: Uuid, task: &TaskNode) -> Result<()> {
-        let task_id = task.id;
-        self.plan_tasks
-            .write()
-            .await
-            .entry(plan_id)
-            .or_default()
-            .push(task_id);
-        self.tasks.write().await.insert(task_id, task.clone());
-        Ok(())
-    }
-
-    async fn get_plan_tasks(&self, plan_id: Uuid) -> Result<Vec<TaskNode>> {
-        let pt = self.plan_tasks.read().await;
-        let tasks = self.tasks.read().await;
-        let ids = pt.get(&plan_id).cloned().unwrap_or_default();
-        Ok(ids.iter().filter_map(|id| tasks.get(id).cloned()).collect())
-    }
-
-    async fn get_task_with_full_details(&self, task_id: Uuid) -> Result<Option<TaskDetails>> {
-        let task = match self.tasks.read().await.get(&task_id).cloned() {
-            Some(t) => t,
-            None => return Ok(None),
-        };
-        let steps = self.get_task_steps(task_id).await?;
-        let decisions = {
-            let td = self.task_decisions.read().await;
-            let decs = self.decisions.read().await;
-            td.get(&task_id)
-                .cloned()
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|id| decs.get(id).cloned())
-                .collect()
-        };
-        let depends_on = self
-            .task_dependencies
-            .read()
-            .await
-            .get(&task_id)
-            .cloned()
-            .unwrap_or_default();
-        let modifies_files = self
-            .task_files
-            .read()
-            .await
-            .get(&task_id)
-            .cloned()
-            .unwrap_or_default();
-        Ok(Some(TaskDetails {
-            task,
-            steps,
-            decisions,
-            depends_on,
-            modifies_files,
-        }))
-    }
-
-    async fn analyze_task_impact(&self, task_id: Uuid) -> Result<Vec<String>> {
-        let file_paths = self
-            .task_files
-            .read()
-            .await
-            .get(&task_id)
-            .cloned()
-            .unwrap_or_default();
-        let ir = self.import_relationships.read().await;
-        let mut impacted = Vec::new();
-        for path in &file_paths {
-            // Find files that import this file
-            for (from, tos) in ir.iter() {
-                if tos.contains(path) && !file_paths.contains(from) {
-                    impacted.push(from.clone());
-                }
-            }
-        }
-        impacted.sort();
-        impacted.dedup();
-        Ok(impacted)
-    }
-
-    async fn find_blocked_tasks(&self, plan_id: Uuid) -> Result<Vec<(TaskNode, Vec<TaskNode>)>> {
-        let task_ids = self
-            .plan_tasks
-            .read()
-            .await
-            .get(&plan_id)
-            .cloned()
-            .unwrap_or_default();
-        let tasks = self.tasks.read().await;
-        let deps = self.task_dependencies.read().await;
-
-        let mut result = Vec::new();
-        for tid in &task_ids {
-            if let Some(task) = tasks.get(tid) {
-                if task.status == TaskStatus::Pending {
-                    if let Some(dep_ids) = deps.get(tid) {
-                        let blockers: Vec<TaskNode> = dep_ids
-                            .iter()
-                            .filter_map(|did| {
-                                tasks.get(did).and_then(|t| {
-                                    if t.status != TaskStatus::Completed {
-                                        Some(t.clone())
-                                    } else {
-                                        None
-                                    }
-                                })
-                            })
-                            .collect();
-                        if !blockers.is_empty() {
-                            result.push((task.clone(), blockers));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    async fn update_task_status(&self, task_id: Uuid, status: TaskStatus) -> Result<()> {
-        if let Some(t) = self.tasks.write().await.get_mut(&task_id) {
-            t.status = status.clone();
-            t.updated_at = Some(Utc::now());
-            if status == TaskStatus::InProgress && t.started_at.is_none() {
-                t.started_at = Some(Utc::now());
-            }
-            if status == TaskStatus::Completed {
-                t.completed_at = Some(Utc::now());
-            }
-            // Leaving `Interrupted` ends the interruption, as in the real store.
-            if status != TaskStatus::Interrupted {
-                t.interrupted_at = None;
-                t.interrupted_reason = None;
-            }
-        }
-        Ok(())
-    }
-
-    async fn interrupt_task(&self, task_id: Uuid, reason: &str) -> Result<bool> {
-        let mut tasks = self.tasks.write().await;
-        let Some(t) = tasks.get_mut(&task_id) else {
-            return Ok(false);
-        };
-        // Same rule as the real store: finished work is not interrupted.
-        if matches!(t.status, TaskStatus::Completed | TaskStatus::Failed) {
-            return Ok(false);
-        }
-        t.status = TaskStatus::Interrupted;
-        t.interrupted_at.get_or_insert_with(Utc::now);
-        t.interrupted_reason = Some(reason.to_owned());
-        t.updated_at = Some(Utc::now());
-        Ok(true)
-    }
-
-    async fn assign_task(&self, task_id: Uuid, agent_id: &str) -> Result<()> {
-        if let Some(t) = self.tasks.write().await.get_mut(&task_id) {
-            t.assigned_to = Some(agent_id.to_string());
-            t.updated_at = Some(Utc::now());
-        }
-        Ok(())
-    }
-
-    async fn add_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()> {
-        self.task_dependencies
-            .write()
-            .await
-            .entry(task_id)
-            .or_default()
-            .push(depends_on_id);
-        Ok(())
-    }
-
-    async fn remove_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()> {
-        if let Some(deps) = self.task_dependencies.write().await.get_mut(&task_id) {
-            deps.retain(|id| *id != depends_on_id);
-        }
-        Ok(())
-    }
-
-    async fn get_task_blockers(&self, task_id: Uuid) -> Result<Vec<TaskNode>> {
-        let deps = self.task_dependencies.read().await;
-        let tasks = self.tasks.read().await;
-        let dep_ids = deps.get(&task_id).cloned().unwrap_or_default();
-        Ok(dep_ids
-            .iter()
-            .filter_map(|did| {
-                tasks.get(did).and_then(|t| {
-                    if t.status != TaskStatus::Completed {
-                        Some(t.clone())
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect())
-    }
-
-    async fn get_tasks_blocked_by(&self, task_id: Uuid) -> Result<Vec<TaskNode>> {
-        let deps = self.task_dependencies.read().await;
-        let tasks = self.tasks.read().await;
-        let mut result = Vec::new();
-        for (tid, dep_ids) in deps.iter() {
-            if dep_ids.contains(&task_id) {
-                if let Some(t) = tasks.get(tid) {
-                    result.push(t.clone());
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    async fn get_task_dependencies(&self, task_id: Uuid) -> Result<Vec<TaskNode>> {
-        let deps = self.task_dependencies.read().await;
-        let tasks = self.tasks.read().await;
-        let dep_ids = deps.get(&task_id).cloned().unwrap_or_default();
-        Ok(dep_ids
-            .iter()
-            .filter_map(|did| tasks.get(did).cloned())
-            .collect())
-    }
-
-    async fn get_plan_dependency_graph(
-        &self,
-        plan_id: Uuid,
-    ) -> Result<(Vec<TaskNode>, Vec<(Uuid, Uuid)>)> {
-        let task_ids = self
-            .plan_tasks
-            .read()
-            .await
-            .get(&plan_id)
-            .cloned()
-            .unwrap_or_default();
-        let tasks_map = self.tasks.read().await;
-        let deps = self.task_dependencies.read().await;
-
-        let task_list: Vec<TaskNode> = task_ids
-            .iter()
-            .filter_map(|id| tasks_map.get(id).cloned())
-            .collect();
-
-        let mut edges = Vec::new();
-        for tid in &task_ids {
-            if let Some(dep_ids) = deps.get(tid) {
-                for did in dep_ids {
-                    edges.push((*tid, *did));
-                }
-            }
-        }
-
-        Ok((task_list, edges))
-    }
-
-    async fn get_task_enrichment_counts(
-        &self,
-        task_ids: &[String],
-    ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentCounts>> {
-        use crate::neo4j::plan::TaskEnrichmentCounts;
-        let mut map = std::collections::HashMap::new();
-        let tasks = self.tasks.read().await;
-        let steps_store = self.steps.read().await;
-        let task_steps_map = self.task_steps.read().await;
-        for tid in task_ids {
-            if let Ok(uuid) = tid.parse::<Uuid>() {
-                if tasks.contains_key(&uuid) {
-                    let step_ids = task_steps_map.get(&uuid).cloned().unwrap_or_default();
-                    let step_count = step_ids.len();
-                    let completed_step_count = step_ids
-                        .iter()
-                        .filter(|sid| {
-                            steps_store
-                                .get(sid)
-                                .map(|s| format!("{:?}", s.status) == "Completed")
-                                .unwrap_or(false)
-                        })
-                        .count();
-                    map.insert(
-                        tid.clone(),
-                        TaskEnrichmentCounts {
-                            step_count,
-                            completed_step_count,
-                            note_count: 0,
-                            decision_count: 0,
-                        },
-                    );
-                }
-            }
-        }
-        Ok(map)
-    }
-
-    async fn get_task_enrichment_data(
-        &self,
-        task_ids: &[String],
-    ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentData>> {
-        use crate::neo4j::plan::{StepSummary, TaskEnrichmentData};
-        let counts = self.get_task_enrichment_counts(task_ids).await?;
-        let steps_store = self.steps.read().await;
-        let task_steps_map = self.task_steps.read().await;
-        let task_sessions = self.task_sessions.read().await;
-        let mut map = std::collections::HashMap::new();
-        for tid in task_ids {
-            if let Ok(uuid) = tid.parse::<Uuid>() {
-                let step_ids = task_steps_map.get(&uuid).cloned().unwrap_or_default();
-                let task_steps: Vec<StepSummary> = step_ids
-                    .iter()
-                    .filter_map(|sid| steps_store.get(sid))
-                    .map(|s| StepSummary {
-                        id: s.id.to_string(),
-                        order: s.order,
-                        description: s.description.clone(),
-                        status: format!("{:?}", s.status),
-                        verification: s.verification.clone(),
-                    })
-                    .collect();
-                map.insert(
-                    tid.clone(),
-                    TaskEnrichmentData {
-                        counts: counts.get(tid).cloned().unwrap_or_default(),
-                        steps: task_steps,
-                        sessions: task_sessions.get(&uuid).cloned().unwrap_or_default(),
-                        discussed_files: vec![],
-                    },
-                );
-            }
-        }
-        Ok(map)
-    }
-
-    async fn get_plan_critical_path(&self, plan_id: Uuid) -> Result<Vec<TaskNode>> {
-        let (tasks, edges) = self.get_plan_dependency_graph(plan_id).await?;
-        if tasks.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Simple longest-path: DFS from each node with no dependents
-        let task_map: HashMap<Uuid, &TaskNode> = tasks.iter().map(|t| (t.id, t)).collect();
-        // Build adjacency: task -> tasks it depends on
-        let mut adj: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
-        for (from, to) in &edges {
-            adj.entry(*from).or_default().push(*to);
-        }
-
-        fn dfs(
-            node: Uuid,
-            adj: &HashMap<Uuid, Vec<Uuid>>,
-            memo: &mut HashMap<Uuid, Vec<Uuid>>,
-        ) -> Vec<Uuid> {
-            if let Some(cached) = memo.get(&node) {
-                return cached.clone();
-            }
-            let mut longest = vec![];
-            if let Some(deps) = adj.get(&node) {
-                for dep in deps {
-                    let path = dfs(*dep, adj, memo);
-                    if path.len() > longest.len() {
-                        longest = path;
-                    }
-                }
-            }
-            longest.push(node);
-            memo.insert(node, longest.clone());
-            longest
-        }
-
-        let mut memo = HashMap::new();
-        let mut best_path = vec![];
-        for t in &tasks {
-            let path = dfs(t.id, &adj, &mut memo);
-            if path.len() > best_path.len() {
-                best_path = path;
-            }
-        }
-
-        // Reverse so it goes from root dependency to final task
-        best_path.reverse();
-        Ok(best_path
-            .iter()
-            .filter_map(|id| task_map.get(id).cloned().cloned())
-            .collect())
-    }
-
-    async fn compute_waves(
-        &self,
-        plan_id: Uuid,
-    ) -> Result<crate::neo4j::plan::WaveComputationResult> {
-        use crate::neo4j::plan::*;
-        use std::collections::{HashSet, VecDeque};
-
-        let (tasks, edges) = self.get_plan_dependency_graph(plan_id).await?;
-
-        if tasks.is_empty() {
-            return Ok(WaveComputationResult {
-                waves: vec![],
-                summary: WaveSummary {
-                    total_tasks: 0,
-                    total_waves: 0,
-                    max_parallel: 0,
-                    critical_path_length: 0,
-                    dependency_edges: 0,
-                    conflicts_detected: 0,
-                },
-                conflicts: vec![],
-                edges: vec![],
-            });
-        }
-
-        let task_map: HashMap<Uuid, &TaskNode> = tasks.iter().map(|t| (t.id, t)).collect();
-        let mut deps_of: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
-        let mut dependents_of: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
-        let mut in_degree: HashMap<Uuid, usize> = HashMap::new();
-
-        for task in &tasks {
-            in_degree.insert(task.id, 0);
-            deps_of.insert(task.id, HashSet::new());
-            dependents_of.insert(task.id, HashSet::new());
-        }
-
-        for &(from, to) in &edges {
-            if task_map.contains_key(&from) && task_map.contains_key(&to) {
-                deps_of.entry(from).or_default().insert(to);
-                dependents_of.entry(to).or_default().insert(from);
-                *in_degree.entry(from).or_default() += 1;
-            }
-        }
-
-        let mut queue: VecDeque<Uuid> = in_degree
-            .iter()
-            .filter(|(_, &deg)| deg == 0)
-            .map(|(&id, _)| id)
-            .collect();
-
-        let mut waves: Vec<Wave> = Vec::new();
-        let mut processed_count = 0;
-
-        while !queue.is_empty() {
-            let current_level: Vec<Uuid> = queue.drain(..).collect();
-            let wave_number = waves.len() + 1;
-            let mut wave_tasks: Vec<WaveTask> = Vec::new();
-
-            for &task_id in &current_level {
-                processed_count += 1;
-                if let Some(task) = task_map.get(&task_id) {
-                    wave_tasks.push(WaveTask {
-                        id: task.id,
-                        title: task.title.clone(),
-                        status: task.status.clone(),
-                        priority: task.priority,
-                        affected_files: task.affected_files.clone(),
-                        depends_on: deps_of
-                            .get(&task_id)
-                            .map(|s| s.iter().copied().collect())
-                            .unwrap_or_default(),
-                    });
-                }
-                if let Some(dependents) = dependents_of.get(&task_id) {
-                    for &dep_id in dependents {
-                        if let Some(deg) = in_degree.get_mut(&dep_id) {
-                            *deg -= 1;
-                            if *deg == 0 {
-                                queue.push_back(dep_id);
-                            }
-                        }
-                    }
-                }
-            }
-
-            let task_count = wave_tasks.len();
-            waves.push(Wave {
-                wave_number,
-                tasks: wave_tasks,
-                task_count,
-                split_from_conflicts: false,
-            });
-        }
-
-        if processed_count < tasks.len() {
-            anyhow::bail!("Cycle detected in dependency graph!");
-        }
-
-        // Conflict splitting (simplified for mock — same logic as real impl)
-        let mut all_conflicts: Vec<FileConflict> = Vec::new();
-        let mut split_waves: Vec<Wave> = Vec::new();
-        let mut wave_counter = 0usize;
-
-        for wave in &waves {
-            let mut has_conflicts = false;
-            for i in 0..wave.tasks.len() {
-                let files_a: HashSet<&str> = wave.tasks[i]
-                    .affected_files
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect();
-                if files_a.is_empty() {
-                    continue;
-                }
-                for j in (i + 1)..wave.tasks.len() {
-                    let shared: Vec<String> = wave.tasks[j]
-                        .affected_files
-                        .iter()
-                        .filter(|f| files_a.contains(f.as_str()))
-                        .cloned()
-                        .collect();
-                    if !shared.is_empty() {
-                        has_conflicts = true;
-                        all_conflicts.push(FileConflict {
-                            task_a: wave.tasks[i].id,
-                            task_b: wave.tasks[j].id,
-                            shared_files: shared,
-                        });
-                    }
-                }
-            }
-            if !has_conflicts {
-                wave_counter += 1;
-                split_waves.push(Wave {
-                    wave_number: wave_counter,
-                    tasks: wave.tasks.clone(),
-                    task_count: wave.task_count,
-                    split_from_conflicts: false,
-                });
-            } else {
-                // Simple split: put each conflicting task in its own sub-wave
-                for t in &wave.tasks {
-                    wave_counter += 1;
-                    split_waves.push(Wave {
-                        wave_number: wave_counter,
-                        tasks: vec![t.clone()],
-                        task_count: 1,
-                        split_from_conflicts: true,
-                    });
-                }
-            }
-        }
-
-        let max_parallel = split_waves.iter().map(|w| w.task_count).max().unwrap_or(0);
-
-        Ok(WaveComputationResult {
-            waves: split_waves.clone(),
-            summary: WaveSummary {
-                total_tasks: tasks.len(),
-                total_waves: split_waves.len(),
-                max_parallel,
-                critical_path_length: split_waves.len(),
-                dependency_edges: edges.len(),
-                conflicts_detected: all_conflicts.len(),
-            },
-            conflicts: all_conflicts,
-            edges,
-        })
-    }
-
-    async fn get_next_available_task(&self, plan_id: Uuid) -> Result<Option<TaskNode>> {
-        let task_ids = self
-            .plan_tasks
-            .read()
-            .await
-            .get(&plan_id)
-            .cloned()
-            .unwrap_or_default();
-        let tasks = self.tasks.read().await;
-        let deps = self.task_dependencies.read().await;
-
-        for tid in &task_ids {
-            if let Some(task) = tasks.get(tid) {
-                if task.status != TaskStatus::Pending {
-                    continue;
-                }
-                // Check all dependencies are completed
-                let dep_ids = deps.get(tid).cloned().unwrap_or_default();
-                let all_deps_completed = dep_ids.iter().all(|did| {
-                    tasks
-                        .get(did)
-                        .map(|t| t.status == TaskStatus::Completed)
-                        .unwrap_or(true)
-                });
-                if all_deps_completed {
-                    return Ok(Some(task.clone()));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    async fn get_task(&self, task_id: Uuid) -> Result<Option<TaskNode>> {
-        Ok(self.tasks.read().await.get(&task_id).cloned())
-    }
-
-    async fn update_task(&self, task_id: Uuid, updates: &UpdateTaskRequest) -> Result<()> {
-        if let Some(t) = self.tasks.write().await.get_mut(&task_id) {
-            if let Some(ref title) = updates.title {
-                t.title = Some(title.clone());
-            }
-            if let Some(ref desc) = updates.description {
-                t.description = desc.clone();
-            }
-            if let Some(ref status) = updates.status {
-                t.status = status.clone();
-                if *status == TaskStatus::InProgress && t.started_at.is_none() {
-                    t.started_at = Some(Utc::now());
-                }
-                if *status == TaskStatus::Completed {
-                    t.completed_at = Some(Utc::now());
-                }
-            }
-            if let Some(ref assigned) = updates.assigned_to {
-                t.assigned_to = Some(assigned.clone());
-            }
-            if let Some(priority) = updates.priority {
-                t.priority = Some(priority);
-            }
-            if let Some(ref tags) = updates.tags {
-                t.tags = tags.clone();
-            }
-            if let Some(ref ac) = updates.acceptance_criteria {
-                t.acceptance_criteria = ac.clone();
-            }
-            if let Some(ref af) = updates.affected_files {
-                t.affected_files = af.clone();
-            }
-            if let Some(complexity) = updates.actual_complexity {
-                t.actual_complexity = Some(complexity);
-            }
-            if let Some(complexity) = updates.estimated_complexity {
-                t.estimated_complexity = Some(complexity);
-            }
-            if let Some(due) = updates.due_date {
-                t.due_date = Some(due);
-            }
-            if let Some(minutes) = updates.estimated_minutes {
-                t.estimated_minutes = Some(minutes);
-            }
-            t.updated_at = Some(Utc::now());
-        }
-        Ok(())
-    }
-
-    async fn update_task_enrichment(
-        &self,
-        task_id: Uuid,
-        execution_context: Option<&str>,
-        persona: Option<&str>,
-        prompt_cache: Option<&str>,
-    ) -> Result<()> {
-        let mut tasks = self.tasks.write().await;
-        if let Some(task) = tasks.get_mut(&task_id) {
-            if let Some(ctx) = execution_context {
-                task.execution_context = Some(ctx.to_string());
-            }
-            if let Some(p) = persona {
-                task.persona = Some(p.to_string());
-            }
-            if let Some(pc) = prompt_cache {
-                task.prompt_cache = Some(pc.to_string());
-            }
-        }
-        Ok(())
-    }
-
-    async fn delete_task(&self, task_id: Uuid) -> Result<()> {
-        self.tasks.write().await.remove(&task_id);
-        // Cascade: steps
-        if let Some(step_ids) = self.task_steps.write().await.remove(&task_id) {
-            let mut steps = self.steps.write().await;
-            for sid in step_ids {
-                steps.remove(&sid);
-            }
-        }
-        // Cascade: decisions
-        if let Some(dec_ids) = self.task_decisions.write().await.remove(&task_id) {
-            let mut decisions = self.decisions.write().await;
-            for did in dec_ids {
-                decisions.remove(&did);
-            }
-        }
-        self.task_dependencies.write().await.remove(&task_id);
-        self.task_files.write().await.remove(&task_id);
-        self.task_commits.write().await.remove(&task_id);
-        // Remove from other tasks' dependency lists
-        let mut deps = self.task_dependencies.write().await;
-        for dep_list in deps.values_mut() {
-            dep_list.retain(|id| *id != task_id);
-        }
-        Ok(())
-    }
-
-    async fn get_project_for_task(&self, task_id: Uuid) -> Result<Option<ProjectNode>> {
-        // Reverse lookup: task_id → plan_id (via plan_tasks)
-        let plan_tasks = self.plan_tasks.read().await;
-        let plan_id = plan_tasks
-            .iter()
-            .find(|(_, tasks)| tasks.contains(&task_id))
-            .map(|(plan_id, _)| *plan_id);
-
-        let plan_id = match plan_id {
-            Some(id) => id,
-            None => return Ok(None),
-        };
-        drop(plan_tasks);
-
-        // Reverse lookup: plan_id → project_id (via project_plans)
-        let project_plans = self.project_plans.read().await;
-        let project_id = project_plans
-            .iter()
-            .find(|(_, plans)| plans.contains(&plan_id))
-            .map(|(project_id, _)| *project_id);
-
-        let project_id = match project_id {
-            Some(id) => id,
-            None => return Ok(None),
-        };
-        drop(project_plans);
-
-        // Get the project
-        let projects = self.projects.read().await;
-        Ok(projects.get(&project_id).cloned())
-    }
-
-    async fn get_plan_id_for_task(&self, task_id: Uuid) -> Result<Option<Uuid>> {
-        let plan_tasks = self.plan_tasks.read().await;
-        Ok(plan_tasks
-            .iter()
-            .find(|(_, tasks)| tasks.contains(&task_id))
-            .map(|(plan_id, _)| *plan_id))
-    }
-
-    // ========================================================================
-    // Day plan operations
-    // ========================================================================
-
-    async fn get_day_plan(&self, user_id: Uuid, date: &str) -> Result<Vec<(Uuid, u32)>> {
-        Ok(self
-            .day_plans
-            .read()
-            .await
-            .get(&(user_id, date.to_string()))
-            .cloned()
-            .unwrap_or_default())
-    }
-
-    async fn set_day_plan(&self, user_id: Uuid, date: &str, ids: &[Uuid]) -> Result<()> {
-        let entries: Vec<(Uuid, u32)> = ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (*id, i as u32))
-            .collect();
-        self.day_plans
-            .write()
-            .await
-            .insert((user_id, date.to_string()), entries);
-        Ok(())
-    }
-
-    async fn add_to_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()> {
-        let mut plans = self.day_plans.write().await;
-        let key = (user_id, date.to_string());
-        let entries = plans.entry(key).or_default();
-        if !entries.iter().any(|(id, _)| *id == task_id) {
-            // Mirror the Neo4j `coalesce(max(order) + 1, 0)`: first entry is 0.
-            let next_order = entries
-                .iter()
-                .map(|(_, o)| *o)
-                .max()
-                .map(|m| m + 1)
-                .unwrap_or(0);
-            entries.push((task_id, next_order));
-        }
-        Ok(())
-    }
-
-    async fn remove_from_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()> {
-        let mut plans = self.day_plans.write().await;
-        if let Some(entries) = plans.get_mut(&(user_id, date.to_string())) {
-            entries.retain(|(id, _)| *id != task_id);
-        }
-        Ok(())
-    }
-
-    // ========================================================================
-    // Step operations
-    // ========================================================================
-
-    async fn create_step(&self, task_id: Uuid, step: &StepNode) -> Result<()> {
-        let step_id = step.id;
-        self.task_steps
-            .write()
-            .await
-            .entry(task_id)
-            .or_default()
-            .push(step_id);
-        self.steps.write().await.insert(step_id, step.clone());
-        Ok(())
-    }
-
-    async fn get_task_steps(&self, task_id: Uuid) -> Result<Vec<StepNode>> {
-        let ts = self.task_steps.read().await;
-        let steps = self.steps.read().await;
-        let ids = ts.get(&task_id).cloned().unwrap_or_default();
-        let mut result: Vec<StepNode> =
-            ids.iter().filter_map(|id| steps.get(id).cloned()).collect();
-        result.sort_by_key(|s| s.order);
-        Ok(result)
-    }
-
-    async fn update_step(&self, step_id: Uuid, updates: &UpdateStepRequest) -> Result<()> {
-        if let Some(s) = self.steps.write().await.get_mut(&step_id) {
-            if let Some(description) = &updates.description {
-                s.description = description.clone();
-            }
-            if let Some(verification) = &updates.verification {
-                s.verification = Some(verification.clone());
-            }
-            s.updated_at = Some(Utc::now());
-        }
-        Ok(())
-    }
-
-    async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> Result<()> {
-        if let Some(s) = self.steps.write().await.get_mut(&step_id) {
-            s.status = status.clone();
-            s.updated_at = Some(Utc::now());
-            if status == StepStatus::Completed {
-                s.completed_at = Some(Utc::now());
-            }
-        }
-        Ok(())
-    }
-
-    async fn get_task_step_progress(&self, task_id: Uuid) -> Result<(u32, u32)> {
-        let steps = self.get_task_steps(task_id).await?;
-        let total = steps.len() as u32;
-        let completed = steps
-            .iter()
-            .filter(|s| s.status == StepStatus::Completed)
-            .count() as u32;
-        Ok((completed, total))
-    }
-
-    async fn get_step(&self, step_id: Uuid) -> Result<Option<StepNode>> {
-        Ok(self.steps.read().await.get(&step_id).cloned())
-    }
-
-    async fn delete_step(&self, step_id: Uuid) -> Result<()> {
-        self.steps.write().await.remove(&step_id);
-        let mut ts = self.task_steps.write().await;
-        for step_ids in ts.values_mut() {
-            step_ids.retain(|id| *id != step_id);
-        }
-        Ok(())
-    }
-
-    async fn complete_pending_steps_for_task(&self, task_id: Uuid) -> Result<u32> {
-        let ts = self.task_steps.read().await;
-        let step_ids = ts.get(&task_id).cloned().unwrap_or_default();
-        drop(ts);
-        let mut steps = self.steps.write().await;
-        let mut count = 0u32;
-        for sid in &step_ids {
-            if let Some(s) = steps.get_mut(sid) {
-                if s.status == StepStatus::Pending || s.status == StepStatus::InProgress {
-                    s.status = StepStatus::Completed;
-                    s.completed_at = Some(Utc::now());
-                    s.updated_at = Some(Utc::now());
-                    count += 1;
-                }
-            }
-        }
-        Ok(count)
-    }
-
-    // ========================================================================
-    // Constraint operations
-    // ========================================================================
-
-    async fn create_constraint(&self, plan_id: Uuid, constraint: &ConstraintNode) -> Result<()> {
-        if !self.plans.read().await.contains_key(&plan_id) {
-            anyhow::bail!(
-                "Failed to create constraint: Plan {} not found in Neo4j",
-                plan_id
-            );
-        }
-        let cid = constraint.id;
-        self.plan_constraints
-            .write()
-            .await
-            .entry(plan_id)
-            .or_default()
-            .push(cid);
-        self.constraints
-            .write()
-            .await
-            .insert(cid, constraint.clone());
-        Ok(())
-    }
-
-    async fn get_plan_constraints(&self, plan_id: Uuid) -> Result<Vec<ConstraintNode>> {
-        let pc = self.plan_constraints.read().await;
-        let constraints = self.constraints.read().await;
-        let ids = pc.get(&plan_id).cloned().unwrap_or_default();
-        Ok(ids
-            .iter()
-            .filter_map(|id| constraints.get(id).cloned())
-            .collect())
-    }
-
-    async fn get_constraint(&self, constraint_id: Uuid) -> Result<Option<ConstraintNode>> {
-        Ok(self.constraints.read().await.get(&constraint_id).cloned())
-    }
-
-    async fn update_constraint(
-        &self,
-        constraint_id: Uuid,
-        description: Option<String>,
-        constraint_type: Option<ConstraintType>,
-        enforced_by: Option<String>,
-    ) -> Result<()> {
-        if let Some(c) = self.constraints.write().await.get_mut(&constraint_id) {
-            if let Some(d) = description {
-                c.description = d;
-            }
-            if let Some(ct) = constraint_type {
-                c.constraint_type = ct;
-            }
-            if let Some(eb) = enforced_by {
-                c.enforced_by = Some(eb);
-            }
-        }
-        Ok(())
-    }
-
-    async fn delete_constraint(&self, constraint_id: Uuid) -> Result<()> {
-        self.constraints.write().await.remove(&constraint_id);
-        let mut pc = self.plan_constraints.write().await;
-        for ids in pc.values_mut() {
-            ids.retain(|id| *id != constraint_id);
-        }
-        Ok(())
     }
 
     // ========================================================================
@@ -19345,5 +16245,3113 @@ impl WorkspaceStore for MockGraphStore {
             result.push((comp, project_slug, deps));
         }
         Ok(result)
+    }
+}
+
+#[async_trait]
+impl CodeStore for MockGraphStore {
+    // ========================================================================
+    // File operations
+    // ========================================================================
+
+    async fn get_project_file_paths(&self, project_id: Uuid) -> Result<Vec<String>> {
+        Ok(self
+            .project_files
+            .read()
+            .await
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn delete_file(&self, path: &str) -> Result<()> {
+        self.files.write().await.remove(path);
+        // Remove from project_files
+        let mut pf = self.project_files.write().await;
+        for paths in pf.values_mut() {
+            paths.retain(|p| p != path);
+        }
+        // Remove symbols linked to this file (mirrors DETACH DELETE in Neo4j)
+        self.file_symbols.write().await.remove(path);
+        self.import_relationships.write().await.remove(path);
+        // Remove all entities whose file_path matches (DETACH DELETE cascade)
+        self.functions
+            .write()
+            .await
+            .retain(|_, f| f.file_path != path);
+        self.structs_map
+            .write()
+            .await
+            .retain(|_, s| s.file_path != path);
+        self.traits_map
+            .write()
+            .await
+            .retain(|_, t| t.file_path != path);
+        self.enums_map
+            .write()
+            .await
+            .retain(|_, e| e.file_path != path);
+        self.impls_map
+            .write()
+            .await
+            .retain(|_, i| i.file_path != path);
+        self.imports
+            .write()
+            .await
+            .retain(|_, i| i.file_path != path);
+        // Remove call relationships from deleted functions
+        {
+            let funcs = self.functions.read().await;
+            let valid_ids: std::collections::HashSet<&str> =
+                funcs.keys().map(|s| s.as_str()).collect();
+            self.call_relationships
+                .write()
+                .await
+                .retain(|caller, _| valid_ids.contains(caller.as_str()));
+        }
+        Ok(())
+    }
+
+    async fn delete_stale_files(
+        &self,
+        project_id: Uuid,
+        valid_paths: &[String],
+    ) -> Result<(usize, usize, Vec<String>)> {
+        let current_paths = self
+            .project_files
+            .read()
+            .await
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut files_deleted = 0usize;
+        let mut symbols_deleted = 0usize;
+        let mut deleted_paths = Vec::new();
+        for path in &current_paths {
+            if !valid_paths.contains(path) {
+                self.files.write().await.remove(path);
+                if let Some(syms) = self.file_symbols.write().await.remove(path) {
+                    symbols_deleted += syms.len();
+                }
+                deleted_paths.push(path.clone());
+                files_deleted += 1;
+            }
+        }
+        if let Some(paths) = self.project_files.write().await.get_mut(&project_id) {
+            paths.retain(|p| valid_paths.contains(p));
+        }
+        Ok((files_deleted, symbols_deleted, deleted_paths))
+    }
+
+    async fn link_file_to_project(&self, file_path: &str, project_id: Uuid) -> Result<()> {
+        self.project_files
+            .write()
+            .await
+            .entry(project_id)
+            .or_default()
+            .push(file_path.to_string());
+        Ok(())
+    }
+
+    async fn upsert_file(&self, file: &FileNode) -> Result<()> {
+        self.files
+            .write()
+            .await
+            .insert(file.path.clone(), file.clone());
+        Ok(())
+    }
+
+    async fn batch_upsert_files(&self, files: &[FileNode]) -> Result<()> {
+        let mut store = self.files.write().await;
+        for file in files {
+            store.insert(file.path.clone(), file.clone());
+        }
+        Ok(())
+    }
+
+    async fn get_file(&self, path: &str) -> Result<Option<FileNode>> {
+        Ok(self.files.read().await.get(path).cloned())
+    }
+
+    async fn find_files_by_path_suffix(
+        &self,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<Uuid>)>> {
+        let mut out: Vec<(String, Option<Uuid>)> = self
+            .files
+            .read()
+            .await
+            .values()
+            .filter(|f| f.path.ends_with(suffix))
+            .map(|f| (f.path.clone(), f.project_id))
+            .collect();
+        out.sort();
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>> {
+        let pf = self.project_files.read().await;
+        let files = self.files.read().await;
+        let paths = pf.get(&project_id).cloned().unwrap_or_default();
+        Ok(paths.iter().filter_map(|p| files.get(p).cloned()).collect())
+    }
+
+    async fn count_project_files(&self, project_id: Uuid) -> Result<i64> {
+        let pf = self.project_files.read().await;
+        Ok(pf.get(&project_id).map(|p| p.len() as i64).unwrap_or(0))
+    }
+
+    async fn count_orphan_files(&self, _project_id: Uuid) -> Result<i64> {
+        Ok(0)
+    }
+
+    async fn count_co_change_pairs(&self, _project_id: Uuid, _min_count: i64) -> Result<i64> {
+        Ok(0)
+    }
+
+    async fn count_protocol_states_transitions(&self, _project_id: Uuid) -> Result<(i64, i64)> {
+        Ok((0, 0))
+    }
+
+    async fn invalidate_computed_properties(
+        &self,
+        _project_id: Uuid,
+        paths: &[String],
+    ) -> Result<u64> {
+        // Mock: return the number of paths as stale count (simplified)
+        Ok(paths.len() as u64)
+    }
+
+    // ========================================================================
+    // Symbol operations
+    // ========================================================================
+
+    async fn upsert_function(&self, func: &FunctionNode) -> Result<()> {
+        let id = format!("{}::{}", func.file_path, func.name);
+        self.file_symbols
+            .write()
+            .await
+            .entry(func.file_path.clone())
+            .or_default()
+            .push(id.clone());
+        self.functions.write().await.insert(id, func.clone());
+        Ok(())
+    }
+
+    async fn upsert_struct(&self, s: &StructNode) -> Result<()> {
+        let id = format!("{}::{}", s.file_path, s.name);
+        self.file_symbols
+            .write()
+            .await
+            .entry(s.file_path.clone())
+            .or_default()
+            .push(id.clone());
+        self.structs_map.write().await.insert(id, s.clone());
+        Ok(())
+    }
+
+    async fn upsert_trait(&self, t: &TraitNode) -> Result<()> {
+        let id = format!("{}::{}", t.file_path, t.name);
+        self.file_symbols
+            .write()
+            .await
+            .entry(t.file_path.clone())
+            .or_default()
+            .push(id.clone());
+        self.traits_map.write().await.insert(id, t.clone());
+        Ok(())
+    }
+
+    async fn find_trait_by_name(&self, name: &str) -> Result<Option<String>> {
+        let traits = self.traits_map.read().await;
+        for (id, t) in traits.iter() {
+            if t.name == name {
+                return Ok(Some(id.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn upsert_enum(&self, e: &EnumNode) -> Result<()> {
+        let id = format!("{}::{}", e.file_path, e.name);
+        self.file_symbols
+            .write()
+            .await
+            .entry(e.file_path.clone())
+            .or_default()
+            .push(id.clone());
+        self.enums_map.write().await.insert(id, e.clone());
+        Ok(())
+    }
+
+    async fn upsert_impl(&self, impl_node: &ImplNode) -> Result<()> {
+        let id = format!(
+            "{}::impl_{}{}",
+            impl_node.file_path,
+            impl_node.for_type,
+            impl_node
+                .trait_name
+                .as_ref()
+                .map(|t| format!("_{}", t))
+                .unwrap_or_default()
+        );
+        self.impls_map.write().await.insert(id, impl_node.clone());
+        Ok(())
+    }
+
+    async fn create_import_relationship(
+        &self,
+        from_file: &str,
+        to_file: &str,
+        _import_path: &str,
+    ) -> Result<()> {
+        self.import_relationships
+            .write()
+            .await
+            .entry(from_file.to_string())
+            .or_default()
+            .push(to_file.to_string());
+        Ok(())
+    }
+
+    async fn upsert_import(&self, import: &ImportNode) -> Result<()> {
+        let id = format!("{}::import_{}", import.file_path, import.path);
+        self.imports.write().await.insert(id, import.clone());
+        Ok(())
+    }
+
+    async fn create_imports_symbol_relationship(
+        &self,
+        _import_id: &str,
+        _symbol_name: &str,
+        _project_id: Option<Uuid>,
+    ) -> Result<()> {
+        // Mock: no-op, IMPORTS_SYMBOL relationships are not tracked in mock store
+        Ok(())
+    }
+
+    async fn create_call_relationship(
+        &self,
+        caller_id: &str,
+        callee_name: &str,
+        project_id: Option<Uuid>,
+        _confidence: f64,
+        _reason: &str,
+    ) -> Result<()> {
+        // When project_id is provided, only create the relationship if the callee
+        // belongs to a file in the same project (mirrors the Cypher join via File→Project)
+        if let Some(pid) = project_id {
+            let project_files = self.project_files.read().await;
+            let functions = self.functions.read().await;
+
+            let project_file_paths: Vec<&String> = project_files
+                .get(&pid)
+                .map(|files| files.iter().collect())
+                .unwrap_or_default();
+
+            // Check if any function with callee_name belongs to a file in this project
+            let callee_in_project = functions.values().any(|f| {
+                f.name == callee_name && project_file_paths.iter().any(|fp| **fp == f.file_path)
+            });
+
+            if !callee_in_project {
+                // Callee not found in this project — skip (same as Cypher MATCH not matching)
+                return Ok(());
+            }
+        }
+
+        self.call_relationships
+            .write()
+            .await
+            .entry(caller_id.to_string())
+            .or_default()
+            .push(callee_name.to_string());
+        Ok(())
+    }
+
+    // ========================================================================
+    // Batch upsert operations (delegates to individual methods)
+    // ========================================================================
+
+    async fn batch_upsert_functions(&self, functions: &[FunctionNode]) -> Result<()> {
+        for func in functions {
+            self.upsert_function(func).await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_upsert_structs(&self, structs: &[StructNode]) -> Result<()> {
+        for s in structs {
+            self.upsert_struct(s).await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_upsert_traits(&self, traits: &[TraitNode]) -> Result<()> {
+        for t in traits {
+            self.upsert_trait(t).await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_upsert_enums(&self, enums: &[EnumNode]) -> Result<()> {
+        for e in enums {
+            self.upsert_enum(e).await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_upsert_impls(&self, impls: &[ImplNode]) -> Result<()> {
+        for imp in impls {
+            self.upsert_impl(imp).await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_upsert_imports(&self, imports: &[ImportNode]) -> Result<()> {
+        for imp in imports {
+            self.upsert_import(imp).await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_create_import_relationships(
+        &self,
+        relationships: &[(String, String, String)],
+    ) -> Result<()> {
+        for (source, target, import_path) in relationships {
+            self.create_import_relationship(source, target, import_path)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_create_imports_symbol_relationships(
+        &self,
+        relationships: &[(String, String, Option<Uuid>)],
+    ) -> Result<()> {
+        for (import_id, symbol_name, project_id) in relationships {
+            self.create_imports_symbol_relationship(import_id, symbol_name, *project_id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_create_call_relationships(
+        &self,
+        calls: &[crate::parser::FunctionCall],
+        project_id: Option<Uuid>,
+    ) -> Result<()> {
+        for call in calls {
+            self.create_call_relationship(
+                &call.caller_id,
+                &call.callee_name,
+                project_id,
+                call.confidence,
+                &call.reason,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_create_extends_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()> {
+        let mut cr = self.call_relationships.write().await;
+        for (child_name, _child_file, parent_name, _pid) in rels {
+            cr.entry(format!("extends:{}", child_name))
+                .or_default()
+                .push(parent_name.clone());
+        }
+        Ok(())
+    }
+
+    async fn batch_create_implements_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()> {
+        let mut cr = self.call_relationships.write().await;
+        for (struct_name, _struct_file, iface_name, _pid) in rels {
+            cr.entry(format!("implements:{}", struct_name))
+                .or_default()
+                .push(iface_name.clone());
+        }
+        Ok(())
+    }
+
+    async fn cleanup_cross_project_calls(&self) -> Result<i64> {
+        let mut cr = self.call_relationships.write().await;
+        let functions = self.functions.read().await;
+        let project_files = self.project_files.read().await;
+        let mut deleted = 0i64;
+
+        // Build reverse map: file_path -> project_ids
+        let mut file_to_projects: std::collections::HashMap<&str, Vec<uuid::Uuid>> =
+            std::collections::HashMap::new();
+        for (&pid, paths) in project_files.iter() {
+            for path in paths {
+                file_to_projects.entry(path.as_str()).or_default().push(pid);
+            }
+        }
+
+        // For each caller → callees, check if they share a project
+        let mut to_remove: Vec<(String, Vec<String>)> = Vec::new();
+        for (caller_id, callees) in cr.iter() {
+            let caller_file = caller_id.rsplit_once("::").map(|(fp, _)| fp);
+            let caller_projects: Vec<uuid::Uuid> = caller_file
+                .and_then(|fp| file_to_projects.get(fp))
+                .cloned()
+                .unwrap_or_default();
+
+            if caller_projects.is_empty() {
+                continue;
+            }
+
+            let mut bad_callees = Vec::new();
+            for callee_name in callees {
+                let callee_shares_project = functions.values().any(|f| {
+                    if f.name != *callee_name {
+                        return false;
+                    }
+                    let callee_projects = file_to_projects
+                        .get(f.file_path.as_str())
+                        .cloned()
+                        .unwrap_or_default();
+                    callee_projects
+                        .iter()
+                        .any(|cp| caller_projects.contains(cp))
+                });
+                if !callee_shares_project {
+                    bad_callees.push(callee_name.clone());
+                }
+            }
+            if !bad_callees.is_empty() {
+                to_remove.push((caller_id.clone(), bad_callees));
+            }
+        }
+
+        for (caller_id, bad_callees) in to_remove {
+            if let Some(callees) = cr.get_mut(&caller_id) {
+                for bad in &bad_callees {
+                    callees.retain(|c| c != bad);
+                    deleted += 1;
+                }
+            }
+        }
+        Ok(deleted)
+    }
+
+    async fn cleanup_builtin_calls(&self) -> Result<i64> {
+        use crate::parser::noise_filter;
+
+        let builtins = noise_filter::builtin_names();
+        let mut cr = self.call_relationships.write().await;
+        let mut deleted = 0i64;
+
+        for (_caller_id, callees) in cr.iter_mut() {
+            let before = callees.len();
+            callees.retain(|callee_name| !builtins.contains(callee_name.as_str()));
+            deleted += (before - callees.len()) as i64;
+        }
+
+        Ok(deleted)
+    }
+
+    async fn migrate_calls_confidence(&self) -> Result<i64> {
+        // Mock: no-op, confidence is always set at creation time in tests
+        Ok(0)
+    }
+
+    async fn cleanup_sync_data(&self) -> Result<i64> {
+        let mut total = 0i64;
+        total += self.files.write().await.drain().count() as i64;
+        total += self.functions.write().await.drain().count() as i64;
+        total += self.structs_map.write().await.drain().count() as i64;
+        total += self.traits_map.write().await.drain().count() as i64;
+        total += self.enums_map.write().await.drain().count() as i64;
+        total += self.impls_map.write().await.drain().count() as i64;
+        total += self.imports.write().await.drain().count() as i64;
+        self.call_relationships.write().await.clear();
+        self.import_relationships.write().await.clear();
+        Ok(total)
+    }
+
+    async fn get_callees(&self, function_id: &str, _depth: u32) -> Result<Vec<FunctionNode>> {
+        let cr = self.call_relationships.read().await;
+        let functions = self.functions.read().await;
+        let callee_names = cr.get(function_id).cloned().unwrap_or_default();
+        let mut result = Vec::new();
+        for name in &callee_names {
+            for (_, f) in functions.iter() {
+                if f.name == *name {
+                    result.push(f.clone());
+                    break;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn create_uses_type_relationship(
+        &self,
+        _function_id: &str,
+        _type_name: &str,
+    ) -> Result<()> {
+        // Simplified: no-op for mock
+        Ok(())
+    }
+
+    async fn find_trait_implementors(&self, trait_name: &str) -> Result<Vec<String>> {
+        let impls = self.impls_map.read().await;
+        let mut result = Vec::new();
+        for imp in impls.values() {
+            if imp.trait_name.as_deref() == Some(trait_name) {
+                result.push(imp.for_type.clone());
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_type_traits(&self, type_name: &str) -> Result<Vec<String>> {
+        let impls = self.impls_map.read().await;
+        let mut result = Vec::new();
+        for imp in impls.values() {
+            if imp.for_type == type_name {
+                if let Some(t) = &imp.trait_name {
+                    result.push(t.clone());
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_impl_blocks(&self, type_name: &str) -> Result<Vec<serde_json::Value>> {
+        let impls = self.impls_map.read().await;
+        let mut result = Vec::new();
+        for imp in impls.values() {
+            if imp.for_type == type_name {
+                result.push(serde_json::json!({
+                    "for_type": imp.for_type,
+                    "trait_name": imp.trait_name,
+                    "file_path": imp.file_path,
+                    "line_start": imp.line_start,
+                    "line_end": imp.line_end,
+                }));
+            }
+        }
+        Ok(result)
+    }
+
+    // ========================================================================
+    // Heritage navigation queries
+    // ========================================================================
+
+    async fn get_class_hierarchy(
+        &self,
+        type_name: &str,
+        _max_depth: u32,
+    ) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "type_name": type_name,
+            "parents": [],
+            "children": [],
+        }))
+    }
+
+    async fn find_subclasses(&self, _class_name: &str) -> Result<Vec<serde_json::Value>> {
+        Ok(Vec::new())
+    }
+
+    async fn find_interface_implementors(
+        &self,
+        _interface_name: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        Ok(Vec::new())
+    }
+
+    // ========================================================================
+    // Process queries
+    // ========================================================================
+
+    async fn list_processes(&self, _project_id: uuid::Uuid) -> Result<Vec<serde_json::Value>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_process_detail(&self, _process_id: &str) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+
+    async fn get_entry_points(
+        &self,
+        _project_id: uuid::Uuid,
+        _limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        Ok(Vec::new())
+    }
+
+    // ========================================================================
+    // Code exploration queries
+    // ========================================================================
+
+    async fn get_file_language(&self, path: &str) -> Result<Option<String>> {
+        Ok(self
+            .files
+            .read()
+            .await
+            .get(path)
+            .map(|f| f.language.clone()))
+    }
+
+    async fn get_file_functions_summary(&self, path: &str) -> Result<Vec<FunctionSummaryNode>> {
+        let functions = self.functions.read().await;
+        let mut result = Vec::new();
+        for (id, f) in functions.iter() {
+            if id.starts_with(&format!("{}::", path)) || f.file_path == path {
+                let params_str = f
+                    .params
+                    .iter()
+                    .map(|p| {
+                        if let Some(t) = &p.type_name {
+                            format!("{}: {}", p.name, t)
+                        } else {
+                            p.name.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ret = f
+                    .return_type
+                    .as_ref()
+                    .map(|r| format!(" -> {}", r))
+                    .unwrap_or_default();
+                let signature = format!("fn {}({}){}", f.name, params_str, ret);
+                result.push(FunctionSummaryNode {
+                    name: f.name.clone(),
+                    signature,
+                    line: f.line_start,
+                    is_async: f.is_async,
+                    is_public: f.visibility == Visibility::Public,
+                    complexity: f.complexity,
+                    docstring: f.docstring.clone(),
+                });
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_file_structs_summary(&self, path: &str) -> Result<Vec<StructSummaryNode>> {
+        let structs = self.structs_map.read().await;
+        let mut result = Vec::new();
+        for s in structs.values() {
+            if s.file_path == path {
+                result.push(StructSummaryNode {
+                    name: s.name.clone(),
+                    line: s.line_start,
+                    is_public: s.visibility == Visibility::Public,
+                    docstring: s.docstring.clone(),
+                });
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_file_import_paths_list(&self, path: &str) -> Result<Vec<String>> {
+        let imports = self.imports.read().await;
+        let mut result = Vec::new();
+        for imp in imports.values() {
+            if imp.file_path == path {
+                result.push(imp.path.clone());
+            }
+        }
+        Ok(result)
+    }
+
+    async fn find_symbol_references(
+        &self,
+        symbol: &str,
+        limit: usize,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<SymbolReferenceNode>> {
+        let mut references = Vec::new();
+
+        // If project_id provided, get the set of file paths belonging to this project
+        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            Some(pf.get(&pid).cloned().unwrap_or_default())
+        } else {
+            None
+        };
+
+        // Find function callers (via call_relationships)
+        let cr = self.call_relationships.read().await;
+        let functions = self.functions.read().await;
+        for (caller_id, callees) in cr.iter() {
+            if callees.contains(&symbol.to_string()) {
+                if let Some(caller_fn) = functions.get(caller_id) {
+                    if let Some(ref paths) = project_file_paths {
+                        if !paths.contains(&caller_fn.file_path) {
+                            continue;
+                        }
+                    }
+                    references.push(SymbolReferenceNode {
+                        file_path: caller_fn.file_path.clone(),
+                        line: caller_fn.line_start,
+                        context: format!("called from {}", caller_fn.name),
+                        reference_type: "call".to_string(),
+                    });
+                    if references.len() >= limit {
+                        return Ok(references);
+                    }
+                }
+            }
+        }
+
+        // Find struct import usages (via imports)
+        let imports = self.imports.read().await;
+        let structs = self.structs_map.read().await;
+        let has_struct = structs.values().any(|s| s.name == symbol);
+        if has_struct {
+            for import in imports.values() {
+                if import.path.ends_with(symbol) {
+                    if let Some(ref paths) = project_file_paths {
+                        if !paths.contains(&import.file_path) {
+                            continue;
+                        }
+                    }
+                    references.push(SymbolReferenceNode {
+                        file_path: import.file_path.clone(),
+                        line: import.line,
+                        context: format!("imported via {}", import.path),
+                        reference_type: "import".to_string(),
+                    });
+                    if references.len() >= limit {
+                        return Ok(references);
+                    }
+                }
+            }
+        }
+
+        Ok(references)
+    }
+
+    async fn get_file_direct_imports(&self, path: &str) -> Result<Vec<FileImportNode>> {
+        let ir = self.import_relationships.read().await;
+        let files = self.files.read().await;
+        let imported = ir.get(path).cloned().unwrap_or_default();
+        Ok(imported
+            .iter()
+            .map(|p| {
+                let lang = files
+                    .get(p)
+                    .map(|f| f.language.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                FileImportNode {
+                    path: p.clone(),
+                    language: lang,
+                }
+            })
+            .collect())
+    }
+
+    async fn get_function_callers_by_name(
+        &self,
+        function_name: &str,
+        _depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>> {
+        let cr = self.call_relationships.read().await;
+        let functions = self.functions.read().await;
+
+        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            Some(pf.get(&pid).cloned().unwrap_or_default())
+        } else {
+            None
+        };
+
+        let mut callers = Vec::new();
+        for (caller, callees) in cr.iter() {
+            if callees.contains(&function_name.to_string()) {
+                if let Some(ref paths) = project_file_paths {
+                    if let Some(caller_fn) = functions.get(caller) {
+                        if !paths.contains(&caller_fn.file_path) {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                callers.push(caller.clone());
+            }
+        }
+        Ok(callers)
+    }
+
+    async fn get_function_callees_by_name(
+        &self,
+        function_name: &str,
+        _depth: u32,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<String>> {
+        let cr = self.call_relationships.read().await;
+        let functions = self.functions.read().await;
+
+        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            Some(pf.get(&pid).cloned().unwrap_or_default())
+        } else {
+            None
+        };
+
+        let mut callees_result = Vec::new();
+        for (caller_id, callees) in cr.iter() {
+            if caller_id.ends_with(&format!("::{}", function_name)) {
+                // If scoped, check that the caller belongs to the project
+                if let Some(ref paths) = project_file_paths {
+                    if let Some(caller_fn) = functions.get(caller_id) {
+                        if !paths.contains(&caller_fn.file_path) {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                callees_result.extend(callees.clone());
+            }
+        }
+        Ok(callees_result)
+    }
+
+    async fn get_callers_with_confidence(
+        &self,
+        function_name: &str,
+        _project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>> {
+        // Mock: return callers with default confidence
+        let cr = self.call_relationships.read().await;
+        let mut result = Vec::new();
+        for (caller_id, callees) in cr.iter() {
+            if callees.iter().any(|c| c == function_name) {
+                let file = caller_id.rsplitn(3, ':').last().unwrap_or(caller_id);
+                result.push((
+                    caller_id.clone(),
+                    file.to_string(),
+                    0.50,
+                    "unscored".to_string(),
+                ));
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_callees_with_confidence(
+        &self,
+        function_name: &str,
+        _project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>> {
+        let cr = self.call_relationships.read().await;
+        let mut result = Vec::new();
+        for (caller_id, callees) in cr.iter() {
+            if caller_id.ends_with(&format!("::{}", function_name))
+                || caller_id.ends_with(&format!(":{}", function_name))
+            {
+                for callee in callees {
+                    result.push((callee.clone(), String::new(), 0.50, "unscored".to_string()));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_language_stats(&self) -> Result<Vec<LanguageStatsNode>> {
+        let files = self.files.read().await;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for f in files.values() {
+            *counts.entry(f.language.clone()).or_default() += 1;
+        }
+        Ok(counts
+            .into_iter()
+            .map(|(language, file_count)| LanguageStatsNode {
+                language,
+                file_count,
+            })
+            .collect())
+    }
+
+    async fn get_language_stats_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<LanguageStatsNode>> {
+        let files = self.files.read().await;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for f in files.values() {
+            if f.project_id == Some(project_id) {
+                *counts.entry(f.language.clone()).or_default() += 1;
+            }
+        }
+        Ok(counts
+            .into_iter()
+            .map(|(language, file_count)| LanguageStatsNode {
+                language,
+                file_count,
+            })
+            .collect())
+    }
+
+    async fn get_most_connected_files(&self, limit: usize) -> Result<Vec<String>> {
+        let ir = self.import_relationships.read().await;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for targets in ir.values() {
+            for target in targets {
+                *counts.entry(target.clone()).or_default() += 1;
+            }
+        }
+        let mut files: Vec<_> = counts.into_iter().collect();
+        files.sort_by(|a, b| b.1.cmp(&a.1));
+        Ok(files.into_iter().take(limit).map(|(f, _)| f).collect())
+    }
+
+    async fn get_most_connected_files_detailed(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ConnectedFileNode>> {
+        let ir = self.import_relationships.read().await;
+        let fa = self.file_analytics.read().await;
+        let mut import_counts: HashMap<String, i64> = HashMap::new();
+        let mut dependent_counts: HashMap<String, i64> = HashMap::new();
+
+        for (from, tos) in ir.iter() {
+            *import_counts.entry(from.clone()).or_default() += tos.len() as i64;
+            for to in tos {
+                *dependent_counts.entry(to.clone()).or_default() += 1;
+            }
+        }
+
+        let all_files: std::collections::HashSet<_> = import_counts
+            .keys()
+            .chain(dependent_counts.keys())
+            .cloned()
+            .collect();
+
+        let mut result: Vec<ConnectedFileNode> = all_files
+            .into_iter()
+            .map(|path| {
+                let analytics = fa.get(&path);
+                ConnectedFileNode {
+                    imports: *import_counts.get(&path).unwrap_or(&0),
+                    dependents: *dependent_counts.get(&path).unwrap_or(&0),
+                    pagerank: analytics.map(|a| a.pagerank),
+                    betweenness: analytics.map(|a| a.betweenness),
+                    community_label: analytics.map(|a| a.community_label.clone()),
+                    community_id: analytics.map(|a| a.community_id as i64),
+                    path,
+                }
+            })
+            .collect();
+
+        // Sort by pagerank (descending) with fallback to degree
+        result.sort_by(|a, b| {
+            let pr_a = a.pagerank.unwrap_or(0.0);
+            let pr_b = b.pagerank.unwrap_or(0.0);
+            pr_b.partial_cmp(&pr_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| (b.imports + b.dependents).cmp(&(a.imports + a.dependents)))
+        });
+        result.truncate(limit);
+        Ok(result)
+    }
+
+    async fn get_most_connected_files_for_project(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<ConnectedFileNode>> {
+        let files = self.files.read().await;
+        let project_paths: std::collections::HashSet<_> = files
+            .values()
+            .filter(|f| f.project_id == Some(project_id))
+            .map(|f| f.path.clone())
+            .collect();
+
+        let ir = self.import_relationships.read().await;
+        let fa = self.file_analytics.read().await;
+        let mut import_counts: HashMap<String, i64> = HashMap::new();
+        let mut dependent_counts: HashMap<String, i64> = HashMap::new();
+
+        for (from, tos) in ir.iter() {
+            if !project_paths.contains(from) {
+                continue;
+            }
+            *import_counts.entry(from.clone()).or_default() += tos.len() as i64;
+            for to in tos {
+                if project_paths.contains(to) {
+                    *dependent_counts.entry(to.clone()).or_default() += 1;
+                }
+            }
+        }
+
+        let all_files: std::collections::HashSet<_> = import_counts
+            .keys()
+            .chain(dependent_counts.keys())
+            .cloned()
+            .collect();
+
+        let mut result: Vec<ConnectedFileNode> = all_files
+            .into_iter()
+            .map(|path| {
+                let analytics = fa.get(&path);
+                ConnectedFileNode {
+                    imports: *import_counts.get(&path).unwrap_or(&0),
+                    dependents: *dependent_counts.get(&path).unwrap_or(&0),
+                    pagerank: analytics.map(|a| a.pagerank),
+                    betweenness: analytics.map(|a| a.betweenness),
+                    community_label: analytics.map(|a| a.community_label.clone()),
+                    community_id: analytics.map(|a| a.community_id as i64),
+                    path,
+                }
+            })
+            .collect();
+
+        // Sort by pagerank (descending) with fallback to degree
+        result.sort_by(|a, b| {
+            let pr_a = a.pagerank.unwrap_or(0.0);
+            let pr_b = b.pagerank.unwrap_or(0.0);
+            pr_b.partial_cmp(&pr_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| (b.imports + b.dependents).cmp(&(a.imports + a.dependents)))
+        });
+        result.truncate(limit);
+        Ok(result)
+    }
+
+    async fn get_project_communities(&self, project_id: Uuid) -> Result<Vec<CommunityRow>> {
+        let files = self.files.read().await;
+        let fa = self.file_analytics.read().await;
+
+        // Collect files belonging to this project that have analytics
+        let project_paths: Vec<String> = files
+            .values()
+            .filter(|f| f.project_id == Some(project_id))
+            .map(|f| f.path.clone())
+            .collect();
+
+        // Group by community_id
+        let mut communities: HashMap<u32, (String, Vec<String>)> = HashMap::new();
+        for path in &project_paths {
+            if let Some(analytics) = fa.get(path) {
+                let entry = communities
+                    .entry(analytics.community_id)
+                    .or_insert_with(|| (analytics.community_label.clone(), Vec::new()));
+                entry.1.push(path.clone());
+            }
+        }
+
+        // Build result sorted by file_count descending
+        let mut result: Vec<CommunityRow> = communities
+            .into_iter()
+            .map(|(cid, (label, paths))| {
+                let key_files: Vec<String> = paths.iter().take(3).cloned().collect();
+                CommunityRow {
+                    community_id: cid as i64,
+                    community_label: label,
+                    file_count: paths.len(),
+                    key_files,
+                    unique_fingerprints: 0,
+                }
+            })
+            .collect();
+
+        result.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+        Ok(result)
+    }
+
+    async fn get_node_analytics(
+        &self,
+        identifier: &str,
+        node_type: &str,
+    ) -> Result<Option<NodeAnalyticsRow>> {
+        if node_type == "function" {
+            let fa = self.function_analytics.read().await;
+            if let Some(analytics) = fa.get(identifier) {
+                return Ok(Some(NodeAnalyticsRow {
+                    pagerank: Some(analytics.pagerank),
+                    betweenness: Some(analytics.betweenness),
+                    community_id: Some(analytics.community_id as i64),
+                    community_label: None, // FunctionAnalyticsUpdate has no label
+                }));
+            }
+            Ok(None)
+        } else {
+            let fa = self.file_analytics.read().await;
+            if let Some(analytics) = fa.get(identifier) {
+                return Ok(Some(NodeAnalyticsRow {
+                    pagerank: Some(analytics.pagerank),
+                    betweenness: Some(analytics.betweenness),
+                    community_id: Some(analytics.community_id as i64),
+                    community_label: Some(analytics.community_label.clone()),
+                }));
+            }
+            Ok(None)
+        }
+    }
+
+    async fn get_affected_communities(&self, file_paths: &[String]) -> Result<Vec<String>> {
+        let fa = self.file_analytics.read().await;
+        let mut labels: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for path in file_paths {
+            if let Some(analytics) = fa.get(path) {
+                labels.insert(analytics.community_label.clone());
+            }
+        }
+        Ok(labels.into_iter().collect())
+    }
+
+    async fn get_code_health_report(
+        &self,
+        project_id: Uuid,
+        god_function_threshold: usize,
+    ) -> Result<CodeHealthReport> {
+        let pf = self.project_files.read().await;
+        let project_paths: Vec<String> = pf.get(&project_id).cloned().unwrap_or_default();
+        let project_paths_set: std::collections::HashSet<&str> =
+            project_paths.iter().map(|s| s.as_str()).collect();
+
+        // --- God functions ---
+        let functions = self.functions.read().await;
+        let cr = self.call_relationships.read().await;
+
+        // Only consider functions that belong to project files
+        let project_functions: Vec<&FunctionNode> = functions
+            .values()
+            .filter(|f| project_paths_set.contains(f.file_path.as_str()))
+            .collect();
+
+        let mut god_functions = Vec::new();
+        for func in &project_functions {
+            // in_degree: how many other functions call this one
+            let in_degree = cr
+                .iter()
+                .filter(|(_, callees)| callees.contains(&func.name))
+                .count();
+            // out_degree: how many functions this one calls
+            let out_degree = cr.get(&func.name).map(|callees| callees.len()).unwrap_or(0);
+            if in_degree >= god_function_threshold {
+                god_functions.push(GodFunction {
+                    name: func.name.clone(),
+                    file: func.file_path.clone(),
+                    in_degree,
+                    out_degree,
+                });
+            }
+        }
+        god_functions.sort_by(|a, b| b.in_degree.cmp(&a.in_degree));
+
+        // --- Orphan files ---
+        let ir = self.import_relationships.read().await;
+        let mut orphan_files = Vec::new();
+        for path in &project_paths {
+            // Orphan = no imports AND no other file imports it AND no functions
+            let has_imports = ir.get(path).map(|v| !v.is_empty()).unwrap_or(false);
+            let is_imported = ir.values().any(|targets| targets.contains(path));
+            let has_functions = project_functions.iter().any(|f| f.file_path == *path);
+            if !has_imports && !is_imported && !has_functions {
+                orphan_files.push(path.clone());
+            }
+        }
+
+        // --- Coupling metrics ---
+        let fa = self.file_analytics.read().await;
+        let project_analytics: Vec<&crate::graph::models::FileAnalyticsUpdate> = fa
+            .values()
+            .filter(|a| project_paths_set.contains(a.path.as_str()))
+            .collect();
+
+        let coupling_metrics = if project_analytics.is_empty() {
+            None
+        } else {
+            let sum: f64 = project_analytics
+                .iter()
+                .map(|a| a.clustering_coefficient)
+                .sum();
+            let avg = sum / project_analytics.len() as f64;
+            let (max_cc, most_coupled) = project_analytics.iter().fold(
+                (0.0_f64, None::<String>),
+                |(max_val, max_file), a| {
+                    if a.clustering_coefficient > max_val {
+                        (a.clustering_coefficient, Some(a.path.clone()))
+                    } else {
+                        (max_val, max_file)
+                    }
+                },
+            );
+            Some(CouplingMetrics {
+                avg_clustering_coefficient: avg,
+                max_clustering_coefficient: max_cc,
+                most_coupled_file: most_coupled,
+            })
+        };
+
+        Ok(CodeHealthReport {
+            god_functions,
+            orphan_files,
+            coupling_metrics,
+            prediction_accuracy: None,
+        })
+    }
+
+    async fn compute_maintenance_snapshot(
+        &self,
+        _project_id: Uuid,
+    ) -> Result<crate::neo4j::models::MaintenanceSnapshot> {
+        use chrono::Utc;
+        let notes = self.notes.read().await;
+        let active_notes = notes
+            .values()
+            .filter(|n| n.status == crate::notes::NoteStatus::Active)
+            .count();
+        let mean_energy = if active_notes > 0 {
+            notes
+                .values()
+                .filter(|n| n.status == crate::notes::NoteStatus::Active)
+                .map(|n| n.energy)
+                .sum::<f64>()
+                / active_notes as f64
+        } else {
+            0.5
+        };
+        let skills = self.skills.read().await;
+        let skill_count = skills
+            .values()
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    crate::skills::models::SkillStatus::Active
+                        | crate::skills::models::SkillStatus::Emerging
+                )
+            })
+            .count();
+        let synapses = self.note_synapses.read().await;
+        let active_synapses: usize = synapses
+            .values()
+            .map(|v| v.iter().filter(|(_, w)| *w > 0.0).count())
+            .sum();
+        Ok(crate::neo4j::models::MaintenanceSnapshot {
+            health_score: 0.8,
+            active_synapses: active_synapses as i64,
+            mean_energy,
+            skill_count: skill_count as i64,
+            note_count: active_notes as i64,
+            captured_at: Utc::now().to_rfc3339(),
+        })
+    }
+
+    async fn compute_scaffolding_level(
+        &self,
+        project_id: Uuid,
+        scaffolding_override: Option<u8>,
+    ) -> Result<crate::neo4j::models::ScaffoldingLevel> {
+        // Compute real values from mock data
+        let plans = self.plans.read().await;
+        let tasks = self.tasks.read().await;
+        let plan_tasks_map = self.plan_tasks.read().await;
+
+        let mut completed = 0u64;
+        let mut failed = 0u64;
+        let mut total_frustration = 0.0f64;
+        let mut frust_count = 0u64;
+
+        for (plan_id, plan) in plans.iter() {
+            if plan.project_id != Some(project_id) {
+                continue;
+            }
+            if let Some(task_ids) = plan_tasks_map.get(plan_id) {
+                for tid in task_ids {
+                    if let Some(t) = tasks.get(tid) {
+                        match t.status {
+                            crate::neo4j::models::TaskStatus::Completed => completed += 1,
+                            crate::neo4j::models::TaskStatus::Failed => failed += 1,
+                            _ => {}
+                        }
+                        total_frustration += t.frustration_score;
+                        frust_count += 1;
+                    }
+                }
+            }
+        }
+
+        let tasks_analyzed = (completed + failed) as i64;
+        let task_success_rate = if tasks_analyzed > 0 {
+            completed as f64 / tasks_analyzed as f64
+        } else {
+            1.0
+        };
+        let avg_frustration = if frust_count > 0 {
+            total_frustration / frust_count as f64
+        } else {
+            0.0
+        };
+
+        // Scar density from notes
+        let notes = self.notes.read().await;
+        let project_notes: Vec<_> = notes
+            .values()
+            .filter(|n| {
+                n.project_id == Some(project_id) && n.status == crate::notes::NoteStatus::Active
+            })
+            .collect();
+        let scar_density = if !project_notes.is_empty() {
+            project_notes.iter().map(|n| n.scar_intensity).sum::<f64>() / project_notes.len() as f64
+        } else {
+            0.0
+        };
+
+        let homeostasis_pain = 0.0; // Simplified for mock
+
+        let competence_score = (task_success_rate * 0.5
+            + (1.0 - avg_frustration) * 0.2
+            + (1.0 - scar_density) * 0.15
+            + (1.0 - homeostasis_pain) * 0.15)
+            .clamp(0.0, 1.0);
+
+        let (level, label, recommended_steps) = if let Some(ovr) = scaffolding_override {
+            let ovr = ovr.min(4);
+            crate::neo4j::analytics::level_info(ovr)
+        } else {
+            let auto_level = if competence_score >= 0.9 {
+                4
+            } else if competence_score >= 0.75 {
+                3
+            } else if competence_score >= 0.5 {
+                2
+            } else if competence_score >= 0.3 {
+                1
+            } else {
+                0
+            };
+            crate::neo4j::analytics::level_info(auto_level)
+        };
+
+        Ok(crate::neo4j::models::ScaffoldingLevel {
+            level,
+            label,
+            recommended_steps,
+            task_success_rate,
+            avg_frustration,
+            scar_density,
+            homeostasis_pain,
+            competence_score,
+            is_overridden: scaffolding_override.is_some(),
+            tasks_analyzed,
+        })
+    }
+
+    async fn set_scaffolding_override(&self, project_id: Uuid, level: Option<u8>) -> Result<()> {
+        let mut projects = self.projects.write().await;
+        if let Some(p) = projects.get_mut(&project_id) {
+            p.scaffolding_override = level.map(|l| l.min(4));
+        }
+        Ok(())
+    }
+
+    async fn set_watch_enabled(&self, project_id: Uuid, enabled: bool) -> Result<()> {
+        if self
+            .mock_fail_set_watch_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(anyhow::anyhow!("mock: set_watch_enabled forced failure"));
+        }
+        let mut projects = self.projects.write().await;
+        if let Some(p) = projects.get_mut(&project_id) {
+            p.watch_enabled = enabled;
+        }
+        Ok(())
+    }
+
+    async fn set_default_note_energy(&self, project_id: Uuid, energy: Option<f64>) -> Result<()> {
+        let mut projects = self.projects.write().await;
+        if let Some(p) = projects.get_mut(&project_id) {
+            p.default_note_energy = energy.map(|e| e.clamp(0.0, 1.0));
+        }
+        Ok(())
+    }
+
+    async fn detect_global_stagnation(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::models::StagnationReport> {
+        // Mock: check task statuses in this project's plans
+        let plans = self.plans.read().await;
+        let tasks = self.tasks.read().await;
+        let plan_tasks = self.plan_tasks.read().await;
+
+        let mut completed_recent = 0i64;
+        let mut total_frustration = 0.0f64;
+        let mut frustration_count = 0i64;
+
+        for (plan_id, plan) in plans.iter() {
+            if plan.project_id != Some(project_id) {
+                continue;
+            }
+            if let Some(task_ids) = plan_tasks.get(plan_id) {
+                for task_id in task_ids {
+                    if let Some(t) = tasks.get(task_id) {
+                        if t.status == crate::neo4j::models::TaskStatus::Completed {
+                            completed_recent += 1;
+                        }
+                        if t.status == crate::neo4j::models::TaskStatus::InProgress
+                            && t.frustration_score > 0.0
+                        {
+                            total_frustration += t.frustration_score;
+                            frustration_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let avg_frustration = if frustration_count > 0 {
+            total_frustration / frustration_count as f64
+        } else {
+            0.0
+        };
+
+        let notes = self.notes.read().await;
+        let note_count = notes
+            .values()
+            .filter(|n| n.project_id == Some(project_id))
+            .count() as i64;
+        let mean_energy = if note_count > 0 {
+            notes
+                .values()
+                .filter(|n| n.project_id == Some(project_id))
+                .map(|n| n.energy)
+                .sum::<f64>()
+                / note_count as f64
+        } else {
+            1.0
+        };
+        let energy_trend = mean_energy - 0.5;
+
+        let mut signals: u8 = 0;
+        let mut recommendations = Vec::new();
+
+        if completed_recent == 0 {
+            signals += 1;
+            recommendations.push("No tasks completed recently.".to_string());
+        }
+        if avg_frustration > 0.6 {
+            signals += 1;
+            recommendations.push(format!("High frustration: {:.2}", avg_frustration));
+        }
+        if energy_trend < 0.0 {
+            signals += 1;
+            recommendations.push("Note energy declining.".to_string());
+        }
+        // Mock: no commit tracking, assume 0
+        signals += 1;
+        recommendations.push("No commits tracked in mock.".to_string());
+
+        let is_stagnating = signals >= 3;
+        if is_stagnating {
+            recommendations.push("⚠️ Global stagnation detected.".to_string());
+        }
+
+        Ok(crate::neo4j::models::StagnationReport {
+            is_stagnating,
+            tasks_completed_48h: completed_recent,
+            avg_frustration,
+            energy_trend,
+            commits_48h: 0,
+            signals_triggered: signals,
+            recommendations,
+        })
+    }
+
+    async fn get_circular_dependencies(&self, project_id: Uuid) -> Result<Vec<Vec<String>>> {
+        let pf = self.project_files.read().await;
+        let project_paths: Vec<String> = pf.get(&project_id).cloned().unwrap_or_default();
+        let project_paths_set: std::collections::HashSet<&str> =
+            project_paths.iter().map(|s| s.as_str()).collect();
+
+        let ir = self.import_relationships.read().await;
+
+        // DFS cycle detection
+        let mut cycles: Vec<Vec<String>> = Vec::new();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for start in &project_paths {
+            if visited.contains(start) {
+                continue;
+            }
+            let mut stack: Vec<(String, Vec<String>)> = vec![(start.clone(), vec![start.clone()])];
+            let mut local_visited: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+
+            while let Some((current, path)) = stack.pop() {
+                if let Some(neighbors) = ir.get(&current) {
+                    for neighbor in neighbors {
+                        if !project_paths_set.contains(neighbor.as_str()) {
+                            continue;
+                        }
+                        if *neighbor == *start && path.len() >= 2 {
+                            // Found a cycle — canonicalize by sorting to deduplicate
+                            let mut cycle = path.clone();
+                            cycle.push(neighbor.clone());
+                            let min_idx = cycle
+                                .iter()
+                                .take(cycle.len() - 1)
+                                .enumerate()
+                                .min_by(|a, b| a.1.cmp(b.1))
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            let mut canonical: Vec<String> =
+                                cycle[min_idx..cycle.len() - 1].to_vec();
+                            canonical.extend(cycle[..min_idx].to_vec());
+                            canonical.push(canonical[0].clone());
+                            if !cycles.iter().any(|c| c == &canonical) {
+                                cycles.push(canonical);
+                            }
+                        } else if !local_visited.contains(neighbor) && path.len() < 6 {
+                            local_visited.insert(neighbor.clone());
+                            let mut new_path = path.clone();
+                            new_path.push(neighbor.clone());
+                            stack.push((neighbor.clone(), new_path));
+                        }
+                    }
+                }
+            }
+            visited.insert(start.clone());
+        }
+
+        Ok(cycles)
+    }
+
+    async fn get_node_gds_metrics(
+        &self,
+        node_path: &str,
+        node_type: &str,
+        project_id: Uuid,
+    ) -> Result<Option<NodeGdsMetrics>> {
+        let pf = self.project_files.read().await;
+        let project_paths = pf.get(&project_id).cloned().unwrap_or_default();
+
+        match node_type {
+            "function" => {
+                let functions = self.functions.read().await;
+                // Functions are keyed by "file_path::name", so find by name
+                let func = functions
+                    .values()
+                    .find(|f| f.name == node_path && project_paths.contains(&f.file_path));
+                if func.is_none() {
+                    return Ok(None);
+                }
+
+                let fa = self.function_analytics.read().await;
+                let cr = self.call_relationships.read().await;
+
+                let in_degree = cr
+                    .iter()
+                    .filter(|(_, callees)| callees.contains(&node_path.to_string()))
+                    .count() as i64;
+                let out_degree = cr.get(node_path).map(|c| c.len()).unwrap_or(0) as i64;
+
+                if let Some(analytics) = fa.get(node_path) {
+                    Ok(Some(NodeGdsMetrics {
+                        node_path: node_path.to_string(),
+                        node_type: "function".to_string(),
+                        pagerank: Some(analytics.pagerank),
+                        betweenness: Some(analytics.betweenness),
+                        clustering_coefficient: Some(analytics.clustering_coefficient),
+                        community_id: Some(analytics.community_id as i64),
+                        community_label: None,
+                        in_degree,
+                        out_degree,
+                        fabric_pagerank: None,
+                        fabric_betweenness: None,
+                        fabric_community_id: None,
+                        fabric_community_label: None,
+                    }))
+                } else {
+                    // Node exists but no GDS metrics
+                    Ok(Some(NodeGdsMetrics {
+                        node_path: node_path.to_string(),
+                        node_type: "function".to_string(),
+                        pagerank: None,
+                        betweenness: None,
+                        clustering_coefficient: None,
+                        community_id: None,
+                        community_label: None,
+                        in_degree,
+                        out_degree,
+                        fabric_pagerank: None,
+                        fabric_betweenness: None,
+                        fabric_community_id: None,
+                        fabric_community_label: None,
+                    }))
+                }
+            }
+            _ => {
+                // File
+                if !project_paths.contains(&node_path.to_string()) {
+                    return Ok(None);
+                }
+
+                let fa = self.file_analytics.read().await;
+                let ir = self.import_relationships.read().await;
+
+                let in_degree = ir
+                    .iter()
+                    .filter(|(_, targets)| targets.contains(&node_path.to_string()))
+                    .count() as i64;
+                let out_degree = ir.get(node_path).map(|t| t.len()).unwrap_or(0) as i64;
+
+                if let Some(analytics) = fa.get(node_path) {
+                    Ok(Some(NodeGdsMetrics {
+                        node_path: node_path.to_string(),
+                        node_type: "file".to_string(),
+                        pagerank: Some(analytics.pagerank),
+                        betweenness: Some(analytics.betweenness),
+                        clustering_coefficient: Some(analytics.clustering_coefficient),
+                        community_id: Some(analytics.community_id as i64),
+                        community_label: Some(analytics.community_label.clone()),
+                        in_degree,
+                        out_degree,
+                        fabric_pagerank: None,
+                        fabric_betweenness: None,
+                        fabric_community_id: None,
+                        fabric_community_label: None,
+                    }))
+                } else {
+                    Ok(Some(NodeGdsMetrics {
+                        node_path: node_path.to_string(),
+                        node_type: "file".to_string(),
+                        pagerank: None,
+                        betweenness: None,
+                        clustering_coefficient: None,
+                        community_id: None,
+                        community_label: None,
+                        in_degree,
+                        out_degree,
+                        fabric_pagerank: None,
+                        fabric_betweenness: None,
+                        fabric_community_id: None,
+                        fabric_community_label: None,
+                    }))
+                }
+            }
+        }
+    }
+
+    async fn get_project_percentiles(&self, project_id: Uuid) -> Result<ProjectPercentiles> {
+        let pf = self.project_files.read().await;
+        let project_paths = pf.get(&project_id).cloned().unwrap_or_default();
+
+        let fa = self.file_analytics.read().await;
+        let fna = self.function_analytics.read().await;
+
+        let mut pageranks: Vec<f64> = Vec::new();
+        let mut betweennesses: Vec<f64> = Vec::new();
+
+        // Collect from file analytics
+        for path in &project_paths {
+            if let Some(a) = fa.get(path) {
+                pageranks.push(a.pagerank);
+                betweennesses.push(a.betweenness);
+            }
+        }
+
+        // Collect from function analytics (functions belonging to project files)
+        let functions = self.functions.read().await;
+        for func in functions.values() {
+            if project_paths.contains(&func.file_path) {
+                if let Some(a) = fna.get(&func.name) {
+                    pageranks.push(a.pagerank);
+                    betweennesses.push(a.betweenness);
+                }
+            }
+        }
+
+        if pageranks.is_empty() {
+            return Ok(ProjectPercentiles {
+                pagerank_p50: 0.0,
+                pagerank_p80: 0.0,
+                pagerank_p95: 0.0,
+                betweenness_p50: 0.0,
+                betweenness_p80: 0.0,
+                betweenness_p95: 0.0,
+                betweenness_mean: 0.0,
+                betweenness_stddev: 0.0,
+            });
+        }
+
+        pageranks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        betweennesses.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let cnt = pageranks.len();
+        let percentile = |sorted: &[f64], p: f64| -> f64 {
+            let idx = ((cnt as f64 * p) as usize).min(cnt - 1);
+            sorted[idx]
+        };
+
+        let bw_mean: f64 = betweennesses.iter().sum::<f64>() / cnt as f64;
+        let bw_var: f64 = betweennesses
+            .iter()
+            .map(|x| (x - bw_mean).powi(2))
+            .sum::<f64>()
+            / cnt as f64;
+
+        Ok(ProjectPercentiles {
+            pagerank_p50: percentile(&pageranks, 0.5),
+            pagerank_p80: percentile(&pageranks, 0.8),
+            pagerank_p95: percentile(&pageranks, 0.95),
+            betweenness_p50: percentile(&betweennesses, 0.5),
+            betweenness_p80: percentile(&betweennesses, 0.8),
+            betweenness_p95: percentile(&betweennesses, 0.95),
+            betweenness_mean: bw_mean,
+            betweenness_stddev: bw_var.sqrt(),
+        })
+    }
+
+    async fn get_top_bridges_by_betweenness(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<BridgeFile>> {
+        let pf = self.project_files.read().await;
+        let project_paths = pf.get(&project_id).cloned().unwrap_or_default();
+        let fa = self.file_analytics.read().await;
+
+        let mut bridges: Vec<BridgeFile> = project_paths
+            .iter()
+            .filter_map(|path| {
+                fa.get(path).map(|a| BridgeFile {
+                    path: path.clone(),
+                    betweenness: a.betweenness,
+                    community_label: Some(a.community_label.clone()),
+                })
+            })
+            .collect();
+
+        bridges.sort_by(|a, b| b.betweenness.partial_cmp(&a.betweenness).unwrap());
+        bridges.truncate(limit);
+        Ok(bridges)
+    }
+
+    async fn get_file_symbol_names(&self, path: &str) -> Result<FileSymbolNamesNode> {
+        let functions = self.functions.read().await;
+        let structs = self.structs_map.read().await;
+        let traits = self.traits_map.read().await;
+        let enums = self.enums_map.read().await;
+
+        let fn_names: Vec<String> = functions
+            .values()
+            .filter(|f| f.file_path == path)
+            .map(|f| f.name.clone())
+            .collect();
+        let struct_names: Vec<String> = structs
+            .values()
+            .filter(|s| s.file_path == path)
+            .map(|s| s.name.clone())
+            .collect();
+        let trait_names: Vec<String> = traits
+            .values()
+            .filter(|t| t.file_path == path)
+            .map(|t| t.name.clone())
+            .collect();
+        let enum_names: Vec<String> = enums
+            .values()
+            .filter(|e| e.file_path == path)
+            .map(|e| e.name.clone())
+            .collect();
+
+        Ok(FileSymbolNamesNode {
+            functions: fn_names,
+            structs: struct_names,
+            traits: trait_names,
+            enums: enum_names,
+        })
+    }
+
+    async fn get_function_caller_count(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<i64> {
+        let cr = self.call_relationships.read().await;
+        let functions = self.functions.read().await;
+
+        // If project_id provided, get the set of file paths belonging to this project
+        let project_file_paths: Option<Vec<String>> = if let Some(pid) = project_id {
+            let pf = self.project_files.read().await;
+            Some(pf.get(&pid).cloned().unwrap_or_default())
+        } else {
+            None
+        };
+
+        let mut count = 0i64;
+        for (caller_id, callees) in cr.iter() {
+            if callees.contains(&function_name.to_string()) {
+                // If scoped by project, only count callers whose file is in the project
+                if let Some(ref paths) = project_file_paths {
+                    if let Some(caller_fn) = functions.get(caller_id) {
+                        if !paths.contains(&caller_fn.file_path) {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn get_trait_info(&self, trait_name: &str) -> Result<Option<TraitInfoNode>> {
+        let traits = self.traits_map.read().await;
+        for t in traits.values() {
+            if t.name == trait_name {
+                return Ok(Some(TraitInfoNode {
+                    is_external: t.is_external,
+                    source: t.source.clone(),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn get_trait_implementors_detailed(
+        &self,
+        trait_name: &str,
+    ) -> Result<Vec<TraitImplementorNode>> {
+        let impls = self.impls_map.read().await;
+        let mut result = Vec::new();
+        for imp in impls.values() {
+            if imp.trait_name.as_deref() == Some(trait_name) {
+                result.push(TraitImplementorNode {
+                    type_name: imp.for_type.clone(),
+                    file_path: imp.file_path.clone(),
+                    line: imp.line_start,
+                });
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_type_trait_implementations(
+        &self,
+        type_name: &str,
+    ) -> Result<Vec<TypeTraitInfoNode>> {
+        let impls = self.impls_map.read().await;
+        let traits = self.traits_map.read().await;
+        let mut result = Vec::new();
+        for imp in impls.values() {
+            if imp.for_type == type_name {
+                if let Some(trait_name) = &imp.trait_name {
+                    let trait_node = traits.values().find(|t| t.name == *trait_name);
+                    result.push(TypeTraitInfoNode {
+                        name: trait_name.clone(),
+                        full_path: trait_node.map(|t| format!("{}::{}", t.file_path, t.name)),
+                        file_path: imp.file_path.clone(),
+                        is_external: trait_node.map(|t| t.is_external).unwrap_or(false),
+                        source: trait_node.and_then(|t| t.source.clone()),
+                    });
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_type_impl_blocks_detailed(
+        &self,
+        type_name: &str,
+    ) -> Result<Vec<ImplBlockDetailNode>> {
+        let impls = self.impls_map.read().await;
+        let functions = self.functions.read().await;
+        let mut result = Vec::new();
+        for imp in impls.values() {
+            if imp.for_type == type_name {
+                // Find methods in this impl block by line range
+                let methods: Vec<String> = functions
+                    .values()
+                    .filter(|f| {
+                        f.file_path == imp.file_path
+                            && f.line_start >= imp.line_start
+                            && f.line_end <= imp.line_end
+                    })
+                    .map(|f| f.name.clone())
+                    .collect();
+                result.push(ImplBlockDetailNode {
+                    file_path: imp.file_path.clone(),
+                    line_start: imp.line_start,
+                    line_end: imp.line_end,
+                    trait_name: imp.trait_name.clone(),
+                    methods,
+                });
+            }
+        }
+        Ok(result)
+    }
+}
+
+#[async_trait]
+impl PlanStore for MockGraphStore {
+    // ========================================================================
+    // Plan operations
+    // ========================================================================
+
+    async fn create_plan(&self, plan: &PlanNode) -> Result<()> {
+        let plan_id = plan.id;
+        if let Some(project_id) = plan.project_id {
+            self.project_plans
+                .write()
+                .await
+                .entry(project_id)
+                .or_default()
+                .push(plan_id);
+        }
+        self.plans.write().await.insert(plan_id, plan.clone());
+        Ok(())
+    }
+
+    async fn get_plan(&self, id: Uuid) -> Result<Option<PlanNode>> {
+        if self.fail_get_plan.lock().is_ok_and(|f| f.contains(&id)) {
+            anyhow::bail!("mock: get_plan failure injected for {id}");
+        }
+        Ok(self.plans.read().await.get(&id).cloned())
+    }
+
+    async fn list_active_plans(&self) -> Result<Vec<PlanNode>> {
+        Ok(self
+            .plans
+            .read()
+            .await
+            .values()
+            .filter(|p| {
+                matches!(
+                    p.status,
+                    PlanStatus::Draft | PlanStatus::Approved | PlanStatus::InProgress
+                )
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn list_project_plans(&self, project_id: Uuid) -> Result<Vec<PlanNode>> {
+        let pp = self.project_plans.read().await;
+        let plans = self.plans.read().await;
+        let ids = pp.get(&project_id).cloned().unwrap_or_default();
+        Ok(ids
+            .iter()
+            .filter_map(|id| plans.get(id).cloned())
+            .filter(|p| {
+                matches!(
+                    p.status,
+                    PlanStatus::Draft | PlanStatus::Approved | PlanStatus::InProgress
+                )
+            })
+            .collect())
+    }
+
+    async fn count_project_plans(&self, project_id: Uuid) -> Result<i64> {
+        let pp = self.project_plans.read().await;
+        let plans = self.plans.read().await;
+        let ids = pp.get(&project_id).cloned().unwrap_or_default();
+        let count = ids
+            .iter()
+            .filter_map(|id| plans.get(id))
+            .filter(|p| {
+                matches!(
+                    p.status,
+                    PlanStatus::Draft | PlanStatus::Approved | PlanStatus::InProgress
+                )
+            })
+            .count();
+        Ok(count as i64)
+    }
+
+    async fn list_plans_for_project(
+        &self,
+        project_id: Uuid,
+        status_filter: Option<Vec<String>>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<PlanNode>, usize)> {
+        let pp = self.project_plans.read().await;
+        let plans = self.plans.read().await;
+        let ids = pp.get(&project_id).cloned().unwrap_or_default();
+        let mut filtered: Vec<PlanNode> = ids
+            .iter()
+            .filter_map(|id| plans.get(id).cloned())
+            .filter(|p| {
+                if let Some(ref statuses) = status_filter {
+                    let ps = serde_json::to_string(&p.status)
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_string();
+                    statuses.contains(&ps)
+                } else {
+                    true
+                }
+            })
+            .collect();
+        filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        let total = filtered.len();
+        Ok((paginate(&filtered, limit, offset), total))
+    }
+
+    async fn update_plan(&self, id: Uuid, updates: &UpdatePlanRequest) -> Result<()> {
+        if let Some(p) = self.plans.write().await.get_mut(&id) {
+            if let Some(title) = &updates.title {
+                p.title = title.clone();
+            }
+            if let Some(description) = &updates.description {
+                p.description = description.clone();
+            }
+            if let Some(priority) = updates.priority {
+                p.priority = priority;
+            }
+        }
+        Ok(())
+    }
+
+    async fn update_plan_status(&self, id: Uuid, status: PlanStatus) -> Result<()> {
+        if let Some(p) = self.plans.write().await.get_mut(&id) {
+            p.status = status;
+        }
+        Ok(())
+    }
+
+    async fn list_plan_project_slugs(&self, plan_id: Uuid) -> Result<Vec<String>> {
+        let primary = self
+            .plans
+            .read()
+            .await
+            .get(&plan_id)
+            .and_then(|p| p.project_id);
+        let linked: Vec<Uuid> = self
+            .project_plans
+            .read()
+            .await
+            .iter()
+            .filter(|(_, plans)| plans.contains(&plan_id))
+            .map(|(pid, _)| *pid)
+            .collect();
+        let projects = self.projects.read().await;
+        let mut slugs: Vec<String> = linked
+            .into_iter()
+            .chain(primary)
+            .filter_map(|pid| projects.get(&pid).map(|p| p.slug.clone()))
+            .collect();
+        slugs.sort();
+        slugs.dedup();
+        Ok(slugs)
+    }
+
+    /// Mirrors Neo4j (`plan.rs` link_plan_to_project): `MATCH` project and
+    /// plan (no-op if either is missing), `SET plan.project_id`, then
+    /// `MERGE (project)-[:HAS_PLAN]->(plan)`. MERGE is additive and
+    /// idempotent: previous HAS_PLAN links are KEPT (this is not a move).
+    async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> Result<()> {
+        if !self.projects.read().await.contains_key(&project_id) {
+            return Ok(());
+        }
+        match self.plans.write().await.get_mut(&plan_id) {
+            Some(p) => p.project_id = Some(project_id),
+            None => return Ok(()),
+        }
+        let mut project_plans = self.project_plans.write().await;
+        let ids = project_plans.entry(project_id).or_default();
+        if !ids.contains(&plan_id) {
+            ids.push(plan_id);
+        }
+        Ok(())
+    }
+
+    /// Mirrors Neo4j: deletes EVERY HAS_PLAN pointing at the plan (not only
+    /// the one matching `plan.project_id`) and clears `project_id`.
+    async fn unlink_plan_from_project(&self, plan_id: Uuid) -> Result<()> {
+        let mut linked = false;
+        for ids in self.project_plans.write().await.values_mut() {
+            let before = ids.len();
+            ids.retain(|id| *id != plan_id);
+            linked |= ids.len() != before;
+        }
+        // Neo4j only reaches the SET when at least one HAS_PLAN matched.
+        if linked {
+            if let Some(p) = self.plans.write().await.get_mut(&plan_id) {
+                p.project_id = None;
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_plan(&self, plan_id: Uuid) -> Result<()> {
+        // Cascade: delete tasks, steps, decisions, constraints
+        if let Some(task_ids) = self.plan_tasks.write().await.remove(&plan_id) {
+            for tid in task_ids {
+                self.delete_task(tid).await?;
+            }
+        }
+        if let Some(constraint_ids) = self.plan_constraints.write().await.remove(&plan_id) {
+            let mut constraints = self.constraints.write().await;
+            for cid in constraint_ids {
+                constraints.remove(&cid);
+            }
+        }
+        self.plan_commits.write().await.remove(&plan_id);
+        if self.plans.write().await.remove(&plan_id).is_some() {
+            // DETACH DELETE drops every HAS_PLAN, not only plan.project_id's.
+            for ids in self.project_plans.write().await.values_mut() {
+                ids.retain(|id| *id != plan_id);
+            }
+        }
+        Ok(())
+    }
+
+    // ========================================================================
+    // Task operations
+    // ========================================================================
+
+    async fn create_task(&self, plan_id: Uuid, task: &TaskNode) -> Result<()> {
+        let task_id = task.id;
+        self.plan_tasks
+            .write()
+            .await
+            .entry(plan_id)
+            .or_default()
+            .push(task_id);
+        self.tasks.write().await.insert(task_id, task.clone());
+        Ok(())
+    }
+
+    async fn get_plan_tasks(&self, plan_id: Uuid) -> Result<Vec<TaskNode>> {
+        let pt = self.plan_tasks.read().await;
+        let tasks = self.tasks.read().await;
+        let ids = pt.get(&plan_id).cloned().unwrap_or_default();
+        Ok(ids.iter().filter_map(|id| tasks.get(id).cloned()).collect())
+    }
+
+    async fn get_task_with_full_details(&self, task_id: Uuid) -> Result<Option<TaskDetails>> {
+        let task = match self.tasks.read().await.get(&task_id).cloned() {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let steps = self.get_task_steps(task_id).await?;
+        let decisions = {
+            let td = self.task_decisions.read().await;
+            let decs = self.decisions.read().await;
+            td.get(&task_id)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|id| decs.get(id).cloned())
+                .collect()
+        };
+        let depends_on = self
+            .task_dependencies
+            .read()
+            .await
+            .get(&task_id)
+            .cloned()
+            .unwrap_or_default();
+        let modifies_files = self
+            .task_files
+            .read()
+            .await
+            .get(&task_id)
+            .cloned()
+            .unwrap_or_default();
+        Ok(Some(TaskDetails {
+            task,
+            steps,
+            decisions,
+            depends_on,
+            modifies_files,
+        }))
+    }
+
+    async fn analyze_task_impact(&self, task_id: Uuid) -> Result<Vec<String>> {
+        let file_paths = self
+            .task_files
+            .read()
+            .await
+            .get(&task_id)
+            .cloned()
+            .unwrap_or_default();
+        let ir = self.import_relationships.read().await;
+        let mut impacted = Vec::new();
+        for path in &file_paths {
+            // Find files that import this file
+            for (from, tos) in ir.iter() {
+                if tos.contains(path) && !file_paths.contains(from) {
+                    impacted.push(from.clone());
+                }
+            }
+        }
+        impacted.sort();
+        impacted.dedup();
+        Ok(impacted)
+    }
+
+    async fn find_blocked_tasks(&self, plan_id: Uuid) -> Result<Vec<(TaskNode, Vec<TaskNode>)>> {
+        let task_ids = self
+            .plan_tasks
+            .read()
+            .await
+            .get(&plan_id)
+            .cloned()
+            .unwrap_or_default();
+        let tasks = self.tasks.read().await;
+        let deps = self.task_dependencies.read().await;
+
+        let mut result = Vec::new();
+        for tid in &task_ids {
+            if let Some(task) = tasks.get(tid) {
+                if task.status == TaskStatus::Pending {
+                    if let Some(dep_ids) = deps.get(tid) {
+                        let blockers: Vec<TaskNode> = dep_ids
+                            .iter()
+                            .filter_map(|did| {
+                                tasks.get(did).and_then(|t| {
+                                    if t.status != TaskStatus::Completed {
+                                        Some(t.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                            .collect();
+                        if !blockers.is_empty() {
+                            result.push((task.clone(), blockers));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn update_task_status(&self, task_id: Uuid, status: TaskStatus) -> Result<()> {
+        if let Some(t) = self.tasks.write().await.get_mut(&task_id) {
+            t.status = status.clone();
+            t.updated_at = Some(Utc::now());
+            if status == TaskStatus::InProgress && t.started_at.is_none() {
+                t.started_at = Some(Utc::now());
+            }
+            if status == TaskStatus::Completed {
+                t.completed_at = Some(Utc::now());
+            }
+            // Leaving `Interrupted` ends the interruption, as in the real store.
+            if status != TaskStatus::Interrupted {
+                t.interrupted_at = None;
+                t.interrupted_reason = None;
+            }
+        }
+        Ok(())
+    }
+
+    async fn interrupt_task(&self, task_id: Uuid, reason: &str) -> Result<bool> {
+        let mut tasks = self.tasks.write().await;
+        let Some(t) = tasks.get_mut(&task_id) else {
+            return Ok(false);
+        };
+        // Same rule as the real store: finished work is not interrupted.
+        if matches!(t.status, TaskStatus::Completed | TaskStatus::Failed) {
+            return Ok(false);
+        }
+        t.status = TaskStatus::Interrupted;
+        t.interrupted_at.get_or_insert_with(Utc::now);
+        t.interrupted_reason = Some(reason.to_owned());
+        t.updated_at = Some(Utc::now());
+        Ok(true)
+    }
+
+    async fn assign_task(&self, task_id: Uuid, agent_id: &str) -> Result<()> {
+        if let Some(t) = self.tasks.write().await.get_mut(&task_id) {
+            t.assigned_to = Some(agent_id.to_string());
+            t.updated_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn add_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()> {
+        self.task_dependencies
+            .write()
+            .await
+            .entry(task_id)
+            .or_default()
+            .push(depends_on_id);
+        Ok(())
+    }
+
+    async fn remove_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()> {
+        if let Some(deps) = self.task_dependencies.write().await.get_mut(&task_id) {
+            deps.retain(|id| *id != depends_on_id);
+        }
+        Ok(())
+    }
+
+    async fn get_task_blockers(&self, task_id: Uuid) -> Result<Vec<TaskNode>> {
+        let deps = self.task_dependencies.read().await;
+        let tasks = self.tasks.read().await;
+        let dep_ids = deps.get(&task_id).cloned().unwrap_or_default();
+        Ok(dep_ids
+            .iter()
+            .filter_map(|did| {
+                tasks.get(did).and_then(|t| {
+                    if t.status != TaskStatus::Completed {
+                        Some(t.clone())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect())
+    }
+
+    async fn get_tasks_blocked_by(&self, task_id: Uuid) -> Result<Vec<TaskNode>> {
+        let deps = self.task_dependencies.read().await;
+        let tasks = self.tasks.read().await;
+        let mut result = Vec::new();
+        for (tid, dep_ids) in deps.iter() {
+            if dep_ids.contains(&task_id) {
+                if let Some(t) = tasks.get(tid) {
+                    result.push(t.clone());
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_task_dependencies(&self, task_id: Uuid) -> Result<Vec<TaskNode>> {
+        let deps = self.task_dependencies.read().await;
+        let tasks = self.tasks.read().await;
+        let dep_ids = deps.get(&task_id).cloned().unwrap_or_default();
+        Ok(dep_ids
+            .iter()
+            .filter_map(|did| tasks.get(did).cloned())
+            .collect())
+    }
+
+    async fn get_plan_dependency_graph(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<(Vec<TaskNode>, Vec<(Uuid, Uuid)>)> {
+        let task_ids = self
+            .plan_tasks
+            .read()
+            .await
+            .get(&plan_id)
+            .cloned()
+            .unwrap_or_default();
+        let tasks_map = self.tasks.read().await;
+        let deps = self.task_dependencies.read().await;
+
+        let task_list: Vec<TaskNode> = task_ids
+            .iter()
+            .filter_map(|id| tasks_map.get(id).cloned())
+            .collect();
+
+        let mut edges = Vec::new();
+        for tid in &task_ids {
+            if let Some(dep_ids) = deps.get(tid) {
+                for did in dep_ids {
+                    edges.push((*tid, *did));
+                }
+            }
+        }
+
+        Ok((task_list, edges))
+    }
+
+    async fn get_task_enrichment_counts(
+        &self,
+        task_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentCounts>> {
+        use crate::neo4j::plan::TaskEnrichmentCounts;
+        let mut map = std::collections::HashMap::new();
+        let tasks = self.tasks.read().await;
+        let steps_store = self.steps.read().await;
+        let task_steps_map = self.task_steps.read().await;
+        for tid in task_ids {
+            if let Ok(uuid) = tid.parse::<Uuid>() {
+                if tasks.contains_key(&uuid) {
+                    let step_ids = task_steps_map.get(&uuid).cloned().unwrap_or_default();
+                    let step_count = step_ids.len();
+                    let completed_step_count = step_ids
+                        .iter()
+                        .filter(|sid| {
+                            steps_store
+                                .get(sid)
+                                .map(|s| format!("{:?}", s.status) == "Completed")
+                                .unwrap_or(false)
+                        })
+                        .count();
+                    map.insert(
+                        tid.clone(),
+                        TaskEnrichmentCounts {
+                            step_count,
+                            completed_step_count,
+                            note_count: 0,
+                            decision_count: 0,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(map)
+    }
+
+    async fn get_task_enrichment_data(
+        &self,
+        task_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentData>> {
+        use crate::neo4j::plan::{StepSummary, TaskEnrichmentData};
+        let counts = self.get_task_enrichment_counts(task_ids).await?;
+        let steps_store = self.steps.read().await;
+        let task_steps_map = self.task_steps.read().await;
+        let task_sessions = self.task_sessions.read().await;
+        let mut map = std::collections::HashMap::new();
+        for tid in task_ids {
+            if let Ok(uuid) = tid.parse::<Uuid>() {
+                let step_ids = task_steps_map.get(&uuid).cloned().unwrap_or_default();
+                let task_steps: Vec<StepSummary> = step_ids
+                    .iter()
+                    .filter_map(|sid| steps_store.get(sid))
+                    .map(|s| StepSummary {
+                        id: s.id.to_string(),
+                        order: s.order,
+                        description: s.description.clone(),
+                        status: format!("{:?}", s.status),
+                        verification: s.verification.clone(),
+                    })
+                    .collect();
+                map.insert(
+                    tid.clone(),
+                    TaskEnrichmentData {
+                        counts: counts.get(tid).cloned().unwrap_or_default(),
+                        steps: task_steps,
+                        sessions: task_sessions.get(&uuid).cloned().unwrap_or_default(),
+                        discussed_files: vec![],
+                    },
+                );
+            }
+        }
+        Ok(map)
+    }
+
+    async fn get_plan_critical_path(&self, plan_id: Uuid) -> Result<Vec<TaskNode>> {
+        let (tasks, edges) = self.get_plan_dependency_graph(plan_id).await?;
+        if tasks.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Simple longest-path: DFS from each node with no dependents
+        let task_map: HashMap<Uuid, &TaskNode> = tasks.iter().map(|t| (t.id, t)).collect();
+        // Build adjacency: task -> tasks it depends on
+        let mut adj: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        for (from, to) in &edges {
+            adj.entry(*from).or_default().push(*to);
+        }
+
+        fn dfs(
+            node: Uuid,
+            adj: &HashMap<Uuid, Vec<Uuid>>,
+            memo: &mut HashMap<Uuid, Vec<Uuid>>,
+        ) -> Vec<Uuid> {
+            if let Some(cached) = memo.get(&node) {
+                return cached.clone();
+            }
+            let mut longest = vec![];
+            if let Some(deps) = adj.get(&node) {
+                for dep in deps {
+                    let path = dfs(*dep, adj, memo);
+                    if path.len() > longest.len() {
+                        longest = path;
+                    }
+                }
+            }
+            longest.push(node);
+            memo.insert(node, longest.clone());
+            longest
+        }
+
+        let mut memo = HashMap::new();
+        let mut best_path = vec![];
+        for t in &tasks {
+            let path = dfs(t.id, &adj, &mut memo);
+            if path.len() > best_path.len() {
+                best_path = path;
+            }
+        }
+
+        // Reverse so it goes from root dependency to final task
+        best_path.reverse();
+        Ok(best_path
+            .iter()
+            .filter_map(|id| task_map.get(id).cloned().cloned())
+            .collect())
+    }
+
+    async fn compute_waves(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<crate::neo4j::plan::WaveComputationResult> {
+        use crate::neo4j::plan::*;
+        use std::collections::{HashSet, VecDeque};
+
+        let (tasks, edges) = self.get_plan_dependency_graph(plan_id).await?;
+
+        if tasks.is_empty() {
+            return Ok(WaveComputationResult {
+                waves: vec![],
+                summary: WaveSummary {
+                    total_tasks: 0,
+                    total_waves: 0,
+                    max_parallel: 0,
+                    critical_path_length: 0,
+                    dependency_edges: 0,
+                    conflicts_detected: 0,
+                },
+                conflicts: vec![],
+                edges: vec![],
+            });
+        }
+
+        let task_map: HashMap<Uuid, &TaskNode> = tasks.iter().map(|t| (t.id, t)).collect();
+        let mut deps_of: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
+        let mut dependents_of: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
+        let mut in_degree: HashMap<Uuid, usize> = HashMap::new();
+
+        for task in &tasks {
+            in_degree.insert(task.id, 0);
+            deps_of.insert(task.id, HashSet::new());
+            dependents_of.insert(task.id, HashSet::new());
+        }
+
+        for &(from, to) in &edges {
+            if task_map.contains_key(&from) && task_map.contains_key(&to) {
+                deps_of.entry(from).or_default().insert(to);
+                dependents_of.entry(to).or_default().insert(from);
+                *in_degree.entry(from).or_default() += 1;
+            }
+        }
+
+        let mut queue: VecDeque<Uuid> = in_degree
+            .iter()
+            .filter(|(_, &deg)| deg == 0)
+            .map(|(&id, _)| id)
+            .collect();
+
+        let mut waves: Vec<Wave> = Vec::new();
+        let mut processed_count = 0;
+
+        while !queue.is_empty() {
+            let current_level: Vec<Uuid> = queue.drain(..).collect();
+            let wave_number = waves.len() + 1;
+            let mut wave_tasks: Vec<WaveTask> = Vec::new();
+
+            for &task_id in &current_level {
+                processed_count += 1;
+                if let Some(task) = task_map.get(&task_id) {
+                    wave_tasks.push(WaveTask {
+                        id: task.id,
+                        title: task.title.clone(),
+                        status: task.status.clone(),
+                        priority: task.priority,
+                        affected_files: task.affected_files.clone(),
+                        depends_on: deps_of
+                            .get(&task_id)
+                            .map(|s| s.iter().copied().collect())
+                            .unwrap_or_default(),
+                    });
+                }
+                if let Some(dependents) = dependents_of.get(&task_id) {
+                    for &dep_id in dependents {
+                        if let Some(deg) = in_degree.get_mut(&dep_id) {
+                            *deg -= 1;
+                            if *deg == 0 {
+                                queue.push_back(dep_id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let task_count = wave_tasks.len();
+            waves.push(Wave {
+                wave_number,
+                tasks: wave_tasks,
+                task_count,
+                split_from_conflicts: false,
+            });
+        }
+
+        if processed_count < tasks.len() {
+            anyhow::bail!("Cycle detected in dependency graph!");
+        }
+
+        // Conflict splitting (simplified for mock — same logic as real impl)
+        let mut all_conflicts: Vec<FileConflict> = Vec::new();
+        let mut split_waves: Vec<Wave> = Vec::new();
+        let mut wave_counter = 0usize;
+
+        for wave in &waves {
+            let mut has_conflicts = false;
+            for i in 0..wave.tasks.len() {
+                let files_a: HashSet<&str> = wave.tasks[i]
+                    .affected_files
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                if files_a.is_empty() {
+                    continue;
+                }
+                for j in (i + 1)..wave.tasks.len() {
+                    let shared: Vec<String> = wave.tasks[j]
+                        .affected_files
+                        .iter()
+                        .filter(|f| files_a.contains(f.as_str()))
+                        .cloned()
+                        .collect();
+                    if !shared.is_empty() {
+                        has_conflicts = true;
+                        all_conflicts.push(FileConflict {
+                            task_a: wave.tasks[i].id,
+                            task_b: wave.tasks[j].id,
+                            shared_files: shared,
+                        });
+                    }
+                }
+            }
+            if !has_conflicts {
+                wave_counter += 1;
+                split_waves.push(Wave {
+                    wave_number: wave_counter,
+                    tasks: wave.tasks.clone(),
+                    task_count: wave.task_count,
+                    split_from_conflicts: false,
+                });
+            } else {
+                // Simple split: put each conflicting task in its own sub-wave
+                for t in &wave.tasks {
+                    wave_counter += 1;
+                    split_waves.push(Wave {
+                        wave_number: wave_counter,
+                        tasks: vec![t.clone()],
+                        task_count: 1,
+                        split_from_conflicts: true,
+                    });
+                }
+            }
+        }
+
+        let max_parallel = split_waves.iter().map(|w| w.task_count).max().unwrap_or(0);
+
+        Ok(WaveComputationResult {
+            waves: split_waves.clone(),
+            summary: WaveSummary {
+                total_tasks: tasks.len(),
+                total_waves: split_waves.len(),
+                max_parallel,
+                critical_path_length: split_waves.len(),
+                dependency_edges: edges.len(),
+                conflicts_detected: all_conflicts.len(),
+            },
+            conflicts: all_conflicts,
+            edges,
+        })
+    }
+
+    async fn get_next_available_task(&self, plan_id: Uuid) -> Result<Option<TaskNode>> {
+        let task_ids = self
+            .plan_tasks
+            .read()
+            .await
+            .get(&plan_id)
+            .cloned()
+            .unwrap_or_default();
+        let tasks = self.tasks.read().await;
+        let deps = self.task_dependencies.read().await;
+
+        for tid in &task_ids {
+            if let Some(task) = tasks.get(tid) {
+                if task.status != TaskStatus::Pending {
+                    continue;
+                }
+                // Check all dependencies are completed
+                let dep_ids = deps.get(tid).cloned().unwrap_or_default();
+                let all_deps_completed = dep_ids.iter().all(|did| {
+                    tasks
+                        .get(did)
+                        .map(|t| t.status == TaskStatus::Completed)
+                        .unwrap_or(true)
+                });
+                if all_deps_completed {
+                    return Ok(Some(task.clone()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn get_task(&self, task_id: Uuid) -> Result<Option<TaskNode>> {
+        Ok(self.tasks.read().await.get(&task_id).cloned())
+    }
+
+    async fn update_task(&self, task_id: Uuid, updates: &UpdateTaskRequest) -> Result<()> {
+        if let Some(t) = self.tasks.write().await.get_mut(&task_id) {
+            if let Some(ref title) = updates.title {
+                t.title = Some(title.clone());
+            }
+            if let Some(ref desc) = updates.description {
+                t.description = desc.clone();
+            }
+            if let Some(ref status) = updates.status {
+                t.status = status.clone();
+                if *status == TaskStatus::InProgress && t.started_at.is_none() {
+                    t.started_at = Some(Utc::now());
+                }
+                if *status == TaskStatus::Completed {
+                    t.completed_at = Some(Utc::now());
+                }
+            }
+            if let Some(ref assigned) = updates.assigned_to {
+                t.assigned_to = Some(assigned.clone());
+            }
+            if let Some(priority) = updates.priority {
+                t.priority = Some(priority);
+            }
+            if let Some(ref tags) = updates.tags {
+                t.tags = tags.clone();
+            }
+            if let Some(ref ac) = updates.acceptance_criteria {
+                t.acceptance_criteria = ac.clone();
+            }
+            if let Some(ref af) = updates.affected_files {
+                t.affected_files = af.clone();
+            }
+            if let Some(complexity) = updates.actual_complexity {
+                t.actual_complexity = Some(complexity);
+            }
+            if let Some(complexity) = updates.estimated_complexity {
+                t.estimated_complexity = Some(complexity);
+            }
+            if let Some(due) = updates.due_date {
+                t.due_date = Some(due);
+            }
+            if let Some(minutes) = updates.estimated_minutes {
+                t.estimated_minutes = Some(minutes);
+            }
+            t.updated_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn update_task_enrichment(
+        &self,
+        task_id: Uuid,
+        execution_context: Option<&str>,
+        persona: Option<&str>,
+        prompt_cache: Option<&str>,
+    ) -> Result<()> {
+        let mut tasks = self.tasks.write().await;
+        if let Some(task) = tasks.get_mut(&task_id) {
+            if let Some(ctx) = execution_context {
+                task.execution_context = Some(ctx.to_string());
+            }
+            if let Some(p) = persona {
+                task.persona = Some(p.to_string());
+            }
+            if let Some(pc) = prompt_cache {
+                task.prompt_cache = Some(pc.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_task(&self, task_id: Uuid) -> Result<()> {
+        self.tasks.write().await.remove(&task_id);
+        // Cascade: steps
+        if let Some(step_ids) = self.task_steps.write().await.remove(&task_id) {
+            let mut steps = self.steps.write().await;
+            for sid in step_ids {
+                steps.remove(&sid);
+            }
+        }
+        // Cascade: decisions
+        if let Some(dec_ids) = self.task_decisions.write().await.remove(&task_id) {
+            let mut decisions = self.decisions.write().await;
+            for did in dec_ids {
+                decisions.remove(&did);
+            }
+        }
+        self.task_dependencies.write().await.remove(&task_id);
+        self.task_files.write().await.remove(&task_id);
+        self.task_commits.write().await.remove(&task_id);
+        // Remove from other tasks' dependency lists
+        let mut deps = self.task_dependencies.write().await;
+        for dep_list in deps.values_mut() {
+            dep_list.retain(|id| *id != task_id);
+        }
+        Ok(())
+    }
+
+    async fn get_project_for_task(&self, task_id: Uuid) -> Result<Option<ProjectNode>> {
+        // Reverse lookup: task_id → plan_id (via plan_tasks)
+        let plan_tasks = self.plan_tasks.read().await;
+        let plan_id = plan_tasks
+            .iter()
+            .find(|(_, tasks)| tasks.contains(&task_id))
+            .map(|(plan_id, _)| *plan_id);
+
+        let plan_id = match plan_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        drop(plan_tasks);
+
+        // Reverse lookup: plan_id → project_id (via project_plans)
+        let project_plans = self.project_plans.read().await;
+        let project_id = project_plans
+            .iter()
+            .find(|(_, plans)| plans.contains(&plan_id))
+            .map(|(project_id, _)| *project_id);
+
+        let project_id = match project_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        drop(project_plans);
+
+        // Get the project
+        let projects = self.projects.read().await;
+        Ok(projects.get(&project_id).cloned())
+    }
+
+    async fn get_plan_id_for_task(&self, task_id: Uuid) -> Result<Option<Uuid>> {
+        let plan_tasks = self.plan_tasks.read().await;
+        Ok(plan_tasks
+            .iter()
+            .find(|(_, tasks)| tasks.contains(&task_id))
+            .map(|(plan_id, _)| *plan_id))
+    }
+
+    // ========================================================================
+    // Day plan operations
+    // ========================================================================
+
+    async fn get_day_plan(&self, user_id: Uuid, date: &str) -> Result<Vec<(Uuid, u32)>> {
+        Ok(self
+            .day_plans
+            .read()
+            .await
+            .get(&(user_id, date.to_string()))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn set_day_plan(&self, user_id: Uuid, date: &str, ids: &[Uuid]) -> Result<()> {
+        let entries: Vec<(Uuid, u32)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i as u32))
+            .collect();
+        self.day_plans
+            .write()
+            .await
+            .insert((user_id, date.to_string()), entries);
+        Ok(())
+    }
+
+    async fn add_to_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()> {
+        let mut plans = self.day_plans.write().await;
+        let key = (user_id, date.to_string());
+        let entries = plans.entry(key).or_default();
+        if !entries.iter().any(|(id, _)| *id == task_id) {
+            // Mirror the Neo4j `coalesce(max(order) + 1, 0)`: first entry is 0.
+            let next_order = entries
+                .iter()
+                .map(|(_, o)| *o)
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0);
+            entries.push((task_id, next_order));
+        }
+        Ok(())
+    }
+
+    async fn remove_from_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()> {
+        let mut plans = self.day_plans.write().await;
+        if let Some(entries) = plans.get_mut(&(user_id, date.to_string())) {
+            entries.retain(|(id, _)| *id != task_id);
+        }
+        Ok(())
+    }
+
+    // ========================================================================
+    // Step operations
+    // ========================================================================
+
+    async fn create_step(&self, task_id: Uuid, step: &StepNode) -> Result<()> {
+        let step_id = step.id;
+        self.task_steps
+            .write()
+            .await
+            .entry(task_id)
+            .or_default()
+            .push(step_id);
+        self.steps.write().await.insert(step_id, step.clone());
+        Ok(())
+    }
+
+    async fn get_task_steps(&self, task_id: Uuid) -> Result<Vec<StepNode>> {
+        let ts = self.task_steps.read().await;
+        let steps = self.steps.read().await;
+        let ids = ts.get(&task_id).cloned().unwrap_or_default();
+        let mut result: Vec<StepNode> =
+            ids.iter().filter_map(|id| steps.get(id).cloned()).collect();
+        result.sort_by_key(|s| s.order);
+        Ok(result)
+    }
+
+    async fn update_step(&self, step_id: Uuid, updates: &UpdateStepRequest) -> Result<()> {
+        if let Some(s) = self.steps.write().await.get_mut(&step_id) {
+            if let Some(description) = &updates.description {
+                s.description = description.clone();
+            }
+            if let Some(verification) = &updates.verification {
+                s.verification = Some(verification.clone());
+            }
+            s.updated_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> Result<()> {
+        if let Some(s) = self.steps.write().await.get_mut(&step_id) {
+            s.status = status.clone();
+            s.updated_at = Some(Utc::now());
+            if status == StepStatus::Completed {
+                s.completed_at = Some(Utc::now());
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_task_step_progress(&self, task_id: Uuid) -> Result<(u32, u32)> {
+        let steps = self.get_task_steps(task_id).await?;
+        let total = steps.len() as u32;
+        let completed = steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Completed)
+            .count() as u32;
+        Ok((completed, total))
+    }
+
+    async fn get_step(&self, step_id: Uuid) -> Result<Option<StepNode>> {
+        Ok(self.steps.read().await.get(&step_id).cloned())
+    }
+
+    async fn delete_step(&self, step_id: Uuid) -> Result<()> {
+        self.steps.write().await.remove(&step_id);
+        let mut ts = self.task_steps.write().await;
+        for step_ids in ts.values_mut() {
+            step_ids.retain(|id| *id != step_id);
+        }
+        Ok(())
+    }
+
+    async fn complete_pending_steps_for_task(&self, task_id: Uuid) -> Result<u32> {
+        let ts = self.task_steps.read().await;
+        let step_ids = ts.get(&task_id).cloned().unwrap_or_default();
+        drop(ts);
+        let mut steps = self.steps.write().await;
+        let mut count = 0u32;
+        for sid in &step_ids {
+            if let Some(s) = steps.get_mut(sid) {
+                if s.status == StepStatus::Pending || s.status == StepStatus::InProgress {
+                    s.status = StepStatus::Completed;
+                    s.completed_at = Some(Utc::now());
+                    s.updated_at = Some(Utc::now());
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    // ========================================================================
+    // Constraint operations
+    // ========================================================================
+
+    async fn create_constraint(&self, plan_id: Uuid, constraint: &ConstraintNode) -> Result<()> {
+        if !self.plans.read().await.contains_key(&plan_id) {
+            anyhow::bail!(
+                "Failed to create constraint: Plan {} not found in Neo4j",
+                plan_id
+            );
+        }
+        let cid = constraint.id;
+        self.plan_constraints
+            .write()
+            .await
+            .entry(plan_id)
+            .or_default()
+            .push(cid);
+        self.constraints
+            .write()
+            .await
+            .insert(cid, constraint.clone());
+        Ok(())
+    }
+
+    async fn get_plan_constraints(&self, plan_id: Uuid) -> Result<Vec<ConstraintNode>> {
+        let pc = self.plan_constraints.read().await;
+        let constraints = self.constraints.read().await;
+        let ids = pc.get(&plan_id).cloned().unwrap_or_default();
+        Ok(ids
+            .iter()
+            .filter_map(|id| constraints.get(id).cloned())
+            .collect())
+    }
+
+    async fn get_constraint(&self, constraint_id: Uuid) -> Result<Option<ConstraintNode>> {
+        Ok(self.constraints.read().await.get(&constraint_id).cloned())
+    }
+
+    async fn update_constraint(
+        &self,
+        constraint_id: Uuid,
+        description: Option<String>,
+        constraint_type: Option<ConstraintType>,
+        enforced_by: Option<String>,
+    ) -> Result<()> {
+        if let Some(c) = self.constraints.write().await.get_mut(&constraint_id) {
+            if let Some(d) = description {
+                c.description = d;
+            }
+            if let Some(ct) = constraint_type {
+                c.constraint_type = ct;
+            }
+            if let Some(eb) = enforced_by {
+                c.enforced_by = Some(eb);
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_constraint(&self, constraint_id: Uuid) -> Result<()> {
+        self.constraints.write().await.remove(&constraint_id);
+        let mut pc = self.plan_constraints.write().await;
+        for ids in pc.values_mut() {
+            ids.retain(|id| *id != constraint_id);
+        }
+        Ok(())
     }
 }
