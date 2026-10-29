@@ -9228,6 +9228,18 @@ impl ChatManager {
                     "Session {} no longer in active_sessions at stream start",
                     session_id
                 );
+                // No turn will run: the caller may already have claimed
+                // `is_streaming` (OOB trigger, drain). Release it, or the session
+                // reads "streaming" forever and nothing ever finalizes it.
+                is_streaming.store(false, Ordering::SeqCst);
+                emit_chat(
+                    ChatEvent::StreamingStatus {
+                        is_streaming: false,
+                    },
+                    &events_tx,
+                    &nats,
+                    &session_id,
+                );
                 return;
             }
         };
