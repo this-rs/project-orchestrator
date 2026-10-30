@@ -110,6 +110,9 @@ pub struct ProjectSummary {
     pub name: String,
     pub slug: String,
     pub root_path: String,
+    /// When the project was created (RFC 3339). The node has always stored it; the
+    /// overview now says it, so a client can place the project on a timeline.
+    pub created_at: String,
 }
 
 // ============================================================================
@@ -567,6 +570,7 @@ pub async fn get_workspace_overview(
                 name: p.name,
                 slug: p.slug,
                 root_path: p.root_path,
+                created_at: p.created_at.to_rfc3339(),
             })
             .collect(),
         milestones: milestones

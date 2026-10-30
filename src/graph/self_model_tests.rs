@@ -254,12 +254,16 @@ async fn an_activation_becomes_a_durable_uses_edge() {
     assert_eq!(outcome.considered, 2);
     assert_eq!(outcome.written, 2, "{outcome:?}");
     let uses = graph.agent_uses.read().await;
-    let (_, label, target) = uses.keys().find(|(a, _, _)| *a == agent).unwrap();
-    assert_eq!(label, "Persona");
-    assert_eq!(*target, persona);
-    let stored = uses.values().next().unwrap();
+    // By key, never by iteration order: a HashMap does not promise one.
+    let stored = uses
+        .get(&(agent, "Persona".to_string(), persona))
+        .expect("the persona is applied by the agent");
     assert!(stored.is_accountable(), "the edge must say why it exists");
     assert_eq!(stored.rule, AGENT_USES_ACTIVATED.name);
+    assert!(
+        uses.contains_key(&(agent, "Skill".to_string(), skill)),
+        "and so is the skill"
+    );
 }
 
 #[tokio::test]

@@ -1056,6 +1056,10 @@ pub struct LiveAgent {
     pub project_slug: Option<String>,
     pub workspace_slug: Option<String>,
     pub model: String,
+    /// The provider instance (harness/engine) the session runs on. The session node
+    /// stores it; without it here a client cannot say which harness carries an agent.
+    /// `None` when the session predates provider routing.
+    pub provider_id: Option<String>,
     pub cwd: String,
     /// Who started it: `user` for a plain chat, else the `spawned_by` type
     /// (`runner`, `delegate`, `protocol_runner`, ...).
@@ -1191,6 +1195,7 @@ pub async fn build_live_agents(
             project_slug: node.as_ref().and_then(|n| n.project_slug.clone()),
             workspace_slug: node.as_ref().and_then(|n| n.workspace_slug.clone()),
             model: node.as_ref().map(|n| n.model.clone()).unwrap_or_default(),
+            provider_id: node.as_ref().and_then(|n| n.provider_id.clone()),
             cwd: node.as_ref().map(|n| n.cwd.clone()).unwrap_or_default(),
             origin,
             run_id,
@@ -2248,6 +2253,30 @@ mod tests {
             .find(|a| a.session_id == id.to_string())
             .expect("listed");
         assert!(a.skills.is_empty() && a.personas.is_empty());
+    }
+
+    /// The session node stores the provider that carries it; the live view must say so,
+    /// or a client cannot tell which harness runs an agent. No provider stored → `None`
+    /// (a session that predates provider routing), never an invented default.
+    #[tokio::test]
+    async fn live_agent_carries_its_provider() {
+        let mut on_provider = test_chat_session(None);
+        on_provider.provider_id = Some("deepseek-vps".to_string());
+        let without = test_chat_session(None);
+        let store = live_store(vec![on_provider.clone(), without.clone()]).await;
+        let snap = snapshot(&[on_provider.id, without.id], &[], &[]);
+        let r = build_live_agents(&store, now(), &snap).await;
+        let of = |id: Uuid| {
+            r.agents
+                .iter()
+                .find(|a| a.session_id == id.to_string())
+                .expect("listed")
+        };
+        assert_eq!(
+            of(on_provider.id).provider_id.as_deref(),
+            Some("deepseek-vps")
+        );
+        assert_eq!(of(without.id).provider_id, None);
     }
 
     /// A chat agent that moved a task to `in_progress` is tied to it by

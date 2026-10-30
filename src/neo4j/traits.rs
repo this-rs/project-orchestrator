@@ -100,6 +100,10 @@ pub trait GraphStore:
     + ReleaseStore
     + NoteStore
     + AnalyticsStore
+    + PersonaStore
+    + SkillStore
+    + AuthStore
+    + ChatStore
     + Send
     + Sync
 {
@@ -2278,6 +2282,1446 @@ pub trait AnalyticsStore: Send + Sync {
     async fn get_all_synapse_weights(&self, project_id: Option<Uuid>) -> Result<Vec<f64>>;
 
     // ========================================================================
+    // Graph visualization queries (PM + Chat layers)
+    // ========================================================================
+
+    /// Get all PM entities (plans, tasks, steps, milestones, releases) and their
+    /// inter-entity edges for the graph visualization layer.
+    /// Returns (nodes, edges) where nodes are tuples of (id, type, label, attributes_json)
+    /// and edges are tuples of (source_id, target_id, rel_type, attributes_json).
+    async fn get_pm_graph_data(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<(Vec<PmGraphNode>, Vec<PmGraphEdge>)>;
+
+    /// Get chat sessions that have DISCUSSED relations, along with those edges.
+    /// Only returns sessions with at least 1 DISCUSSED relation.
+    /// Returns (sessions, discussed_edges).
+    async fn get_chat_graph_data(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<(Vec<ChatGraphSession>, Vec<ChatGraphDiscussed>)>;
+
+    // ================================================================
+    // Feature Graphs
+    // ================================================================
+
+    /// Create a feature graph
+    async fn create_feature_graph(&self, graph: &FeatureGraphNode) -> Result<()>;
+
+    /// Get a feature graph by ID (without entities)
+    async fn get_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphNode>>;
+
+    /// Get a feature graph with all its included entities
+    async fn get_feature_graph_detail(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>>;
+
+    /// List feature graphs, optionally filtered by project
+    async fn list_feature_graphs(&self, project_id: Option<Uuid>) -> Result<Vec<FeatureGraphNode>>;
+
+    /// Delete a feature graph and all its INCLUDES_ENTITY relationships
+    async fn delete_feature_graph(&self, id: Uuid) -> Result<bool>;
+
+    /// Add an entity (file, function, struct, trait) to a feature graph.
+    /// When `project_id` is provided, MATCH queries for Function/Struct/Trait/Enum
+    /// are scoped to that project to avoid cross-project contamination.
+    async fn add_entity_to_feature_graph(
+        &self,
+        feature_graph_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+        role: Option<&str>,
+        project_id: Option<Uuid>,
+    ) -> Result<()>;
+
+    /// Remove an entity from a feature graph
+    async fn remove_entity_from_feature_graph(
+        &self,
+        feature_graph_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<bool>;
+
+    /// Automatically build a feature graph from a function entry point.
+    /// Uses the call graph (callers + callees) to discover related functions and files,
+    /// creates a FeatureGraph, and populates it with the discovered entities.
+    #[allow(clippy::too_many_arguments)]
+    async fn auto_build_feature_graph(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        project_id: Uuid,
+        entry_function: &str,
+        depth: u32,
+        include_relations: Option<&[String]>,
+        filter_community: Option<bool>,
+    ) -> Result<FeatureGraphDetail>;
+
+    /// Refresh an auto-built feature graph by re-running the BFS with the
+    /// same parameters (entry_function, depth, include_relations).
+    /// Returns None if the graph was manually created (no entry_function).
+    /// Returns Err if the graph doesn't exist.
+    async fn refresh_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>>;
+
+    /// Get the top N most connected functions for a project, ranked by
+    /// (callers + callees). Used for auto-generating feature graphs after sync.
+    async fn get_top_entry_functions(&self, project_id: Uuid, limit: usize) -> Result<Vec<String>>;
+
+    /// Compute statistics for a feature graph: coupling, cohesion, complexity metrics.
+    async fn get_feature_graph_statistics(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<FeatureGraphStatistics>>;
+
+    /// Compare two feature graphs: shared entities, unique entities, similarity score.
+    async fn compare_feature_graphs(
+        &self,
+        id_a: Uuid,
+        id_b: Uuid,
+    ) -> Result<Option<FeatureGraphComparison>>;
+
+    /// Find feature graphs that overlap with a reference graph (same project).
+    async fn find_overlapping_feature_graphs(
+        &self,
+        id: Uuid,
+        min_overlap: f64,
+    ) -> Result<Vec<FeatureGraphOverlap>>;
+
+    // ========================================================================
+    // Bulk graph extraction (for graph analytics)
+    // ========================================================================
+
+    /// Get all IMPORTS edges between files in a project as (source_path, target_path) pairs.
+    /// Single bulk query — used by the graph analytics engine for extraction.
+    async fn get_project_import_edges(&self, project_id: Uuid) -> Result<Vec<(String, String)>>;
+
+    /// Get all CALLS edges between functions in a project as (caller_id, callee_id) pairs.
+    /// Scoped to the same project (no cross-project calls).
+    /// Single bulk query — used by the graph analytics engine for extraction.
+    async fn get_project_call_edges(&self, project_id: Uuid) -> Result<Vec<(String, String)>>;
+
+    /// Get all EXTENDS edges between structs/classes in a project as (child_file, parent_file) pairs.
+    /// Returns file-level edges for the graph analytics engine.
+    async fn get_project_extends_edges(&self, project_id: Uuid) -> Result<Vec<(String, String)>>;
+
+    /// Get all IMPLEMENTS edges between structs and traits in a project as (struct_file, trait_file) pairs.
+    /// Returns file-level edges for the graph analytics engine.
+    async fn get_project_implements_edges(&self, project_id: Uuid)
+        -> Result<Vec<(String, String)>>;
+
+    /// Batch-update analytics scores on File nodes.
+    /// Uses UNWIND for single-query efficiency.
+    async fn batch_update_file_analytics(&self, updates: &[FileAnalyticsUpdate]) -> Result<()>;
+
+    /// Batch-update analytics scores on Function nodes.
+    /// Uses UNWIND for single-query efficiency.
+    async fn batch_update_function_analytics(
+        &self,
+        updates: &[FunctionAnalyticsUpdate],
+    ) -> Result<()>;
+
+    /// Batch-update **fabric** analytics scores on File nodes.
+    /// Writes to `fabric_pagerank`, `fabric_betweenness`, `fabric_community_id`, etc.
+    /// These are separate from the code-only scores written by `batch_update_file_analytics`.
+    async fn batch_update_fabric_file_analytics(
+        &self,
+        updates: &[FabricFileAnalyticsUpdate],
+    ) -> Result<()>;
+
+    /// Batch-update structural DNA vectors on File nodes.
+    /// Writes the `structural_dna` property (Vec<f64>) via UNWIND in chunks of 1000.
+    /// DNA = K-dimensional distance vector to anchor nodes, normalized [0,1].
+    async fn batch_update_structural_dna(
+        &self,
+        updates: &[crate::graph::models::StructuralDnaUpdate],
+    ) -> Result<()>;
+
+    /// Write predicted missing links for a project.
+    /// Persists top-N link predictions as PREDICTED_LINK relationships in Neo4j.
+    async fn write_predicted_links(
+        &self,
+        project_id: &str,
+        links: &[crate::graph::models::LinkPrediction],
+    ) -> Result<()>;
+
+    /// Read structural DNA vectors for all File nodes in a project.
+    /// Returns (file_path, dna_vector) pairs.
+    async fn get_project_structural_dna(&self, project_id: &str)
+        -> Result<Vec<(String, Vec<f64>)>>;
+
+    /// Batch-update structural fingerprint vectors on File nodes.
+    /// Writes the `structural_fingerprint` property (Vec<f64>, 17 dims) via UNWIND in chunks of 1000.
+    /// Fingerprint = universal feature vector with fixed semantics, project-independent.
+    async fn batch_update_structural_fingerprints(
+        &self,
+        updates: &[crate::graph::models::StructuralFingerprintUpdate],
+    ) -> Result<()>;
+
+    /// Read structural fingerprint vectors for all File nodes in a project.
+    /// Returns (file_path, fingerprint_vector) pairs.
+    async fn get_project_structural_fingerprints(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, Vec<f64>)>>;
+
+    /// Read all file signals needed for multi-signal structural similarity.
+    ///
+    /// Returns fingerprint, WL hash, and function count for each file in one query.
+    /// Used by `find_cross_project_twins` and `find_structural_twins` handlers.
+    async fn get_project_file_signals(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<crate::graph::models::FileSignalRecord>>;
+
+    // ========================================================================
+    // SYNAPSE (neural connections bridged to file-level)
+    // ========================================================================
+
+    /// Get SYNAPSE edges bridged from Note-level to File-level.
+    /// Returns (source_file_path, target_file_path, avg_weight) tuples.
+    async fn get_project_synapse_edges(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(String, String, f64)>>;
+
+    /// Get neural network metrics for a project's SYNAPSE layer.
+    async fn get_neural_metrics(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::models::NeuralMetrics>;
+
+    // ========================================================================
+    // T5.5 — Churn score (commit frequency per file)
+    // ========================================================================
+
+    /// Compute churn metrics per file via TOUCHES relations.
+    async fn compute_churn_scores(&self, project_id: Uuid) -> Result<Vec<FileChurnScore>>;
+
+    /// Batch-write churn scores to File nodes.
+    async fn batch_update_churn_scores(&self, updates: &[FileChurnScore]) -> Result<()>;
+
+    /// Get top N files by churn_score (pre-computed on File nodes).
+    async fn get_top_hotspots(&self, project_id: Uuid, limit: usize)
+        -> Result<Vec<FileChurnScore>>;
+
+    // ========================================================================
+    // T5.6 — Knowledge density score
+    // ========================================================================
+
+    /// Compute knowledge density per file based on linked notes and decisions.
+    async fn compute_knowledge_density(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<FileKnowledgeDensity>>;
+
+    /// Batch-write knowledge density scores to File nodes.
+    async fn batch_update_knowledge_density(&self, updates: &[FileKnowledgeDensity]) -> Result<()>;
+
+    /// Get top N files with lowest knowledge_density (knowledge gaps).
+    async fn get_top_knowledge_gaps(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<FileKnowledgeDensity>>;
+
+    // ========================================================================
+    // T5.7 — Risk score composite
+    // ========================================================================
+
+    /// Compute composite risk scores for all files in a project.
+    async fn compute_risk_scores(&self, project_id: Uuid) -> Result<Vec<FileRiskScore>>;
+
+    /// Batch-write composite risk scores to File nodes.
+    async fn batch_update_risk_scores(&self, updates: &[FileRiskScore]) -> Result<()>;
+
+    /// Get risk assessment summary stats for a project.
+    async fn get_risk_summary(&self, project_id: Uuid) -> Result<serde_json::Value>;
+
+    // ========================================================================
+    // Process detection
+    // ========================================================================
+
+    /// Batch upsert Process nodes using UNWIND.
+    async fn batch_upsert_processes(&self, processes: &[ProcessNode]) -> Result<()>;
+
+    /// Batch create STEP_IN_PROCESS relationships.
+    /// Takes (process_id, function_id, step_number) tuples.
+    async fn batch_create_step_relationships(&self, steps: &[(String, String, u32)]) -> Result<()>;
+
+    /// Delete all Process nodes and their STEP_IN_PROCESS relationships for a project.
+    /// Returns the number of deleted entities.
+    async fn delete_project_processes(&self, project_id: Uuid) -> Result<u64>;
+
+    // ========================================================================
+    // Skill operations (Neural Skills)
+    // ========================================================================
+
+    /// Re-scope a protocol: `None` makes it transverse, `Some(pid)` attaches it.
+    async fn rescope_protocol(&self, protocol_id: Uuid, project_id: Option<Uuid>) -> Result<()>;
+
+    // ========================================================================
+    // Skill membership operations
+    // ========================================================================
+
+    // ========================================================================
+    // Skill query & activation operations
+    // ========================================================================
+
+    /// Run the pending one-time data migrations (see
+    /// `neo4j::data_migrations`). Backends without migrations do nothing.
+    async fn run_data_migrations(&self) -> Vec<crate::neo4j::data_migrations::MigrationOutcome> {
+        Vec::new()
+    }
+
+    /// Decay and prune the synapses of one project's notes (see the Neo4j
+    /// implementation). Per-project maintenance MUST use this rather than the
+    /// global `decay_synapses`. Defaults to the global decay for stores
+    /// without a project-scoped variant (test mocks).
+    async fn decay_project_synapses(
+        &self,
+        _project_id: Uuid,
+        decay_amount: f64,
+        prune_threshold: f64,
+    ) -> Result<(usize, usize)> {
+        self.decay_synapses(decay_amount, prune_threshold).await
+    }
+
+    /// Weaken one node's synapses (see the Neo4j implementation). Defaults to
+    /// a no-op for stores without synapse storage.
+    async fn weaken_node_synapses(
+        &self,
+        _node_id: Uuid,
+        _amount: f64,
+        _prune_threshold: f64,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// When each project last got a deep maintenance pass (persisted, so a
+    /// restart does not re-run a full pass over every project).
+    async fn get_deep_maintenance_times(
+        &self,
+    ) -> Result<Vec<(Uuid, chrono::DateTime<chrono::Utc>)>> {
+        Ok(Vec::new())
+    }
+
+    /// Record that a project's deep maintenance pass started now.
+    async fn mark_deep_maintenance(&self, _project_id: Uuid) -> Result<()> {
+        Ok(())
+    }
+
+    // ========================================================================
+    // Skill Detection — Graph Extraction
+    // ========================================================================
+
+    /// Extract the SYNAPSE graph for a project: all Note↔Note edges with weight > min_weight.
+    /// Returns Vec<(from_note_id, to_note_id, weight)>.
+    async fn get_synapse_graph(
+        &self,
+        project_id: Uuid,
+        min_weight: f64,
+    ) -> Result<Vec<(String, String, f64)>>;
+
+    // ========================================================================
+    // Persona operations (Living Personas)
+    // ========================================================================
+
+    // ========================================================================
+    // Persona relation operations
+    // ========================================================================
+
+    // ========================================================================
+    // Persona subgraph (knowledge assembly)
+    // ========================================================================
+
+    /// Auto-scope each persona to the FeatureGraph that best matches its KNOWS files.
+    /// Returns the number of personas that were scoped.
+    async fn auto_scope_to_feature_graphs(&self, project_id: Uuid) -> Result<usize>;
+
+    /// Compute adaptive thresholds from actual KNOWS/USES weight distributions.
+    /// Falls back to hardcoded defaults when there are fewer than 10 data points.
+    async fn compute_adaptive_thresholds(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::persona::AdaptivePersonaThresholds>;
+
+    /// Auto-grow: create a weak KNOWS relation between persona and file.
+    async fn auto_grow_file_knows(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        weight: f64,
+    ) -> Result<()>;
+
+    // ========================================================================
+    // Persona learning methods (CO_CHANGED, merge, SYNAPSE, energy)
+    // ========================================================================
+
+    /// Propagate KNOWS to co-changed files (attenuated weight).
+    async fn propagate_knows_via_co_change(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        base_weight: f64,
+    ) -> Result<usize>;
+
+    /// Apply rate-limited energy boost to a persona. Returns true if applied.
+    async fn rate_limited_energy_boost(
+        &self,
+        persona_id: Uuid,
+        boost: f64,
+        max_per_cycle: f64,
+    ) -> Result<bool>;
+
+    /// Get learning health metrics for a project's persona system.
+    async fn get_learning_health(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::analytics::LearningHealthReport>;
+
+    // ========================================================================
+    // Analysis Profile operations
+    // ========================================================================
+
+    /// Create or update an analysis profile.
+    ///
+    /// Uses MERGE on `id` so built-in profiles can be upserted idempotently.
+    /// If `project_id` is Some, links the profile to the project via HAS_PROFILE.
+    async fn create_analysis_profile(&self, profile: &AnalysisProfile) -> Result<()>;
+
+    /// List analysis profiles visible to a project.
+    ///
+    /// Returns global profiles (project_id IS NULL) + project-specific profiles.
+    /// If `project_id` is None, returns only global profiles.
+    async fn list_analysis_profiles(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Vec<AnalysisProfile>>;
+
+    /// Get a single analysis profile by id.
+    async fn get_analysis_profile(&self, id: &str) -> Result<Option<AnalysisProfile>>;
+
+    /// Delete an analysis profile by id.
+    ///
+    /// Returns an error if the profile is built-in (`is_builtin = true`).
+    async fn delete_analysis_profile(&self, id: &str) -> Result<()>;
+
+    // ========================================================================
+    // Bridge subgraph extraction (GraIL Plan 1)
+    // ========================================================================
+
+    /// Extract the enclosing bridge subgraph between two nodes via bidirectional
+    /// BFS intersection. Returns raw nodes and edges; double-radius labeling
+    /// and bottleneck detection are done in Rust (see graph/algorithms.rs).
+    ///
+    /// - `source`/`target`: file paths within the project
+    /// - `max_hops`: BFS radius (1..=5)
+    /// - `relation_types`: edge types to traverse (e.g. ["IMPORTS", "CALLS"])
+    /// - `project_id`: project UUID for scoping
+    async fn find_bridge_subgraph(
+        &self,
+        source: &str,
+        target: &str,
+        max_hops: u32,
+        relation_types: &[String],
+        project_id: &str,
+    ) -> Result<(
+        Vec<crate::graph::models::BridgeRawNode>,
+        Vec<crate::graph::models::BridgeRawEdge>,
+    )>;
+
+    // ========================================================================
+    // Multi-signal impact queries
+    // ========================================================================
+
+    /// Get the knowledge density for a file: count of notes LINKED_TO + decisions AFFECTS,
+    /// normalized by max count across all files in the project. Returns f64 in [0, 1].
+    async fn get_knowledge_density(&self, file_path: &str, project_id: &str) -> Result<f64>;
+
+    /// Get the PageRank score for a file node.
+    /// Reads the `cc_pagerank` property set by GDS projection. Falls back to 0.0.
+    async fn get_node_pagerank(&self, file_path: &str, project_id: &str) -> Result<f64>;
+
+    /// Get bridge proximity scores for a file's top co-changers.
+    /// For each co-changer, computes 1.0 / shortestPath distance to the target.
+    /// Returns Vec<(path, score)> sorted by score descending.
+    async fn get_bridge_proximity(
+        &self,
+        file_path: &str,
+        project_id: &str,
+    ) -> Result<Vec<(String, f64)>>;
+
+    /// Compute the average multi-signal impact score across the top-10 files
+    /// by PageRank. Uses GDS properties (pagerank, betweenness, churn_score,
+    /// knowledge_density) to approximate the 5-signal fusion in a single query.
+    /// Returns 0.0 if no files have GDS metrics computed.
+    async fn get_avg_multi_signal_score(&self, project_id: Uuid) -> Result<f64>;
+
+    // ========================================================================
+    // Topology Firewall (GraIL Plan 3)
+    // ========================================================================
+
+    /// Create a topology rule.
+    ///
+    /// Stores the rule as a `TopologyRule` node in Neo4j with the given
+    /// project_id, rule_type, source/target patterns, threshold, and severity.
+    async fn create_topology_rule(&self, rule: &TopologyRule) -> Result<()>;
+
+    /// List all topology rules for a project.
+    async fn list_topology_rules(&self, project_id: &str) -> Result<Vec<TopologyRule>>;
+
+    /// Delete a topology rule by id.
+    async fn delete_topology_rule(&self, rule_id: &str) -> Result<()>;
+
+    /// Check all topology rules for a project and return violations.
+    ///
+    /// Iterates over all rules for the project and runs type-specific Cypher
+    /// queries to detect violations:
+    /// - `MustNotImport`: files matching source_pattern that IMPORTS files matching target_pattern
+    /// - `MustNotCall`: functions matching source_pattern that CALLS functions matching target_pattern
+    /// - `MaxFanOut`: files matching source_pattern with more than threshold IMPORTS
+    /// - `NoCircular`: circular import chains (depth 2..6) among files matching source_pattern
+    /// - `MaxDistance`: shortest path between source and target patterns >= threshold
+    async fn check_topology_rules(&self, project_id: &str) -> Result<Vec<TopologyViolation>>;
+
+    /// Check if a specific file's new imports would violate any topology rules.
+    ///
+    /// Designed for real-time pre-write validation (<50ms target).
+    /// Only checks `MustNotImport` rules where `file_path` matches the source pattern
+    /// and any of `new_imports` matches the target pattern.
+    async fn check_file_topology(
+        &self,
+        project_id: &str,
+        file_path: &str,
+        new_imports: &[String],
+    ) -> Result<Vec<TopologyViolation>>;
+
+    // ========================================================================
+    // Cognitive routing (bandit arms and decisions)
+    // ========================================================================
+
+    /// One bandit arm, `None` when it was never observed.
+    async fn get_routing_arm(
+        &self,
+        key: &crate::chat::provider::cognitive::store::ArmKey,
+    ) -> Result<Option<crate::chat::provider::cognitive::store::ArmStats>>;
+
+    /// Every arm of a class of work.
+    async fn list_routing_arms(
+        &self,
+        class: &str,
+    ) -> Result<Vec<crate::chat::provider::cognitive::store::ArmStats>>;
+
+    /// Records one observation, creating the arm with Beta(1, 1) when absent;
+    /// returns the arm as updated. Atomic per arm.
+    async fn observe_routing_arm(
+        &self,
+        key: &crate::chat::provider::cognitive::store::ArmKey,
+        observation: &crate::chat::provider::cognitive::store::ArmObservation,
+    ) -> Result<crate::chat::provider::cognitive::store::ArmStats>;
+
+    /// Stores or replaces a routing decision, linked best effort to its
+    /// session, task and run when they exist.
+    async fn put_routing_decision(
+        &self,
+        decision: &crate::chat::provider::cognitive::decision::CognitiveDecision,
+    ) -> Result<()>;
+
+    /// One routing decision.
+    async fn get_routing_decision(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<crate::chat::provider::cognitive::decision::CognitiveDecision>>;
+
+    /// Routing decisions, newest first.
+    async fn list_routing_decisions(
+        &self,
+        filter: &crate::chat::provider::cognitive::store::DecisionFilter,
+    ) -> Result<Vec<crate::chat::provider::cognitive::decision::CognitiveDecision>>;
+
+    /// Fills the outcome of a decision; `false` when it is unknown.
+    async fn set_routing_decision_outcome(
+        &self,
+        id: Uuid,
+        outcome: crate::chat::provider::cognitive::decision::DecisionOutcome,
+    ) -> Result<bool>;
+
+    // ========================================================================
+    // Conversation segments (episodic memory)
+    // ========================================================================
+
+    /// Stores (replacing) the conversation segments of a conversation.
+    async fn put_segments(
+        &self,
+        conversation: &str,
+        segments: &[crate::chat::provider::cognitive::segment::Segment],
+    ) -> Result<()>;
+
+    /// The stored conversation segments of a conversation, empty when none.
+    async fn get_segments(
+        &self,
+        conversation: &str,
+    ) -> Result<Vec<crate::chat::provider::cognitive::segment::Segment>>;
+
+    /// Stores (replacing) the boundaries of a conversation.
+    async fn put_boundaries(
+        &self,
+        conversation: &str,
+        boundaries: &[crate::chat::provider::cognitive::segment::Boundary],
+    ) -> Result<()>;
+
+    /// The stored boundaries of a conversation, empty when none.
+    async fn get_boundaries(
+        &self,
+        conversation: &str,
+    ) -> Result<Vec<crate::chat::provider::cognitive::segment::Boundary>>;
+
+    // ========================================================================
+    // Health check
+    // ========================================================================
+
+    /// Check connectivity to the graph database.
+    /// Returns Ok(true) if the database is reachable, Ok(false) if not.
+    async fn health_check(&self) -> Result<bool>;
+
+    // ========================================================================
+    // Context Cards persistence
+    // ========================================================================
+
+    /// Batch-write context cards as cc_* properties on File nodes.
+    async fn batch_save_context_cards(
+        &self,
+        cards: &[crate::graph::models::ContextCard],
+    ) -> Result<()>;
+
+    /// Invalidate context cards for given file paths + their 1-hop neighbors.
+    /// Sets cc_version = -1 on the target files and their direct neighbors.
+    async fn invalidate_context_cards(&self, paths: &[String], project_id: &str) -> Result<()>;
+
+    /// Read a single context card from Neo4j cc_* properties.
+    /// Returns None if the file doesn't exist or has no cc_* properties.
+    async fn get_context_card(
+        &self,
+        path: &str,
+        project_id: &str,
+    ) -> Result<Option<crate::graph::models::ContextCard>>;
+
+    /// Batch-read context cards for multiple files.
+    async fn get_context_cards_batch(
+        &self,
+        paths: &[String],
+        project_id: &str,
+    ) -> Result<Vec<crate::graph::models::ContextCard>>;
+
+    /// Find groups of files with identical WL hash (isomorphic neighborhoods).
+    /// Returns groups with at least `min_group_size` members.
+    async fn find_isomorphic_groups(
+        &self,
+        project_id: &str,
+        min_group_size: usize,
+    ) -> Result<Vec<crate::graph::models::IsomorphicGroup>>;
+
+    /// Check if any file in the project has GraIL analytics (context cards) computed.
+    /// Used by staleness check to detect pre-GraIL projects needing first computation.
+    async fn has_context_cards(&self, project_id: &str) -> Result<bool>;
+
+    // ========================================================================
+    // Embedding projection (UMAP visualization)
+    // ========================================================================
+
+    /// Get all note embeddings for a project in a single batch query.
+    /// Returns (note_id, embedding_vec, note_type, importance, energy, tags, content_preview).
+    /// Only returns notes that have embeddings. Used for UMAP 2D projection.
+    async fn get_note_embeddings_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<NoteEmbeddingPoint>>;
+
+    // ========================================================================
+    // Protocol operations (Pattern Federation)
+    // ========================================================================
+
+    /// Create a new protocol with its BELONGS_TO relationship to project.
+    /// Also creates HAS_STATE and HAS_TRANSITION relationships for sub-entities.
+    async fn upsert_protocol(&self, protocol: &Protocol) -> Result<()>;
+
+    /// Get a protocol by ID, including its states and transitions.
+    async fn get_protocol(&self, id: Uuid) -> Result<Option<Protocol>>;
+
+    /// List protocols for a project with optional category filter and pagination.
+    /// Returns (protocols, total_count).
+    ///
+    /// The scope rule is the one of the transverse library, the same skills follow: with
+    /// a project, the listing is that project's protocols PLUS the instance's transverse
+    /// ones (`project_id IS NULL`), and never another project's; with no project, the
+    /// transverse set alone. `total_count` counts what the listing covers, transverse
+    /// protocols included — it is NOT the size of one project's own set, so a caller that
+    /// wants that count filters on `project_id` itself.
+    async fn list_protocols(
+        &self,
+        project_id: Option<Uuid>,
+        category: Option<crate::protocol::ProtocolCategory>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Protocol>, usize)>;
+
+    /// Delete a protocol and all its states, transitions, and relationships.
+    /// Returns true if the protocol existed and was deleted.
+    async fn delete_protocol(&self, id: Uuid) -> Result<bool>;
+
+    /// Upsert a protocol state and create its HAS_STATE relationship.
+    async fn upsert_protocol_state(&self, state: &ProtocolState) -> Result<()>;
+
+    /// Get all states for a protocol.
+    async fn get_protocol_states(&self, protocol_id: Uuid) -> Result<Vec<ProtocolState>>;
+
+    /// Check if a protocol with the given name already exists in the project.
+    /// Returns the existing protocol's UUID if found.
+    async fn get_protocol_by_name_and_project(
+        &self,
+        name: &str,
+        project_id: Uuid,
+    ) -> Result<Option<Uuid>>;
+
+    /// Delete a protocol state and its relationships.
+    async fn delete_protocol_state(&self, state_id: Uuid) -> Result<bool>;
+
+    /// Upsert a protocol transition and create its HAS_TRANSITION relationship.
+    async fn upsert_protocol_transition(&self, transition: &ProtocolTransition) -> Result<()>;
+
+    /// Get all transitions for a protocol.
+    async fn get_protocol_transitions(&self, protocol_id: Uuid) -> Result<Vec<ProtocolTransition>>;
+
+    /// Delete a protocol transition.
+    async fn delete_protocol_transition(&self, transition_id: Uuid) -> Result<bool>;
+
+    // ========================================================================
+    // ProtocolRun operations (FSM Runtime)
+    // ========================================================================
+
+    /// Create a new protocol run node with INSTANCE_OF relationship to its protocol.
+    async fn create_protocol_run(&self, run: &ProtocolRun) -> Result<()>;
+
+    /// Get a protocol run by ID.
+    async fn get_protocol_run(&self, run_id: Uuid) -> Result<Option<ProtocolRun>>;
+
+    /// Update an existing protocol run (current_state, states_visited, status, etc.).
+    /// On success, bumps `run.version` in-place to match the persisted value.
+    /// Returns `OptimisticLockError` if the run was modified concurrently.
+    async fn update_protocol_run(&self, run: &mut ProtocolRun) -> Result<()>;
+
+    /// List protocol runs for a protocol with optional status filter and pagination.
+    /// Returns (runs, total_count).
+    async fn list_protocol_runs(
+        &self,
+        protocol_id: Uuid,
+        status: Option<RunStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<ProtocolRun>, usize)>;
+
+    /// List protocol runs across ALL protocols (cross-cutting), newest first.
+    ///
+    /// `project_id` wins over `workspace_slug`; with neither, every project is
+    /// included. Returns (page, total).
+    async fn list_all_protocol_runs(
+        &self,
+        status: Option<RunStatus>,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<ProtocolRun>, usize)>;
+
+    /// List child runs for a given parent run.
+    async fn list_child_runs(&self, parent_run_id: Uuid) -> Result<Vec<ProtocolRun>>;
+
+    /// Count children for a given run.
+    async fn count_child_runs(&self, parent_run_id: Uuid) -> Result<usize>;
+
+    /// Get the full run tree rooted at a given run (recursive, depth limit 5).
+    /// Returns root + all descendants, ordered by depth then started_at.
+    async fn get_run_tree(&self, root_run_id: Uuid) -> Result<Vec<ProtocolRun>>;
+
+    /// Delete a protocol run.
+    /// Returns true if the run existed and was deleted.
+    async fn delete_protocol_run(&self, run_id: Uuid) -> Result<bool>;
+
+    /// Create a PRODUCED_DURING relation between a Note/Decision and a ProtocolRun.
+    /// entity_type must be "Note" or "Decision".
+    async fn create_produced_during(
+        &self,
+        entity_type: &str,
+        entity_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<bool>;
+
+    /// Get all notes and decisions produced during a protocol run.
+    async fn get_run_outcomes(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::protocol::ProducedArtefact>>;
+
+    /// Find the most recently started active (running) protocol run for a project.
+    async fn find_active_run_for_project(&self, project_id: Uuid) -> Result<Option<Uuid>>;
+
+    /// Persist a ReasoningTree to Neo4j as a PersistedReasoningTree node.
+    /// Optionally links it to an entity via REASONING_FOR relation.
+    async fn persist_reasoning_tree(
+        &self,
+        tree: &crate::reasoning::ReasoningTree,
+        linked_entity_type: Option<&str>,
+        linked_entity_id: Option<Uuid>,
+    ) -> Result<Uuid>;
+
+    /// Get the ID of a persisted reasoning tree linked to a protocol run.
+    async fn get_run_reasoning_tree_id(&self, run_id: Uuid) -> Result<Option<Uuid>>;
+
+    /// List completed protocol runs for a project (most recent first).
+    async fn list_completed_runs_for_project(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<crate::protocol::models::ProtocolRun>>;
+
+    // ========================================================================
+    // RuntimeState operations (Generator-produced dynamic states)
+    // ========================================================================
+
+    /// Create a new RuntimeState node with HAS_RUNTIME_STATE and GENERATED_BY relationships.
+    async fn create_runtime_state(&self, state: &RuntimeState) -> Result<()>;
+
+    /// Get all RuntimeStates for a protocol run, ordered by index.
+    async fn get_runtime_states(&self, run_id: Uuid) -> Result<Vec<RuntimeState>>;
+
+    /// Delete all RuntimeStates for a protocol run.
+    async fn delete_runtime_states(&self, run_id: Uuid) -> Result<()>;
+
+    // ========================================================================
+    // System Inference — Audit Gaps
+    // ========================================================================
+
+    /// Audit the knowledge graph for gaps: orphan notes, decisions without AFFECTS,
+    /// commits without TOUCHES, skills without members.
+    async fn audit_knowledge_gaps(&self, project_id: Uuid) -> Result<AuditGapsReport>;
+
+    // ========================================================================
+    // Skill Registry
+    // ========================================================================
+
+    // ========================================================================
+    // Graph visualization helpers (sub-file symbols, inheritance, constraints)
+    // ========================================================================
+
+    /// List all sub-file symbols (Function, Struct, Trait, Enum) for a project.
+    /// Returns tuples of (id, name, symbol_type, file_path, visibility, line_start).
+    async fn list_project_symbols(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String, String, Option<String>, Option<i64>)>>;
+
+    /// List EXTENDS and IMPLEMENTS edges between structs/traits in a project.
+    /// Returns (source_id, target_id, relation_type).
+    async fn get_project_inheritance_edges(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(String, String, String)>>;
+
+    /// Get all constraints for a project (via Project → Plan → Constraint).
+    /// Returns (constraint, plan_id) pairs for graph visualization.
+    async fn get_project_constraints(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(crate::neo4j::models::ConstraintNode, Uuid)>>;
+
+    // ========================================================================
+    // PlanRun operations (Runner execution state)
+    // ========================================================================
+
+    /// Create a new PlanRun node linked to a Plan via (:PlanRun)-[:RUNS]->(:Plan).
+    async fn create_plan_run(&self, state: &crate::runner::RunnerState) -> Result<()>;
+
+    /// Update an existing PlanRun with current execution state.
+    async fn update_plan_run(&self, state: &crate::runner::RunnerState) -> Result<()>;
+
+    /// Get a PlanRun by its run_id.
+    async fn get_plan_run(&self, run_id: Uuid) -> Result<Option<crate::runner::RunnerState>>;
+
+    /// List all PlanRuns with status=Running (for crash recovery at boot).
+    async fn list_active_plan_runs(&self) -> Result<Vec<crate::runner::RunnerState>>;
+
+    /// List all PlanRuns across all plans, ordered by started_at desc.
+    /// If `workspace_slug` is provided, only returns runs for plans belonging to
+    /// projects in that workspace.
+    async fn list_all_plan_runs(
+        &self,
+        limit: i64,
+        offset: i64,
+        status: Option<&str>,
+        workspace_slug: Option<&str>,
+    ) -> Result<Vec<crate::runner::RunnerState>>;
+
+    /// List all PlanRuns for a given plan, ordered by started_at desc.
+    async fn list_plan_runs(
+        &self,
+        plan_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<crate::runner::RunnerState>>;
+
+    // ── Triggers ──────────────────────────────────────────────────────────
+
+    /// Create a trigger node linked to a plan via (:Trigger)-[:TRIGGERS]->(:Plan).
+    async fn create_trigger(
+        &self,
+        trigger: &crate::runner::Trigger,
+    ) -> Result<crate::runner::Trigger>;
+
+    /// Get a trigger by its UUID.
+    async fn get_trigger(&self, trigger_id: Uuid) -> Result<Option<crate::runner::Trigger>>;
+
+    /// List all triggers for a given plan.
+    async fn list_triggers(&self, plan_id: Uuid) -> Result<Vec<crate::runner::Trigger>>;
+
+    /// Disable a trigger, with the reason when the system does it (`None`:
+    /// someone disabled it). The only way back is [`Self::enable_trigger_as`],
+    /// which records who enables it: there is no enable without an author.
+    async fn disable_trigger(
+        &self,
+        trigger_id: Uuid,
+        reason: Option<&str>,
+    ) -> Result<Option<crate::runner::Trigger>>;
+
+    /// Record that a third-party session wrote `content` (the plan itself, or
+    /// one of its tasks, steps, constraints or decisions): the plan it belongs
+    /// to gets `third_party_written_at = now`. Returns that plan, `None` when
+    /// the content belongs to no plan (or does not exist).
+    async fn mark_third_party_write(
+        &self,
+        content: crate::runner::PlanContent,
+    ) -> Result<Option<Uuid>>;
+
+    /// When a third-party session last wrote the plan or its content (see
+    /// [`Self::mark_third_party_write`]); `None` if never.
+    async fn plan_third_party_written_at(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>>;
+
+    /// Delete a trigger by its UUID.
+    async fn delete_trigger(&self, trigger_id: Uuid) -> Result<()>;
+
+    /// Record a trigger firing event (`fire_count` + 1). `last_fired` is left
+    /// to [`Self::reserve_trigger_signal`]: a firing refused before the
+    /// reservation consumes no cooldown.
+    async fn record_trigger_firing(&self, firing: &crate::runner::TriggerFiring) -> Result<()>;
+
+    /// Enable a trigger and record `author` as the identity its runs start as,
+    /// in one write. `None` when there is no such trigger.
+    async fn enable_trigger_as(
+        &self,
+        trigger_id: Uuid,
+        author: &crate::runner::TriggerAuthor,
+    ) -> Result<Option<crate::runner::Trigger>>;
+
+    /// Reserve the signal `key` of trigger `trigger_id`, atomically, across
+    /// instances: `Reserved` for the one caller that sees `key` for the first
+    /// time (one `TriggerSignal` per key, kept 24 h) AND finds the trigger out
+    /// of its `cooldown_secs` — `last_fired` then moves to now in the same
+    /// write; `Duplicate` when `key` was already reserved (or no such trigger);
+    /// `Cooldown` when the trigger fired less than `cooldown_secs` ago.
+    async fn reserve_trigger_signal(
+        &self,
+        trigger_id: Uuid,
+        key: &str,
+        cooldown_secs: u64,
+    ) -> Result<crate::runner::SignalReservation>;
+
+    /// List all triggers across all plans, optionally filtered by type.
+    async fn list_all_triggers(
+        &self,
+        trigger_type: Option<&str>,
+    ) -> Result<Vec<crate::runner::Trigger>>;
+
+    /// List trigger firings for a given trigger, ordered by fired_at desc.
+    async fn list_trigger_firings(
+        &self,
+        trigger_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<crate::runner::TriggerFiring>>;
+
+    /// Journalise une livraison reçue (accepted ou rejected), sans son corps.
+    async fn record_external_event(&self, event: &crate::ingress::ExternalEvent) -> Result<()>;
+
+    /// Derniers événements externes journalisés pour un déclencheur, le plus récent d'abord.
+    async fn list_external_events(
+        &self,
+        trigger_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<crate::ingress::ExternalEvent>>;
+
+    /// Réserve la livraison `delivery_key` pour `trigger_id`: `true` au premier appel, `false` au rejeu.
+    async fn claim_external_delivery(&self, trigger_id: Uuid, delivery_key: &str) -> Result<bool>;
+
+    /// Libère une réservation de livraison (la livraison n'a pas pu être journalisée) :
+    /// une relivraison sera de nouveau acceptée. `true` si une réservation existait.
+    async fn release_external_delivery(&self, trigger_id: Uuid, delivery_key: &str)
+        -> Result<bool>;
+
+    /// Purge les événements externes reçus avant `before` (rétention). Rend le nombre
+    /// d'événements supprimés. Les réservations de livraison sont conservées (sans
+    /// elles, un corps signé capturé redeviendrait rejouable).
+    async fn purge_external_events_before(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64>;
+
+    // ── AgentExecution ──────────────────────────────────────────────────────
+
+    /// Create an AgentExecution node linked to a PlanRun and Task.
+    async fn create_agent_execution(
+        &self,
+        ae: &crate::neo4j::agent_execution::AgentExecutionNode,
+    ) -> Result<()>;
+
+    /// Update an existing AgentExecution with final results.
+    async fn update_agent_execution(
+        &self,
+        ae: &crate::neo4j::agent_execution::AgentExecutionNode,
+    ) -> Result<()>;
+
+    /// Get all AgentExecution nodes for a given PlanRun.
+    async fn get_agent_executions_for_run(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>>;
+
+    /// Record the per-check verification result on one execution.
+    ///
+    /// A narrow write on purpose: verification runs after the attempt is
+    /// closed, so rewriting the whole node from a stale copy would race with
+    /// the close and could put `status` back to `running`.
+    async fn record_agent_execution_verification(
+        &self,
+        agent_execution_id: Uuid,
+        verification_json: &str,
+    ) -> Result<()>;
+
+    /// Every AgentExecution still `running`, across all runs (oldest first).
+    ///
+    /// Used by the reconciliation sweep to close the ones whose process is gone.
+    async fn list_running_agent_executions(
+        &self,
+    ) -> Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>>;
+
+    /// Cost, tokens, first-attempt verification and median duration of the
+    /// executions started in `[from, to)`, one row per `group_by` key (B35).
+    /// Marginal and notional amounts are summed apart and an unknown cost is
+    /// counted, never summed (A21). Sorted by key.
+    async fn agent_execution_cost_breakdown(
+        &self,
+        group_by: crate::neo4j::agent_execution::CostGroupBy,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<crate::neo4j::agent_execution::CostBreakdownRow>>;
+
+    // ========================================================================
+    // rs-stats data providers — bulk metric retrieval for statistical analysis
+    // ========================================================================
+
+    /// Fetch all PageRank values for a project as a flat vector.
+    async fn get_all_pagerank_values(&self, project_id: Uuid) -> Result<Vec<f64>>;
+
+    /// Fetch risk scores grouped by community (for ANOVA analysis).
+    async fn get_community_risk_vectors(&self, project_id: Uuid) -> Result<Vec<Vec<f64>>>;
+
+    /// Fetch all risk scores for a project as a flat vector.
+    async fn get_all_risk_score_values(&self, project_id: Uuid) -> Result<Vec<f64>>;
+
+    // ========================================================================
+    // Sharing & Privacy operations (RFC Privacy MVP)
+    // ========================================================================
+
+    /// Get the sharing policy for a project. Returns None if no policy is set.
+    async fn get_sharing_policy(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Option<crate::episodes::distill_models::SharingPolicy>>;
+
+    /// Update the sharing policy for a project.
+    async fn update_sharing_policy(
+        &self,
+        project_id: Uuid,
+        policy: &crate::episodes::distill_models::SharingPolicy,
+    ) -> Result<()>;
+
+    /// Get the sharing consent for a note.
+    async fn get_sharing_consent(
+        &self,
+        note_id: Uuid,
+    ) -> Result<crate::episodes::distill_models::SharingConsent>;
+
+    /// Update the sharing consent for a note.
+    async fn update_sharing_consent(
+        &self,
+        note_id: Uuid,
+        consent: &crate::episodes::distill_models::SharingConsent,
+    ) -> Result<()>;
+
+    /// Set the sharing consent of a decision (`NotSet` for every pre-existing one).
+    async fn update_decision_sharing_consent(
+        &self,
+        decision_id: Uuid,
+        consent: &crate::episodes::distill_models::SharingConsent,
+    ) -> Result<()>;
+
+    /// Count notes per consent value, optionally for one project. Measures the
+    /// real `NotSet` population (read-only; no data is changed).
+    async fn count_notes_by_consent(
+        &self,
+        project_id: Option<Uuid>,
+    ) -> Result<crate::episodes::distill_models::ConsentCounts>;
+
+    /// Create a sharing event (audit trail).
+    async fn create_sharing_event(
+        &self,
+        event: &crate::episodes::distill_models::SharingEvent,
+    ) -> Result<()>;
+
+    /// List sharing events for a project (newest first).
+    async fn list_sharing_events(
+        &self,
+        project_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<crate::episodes::distill_models::SharingEvent>>;
+
+    /// Persist a signed tombstone to the graph.
+    async fn persist_tombstone(
+        &self,
+        tombstone: &crate::reception::anchor::SignedTombstone,
+    ) -> Result<()>;
+
+    /// List all persisted tombstones.
+    async fn list_tombstones(&self) -> Result<Vec<crate::reception::anchor::SignedTombstone>>;
+
+    /// Check if a content hash has been tombstoned.
+    async fn is_tombstoned(&self, content_hash: &str) -> Result<bool>;
+
+    // ========================================================================
+    // UserProfile operations (adaptive behavioral profiles)
+    // ========================================================================
+
+    /// Create or get an existing user profile by user_id.
+    /// Uses MERGE semantics — idempotent for the same user_id.
+    async fn create_or_get_user_profile(
+        &self,
+        user_id: &str,
+    ) -> Result<crate::profile::UserProfile>;
+
+    /// Update a user profile with new dimension values.
+    async fn update_user_profile(&self, profile: &crate::profile::UserProfile) -> Result<()>;
+
+    /// Get a user profile by user_id.
+    async fn get_user_profile(&self, user_id: &str) -> Result<Option<crate::profile::UserProfile>>;
+
+    /// Upsert a WORKS_ON relationship between a user and a project.
+    /// Increments frequency and updates last_active.
+    async fn upsert_works_on(&self, user_id: &str, project_id: Uuid) -> Result<()>;
+
+    /// Get all WORKS_ON relationships for a user.
+    async fn get_works_on(&self, user_id: &str) -> Result<Vec<crate::profile::WorksOnRelation>>;
+
+    // ========================================================================
+    // Alert operations (Heartbeat Engine)
+    // ========================================================================
+
+    /// Create a new alert node.
+    async fn create_alert(&self, alert: &AlertNode) -> Result<()>;
+
+    /// List pending (unacknowledged) alerts, optionally filtered by project.
+    /// Returns alerts ordered by created_at DESC.
+    async fn list_pending_alerts(
+        &self,
+        project_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<AlertNode>>;
+
+    /// Acknowledge an alert by ID. Sets acknowledged=true and records who/when.
+    async fn acknowledge_alert(&self, alert_id: Uuid, acknowledged_by: &str) -> Result<()>;
+
+    /// Get a single alert by ID.
+    async fn get_alert(&self, alert_id: Uuid) -> Result<Option<AlertNode>>;
+
+    /// List all alerts (including acknowledged), optionally filtered by project.
+    async fn list_alerts(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<AlertNode>, usize)>;
+
+    // ========================================================================
+    // EventTrigger operations
+    // ========================================================================
+
+    /// List EventTriggers, optionally filtered by project scope and/or enabled status.
+    async fn list_event_triggers(
+        &self,
+        project_scope: Option<Uuid>,
+        enabled_only: bool,
+    ) -> Result<Vec<EventTrigger>>;
+
+    /// Create an EventTrigger node. Returns the generated UUID.
+    async fn create_event_trigger(&self, trigger: &EventTrigger) -> Result<Uuid>;
+
+    /// Get an EventTrigger by its UUID.
+    async fn get_event_trigger(&self, id: Uuid) -> Result<Option<EventTrigger>>;
+
+    /// Update an EventTrigger's fields. Only provided fields are updated.
+    /// Returns `true` if the trigger was found and updated, `false` if not found.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_event_trigger(
+        &self,
+        id: Uuid,
+        enabled: Option<bool>,
+        name: Option<String>,
+        entity_type_pattern: Option<Option<String>>,
+        action_pattern: Option<Option<String>>,
+        payload_conditions: Option<Option<serde_json::Value>>,
+        cooldown_secs: Option<u32>,
+        project_scope: Option<Option<Uuid>>,
+    ) -> Result<bool>;
+
+    /// Delete an EventTrigger by its UUID.
+    /// Returns `true` if a node was deleted, `false` if not found.
+    async fn delete_event_trigger(&self, id: Uuid) -> Result<bool>;
+
+    // ========================================================================
+    // LifecycleHook operations
+    // ========================================================================
+
+    /// Create a lifecycle hook
+    async fn create_lifecycle_hook(&self, hook: &LifecycleHook) -> Result<()>;
+
+    /// Get a lifecycle hook by ID
+    async fn get_lifecycle_hook(&self, id: Uuid) -> Result<Option<LifecycleHook>>;
+
+    /// List lifecycle hooks, optionally filtered by project_id
+    async fn list_lifecycle_hooks(&self, project_id: Option<Uuid>) -> Result<Vec<LifecycleHook>>;
+
+    /// Update a lifecycle hook
+    async fn update_lifecycle_hook(
+        &self,
+        id: Uuid,
+        updates: &UpdateLifecycleHookRequest,
+    ) -> Result<()>;
+
+    /// Delete a lifecycle hook (builtin hooks cannot be deleted)
+    async fn delete_lifecycle_hook(&self, id: Uuid) -> Result<()>;
+
+    /// List hooks matching scope and on_status, including global hooks
+    async fn list_hooks_for_scope(
+        &self,
+        scope: &LifecycleScope,
+        on_status: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<LifecycleHook>>;
+
+    // ========================================================================
+    // MCP Federation operations
+    // ========================================================================
+
+    /// Create an MCP server node
+    async fn create_mcp_server(&self, server: &McpServerNode) -> Result<()>;
+
+    /// Get an MCP server by UUID
+    async fn get_mcp_server(&self, id: Uuid) -> Result<Option<McpServerNode>>;
+
+    /// List MCP servers for a project
+    async fn list_mcp_servers(&self, project_id: Uuid) -> Result<Vec<McpServerNode>>;
+
+    /// List ALL MCP servers across all projects (used for startup bootstrap)
+    async fn list_all_mcp_servers(&self) -> Result<Vec<McpServerNode>>;
+
+    /// Delete an MCP server and its tools
+    async fn delete_mcp_server(&self, id: Uuid) -> Result<()>;
+
+    /// Delete an MCP server by its string server_id (e.g. "discord")
+    async fn delete_mcp_server_by_server_id(&self, server_id: &str) -> Result<()>;
+
+    /// Update MCP server connection status
+    async fn update_mcp_server_status(&self, id: Uuid, status: &str) -> Result<()>;
+
+    /// Create an MCP tool node
+    async fn create_mcp_tool(&self, tool: &McpToolNode) -> Result<()>;
+
+    /// List tools for an MCP server
+    async fn list_mcp_tools_for_server(&self, server_id: &str) -> Result<Vec<McpToolNode>>;
+
+    /// Delete all tools for an MCP server
+    async fn delete_mcp_tools_for_server(&self, server_id: &str) -> Result<()>;
+
+    /// Create SIMILAR_TO relation between two MCP tools
+    async fn create_mcp_similar_to(
+        &self,
+        tool_fqn: &str,
+        similar_to_fqn: &str,
+        score: f64,
+    ) -> Result<()>;
+
+    /// Create CO_ACTIVATED_WITH relation (tools used in the same session)
+    async fn create_mcp_co_activated(
+        &self,
+        tool_fqn_a: &str,
+        tool_fqn_b: &str,
+        count: i64,
+    ) -> Result<()>;
+
+    /// Create OFTEN_FOLLOWS relation (tool B called after tool A)
+    async fn create_mcp_often_follows(
+        &self,
+        tool_fqn_a: &str,
+        tool_fqn_b: &str,
+        count: i64,
+        avg_delta_ms: f64,
+    ) -> Result<()>;
+
+    /// Backfill CO_ACTIVATED_WITH relations from chat event history
+    async fn backfill_co_activated_with(&self) -> Result<usize>;
+
+    /// Backfill OFTEN_FOLLOWS relations from consecutive tool use events
+    async fn backfill_often_follows(&self) -> Result<usize>;
+
+    // ========================================================================
+    // Entity neighbourhood (ego-graph)
+    // ========================================================================
+
+    /// Bounded candidate neighbourhood around an entity, walked hop by hop
+    /// over the relationship types of `params.layers` (see
+    /// `crate::graph::neighborhood`). `Ok(None)` when the centre is unknown.
+    async fn get_entity_neighborhood(
+        &self,
+        center_type: &str,
+        center_id: &str,
+        params: &crate::graph::neighborhood::NeighborhoodParams,
+    ) -> Result<Option<crate::graph::neighborhood::RawNeighborhood>>;
+
+    /// [`get_entity_neighborhood`](Self::get_entity_neighborhood) with the PROJECT
+    /// filter applied inside each hop, before the fan-out limit (a neighbour of
+    /// another project cannot evict a local one). The centre is always returned
+    /// with its owner; neighbours carry theirs and their own consent, for the
+    /// `may_read` post-filter. Used by the anchor resolver.
+    async fn get_scoped_entity_neighborhood(
+        &self,
+        center_type: &str,
+        center_id: &str,
+        params: &crate::graph::neighborhood::NeighborhoodParams,
+        filter: &crate::graph::neighborhood::ProjectFilter,
+    ) -> Result<Option<crate::graph::neighborhood::ScopedNeighborhood>>;
+
+    /// Makes the agent `agent_id` a node of the graph, idempotently: a `(:Agent {kind:'model'})`
+    /// under its id, attached by `FACET_OF` to the durable `(:Agent {kind:'self'})` whose id is
+    /// [`crate::neo4j::ChatStore::agent_identity_namespace`] (generated once, persisted, never derived from a model).
+    /// `model`, when known, is recorded as a dated fact (`last_seen`), not as the identity.
+    /// Returns `true` when the node did not exist and was created by this call.
+    async fn ensure_agent(&self, agent_id: Uuid, model: Option<&str>) -> Result<bool>;
+
+    /// Rebuilds the agent nodes of what is already written: the distinct `agent:<id>` of the
+    /// `created_by` of notes and the agent of each session episode. Idempotent (a second run
+    /// creates nothing) and it reports what it found, before and after.
+    async fn backfill_agents(&self) -> Result<crate::neo4j::models::AgentBackfill>;
+
+    /// Draws `(:Agent)-[:AUTHORED]->(:Note)`: the note was written under that agent's
+    /// name (`created_by = "agent:<id>"`). The writer is the *facet* node; `FACET_OF`
+    /// carries the attribution up to the durable self. Returns `true` only when the edge
+    /// was created by this call.
+    async fn link_agent_authored(&self, agent_id: Uuid, note_id: Uuid) -> Result<bool>;
+
+    /// Draws `(:Agent)-[:LIVED]->(:SessionEpisode)`: the session that produced this
+    /// episode ran as that agent. Returns `true` only when the edge was created.
+    async fn link_agent_lived(&self, agent_id: Uuid, episode_id: Uuid) -> Result<bool>;
+
+    /// Draws `(:Agent)-[:KNOWS {rule, measure, at}]->(:Note)` — what a subject durably
+    /// knows, as opposed to `(Persona)-[:KNOWS]->(File)`, which says what a persona
+    /// covers. The provenance is written **on the edge**: an edge whose rule and measure
+    /// cannot be read is indistinguishable from an accident.
+    ///
+    /// A missing target draws nothing (`Ok(false)`), never a dangling edge: a pin naming
+    /// a deleted note is a skip, not a failure.
+    async fn link_agent_knows(
+        &self,
+        agent_id: Uuid,
+        note_id: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> Result<bool>;
+
+    /// Draws `(:Agent)-[:USES {rule, measure, at}]->(:Persona|:Skill|:Protocol)` — what
+    /// the subject actually applied to itself. The source is the activation registry: the
+    /// stages record what they injected into a session, and this makes that a durable edge
+    /// instead of a memory that dies with the process.
+    ///
+    /// `label` is one of [`crate::graph::rules::USABLE_LABELS`]; anything else is refused
+    /// before a query is built. A target that does not exist draws nothing (`Ok(false)`).
+    async fn link_agent_uses(
+        &self,
+        agent_id: Uuid,
+        label: &str,
+        target_id: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> Result<bool>;
+
+    /// Reinforces the `SYNAPSE` pairs among `notes` (all pairs, both directions), scoped to
+    /// `project`, and records on each edge WHICH rule and WHICH measure produced the
+    /// reinforcement — plus the session that did it. `last_session` is the last activator,
+    /// never a claim about who created the edge.
+    ///
+    /// Returns the number of edges touched (created or reinforced).
+    async fn coactivate_session(
+        &self,
+        project: Uuid,
+        notes: &[Uuid],
+        session: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> Result<usize>;
+
+    /// What that agent knows, bounded by `limit`, plus how many exist — « la part lue est
+    /// dite ». Only `(:Agent)-[:KNOWS]->(:Note)` is read: a `KNOWS` reaching a `File` (the
+    /// persona meaning) never leaks into this answer.
+    async fn agent_knows(
+        &self,
+        agent_id: Uuid,
+        limit: usize,
+    ) -> Result<crate::graph::rules::AgentKnowledge>;
+
+    /// The graph described as a catalog: its labels, and for each relationship type the
+    /// label pairs it really connects, with measured counts. Measured, never declared.
+    async fn schema_catalog(&self) -> Result<crate::graph::schema::SchemaCatalog>;
+
+    /// Walks forward from one anchor along the causal family
+    /// ([`crate::graph::schema::CAUSAL_TYPES`]), up to `max_depth` hops. `label` must be
+    /// one of [`crate::graph::schema::CAUSAL_ANCHORS`]; anything else is an error, never a
+    /// query built from caller input. An anchor that does not exist yields an empty walk
+    /// (the chain does not exist), never an error.
+    async fn causal_walk(
+        &self,
+        label: &str,
+        id: &str,
+        max_depth: u32,
+    ) -> Result<crate::graph::schema::CausalWalk>;
+}
+
+// ============================================================================
+// Chat domain
+// ============================================================================
+
+/// The chat domain: sessions, their anchors, the event log replayed over the
+/// websocket, the entities a conversation discussed, and what it is linked to.
+#[async_trait]
+pub trait ChatStore: Send + Sync {
+    // ========================================================================
     // Chat session operations
     // ========================================================================
 
@@ -2780,30 +4224,61 @@ pub trait AnalyticsStore: Send + Sync {
 
     /// Get the plan_id for a task (via HAS_TASK relation).
     async fn get_task_plan_id(&self, task_id: Uuid) -> Result<Option<Uuid>>;
-
     // ========================================================================
-    // Graph visualization queries (PM + Chat layers)
+    // Session episodes (the episode a chat session leaves at its close)
     // ========================================================================
 
-    /// Get all PM entities (plans, tasks, steps, milestones, releases) and their
-    /// inter-entity edges for the graph visualization layer.
-    /// Returns (nodes, edges) where nodes are tuples of (id, type, label, attributes_json)
-    /// and edges are tuples of (source_id, target_id, rel_type, attributes_json).
-    async fn get_pm_graph_data(
+    /// Store the episode of a chat session, `episode.session` naming it. One per
+    /// session: a later close of the same session (after a resume) replaces it.
+    /// Written only while the session exists, in one statement, so a session deleted
+    /// meanwhile never gets an orphan episode. `Ok(false)`: the session is gone, or
+    /// the episode names no session.
+    async fn save_session_episode(
+        &self,
+        episode: &crate::episodes::models::Episode,
+    ) -> Result<bool>;
+
+    /// The session episodes of a project, most recent close first.
+    async fn list_session_episodes(
         &self,
         project_id: Uuid,
         limit: usize,
-    ) -> Result<(Vec<PmGraphNode>, Vec<PmGraphEdge>)>;
+    ) -> Result<Vec<crate::episodes::models::Episode>>;
 
-    /// Get chat sessions that have DISCUSSED relations, along with those edges.
-    /// Only returns sessions with at least 1 DISCUSSED relation.
-    /// Returns (sessions, discussed_edges).
-    async fn get_chat_graph_data(
+    /// The root the agent ids are derived from (`crate::notes::provenance`): created on the
+    /// first call, atomically, and the same on every call after — two first calls at
+    /// once still agree on one root.
+    async fn agent_identity_namespace(&self) -> Result<Uuid>;
+
+    // ========================================================================
+    // Episode embedding search (ReflexEngine)
+    // ========================================================================
+
+    /// Search episodes by embedding similarity (cosine).
+    ///
+    /// Returns up to `limit` episodes with their cosine similarity score (0.0-1.0).
+    /// Used by the ReflexEngine for episode recall suggestions.
+    ///
+    /// Default implementation returns an empty vec (graceful fallback for
+    /// implementations that don't support embedding search yet).
+    async fn search_episodes_by_embedding(
         &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> Result<(Vec<ChatGraphSession>, Vec<ChatGraphDiscussed>)>;
+        _project_id: Uuid,
+        _embedding: &[f32],
+        _limit: usize,
+    ) -> Result<Vec<(crate::episodes::models::Episode, f64)>> {
+        Ok(Vec::new())
+    }
+}
 
+// ============================================================================
+// Auth domain
+// ============================================================================
+
+/// The auth domain: users and works-on relations, refresh tokens, and the
+/// long-lived scoped tokens used by the remote MCP transport.
+#[async_trait]
+pub trait AuthStore: Send + Sync {
     // ========================================================================
     // User / Auth operations
     // ========================================================================
@@ -2870,6 +4345,10 @@ pub trait AnalyticsStore: Send + Sync {
     /// Revoke all refresh tokens for a given user (e.g. on password change).
     async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64>;
 
+    // ========================================================================
+    // Episode embedding search (ReflexEngine)
+    // ========================================================================
+
     // ================================================================
     // MCP Tokens (long-lived, revocable, scoped — remote MCP transport)
     // ================================================================
@@ -2900,283 +4379,186 @@ pub trait AnalyticsStore: Send + Sync {
     /// Permanently remove a user's dead MCP token records (revoked or
     /// expired). Never removes an active token. Returns the count removed.
     async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64>;
+}
 
-    // ================================================================
-    // Feature Graphs
-    // ================================================================
+// ============================================================================
+// Persona domain
+// ============================================================================
 
-    /// Create a feature graph
-    async fn create_feature_graph(&self, graph: &FeatureGraphNode) -> Result<()>;
-
-    /// Get a feature graph by ID (without entities)
-    async fn get_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphNode>>;
-
-    /// Get a feature graph with all its included entities
-    async fn get_feature_graph_detail(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>>;
-
-    /// List feature graphs, optionally filtered by project
-    async fn list_feature_graphs(&self, project_id: Option<Uuid>) -> Result<Vec<FeatureGraphNode>>;
-
-    /// Delete a feature graph and all its INCLUDES_ENTITY relationships
-    async fn delete_feature_graph(&self, id: Uuid) -> Result<bool>;
-
-    /// Add an entity (file, function, struct, trait) to a feature graph.
-    /// When `project_id` is provided, MATCH queries for Function/Struct/Trait/Enum
-    /// are scoped to that project to avoid cross-project contamination.
-    async fn add_entity_to_feature_graph(
-        &self,
-        feature_graph_id: Uuid,
-        entity_type: &str,
-        entity_id: &str,
-        role: Option<&str>,
-        project_id: Option<Uuid>,
-    ) -> Result<()>;
-
-    /// Remove an entity from a feature graph
-    async fn remove_entity_from_feature_graph(
-        &self,
-        feature_graph_id: Uuid,
-        entity_type: &str,
-        entity_id: &str,
-    ) -> Result<bool>;
-
-    /// Automatically build a feature graph from a function entry point.
-    /// Uses the call graph (callers + callees) to discover related functions and files,
-    /// creates a FeatureGraph, and populates it with the discovered entities.
-    #[allow(clippy::too_many_arguments)]
-    async fn auto_build_feature_graph(
-        &self,
-        name: &str,
-        description: Option<&str>,
-        project_id: Uuid,
-        entry_function: &str,
-        depth: u32,
-        include_relations: Option<&[String]>,
-        filter_community: Option<bool>,
-    ) -> Result<FeatureGraphDetail>;
-
-    /// Refresh an auto-built feature graph by re-running the BFS with the
-    /// same parameters (entry_function, depth, include_relations).
-    /// Returns None if the graph was manually created (no entry_function).
-    /// Returns Err if the graph doesn't exist.
-    async fn refresh_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>>;
-
-    /// Get the top N most connected functions for a project, ranked by
-    /// (callers + callees). Used for auto-generating feature graphs after sync.
-    async fn get_top_entry_functions(&self, project_id: Uuid, limit: usize) -> Result<Vec<String>>;
-
-    /// Compute statistics for a feature graph: coupling, cohesion, complexity metrics.
-    async fn get_feature_graph_statistics(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<FeatureGraphStatistics>>;
-
-    /// Compare two feature graphs: shared entities, unique entities, similarity score.
-    async fn compare_feature_graphs(
-        &self,
-        id_a: Uuid,
-        id_b: Uuid,
-    ) -> Result<Option<FeatureGraphComparison>>;
-
-    /// Find feature graphs that overlap with a reference graph (same project).
-    async fn find_overlapping_feature_graphs(
-        &self,
-        id: Uuid,
-        min_overlap: f64,
-    ) -> Result<Vec<FeatureGraphOverlap>>;
-
-    // ========================================================================
-    // Bulk graph extraction (for graph analytics)
-    // ========================================================================
-
-    /// Get all IMPORTS edges between files in a project as (source_path, target_path) pairs.
-    /// Single bulk query — used by the graph analytics engine for extraction.
-    async fn get_project_import_edges(&self, project_id: Uuid) -> Result<Vec<(String, String)>>;
-
-    /// Get all CALLS edges between functions in a project as (caller_id, callee_id) pairs.
-    /// Scoped to the same project (no cross-project calls).
-    /// Single bulk query — used by the graph analytics engine for extraction.
-    async fn get_project_call_edges(&self, project_id: Uuid) -> Result<Vec<(String, String)>>;
-
-    /// Get all EXTENDS edges between structs/classes in a project as (child_file, parent_file) pairs.
-    /// Returns file-level edges for the graph analytics engine.
-    async fn get_project_extends_edges(&self, project_id: Uuid) -> Result<Vec<(String, String)>>;
-
-    /// Get all IMPLEMENTS edges between structs and traits in a project as (struct_file, trait_file) pairs.
-    /// Returns file-level edges for the graph analytics engine.
-    async fn get_project_implements_edges(&self, project_id: Uuid)
-        -> Result<Vec<(String, String)>>;
-
-    /// Batch-update analytics scores on File nodes.
-    /// Uses UNWIND for single-query efficiency.
-    async fn batch_update_file_analytics(&self, updates: &[FileAnalyticsUpdate]) -> Result<()>;
-
-    /// Batch-update analytics scores on Function nodes.
-    /// Uses UNWIND for single-query efficiency.
-    async fn batch_update_function_analytics(
-        &self,
-        updates: &[FunctionAnalyticsUpdate],
-    ) -> Result<()>;
-
-    /// Batch-update **fabric** analytics scores on File nodes.
-    /// Writes to `fabric_pagerank`, `fabric_betweenness`, `fabric_community_id`, etc.
-    /// These are separate from the code-only scores written by `batch_update_file_analytics`.
-    async fn batch_update_fabric_file_analytics(
-        &self,
-        updates: &[FabricFileAnalyticsUpdate],
-    ) -> Result<()>;
-
-    /// Batch-update structural DNA vectors on File nodes.
-    /// Writes the `structural_dna` property (Vec<f64>) via UNWIND in chunks of 1000.
-    /// DNA = K-dimensional distance vector to anchor nodes, normalized [0,1].
-    async fn batch_update_structural_dna(
-        &self,
-        updates: &[crate::graph::models::StructuralDnaUpdate],
-    ) -> Result<()>;
-
-    /// Write predicted missing links for a project.
-    /// Persists top-N link predictions as PREDICTED_LINK relationships in Neo4j.
-    async fn write_predicted_links(
-        &self,
-        project_id: &str,
-        links: &[crate::graph::models::LinkPrediction],
-    ) -> Result<()>;
-
-    /// Read structural DNA vectors for all File nodes in a project.
-    /// Returns (file_path, dna_vector) pairs.
-    async fn get_project_structural_dna(&self, project_id: &str)
-        -> Result<Vec<(String, Vec<f64>)>>;
-
-    /// Batch-update structural fingerprint vectors on File nodes.
-    /// Writes the `structural_fingerprint` property (Vec<f64>, 17 dims) via UNWIND in chunks of 1000.
-    /// Fingerprint = universal feature vector with fixed semantics, project-independent.
-    async fn batch_update_structural_fingerprints(
-        &self,
-        updates: &[crate::graph::models::StructuralFingerprintUpdate],
-    ) -> Result<()>;
-
-    /// Read structural fingerprint vectors for all File nodes in a project.
-    /// Returns (file_path, fingerprint_vector) pairs.
-    async fn get_project_structural_fingerprints(
-        &self,
-        project_id: &str,
-    ) -> Result<Vec<(String, Vec<f64>)>>;
-
-    /// Read all file signals needed for multi-signal structural similarity.
-    ///
-    /// Returns fingerprint, WL hash, and function count for each file in one query.
-    /// Used by `find_cross_project_twins` and `find_structural_twins` handlers.
-    async fn get_project_file_signals(
-        &self,
-        project_id: &str,
-    ) -> Result<Vec<crate::graph::models::FileSignalRecord>>;
-
-    // ========================================================================
-    // SYNAPSE (neural connections bridged to file-level)
-    // ========================================================================
-
-    /// Get SYNAPSE edges bridged from Note-level to File-level.
-    /// Returns (source_file_path, target_file_path, avg_weight) tuples.
-    async fn get_project_synapse_edges(
+/// The persona domain: the living personas, what they know, the files and
+/// notes they are attached to, and the matching that links them to new work.
+#[async_trait]
+pub trait PersonaStore: Send + Sync {
+    /// Create a new persona node. If project_id is Some, links it via BELONGS_TO.
+    async fn create_persona(&self, persona: &PersonaNode) -> Result<()>;
+    /// Get a persona by ID.
+    async fn get_persona(&self, id: Uuid) -> Result<Option<PersonaNode>>;
+    /// Update a persona node (replaces all mutable fields).
+    async fn update_persona(&self, persona: &PersonaNode) -> Result<()>;
+    /// Delete a persona and all its relationships.
+    /// Returns true if the persona existed and was deleted.
+    async fn delete_persona(&self, id: Uuid) -> Result<bool>;
+    /// List personas for a project with optional status filter and pagination.
+    /// Returns (personas, total_count).
+    async fn list_personas(
         &self,
         project_id: Uuid,
-    ) -> Result<Vec<(String, String, f64)>>;
-
-    /// Get neural network metrics for a project's SYNAPSE layer.
-    async fn get_neural_metrics(
-        &self,
-        project_id: Uuid,
-    ) -> Result<crate::neo4j::models::NeuralMetrics>;
-
-    // ========================================================================
-    // T5.5 — Churn score (commit frequency per file)
-    // ========================================================================
-
-    /// Compute churn metrics per file via TOUCHES relations.
-    async fn compute_churn_scores(&self, project_id: Uuid) -> Result<Vec<FileChurnScore>>;
-
-    /// Batch-write churn scores to File nodes.
-    async fn batch_update_churn_scores(&self, updates: &[FileChurnScore]) -> Result<()>;
-
-    /// Get top N files by churn_score (pre-computed on File nodes).
-    async fn get_top_hotspots(&self, project_id: Uuid, limit: usize)
-        -> Result<Vec<FileChurnScore>>;
-
-    // ========================================================================
-    // T5.6 — Knowledge density score
-    // ========================================================================
-
-    /// Compute knowledge density per file based on linked notes and decisions.
-    async fn compute_knowledge_density(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<FileKnowledgeDensity>>;
-
-    /// Batch-write knowledge density scores to File nodes.
-    async fn batch_update_knowledge_density(&self, updates: &[FileKnowledgeDensity]) -> Result<()>;
-
-    /// Get top N files with lowest knowledge_density (knowledge gaps).
-    async fn get_top_knowledge_gaps(
-        &self,
-        project_id: Uuid,
+        status: Option<PersonaStatus>,
         limit: usize,
-    ) -> Result<Vec<FileKnowledgeDensity>>;
+        offset: usize,
+    ) -> Result<(Vec<PersonaNode>, usize)>;
+    /// List global personas (project_id IS NULL) — portable personas.
+    async fn list_global_personas(&self) -> Result<Vec<PersonaNode>>;
+    /// Add MASTERS relation: Persona -> Skill
+    async fn add_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()>;
+    /// Remove MASTERS relation: Persona -> Skill
+    async fn remove_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()>;
+    /// Add FOLLOWS relation: Persona -> Protocol
+    async fn add_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()>;
+    /// Remove FOLLOWS relation: Persona -> Protocol
+    async fn remove_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()>;
+    /// Increment activation_count and update last_activated for a Persona.
+    async fn increment_persona_activation(&self, persona_id: Uuid) -> Result<()>;
+    /// Add SCOPED_TO relation: Persona -> FeatureGraph
+    async fn set_persona_feature_graph(
+        &self,
+        persona_id: Uuid,
+        feature_graph_id: Uuid,
+    ) -> Result<()>;
+    /// Remove SCOPED_TO relation: Persona -> FeatureGraph
+    async fn remove_persona_feature_graph(&self, persona_id: Uuid) -> Result<()>;
+    /// Add KNOWS relation: Persona -> File (with weight)
+    async fn add_persona_file(&self, persona_id: Uuid, file_path: &str, weight: f64) -> Result<()>;
+    /// Remove KNOWS relation: Persona -> File
+    async fn remove_persona_file(&self, persona_id: Uuid, file_path: &str) -> Result<()>;
+    /// Add KNOWS relation: Persona -> Function (with weight)
+    async fn add_persona_function(
+        &self,
+        persona_id: Uuid,
+        function_id: &str,
+        weight: f64,
+    ) -> Result<()>;
+    /// Remove KNOWS relation: Persona -> Function
+    async fn remove_persona_function(&self, persona_id: Uuid, function_id: &str) -> Result<()>;
+    /// Add USES relation: Persona -> Note (with weight)
+    async fn add_persona_note(&self, persona_id: Uuid, note_id: Uuid, weight: f64) -> Result<()>;
+    /// Remove USES relation: Persona -> Note
+    async fn remove_persona_note(&self, persona_id: Uuid, note_id: Uuid) -> Result<()>;
+    /// Add USES relation: Persona -> Decision (with weight)
+    async fn add_persona_decision(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
+    ) -> Result<()>;
+    /// Remove USES relation: Persona -> Decision
+    async fn remove_persona_decision(&self, persona_id: Uuid, decision_id: Uuid) -> Result<()>;
+    /// Add EXTENDS relation: child Persona -> parent Persona
+    async fn add_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()>;
+    /// Remove EXTENDS relation: child Persona -> parent Persona
+    async fn remove_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()>;
+    /// Assemble the full knowledge subgraph for a persona.
+    /// Includes all KNOWS, USES, MASTERS, FOLLOWS, SCOPED_TO, EXTENDS entities.
+    async fn get_persona_subgraph(&self, persona_id: Uuid) -> Result<PersonaSubgraph>;
+    /// Find personas that KNOW a given file (for activation by file match).
+    /// Returns (persona, weight) sorted by weight descending.
+    async fn find_personas_for_file(
+        &self,
+        file_path: &str,
+        project_id: Uuid,
+    ) -> Result<Vec<(PersonaNode, f64)>>;
+    /// Load ALL persona KNOWS relations for a project in a single query.
+    /// Returns Vec<(PersonaNode, file_path, weight)> for building a complete
+    /// PersonaFileIndex without cold-start issues.
+    async fn get_all_persona_knows(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<(PersonaNode, String, f64)>>;
+    /// Maintain all personas for a project: decay weights, prune, recalculate cohesion.
+    /// Returns (decayed_count, pruned_count, personas_updated).
+    async fn maintain_personas(&self, project_id: Uuid) -> Result<(usize, usize, usize)>;
+    /// Detect potential personas from Louvain communities.
+    async fn detect_personas(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::persona::PersonaProposal>>;
+    /// Find personas adjacent to a file (same dir or 1-hop IMPORTS).
+    async fn find_adjacent_personas(
+        &self,
+        file_path: &str,
+        project_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>>;
+    /// Find personas relevant to a note based on KNOWS file overlap.
+    async fn find_relevant_personas_for_note(
+        &self,
+        file_paths: &[String],
+        project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>>;
+    /// Find personas relevant to a decision based on KNOWS overlap with AFFECTS entities.
+    async fn find_relevant_personas_for_decision(
+        &self,
+        decision_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<Vec<(Uuid, f64)>>;
+    /// Auto-link a note to an active persona (growth hook).
+    async fn auto_link_note_to_persona(
+        &self,
+        persona_id: Uuid,
+        note_id: Uuid,
+        weight: f64,
+    ) -> Result<()>;
+    /// Auto-link a decision to an active persona (growth hook).
+    async fn auto_link_decision_to_persona(
+        &self,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
+    ) -> Result<()>;
+    /// Auto-link a file to an active persona (growth hook).
+    async fn auto_link_file_to_persona(
+        &self,
+        persona_id: Uuid,
+        file_path: &str,
+        weight: f64,
+    ) -> Result<()>;
+    /// Compute affinity between two personas for merge detection.
+    async fn compute_persona_affinity(
+        &self,
+        persona_a: Uuid,
+        persona_b: Uuid,
+    ) -> Result<crate::neo4j::persona::PersonaAffinityScore>;
+    /// Merge persona B into persona A: transfer all KNOWS/USES, then delete B.
+    async fn merge_personas(&self, keep_id: Uuid, merge_id: Uuid) -> Result<()>;
+    /// Find personas linked via strong SYNAPSE connections between their USES notes.
+    async fn find_synapse_linked_personas(
+        &self,
+        persona_id: Uuid,
+    ) -> Result<Vec<(Uuid, String, f64)>>;
+}
 
-    // ========================================================================
-    // T5.7 — Risk score composite
-    // ========================================================================
+// ============================================================================
+// Skill domain
+// ============================================================================
 
-    /// Compute composite risk scores for all files in a project.
-    async fn compute_risk_scores(&self, project_id: Uuid) -> Result<Vec<FileRiskScore>>;
-
-    /// Batch-write composite risk scores to File nodes.
-    async fn batch_update_risk_scores(&self, updates: &[FileRiskScore]) -> Result<()>;
-
-    /// Get risk assessment summary stats for a project.
-    async fn get_risk_summary(&self, project_id: Uuid) -> Result<serde_json::Value>;
-
-    // ========================================================================
-    // Process detection
-    // ========================================================================
-
-    /// Batch upsert Process nodes using UNWIND.
-    async fn batch_upsert_processes(&self, processes: &[ProcessNode]) -> Result<()>;
-
-    /// Batch create STEP_IN_PROCESS relationships.
-    /// Takes (process_id, function_id, step_number) tuples.
-    async fn batch_create_step_relationships(&self, steps: &[(String, String, u32)]) -> Result<()>;
-
-    /// Delete all Process nodes and their STEP_IN_PROCESS relationships for a project.
-    /// Returns the number of deleted entities.
-    async fn delete_project_processes(&self, project_id: Uuid) -> Result<u64>;
-
-    // ========================================================================
-    // Skill operations (Neural Skills)
-    // ========================================================================
-
+/// The skill domain: skills, their members and activations, and the published
+/// skills other projects can import.
+#[async_trait]
+pub trait SkillStore: Send + Sync {
     /// Create a new skill node with its BELONGS_TO relationship to project.
     async fn create_skill(&self, skill: &SkillNode) -> Result<()>;
-
     /// Get a skill by ID.
     async fn get_skill(&self, id: Uuid) -> Result<Option<SkillNode>>;
-
     /// Update a skill node (replaces all mutable fields).
     async fn update_skill(&self, skill: &SkillNode) -> Result<()>;
-
     /// Re-scope a skill: `None` makes it transverse, `Some(pid)` attaches it.
     ///
     /// Moves the `BELONGS_TO` edge (never adds a second one) and writes
     /// `project_id` in the same transaction, so a node is never left claiming a
     /// project it is not attached to.
     async fn rescope_skill(&self, skill_id: Uuid, project_id: Option<Uuid>) -> Result<()>;
-
-    /// Re-scope a protocol: `None` makes it transverse, `Some(pid)` attaches it.
-    async fn rescope_protocol(&self, protocol_id: Uuid, project_id: Option<Uuid>) -> Result<()>;
-
     /// Delete a skill and all its relationships (CONTAINS, COVERS, BELONGS_TO).
     /// Returns true if the skill existed and was deleted.
     async fn delete_skill(&self, id: Uuid) -> Result<bool>;
-
     /// List skills for a project with optional status filter and pagination.
     /// Returns (skills, total_count).
     async fn list_skills(
@@ -3186,14 +4568,8 @@ pub trait AnalyticsStore: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<SkillNode>, usize)>;
-
-    // ========================================================================
-    // Skill membership operations
-    // ========================================================================
-
     /// Get all member notes and decisions for a skill.
     async fn get_skill_members(&self, skill_id: Uuid) -> Result<(Vec<Note>, Vec<DecisionNode>)>;
-
     /// Add a note or decision as a member of a skill.
     /// `entity_type` must be "note" or "decision".
     /// Uses MERGE for idempotence — calling twice is safe.
@@ -3203,7 +4579,6 @@ pub trait AnalyticsStore: Send + Sync {
         entity_type: &str,
         entity_id: Uuid,
     ) -> Result<()>;
-
     /// Remove a member (note or decision) from a skill.
     /// Returns true if the relationship existed and was removed.
     async fn remove_skill_member(
@@ -3212,22 +4587,14 @@ pub trait AnalyticsStore: Send + Sync {
         entity_type: &str,
         entity_id: Uuid,
     ) -> Result<bool>;
-
     /// Remove all members (notes and decisions) from a skill.
     /// Used during evolution to clean up relationships before archiving.
     /// Returns the number of relationships removed.
     async fn remove_all_skill_members(&self, skill_id: Uuid) -> Result<i64>;
-
-    // ========================================================================
-    // Skill query & activation operations
-    // ========================================================================
-
     /// Get all skills that contain a given note as member.
     async fn get_skills_for_note(&self, note_id: Uuid) -> Result<Vec<SkillNode>>;
-
     /// Get all skills belonging to a project (convenience for list without pagination).
     async fn get_skills_for_project(&self, project_id: Uuid) -> Result<Vec<SkillNode>>;
-
     /// Delete a project's archived skills that nothing references anymore
     /// (no member, persona, protocol, execution…) and that were archived
     /// before `archived_before`. Returns how many were deleted.
@@ -3238,50 +4605,6 @@ pub trait AnalyticsStore: Send + Sync {
     ) -> Result<i64> {
         Ok(0)
     }
-
-    /// Run the pending one-time data migrations (see
-    /// `neo4j::data_migrations`). Backends without migrations do nothing.
-    async fn run_data_migrations(&self) -> Vec<crate::neo4j::data_migrations::MigrationOutcome> {
-        Vec::new()
-    }
-
-    /// Decay and prune the synapses of one project's notes (see the Neo4j
-    /// implementation). Per-project maintenance MUST use this rather than the
-    /// global `decay_synapses`. Defaults to the global decay for stores
-    /// without a project-scoped variant (test mocks).
-    async fn decay_project_synapses(
-        &self,
-        _project_id: Uuid,
-        decay_amount: f64,
-        prune_threshold: f64,
-    ) -> Result<(usize, usize)> {
-        self.decay_synapses(decay_amount, prune_threshold).await
-    }
-
-    /// Weaken one node's synapses (see the Neo4j implementation). Defaults to
-    /// a no-op for stores without synapse storage.
-    async fn weaken_node_synapses(
-        &self,
-        _node_id: Uuid,
-        _amount: f64,
-        _prune_threshold: f64,
-    ) -> Result<usize> {
-        Ok(0)
-    }
-
-    /// When each project last got a deep maintenance pass (persisted, so a
-    /// restart does not re-run a full pass over every project).
-    async fn get_deep_maintenance_times(
-        &self,
-    ) -> Result<Vec<(Uuid, chrono::DateTime<chrono::Utc>)>> {
-        Ok(Vec::new())
-    }
-
-    /// Record that a project's deep maintenance pass started now.
-    async fn mark_deep_maintenance(&self, _project_id: Uuid) -> Result<()> {
-        Ok(())
-    }
-
     /// Every non-archived skill of a project, uncapped.
     ///
     /// Skill evolution MUST compare new clusters against this set: the
@@ -3296,15 +4619,12 @@ pub trait AnalyticsStore: Send + Sync {
             .filter(|s| s.status != crate::skills::SkillStatus::Archived)
             .collect())
     }
-
     /// Activate a skill: collect member notes (above min energy) and relevant
     /// decisions, assemble context text. Returns the full activation payload.
     async fn activate_skill(&self, skill_id: Uuid, query: &str) -> Result<ActivatedSkillContext>;
-
     /// Increment a skill's activation_count and update last_activated.
     /// Used by hook activation paths (fire-and-forget, best-effort).
     async fn increment_skill_activation(&self, skill_id: Uuid) -> Result<()>;
-
     /// Match skills by evaluating trigger patterns against an input string.
     /// Returns matching skills with their confidence scores, sorted descending.
     /// Only matches Active/Emerging skills with reliable triggers.
@@ -3335,7 +4655,6 @@ pub trait AnalyticsStore: Send + Sync {
         )
         .await
     }
-
     /// Same ranking, with the note-affinity channel supplied by the caller.
     ///
     /// `affinity` maps a skill id to how strongly the query matched that skill's
@@ -3369,706 +4688,21 @@ pub trait AnalyticsStore: Send + Sync {
             limit,
         ))
     }
-
     async fn match_skills_by_trigger(
         &self,
         project_id: Option<Uuid>,
         input: &str,
     ) -> Result<Vec<(SkillNode, f64)>>;
-
-    // ========================================================================
-    // Skill Detection — Graph Extraction
-    // ========================================================================
-
-    /// Extract the SYNAPSE graph for a project: all Note↔Note edges with weight > min_weight.
-    /// Returns Vec<(from_note_id, to_note_id, weight)>.
-    async fn get_synapse_graph(
-        &self,
-        project_id: Uuid,
-        min_weight: f64,
-    ) -> Result<Vec<(String, String, f64)>>;
-
-    // ========================================================================
-    // Persona operations (Living Personas)
-    // ========================================================================
-
-    /// Create a new persona node. If project_id is Some, links it via BELONGS_TO.
-    async fn create_persona(&self, persona: &PersonaNode) -> Result<()>;
-
-    /// Get a persona by ID.
-    async fn get_persona(&self, id: Uuid) -> Result<Option<PersonaNode>>;
-
-    /// Update a persona node (replaces all mutable fields).
-    async fn update_persona(&self, persona: &PersonaNode) -> Result<()>;
-
-    /// Delete a persona and all its relationships.
-    /// Returns true if the persona existed and was deleted.
-    async fn delete_persona(&self, id: Uuid) -> Result<bool>;
-
-    /// List personas for a project with optional status filter and pagination.
-    /// Returns (personas, total_count).
-    async fn list_personas(
-        &self,
-        project_id: Uuid,
-        status: Option<PersonaStatus>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<PersonaNode>, usize)>;
-
-    /// List global personas (project_id IS NULL) — portable personas.
-    async fn list_global_personas(&self) -> Result<Vec<PersonaNode>>;
-
-    // ========================================================================
-    // Persona relation operations
-    // ========================================================================
-
-    /// Add MASTERS relation: Persona -> Skill
-    async fn add_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()>;
-
-    /// Remove MASTERS relation: Persona -> Skill
-    async fn remove_persona_skill(&self, persona_id: Uuid, skill_id: Uuid) -> Result<()>;
-
-    /// Add FOLLOWS relation: Persona -> Protocol
-    async fn add_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()>;
-
-    /// Remove FOLLOWS relation: Persona -> Protocol
-    async fn remove_persona_protocol(&self, persona_id: Uuid, protocol_id: Uuid) -> Result<()>;
-
-    /// Increment activation_count and update last_activated for a Persona.
-    async fn increment_persona_activation(&self, persona_id: Uuid) -> Result<()>;
-
-    /// Add SCOPED_TO relation: Persona -> FeatureGraph
-    async fn set_persona_feature_graph(
-        &self,
-        persona_id: Uuid,
-        feature_graph_id: Uuid,
-    ) -> Result<()>;
-
-    /// Remove SCOPED_TO relation: Persona -> FeatureGraph
-    async fn remove_persona_feature_graph(&self, persona_id: Uuid) -> Result<()>;
-
-    /// Add KNOWS relation: Persona -> File (with weight)
-    async fn add_persona_file(&self, persona_id: Uuid, file_path: &str, weight: f64) -> Result<()>;
-
-    /// Remove KNOWS relation: Persona -> File
-    async fn remove_persona_file(&self, persona_id: Uuid, file_path: &str) -> Result<()>;
-
-    /// Add KNOWS relation: Persona -> Function (with weight)
-    async fn add_persona_function(
-        &self,
-        persona_id: Uuid,
-        function_id: &str,
-        weight: f64,
-    ) -> Result<()>;
-
-    /// Remove KNOWS relation: Persona -> Function
-    async fn remove_persona_function(&self, persona_id: Uuid, function_id: &str) -> Result<()>;
-
-    /// Add USES relation: Persona -> Note (with weight)
-    async fn add_persona_note(&self, persona_id: Uuid, note_id: Uuid, weight: f64) -> Result<()>;
-
-    /// Remove USES relation: Persona -> Note
-    async fn remove_persona_note(&self, persona_id: Uuid, note_id: Uuid) -> Result<()>;
-
-    /// Add USES relation: Persona -> Decision (with weight)
-    async fn add_persona_decision(
-        &self,
-        persona_id: Uuid,
-        decision_id: Uuid,
-        weight: f64,
-    ) -> Result<()>;
-
-    /// Remove USES relation: Persona -> Decision
-    async fn remove_persona_decision(&self, persona_id: Uuid, decision_id: Uuid) -> Result<()>;
-
-    /// Add EXTENDS relation: child Persona -> parent Persona
-    async fn add_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()>;
-
-    /// Remove EXTENDS relation: child Persona -> parent Persona
-    async fn remove_persona_extends(&self, child_id: Uuid, parent_id: Uuid) -> Result<()>;
-
-    // ========================================================================
-    // Persona subgraph (knowledge assembly)
-    // ========================================================================
-
-    /// Assemble the full knowledge subgraph for a persona.
-    /// Includes all KNOWS, USES, MASTERS, FOLLOWS, SCOPED_TO, EXTENDS entities.
-    async fn get_persona_subgraph(&self, persona_id: Uuid) -> Result<PersonaSubgraph>;
-
-    /// Find personas that KNOW a given file (for activation by file match).
-    /// Returns (persona, weight) sorted by weight descending.
-    async fn find_personas_for_file(
-        &self,
-        file_path: &str,
-        project_id: Uuid,
-    ) -> Result<Vec<(PersonaNode, f64)>>;
-
-    /// Load ALL persona KNOWS relations for a project in a single query.
-    /// Returns Vec<(PersonaNode, file_path, weight)> for building a complete
-    /// PersonaFileIndex without cold-start issues.
-    async fn get_all_persona_knows(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<(PersonaNode, String, f64)>>;
-
-    /// Auto-scope each persona to the FeatureGraph that best matches its KNOWS files.
-    /// Returns the number of personas that were scoped.
-    async fn auto_scope_to_feature_graphs(&self, project_id: Uuid) -> Result<usize>;
-
-    /// Compute adaptive thresholds from actual KNOWS/USES weight distributions.
-    /// Falls back to hardcoded defaults when there are fewer than 10 data points.
-    async fn compute_adaptive_thresholds(
-        &self,
-        project_id: Uuid,
-    ) -> Result<crate::neo4j::persona::AdaptivePersonaThresholds>;
-
-    /// Maintain all personas for a project: decay weights, prune, recalculate cohesion.
-    /// Returns (decayed_count, pruned_count, personas_updated).
-    async fn maintain_personas(&self, project_id: Uuid) -> Result<(usize, usize, usize)>;
-
-    /// Detect potential personas from Louvain communities.
-    async fn detect_personas(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<crate::neo4j::persona::PersonaProposal>>;
-
-    /// Find personas adjacent to a file (same dir or 1-hop IMPORTS).
-    async fn find_adjacent_personas(
-        &self,
-        file_path: &str,
-        project_id: Uuid,
-    ) -> Result<Vec<(Uuid, String)>>;
-
-    /// Auto-grow: create a weak KNOWS relation between persona and file.
-    async fn auto_grow_file_knows(
-        &self,
-        persona_id: Uuid,
-        file_path: &str,
-        weight: f64,
-    ) -> Result<()>;
-
-    /// Find personas relevant to a note based on KNOWS file overlap.
-    async fn find_relevant_personas_for_note(
-        &self,
-        file_paths: &[String],
-        project_id: Uuid,
-    ) -> Result<Vec<(Uuid, f64)>>;
-
-    /// Find personas relevant to a decision based on KNOWS overlap with AFFECTS entities.
-    async fn find_relevant_personas_for_decision(
-        &self,
-        decision_id: Uuid,
-        project_id: Uuid,
-    ) -> Result<Vec<(Uuid, f64)>>;
-
-    /// Auto-link a note to an active persona (growth hook).
-    async fn auto_link_note_to_persona(
-        &self,
-        persona_id: Uuid,
-        note_id: Uuid,
-        weight: f64,
-    ) -> Result<()>;
-
-    /// Auto-link a decision to an active persona (growth hook).
-    async fn auto_link_decision_to_persona(
-        &self,
-        persona_id: Uuid,
-        decision_id: Uuid,
-        weight: f64,
-    ) -> Result<()>;
-
-    /// Auto-link a file to an active persona (growth hook).
-    async fn auto_link_file_to_persona(
-        &self,
-        persona_id: Uuid,
-        file_path: &str,
-        weight: f64,
-    ) -> Result<()>;
-
-    // ========================================================================
-    // Persona learning methods (CO_CHANGED, merge, SYNAPSE, energy)
-    // ========================================================================
-
-    /// Propagate KNOWS to co-changed files (attenuated weight).
-    async fn propagate_knows_via_co_change(
-        &self,
-        persona_id: Uuid,
-        file_path: &str,
-        base_weight: f64,
-    ) -> Result<usize>;
-
-    /// Compute affinity between two personas for merge detection.
-    async fn compute_persona_affinity(
-        &self,
-        persona_a: Uuid,
-        persona_b: Uuid,
-    ) -> Result<crate::neo4j::persona::PersonaAffinityScore>;
-
-    /// Merge persona B into persona A: transfer all KNOWS/USES, then delete B.
-    async fn merge_personas(&self, keep_id: Uuid, merge_id: Uuid) -> Result<()>;
-
-    /// Find personas linked via strong SYNAPSE connections between their USES notes.
-    async fn find_synapse_linked_personas(
-        &self,
-        persona_id: Uuid,
-    ) -> Result<Vec<(Uuid, String, f64)>>;
-
-    /// Apply rate-limited energy boost to a persona. Returns true if applied.
-    async fn rate_limited_energy_boost(
-        &self,
-        persona_id: Uuid,
-        boost: f64,
-        max_per_cycle: f64,
-    ) -> Result<bool>;
-
-    /// Get learning health metrics for a project's persona system.
-    async fn get_learning_health(
-        &self,
-        project_id: Uuid,
-    ) -> Result<crate::neo4j::analytics::LearningHealthReport>;
-
-    // ========================================================================
-    // Analysis Profile operations
-    // ========================================================================
-
-    /// Create or update an analysis profile.
-    ///
-    /// Uses MERGE on `id` so built-in profiles can be upserted idempotently.
-    /// If `project_id` is Some, links the profile to the project via HAS_PROFILE.
-    async fn create_analysis_profile(&self, profile: &AnalysisProfile) -> Result<()>;
-
-    /// List analysis profiles visible to a project.
-    ///
-    /// Returns global profiles (project_id IS NULL) + project-specific profiles.
-    /// If `project_id` is None, returns only global profiles.
-    async fn list_analysis_profiles(
-        &self,
-        project_id: Option<&str>,
-    ) -> Result<Vec<AnalysisProfile>>;
-
-    /// Get a single analysis profile by id.
-    async fn get_analysis_profile(&self, id: &str) -> Result<Option<AnalysisProfile>>;
-
-    /// Delete an analysis profile by id.
-    ///
-    /// Returns an error if the profile is built-in (`is_builtin = true`).
-    async fn delete_analysis_profile(&self, id: &str) -> Result<()>;
-
-    // ========================================================================
-    // Bridge subgraph extraction (GraIL Plan 1)
-    // ========================================================================
-
-    /// Extract the enclosing bridge subgraph between two nodes via bidirectional
-    /// BFS intersection. Returns raw nodes and edges; double-radius labeling
-    /// and bottleneck detection are done in Rust (see graph/algorithms.rs).
-    ///
-    /// - `source`/`target`: file paths within the project
-    /// - `max_hops`: BFS radius (1..=5)
-    /// - `relation_types`: edge types to traverse (e.g. ["IMPORTS", "CALLS"])
-    /// - `project_id`: project UUID for scoping
-    async fn find_bridge_subgraph(
-        &self,
-        source: &str,
-        target: &str,
-        max_hops: u32,
-        relation_types: &[String],
-        project_id: &str,
-    ) -> Result<(
-        Vec<crate::graph::models::BridgeRawNode>,
-        Vec<crate::graph::models::BridgeRawEdge>,
-    )>;
-
-    // ========================================================================
-    // Multi-signal impact queries
-    // ========================================================================
-
-    /// Get the knowledge density for a file: count of notes LINKED_TO + decisions AFFECTS,
-    /// normalized by max count across all files in the project. Returns f64 in [0, 1].
-    async fn get_knowledge_density(&self, file_path: &str, project_id: &str) -> Result<f64>;
-
-    /// Get the PageRank score for a file node.
-    /// Reads the `cc_pagerank` property set by GDS projection. Falls back to 0.0.
-    async fn get_node_pagerank(&self, file_path: &str, project_id: &str) -> Result<f64>;
-
-    /// Get bridge proximity scores for a file's top co-changers.
-    /// For each co-changer, computes 1.0 / shortestPath distance to the target.
-    /// Returns Vec<(path, score)> sorted by score descending.
-    async fn get_bridge_proximity(
-        &self,
-        file_path: &str,
-        project_id: &str,
-    ) -> Result<Vec<(String, f64)>>;
-
-    /// Compute the average multi-signal impact score across the top-10 files
-    /// by PageRank. Uses GDS properties (pagerank, betweenness, churn_score,
-    /// knowledge_density) to approximate the 5-signal fusion in a single query.
-    /// Returns 0.0 if no files have GDS metrics computed.
-    async fn get_avg_multi_signal_score(&self, project_id: Uuid) -> Result<f64>;
-
-    // ========================================================================
-    // Topology Firewall (GraIL Plan 3)
-    // ========================================================================
-
-    /// Create a topology rule.
-    ///
-    /// Stores the rule as a `TopologyRule` node in Neo4j with the given
-    /// project_id, rule_type, source/target patterns, threshold, and severity.
-    async fn create_topology_rule(&self, rule: &TopologyRule) -> Result<()>;
-
-    /// List all topology rules for a project.
-    async fn list_topology_rules(&self, project_id: &str) -> Result<Vec<TopologyRule>>;
-
-    /// Delete a topology rule by id.
-    async fn delete_topology_rule(&self, rule_id: &str) -> Result<()>;
-
-    /// Check all topology rules for a project and return violations.
-    ///
-    /// Iterates over all rules for the project and runs type-specific Cypher
-    /// queries to detect violations:
-    /// - `MustNotImport`: files matching source_pattern that IMPORTS files matching target_pattern
-    /// - `MustNotCall`: functions matching source_pattern that CALLS functions matching target_pattern
-    /// - `MaxFanOut`: files matching source_pattern with more than threshold IMPORTS
-    /// - `NoCircular`: circular import chains (depth 2..6) among files matching source_pattern
-    /// - `MaxDistance`: shortest path between source and target patterns >= threshold
-    async fn check_topology_rules(&self, project_id: &str) -> Result<Vec<TopologyViolation>>;
-
-    /// Check if a specific file's new imports would violate any topology rules.
-    ///
-    /// Designed for real-time pre-write validation (<50ms target).
-    /// Only checks `MustNotImport` rules where `file_path` matches the source pattern
-    /// and any of `new_imports` matches the target pattern.
-    async fn check_file_topology(
-        &self,
-        project_id: &str,
-        file_path: &str,
-        new_imports: &[String],
-    ) -> Result<Vec<TopologyViolation>>;
-
-    // ========================================================================
-    // Cognitive routing (bandit arms and decisions)
-    // ========================================================================
-
-    /// One bandit arm, `None` when it was never observed.
-    async fn get_routing_arm(
-        &self,
-        key: &crate::chat::provider::cognitive::store::ArmKey,
-    ) -> Result<Option<crate::chat::provider::cognitive::store::ArmStats>>;
-
-    /// Every arm of a class of work.
-    async fn list_routing_arms(
-        &self,
-        class: &str,
-    ) -> Result<Vec<crate::chat::provider::cognitive::store::ArmStats>>;
-
-    /// Records one observation, creating the arm with Beta(1, 1) when absent;
-    /// returns the arm as updated. Atomic per arm.
-    async fn observe_routing_arm(
-        &self,
-        key: &crate::chat::provider::cognitive::store::ArmKey,
-        observation: &crate::chat::provider::cognitive::store::ArmObservation,
-    ) -> Result<crate::chat::provider::cognitive::store::ArmStats>;
-
-    /// Stores or replaces a routing decision, linked best effort to its
-    /// session, task and run when they exist.
-    async fn put_routing_decision(
-        &self,
-        decision: &crate::chat::provider::cognitive::decision::CognitiveDecision,
-    ) -> Result<()>;
-
-    /// One routing decision.
-    async fn get_routing_decision(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<crate::chat::provider::cognitive::decision::CognitiveDecision>>;
-
-    /// Routing decisions, newest first.
-    async fn list_routing_decisions(
-        &self,
-        filter: &crate::chat::provider::cognitive::store::DecisionFilter,
-    ) -> Result<Vec<crate::chat::provider::cognitive::decision::CognitiveDecision>>;
-
-    /// Fills the outcome of a decision; `false` when it is unknown.
-    async fn set_routing_decision_outcome(
-        &self,
-        id: Uuid,
-        outcome: crate::chat::provider::cognitive::decision::DecisionOutcome,
-    ) -> Result<bool>;
-
-    // ========================================================================
-    // Conversation segments (episodic memory)
-    // ========================================================================
-
-    /// Stores (replacing) the conversation segments of a conversation.
-    async fn put_segments(
-        &self,
-        conversation: &str,
-        segments: &[crate::chat::provider::cognitive::segment::Segment],
-    ) -> Result<()>;
-
-    /// The stored conversation segments of a conversation, empty when none.
-    async fn get_segments(
-        &self,
-        conversation: &str,
-    ) -> Result<Vec<crate::chat::provider::cognitive::segment::Segment>>;
-
-    /// Stores (replacing) the boundaries of a conversation.
-    async fn put_boundaries(
-        &self,
-        conversation: &str,
-        boundaries: &[crate::chat::provider::cognitive::segment::Boundary],
-    ) -> Result<()>;
-
-    /// The stored boundaries of a conversation, empty when none.
-    async fn get_boundaries(
-        &self,
-        conversation: &str,
-    ) -> Result<Vec<crate::chat::provider::cognitive::segment::Boundary>>;
-
-    // ========================================================================
-    // Health check
-    // ========================================================================
-
-    /// Check connectivity to the graph database.
-    /// Returns Ok(true) if the database is reachable, Ok(false) if not.
-    async fn health_check(&self) -> Result<bool>;
-
-    // ========================================================================
-    // Context Cards persistence
-    // ========================================================================
-
-    /// Batch-write context cards as cc_* properties on File nodes.
-    async fn batch_save_context_cards(
-        &self,
-        cards: &[crate::graph::models::ContextCard],
-    ) -> Result<()>;
-
-    /// Invalidate context cards for given file paths + their 1-hop neighbors.
-    /// Sets cc_version = -1 on the target files and their direct neighbors.
-    async fn invalidate_context_cards(&self, paths: &[String], project_id: &str) -> Result<()>;
-
-    /// Read a single context card from Neo4j cc_* properties.
-    /// Returns None if the file doesn't exist or has no cc_* properties.
-    async fn get_context_card(
-        &self,
-        path: &str,
-        project_id: &str,
-    ) -> Result<Option<crate::graph::models::ContextCard>>;
-
-    /// Batch-read context cards for multiple files.
-    async fn get_context_cards_batch(
-        &self,
-        paths: &[String],
-        project_id: &str,
-    ) -> Result<Vec<crate::graph::models::ContextCard>>;
-
-    /// Find groups of files with identical WL hash (isomorphic neighborhoods).
-    /// Returns groups with at least `min_group_size` members.
-    async fn find_isomorphic_groups(
-        &self,
-        project_id: &str,
-        min_group_size: usize,
-    ) -> Result<Vec<crate::graph::models::IsomorphicGroup>>;
-
-    /// Check if any file in the project has GraIL analytics (context cards) computed.
-    /// Used by staleness check to detect pre-GraIL projects needing first computation.
-    async fn has_context_cards(&self, project_id: &str) -> Result<bool>;
-
-    // ========================================================================
-    // Embedding projection (UMAP visualization)
-    // ========================================================================
-
-    /// Get all note embeddings for a project in a single batch query.
-    /// Returns (note_id, embedding_vec, note_type, importance, energy, tags, content_preview).
-    /// Only returns notes that have embeddings. Used for UMAP 2D projection.
-    async fn get_note_embeddings_for_project(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<NoteEmbeddingPoint>>;
-
-    // ========================================================================
-    // Protocol operations (Pattern Federation)
-    // ========================================================================
-
-    /// Create a new protocol with its BELONGS_TO relationship to project.
-    /// Also creates HAS_STATE and HAS_TRANSITION relationships for sub-entities.
-    async fn upsert_protocol(&self, protocol: &Protocol) -> Result<()>;
-
-    /// Get a protocol by ID, including its states and transitions.
-    async fn get_protocol(&self, id: Uuid) -> Result<Option<Protocol>>;
-
-    /// List protocols for a project with optional category filter and pagination.
-    /// Returns (protocols, total_count).
-    ///
-    /// The scope rule is the one of the transverse library, the same skills follow: with
-    /// a project, the listing is that project's protocols PLUS the instance's transverse
-    /// ones (`project_id IS NULL`), and never another project's; with no project, the
-    /// transverse set alone. `total_count` counts what the listing covers, transverse
-    /// protocols included — it is NOT the size of one project's own set, so a caller that
-    /// wants that count filters on `project_id` itself.
-    async fn list_protocols(
-        &self,
-        project_id: Option<Uuid>,
-        category: Option<crate::protocol::ProtocolCategory>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<Protocol>, usize)>;
-
-    /// Delete a protocol and all its states, transitions, and relationships.
-    /// Returns true if the protocol existed and was deleted.
-    async fn delete_protocol(&self, id: Uuid) -> Result<bool>;
-
-    /// Upsert a protocol state and create its HAS_STATE relationship.
-    async fn upsert_protocol_state(&self, state: &ProtocolState) -> Result<()>;
-
-    /// Get all states for a protocol.
-    async fn get_protocol_states(&self, protocol_id: Uuid) -> Result<Vec<ProtocolState>>;
-
-    /// Check if a protocol with the given name already exists in the project.
-    /// Returns the existing protocol's UUID if found.
-    async fn get_protocol_by_name_and_project(
-        &self,
-        name: &str,
-        project_id: Uuid,
-    ) -> Result<Option<Uuid>>;
-
-    /// Delete a protocol state and its relationships.
-    async fn delete_protocol_state(&self, state_id: Uuid) -> Result<bool>;
-
-    /// Upsert a protocol transition and create its HAS_TRANSITION relationship.
-    async fn upsert_protocol_transition(&self, transition: &ProtocolTransition) -> Result<()>;
-
-    /// Get all transitions for a protocol.
-    async fn get_protocol_transitions(&self, protocol_id: Uuid) -> Result<Vec<ProtocolTransition>>;
-
-    /// Delete a protocol transition.
-    async fn delete_protocol_transition(&self, transition_id: Uuid) -> Result<bool>;
-
-    // ========================================================================
-    // ProtocolRun operations (FSM Runtime)
-    // ========================================================================
-
-    /// Create a new protocol run node with INSTANCE_OF relationship to its protocol.
-    async fn create_protocol_run(&self, run: &ProtocolRun) -> Result<()>;
-
-    /// Get a protocol run by ID.
-    async fn get_protocol_run(&self, run_id: Uuid) -> Result<Option<ProtocolRun>>;
-
-    /// Update an existing protocol run (current_state, states_visited, status, etc.).
-    /// On success, bumps `run.version` in-place to match the persisted value.
-    /// Returns `OptimisticLockError` if the run was modified concurrently.
-    async fn update_protocol_run(&self, run: &mut ProtocolRun) -> Result<()>;
-
-    /// List protocol runs for a protocol with optional status filter and pagination.
-    /// Returns (runs, total_count).
-    async fn list_protocol_runs(
-        &self,
-        protocol_id: Uuid,
-        status: Option<RunStatus>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<ProtocolRun>, usize)>;
-
-    /// List protocol runs across ALL protocols (cross-cutting), newest first.
-    ///
-    /// `project_id` wins over `workspace_slug`; with neither, every project is
-    /// included. Returns (page, total).
-    async fn list_all_protocol_runs(
-        &self,
-        status: Option<RunStatus>,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<ProtocolRun>, usize)>;
-
-    /// List child runs for a given parent run.
-    async fn list_child_runs(&self, parent_run_id: Uuid) -> Result<Vec<ProtocolRun>>;
-
-    /// Count children for a given run.
-    async fn count_child_runs(&self, parent_run_id: Uuid) -> Result<usize>;
-
-    /// Get the full run tree rooted at a given run (recursive, depth limit 5).
-    /// Returns root + all descendants, ordered by depth then started_at.
-    async fn get_run_tree(&self, root_run_id: Uuid) -> Result<Vec<ProtocolRun>>;
-
-    /// Delete a protocol run.
-    /// Returns true if the run existed and was deleted.
-    async fn delete_protocol_run(&self, run_id: Uuid) -> Result<bool>;
-
-    /// Create a PRODUCED_DURING relation between a Note/Decision and a ProtocolRun.
-    /// entity_type must be "Note" or "Decision".
-    async fn create_produced_during(
-        &self,
-        entity_type: &str,
-        entity_id: Uuid,
-        run_id: Uuid,
-    ) -> Result<bool>;
-
-    /// Get all notes and decisions produced during a protocol run.
-    async fn get_run_outcomes(
-        &self,
-        run_id: Uuid,
-    ) -> Result<Vec<crate::neo4j::protocol::ProducedArtefact>>;
-
-    /// Find the most recently started active (running) protocol run for a project.
-    async fn find_active_run_for_project(&self, project_id: Uuid) -> Result<Option<Uuid>>;
-
-    /// Persist a ReasoningTree to Neo4j as a PersistedReasoningTree node.
-    /// Optionally links it to an entity via REASONING_FOR relation.
-    async fn persist_reasoning_tree(
-        &self,
-        tree: &crate::reasoning::ReasoningTree,
-        linked_entity_type: Option<&str>,
-        linked_entity_id: Option<Uuid>,
-    ) -> Result<Uuid>;
-
-    /// Get the ID of a persisted reasoning tree linked to a protocol run.
-    async fn get_run_reasoning_tree_id(&self, run_id: Uuid) -> Result<Option<Uuid>>;
-
-    /// List completed protocol runs for a project (most recent first).
-    async fn list_completed_runs_for_project(
-        &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> Result<Vec<crate::protocol::models::ProtocolRun>>;
-
-    // ========================================================================
-    // RuntimeState operations (Generator-produced dynamic states)
-    // ========================================================================
-
-    /// Create a new RuntimeState node with HAS_RUNTIME_STATE and GENERATED_BY relationships.
-    async fn create_runtime_state(&self, state: &RuntimeState) -> Result<()>;
-
-    /// Get all RuntimeStates for a protocol run, ordered by index.
-    async fn get_runtime_states(&self, run_id: Uuid) -> Result<Vec<RuntimeState>>;
-
-    /// Delete all RuntimeStates for a protocol run.
-    async fn delete_runtime_states(&self, run_id: Uuid) -> Result<()>;
-
-    // ========================================================================
-    // System Inference — Audit Gaps
-    // ========================================================================
-
-    /// Audit the knowledge graph for gaps: orphan notes, decisions without AFFECTS,
-    /// commits without TOUCHES, skills without members.
-    async fn audit_knowledge_gaps(&self, project_id: Uuid) -> Result<AuditGapsReport>;
-
-    // ========================================================================
-    // Skill Registry
-    // ========================================================================
-
     /// Create or update a published skill in the registry.
     async fn upsert_published_skill(
         &self,
         published: &crate::skills::registry::PublishedSkill,
     ) -> Result<()>;
-
     /// Get a published skill by ID.
     async fn get_published_skill(
         &self,
         id: Uuid,
     ) -> Result<Option<crate::skills::registry::PublishedSkill>>;
-
     /// Search published skills with optional filters.
     /// Returns (matching entries, total count).
     async fn search_published_skills(
@@ -4079,226 +4713,8 @@ pub trait AnalyticsStore: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<crate::skills::registry::PublishedSkill>, usize)>;
-
     /// Increment the import count for a published skill.
     async fn increment_published_skill_imports(&self, id: Uuid) -> Result<()>;
-
-    // ========================================================================
-    // Graph visualization helpers (sub-file symbols, inheritance, constraints)
-    // ========================================================================
-
-    /// List all sub-file symbols (Function, Struct, Trait, Enum) for a project.
-    /// Returns tuples of (id, name, symbol_type, file_path, visibility, line_start).
-    async fn list_project_symbols(
-        &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> Result<Vec<(String, String, String, String, Option<String>, Option<i64>)>>;
-
-    /// List EXTENDS and IMPLEMENTS edges between structs/traits in a project.
-    /// Returns (source_id, target_id, relation_type).
-    async fn get_project_inheritance_edges(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<(String, String, String)>>;
-
-    /// Get all constraints for a project (via Project → Plan → Constraint).
-    /// Returns (constraint, plan_id) pairs for graph visualization.
-    async fn get_project_constraints(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<(crate::neo4j::models::ConstraintNode, Uuid)>>;
-
-    // ========================================================================
-    // PlanRun operations (Runner execution state)
-    // ========================================================================
-
-    /// Create a new PlanRun node linked to a Plan via (:PlanRun)-[:RUNS]->(:Plan).
-    async fn create_plan_run(&self, state: &crate::runner::RunnerState) -> Result<()>;
-
-    /// Update an existing PlanRun with current execution state.
-    async fn update_plan_run(&self, state: &crate::runner::RunnerState) -> Result<()>;
-
-    /// Get a PlanRun by its run_id.
-    async fn get_plan_run(&self, run_id: Uuid) -> Result<Option<crate::runner::RunnerState>>;
-
-    /// List all PlanRuns with status=Running (for crash recovery at boot).
-    async fn list_active_plan_runs(&self) -> Result<Vec<crate::runner::RunnerState>>;
-
-    /// List all PlanRuns across all plans, ordered by started_at desc.
-    /// If `workspace_slug` is provided, only returns runs for plans belonging to
-    /// projects in that workspace.
-    async fn list_all_plan_runs(
-        &self,
-        limit: i64,
-        offset: i64,
-        status: Option<&str>,
-        workspace_slug: Option<&str>,
-    ) -> Result<Vec<crate::runner::RunnerState>>;
-
-    /// List all PlanRuns for a given plan, ordered by started_at desc.
-    async fn list_plan_runs(
-        &self,
-        plan_id: Uuid,
-        limit: i64,
-    ) -> Result<Vec<crate::runner::RunnerState>>;
-
-    // ── Triggers ──────────────────────────────────────────────────────────
-
-    /// Create a trigger node linked to a plan via (:Trigger)-[:TRIGGERS]->(:Plan).
-    async fn create_trigger(
-        &self,
-        trigger: &crate::runner::Trigger,
-    ) -> Result<crate::runner::Trigger>;
-
-    /// Get a trigger by its UUID.
-    async fn get_trigger(&self, trigger_id: Uuid) -> Result<Option<crate::runner::Trigger>>;
-
-    /// List all triggers for a given plan.
-    async fn list_triggers(&self, plan_id: Uuid) -> Result<Vec<crate::runner::Trigger>>;
-
-    /// Disable a trigger, with the reason when the system does it (`None`:
-    /// someone disabled it). The only way back is [`Self::enable_trigger_as`],
-    /// which records who enables it: there is no enable without an author.
-    async fn disable_trigger(
-        &self,
-        trigger_id: Uuid,
-        reason: Option<&str>,
-    ) -> Result<Option<crate::runner::Trigger>>;
-
-    /// Record that a third-party session wrote `content` (the plan itself, or
-    /// one of its tasks, steps, constraints or decisions): the plan it belongs
-    /// to gets `third_party_written_at = now`. Returns that plan, `None` when
-    /// the content belongs to no plan (or does not exist).
-    async fn mark_third_party_write(
-        &self,
-        content: crate::runner::PlanContent,
-    ) -> Result<Option<Uuid>>;
-
-    /// When a third-party session last wrote the plan or its content (see
-    /// [`Self::mark_third_party_write`]); `None` if never.
-    async fn plan_third_party_written_at(
-        &self,
-        plan_id: Uuid,
-    ) -> Result<Option<chrono::DateTime<chrono::Utc>>>;
-
-    /// Delete a trigger by its UUID.
-    async fn delete_trigger(&self, trigger_id: Uuid) -> Result<()>;
-
-    /// Record a trigger firing event (`fire_count` + 1). `last_fired` is left
-    /// to [`Self::reserve_trigger_signal`]: a firing refused before the
-    /// reservation consumes no cooldown.
-    async fn record_trigger_firing(&self, firing: &crate::runner::TriggerFiring) -> Result<()>;
-
-    /// Enable a trigger and record `author` as the identity its runs start as,
-    /// in one write. `None` when there is no such trigger.
-    async fn enable_trigger_as(
-        &self,
-        trigger_id: Uuid,
-        author: &crate::runner::TriggerAuthor,
-    ) -> Result<Option<crate::runner::Trigger>>;
-
-    /// Reserve the signal `key` of trigger `trigger_id`, atomically, across
-    /// instances: `Reserved` for the one caller that sees `key` for the first
-    /// time (one `TriggerSignal` per key, kept 24 h) AND finds the trigger out
-    /// of its `cooldown_secs` — `last_fired` then moves to now in the same
-    /// write; `Duplicate` when `key` was already reserved (or no such trigger);
-    /// `Cooldown` when the trigger fired less than `cooldown_secs` ago.
-    async fn reserve_trigger_signal(
-        &self,
-        trigger_id: Uuid,
-        key: &str,
-        cooldown_secs: u64,
-    ) -> Result<crate::runner::SignalReservation>;
-
-    /// List all triggers across all plans, optionally filtered by type.
-    async fn list_all_triggers(
-        &self,
-        trigger_type: Option<&str>,
-    ) -> Result<Vec<crate::runner::Trigger>>;
-
-    /// List trigger firings for a given trigger, ordered by fired_at desc.
-    async fn list_trigger_firings(
-        &self,
-        trigger_id: Uuid,
-        limit: i64,
-    ) -> Result<Vec<crate::runner::TriggerFiring>>;
-
-    /// Journalise une livraison reçue (accepted ou rejected), sans son corps.
-    async fn record_external_event(&self, event: &crate::ingress::ExternalEvent) -> Result<()>;
-
-    /// Derniers événements externes journalisés pour un déclencheur, le plus récent d'abord.
-    async fn list_external_events(
-        &self,
-        trigger_id: Uuid,
-        limit: i64,
-    ) -> Result<Vec<crate::ingress::ExternalEvent>>;
-
-    /// Réserve la livraison `delivery_key` pour `trigger_id`: `true` au premier appel, `false` au rejeu.
-    async fn claim_external_delivery(&self, trigger_id: Uuid, delivery_key: &str) -> Result<bool>;
-
-    /// Libère une réservation de livraison (la livraison n'a pas pu être journalisée) :
-    /// une relivraison sera de nouveau acceptée. `true` si une réservation existait.
-    async fn release_external_delivery(&self, trigger_id: Uuid, delivery_key: &str)
-        -> Result<bool>;
-
-    /// Purge les événements externes reçus avant `before` (rétention). Rend le nombre
-    /// d'événements supprimés. Les réservations de livraison sont conservées (sans
-    /// elles, un corps signé capturé redeviendrait rejouable).
-    async fn purge_external_events_before(
-        &self,
-        before: chrono::DateTime<chrono::Utc>,
-    ) -> Result<u64>;
-
-    // ── AgentExecution ──────────────────────────────────────────────────────
-
-    /// Create an AgentExecution node linked to a PlanRun and Task.
-    async fn create_agent_execution(
-        &self,
-        ae: &crate::neo4j::agent_execution::AgentExecutionNode,
-    ) -> Result<()>;
-
-    /// Update an existing AgentExecution with final results.
-    async fn update_agent_execution(
-        &self,
-        ae: &crate::neo4j::agent_execution::AgentExecutionNode,
-    ) -> Result<()>;
-
-    /// Get all AgentExecution nodes for a given PlanRun.
-    async fn get_agent_executions_for_run(
-        &self,
-        run_id: Uuid,
-    ) -> Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>>;
-
-    /// Record the per-check verification result on one execution.
-    ///
-    /// A narrow write on purpose: verification runs after the attempt is
-    /// closed, so rewriting the whole node from a stale copy would race with
-    /// the close and could put `status` back to `running`.
-    async fn record_agent_execution_verification(
-        &self,
-        agent_execution_id: Uuid,
-        verification_json: &str,
-    ) -> Result<()>;
-
-    /// Every AgentExecution still `running`, across all runs (oldest first).
-    ///
-    /// Used by the reconciliation sweep to close the ones whose process is gone.
-    async fn list_running_agent_executions(
-        &self,
-    ) -> Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>>;
-
-    /// Cost, tokens, first-attempt verification and median duration of the
-    /// executions started in `[from, to)`, one row per `group_by` key (B35).
-    /// Marginal and notional amounts are summed apart and an unknown cost is
-    /// counted, never summed (A21). Sorted by key.
-    async fn agent_execution_cost_breakdown(
-        &self,
-        group_by: crate::neo4j::agent_execution::CostGroupBy,
-        from: chrono::DateTime<chrono::Utc>,
-        to: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<crate::neo4j::agent_execution::CostBreakdownRow>>;
-
     /// Create a USED_SKILL relationship from AgentExecution to Skill.
     async fn create_used_skill_relation(
         &self,
@@ -4306,438 +4722,6 @@ pub trait AnalyticsStore: Send + Sync {
         skill_id: Uuid,
         result: &str,
     ) -> Result<()>;
-
-    // ========================================================================
-    // rs-stats data providers — bulk metric retrieval for statistical analysis
-    // ========================================================================
-
-    /// Fetch all PageRank values for a project as a flat vector.
-    async fn get_all_pagerank_values(&self, project_id: Uuid) -> Result<Vec<f64>>;
-
-    /// Fetch risk scores grouped by community (for ANOVA analysis).
-    async fn get_community_risk_vectors(&self, project_id: Uuid) -> Result<Vec<Vec<f64>>>;
-
-    /// Fetch all risk scores for a project as a flat vector.
-    async fn get_all_risk_score_values(&self, project_id: Uuid) -> Result<Vec<f64>>;
-
-    // ========================================================================
-    // Sharing & Privacy operations (RFC Privacy MVP)
-    // ========================================================================
-
-    /// Get the sharing policy for a project. Returns None if no policy is set.
-    async fn get_sharing_policy(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Option<crate::episodes::distill_models::SharingPolicy>>;
-
-    /// Update the sharing policy for a project.
-    async fn update_sharing_policy(
-        &self,
-        project_id: Uuid,
-        policy: &crate::episodes::distill_models::SharingPolicy,
-    ) -> Result<()>;
-
-    /// Get the sharing consent for a note.
-    async fn get_sharing_consent(
-        &self,
-        note_id: Uuid,
-    ) -> Result<crate::episodes::distill_models::SharingConsent>;
-
-    /// Update the sharing consent for a note.
-    async fn update_sharing_consent(
-        &self,
-        note_id: Uuid,
-        consent: &crate::episodes::distill_models::SharingConsent,
-    ) -> Result<()>;
-
-    /// Set the sharing consent of a decision (`NotSet` for every pre-existing one).
-    async fn update_decision_sharing_consent(
-        &self,
-        decision_id: Uuid,
-        consent: &crate::episodes::distill_models::SharingConsent,
-    ) -> Result<()>;
-
-    /// Count notes per consent value, optionally for one project. Measures the
-    /// real `NotSet` population (read-only; no data is changed).
-    async fn count_notes_by_consent(
-        &self,
-        project_id: Option<Uuid>,
-    ) -> Result<crate::episodes::distill_models::ConsentCounts>;
-
-    /// Create a sharing event (audit trail).
-    async fn create_sharing_event(
-        &self,
-        event: &crate::episodes::distill_models::SharingEvent,
-    ) -> Result<()>;
-
-    /// List sharing events for a project (newest first).
-    async fn list_sharing_events(
-        &self,
-        project_id: Uuid,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<crate::episodes::distill_models::SharingEvent>>;
-
-    /// Persist a signed tombstone to the graph.
-    async fn persist_tombstone(
-        &self,
-        tombstone: &crate::reception::anchor::SignedTombstone,
-    ) -> Result<()>;
-
-    /// List all persisted tombstones.
-    async fn list_tombstones(&self) -> Result<Vec<crate::reception::anchor::SignedTombstone>>;
-
-    /// Check if a content hash has been tombstoned.
-    async fn is_tombstoned(&self, content_hash: &str) -> Result<bool>;
-
-    // ========================================================================
-    // UserProfile operations (adaptive behavioral profiles)
-    // ========================================================================
-
-    /// Create or get an existing user profile by user_id.
-    /// Uses MERGE semantics — idempotent for the same user_id.
-    async fn create_or_get_user_profile(
-        &self,
-        user_id: &str,
-    ) -> Result<crate::profile::UserProfile>;
-
-    /// Update a user profile with new dimension values.
-    async fn update_user_profile(&self, profile: &crate::profile::UserProfile) -> Result<()>;
-
-    /// Get a user profile by user_id.
-    async fn get_user_profile(&self, user_id: &str) -> Result<Option<crate::profile::UserProfile>>;
-
-    /// Upsert a WORKS_ON relationship between a user and a project.
-    /// Increments frequency and updates last_active.
-    async fn upsert_works_on(&self, user_id: &str, project_id: Uuid) -> Result<()>;
-
-    /// Get all WORKS_ON relationships for a user.
-    async fn get_works_on(&self, user_id: &str) -> Result<Vec<crate::profile::WorksOnRelation>>;
-
-    // ========================================================================
-    // Session episodes (the episode a chat session leaves at its close)
-    // ========================================================================
-
-    /// Store the episode of a chat session, `episode.session` naming it. One per
-    /// session: a later close of the same session (after a resume) replaces it.
-    /// Written only while the session exists, in one statement, so a session deleted
-    /// meanwhile never gets an orphan episode. `Ok(false)`: the session is gone, or
-    /// the episode names no session.
-    async fn save_session_episode(
-        &self,
-        episode: &crate::episodes::models::Episode,
-    ) -> Result<bool>;
-
-    /// The session episodes of a project, most recent close first.
-    async fn list_session_episodes(
-        &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> Result<Vec<crate::episodes::models::Episode>>;
-
-    /// The root the agent ids are derived from (`crate::notes::provenance`): created on the
-    /// first call, atomically, and the same on every call after — two first calls at
-    /// once still agree on one root.
-    async fn agent_identity_namespace(&self) -> Result<Uuid>;
-
-    /// Makes the agent `agent_id` a node of the graph, idempotently: a `(:Agent {kind:'model'})`
-    /// under its id, attached by `FACET_OF` to the durable `(:Agent {kind:'self'})` whose id is
-    /// [`Self::agent_identity_namespace`] (generated once, persisted, never derived from a model).
-    /// `model`, when known, is recorded as a dated fact (`last_seen`), not as the identity.
-    /// Returns `true` when the node did not exist and was created by this call.
-    async fn ensure_agent(&self, agent_id: Uuid, model: Option<&str>) -> Result<bool>;
-
-    /// Rebuilds the agent nodes of what is already written: the distinct `agent:<id>` of the
-    /// `created_by` of notes and the agent of each session episode. Idempotent (a second run
-    /// creates nothing) and it reports what it found, before and after.
-    async fn backfill_agents(&self) -> Result<crate::neo4j::models::AgentBackfill>;
-
-    /// Draws `(:Agent)-[:AUTHORED]->(:Note)`: the note was written under that agent's
-    /// name (`created_by = "agent:<id>"`). The writer is the *facet* node; `FACET_OF`
-    /// carries the attribution up to the durable self. Returns `true` only when the edge
-    /// was created by this call.
-    async fn link_agent_authored(&self, agent_id: Uuid, note_id: Uuid) -> Result<bool>;
-
-    /// Draws `(:Agent)-[:LIVED]->(:SessionEpisode)`: the session that produced this
-    /// episode ran as that agent. Returns `true` only when the edge was created.
-    async fn link_agent_lived(&self, agent_id: Uuid, episode_id: Uuid) -> Result<bool>;
-
-    /// Draws `(:Agent)-[:KNOWS {rule, measure, at}]->(:Note)` — what a subject durably
-    /// knows, as opposed to `(Persona)-[:KNOWS]->(File)`, which says what a persona
-    /// covers. The provenance is written **on the edge**: an edge whose rule and measure
-    /// cannot be read is indistinguishable from an accident.
-    ///
-    /// A missing target draws nothing (`Ok(false)`), never a dangling edge: a pin naming
-    /// a deleted note is a skip, not a failure.
-    async fn link_agent_knows(
-        &self,
-        agent_id: Uuid,
-        note_id: Uuid,
-        provenance: &crate::graph::rules::Provenance,
-    ) -> Result<bool>;
-
-    /// Draws `(:Agent)-[:USES {rule, measure, at}]->(:Persona|:Skill|:Protocol)` — what
-    /// the subject actually applied to itself. The source is the activation registry: the
-    /// stages record what they injected into a session, and this makes that a durable edge
-    /// instead of a memory that dies with the process.
-    ///
-    /// `label` is one of [`crate::graph::rules::USABLE_LABELS`]; anything else is refused
-    /// before a query is built. A target that does not exist draws nothing (`Ok(false)`).
-    async fn link_agent_uses(
-        &self,
-        agent_id: Uuid,
-        label: &str,
-        target_id: Uuid,
-        provenance: &crate::graph::rules::Provenance,
-    ) -> Result<bool>;
-
-    /// Reinforces the `SYNAPSE` pairs among `notes` (all pairs, both directions), scoped to
-    /// `project`, and records on each edge WHICH rule and WHICH measure produced the
-    /// reinforcement — plus the session that did it. `last_session` is the last activator,
-    /// never a claim about who created the edge.
-    ///
-    /// Returns the number of edges touched (created or reinforced).
-    async fn coactivate_session(
-        &self,
-        project: Uuid,
-        notes: &[Uuid],
-        session: Uuid,
-        provenance: &crate::graph::rules::Provenance,
-    ) -> Result<usize>;
-
-    /// What that agent knows, bounded by `limit`, plus how many exist — « la part lue est
-    /// dite ». Only `(:Agent)-[:KNOWS]->(:Note)` is read: a `KNOWS` reaching a `File` (the
-    /// persona meaning) never leaks into this answer.
-    async fn agent_knows(
-        &self,
-        agent_id: Uuid,
-        limit: usize,
-    ) -> Result<crate::graph::rules::AgentKnowledge>;
-
-    /// The graph described as a catalog: its labels, and for each relationship type the
-    /// label pairs it really connects, with measured counts. Measured, never declared.
-    async fn schema_catalog(&self) -> Result<crate::graph::schema::SchemaCatalog>;
-
-    /// Walks forward from one anchor along the causal family
-    /// ([`crate::graph::schema::CAUSAL_TYPES`]), up to `max_depth` hops. `label` must be
-    /// one of [`crate::graph::schema::CAUSAL_ANCHORS`]; anything else is an error, never a
-    /// query built from caller input. An anchor that does not exist yields an empty walk
-    /// (the chain does not exist), never an error.
-    async fn causal_walk(
-        &self,
-        label: &str,
-        id: &str,
-        max_depth: u32,
-    ) -> Result<crate::graph::schema::CausalWalk>;
-
-    // ========================================================================
-    // Episode embedding search (ReflexEngine)
-    // ========================================================================
-
-    /// Search episodes by embedding similarity (cosine).
-    ///
-    /// Returns up to `limit` episodes with their cosine similarity score (0.0-1.0).
-    /// Used by the ReflexEngine for episode recall suggestions.
-    ///
-    /// Default implementation returns an empty vec (graceful fallback for
-    /// implementations that don't support embedding search yet).
-    async fn search_episodes_by_embedding(
-        &self,
-        _project_id: Uuid,
-        _embedding: &[f32],
-        _limit: usize,
-    ) -> Result<Vec<(crate::episodes::models::Episode, f64)>> {
-        Ok(Vec::new())
-    }
-
-    // ========================================================================
-    // Alert operations (Heartbeat Engine)
-    // ========================================================================
-
-    /// Create a new alert node.
-    async fn create_alert(&self, alert: &AlertNode) -> Result<()>;
-
-    /// List pending (unacknowledged) alerts, optionally filtered by project.
-    /// Returns alerts ordered by created_at DESC.
-    async fn list_pending_alerts(
-        &self,
-        project_id: Option<Uuid>,
-        limit: usize,
-    ) -> Result<Vec<AlertNode>>;
-
-    /// Acknowledge an alert by ID. Sets acknowledged=true and records who/when.
-    async fn acknowledge_alert(&self, alert_id: Uuid, acknowledged_by: &str) -> Result<()>;
-
-    /// Get a single alert by ID.
-    async fn get_alert(&self, alert_id: Uuid) -> Result<Option<AlertNode>>;
-
-    /// List all alerts (including acknowledged), optionally filtered by project.
-    async fn list_alerts(
-        &self,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<AlertNode>, usize)>;
-
-    // ========================================================================
-    // EventTrigger operations
-    // ========================================================================
-
-    /// List EventTriggers, optionally filtered by project scope and/or enabled status.
-    async fn list_event_triggers(
-        &self,
-        project_scope: Option<Uuid>,
-        enabled_only: bool,
-    ) -> Result<Vec<EventTrigger>>;
-
-    /// Create an EventTrigger node. Returns the generated UUID.
-    async fn create_event_trigger(&self, trigger: &EventTrigger) -> Result<Uuid>;
-
-    /// Get an EventTrigger by its UUID.
-    async fn get_event_trigger(&self, id: Uuid) -> Result<Option<EventTrigger>>;
-
-    /// Update an EventTrigger's fields. Only provided fields are updated.
-    /// Returns `true` if the trigger was found and updated, `false` if not found.
-    #[allow(clippy::too_many_arguments)]
-    async fn update_event_trigger(
-        &self,
-        id: Uuid,
-        enabled: Option<bool>,
-        name: Option<String>,
-        entity_type_pattern: Option<Option<String>>,
-        action_pattern: Option<Option<String>>,
-        payload_conditions: Option<Option<serde_json::Value>>,
-        cooldown_secs: Option<u32>,
-        project_scope: Option<Option<Uuid>>,
-    ) -> Result<bool>;
-
-    /// Delete an EventTrigger by its UUID.
-    /// Returns `true` if a node was deleted, `false` if not found.
-    async fn delete_event_trigger(&self, id: Uuid) -> Result<bool>;
-
-    // ========================================================================
-    // LifecycleHook operations
-    // ========================================================================
-
-    /// Create a lifecycle hook
-    async fn create_lifecycle_hook(&self, hook: &LifecycleHook) -> Result<()>;
-
-    /// Get a lifecycle hook by ID
-    async fn get_lifecycle_hook(&self, id: Uuid) -> Result<Option<LifecycleHook>>;
-
-    /// List lifecycle hooks, optionally filtered by project_id
-    async fn list_lifecycle_hooks(&self, project_id: Option<Uuid>) -> Result<Vec<LifecycleHook>>;
-
-    /// Update a lifecycle hook
-    async fn update_lifecycle_hook(
-        &self,
-        id: Uuid,
-        updates: &UpdateLifecycleHookRequest,
-    ) -> Result<()>;
-
-    /// Delete a lifecycle hook (builtin hooks cannot be deleted)
-    async fn delete_lifecycle_hook(&self, id: Uuid) -> Result<()>;
-
-    /// List hooks matching scope and on_status, including global hooks
-    async fn list_hooks_for_scope(
-        &self,
-        scope: &LifecycleScope,
-        on_status: &str,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<LifecycleHook>>;
-
-    // ========================================================================
-    // MCP Federation operations
-    // ========================================================================
-
-    /// Create an MCP server node
-    async fn create_mcp_server(&self, server: &McpServerNode) -> Result<()>;
-
-    /// Get an MCP server by UUID
-    async fn get_mcp_server(&self, id: Uuid) -> Result<Option<McpServerNode>>;
-
-    /// List MCP servers for a project
-    async fn list_mcp_servers(&self, project_id: Uuid) -> Result<Vec<McpServerNode>>;
-
-    /// List ALL MCP servers across all projects (used for startup bootstrap)
-    async fn list_all_mcp_servers(&self) -> Result<Vec<McpServerNode>>;
-
-    /// Delete an MCP server and its tools
-    async fn delete_mcp_server(&self, id: Uuid) -> Result<()>;
-
-    /// Delete an MCP server by its string server_id (e.g. "discord")
-    async fn delete_mcp_server_by_server_id(&self, server_id: &str) -> Result<()>;
-
-    /// Update MCP server connection status
-    async fn update_mcp_server_status(&self, id: Uuid, status: &str) -> Result<()>;
-
-    /// Create an MCP tool node
-    async fn create_mcp_tool(&self, tool: &McpToolNode) -> Result<()>;
-
-    /// List tools for an MCP server
-    async fn list_mcp_tools_for_server(&self, server_id: &str) -> Result<Vec<McpToolNode>>;
-
-    /// Delete all tools for an MCP server
-    async fn delete_mcp_tools_for_server(&self, server_id: &str) -> Result<()>;
-
-    /// Create SIMILAR_TO relation between two MCP tools
-    async fn create_mcp_similar_to(
-        &self,
-        tool_fqn: &str,
-        similar_to_fqn: &str,
-        score: f64,
-    ) -> Result<()>;
-
-    /// Create CO_ACTIVATED_WITH relation (tools used in the same session)
-    async fn create_mcp_co_activated(
-        &self,
-        tool_fqn_a: &str,
-        tool_fqn_b: &str,
-        count: i64,
-    ) -> Result<()>;
-
-    /// Create OFTEN_FOLLOWS relation (tool B called after tool A)
-    async fn create_mcp_often_follows(
-        &self,
-        tool_fqn_a: &str,
-        tool_fqn_b: &str,
-        count: i64,
-        avg_delta_ms: f64,
-    ) -> Result<()>;
-
-    /// Backfill CO_ACTIVATED_WITH relations from chat event history
-    async fn backfill_co_activated_with(&self) -> Result<usize>;
-
-    /// Backfill OFTEN_FOLLOWS relations from consecutive tool use events
-    async fn backfill_often_follows(&self) -> Result<usize>;
-
-    // ========================================================================
-    // Entity neighbourhood (ego-graph)
-    // ========================================================================
-
-    /// Bounded candidate neighbourhood around an entity, walked hop by hop
-    /// over the relationship types of `params.layers` (see
-    /// `crate::graph::neighborhood`). `Ok(None)` when the centre is unknown.
-    async fn get_entity_neighborhood(
-        &self,
-        center_type: &str,
-        center_id: &str,
-        params: &crate::graph::neighborhood::NeighborhoodParams,
-    ) -> Result<Option<crate::graph::neighborhood::RawNeighborhood>>;
-
-    /// [`get_entity_neighborhood`](Self::get_entity_neighborhood) with the PROJECT
-    /// filter applied inside each hop, before the fan-out limit (a neighbour of
-    /// another project cannot evict a local one). The centre is always returned
-    /// with its owner; neighbours carry theirs and their own consent, for the
-    /// `may_read` post-filter. Used by the anchor resolver.
-    async fn get_scoped_entity_neighborhood(
-        &self,
-        center_type: &str,
-        center_id: &str,
-        params: &crate::graph::neighborhood::NeighborhoodParams,
-        filter: &crate::graph::neighborhood::ProjectFilter,
-    ) -> Result<Option<crate::graph::neighborhood::ScopedNeighborhood>>;
 }
 
 #[cfg(test)]
