@@ -237,7 +237,7 @@ pub async fn update_config(
             );
         } else if collection_enabled {
             // Collector doesn't exist yet — create it on demand
-            if let Some(ref store) = state.trajectory_store_neo4j {
+            if let Some(ref store) = state.trajectory_store {
                 let coll_config = neural_routing_runtime::config::CollectionConfig {
                     enabled: true,
                     buffer_size: config.collection.buffer_size,
@@ -317,7 +317,6 @@ mod tests {
             oidc_client: None,
             neural_router: mock_neural_router(),
             trajectory_collector: std::sync::RwLock::new(None),
-            trajectory_store_neo4j: None,
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),

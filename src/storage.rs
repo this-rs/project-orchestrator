@@ -30,14 +30,6 @@ pub struct StorageBackend {
     pub trajectories: Arc<dyn neural_routing_runtime::TrajectoryStore>,
     /// What the built graph store actually supports.
     pub capabilities: StoreCapabilities,
-    /// The concrete trajectory store, kept for the lazy initialization of the
-    /// trajectory collector.
-    ///
-    /// The collector itself now takes the [`neural_routing_runtime::TrajectoryStore`]
-    /// trait object; this typed handle only survives because the main crate is the
-    /// adapter's home and may legitimately hold the concrete implementation it built.
-    pub trajectory_store_concrete:
-        Option<Arc<crate::neo4j::trajectory_store::Neo4jTrajectoryStore>>,
 }
 
 /// Which storage backend to build.
@@ -95,7 +87,6 @@ impl StorageBackend {
             search,
             trajectories: nr_store.clone(),
             capabilities,
-            trajectory_store_concrete: Some(nr_store),
         })
     }
 }

@@ -145,7 +145,6 @@ pub fn mock_app_state() -> AppState {
         }),
         neural_router: mock_neural_router(),
         trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
-        trajectory_store_neo4j: None,
         trajectory_store: mock_trajectory_store(),
         mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
     }
@@ -205,7 +204,6 @@ pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> Ap
         }),
         neural_router: mock_neural_router(),
         trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
-        trajectory_store_neo4j: None,
         trajectory_store: mock_trajectory_store(),
         mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
     }
@@ -265,7 +263,6 @@ pub fn mock_app_state_with_graph(graph: Arc<MockGraphStore>) -> AppState {
         }),
         neural_router: mock_neural_router(),
         trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
-        trajectory_store_neo4j: None,
         trajectory_store: mock_trajectory_store(),
         mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
     }
@@ -330,7 +327,6 @@ pub fn mock_app_state_with_stores() -> (AppState, Arc<MockGraphStore>, Arc<MockS
         }),
         neural_router: mock_neural_router(),
         trajectory_collector: Arc::new(std::sync::RwLock::new(None)),
-        trajectory_store_neo4j: None,
         trajectory_store: mock_trajectory_store(),
         mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
     };
@@ -724,7 +720,6 @@ pub async fn server_state_with_chat(
         oidc_client: None,
         neural_router: mock_neural_router(),
         trajectory_collector: std::sync::RwLock::new(None),
-        trajectory_store_neo4j: None,
         trajectory_store: None,
         identity: None,
         reactor_counters: std::sync::OnceLock::new(),
@@ -795,7 +790,6 @@ pub async fn router_with_auth_and_events(
         oidc_client: None,
         neural_router: mock_neural_router(),
         trajectory_collector: std::sync::RwLock::new(None),
-        trajectory_store_neo4j: None,
         trajectory_store: None,
         identity: None,
         reactor_counters: std::sync::OnceLock::new(),
