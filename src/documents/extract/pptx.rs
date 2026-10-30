@@ -340,6 +340,7 @@ fn ordered_slide_parts<R: Read + Seek>(
     let mut numbered: Vec<(u64, String)> = archive
         .file_names()
         .filter_map(|n| {
+            let n = n.ok()?;
             let num = n
                 .strip_prefix("ppt/slides/slide")?
                 .strip_suffix(".xml")?
