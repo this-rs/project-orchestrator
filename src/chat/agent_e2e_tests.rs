@@ -9483,6 +9483,101 @@ mod native_transcripts {
         assert!(!after.delete_session(uuid).await.unwrap(), "already gone");
     }
 
+    fn script_lost() -> Value {
+        let mut routes = vec![answer("AFTER-LOST"), answer("SECOND-TURN")];
+        routes.extend(script().as_array().cloned().unwrap());
+        Value::Array(routes)
+    }
+
+    /// A native session whose transcript FILE is gone must still resume: the resume token
+    /// names a transcript written only when a turn commits, so a session cut before its
+    /// first committed turn (a fresh open, notably the first turn after a provider switch)
+    /// carried a token that named nothing. Every resume then failed with
+    /// `"unknown transcript: nothing to resume"` and the conversation was bricked even
+    /// though the graph held it whole (05716244). The repair reopens FRESH with the stored
+    /// history relayed in front of the message: the conversation is never lost.
+    #[tokio::test]
+    async fn a_native_session_whose_transcript_is_gone_resumes_by_relaying_the_stored_history() {
+        let fake = FakeOpenAi::start(script_lost());
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("native-transcripts");
+
+        // Two committed turns: the transcript the token names is written to disk.
+        let before = manager(graph.clone(), true).with_native_transcripts(&root);
+        let sid = before
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        wait_results(&graph, &sid, 1).await;
+        before.send_message(&sid, "SECOND-TURN").await.unwrap();
+        wait_results(&graph, &sid, 2).await;
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+
+        let uuid = Uuid::parse_str(&sid).unwrap();
+        let token = graph
+            .get_chat_session(uuid)
+            .await
+            .unwrap()
+            .unwrap()
+            .resume_token
+            .expect("a native session persists its resume token");
+        let old_id = super::super::provider::transcripts::transcript_id_of(&token)
+            .expect("a native token names a transcript");
+        let file = root.join("local").join(format!("{old_id}.json"));
+        assert!(file.exists(), "the transcript is on disk");
+        // Simulate the bug: the token still names the transcript, but the file — never
+        // written because no turn ever committed — is absent.
+        std::fs::remove_file(&file).unwrap();
+        assert!(!file.exists());
+
+        // A restart. The resume must NOT fail with "unknown transcript": it reopens fresh
+        // and relays the stored history in front of the message.
+        let after = manager(graph.clone(), true).with_native_transcripts(&root);
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        after
+            .resume_session(&sid, "AFTER-LOST", Some(&claims))
+            .await
+            .unwrap_or_else(|e| panic!("resume with a lost transcript failed: {e:#}"));
+        wait_results(&graph, &sid, 3).await;
+
+        // The model's request carries the earlier conversation, rebuilt from the graph
+        // (the absent transcript could no longer provide it).
+        let body = fake
+            .chat_requests()
+            .iter()
+            .map(|r| r["body"].to_string())
+            .find(|b| b.contains("AFTER-LOST"))
+            .expect("the repaired turn reached the model");
+        for earlier in ["hi there", "hello from the fake model", "SECOND-TURN"] {
+            assert!(
+                body.contains(earlier),
+                "the repaired resume carries the stored history ({earlier}): {body}"
+            );
+        }
+
+        // A fresh transcript is on disk under a NEW token: the session is whole again and
+        // will resume after the next restart too.
+        let new_token = graph
+            .get_chat_session(uuid)
+            .await
+            .unwrap()
+            .unwrap()
+            .resume_token
+            .expect("the repaired session persists a resume token");
+        let new_id = super::super::provider::transcripts::transcript_id_of(&new_token)
+            .expect("a native token names a transcript");
+        assert_ne!(new_id, old_id, "the repair opened a fresh transcript");
+        assert!(
+            root.join("local").join(format!("{new_id}.json")).exists(),
+            "the repaired session wrote a fresh transcript"
+        );
+    }
+
     /// The `degraded_features` of the session's `system_init`, as persisted.
     async fn degraded_of(graph: &MockGraphStore, sid: &str) -> Vec<String> {
         let uuid = Uuid::parse_str(sid).unwrap();

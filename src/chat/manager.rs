@@ -18431,8 +18431,64 @@ impl ChatManager {
                 return Err(anyhow::Error::new(incompatible));
             }
         }
-        // No resume token survives a move across provider families: a switch opens fresh.
-        let token = if relay.is_some() {
+        // A native resume token names a transcript FILE on disk, and that file is written
+        // only when a turn COMMITS (`loop.rs`). A session cut before its first committed
+        // turn — a fresh open, notably the first turn right after a provider switch —
+        // therefore carries a token that names NOTHING, and every resume then failed with
+        // "unknown transcript: nothing to resume", bricking the session for good even
+        // though the graph holds the whole conversation (a switch cut mid-first-turn).
+        // When the transcript the token names is absent, do NOT resume it: reopen FRESH
+        // with the stored history relayed in front of the message (the same rendering a
+        // provider switch uses), so a conversation is never lost.
+        let lost_native = relay.is_none()
+            && node.resume_token.as_deref().is_some_and(|wire| {
+                super::provider::transcripts::named_transcript_missing(
+                    self.native_transcripts.as_deref(),
+                    &provider_id,
+                    wire,
+                ) == Some(true)
+            });
+        let fallback_relay = if lost_native {
+            let records = self
+                .graph
+                .get_chat_events(node.id, 0, 5_000)
+                .await
+                .unwrap_or_default();
+            let events: Vec<ChatEvent> = records
+                .iter()
+                .filter_map(|record| serde_json::from_str(&record.data).ok())
+                .collect();
+            let window = provider
+                .capabilities(Some(node.model.as_str()))
+                .context_window
+                .map(|w| w.value);
+            warn!(
+                session_id = %sid,
+                provider = %provider_id,
+                "resume: the native transcript is gone; reopening fresh with the stored history relayed"
+            );
+            Some(super::relay::RelayedFrom {
+                relay: super::relay::render_relay(
+                    &events,
+                    &provider_id,
+                    &provider_id,
+                    super::relay::budget_for_window(window),
+                ),
+                from_session_id: sid.clone(),
+                from_provider: provider_id.clone(),
+                // Not a router move: a resume that repairs a lost transcript never imposes
+                // a target and never counts as an automatic `full`-mode move.
+                moved_by: super::relay::MOVED_BY_USER.to_string(),
+                conversation_id: node.conversation_id.clone(),
+                segments: None,
+                next_turn: 0,
+            })
+        } else {
+            None
+        };
+        // No resume token survives a move across provider families, nor a repair of a lost
+        // transcript: both open fresh (the second replays the history as a relay instead).
+        let token = if relay.is_some() || fallback_relay.is_some() {
             None
         } else {
             node.resume_token
@@ -18548,6 +18604,12 @@ impl ChatManager {
             // front of it (never stored).
             handle
                 .send_message_relayed(message, &super::relay::prefixed(relay.text(), message))
+                .await
+        } else if let Some(lost) = fallback_relay.as_ref() {
+            // The lost-transcript repair: the same as a switch — the thread shows `message`
+            // alone, the model reads the rebuilt history in front of it (never stored).
+            handle
+                .send_message_relayed(message, &super::relay::prefixed(lost.text(), message))
                 .await
         } else {
             handle.send_message(message).await
