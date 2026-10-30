@@ -4476,6 +4476,35 @@ pub trait AnalyticsStore: Send + Sync {
         provenance: &crate::graph::rules::Provenance,
     ) -> Result<bool>;
 
+    /// Draws `(:Agent)-[:USES {rule, measure, at}]->(:Persona|:Skill|:Protocol)` — what
+    /// the subject actually applied to itself. The source is the activation registry: the
+    /// stages record what they injected into a session, and this makes that a durable edge
+    /// instead of a memory that dies with the process.
+    ///
+    /// `label` is one of [`crate::graph::rules::USABLE_LABELS`]; anything else is refused
+    /// before a query is built. A target that does not exist draws nothing (`Ok(false)`).
+    async fn link_agent_uses(
+        &self,
+        agent_id: Uuid,
+        label: &str,
+        target_id: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> Result<bool>;
+
+    /// Reinforces the `SYNAPSE` pairs among `notes` (all pairs, both directions), scoped to
+    /// `project`, and records on each edge WHICH rule and WHICH measure produced the
+    /// reinforcement — plus the session that did it. `last_session` is the last activator,
+    /// never a claim about who created the edge.
+    ///
+    /// Returns the number of edges touched (created or reinforced).
+    async fn coactivate_session(
+        &self,
+        project: Uuid,
+        notes: &[Uuid],
+        session: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> Result<usize>;
+
     /// What that agent knows, bounded by `limit`, plus how many exist — « la part lue est
     /// dite ». Only `(:Agent)-[:KNOWS]->(:Note)` is read: a `KNOWS` reaching a `File` (the
     /// persona meaning) never leaks into this answer.

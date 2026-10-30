@@ -2781,6 +2781,28 @@ impl AnalyticsStore for Neo4jClient {
         self.link_agent_knows(agent_id, note_id, provenance).await
     }
 
+    async fn coactivate_session(
+        &self,
+        project: Uuid,
+        notes: &[Uuid],
+        session: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> anyhow::Result<usize> {
+        self.coactivate_session(project, notes, session, provenance)
+            .await
+    }
+
+    async fn link_agent_uses(
+        &self,
+        agent_id: Uuid,
+        label: &str,
+        target_id: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> anyhow::Result<bool> {
+        self.link_agent_uses(agent_id, label, target_id, provenance)
+            .await
+    }
+
     async fn agent_knows(
         &self,
         agent_id: Uuid,

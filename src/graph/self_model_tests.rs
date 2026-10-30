@@ -228,6 +228,142 @@ async fn the_backfill_rebuilds_the_two_attribution_families() {
     );
 }
 
+#[tokio::test]
+async fn an_activation_becomes_a_durable_uses_edge() {
+    // The registry that holds activations dies with the process. `USES` is the same fact,
+    // written where it survives — and it names the rule and the session that measured it.
+    use crate::graph::rules::{run_with, Measurement, AGENT_USES_ACTIVATED};
+    let graph = MockGraphStore::new();
+    let agent = Uuid::new_v4();
+    let persona = Uuid::new_v4();
+    let skill = Uuid::new_v4();
+
+    let outcome = run_with(
+        &graph,
+        AGENT_USES_ACTIVATED.name,
+        Measurement::Activation {
+            session: Uuid::new_v4(),
+            agent,
+            personas: vec![persona],
+            skills: vec![skill],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.considered, 2);
+    assert_eq!(outcome.written, 2, "{outcome:?}");
+    let uses = graph.agent_uses.read().await;
+    let (_, label, target) = uses.keys().find(|(a, _, _)| *a == agent).unwrap();
+    assert_eq!(label, "Persona");
+    assert_eq!(*target, persona);
+    let stored = uses.values().next().unwrap();
+    assert!(stored.is_accountable(), "the edge must say why it exists");
+    assert_eq!(stored.rule, AGENT_USES_ACTIVATED.name);
+}
+
+#[tokio::test]
+async fn an_activation_of_nothing_writes_nothing() {
+    use crate::graph::rules::{run_with, Measurement, AGENT_USES_ACTIVATED};
+    let graph = MockGraphStore::new();
+    let outcome = run_with(
+        &graph,
+        AGENT_USES_ACTIVATED.name,
+        Measurement::Activation {
+            session: Uuid::new_v4(),
+            agent: Uuid::new_v4(),
+            personas: vec![],
+            skills: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.written, 0);
+    assert_eq!(outcome.considered, 0);
+    assert!(graph.agent_uses.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_session_welds_the_notes_it_had_in_context() {
+    // T5: what the turn really had in context becomes structure, and each edge says which
+    // session did it. Three notes → three pairs, both directions.
+    use crate::graph::rules::{run_with, Measurement, SESSION_CO_ACTIVATION};
+    let graph = MockGraphStore::new();
+    let project = Uuid::new_v4();
+    let session = Uuid::new_v4();
+    let notes: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+
+    let outcome = run_with(
+        &graph,
+        SESSION_CO_ACTIVATION.name,
+        Measurement::SessionNotes {
+            session,
+            project: Some(project),
+            notes: notes.clone(),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.considered, 3);
+    assert_eq!(outcome.written, 6, "3 pairs, both directions: {outcome:?}");
+    let synapses = graph.synapses.read().await;
+    assert_eq!(synapses.len(), 3);
+    let (owner, welder, provenance) = synapses.values().next().unwrap();
+    assert_eq!(*owner, project);
+    assert_eq!(*welder, session);
+    assert_eq!(provenance.rule, SESSION_CO_ACTIVATION.name);
+}
+
+#[tokio::test]
+async fn a_session_with_one_note_or_no_project_welds_nothing() {
+    use crate::graph::rules::{run_with, Measurement, SESSION_CO_ACTIVATION};
+    let graph = MockGraphStore::new();
+
+    let single = run_with(
+        &graph,
+        SESSION_CO_ACTIVATION.name,
+        Measurement::SessionNotes {
+            session: Uuid::new_v4(),
+            project: Some(Uuid::new_v4()),
+            notes: vec![Uuid::new_v4()],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(single.written, 0);
+    assert!(single.measure.contains('1'), "{}", single.measure);
+
+    let homeless = run_with(
+        &graph,
+        SESSION_CO_ACTIVATION.name,
+        Measurement::SessionNotes {
+            session: Uuid::new_v4(),
+            project: None,
+            notes: vec![Uuid::new_v4(), Uuid::new_v4()],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(homeless.written, 0);
+    assert!(graph.synapses.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn an_unusable_label_is_refused_before_any_query() {
+    let graph = MockGraphStore::new();
+    let err = graph
+        .link_agent_uses(
+            Uuid::new_v4(),
+            "User; MATCH (n) DETACH DELETE n //",
+            Uuid::new_v4(),
+            &Provenance::new("agent-uses-activated", "measured"),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not a usable label"), "{err}");
+}
+
 #[test]
 fn the_rule_engine_names_no_language_model() {
     // The constraint is mechanical, so the test is too: the module may use an embedding

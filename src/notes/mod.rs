@@ -189,6 +189,41 @@ pub mod provenance {
         }
     }
 
+    /// Records, durably, that the agent of `session` applied `label` (a persona, a skill)
+    /// — the edge the activation registry only ever held in memory.
+    ///
+    /// Best effort by construction: an agent that cannot be named, or a target the graph
+    /// does not have, draws nothing and is logged. Activation decides what the turn sees;
+    /// it must never fail because a bookkeeping edge could not be written.
+    pub async fn record_agent_uses(
+        graph: &dyn GraphStore,
+        session_id: Uuid,
+        label: &str,
+        target: Uuid,
+    ) {
+        let agent = match agent_id_of_session(graph, session_id).await {
+            Ok(Some(id)) => id,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::debug!(session_id = %session_id, error = %e, "the agent of an activation could not be named");
+                return;
+            }
+        };
+        if let Err(e) = graph.ensure_agent(agent, None).await {
+            tracing::debug!(agent = %agent, error = %e, "the node of an activated agent could not be made");
+        }
+        let provenance = crate::graph::rules::Provenance::new(
+            crate::graph::rules::AGENT_USES_ACTIVATED.name,
+            format!("activé dans la session {session_id}"),
+        );
+        if let Err(e) = graph
+            .link_agent_uses(agent, label, target, &provenance)
+            .await
+        {
+            tracing::debug!(agent = %agent, label, error = %e, "an activation did not become an edge");
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;

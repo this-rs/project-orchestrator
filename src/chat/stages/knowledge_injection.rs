@@ -1445,10 +1445,14 @@ impl KnowledgeInjectionStage {
             workspace_notes,
             max_content_chars,
             None,
+            &mut Vec::new(),
         )
     }
 
-    /// [`Self::render_knowledge`] with the project slug carried by the containers.
+    /// [`Self::render_knowledge`] with the project slug carried by the containers, and the
+    /// ids it actually rendered written into `rendered` (they feed the session's
+    /// co-activation, never the prompt).
+    #[allow(clippy::too_many_arguments)]
     fn render_knowledge_in(
         &self,
         notes: &[ScoredNote],
@@ -1457,6 +1461,7 @@ impl KnowledgeInjectionStage {
         workspace_notes: &[ScoredNote],
         max_content_chars: usize,
         project: Option<&str>,
+        rendered: &mut Vec<String>,
     ) -> Option<String> {
         if notes.is_empty()
             && decisions.is_empty()
@@ -1485,6 +1490,7 @@ impl KnowledgeInjectionStage {
                 }
                 group.push_str(&entry);
                 chars_used += entry.len();
+                rendered.push(note.id.clone());
             }
             content.push_str(&untrusted_group("note", &group, project));
             content.push('\n');
@@ -1506,6 +1512,7 @@ impl KnowledgeInjectionStage {
                 }
                 group.push_str(&entry);
                 chars_used += entry.len();
+                rendered.push(note.id.clone());
             }
             content.push_str(&untrusted_group("note", &group, project));
             content.push('\n');
@@ -1822,14 +1829,28 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
         }
 
         // Render and inject into output
-        if let Some(content) = self.render_knowledge_in(
+        let mut rendered: Vec<String> = Vec::new();
+        let content = self.render_knowledge_in(
             &notes,
             &decisions,
             &predictions,
             &workspace_notes,
             effective_config.max_content_chars,
             input.project_slug.as_deref(),
-        ) {
+            &mut rendered,
+        );
+
+        // What the turn actually had in context, recorded for the session. The close reads
+        // it to reinforce the pairs that were really co-injected — not the ones a rule
+        // imagines. Bounded in the registry, like skills and personas.
+        let mut activated: Vec<Uuid> = pinned
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect();
+        activated.extend(rendered.iter().filter_map(|id| Uuid::parse_str(id).ok()));
+        crate::chat::activation_registry::record_notes(input.session_id, activated);
+
+        if let Some(content) = content {
             output.add_section(
                 "Relevant Knowledge",
                 content,

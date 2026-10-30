@@ -1122,6 +1122,44 @@ impl Neo4jClient {
         }
     }
 
+    /// See [`crate::neo4j::AnalyticsStore::link_agent_uses`].
+    pub async fn link_agent_uses(
+        &self,
+        agent_id: Uuid,
+        label: &str,
+        target_id: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> Result<bool> {
+        if !crate::graph::rules::USABLE_LABELS.contains(&label) {
+            anyhow::bail!(
+                "{label} is not a usable label: {}",
+                crate::graph::rules::USABLE_LABELS.join(", ")
+            );
+        }
+        let statement = format!(
+            "MATCH (a:Agent {{id: $agent}}), (t:{label} {{id: $target}}) \
+             MERGE (a)-[r:USES]->(t) \
+             ON CREATE SET r.created_at = datetime() \
+             SET r.rule = $rule, r.measure = $measure, r.at = $at \
+             RETURN r.created_at IS NOT NULL AND r.created_at >= datetime() - duration('PT2S') AS created"
+        );
+        let mut result = self
+            .graph
+            .execute(
+                query(&statement)
+                    .param("agent", agent_id.to_string())
+                    .param("target", target_id.to_string())
+                    .param("rule", provenance.rule.clone())
+                    .param("measure", provenance.measure.clone())
+                    .param("at", provenance.at.clone()),
+            )
+            .await?;
+        match result.next().await? {
+            Some(row) => Ok(row.get::<bool>("created").unwrap_or(false)),
+            None => Ok(false),
+        }
+    }
+
     /// See [`crate::neo4j::AnalyticsStore::agent_knows`]. Two reads, not one: the bounded
     /// list and the total. A single query that returned only the list could not say how
     /// much it had left out.

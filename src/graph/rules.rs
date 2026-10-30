@@ -107,8 +107,47 @@ pub const AGENT_KNOWS_CORE: Rule = Rule {
     target_label: "Note",
 };
 
+/// `(:Agent {kind:'self'})-[:USES]->(:Persona | :Skill)` — ce que le sujet s'applique.
+///
+/// La mesure vient du registre d'activation : les étages de persona et d'activation de
+/// skills enregistrent ce qu'ils ont injecté dans une session. Cette liste vivait en
+/// mémoire et mourait avec le processus ; la règle en fait une arête durable, avec la
+/// mesure (« 2 sessions sur 9 ») écrite dessus.
+pub const AGENT_USES_ACTIVATED: Rule = Rule {
+    name: "agent-uses-activated",
+    justification: "Une persona ou un skill réellement injecté dans une session est \
+                    appliqué par l'agent de cette session : c'est une mesure, pas un \
+                    réglage, et elle devient USES.",
+    edge: "USES",
+    target_label: "Persona|Skill",
+};
+
+/// The labels a `USES` edge may reach. A label is interpolated into a query, so it is
+/// matched against this closed list first.
+pub const USABLE_LABELS: &[&str] = &["Persona", "Skill", "Protocol"];
+
+/// `(:Note)-[:SYNAPSE]->(:Note)` entre les notes qu'une session a réellement eues en
+/// contexte, renforcée à la clôture.
+///
+/// L'expérience devient structurante : jusqu'ici les 65 069 synapses reliaient des notes
+/// entre elles sans qu'aucune ne dise quelle session les avait activées. La mesure vient
+/// du registre d'activation (les notes rendues dans le tour), et elle est écrite sur
+/// l'arête — c'est ce qui rend le renforcement contestable.
+pub const SESSION_CO_ACTIVATION: Rule = Rule {
+    name: "session-co-activation",
+    justification: "Deux notes présentes dans le même contexte et durcies par une même \
+                    session sont liées : c'est une co-occurrence mesurée, pas une \
+                    similarité supposée.",
+    edge: "SYNAPSE",
+    target_label: "Note",
+};
+
 /// The rules this engine knows, in a stable order.
-pub const RULES: &[Rule] = &[AGENT_KNOWS_CORE];
+pub const RULES: &[Rule] = &[
+    AGENT_KNOWS_CORE,
+    AGENT_USES_ACTIVATED,
+    SESSION_CO_ACTIVATION,
+];
 
 /// The declared rule of that name, if any.
 pub fn rule(name: &str) -> Option<&'static Rule> {
@@ -126,6 +165,29 @@ pub struct RuleOutcome {
     /// Edges that were already there, re-attested rather than duplicated.
     pub skipped: usize,
     pub measure: String,
+}
+
+/// The measurement a rule needs when it cannot be read from the graph alone.
+///
+/// Most rules read the graph and need nothing else. One does not: what an agent applied to
+/// itself exists only in memory, in the activation registry, and the close of a session is
+/// the only moment it can become edges. Rather than a second engine, the same engine takes
+/// the measurement as an argument — and the rule stays a declaration either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Measurement {
+    /// What the stages injected while one session ran.
+    Activation {
+        session: Uuid,
+        agent: Uuid,
+        personas: Vec<Uuid>,
+        skills: Vec<Uuid>,
+    },
+    /// The notes a turn really had in context, and the project that owns them.
+    SessionNotes {
+        session: Uuid,
+        project: Option<Uuid>,
+        notes: Vec<Uuid>,
+    },
 }
 
 /// The outcome of a run, rule by rule.
@@ -160,12 +222,103 @@ pub async fn run(graph: &dyn GraphStore, names: &[&str]) -> anyhow::Result<Rules
     for r in selected {
         let outcome = match r.name {
             "agent-knows-core" => run_agent_knows_core(graph).await?,
+            "session-co-activation" => RuleOutcome {
+                name: r.name.to_string(),
+                measure: "non exécutée ici : sa mesure vient de l'appelant (les notes \
+                          injectées dans la session), pas du graphe — voir `run_with`"
+                    .to_string(),
+                ..Default::default()
+            },
+            "agent-uses-activated" => RuleOutcome {
+                name: r.name.to_string(),
+                measure: "non exécutée ici : sa mesure vient de l'appelant (le registre \
+                          d'activation), pas du graphe — voir `run_with`"
+                    .to_string(),
+                ..Default::default()
+            },
             other => anyhow::bail!("rule {other} is declared but has no executor"),
         };
         report.edges_written += outcome.written;
         report.rules.push(outcome);
     }
     Ok(report)
+}
+
+/// Runs one rule whose measurement the caller holds. Deterministic all the same: the input
+/// is a list of ids that were measured, never text.
+pub async fn run_with(
+    graph: &dyn GraphStore,
+    rule_name: &str,
+    measurement: Measurement,
+) -> anyhow::Result<RuleOutcome> {
+    let r = rule(rule_name).ok_or_else(|| anyhow::anyhow!("unknown rule: {rule_name}"))?;
+    match (r.name, measurement) {
+        (
+            "agent-uses-activated",
+            Measurement::Activation {
+                session,
+                agent,
+                personas,
+                skills,
+            },
+        ) => run_agent_uses_activated(graph, session, agent, &personas, &skills).await,
+        (
+            "session-co-activation",
+            Measurement::SessionNotes {
+                session,
+                project,
+                notes,
+            },
+        ) => run_session_co_activation(graph, session, project, &notes).await,
+        (name, _) => anyhow::bail!("rule {name} does not take this measurement"),
+    }
+}
+
+async fn run_agent_uses_activated(
+    graph: &dyn GraphStore,
+    session: Uuid,
+    agent: Uuid,
+    personas: &[Uuid],
+    skills: &[Uuid],
+) -> anyhow::Result<RuleOutcome> {
+    let considered = personas.len() + skills.len();
+    if considered == 0 {
+        return Ok(RuleOutcome {
+            name: AGENT_USES_ACTIVATED.name.to_string(),
+            measure: format!("session {session} : rien n'a été activé"),
+            ..Default::default()
+        });
+    }
+
+    let measure = format!(
+        "{} persona(s) et {} skill(s) activés dans la session {session}",
+        personas.len(),
+        skills.len()
+    );
+    let provenance = Provenance::new(AGENT_USES_ACTIVATED.name, measure.clone());
+
+    let mut written = 0;
+    let mut skipped = 0;
+    for (label, ids) in [("Persona", personas), ("Skill", skills)] {
+        for id in ids {
+            if graph
+                .link_agent_uses(agent, label, *id, &provenance)
+                .await?
+            {
+                written += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+    }
+
+    Ok(RuleOutcome {
+        name: AGENT_USES_ACTIVATED.name.to_string(),
+        considered,
+        written,
+        skipped,
+        measure,
+    })
 }
 
 /// The pins of every scope: the instance's own, then each project's. A project scope is
@@ -217,6 +370,48 @@ async fn run_agent_knows_core(graph: &dyn GraphStore) -> anyhow::Result<RuleOutc
         considered: ids.len(),
         written,
         skipped,
+        measure,
+    })
+}
+
+async fn run_session_co_activation(
+    graph: &dyn GraphStore,
+    session: Uuid,
+    project: Option<Uuid>,
+    notes: &[Uuid],
+) -> anyhow::Result<RuleOutcome> {
+    // A pair needs two notes, and a project: the co-activation is scoped like every other
+    // reinforcement, so a session never welds the notes of two projects together.
+    let name = SESSION_CO_ACTIVATION.name;
+    let Some(project) = project else {
+        return Ok(RuleOutcome {
+            name: name.to_string(),
+            measure: format!("session {session} : aucun projet, rien à renforcer"),
+            ..Default::default()
+        });
+    };
+    if notes.len() < 2 {
+        return Ok(RuleOutcome {
+            name: name.to_string(),
+            measure: format!("session {session} : {} note(s), aucune paire", notes.len()),
+            ..Default::default()
+        });
+    }
+
+    let measure = format!(
+        "{} note(s) dans le contexte de la session {session}",
+        notes.len()
+    );
+    let provenance = Provenance::new(name, measure.clone());
+    let written = graph
+        .coactivate_session(project, notes, session, &provenance)
+        .await?;
+
+    Ok(RuleOutcome {
+        name: name.to_string(),
+        considered: notes.len(),
+        written,
+        skipped: 0,
         measure,
     })
 }

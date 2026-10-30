@@ -270,6 +270,16 @@ impl ParallelEnrichmentStage for SkillActivationStage {
                     name: s.name.clone(),
                 }),
         );
+        // The activation becomes a durable `USES` edge, not only an in-memory fact.
+        for (skill, _) in &matches {
+            crate::notes::provenance::record_agent_uses(
+                self.graph.as_ref(),
+                input.session_id,
+                "Skill",
+                skill.id,
+            )
+            .await;
+        }
 
         if !content_parts.is_empty() {
             output.add_section(

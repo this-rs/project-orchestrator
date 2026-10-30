@@ -65,6 +65,9 @@ pub struct MockAnchorStore {
 /// Shadow state of one directed synapse: `(shadow_weight, last shadow decay)`.
 pub type MockShadowSynapse = (f64, Option<chrono::DateTime<chrono::Utc>>);
 
+/// `(project, session, provenance)` of a `SYNAPSE` the mock welded.
+pub type SynapseWeld = (Uuid, Uuid, crate::graph::rules::Provenance);
+
 pub struct MockGraphStore {
     // Entity stores
     pub projects: RwLock<HashMap<Uuid, ProjectNode>>,
@@ -215,6 +218,11 @@ pub struct MockGraphStore {
     pub agent_lived: RwLock<std::collections::HashSet<(Uuid, Uuid)>>,
     /// `(:Agent)-[:KNOWS]->(:Note)`, with the provenance written on the edge.
     pub agent_knows: RwLock<HashMap<(Uuid, Uuid), crate::graph::rules::Provenance>>,
+    /// `coactivate_session`: the pairs it welded, and who welded them — `(project,
+    /// session, provenance)`.
+    pub synapses: RwLock<HashMap<(Uuid, Uuid), SynapseWeld>>,
+    /// `(:Agent)-[:USES]->(:Persona|:Skill|:Protocol)`, as `(agent, label, target)`.
+    pub agent_uses: RwLock<HashMap<(Uuid, String, Uuid), crate::graph::rules::Provenance>>,
     /// Makes every `create_chat_session` fail once set (a session written after it, such as
     /// the mirror of a sub-agent, is lost; the sessions already written are untouched).
     pub fail_session_writes: std::sync::atomic::AtomicBool,
@@ -471,6 +479,8 @@ impl MockGraphStore {
             agent_authored: RwLock::new(std::collections::HashSet::new()),
             agent_lived: RwLock::new(std::collections::HashSet::new()),
             agent_knows: RwLock::new(HashMap::new()),
+            agent_uses: RwLock::new(HashMap::new()),
+            synapses: RwLock::new(HashMap::new()),
             fail_session_writes: std::sync::atomic::AtomicBool::new(false),
             land_children_after_read: std::sync::Mutex::new(HashMap::new()),
             plan_tasks: RwLock::new(HashMap::new()),
@@ -14331,6 +14341,43 @@ impl AnalyticsStore for MockGraphStore {
         let mut edges = self.agent_knows.write().await;
         let created = !edges.contains_key(&(agent_id, note_id));
         edges.insert((agent_id, note_id), provenance.clone());
+        Ok(created)
+    }
+
+    async fn coactivate_session(
+        &self,
+        project: Uuid,
+        notes: &[Uuid],
+        session: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> Result<usize> {
+        let mut n = 0;
+        for i in 0..notes.len() {
+            for j in (i + 1)..notes.len() {
+                self.synapses
+                    .write()
+                    .await
+                    .insert((notes[i], notes[j]), (project, session, provenance.clone()));
+                n += 1;
+            }
+        }
+        Ok(n * 2)
+    }
+
+    async fn link_agent_uses(
+        &self,
+        agent_id: Uuid,
+        label: &str,
+        target_id: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> Result<bool> {
+        if !crate::graph::rules::USABLE_LABELS.contains(&label) {
+            anyhow::bail!("{label} is not a usable label");
+        }
+        let key = (agent_id, label.to_string(), target_id);
+        let mut edges = self.agent_uses.write().await;
+        let created = !edges.contains_key(&key);
+        edges.insert(key, provenance.clone());
         Ok(created)
     }
 

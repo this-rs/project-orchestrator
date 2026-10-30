@@ -18825,6 +18825,49 @@ impl ChatManager {
             }
             graph.save_session_episode(&episode).await
         };
+        // What the session really had in context becomes edges, once. The registry that
+        // holds it is in memory and this is its last moment: after the close, the notes it
+        // welded are all that is left.
+        let graph = self.graph.clone();
+        let activated = crate::chat::activation_registry::get(id).notes;
+        if activated.len() >= 2 {
+            tokio::spawn(async move {
+                // The session carries a slug, not an id: the co-activation is scoped to
+                // the project the notes must belong to.
+                let project = match graph.get_chat_session(id).await {
+                    Ok(Some(session)) => match session.project_slug.as_deref() {
+                        Some(slug) => match graph.get_project_by_slug(slug).await {
+                            Ok(Some(p)) => Some(p.id),
+                            _ => None,
+                        },
+                        None => None,
+                    },
+                    _ => None,
+                };
+                let work = crate::graph::rules::run_with(
+                    graph.as_ref(),
+                    crate::graph::rules::SESSION_CO_ACTIVATION.name,
+                    crate::graph::rules::Measurement::SessionNotes {
+                        session: id,
+                        project,
+                        notes: activated,
+                    },
+                );
+                match tokio::time::timeout(CLOSE_EPISODE_BUDGET, work).await {
+                    Ok(Ok(outcome)) => debug!(
+                        session_id = %id,
+                        written = outcome.written,
+                        "{}",
+                        outcome.measure
+                    ),
+                    Ok(Err(e)) => {
+                        warn!(session_id = %id, error = %e, "the session's co-activation failed")
+                    }
+                    Err(_) => warn!(session_id = %id, "the session's co-activation timed out"),
+                }
+            });
+        }
+
         // Detached: the close never waits on the graph for its episode (a cascade or a
         // deletion closes many sessions in a row). The write cannot outlive a deletion:
         // it is one statement that MATCHes the session, and a deletion removes the session

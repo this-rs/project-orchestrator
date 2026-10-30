@@ -2214,6 +2214,7 @@ mod tests {
                     id: "pe1".into(),
                     name: "Pentest".into(),
                 }],
+                notes: vec![],
             },
         );
         let r = build_live_agents(&store, now(), &snap).await;

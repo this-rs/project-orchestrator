@@ -138,6 +138,15 @@ impl ParallelEnrichmentStage for PersonaStage {
                 name: persona.name.clone(),
             },
         );
+        // The registry dies with the process; the edge does not. `USES` is what the subject
+        // applied to itself, measured where the activation happens.
+        crate::notes::provenance::record_agent_uses(
+            self.graph.as_ref(),
+            input.session_id,
+            "Persona",
+            persona.id,
+        )
+        .await;
 
         // Set hint so downstream stages know which persona is active
         output.set_hint("active_persona", persona.name.clone());

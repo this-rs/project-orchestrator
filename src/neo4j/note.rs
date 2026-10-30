@@ -2978,6 +2978,77 @@ impl Neo4jClient {
         }
     }
 
+    /// See [`crate::neo4j::AnalyticsStore::coactivate_session`].
+    ///
+    /// The same pair logic as [`Self::reinforce_synapses`] — same project, both directions,
+    /// `MERGE ... ON CREATE` — plus the provenance: `rule`, `measure`, `at`, and the session
+    /// that did it.
+    ///
+    /// `last_session` names the last activator, never the creator: an edge that existed
+    /// before this call keeps its history and gains the new fact.
+    pub async fn coactivate_session(
+        &self,
+        project: Uuid,
+        notes: &[Uuid],
+        session: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> Result<usize> {
+        use super::batch::{bolt_map, BoltMap};
+
+        if notes.len() < 2 {
+            return Ok(0);
+        }
+        let mut pairs: Vec<BoltMap> = Vec::new();
+        for i in 0..notes.len() {
+            for j in (i + 1)..notes.len() {
+                pairs.push(bolt_map(&[
+                    ("a", notes[i].to_string().into()),
+                    ("b", notes[j].to_string().into()),
+                ]));
+            }
+        }
+
+        let cypher = r#"
+            UNWIND $items AS pair
+            MATCH (a:Note {id: pair.a}), (b:Note {id: pair.b})
+            WHERE a.project_id = $project AND b.project_id = $project AND a.id <> b.id
+            MERGE (a)-[s1:SYNAPSE]->(b)
+              ON CREATE SET s1.weight = 0.5, s1.created_at = datetime(),
+                s1.reinforcement_count = 1, s1.source = 'coactivation'
+              ON MATCH SET s1.weight = CASE
+                  WHEN s1.weight + 0.2 > 1.0 THEN 1.0 ELSE s1.weight + 0.2 END,
+                s1.reinforcement_count = coalesce(s1.reinforcement_count, 0) + 1
+            SET s1.last_reinforced_at = datetime(), s1.rule = $rule,
+                s1.measure = $measure, s1.at = $at, s1.last_session = $session
+            MERGE (b)-[s2:SYNAPSE]->(a)
+              ON CREATE SET s2.weight = 0.5, s2.created_at = datetime(),
+                s2.reinforcement_count = 1, s2.source = 'coactivation'
+              ON MATCH SET s2.weight = CASE
+                  WHEN s2.weight + 0.2 > 1.0 THEN 1.0 ELSE s2.weight + 0.2 END,
+                s2.reinforcement_count = coalesce(s2.reinforcement_count, 0) + 1
+            SET s2.last_reinforced_at = datetime(), s2.rule = $rule,
+                s2.measure = $measure, s2.at = $at, s2.last_session = $session
+            RETURN count(s1) AS n
+        "#;
+        let mut result = self
+            .graph
+            .execute(
+                query(cypher)
+                    .param("items", pairs)
+                    .param("project", project.to_string())
+                    .param("session", session.to_string())
+                    .param("rule", provenance.rule.clone())
+                    .param("measure", provenance.measure.clone())
+                    .param("at", provenance.at.clone()),
+            )
+            .await?;
+        let n: i64 = match result.next().await? {
+            Some(row) => row.get("n").unwrap_or(0),
+            None => 0,
+        };
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
     /// Reinforce synapses between co-activated notes (Hebbian learning).
     ///
     /// For every pair (i, j) in note_ids, MERGE a bidirectional SYNAPSE.
