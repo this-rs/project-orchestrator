@@ -609,8 +609,122 @@ async fn a_causal_walk_follows_a_real_chain_and_refuses_a_stranger_label() {
     let refused = e.client.causal_walk("Task) DETACH DELETE (n", "x", 2).await;
     assert!(refused.is_err());
 
-    drop_nodes(&e, "Task", &[task]).await;
+    // A chain longer than the bound must say it was cut: a walk stopped by its own depth
+    // limit cannot read as « the chain ends here ». Built in one statement — a `MATCH` on a
+    // node that does not exist yet silently creates nothing, which is how this test first
+    // proved the opposite of what it claimed.
+    let deep_t = Uuid::new_v4();
+    let hops: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+    e.raw
+        .run(
+            query(
+                "MERGE (t:Task {id: $t}) \
+                 MERGE (a:Decision {id: $a}) MERGE (b:Decision {id: $b}) MERGE (c:Decision {id: $c}) \
+                 MERGE (t)-[:PRECEDES]->(a) MERGE (a)-[:PRECEDES]->(b) MERGE (b)-[:PRECEDES]->(c)",
+            )
+            .param("t", deep_t.to_string())
+            .param("a", hops[0].to_string())
+            .param("b", hops[1].to_string())
+            .param("c", hops[2].to_string()),
+        )
+        .await
+        .unwrap();
+
+    let cut = e
+        .client
+        .causal_walk("Task", &deep_t.to_string(), 1)
+        .await
+        .unwrap();
+    assert!(cut.exists(), "the first hop exists: {cut:?}");
+    assert_eq!(cut.steps.len(), 1, "one hop, the depth asked: {cut:?}");
+    assert!(
+        cut.truncated,
+        "and the walk says it stopped on its bound: {cut:?}"
+    );
+    // A depth beyond the ceiling is clamped, never interpolated as given.
+    let clamped = e
+        .client
+        .causal_walk("Task", &deep_t.to_string(), 99)
+        .await
+        .unwrap();
+    assert_eq!(clamped.max_depth, 4);
+    assert!(
+        !clamped.truncated,
+        "a 4-hop bound reaches the end: {clamped:?}"
+    );
+
+    // An agent the graph does not have is absent, not invented.
+    assert!(e.client.find_agent(Uuid::new_v4()).await.unwrap().is_none());
+
+    drop_nodes(&e, "Task", &[task, deep_t]).await;
+    drop_nodes(&e, "Decision", &hops).await;
     drop_nodes(&e, "Decision", &[decision]).await;
+    cleanup(&e).await;
+}
+
+#[tokio::test]
+async fn a_walk_cut_by_its_depth_says_it_was_cut() {
+    // « La part lue est dite », appliqué à une chaîne : une marche arrêtée par sa propre
+    // borne ne doit pas se lire « la chaîne s'arrête ici ». Deux sauts existent, la borne
+    // n'en lit qu'un, et `truncated` le dit.
+    let _serial = serial().await;
+    let Some(e) = env("truncated").await else {
+        return;
+    };
+    let task = Uuid::new_v4();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    e.raw
+        .run(
+            query(
+                "CREATE (t:Task {id: $t, title: 'a task'}) \
+                 CREATE (a:Decision {id: $a, description: 'first'}) \
+                 CREATE (b:Decision {id: $b, description: 'second'}) \
+                 CREATE (t)-[:INFORMED_BY]->(a) CREATE (a)-[:NEXT_DECISION]->(b)",
+            )
+            .param("t", task.to_string())
+            .param("a", first.to_string())
+            .param("b", second.to_string()),
+        )
+        .await
+        .unwrap();
+
+    let cut = e
+        .client
+        .causal_walk("Task", &task.to_string(), 1)
+        .await
+        .unwrap();
+    assert_eq!(cut.steps.len(), 1, "the bound is one hop: {cut:?}");
+    assert!(
+        cut.truncated,
+        "there is more to follow and the walk says so: {cut:?}"
+    );
+
+    let whole = e
+        .client
+        .causal_walk("Task", &task.to_string(), 3)
+        .await
+        .unwrap();
+    assert_eq!(whole.steps.len(), 2, "both hops: {whole:?}");
+    assert!(!whole.truncated);
+
+    drop_nodes(&e, "Task", &[task]).await;
+    drop_nodes(&e, "Decision", &[first, second]).await;
+    cleanup(&e).await;
+}
+
+#[tokio::test]
+async fn an_agent_that_does_not_exist_is_absent_not_an_error() {
+    let _serial = serial().await;
+    let Some(e) = env("noagent").await else {
+        return;
+    };
+    assert!(e.client.find_agent(Uuid::new_v4()).await.unwrap().is_none());
+    let known = Uuid::new_v4();
+    e.client.ensure_agent(known, Some("m")).await.unwrap();
+    let found = e.client.find_agent(known).await.unwrap();
+    assert_eq!(found, Some(("model".to_string(), Some("m".to_string()))));
+    drop_nodes(&e, "Agent", &[known]).await;
     cleanup(&e).await;
 }
 
