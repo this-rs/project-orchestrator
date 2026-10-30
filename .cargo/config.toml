@@ -1,4 +1,6 @@
-# No local patches — all dependencies resolved from git
+# One local patch, and it is a security one: vendor/candle-core (see
+# vendor/candle-core/PATCH.md and the [patch.crates-io] block of Cargo.toml).
+# Everything else is resolved from crates.io or from a git rev.
 
 # `cargo xtask <subcommand>`: the after-merge checks of xtask/ (a standalone
 # std-only crate, excluded from the workspace). Run from the repo root.

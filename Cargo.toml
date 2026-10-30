@@ -2,8 +2,13 @@
 members = [".", "crates/*", "desktop/src-tauri"]
 # xtask/ (`cargo xtask in-service|pins`, after-merge checks) is a standalone
 # std-only crate with its own Cargo.lock: not a member, so the Docker and
-# release builds, which copy Cargo.toml + crates/ + src/ only, never see it.
-exclude = ["xtask"]
+# release builds, which copy Cargo.toml + crates/ + src/ + vendor/ only, never
+# see it.
+# vendor/candle-core/ is the local copy of candle-core 0.8.4 that reads zip 9
+# (see vendor/candle-core/PATCH.md). It is not a member, so the fork's tests,
+# examples and formatting stay out of `cargo test --workspace` and
+# `cargo fmt --all`; it still enters the dependency graph through [patch].
+exclude = ["xtask", "vendor/candle-core"]
 resolver = "2"
 
 # =============================================================================
@@ -49,10 +54,13 @@ async-trait = "0.1"
 futures = "0.3"
 
 # ML — candle (always compiled, runtime-controlled).
-# 0.8 keeps a zip 1.1.x copy in Cargo.lock, through candle's npz/pickle loaders.
-# No release moves off it: 0.11.0, the latest, still asks for zip ^8.6.0, and
-# candle's main branch — already on zip 9.1.3 — is unreleased. That single copy
-# is what deny.toml's zip block is about. Bump candle when a release carries it.
+# candle-core comes from a local copy: see the [patch.crates-io] block at the
+# bottom of this file and vendor/candle-core/PATCH.md. The published 0.8.4 asks
+# for zip ^1.1, which pulls zip 1.1.4 into Cargo.lock and matches two dependabot
+# advisories on that crate (GHSA-m665-v7pm-7grj, fixed in zip 9.0.5, and
+# GHSA-8hxf-qr8p-62x4, fixed in 9.0.0). No published candle carries zip 9: 0.9
+# and 0.10 ask for ^7.2, 0.11 — the latest — for ^8.6, and only candle's main
+# branch is on 9.1.3. Bump candle and drop the patch when a release carries it.
 candle-core = "0.8"
 candle-nn = "0.8"
 safetensors = "0.8"
@@ -433,3 +441,18 @@ systemd = "*"
 [[example]]
 name = "mem_embed"
 required-features = ["local-embeddings"]
+
+
+# =============================================================================
+# Local patches
+# =============================================================================
+# One entry, for one security reason: the published candle-core 0.8.4 pins
+# zip ^1.1, and that copy (1.1.4) matches two dependabot advisories whose only
+# fix line is zip >= 9.0.5. No cargo mechanism widens a transitive requirement —
+# [patch] is ignored when the patched version does not satisfy the dependent's
+# requirement — so the crate itself carries the requirement. The delta against
+# crates.io is zip 9.1.3 plus the three call sites upstream's main branch had to
+# change, nothing else. Removal procedure and verification:
+# vendor/candle-core/PATCH.md.
+[patch.crates-io]
+candle-core = { path = "vendor/candle-core" }

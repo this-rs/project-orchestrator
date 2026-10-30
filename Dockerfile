@@ -79,6 +79,11 @@ RUN sed -i 's/, "desktop\/src-tauri"//' Cargo.toml
 # Copy local crates (path dependencies referenced in Cargo.toml)
 COPY crates ./crates/
 
+# Local copy of candle-core (the [patch.crates-io] entry): a path dependency
+# too, so it has to be here before the dependency-cache layer runs — and it is
+# the only reason this list is not just Cargo.toml + crates/ + src/.
+COPY vendor ./vendor/
+
 # Create dummy source files to build dependencies.
 # This must match the actual module layout so the dep-cache layer is valid.
 # Module directories (16):
