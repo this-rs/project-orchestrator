@@ -17,7 +17,7 @@ use neo4rs::{query, Graph};
 use project_orchestrator::graph::rules;
 use project_orchestrator::neo4j::client::Neo4jClient;
 use project_orchestrator::neo4j::models::{ChatSessionNode, ProjectNode};
-use project_orchestrator::neo4j::traits::*;
+
 use project_orchestrator::notes::models::{Note, NoteType};
 use uuid::Uuid;
 
