@@ -44,6 +44,16 @@ jobs:
       - name: Install the repository toolchain
         run: rustup show
 
+      # An audit reads Cargo.lock; a build silently rewrites that same file when
+      # it no longer agrees with the manifests. That is how dependabot's
+      # `zip 9.0.5` bump (#1017) landed on main as a no-op: it updated the lock
+      # alone, Cargo.toml still asked for `zip = "8"`, the next cargo run put
+      # 8.6.0 back, and the advisory it had just closed reopened. Release builds
+      # already run `cargo fetch --locked` (release.yml), so the mismatch would
+      # only have surfaced at tag time; check it here, on every PR.
+      - name: Lock file agrees with the manifests
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
       # Same arguments as the action had (log-level warn, --all-features,
       # manifest ./Cargo.toml); deny.toml is read from the repo root.
       - name: Run cargo-deny (advisories, bans, licenses, sources)
