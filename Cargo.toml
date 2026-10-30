@@ -48,7 +48,11 @@ chrono-tz = "0.8"
 async-trait = "0.1"
 futures = "0.3"
 
-# ML — candle (always compiled, runtime-controlled)
+# ML — candle (always compiled, runtime-controlled).
+# 0.8 keeps a zip 1.1.x copy in Cargo.lock, through candle's npz/pickle loaders.
+# No release moves off it: 0.11.0, the latest, still asks for zip ^8.6.0, and
+# candle's main branch — already on zip 9.1.3 — is unreleased. That single copy
+# is what deny.toml's zip block is about. Bump candle when a release carries it.
 candle-core = "0.8"
 candle-nn = "0.8"
 safetensors = "0.8"
@@ -181,6 +185,15 @@ multibase = "0.9"
 # Self-update (archive extraction)
 flate2 = "1"
 tar = "0.4"
+# Also the container of the DOCX and PPTX parts read below. 9 is a security
+# floor, not a routine freshening: 9.0.5 is the first release that closes the
+# parser differential between ZipArchive and the streaming reader
+# (GHSA-m665-v7pm-7grj, CVE-2026-115905 — a dual-header archive that one reader
+# sees as a document and the other extracts under the name of a shell script).
+# #1017 had bumped Cargo.lock to 9.0.5 without this line, so the lock was invalid
+# and the next cargo run resolved it back to 8.6.0 — #1034 put the requirement
+# right, and security.yml now fails a PR whose lock has drifted from the
+# manifests.
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # DOCX text extraction (feature `docx`). A .docx is a ZIP of XML parts, so the
@@ -192,8 +205,9 @@ quick-xml = { version = "0.39", optional = true }
 # XLSX text extraction (feature `xlsx`). Spreadsheets are cell grids with shared
 # strings, typed values and several storage formats, so unlike DOCX/PPTX this is
 # not worth hand-rolling on top of `zip`. Default features are off: `dates` and
-# `picture` are not needed to read cell text.
-calamine = { version = "0.36", default-features = false, optional = true }
+# `picture` are not needed to read cell text. 0.37 is the first release that
+# accepts zip 9 — 0.36 pins ^8.6, below the fix for GHSA-m665-v7pm-7grj.
+calamine = { version = "0.37", default-features = false, optional = true }
 
 # Home directory detection
 dirs = "6"
@@ -247,20 +261,15 @@ openssl-sys = { version = "0.9", optional = true, features = ["vendored"] }
 pdf_oxide = { version = "0.3.78", default-features = false, optional = true }
 
 # Not used directly — an upper bound on a transitive dependency of pdf_oxide.
-# pdf_oxide 0.3.78 requires office_oxide "0.1.9", but office_oxide 0.1.12
-# (released after it) added a field to `DocumentIR`, so pdf_oxide no longer
-# compiles against it: `missing field `defined_names` in initializer`. A
-# semver-compatible break, which means cargo picks the broken version by
-# default and `cargo update` would re-break a lockfile pin. Stating the bound
-# here makes it a constraint rather than an accident. Remove once pdf_oxide
-# ships a release that builds against office_oxide 0.1.12.
-#
-# Separately, the whole zip 8.x line was yanked on crates.io; office_oxide
-# 0.1.9-0.1.12 need zip ^8.6 (unresolvable), and only 0.1.15 uses zip ^9, which
-# pdf_oxide 0.3.78 does not compile against. So a fresh `cargo generate-lockfile`
-# cannot resolve; ci.yml audits the committed Cargo.lock as-is. Lift both once
-# pdf_oxide builds against office_oxide 0.1.15.
-office_oxide = { version = ">=0.1.9, <0.1.12", default-features = false, optional = true }
+# pdf_oxide 0.3.78 asks for `office_oxide ^0.1.9`, which cargo resolves to the
+# newest 0.1.x, so the tested version has to be stated here or the build rides
+# whatever ships next. The bound used to read `<0.1.12`: 0.1.12 added a field to
+# `DocumentIR` and pdf_oxide stopped compiling against it (`missing field
+# defined_names in initializer`). That break is gone — 0.1.16 compiles clean
+# with pdf_oxide 0.3.78 (`cargo check --features pdf`) — and 0.1.16 is also what
+# the zip advisory needs: 0.1.15 is the first office_oxide on zip ^9, 0.1.16 the
+# first on ^9.1 (GHSA-m665-v7pm-7grj).
+office_oxide = { version = "0.1.16", default-features = false, optional = true }
 
 # Unix process signaling (SIGINT to process group for interrupt)
 [target.'cfg(unix)'.dependencies]

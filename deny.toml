@@ -91,10 +91,31 @@ ignore = [
     # ── quick-xml DoS advisories — no upgrade path (fix requires quick-xml >= 0.40).
     { id = "RUSTSEC-2026-0194", reason = "quick-xml quadratic duplicate-attribute check DoS. Transitive via plist 1.9.0 ← tauri; latest plist still pins quick-xml 0.39. Only used to read trusted macOS Info.plist bundle metadata — never untrusted XML. Revisit when plist bumps quick-xml >= 0.40." },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml parsing-cost DoS (same family as RUSTSEC-2026-0194). Same transitive chain and justification: plist ← tauri, trusted local Info.plist input only." },
-    # ── zip extraction advisories — no upgrade path (fix requires zip >= 9.0.0).
-    { id = "RUSTSEC-2026-0367", reason = "zip ZipArchive::extract() preserves SUID/SGID bits from an attacker-controlled archive. Patched only in zip >= 9.0.0; no upgrade path today (calamine 0.36.1 -> ^8.6, candle-core 0.11.0 -> ^8.6.0, tauri-plugin-updater 2.14.0 -> ^4 are all still below 9 at their latest; office_oxide 0.1.15 -> ^9 is blocked by pdf_oxide 0.3.78 — see the Cargo.toml block). The extract* API is never called here: our only ZipArchive reader (src/update/mod.rs) reads one entry into memory from the project's own release archive." },
-    { id = "RUSTSEC-2026-0368", reason = "zip: extract() creates symlinks whose attacker-controlled targets escape the destination dir. Same patched range (>= 9.0.0) and same blocked upgrade path as RUSTSEC-2026-0367; the extract* API is never called in this codebase." },
-    { id = "RUSTSEC-2026-0369", reason = "zip: stream extraction applies Unix permissions through symlinks without confining the target. Same range and same block as RUSTSEC-2026-0367; extract* never called." },
+    # ── zip extraction advisories — one transitive copy still below the fix line.
+    #
+    # Everything we declare resolves zip 9.1.3 now: the root crate (self-update
+    # reader, document export), calamine 0.37, office_oxide 0.1.16 and
+    # tauri-plugin-updater 2.14.1. One copy remains — candle-core 0.8.4 requires
+    # zip ^1.1 (1.1.4), and candle 0.11.0, its latest release, still asks for
+    # ^8.6.0: candle's main branch is already on zip 9.1.3 but no release carries
+    # it, so there is no version to move to yet.
+    #
+    # These three advisories, and the October 2026 GitHub batch on the same crate
+    # (CVE-2026-115905 fixed in 9.0.5; CVE-2026-115906..909 fixed in 9.0.0 —
+    # dependabot alerts 47 to 51), are therefore still matched through that
+    # single copy.
+    #
+    # Justification: the vulnerable surface is the write path — extract(),
+    # extract_unwrapped(), ZipStreamReader::extract(), shallow_copy_file() — plus
+    # AES entries (CVE-2026-115906). No caller in this tree reaches the first
+    # four: src/update/mod.rs and candle's npz/pickle loaders read entries into
+    # memory through ZipArchive, calamine and office_oxide are read-only, and the
+    # two writers (document export, candle npz) only produce archives. AES is not
+    # even compiled in candle's copy — it takes zip with default-features = false,
+    # so `aes-crypto` is off. Revisit when candle releases zip 9.
+    { id = "RUSTSEC-2026-0367", reason = "zip extract() keeps SUID/SGID bits. Reachable only through candle-core 0.8.4 -> zip 1.1.4; extract* is never called — see the block comment above." },
+    { id = "RUSTSEC-2026-0368", reason = "zip extract() symlink escape. Same single remaining copy (candle-core 0.8.4) and same justification: extract* is never called." },
+    { id = "RUSTSEC-2026-0369", reason = "zip stream extraction permissions through symlinks. Same copy, same justification: no stream extractor in the tree." },
 ]
 
 [bans]
