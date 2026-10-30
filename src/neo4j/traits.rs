@@ -1149,6 +1149,11 @@ pub trait DecisionStore: Send + Sync {
     /// Record a decision
     async fn create_decision(&self, task_id: Uuid, decision: &DecisionNode) -> Result<()>;
 
+    /// Record a decision attached to NO task (infrastructure choice made outside
+    /// any plan). The task-bound path keeps its integrity check: a decision
+    /// naming a task that does not exist is still rejected (bug 3693617b).
+    async fn create_decision_global(&self, decision: &DecisionNode) -> Result<()>;
+
     /// Get a single decision by ID
     async fn get_decision(&self, decision_id: Uuid) -> Result<Option<DecisionNode>>;
 
