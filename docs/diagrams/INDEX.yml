@@ -362,6 +362,17 @@ diagrams:
     covers:
       - "backend:src/refs/**"
       - "backend:src/api/refs_handlers.rs"
+  - name: po-self-graph
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-self-graph.mmd
+    # Arbitrage : ce diagramme possede les fichiers NEUFS du soi natif (moteur de regles,
+    # catalogue du schema, marche causale, leurs preuves). src/graph/{mod,engine,...}.rs
+    # reste le perimetre de po-code-intelligence (planned), et src/neo4j/*.rs des entrees
+    # existantes : les nouveaux fichiers ne recouvrent aucun des deux.
+    covers:
+      - "backend:src/graph/{rules,schema,self_model_tests}.rs"
+      - "backend:src/neo4j/graph_schema.rs"
   - name: po-synaptic-shadow
     owner: theotime
     status: verified

@@ -1,0 +1,65 @@
+%% name: po-self-graph
+%% covers: backend:src/graph/{rules,schema,self_model_tests}.rs backend:src/neo4j/graph_schema.rs
+%% verified: fab2029f
+%% ---
+%% PROUVE : le soi comme SUJET du graphe — un noeud, quatre familles d'aretes, un moteur de
+%%   regles deterministe qui les produit avec leur provenance, et le catalogue du schema qui
+%%   permet a l'agent de DEMANDER quels liens existent au lieu d'en inventer.
+%% ---
+%% CE QUI ETAIT MESURE AVANT : 0 noeud :Agent ; KNOWS ne reliait qu'une persona a un fichier
+%%   (785) ; aucun point de lecture du schema (77 types de relations, 70 labels) ; close_reason
+%%   valait "closed" partout.
+%% ---
+%% SOURCES LUES : src/graph/rules.rs (contrat de regle, provenance, run_with), src/graph/schema.rs
+%%   (SchemaCatalog, marche causale), src/neo4j/graph_schema.rs (Cypher du catalogue et de la
+%%   marche), src/graph/self_model_tests.rs (les preuves sur mock).
+%% ---
+flowchart TD
+  subgraph SUJET["Le sujet (T1)"]
+    SELF["(:Agent {kind:'self'})<br/>identite durable, engendree une fois"]
+    FACET["(:Agent {kind:'model'})<br/>facette par identite v5"]
+    FACET -->|FACET_OF| SELF
+  end
+
+  subgraph CONNU["Ce que le sujet relie (T2)"]
+    NOTE["(:Note)"]
+    EP["(:SessionEpisode)"]
+    PER["(:Persona)"]
+    SKI["(:Skill)"]
+  end
+
+  FACET -->|AUTHORED<br/>rule? non : le fait| NOTE
+  FACET -->|LIVED| EP
+  SELF -->|"KNOWS {rule, measure, at}"| NOTE
+  SELF -->|"USES {rule, measure, at}"| PER
+  SELF -->|"USES {rule, measure, at}"| SKI
+
+  subgraph MOTEUR["Le moteur de regles (T3)"]
+    R1["agent-knows-core<br/>epingles -> KNOWS"]
+    R2["agent-uses-activated<br/>registre -> USES"]
+    R3["session-co-activation<br/>contexte du tour -> SYNAPSE"]
+    RUN["run(graph, noms)<br/>mesure lue dans le graphe"]
+    RUNW["run_with(graph, nom, mesure)<br/>mesure fournie par l'appelant"]
+    RUN --> R1
+    RUNW --> R2
+    RUNW --> R3
+  end
+
+  NOTE -->|"SYNAPSE {rule, measure, at, last_session}"| NOTE
+
+  subgraph CATALOGUE["Le catalogue du schema (T6)"]
+    SHAPE["forme : apoc.meta.schema<br/>(volumes JETES : 0 INFORMED_BY annonce, 833 reels)"]
+    VOL["volumes : count-store<br/>(MATCH ()-[r:T]->() RETURN count(r))"]
+    CAT["SchemaCatalog<br/>has_edge / shapes_of / volume / causal_edges"]
+    WALK["causal_walk(label, id, profondeur)<br/>ancre sur index, famille causale seule"]
+    SHAPE --> CAT
+    VOL --> CAT
+    CAT --> WALK
+  end
+
+  WALK -.->|"l'agent demande AVANT d'ecrire"| MOTEUR
+  R1 --> MOTEUR
+  MOTEUR -->|"chaque arete porte sa mesure"| CONNU
+
+  classDef misura fill:#1f3b2d,stroke:#3ddc84,color:#e8f5e9
+  class R1,R2,R3,SHAPE,VOL,CAT misura
