@@ -877,7 +877,11 @@ mod tests {
                 before: 1,
                 after: 2,
                 from_notes: 1,
-                from_episodes: 1
+                from_episodes: 1,
+                // The edges the same run drew: one note given to its author, one episode
+                // given to the agent that lived it.
+                authored: 1,
+                lived: 1
             },
             "the older agent appears; the one already a node is not made twice"
         );

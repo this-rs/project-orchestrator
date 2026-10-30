@@ -247,6 +247,18 @@ impl Neo4jClient {
             self.graph.run(link_q).await?;
         }
 
+        // The author is a node, and this note is one of its own. Drawn at the write, so
+        // the edge never waits for a backfill to exist — and never a reason to refuse the
+        // note: an author that cannot be stamped is logged, not fatal.
+        if let Some(agent) = crate::notes::provenance::parse_actor(&note.created_by) {
+            if let Err(e) = self.ensure_agent(agent, None).await {
+                tracing::warn!(error = %e, "the node of the author of a note could not be made");
+            }
+            if let Err(e) = self.link_agent_authored(agent, note.id).await {
+                tracing::warn!(error = %e, "the note could not be given to its author");
+            }
+        }
+
         Ok(())
     }
 

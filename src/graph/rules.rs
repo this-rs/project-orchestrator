@@ -1,0 +1,333 @@
+//! Le MOTEUR DE RÈGLES du tissu de connaissance : une règle déclare une mesure et
+//! l'arête qu'elle produit ; chaque arête écrite porte sa provenance.
+//!
+//! # Pourquoi un moteur, et pas du code au cas par cas
+//!
+//! Jusqu'ici, chaque mécanisme écrivait ses arêtes en dur — les synapses dans
+//! `notes/coactivation.rs`, le co-changement ailleurs. Ajouter une arête dérivée
+//! demandait donc du code neuf, et **rien ne disait pourquoi l'arête existait** : elle
+//! était là, ou pas, et il fallait lire le module pour le comprendre.
+//!
+//! Ici, une règle est une **déclaration** : un nom, une justification en clair, le type
+//! d'arête et le label qu'elle atteint. Le moteur l'exécute en appelant les primitives
+//! du store — jamais un modèle de langage. La différence est ce qui rend le résultat
+//! reproductible : deux passages sur les mêmes données produisent les mêmes arêtes.
+//!
+//! # La règle de provenance, sans exception
+//!
+//! Chaque arête écrite porte `rule`, `measure` et `at`. `measure` est la **mesure**
+//! qui l'a justifiée, en clair, avec ses chiffres (« 3 portées lues, 7 notes
+//! épinglées »). Une arête sans provenance est un bug, et
+//! [`Provenance::is_accountable`] est le prédicat que les tests opposent à tout écrivain.
+//!
+//! C'est ce qui rend une croyance **contestable** : on peut relire la mesure, la
+//! refaire, et constater qu'elle a changé. Une note qui affirme sans mesure est une
+//! opinion ; une arête qui porte sa mesure est une observation datée.
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::neo4j::traits::GraphStore;
+
+/// Ce qu'une arête dérivée porte, pour être contestable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provenance {
+    /// The rule that drew the edge.
+    pub rule: String,
+    /// The measurement that justified it, in words and numbers.
+    pub measure: String,
+    /// When it was measured (RFC 3339).
+    pub at: String,
+}
+
+impl Provenance {
+    /// A provenance stamped now.
+    pub fn new(rule: &str, measure: impl Into<String>) -> Self {
+        Self {
+            rule: rule.to_string(),
+            measure: measure.into(),
+            at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    /// Whether this provenance can be contested: it must name a rule and a measure. An
+    /// edge whose origin cannot be named is indistinguishable from an accident.
+    pub fn is_accountable(&self) -> bool {
+        !self.rule.trim().is_empty()
+            && !self.measure.trim().is_empty()
+            && !self.at.trim().is_empty()
+    }
+}
+
+/// A declared rule. It says what it produces, never how: the how is one function per
+/// rule, below, and it may only measure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rule {
+    /// Stable identifier, the one written on every edge it draws.
+    pub name: &'static str,
+    /// Why this edge carries meaning, in one sentence a reader can disagree with.
+    pub justification: &'static str,
+    /// The relationship type it writes.
+    pub edge: &'static str,
+    /// The label it reaches.
+    pub target_label: &'static str,
+}
+
+/// What the self knows, and how much of it was read.
+///
+/// The pair is the whole point: `notes` is a bounded read, `available` is the truth about
+/// the size. A reader that published only `notes` would make a truncated answer look
+/// complete — the failure the graph API already has (`unwrap_or(5000)` with no
+/// `truncated`), and the one this type exists to stop repeating.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentKnowledge {
+    /// The notes read, most recently attested first.
+    pub notes: Vec<Uuid>,
+    /// How many the agent knows in total.
+    pub available: usize,
+}
+
+impl AgentKnowledge {
+    /// The notes NOT read because of the bound. Zero means the read was whole.
+    pub fn withheld(&self) -> usize {
+        self.available.saturating_sub(self.notes.len())
+    }
+}
+
+/// `(:Agent {kind:'self'})-[:KNOWS]->(:Note)` — le socle déclaré du sujet.
+///
+/// Une note épinglée est une fondation assumée : aucune question ne la rend pertinente,
+/// c'est pourquoi elle est injectée sans être classée. La règle la transforme en arête,
+/// pour que le sujet la **lise dans le graphe** au lieu de la tenir d'un réglage.
+pub const AGENT_KNOWS_CORE: Rule = Rule {
+    name: "agent-knows-core",
+    justification: "Une note épinglée pour l'instance ou pour un projet est une fondation \
+                    déclarée du soi : elle devient KNOWS, lisible sans configuration.",
+    edge: "KNOWS",
+    target_label: "Note",
+};
+
+/// The rules this engine knows, in a stable order.
+pub const RULES: &[Rule] = &[AGENT_KNOWS_CORE];
+
+/// The declared rule of that name, if any.
+pub fn rule(name: &str) -> Option<&'static Rule> {
+    RULES.iter().find(|r| r.name == name)
+}
+
+/// What one rule did on one run. `considered` and `written` are both published: a rule
+/// that considered nothing is not a rule that succeeded silently, it is a rule with
+/// nothing to say.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleOutcome {
+    pub name: String,
+    pub considered: usize,
+    pub written: usize,
+    /// Edges that were already there, re-attested rather than duplicated.
+    pub skipped: usize,
+    pub measure: String,
+}
+
+/// The outcome of a run, rule by rule.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RulesReport {
+    pub rules: Vec<RuleOutcome>,
+    pub edges_written: usize,
+}
+
+impl RulesReport {
+    /// The outcome of one rule, if it ran.
+    pub fn of(&self, name: &str) -> Option<&RuleOutcome> {
+        self.rules.iter().find(|o| o.name == name)
+    }
+}
+
+/// Runs the named rules (all of them when `names` is empty). Deterministic: it reads
+/// counts and settings, never text, and writes nothing but the edges it declares.
+pub async fn run(graph: &dyn GraphStore, names: &[&str]) -> anyhow::Result<RulesReport> {
+    let selected: Vec<&'static Rule> = if names.is_empty() {
+        RULES.iter().collect()
+    } else {
+        let mut out = Vec::new();
+        for name in names {
+            let r = rule(name).ok_or_else(|| anyhow::anyhow!("unknown rule: {name}"))?;
+            out.push(r);
+        }
+        out
+    };
+
+    let mut report = RulesReport::default();
+    for r in selected {
+        let outcome = match r.name {
+            "agent-knows-core" => run_agent_knows_core(graph).await?,
+            other => anyhow::bail!("rule {other} is declared but has no executor"),
+        };
+        report.edges_written += outcome.written;
+        report.rules.push(outcome);
+    }
+    Ok(report)
+}
+
+/// The pins of every scope: the instance's own, then each project's. A project scope is
+/// read through its slug, which is what [`crate::chat::stages::knowledge_injection`]
+/// keys the setting by.
+async fn pinned_notes_everywhere(graph: &dyn GraphStore) -> anyhow::Result<(Vec<Uuid>, usize)> {
+    use crate::chat::stages::knowledge_injection::load_pinned_notes;
+
+    let mut scopes: Vec<Option<String>> = vec![None];
+    for project in graph.list_projects().await? {
+        scopes.push(Some(project.slug));
+    }
+    let read = scopes.len();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::new();
+    for scope in scopes {
+        let pinned = load_pinned_notes(graph, scope.as_deref()).await?;
+        for id in pinned {
+            if seen.insert(id) {
+                ids.push(id);
+            }
+        }
+    }
+    Ok((ids, read))
+}
+
+async fn run_agent_knows_core(graph: &dyn GraphStore) -> anyhow::Result<RuleOutcome> {
+    let self_id = graph.agent_identity_namespace().await?;
+    let (ids, scopes) = pinned_notes_everywhere(graph).await?;
+
+    let measure = format!("{scopes} portées lues, {} note(s) épinglée(s)", ids.len());
+    let provenance = Provenance::new(AGENT_KNOWS_CORE.name, measure.clone());
+
+    let mut written = 0;
+    let mut skipped = 0;
+    for note in &ids {
+        // A pin that names a note the graph no longer has draws no edge: the store says
+        // whether the target exists, and a missing target is a skip, not an error.
+        if graph.link_agent_knows(self_id, *note, &provenance).await? {
+            written += 1;
+        } else {
+            skipped += 1;
+        }
+    }
+
+    Ok(RuleOutcome {
+        name: AGENT_KNOWS_CORE.name.to_string(),
+        considered: ids.len(),
+        written,
+        skipped,
+        measure,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::*;
+
+    #[test]
+    fn every_rule_is_accountable_before_it_runs() {
+        // The declaration is the contract: no unnamed rule, no unjustified edge. This
+        // runs without a graph, because a rule that cannot state its own purpose would
+        // not be fixed by one.
+        for r in RULES {
+            assert!(!r.name.trim().is_empty());
+            assert!(
+                r.justification.split_whitespace().count() >= 5,
+                "{}: a justification, not a label",
+                r.name
+            );
+            assert!(r.edge.chars().all(|c| c == '_' || c.is_ascii_uppercase()));
+            assert!(!r.target_label.trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn rule_names_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for r in RULES {
+            assert!(seen.insert(r.name), "duplicate rule {}", r.name);
+        }
+        assert!(rule("agent-knows-core").is_some());
+        assert!(rule("agent-knows-everything").is_none());
+    }
+
+    #[test]
+    fn a_provenance_must_name_a_rule_and_a_measure() {
+        // The predicate the tests below oppose to every writer.
+        let good = Provenance::new("agent-knows-core", "2 portées lues, 1 note épinglée");
+        assert!(good.is_accountable());
+        assert!(!Provenance::new("", "measured").is_accountable());
+        assert!(!Provenance::new("agent-knows-core", "  ").is_accountable());
+    }
+
+    fn a_note(content: &str) -> crate::notes::models::Note {
+        crate::notes::models::Note::new(
+            None,
+            crate::notes::models::NoteType::Guideline,
+            content.into(),
+            "api".into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_pins_become_edges_of_the_self() {
+        use crate::chat::stages::knowledge_injection::store_pinned_notes;
+
+        let graph = MockGraphStore::new();
+        let note = a_note("a foundation");
+        graph.create_note(&note).await.unwrap();
+        store_pinned_notes(&graph, None, &[note.id]).await.unwrap();
+
+        let report = run(&graph, &["agent-knows-core"]).await.unwrap();
+        let outcome = report.of("agent-knows-core").unwrap();
+        assert_eq!(outcome.considered, 1);
+        assert_eq!(outcome.written, 1, "{report:?}");
+        assert_eq!(report.edges_written, 1);
+
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        let known = graph.agent_knows(self_id, 10).await.unwrap();
+        assert_eq!(known.notes, vec![note.id]);
+    }
+
+    #[tokio::test]
+    async fn a_second_run_attests_instead_of_duplicating() {
+        use crate::chat::stages::knowledge_injection::store_pinned_notes;
+
+        let graph = MockGraphStore::new();
+        let note = a_note("a foundation");
+        graph.create_note(&note).await.unwrap();
+        store_pinned_notes(&graph, None, &[note.id]).await.unwrap();
+
+        let first = run(&graph, &[]).await.unwrap();
+        let second = run(&graph, &[]).await.unwrap();
+        assert_eq!(first.edges_written, 1);
+        assert_eq!(second.edges_written, 0, "idempotent: {second:?}");
+        assert_eq!(second.of("agent-knows-core").unwrap().skipped, 1);
+    }
+
+    #[tokio::test]
+    async fn a_pin_that_names_nothing_draws_nothing() {
+        use crate::chat::stages::knowledge_injection::store_pinned_notes;
+
+        let graph = MockGraphStore::new();
+        store_pinned_notes(&graph, None, &[Uuid::new_v4()])
+            .await
+            .unwrap();
+
+        let report = run(&graph, &[]).await.unwrap();
+        let outcome = report.of("agent-knows-core").unwrap();
+        assert_eq!(outcome.considered, 1, "it was considered");
+        assert_eq!(outcome.written, 0, "and the target did not exist");
+        assert_eq!(outcome.skipped, 1);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_rule_is_refused_not_ignored() {
+        let graph = MockGraphStore::new();
+        let err = run(&graph, &["agent-knows-everything"]).await.unwrap_err();
+        assert!(err.to_string().contains("unknown rule"), "{err}");
+    }
+}

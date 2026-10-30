@@ -492,6 +492,10 @@ pub struct AgentBackfill {
     pub from_notes: usize,
     /// Distinct agent ids read from the session episodes.
     pub from_episodes: usize,
+    /// `AUTHORED` edges drawn from the notes read (0 on a re-run: they already exist).
+    pub authored: usize,
+    /// `LIVED` edges drawn from the episodes read.
+    pub lived: usize,
 }
 
 /// `stream_delta` events are NOT persisted (accumulated in memory, stored as

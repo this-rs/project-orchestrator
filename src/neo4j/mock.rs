@@ -209,6 +209,12 @@ pub struct MockGraphStore {
     pub agent_identity_root: std::sync::Mutex<Option<Uuid>>,
     /// The model identities made by `ensure_agent`: id, then the last model recorded.
     pub agents: std::sync::Mutex<HashMap<Uuid, Option<String>>>,
+    /// `(:Agent)-[:AUTHORED]->(:Note)`, as `(agent, note)`.
+    pub agent_authored: RwLock<std::collections::HashSet<(Uuid, Uuid)>>,
+    /// `(:Agent)-[:LIVED]->(:SessionEpisode)`, as `(agent, episode)`.
+    pub agent_lived: RwLock<std::collections::HashSet<(Uuid, Uuid)>>,
+    /// `(:Agent)-[:KNOWS]->(:Note)`, with the provenance written on the edge.
+    pub agent_knows: RwLock<HashMap<(Uuid, Uuid), crate::graph::rules::Provenance>>,
     /// Makes every `create_chat_session` fail once set (a session written after it, such as
     /// the mirror of a sub-agent, is lost; the sessions already written are untouched).
     pub fail_session_writes: std::sync::atomic::AtomicBool,
@@ -462,6 +468,9 @@ impl MockGraphStore {
             session_episodes: RwLock::new(HashMap::new()),
             agent_identity_root: std::sync::Mutex::new(None),
             agents: std::sync::Mutex::new(HashMap::new()),
+            agent_authored: RwLock::new(std::collections::HashSet::new()),
+            agent_lived: RwLock::new(std::collections::HashSet::new()),
+            agent_knows: RwLock::new(HashMap::new()),
             fail_session_writes: std::sync::atomic::AtomicBool::new(false),
             land_children_after_read: std::sync::Mutex::new(HashMap::new()),
             plan_tasks: RwLock::new(HashMap::new()),
@@ -11884,6 +11893,13 @@ impl NoteStore for MockGraphStore {
 
     async fn create_note(&self, note: &Note) -> Result<()> {
         self.notes.write().await.insert(note.id, note.clone());
+        // The author is a node and owns the note, drawn at the write — the same edge, the
+        // same moment, as the Neo4j path. A mock that skipped it would let a divergent
+        // write path pass every test.
+        if let Some(agent) = crate::notes::provenance::parse_actor(&note.created_by) {
+            let _ = self.ensure_agent(agent, None).await;
+            let _ = self.link_agent_authored(agent, note.id).await;
+        }
         Ok(())
     }
 
@@ -14133,6 +14149,11 @@ impl AnalyticsStore for MockGraphStore {
             .write()
             .await
             .insert(session.session_id, episode.clone());
+        // The edge at the write, as Neo4j does: the same facts, drawn the same day.
+        if let Some(agent) = session.agent_id {
+            let _ = self.ensure_agent(agent, None).await;
+            let _ = self.link_agent_lived(agent, episode.id).await;
+        }
         Ok(true)
     }
 
@@ -14225,11 +14246,175 @@ impl AnalyticsStore for MockGraphStore {
         for id in from_notes.union(&from_episodes) {
             self.ensure_agent(*id, None).await?;
         }
+
+        // The same edges the write path draws, rebuilt from what is already written.
+        let note_edges: Vec<(Uuid, Uuid)> = self
+            .notes
+            .read()
+            .await
+            .values()
+            .filter_map(|n| crate::notes::provenance::parse_actor(&n.created_by).map(|a| (a, n.id)))
+            .collect();
+        let mut authored = 0;
+        for (agent, note) in &note_edges {
+            if self.link_agent_authored(*agent, *note).await? {
+                authored += 1;
+            }
+        }
+        let episode_edges: Vec<(Uuid, Uuid)> = self
+            .session_episodes
+            .read()
+            .await
+            .values()
+            .filter_map(|e| {
+                e.session
+                    .as_ref()
+                    .and_then(|s| s.agent_id)
+                    .map(|a| (a, e.id))
+            })
+            .collect();
+        let mut lived = 0;
+        for (agent, episode) in &episode_edges {
+            if self.link_agent_lived(*agent, *episode).await? {
+                lived += 1;
+            }
+        }
+
         Ok(crate::neo4j::models::AgentBackfill {
             before,
             after: count(self),
             from_notes: from_notes.len(),
             from_episodes: from_episodes.len(),
+            authored,
+            lived,
+        })
+    }
+
+    async fn link_agent_authored(&self, agent_id: Uuid, note_id: Uuid) -> Result<bool> {
+        if self.notes.read().await.get(&note_id).is_none() {
+            return Ok(false);
+        }
+        Ok(self
+            .agent_authored
+            .write()
+            .await
+            .insert((agent_id, note_id)))
+    }
+
+    async fn link_agent_lived(&self, agent_id: Uuid, episode_id: Uuid) -> Result<bool> {
+        let known = self
+            .session_episodes
+            .read()
+            .await
+            .values()
+            .any(|e| e.id == episode_id);
+        if !known {
+            return Ok(false);
+        }
+        Ok(self
+            .agent_lived
+            .write()
+            .await
+            .insert((agent_id, episode_id)))
+    }
+
+    async fn link_agent_knows(
+        &self,
+        agent_id: Uuid,
+        note_id: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> Result<bool> {
+        // A missing target draws nothing, exactly like the Cypher `MATCH`.
+        if self.notes.read().await.get(&note_id).is_none() {
+            return Ok(false);
+        }
+        let mut edges = self.agent_knows.write().await;
+        let created = !edges.contains_key(&(agent_id, note_id));
+        edges.insert((agent_id, note_id), provenance.clone());
+        Ok(created)
+    }
+
+    async fn agent_knows(
+        &self,
+        agent_id: Uuid,
+        limit: usize,
+    ) -> Result<crate::graph::rules::AgentKnowledge> {
+        let edges = self.agent_knows.read().await;
+        let mut all: Vec<(Uuid, String)> = edges
+            .iter()
+            .filter(|((a, _), _)| *a == agent_id)
+            .map(|((_, n), p)| (*n, p.at.clone()))
+            .collect();
+        // Most recently attested first, then by id so two equal stamps stay deterministic.
+        all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(crate::graph::rules::AgentKnowledge {
+            available: all.len(),
+            notes: all.into_iter().take(limit).map(|(n, _)| n).collect(),
+        })
+    }
+
+    async fn schema_catalog(&self) -> Result<crate::graph::schema::SchemaCatalog> {
+        // The mock models no relationship shapes of its own: it publishes the edges it
+        // really holds, so a rule or a reader tested here sees its own writes.
+        let mut edges = Vec::new();
+        let knows = self.agent_knows.read().await.keys().count();
+        let authored = self.agent_authored.read().await.len();
+        let lived = self.agent_lived.read().await.len();
+        for (edge, from, to, n) in [
+            ("AUTHORED", "Agent", "Note", authored),
+            ("KNOWS", "Agent", "Note", knows),
+            ("LIVED", "Agent", "SessionEpisode", lived),
+        ] {
+            if n > 0 {
+                edges.push(crate::graph::schema::RelationShape {
+                    edge: edge.into(),
+                    from: from.into(),
+                    to: to.into(),
+                });
+            }
+        }
+        let mut volumes = std::collections::BTreeMap::new();
+        for shape in &edges {
+            let n = match shape.edge.as_str() {
+                "AUTHORED" => authored,
+                "KNOWS" => knows,
+                "LIVED" => lived,
+                _ => 0,
+            };
+            volumes.insert(shape.edge.clone(), n as u64);
+        }
+        Ok(crate::graph::schema::SchemaCatalog {
+            labels: ["Agent", "Note", "SessionEpisode"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            edges,
+            volumes,
+        })
+    }
+
+    async fn causal_walk(
+        &self,
+        label: &str,
+        id: &str,
+        max_depth: u32,
+    ) -> Result<crate::graph::schema::CausalWalk> {
+        // The mock carries no typed causal chain (Task INFORMED_BY Decision …): it says so
+        // with an empty walk instead of inventing hops. The real traversal is proved
+        // against Neo4j, where the chain exists.
+        if !crate::graph::schema::CAUSAL_ANCHORS.contains(&label) {
+            anyhow::bail!("{label} is not a causal anchor");
+        }
+        Ok(crate::graph::schema::CausalWalk {
+            anchor_label: label.to_string(),
+            anchor_id: id.to_string(),
+            max_depth: max_depth.clamp(1, 4),
+            edges_followed: crate::graph::schema::CAUSAL_TYPES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            steps: Vec::new(),
+            truncated: false,
         })
     }
 

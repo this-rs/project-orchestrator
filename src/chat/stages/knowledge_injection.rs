@@ -581,7 +581,35 @@ impl KnowledgeInjectionStage {
         let project_owned = project.map(str::to_string);
         let read = async move {
             let mut ids = configured;
+            // The self, read as a NODE: what it knows is an edge, not a setting. A graph
+            // that cannot answer yields no structural note — never another agent's.
+            let structural = match graph.agent_identity_namespace().await {
+                Ok(self_id) => match graph.agent_knows(self_id, MAX_PINNED_NOTES).await {
+                    Ok(known) => {
+                        if known.withheld() > 0 {
+                            // « la part lue est dite »: the bound is published, not silent.
+                            debug!(
+                                read = known.notes.len(),
+                                available = known.available,
+                                "[knowledge_injection] the self knows more notes than were read"
+                            );
+                        }
+                        known.notes
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "the knowledge of the self could not be read");
+                        Vec::new()
+                    }
+                },
+                Err(e) => {
+                    debug!(error = %e, "the self has no identity root yet");
+                    Vec::new()
+                }
+            };
+            ids.extend(structural);
             // The global pins, then the project's (a session without a project: global only).
+            // Kept alongside the edges until the structural read is proven equivalent:
+            // a subject that lost its edges would otherwise lose its foundation in silence.
             let mut scopes = vec![None];
             if let Some(slug) = project_owned.as_deref() {
                 scopes.push(Some(slug));

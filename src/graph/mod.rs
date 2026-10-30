@@ -42,10 +42,15 @@ pub mod guard;
 pub mod models;
 pub mod neighborhood;
 pub mod process;
+pub mod rules;
+pub mod schema;
 pub mod writer;
 
 #[cfg(test)]
 pub mod mock;
+
+#[cfg(test)]
+mod self_model_tests;
 
 // Re-export primary types for convenience
 pub use confidence::{

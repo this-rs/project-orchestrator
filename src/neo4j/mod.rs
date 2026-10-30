@@ -20,6 +20,7 @@ mod event_trigger;
 mod execution_place;
 mod feature_graph;
 pub mod graph_sampler;
+pub mod graph_schema;
 mod impl_graph_store;
 mod ingress;
 mod lifecycle_hook;

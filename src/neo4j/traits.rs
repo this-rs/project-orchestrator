@@ -4452,6 +4452,55 @@ pub trait AnalyticsStore: Send + Sync {
     /// creates nothing) and it reports what it found, before and after.
     async fn backfill_agents(&self) -> Result<crate::neo4j::models::AgentBackfill>;
 
+    /// Draws `(:Agent)-[:AUTHORED]->(:Note)`: the note was written under that agent's
+    /// name (`created_by = "agent:<id>"`). The writer is the *facet* node; `FACET_OF`
+    /// carries the attribution up to the durable self. Returns `true` only when the edge
+    /// was created by this call.
+    async fn link_agent_authored(&self, agent_id: Uuid, note_id: Uuid) -> Result<bool>;
+
+    /// Draws `(:Agent)-[:LIVED]->(:SessionEpisode)`: the session that produced this
+    /// episode ran as that agent. Returns `true` only when the edge was created.
+    async fn link_agent_lived(&self, agent_id: Uuid, episode_id: Uuid) -> Result<bool>;
+
+    /// Draws `(:Agent)-[:KNOWS {rule, measure, at}]->(:Note)` — what a subject durably
+    /// knows, as opposed to `(Persona)-[:KNOWS]->(File)`, which says what a persona
+    /// covers. The provenance is written **on the edge**: an edge whose rule and measure
+    /// cannot be read is indistinguishable from an accident.
+    ///
+    /// A missing target draws nothing (`Ok(false)`), never a dangling edge: a pin naming
+    /// a deleted note is a skip, not a failure.
+    async fn link_agent_knows(
+        &self,
+        agent_id: Uuid,
+        note_id: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> Result<bool>;
+
+    /// What that agent knows, bounded by `limit`, plus how many exist — « la part lue est
+    /// dite ». Only `(:Agent)-[:KNOWS]->(:Note)` is read: a `KNOWS` reaching a `File` (the
+    /// persona meaning) never leaks into this answer.
+    async fn agent_knows(
+        &self,
+        agent_id: Uuid,
+        limit: usize,
+    ) -> Result<crate::graph::rules::AgentKnowledge>;
+
+    /// The graph described as a catalog: its labels, and for each relationship type the
+    /// label pairs it really connects, with measured counts. Measured, never declared.
+    async fn schema_catalog(&self) -> Result<crate::graph::schema::SchemaCatalog>;
+
+    /// Walks forward from one anchor along the causal family
+    /// ([`crate::graph::schema::CAUSAL_TYPES`]), up to `max_depth` hops. `label` must be
+    /// one of [`crate::graph::schema::CAUSAL_ANCHORS`]; anything else is an error, never a
+    /// query built from caller input. An anchor that does not exist yields an empty walk
+    /// (the chain does not exist), never an error.
+    async fn causal_walk(
+        &self,
+        label: &str,
+        id: &str,
+        max_depth: u32,
+    ) -> Result<crate::graph::schema::CausalWalk>;
+
     // ========================================================================
     // Episode embedding search (ReflexEngine)
     // ========================================================================

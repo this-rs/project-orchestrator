@@ -18722,7 +18722,19 @@ impl ChatManager {
     }
 
     async fn close_session_inner(&self, session_id: &str) -> Result<()> {
-        self.close_session_inner_with(session_id, true, "closed")
+        self.close_session_inner_with(
+            session_id,
+            true,
+            crate::episodes::models::close_reason::USER_CLOSED,
+        )
+        .await
+    }
+
+    /// Closes a session and records WHY in its close episode. The reason is the caller's
+    /// knowledge — a sub-agent's call returning is not a person closing the window — and
+    /// it is the only thing that makes two closed sessions comparable after the fact.
+    pub async fn close_session_because(&self, session_id: &str, reason: &str) -> Result<()> {
+        self.close_session_inner_with(session_id, true, reason)
             .await
     }
 
@@ -18754,7 +18766,11 @@ impl ChatManager {
         for id in &dead {
             warn!(session_id = %id, "CLI process is gone: closing its session (process_died)");
             if let Err(e) = self
-                .close_session_inner_with(id, true, "process_died")
+                .close_session_inner_with(
+                    id,
+                    true,
+                    crate::episodes::models::close_reason::PROCESS_DIED,
+                )
                 .await
             {
                 warn!(session_id = %id, error = %e, "closing a session of a dead CLI failed");
@@ -18828,8 +18844,14 @@ impl ChatManager {
     /// switch, whose same thread must see only `provider_switched`, never `session_closed`.
     /// Unlike [`Self::close_session`], it does not remove a neutral directory.
     async fn close_session_for_switch(&self, session_id: &str) -> Result<()> {
-        self.close_session_inner_with(session_id, false, "closed")
-            .await
+        // No episode is written here (announce = false), so the reason is only carried by
+        // the event: it names the switch rather than pretending it was a close.
+        self.close_session_inner_with(
+            session_id,
+            false,
+            crate::episodes::models::close_reason::SWITCHED,
+        )
+        .await
     }
 
     async fn close_session_inner_with(
@@ -23844,7 +23866,10 @@ mod tests {
         }
         assert_eq!(
             seen,
-            Some(("sess-close".to_string(), Some("closed".to_string())))
+            Some((
+                "sess-close".to_string(),
+                Some(crate::episodes::models::close_reason::USER_CLOSED.to_string())
+            ))
         );
     }
 
