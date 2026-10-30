@@ -216,6 +216,11 @@ fn native_provider_with(
 
     let mut config = NativeConfig::new(record.id.clone());
     config.default_model = record.default_model.clone();
+    // The window the operator declared for this instance. nexus prefers it to
+    // the catalogue's and to the probe's, and reports its source as
+    // `Configured`, so a declared number is never mistaken for a measured one.
+    // Absent = unknown, exactly as before this field existed.
+    config.context_window = record.context_window;
     config.strict_tool_exposure = STRICT_TOOL_EXPOSURE;
     // The tools whose definitions are withheld behind `ToolSearch` (CTX2,
     // `chat::deferred_tools`): the list in force when this provider is built. Empty =
@@ -742,6 +747,24 @@ mod tests {
         let p = build_native_provider(&record("none", Some("llama_server")), None).unwrap();
         assert_eq!(p.id(), "local");
         assert_eq!(p.kind(), nexus_claude::agent::ProviderKind::Native);
+    }
+
+    #[test]
+    fn a_declared_window_reaches_the_provider_as_a_configured_capability() {
+        use nexus_claude::agent::ContextWindowSource;
+        let mut declared = record("none", Some("nim"));
+        declared.context_window = Some(131_072);
+        let p = build_native_provider(&declared, None).unwrap();
+        let window = p
+            .capabilities(Some("m"))
+            .context_window
+            .expect("the declared window is reported");
+        assert_eq!(window.value, 131_072);
+        // A number the operator declared is never mistaken for one a probe measured.
+        assert_eq!(window.source, ContextWindowSource::Configured);
+        // And an instance that declares nothing claims nothing.
+        let plain = build_native_provider(&record("none", Some("nim")), None).unwrap();
+        assert_eq!(plain.capabilities(Some("m")).context_window, None);
     }
 
     #[test]
