@@ -1741,6 +1741,7 @@ mod tests {
             origin: origin_of(&base_url).unwrap(),
             base_url,
             default_model: None,
+            context_window: None,
             cost_source: "unknown".into(),
             credential_ref: "vault:anthropic-key".into(),
             host: None,
