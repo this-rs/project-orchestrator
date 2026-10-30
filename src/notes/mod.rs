@@ -173,12 +173,54 @@ pub mod provenance {
             return fallback.to_string();
         };
         match agent_id_of_session(graph, session).await {
-            Ok(Some(id)) => actor(id),
+            Ok(Some(id)) => {
+                // The agent becomes a node the first time it writes. Never a reason to
+                // refuse the write: a graph that cannot make the node is logged.
+                if let Err(e) = graph.ensure_agent(id, None).await {
+                    tracing::warn!(agent = %id, error = %e, "the node of an agent could not be made");
+                }
+                actor(id)
+            }
             Ok(None) => fallback.to_string(),
             Err(e) => {
                 tracing::warn!(session_id = %session, error = %e, "the agent behind a write could not be named");
                 fallback.to_string()
             }
+        }
+    }
+
+    /// Records, durably, that the agent of `session` applied `label` (a persona, a skill)
+    /// — the edge the activation registry only ever held in memory.
+    ///
+    /// Best effort by construction: an agent that cannot be named, or a target the graph
+    /// does not have, draws nothing and is logged. Activation decides what the turn sees;
+    /// it must never fail because a bookkeeping edge could not be written.
+    pub async fn record_agent_uses(
+        graph: &dyn GraphStore,
+        session_id: Uuid,
+        label: &str,
+        target: Uuid,
+    ) {
+        let agent = match agent_id_of_session(graph, session_id).await {
+            Ok(Some(id)) => id,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::debug!(session_id = %session_id, error = %e, "the agent of an activation could not be named");
+                return;
+            }
+        };
+        if let Err(e) = graph.ensure_agent(agent, None).await {
+            tracing::debug!(agent = %agent, error = %e, "the node of an activated agent could not be made");
+        }
+        let provenance = crate::graph::rules::Provenance::new(
+            crate::graph::rules::AGENT_USES_ACTIVATED.name,
+            format!("activé dans la session {session_id}"),
+        );
+        if let Err(e) = graph
+            .link_agent_uses(agent, label, target, &provenance)
+            .await
+        {
+            tracing::debug!(agent = %agent, label, error = %e, "an activation did not become an edge");
         }
     }
 
@@ -195,6 +237,33 @@ pub mod provenance {
             let id = s.id;
             graph.create_chat_session(&s).await.unwrap();
             id
+        }
+
+        #[tokio::test]
+        async fn a_write_makes_the_agent_a_node_once_per_identity() {
+            let graph = MockGraphStore::new();
+            let a = session_of(&graph, "claude-opus-5-5").await;
+            let a_again = session_of(&graph, " Claude-Opus-5-5 ").await;
+            let other = session_of(&graph, "deepseek-v4").await;
+            let none = session_of(&graph, "auto").await;
+
+            let by_a = author_of(&graph, Some(&a.to_string()), "api").await;
+            author_of(&graph, Some(&a_again.to_string()), "api").await;
+            assert_eq!(graph.agents.lock().unwrap().len(), 1, "one model, one node");
+            author_of(&graph, Some(&other.to_string()), "api").await;
+            assert_eq!(
+                graph.agents.lock().unwrap().len(),
+                2,
+                "two models, two nodes"
+            );
+
+            // A session that names no model leaves no node and keeps its fallback.
+            assert_eq!(
+                author_of(&graph, Some(&none.to_string()), "api").await,
+                "api"
+            );
+            assert_eq!(graph.agents.lock().unwrap().len(), 2);
+            assert!(parse_actor(&by_a).is_some());
         }
 
         #[tokio::test]

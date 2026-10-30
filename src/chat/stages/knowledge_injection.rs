@@ -581,7 +581,35 @@ impl KnowledgeInjectionStage {
         let project_owned = project.map(str::to_string);
         let read = async move {
             let mut ids = configured;
+            // The self, read as a NODE: what it knows is an edge, not a setting. A graph
+            // that cannot answer yields no structural note — never another agent's.
+            let structural = match graph.agent_identity_namespace().await {
+                Ok(self_id) => match graph.agent_knows(self_id, MAX_PINNED_NOTES).await {
+                    Ok(known) => {
+                        if known.withheld() > 0 {
+                            // « la part lue est dite »: the bound is published, not silent.
+                            debug!(
+                                read = known.notes.len(),
+                                available = known.available,
+                                "[knowledge_injection] the self knows more notes than were read"
+                            );
+                        }
+                        known.notes
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "the knowledge of the self could not be read");
+                        Vec::new()
+                    }
+                },
+                Err(e) => {
+                    debug!(error = %e, "the self has no identity root yet");
+                    Vec::new()
+                }
+            };
+            ids.extend(structural);
             // The global pins, then the project's (a session without a project: global only).
+            // Kept alongside the edges until the structural read is proven equivalent:
+            // a subject that lost its edges would otherwise lose its foundation in silence.
             let mut scopes = vec![None];
             if let Some(slug) = project_owned.as_deref() {
                 scopes.push(Some(slug));
@@ -1417,10 +1445,14 @@ impl KnowledgeInjectionStage {
             workspace_notes,
             max_content_chars,
             None,
+            &mut Vec::new(),
         )
     }
 
-    /// [`Self::render_knowledge`] with the project slug carried by the containers.
+    /// [`Self::render_knowledge`] with the project slug carried by the containers, and the
+    /// ids it actually rendered written into `rendered` (they feed the session's
+    /// co-activation, never the prompt).
+    #[allow(clippy::too_many_arguments)]
     fn render_knowledge_in(
         &self,
         notes: &[ScoredNote],
@@ -1429,6 +1461,7 @@ impl KnowledgeInjectionStage {
         workspace_notes: &[ScoredNote],
         max_content_chars: usize,
         project: Option<&str>,
+        rendered: &mut Vec<String>,
     ) -> Option<String> {
         if notes.is_empty()
             && decisions.is_empty()
@@ -1457,6 +1490,7 @@ impl KnowledgeInjectionStage {
                 }
                 group.push_str(&entry);
                 chars_used += entry.len();
+                rendered.push(note.id.clone());
             }
             content.push_str(&untrusted_group("note", &group, project));
             content.push('\n');
@@ -1478,6 +1512,7 @@ impl KnowledgeInjectionStage {
                 }
                 group.push_str(&entry);
                 chars_used += entry.len();
+                rendered.push(note.id.clone());
             }
             content.push_str(&untrusted_group("note", &group, project));
             content.push('\n');
@@ -1794,14 +1829,28 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
         }
 
         // Render and inject into output
-        if let Some(content) = self.render_knowledge_in(
+        let mut rendered: Vec<String> = Vec::new();
+        let content = self.render_knowledge_in(
             &notes,
             &decisions,
             &predictions,
             &workspace_notes,
             effective_config.max_content_chars,
             input.project_slug.as_deref(),
-        ) {
+            &mut rendered,
+        );
+
+        // What the turn actually had in context, recorded for the session. The close reads
+        // it to reinforce the pairs that were really co-injected — not the ones a rule
+        // imagines. Bounded in the registry, like skills and personas.
+        let mut activated: Vec<Uuid> = pinned
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect();
+        activated.extend(rendered.iter().filter_map(|id| Uuid::parse_str(id).ok()));
+        crate::chat::activation_registry::record_notes(input.session_id, activated);
+
+        if let Some(content) = content {
             output.add_section(
                 "Relevant Knowledge",
                 content,

@@ -796,6 +796,7 @@ jobs:
             --test neo4j_store_tests \
             --test harness_neo4j \
             --test neo4j_decision_project \
+            --test self_graph \
             --test neural_routing_sampler \
             --test store_conformance
 

@@ -4131,7 +4131,10 @@ mod provider_switch {
         let episode = &episodes[0];
         let trace = episode.session.as_ref().expect("a session episode");
         assert_eq!(trace.session_id, id);
-        assert_eq!(trace.close_reason, "closed");
+        assert_eq!(
+            trace.close_reason,
+            crate::episodes::models::close_reason::USER_CLOSED
+        );
         assert!(trace.message_count > 0, "{trace:?}");
         assert!(
             episode.stimulus.request.contains("hi there"),
@@ -9078,7 +9081,10 @@ mod legacy_session_record {
         assert_eq!(episodes.len(), 1, "{episodes:?}");
         let trace = episodes[0].session.as_ref().unwrap();
         assert_eq!(trace.session_id.to_string(), sid);
-        assert_eq!(trace.close_reason, "closed");
+        assert_eq!(
+            trace.close_reason,
+            crate::episodes::models::close_reason::USER_CLOSED
+        );
         assert_eq!(trace.total_cost_usd, Some(0.01));
         assert!(episodes[0].stimulus.request.contains("legacy first words"));
     }

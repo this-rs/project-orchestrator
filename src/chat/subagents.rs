@@ -894,7 +894,13 @@ impl ChatManager {
         #[cfg(test)]
         panic_injection::panic_if_injected(parent_session_id);
         self.deny_waiting_permissions(&child_id).await;
-        if let Err(e) = self.close_session(&child_id).await {
+        if let Err(e) = self
+            .close_session_because(
+                &child_id,
+                crate::episodes::models::close_reason::SUBAGENT_FINISHED,
+            )
+            .await
+        {
             tracing::debug!(child = %child_id, error = %e, "sub-agent close");
         }
         // What the child spent is the parent's too, however the call ended (PYSR-3).

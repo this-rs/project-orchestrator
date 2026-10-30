@@ -18723,7 +18723,19 @@ impl ChatManager {
     }
 
     async fn close_session_inner(&self, session_id: &str) -> Result<()> {
-        self.close_session_inner_with(session_id, true, "closed")
+        self.close_session_inner_with(
+            session_id,
+            true,
+            crate::episodes::models::close_reason::USER_CLOSED,
+        )
+        .await
+    }
+
+    /// Closes a session and records WHY in its close episode. The reason is the caller's
+    /// knowledge — a sub-agent's call returning is not a person closing the window — and
+    /// it is the only thing that makes two closed sessions comparable after the fact.
+    pub async fn close_session_because(&self, session_id: &str, reason: &str) -> Result<()> {
+        self.close_session_inner_with(session_id, true, reason)
             .await
     }
 
@@ -18755,7 +18767,11 @@ impl ChatManager {
         for id in &dead {
             warn!(session_id = %id, "CLI process is gone: closing its session (process_died)");
             if let Err(e) = self
-                .close_session_inner_with(id, true, "process_died")
+                .close_session_inner_with(
+                    id,
+                    true,
+                    crate::episodes::models::close_reason::PROCESS_DIED,
+                )
                 .await
             {
                 warn!(session_id = %id, error = %e, "closing a session of a dead CLI failed");
@@ -18782,6 +18798,51 @@ impl ChatManager {
     /// Called on an ANNOUNCED close only — never on an in-place switch, whose thread goes on.
     /// Best effort, bounded and detached: a graph that fails or hangs is logged, and the
     /// close neither waits for it nor fails because of it.
+    /// Turns what a session really had in context into `SYNAPSE` edges (T5).
+    ///
+    /// Extracted from the close so it can be tested without a live session: the rule needs a
+    /// project (the co-activation never welds two projects' notes together) and it needs at
+    /// least two notes. `None` says « nothing to do », which is not a failure — a session that
+    /// read one note has no pair to weld.
+    pub(crate) async fn reinforce_session_knowledge(
+        graph: std::sync::Arc<dyn crate::neo4j::traits::GraphStore>,
+        session: Uuid,
+        notes: Vec<Uuid>,
+    ) -> Option<crate::graph::rules::RuleOutcome> {
+        if notes.len() < 2 {
+            return None;
+        }
+        // The session carries a slug, not an id: the co-activation is scoped to the project
+        // the notes must belong to.
+        let project = match graph.get_chat_session(session).await {
+            Ok(Some(s)) => match s.project_slug.as_deref() {
+                Some(slug) => match graph.get_project_by_slug(slug).await {
+                    Ok(Some(p)) => Some(p.id),
+                    _ => None,
+                },
+                None => None,
+            },
+            _ => None,
+        };
+        match crate::graph::rules::run_with(
+            graph.as_ref(),
+            crate::graph::rules::SESSION_CO_ACTIVATION.name,
+            crate::graph::rules::Measurement::SessionNotes {
+                session,
+                project,
+                notes,
+            },
+        )
+        .await
+        {
+            Ok(outcome) => Some(outcome),
+            Err(e) => {
+                warn!(session_id = %session, error = %e, "the session's co-activation failed");
+                None
+            }
+        }
+    }
+
     fn record_close_episode(&self, session_id: &str, reason: &str) {
         let Ok(id) = Uuid::parse_str(session_id) else {
             return;
@@ -18810,6 +18871,31 @@ impl ChatManager {
             }
             graph.save_session_episode(&episode).await
         };
+        // What the session really had in context becomes edges, once. The registry that
+        // holds it is in memory and this is its last moment: after the close, the notes it
+        // welded are all that is left.
+        let graph = self.graph.clone();
+        let activated = crate::chat::activation_registry::get(id).notes;
+        if activated.len() >= 2 {
+            tokio::spawn(async move {
+                match tokio::time::timeout(
+                    CLOSE_EPISODE_BUDGET,
+                    Self::reinforce_session_knowledge(graph, id, activated),
+                )
+                .await
+                {
+                    Ok(Some(outcome)) => debug!(
+                        session_id = %id,
+                        written = outcome.written,
+                        "{}",
+                        outcome.measure
+                    ),
+                    Ok(None) => debug!(session_id = %id, "nothing to co-activate"),
+                    Err(_) => warn!(session_id = %id, "the session's co-activation timed out"),
+                }
+            });
+        }
+
         // Detached: the close never waits on the graph for its episode (a cascade or a
         // deletion closes many sessions in a row). The write cannot outlive a deletion:
         // it is one statement that MATCHes the session, and a deletion removes the session
@@ -18829,8 +18915,14 @@ impl ChatManager {
     /// switch, whose same thread must see only `provider_switched`, never `session_closed`.
     /// Unlike [`Self::close_session`], it does not remove a neutral directory.
     async fn close_session_for_switch(&self, session_id: &str) -> Result<()> {
-        self.close_session_inner_with(session_id, false, "closed")
-            .await
+        // No episode is written here (announce = false), so the reason is only carried by
+        // the event: it names the switch rather than pretending it was a close.
+        self.close_session_inner_with(
+            session_id,
+            false,
+            crate::episodes::models::close_reason::SWITCHED,
+        )
+        .await
     }
 
     async fn close_session_inner_with(
@@ -23882,7 +23974,10 @@ mod tests {
         }
         assert_eq!(
             seen,
-            Some(("sess-close".to_string(), Some("closed".to_string())))
+            Some((
+                "sess-close".to_string(),
+                Some(crate::episodes::models::close_reason::USER_CLOSED.to_string())
+            ))
         );
     }
 
@@ -34405,6 +34500,48 @@ mod tests {
         assert!(ChatManager::forget_if_client(&sessions, "s", &old_client).await);
         assert!(!sessions.read().await.contains_key("s"));
         assert!(old_token.is_cancelled());
+    }
+
+    /// T5: the notes a turn really had in context become synapses at the close, scoped to
+    /// their project — and a session with one note welds nothing, without failing.
+    #[tokio::test]
+    async fn a_closed_session_welds_the_notes_it_really_had_in_context() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::traits::*;
+
+        let graph = std::sync::Arc::new(MockGraphStore::new());
+        let project = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&project).await.unwrap();
+        let mut session = crate::test_helpers::test_chat_session(Some("alpha"));
+        session.preview = Some("first".into());
+        let sid = session.id;
+        graph.create_chat_session(&session).await.unwrap();
+
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let mut n = crate::notes::models::Note::new(
+                Some(project.id),
+                crate::notes::models::NoteType::Guideline,
+                format!("seen {i}"),
+                "api".into(),
+            );
+            n.status = crate::notes::models::NoteStatus::Active;
+            graph.create_note(&n).await.unwrap();
+            ids.push(n.id);
+        }
+
+        let outcome = ChatManager::reinforce_session_knowledge(graph.clone(), sid, ids.clone())
+            .await
+            .expect("three notes are three pairs");
+        assert_eq!(outcome.written, 6, "both directions: {outcome:?}");
+        assert_eq!(graph.synapses.read().await.len(), 3);
+
+        assert!(
+            ChatManager::reinforce_session_knowledge(graph.clone(), sid, vec![ids[0]])
+                .await
+                .is_none(),
+            "one note has no pair to weld"
+        );
     }
 
     /// Review of #685, finding 3: a task already being stopped (its grace period

@@ -480,6 +480,24 @@ pub struct SessionInfo {
 /// A persisted chat event with sequence number for replay support.
 ///
 /// Events are stored as `(:ChatSession)-[:HAS_EVENT]->(:ChatEvent)` in Neo4j.
+/// What a rebuild of the `:Agent` nodes found and made, published instead of assumed:
+/// the number of model identities before and after, and where the ids were read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentBackfill {
+    /// `:Agent` nodes of kind `model` before the run.
+    pub before: usize,
+    /// The same, after: `after - before` is what the run created.
+    pub after: usize,
+    /// Distinct agent ids read from the `created_by` of notes.
+    pub from_notes: usize,
+    /// Distinct agent ids read from the session episodes.
+    pub from_episodes: usize,
+    /// `AUTHORED` edges drawn from the notes read (0 on a re-run: they already exist).
+    pub authored: usize,
+    /// `LIVED` edges drawn from the episodes read.
+    pub lived: usize,
+}
+
 /// `stream_delta` events are NOT persisted (accumulated in memory, stored as
 /// a single `assistant_text` at the end).
 #[derive(Debug, Clone, Serialize, Deserialize)]

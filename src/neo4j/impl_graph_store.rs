@@ -3160,6 +3160,74 @@ impl AnalyticsStore for Neo4jClient {
         self.get_scoped_entity_neighborhood(center_type, center_id, params, filter)
             .await
     }
+
+    async fn ensure_agent(&self, agent_id: Uuid, model: Option<&str>) -> anyhow::Result<bool> {
+        self.ensure_agent(agent_id, model).await
+    }
+
+    async fn backfill_agents(&self) -> anyhow::Result<crate::neo4j::models::AgentBackfill> {
+        self.backfill_agents().await
+    }
+
+    async fn link_agent_authored(&self, agent_id: Uuid, note_id: Uuid) -> anyhow::Result<bool> {
+        self.link_agent_authored(agent_id, note_id).await
+    }
+
+    async fn link_agent_lived(&self, agent_id: Uuid, episode_id: Uuid) -> anyhow::Result<bool> {
+        self.link_agent_lived(agent_id, episode_id).await
+    }
+
+    async fn link_agent_knows(
+        &self,
+        agent_id: Uuid,
+        note_id: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> anyhow::Result<bool> {
+        self.link_agent_knows(agent_id, note_id, provenance).await
+    }
+
+    async fn coactivate_session(
+        &self,
+        project: Uuid,
+        notes: &[Uuid],
+        session: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> anyhow::Result<usize> {
+        self.coactivate_session(project, notes, session, provenance)
+            .await
+    }
+
+    async fn link_agent_uses(
+        &self,
+        agent_id: Uuid,
+        label: &str,
+        target_id: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> anyhow::Result<bool> {
+        self.link_agent_uses(agent_id, label, target_id, provenance)
+            .await
+    }
+
+    async fn agent_knows(
+        &self,
+        agent_id: Uuid,
+        limit: usize,
+    ) -> anyhow::Result<crate::graph::rules::AgentKnowledge> {
+        self.agent_knows(agent_id, limit).await
+    }
+
+    async fn schema_catalog(&self) -> anyhow::Result<crate::graph::schema::SchemaCatalog> {
+        self.schema_catalog().await
+    }
+
+    async fn causal_walk(
+        &self,
+        label: &str,
+        id: &str,
+        max_depth: u32,
+    ) -> anyhow::Result<crate::graph::schema::CausalWalk> {
+        self.causal_walk(label, id, max_depth).await
+    }
 }
 
 #[async_trait]

@@ -19,6 +19,30 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Comment une session s'est terminée, dit une fois.
+///
+/// `close_reason` valait `"closed"` partout : une fermeture par une personne, une
+/// éviction et l'arrêt normal d'un sous-agent étaient indiscernables dans le journal.
+/// Or c'est précisément ce champ qui, avec `files_modified`, décide si un épisode peut
+/// servir de leçon — un épisode dont on ne sait pas comment il s'est fini ne dit rien.
+///
+/// Ces valeurs sont écrites telles quelles dans `outcome.session.close_reason`, et un
+/// test vérifie qu'il y en a au moins trois réellement produites.
+pub mod close_reason {
+    /// A person (or the API on their behalf) closed the session.
+    pub const USER_CLOSED: &str = "user_closed";
+    /// The child process vanished: the provider reported it gone, out of a turn.
+    pub const PROCESS_DIED: &str = "process_died";
+    /// The session was a sub-agent's, and its call returned.
+    pub const SUBAGENT_FINISHED: &str = "subagent_finished";
+    /// The session was torn down for an in-place provider switch. It writes no episode:
+    /// the same thread must see only `provider_switched`.
+    pub const SWITCHED: &str = "switched";
+
+    /// Every reason this instance can write, for the test that counts them.
+    pub const ALL: &[&str] = &[USER_CLOSED, PROCESS_DIED, SUBAGENT_FINISHED, SWITCHED];
+}
+
 // ============================================================================
 // Episode — local, fully-resolved version
 // ============================================================================

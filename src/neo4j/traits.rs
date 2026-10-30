@@ -2915,6 +2915,100 @@ pub trait AnalyticsStore: Send + Sync {
         params: &crate::graph::neighborhood::NeighborhoodParams,
         filter: &crate::graph::neighborhood::ProjectFilter,
     ) -> Result<Option<crate::graph::neighborhood::ScopedNeighborhood>>;
+
+    /// Makes the agent `agent_id` a node of the graph, idempotently: a `(:Agent {kind:'model'})`
+    /// under its id, attached by `FACET_OF` to the durable `(:Agent {kind:'self'})` whose id is
+    /// [`crate::neo4j::ChatStore::agent_identity_namespace`] (generated once, persisted, never derived from a model).
+    /// `model`, when known, is recorded as a dated fact (`last_seen`), not as the identity.
+    /// Returns `true` when the node did not exist and was created by this call.
+    async fn ensure_agent(&self, agent_id: Uuid, model: Option<&str>) -> Result<bool>;
+
+    /// Rebuilds the agent nodes of what is already written: the distinct `agent:<id>` of the
+    /// `created_by` of notes and the agent of each session episode. Idempotent (a second run
+    /// creates nothing) and it reports what it found, before and after.
+    async fn backfill_agents(&self) -> Result<crate::neo4j::models::AgentBackfill>;
+
+    /// Draws `(:Agent)-[:AUTHORED]->(:Note)`: the note was written under that agent's
+    /// name (`created_by = "agent:<id>"`). The writer is the *facet* node; `FACET_OF`
+    /// carries the attribution up to the durable self. Returns `true` only when the edge
+    /// was created by this call.
+    async fn link_agent_authored(&self, agent_id: Uuid, note_id: Uuid) -> Result<bool>;
+
+    /// Draws `(:Agent)-[:LIVED]->(:SessionEpisode)`: the session that produced this
+    /// episode ran as that agent. Returns `true` only when the edge was created.
+    async fn link_agent_lived(&self, agent_id: Uuid, episode_id: Uuid) -> Result<bool>;
+
+    /// Draws `(:Agent)-[:KNOWS {rule, measure, at}]->(:Note)` — what a subject durably
+    /// knows, as opposed to `(Persona)-[:KNOWS]->(File)`, which says what a persona
+    /// covers. The provenance is written **on the edge**: an edge whose rule and measure
+    /// cannot be read is indistinguishable from an accident.
+    ///
+    /// A missing target draws nothing (`Ok(false)`), never a dangling edge: a pin naming
+    /// a deleted note is a skip, not a failure.
+    ///
+    /// The SUBJECT must already exist: the statement MATCHes both ends, so an agent with no
+    /// node yet is a silent no-op (`Ok(false)`). Callers make it first ([`Self::ensure_agent`])
+    /// — the rules do, and a caller that forgets gets an empty run that looks successful.
+    async fn link_agent_knows(
+        &self,
+        agent_id: Uuid,
+        note_id: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> Result<bool>;
+
+    /// Draws `(:Agent)-[:USES {rule, measure, at}]->(:Persona|:Skill|:Protocol)` — what
+    /// the subject actually applied to itself. The source is the activation registry: the
+    /// stages record what they injected into a session, and this makes that a durable edge
+    /// instead of a memory that dies with the process.
+    ///
+    /// `label` is one of [`crate::graph::rules::USABLE_LABELS`]; anything else is refused
+    /// before a query is built. A target that does not exist draws nothing (`Ok(false)`).
+    async fn link_agent_uses(
+        &self,
+        agent_id: Uuid,
+        label: &str,
+        target_id: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> Result<bool>;
+
+    /// Reinforces the `SYNAPSE` pairs among `notes` (all pairs, both directions), scoped to
+    /// `project`, and records on each edge WHICH rule and WHICH measure produced the
+    /// reinforcement — plus the session that did it. `last_session` is the last activator,
+    /// never a claim about who created the edge.
+    ///
+    /// Returns the number of edges touched (created or reinforced).
+    async fn coactivate_session(
+        &self,
+        project: Uuid,
+        notes: &[Uuid],
+        session: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> Result<usize>;
+
+    /// What that agent knows, bounded by `limit`, plus how many exist — « la part lue est
+    /// dite ». Only `(:Agent)-[:KNOWS]->(:Note)` is read: a `KNOWS` reaching a `File` (the
+    /// persona meaning) never leaks into this answer.
+    async fn agent_knows(
+        &self,
+        agent_id: Uuid,
+        limit: usize,
+    ) -> Result<crate::graph::rules::AgentKnowledge>;
+
+    /// The graph described as a catalog: its labels, and for each relationship type the
+    /// label pairs it really connects, with measured counts. Measured, never declared.
+    async fn schema_catalog(&self) -> Result<crate::graph::schema::SchemaCatalog>;
+
+    /// Walks forward from one anchor along the causal family
+    /// ([`crate::graph::schema::CAUSAL_TYPES`]), up to `max_depth` hops. `label` must be
+    /// one of [`crate::graph::schema::CAUSAL_ANCHORS`]; anything else is an error, never a
+    /// query built from caller input. An anchor that does not exist yields an empty walk
+    /// (the chain does not exist), never an error.
+    async fn causal_walk(
+        &self,
+        label: &str,
+        id: &str,
+        max_depth: u32,
+    ) -> Result<crate::graph::schema::CausalWalk>;
 }
 
 // ============================================================================
@@ -3577,6 +3671,10 @@ pub trait AuthStore: Send + Sync {
 
     /// Revoke all refresh tokens for a given user (e.g. on password change).
     async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64>;
+
+    // ========================================================================
+    // Episode embedding search (ReflexEngine)
+    // ========================================================================
 
     // ================================================================
     // MCP Tokens (long-lived, revocable, scoped — remote MCP transport)

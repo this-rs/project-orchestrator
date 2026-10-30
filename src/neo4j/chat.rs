@@ -832,7 +832,21 @@ impl Neo4jClient {
             q = q.param("embedding", vector);
         }
         let mut result = self.graph.execute(q).await?;
-        Ok(result.next().await?.is_some())
+        if result.next().await?.is_none() {
+            return Ok(false);
+        }
+
+        // The agent that lived this episode becomes a node and owns the edge, at the
+        // write. Best effort: an episode is more valuable than the edge that names it.
+        if let Some(agent) = session.agent_id {
+            if let Err(e) = self.ensure_agent(agent, None).await {
+                tracing::warn!(error = %e, "the node of the agent of an episode could not be made");
+            }
+            if let Err(e) = self.link_agent_lived(agent, episode.id).await {
+                tracing::warn!(error = %e, "the episode could not be given to its agent");
+            }
+        }
+        Ok(true)
     }
 
     /// See [`crate::neo4j::GraphStore::search_episodes_by_embedding`]: the session
@@ -909,6 +923,287 @@ impl Neo4jClient {
             .ok_or_else(|| anyhow::anyhow!("MERGE of the agent identity root returned no row"))?;
         let ns: String = row.get("ns")?;
         Ok(Uuid::parse_str(&ns)?)
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::ensure_agent`]. One statement: the durable self, the
+    /// model identity and the edge between them are MERGEd together, so a concurrent first call
+    /// matches what the other made (both ids are under a uniqueness constraint).
+    pub async fn ensure_agent(&self, agent_id: Uuid, model: Option<&str>) -> Result<bool> {
+        let root = self.agent_identity_namespace().await?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MERGE (s:Agent {id: $root}) ON CREATE SET s.kind = 'self', s.created_at = $now \
+                     MERGE (f:Agent {id: $id}) \
+                     ON CREATE SET f.kind = 'model', f.created_at = $now \
+                     SET f.last_seen = $now, \
+                         f.model = CASE WHEN $model = '' THEN f.model ELSE $model END \
+                     MERGE (f)-[:FACET_OF]->(s) \
+                     RETURN f.created_at = $now AS created",
+                )
+                .param("root", root.to_string())
+                .param("id", agent_id.to_string())
+                .param("now", now)
+                .param("model", model.unwrap_or_default().to_string()),
+            )
+            .await?;
+        let row = result
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("MERGE of an agent returned no row"))?;
+        Ok(row.get::<bool>("created").unwrap_or(false))
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::backfill_agents`].
+    pub async fn backfill_agents(&self) -> Result<AgentBackfill> {
+        let before = self.count_model_agents().await?;
+
+        let mut from_notes = std::collections::HashSet::new();
+        let mut note_edges: Vec<(Uuid, Uuid)> = Vec::new();
+        let mut rows = self
+            .graph
+            .execute(query(
+                "MATCH (n:Note) WHERE n.created_by STARTS WITH 'agent:' \
+                 RETURN n.id AS note, n.created_by AS by",
+            ))
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let by: String = row.get("by")?;
+            if let Some(agent) = crate::notes::provenance::parse_actor(&by) {
+                from_notes.insert(agent);
+                if let Some(note) = row
+                    .get::<String>("note")
+                    .ok()
+                    .and_then(|s| Uuid::parse_str(&s).ok())
+                {
+                    note_edges.push((agent, note));
+                }
+            }
+        }
+
+        let mut from_episodes = std::collections::HashSet::new();
+        let mut episode_edges: Vec<(Uuid, Uuid)> = Vec::new();
+        let mut rows = self
+            .graph
+            .execute(query(
+                "MATCH (e:SessionEpisode) RETURN e.id AS episode, e.payload AS payload",
+            ))
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let payload: String = row.get("payload")?;
+            match serde_json::from_str::<crate::episodes::models::Episode>(&payload) {
+                Ok(episode) => {
+                    if let Some(id) = episode.session.and_then(|s| s.agent_id) {
+                        from_episodes.insert(id);
+                        episode_edges.push((id, episode.id));
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "unreadable SessionEpisode payload, skipped"),
+            }
+        }
+
+        for id in from_notes.union(&from_episodes) {
+            self.ensure_agent(*id, None).await?;
+        }
+
+        // The same edges the write path draws, rebuilt from what is already written: one
+        // path, not two that could diverge.
+        let mut authored = 0;
+        for (agent, note) in &note_edges {
+            if self.link_agent_authored(*agent, *note).await? {
+                authored += 1;
+            }
+        }
+        let mut lived = 0;
+        for (agent, episode) in &episode_edges {
+            if self.link_agent_lived(*agent, *episode).await? {
+                lived += 1;
+            }
+        }
+
+        let after = self.count_model_agents().await?;
+        Ok(AgentBackfill {
+            before,
+            after,
+            from_notes: from_notes.len(),
+            from_episodes: from_episodes.len(),
+            authored,
+            lived,
+        })
+    }
+
+    async fn count_model_agents(&self) -> Result<usize> {
+        let mut rows = self
+            .graph
+            .execute(query(
+                "MATCH (a:Agent {kind: 'model'}) RETURN count(a) AS n",
+            ))
+            .await?;
+        let n: i64 = match rows.next().await? {
+            Some(row) => row.get("n")?,
+            None => 0,
+        };
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::link_agent_authored`].
+    pub async fn link_agent_authored(&self, agent_id: Uuid, note_id: Uuid) -> Result<bool> {
+        self.link_agent_to("AUTHORED", agent_id, "Note", note_id)
+            .await
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::link_agent_lived`].
+    pub async fn link_agent_lived(&self, agent_id: Uuid, episode_id: Uuid) -> Result<bool> {
+        self.link_agent_to("LIVED", agent_id, "SessionEpisode", episode_id)
+            .await
+    }
+
+    /// One MERGE for the plain attribution edges (`AUTHORED`, `LIVED`): they carry no
+    /// measure, only the fact, so `created_at` is all they record. A missing endpoint
+    /// draws nothing — a note or an episode deleted between the read and the write is a
+    /// skip, not a failure of the caller.
+    async fn link_agent_to(
+        &self,
+        edge: &str,
+        agent_id: Uuid,
+        target_label: &str,
+        target_id: Uuid,
+    ) -> Result<bool> {
+        // Both labels come from this file's own call sites, never from input.
+        // « Created » must mean « created by THIS call », not « recent ». A window would
+        // call a two-second-old edge new, which is precisely what a backfill re-run does.
+        // The stamp is ours, so equality is the proof.
+        let now = chrono::Utc::now().to_rfc3339();
+        let statement = format!(
+            "MATCH (a:Agent {{id: $agent}}), (t:{target_label} {{id: $target}}) \
+             MERGE (a)-[r:{edge}]->(t) \
+             ON CREATE SET r.created_at = $now \
+             RETURN r.created_at = $now AS created"
+        );
+        let mut result = self
+            .graph
+            .execute(
+                query(&statement)
+                    .param("agent", agent_id.to_string())
+                    .param("target", target_id.to_string())
+                    .param("now", now),
+            )
+            .await?;
+        match result.next().await? {
+            Some(row) => Ok(row.get::<bool>("created").unwrap_or(false)),
+            None => Ok(false),
+        }
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::link_agent_knows`].
+    pub async fn link_agent_knows(
+        &self,
+        agent_id: Uuid,
+        note_id: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> Result<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (a:Agent {id: $agent}), (n:Note {id: $note}) \
+                     MERGE (a)-[r:KNOWS]->(n) \
+                     ON CREATE SET r.created_at = $now \
+                     SET r.rule = $rule, r.measure = $measure, r.at = $at \
+                     RETURN r.created_at = $now AS created",
+                )
+                .param("agent", agent_id.to_string())
+                .param("note", note_id.to_string())
+                .param("now", now)
+                .param("rule", provenance.rule.clone())
+                .param("measure", provenance.measure.clone())
+                .param("at", provenance.at.clone()),
+            )
+            .await?;
+        match result.next().await? {
+            Some(row) => Ok(row.get::<bool>("created").unwrap_or(false)),
+            None => Ok(false),
+        }
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::link_agent_uses`].
+    pub async fn link_agent_uses(
+        &self,
+        agent_id: Uuid,
+        label: &str,
+        target_id: Uuid,
+        provenance: &crate::graph::rules::Provenance,
+    ) -> Result<bool> {
+        if !crate::graph::rules::USABLE_LABELS.contains(&label) {
+            anyhow::bail!(
+                "{label} is not a usable label: {}",
+                crate::graph::rules::USABLE_LABELS.join(", ")
+            );
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let statement = format!(
+            "MATCH (a:Agent {{id: $agent}}), (t:{label} {{id: $target}}) \
+             MERGE (a)-[r:USES]->(t) \
+             ON CREATE SET r.created_at = $now \
+             SET r.rule = $rule, r.measure = $measure, r.at = $at \
+             RETURN r.created_at = $now AS created"
+        );
+        let mut result = self
+            .graph
+            .execute(
+                query(&statement)
+                    .param("agent", agent_id.to_string())
+                    .param("target", target_id.to_string())
+                    .param("now", now)
+                    .param("rule", provenance.rule.clone())
+                    .param("measure", provenance.measure.clone())
+                    .param("at", provenance.at.clone()),
+            )
+            .await?;
+        match result.next().await? {
+            Some(row) => Ok(row.get::<bool>("created").unwrap_or(false)),
+            None => Ok(false),
+        }
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::agent_knows`]. Two reads, not one: the bounded
+    /// list and the total. A single query that returned only the list could not say how
+    /// much it had left out.
+    pub async fn agent_knows(
+        &self,
+        agent_id: Uuid,
+        limit: usize,
+    ) -> Result<crate::graph::rules::AgentKnowledge> {
+        // One row per edge, ordered in Rust: `collect()` promises no order, so asking the
+        // graph to sort it would promise something it does not deliver. A subject knows
+        // tens of notes, not millions — reading them all is the honest read.
+        let mut rows = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (a:Agent {id: $agent})-[r:KNOWS]->(n:Note) \
+                     RETURN n.id AS id, r.at AS at",
+                )
+                .param("agent", agent_id.to_string()),
+            )
+            .await?;
+        let mut all: Vec<(Uuid, String)> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let id: String = row.get("id")?;
+            let at: String = row.get("at").unwrap_or_default();
+            if let Ok(id) = Uuid::parse_str(&id) {
+                all.push((id, at));
+            }
+        }
+        // Most recently attested first, then by id so two equal stamps stay deterministic.
+        all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(crate::graph::rules::AgentKnowledge {
+            available: all.len(),
+            notes: all.into_iter().take(limit).map(|(id, _)| id).collect(),
+        })
     }
 
     /// See [`crate::neo4j::GraphStore::list_session_episodes`]. A payload that no longer

@@ -178,6 +178,67 @@ async fn run_has_its_own_episode(neo4j: &dyn GraphStore, spawned_by: Option<&str
         .is_some_and(|run| run.lifecycle_run_id.is_some()))
 }
 
+/// The tools whose call changes a file. `SessionWorkLog` counts the first, second and fourth;
+/// `MultiEdit` is added because it edits several places of one file in a single call.
+const EDITING_TOOLS: [&str; 4] = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
+
+/// What a session's persisted events say it did, read once at the close.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SessionJournal {
+    /// Distinct files an editing tool was called on (a file edited twice counts once).
+    files_modified: usize,
+    /// `user_message` events: the messages the session really received.
+    user_messages: i64,
+}
+
+/// Reads the journal of a session from its events. Best effort: a graph that cannot answer
+/// is logged and yields the empty journal, because the episode matters more than its detail.
+async fn read_session_journal(neo4j: &dyn GraphStore, session_id: Uuid) -> SessionJournal {
+    match neo4j.get_chat_events(session_id, -1, 100_000).await {
+        Ok(events) => journal_of(
+            events
+                .iter()
+                .map(|e| (e.event_type.as_str(), e.data.as_str())),
+        ),
+        Err(e) => {
+            tracing::warn!(session_id = %session_id, error = %e, "the events of a closed session could not be read: its episode keeps no file count");
+            SessionJournal::default()
+        }
+    }
+}
+
+/// Pure counting over `(event_type, json)` pairs.
+fn journal_of<'a>(events: impl Iterator<Item = (&'a str, &'a str)>) -> SessionJournal {
+    let mut files = std::collections::HashSet::new();
+    let mut user_messages = 0_i64;
+    for (event_type, data) in events {
+        match event_type {
+            "user_message" => user_messages += 1,
+            "tool_use" => {
+                let Ok(crate::chat::types::ChatEvent::ToolUse { tool, input, .. }) =
+                    serde_json::from_str(data)
+                else {
+                    continue;
+                };
+                if EDITING_TOOLS.contains(&tool.as_str()) {
+                    // `NotebookEdit` names its target `notebook_path`; the others `file_path`.
+                    if let Some(path) = ["file_path", "notebook_path"]
+                        .iter()
+                        .find_map(|k| input.get(*k).and_then(|v| v.as_str()))
+                    {
+                        files.insert(path.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    SessionJournal {
+        files_modified: files.len(),
+        user_messages,
+    }
+}
+
 /// Take the episode a chat session leaves at its close, `close_reason` being the
 /// reason announced on its `session_closed`.
 ///
@@ -186,7 +247,9 @@ async fn run_has_its_own_episode(neo4j: &dyn GraphStore, spawned_by: Option<&str
 ///   `UserRequest`, or `Manual` for a session another agent or a runner spawned.
 /// - **Process**: no FSM state; its active span (`created_at` → last update).
 /// - **Outcome**: no artefact list — nothing links what a session wrote back to it yet,
-///   and an episode does not invent it. How it ended is `session.close_reason`.
+///   and an episode does not invent it. It does count the distinct files an editing tool
+///   was called on, read from the persisted events (`files_modified`). How it ended is
+///   `session.close_reason`.
 /// - **Validation**: none.
 /// - **Session**: id, messages exchanged, close reason, cost, agent.
 ///
@@ -236,6 +299,15 @@ pub async fn collect_session_episode(
         }
     };
 
+    // The agent that lived it is a node, and the model it ran on a dated fact beside it.
+    if let Some(id) = agent_id {
+        if let Err(e) = neo4j.ensure_agent(id, Some(&session.model)).await {
+            tracing::warn!(session_id = %session_id, error = %e, "the node of the agent of a closed session could not be made");
+        }
+    }
+
+    let journal = read_session_journal(neo4j, session_id).await;
+
     let spawned = session
         .spawned_by
         .as_deref()
@@ -270,7 +342,7 @@ pub async fn collect_session_episode(
             note_ids: Vec::new(),
             decision_ids: Vec::new(),
             commit_shas: Vec::new(),
-            files_modified: 0,
+            files_modified: journal.files_modified,
         },
         validation: Validation {
             feedback_type: FeedbackType::None,
@@ -282,7 +354,9 @@ pub async fn collect_session_episode(
         source_run_id: None,
         session: Some(SessionTrace {
             session_id,
-            message_count: session.message_count,
+            // Raised by the persisted events, never lowered: the node's counter can lag the
+            // last messages when it is read at the close.
+            message_count: session.message_count.max(journal.user_messages),
             close_reason: close_reason.to_string(),
             total_cost_usd: session.total_cost_usd,
             agent_id,
@@ -659,6 +733,161 @@ mod tests {
         // Nothing links what the session wrote back to it: nothing is invented.
         assert!(episode.outcome.note_ids.is_empty() && episode.outcome.decision_ids.is_empty());
         assert_eq!(episode.validation.feedback_type, FeedbackType::None);
+    }
+
+    fn tool_use(tool: &str, input: serde_json::Value) -> String {
+        serde_json::to_string(&crate::chat::types::ChatEvent::ToolUse {
+            id: Uuid::new_v4().to_string(),
+            tool: tool.into(),
+            input,
+            parent_tool_use_id: None,
+            category: None,
+            canonical: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn the_journal_counts_distinct_edited_files_and_user_messages() {
+        let edit_a = tool_use("Edit", serde_json::json!({"file_path": "/r/a.rs"}));
+        let edit_a_again = tool_use("Edit", serde_json::json!({"file_path": "/r/a.rs"}));
+        let write_b = tool_use("Write", serde_json::json!({"file_path": "/r/b.rs"}));
+        let multi_c = tool_use("MultiEdit", serde_json::json!({"file_path": "/r/c.rs"}));
+        let notebook = tool_use(
+            "NotebookEdit",
+            serde_json::json!({"notebook_path": "/r/n.ipynb"}),
+        );
+        let read_d = tool_use("Read", serde_json::json!({"file_path": "/r/d.rs"}));
+        let no_path = tool_use("Edit", serde_json::json!({}));
+        let events = [
+            ("user_message", "{}"),
+            ("tool_use", edit_a.as_str()),
+            ("tool_use", edit_a_again.as_str()),
+            ("tool_use", write_b.as_str()),
+            ("tool_use", multi_c.as_str()),
+            ("tool_use", notebook.as_str()),
+            ("tool_use", read_d.as_str()),
+            ("tool_use", no_path.as_str()),
+            ("tool_use", "not json"),
+            ("user_message", "{}"),
+            ("assistant_text", "{}"),
+        ];
+        assert_eq!(
+            journal_of(events.into_iter()),
+            SessionJournal {
+                files_modified: 4,
+                user_messages: 2
+            },
+            "a, b, c and the notebook count once each; a read, a call without a path and a broken payload count for nothing"
+        );
+        assert_eq!(journal_of(std::iter::empty()), SessionJournal::default());
+    }
+
+    #[tokio::test]
+    async fn a_session_that_edited_three_files_leaves_an_episode_that_says_so() {
+        use crate::neo4j::models::ChatEventRecord;
+        let (store, sid, _) = store_with_session(Some("alpha"), Some("edit things")).await;
+        // The node lags: it says 4 messages, the events hold 6 (the 9-versus-13 gap).
+        let mut records = Vec::new();
+        let mut push = |seq: i64, event_type: &str, data: String| {
+            records.push(ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id: sid,
+                seq,
+                event_type: event_type.into(),
+                data,
+                created_at: Utc::now(),
+            });
+        };
+        for i in 0..6 {
+            push(
+                i * 2,
+                "user_message",
+                r#"{"type":"user_message","content":"m"}"#.into(),
+            );
+        }
+        for (i, f) in ["/r/a.rs", "/r/b.rs", "/r/c.rs", "/r/a.rs"]
+            .iter()
+            .enumerate()
+        {
+            push(
+                100 + i as i64,
+                "tool_use",
+                tool_use("Edit", serde_json::json!({ "file_path": f })),
+            );
+        }
+        push(
+            200,
+            "tool_use",
+            tool_use("Read", serde_json::json!({"file_path": "/r/z.rs"})),
+        );
+        store.store_chat_events(sid, records).await.unwrap();
+
+        let episode = collect_session_episode(&store, sid, "closed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(episode.outcome.files_modified, 3);
+        assert_eq!(episode.session.unwrap().message_count, 6);
+    }
+
+    #[tokio::test]
+    async fn a_session_without_edits_says_zero_and_keeps_its_own_count() {
+        let (store, sid, _) = store_with_session(Some("alpha"), Some("just talking")).await;
+        let episode = collect_session_episode(&store, sid, "closed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(episode.outcome.files_modified, 0);
+        // No events: the node's count stands, it is never lowered.
+        assert_eq!(episode.session.unwrap().message_count, 4);
+    }
+
+    #[tokio::test]
+    async fn the_agent_of_a_closed_session_is_a_node_and_the_backfill_rebuilds_the_rest() {
+        use crate::neo4j::models::AgentBackfill;
+        let (store, sid, project_id) = store_with_session(Some("alpha"), Some("work")).await;
+
+        // Taking the episode names the agent AND makes its node, with the model as a fact.
+        let episode = collect_session_episode(&store, sid, "closed")
+            .await
+            .unwrap()
+            .unwrap();
+        let named = episode.session.as_ref().unwrap().agent_id.unwrap();
+        assert_eq!(
+            store.agents.lock().unwrap().get(&named),
+            Some(&Some(crate::test_helpers::test_chat_session(None).model))
+        );
+
+        // Another agent wrote a note and never became a node (history before this change).
+        let other = Uuid::new_v4();
+        let mut note = crate::test_helpers::test_note(
+            project_id.unwrap(),
+            crate::notes::NoteType::Tip,
+            "written before agents were nodes",
+        );
+        note.created_by = crate::notes::provenance::actor(other);
+        store.notes.write().await.insert(note.id, note);
+        store.session_episodes.write().await.insert(sid, episode);
+
+        let first = store.backfill_agents().await.unwrap();
+        assert_eq!(
+            first,
+            AgentBackfill {
+                before: 1,
+                after: 2,
+                from_notes: 1,
+                from_episodes: 1,
+                // The edges the same run drew: one note given to its author, one episode
+                // given to the agent that lived it.
+                authored: 1,
+                lived: 1
+            },
+            "the older agent appears; the one already a node is not made twice"
+        );
+        let second = store.backfill_agents().await.unwrap();
+        assert_eq!(second.before, second.after, "a second run creates nothing");
+        assert_eq!(second.after, 2);
     }
 
     #[tokio::test]

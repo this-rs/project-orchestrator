@@ -16,6 +16,10 @@ use uuid::Uuid;
 /// Most distinct references kept per kind and per session. The newest win.
 const MAX_PER_KIND: usize = 8;
 
+/// Most notes kept per session. The injected set is already bounded by the context
+/// budget; this is the ceiling that keeps a long session from growing without end.
+pub const MAX_NOTES: usize = 24;
+
 /// One skill or persona, as the cockpit shows it.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ActivatedRef {
@@ -28,6 +32,10 @@ pub struct ActivatedRef {
 pub struct SessionActivations {
     pub skills: Vec<ActivatedRef>,
     pub personas: Vec<ActivatedRef>,
+    /// The notes the turn actually had in context, in the order they were injected. Kept
+    /// so the close can reinforce the pairs that were really co-injected instead of the
+    /// ones a rule imagines.
+    pub notes: Vec<Uuid>,
 }
 
 /// Add references to a list: an already known one moves to the front, and the
@@ -66,6 +74,26 @@ impl ActivationRegistry {
         }
     }
 
+    /// Record the notes a turn injected into `session`. Bounded newest-first: a session
+    /// that runs for hours must not grow a list of thousands.
+    pub fn record_notes(&self, session: Uuid, notes: impl IntoIterator<Item = Uuid>) {
+        let incoming: Vec<Uuid> = notes.into_iter().collect();
+        if incoming.is_empty() {
+            return;
+        }
+        if let Ok(mut reg) = self.by_session.lock() {
+            let entry = reg.entry(session).or_default();
+            for id in incoming {
+                entry.notes.retain(|x| *x != id);
+                entry.notes.push(id);
+            }
+            let excess = entry.notes.len().saturating_sub(MAX_NOTES);
+            if excess > 0 {
+                entry.notes.drain(0..excess);
+            }
+        }
+    }
+
     /// What `session` has been given, empty when nothing was recorded.
     pub fn get(&self, session: Uuid) -> SessionActivations {
         self.by_session
@@ -94,6 +122,11 @@ pub fn record_skills(session: Uuid, skills: impl IntoIterator<Item = ActivatedRe
 }
 
 /// Record the persona the persona stage just activated for `session`.
+/// Record, on the process-wide registry, the notes a turn injected into `session`.
+pub fn record_notes(session: Uuid, notes: impl IntoIterator<Item = Uuid>) {
+    global().record_notes(session, notes);
+}
+
 pub fn record_persona(session: Uuid, persona: ActivatedRef) {
     global().record_persona(session, persona);
 }
