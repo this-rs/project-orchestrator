@@ -649,8 +649,15 @@ mod tests {
 
         match DocxExtractor.extract(&bytes) {
             Err(ExtractError::Malformed { detail, .. }) => {
+                // zip 9 refuses this itself: the decompressor compares what it
+                // produces against the size the entry declares, so it speaks
+                // first and our bounded read never gets to its own wording. The
+                // guard below stays — it is what bounds memory if that check
+                // ever moves — so either message means the bomb was refused,
+                // and that is the assertion.
                 assert!(
-                    detail.contains("decompresses past"),
+                    detail.contains("larger than its declared uncompressed size")
+                        || detail.contains("decompresses past"),
                     "detail was {detail:?}"
                 );
             }

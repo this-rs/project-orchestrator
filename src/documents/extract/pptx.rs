@@ -339,8 +339,11 @@ fn ordered_slide_parts<R: Read + Seek>(
     // Fallback: every `ppt/slides/slideN.xml`, in numeric order.
     let mut numbered: Vec<(u64, String)> = archive
         .file_names()
+        // zip 9 yields `ZipResult<Cow<str>>` per entry (a name that is not
+        // valid UTF-8 is reported instead of skipped): `flatten` keeps the
+        // fallback scanning the rest of the directory.
+        .flatten()
         .filter_map(|n| {
-            let n = n.ok()?;
             let num = n
                 .strip_prefix("ppt/slides/slide")?
                 .strip_suffix(".xml")?

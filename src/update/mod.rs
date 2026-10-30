@@ -483,7 +483,9 @@ fn extract_from_zip(archive_bytes: &[u8]) -> Result<Vec<u8>> {
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
-        let name = file.name().to_string();
+        // zip 9 makes the name fallible: an entry whose name is not valid UTF-8
+        // is an error per entry instead of a silent lossy conversion.
+        let name = file.name()?.to_string();
         let file_name = std::path::Path::new(&name)
             .file_name()
             .and_then(|n| n.to_str())
