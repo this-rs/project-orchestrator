@@ -333,8 +333,19 @@ async fn pinned_notes_everywhere(graph: &dyn GraphStore) -> anyhow::Result<(Vec<
     use crate::chat::stages::knowledge_injection::load_pinned_notes;
 
     let mut scopes: Vec<Option<String>> = vec![None];
-    for project in graph.list_projects().await? {
-        scopes.push(Some(project.slug));
+    // The global pins are the socle; the project-scoped ones are a convenience. A graph that
+    // holds a project the mapper cannot read (a foreign suite left a bare `(:Project)` without
+    // `name`/`slug`) must not kill the rule over it — « never fail without a socle »: the
+    // global pins are still applied, the unreadable scopes are said, not silently skipped.
+    match graph.list_projects().await {
+        Ok(projects) => {
+            for project in projects {
+                scopes.push(Some(project.slug));
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "project pin scopes are unreadable: only the global pins are read");
+        }
     }
     let read = scopes.len();
 
