@@ -191,6 +191,33 @@ pub fn transcript_id_of(wire: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether the native transcript a persisted resume token names is ABSENT from the
+/// disk store, so a resume of it cannot succeed.
+///
+/// `None` when the token is not a native one: a legacy token names a CLI
+/// conversation, not a transcript file, and there is nothing to check. `Some(true)`
+/// when the token IS native but the file the store would load is not there — the
+/// session was cut before its FIRST committed turn (a transcript is written only
+/// when a turn commits, `loop.rs`), so the token names nothing and every resume
+/// failed with `"unknown transcript: nothing to resume"`. `root == None` means the
+/// host keeps the transcripts in memory ([`store_for`] was never given a disk
+/// root): after a restart nothing is on disk, so a native token is missing too.
+pub fn named_transcript_missing(
+    root: Option<&Path>,
+    instance_id: &str,
+    wire: &str,
+) -> Option<bool> {
+    let id = transcript_id_of(wire)?;
+    let missing = match root {
+        Some(root) => dir_for(root, instance_id)
+            .map(|dir| !dir.join(format!("{id}.json")).exists())
+            // An instance id that is not a path component has no store either.
+            .unwrap_or(true),
+        None => true,
+    };
+    Some(missing)
+}
+
 /// Removes the transcript a session's token names (and a leftover temporary
 /// file of an interrupted write). `Ok(false)`: nothing to remove — not a native
 /// token, or no file. nexus' `TranscriptStore` has no deletion: the host owns
@@ -349,6 +376,46 @@ mod tests {
         assert_eq!(transcript_id_of(&cli), None);
         assert_eq!(transcript_id_of(&native_token("../x")), None);
         assert_eq!(transcript_id_of("not json"), None);
+    }
+
+    /// The resume token names a transcript FILE, written only when a turn commits. A
+    /// session cut before its first committed turn (a fresh open, notably the first
+    /// turn after a provider switch) carries a token that names nothing: every resume
+    /// then failed with `"unknown transcript: nothing to resume"`. This tells that
+    /// apart from a token whose file is present, so the host can reopen fresh instead
+    /// of bricking the conversation (05716244).
+    #[test]
+    fn a_native_token_names_a_missing_transcript_when_the_file_is_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(DIR_NAME);
+        let token = native_token("abc123");
+        // Nothing written yet: the file the token names is absent.
+        assert_eq!(
+            named_transcript_missing(Some(&root), "local", &token),
+            Some(true)
+        );
+
+        // The store writes it: the token now names an existing transcript.
+        let store = store_for(&root, "local", KnownSecrets::new()).unwrap();
+        store.save("abc123", &[ChatMessage::user("hi")]).unwrap();
+        assert_eq!(
+            named_transcript_missing(Some(&root), "local", &token),
+            Some(false)
+        );
+
+        // No disk root (transcripts in memory): nothing survives a restart.
+        assert_eq!(named_transcript_missing(None, "local", &token), Some(true));
+
+        // An instance id that is not a path component has no store either.
+        assert_eq!(
+            named_transcript_missing(Some(&root), "../x", &token),
+            Some(true)
+        );
+
+        // A legacy (Claude Code) token names a CLI conversation, not a transcript:
+        // there is nothing to check, so the plain resume is kept.
+        let cli = ResumeToken::claude_code_session("abc123").to_wire();
+        assert_eq!(named_transcript_missing(Some(&root), "local", &cli), None);
     }
 
     #[cfg(unix)]
