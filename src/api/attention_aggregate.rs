@@ -1054,6 +1054,9 @@ pub struct LiveAgent {
     /// First user message, truncated by the store; null when unknown.
     pub preview: Option<String>,
     pub project_slug: Option<String>,
+    /// The session runs in a git worktree of `project_slug` (its cwd is not under
+    /// the project root directly). The client shows a marker instead of "hors graphe".
+    pub in_worktree: bool,
     pub workspace_slug: Option<String>,
     pub model: String,
     /// The provider instance (harness/engine) the session runs on. The session node
@@ -1184,6 +1187,19 @@ pub async fn build_live_agents(
             read_origin(node.as_ref().and_then(|n| n.spawned_by.as_deref()));
         let started_at = node.as_ref().map_or(now, |n| n.created_at);
         let updated_at = node.as_ref().map_or(now, |n| n.updated_at);
+        // A session opened in a git worktree has no project_slug (its cwd is not
+        // under any project root). Resolve the worktree's MAIN repository so the
+        // agent attaches to its project instead of floating "hors graphe".
+        let (project_slug, in_worktree) = match node.as_ref().and_then(|n| n.project_slug.clone()) {
+            Some(slug) => (Some(slug), false),
+            None => {
+                let cwd = node.as_ref().map(|n| n.cwd.clone()).unwrap_or_default();
+                crate::skills::project_resolver::infer_project_slug_worktree_aware(store, &cwd)
+                    .await
+                    .map(|(slug, wt)| (Some(slug), wt))
+                    .unwrap_or((None, false))
+            }
+        };
         agents.push(LiveAgent {
             session_id: id.to_string(),
             title: node
@@ -1192,7 +1208,8 @@ pub async fn build_live_agents(
                 .filter(|t| !t.trim().is_empty())
                 .unwrap_or_else(|| "Session sans titre".to_string()),
             preview: node.as_ref().and_then(|n| n.preview.clone()),
-            project_slug: node.as_ref().and_then(|n| n.project_slug.clone()),
+            project_slug,
+            in_worktree,
             workspace_slug: node.as_ref().and_then(|n| n.workspace_slug.clone()),
             model: node.as_ref().map(|n| n.model.clone()).unwrap_or_default(),
             provider_id: node.as_ref().and_then(|n| n.provider_id.clone()),

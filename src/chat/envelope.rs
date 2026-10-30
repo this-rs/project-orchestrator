@@ -346,7 +346,7 @@ pub struct ParentEnvelope {
 /// `git worktree add`), so a `.git` file planted anywhere cannot borrow a repository. Its
 /// `commondir` then names the repository's `.git`. `None`: not a linked worktree (no `.git`, a
 /// `.git` DIRECTORY, a broken or forged link). Pure file reads: no `git` process.
-fn worktree_repository(dir: &str) -> Option<(PathBuf, PathBuf)> {
+pub(crate) fn worktree_repository(dir: &str) -> Option<(PathBuf, PathBuf)> {
     let start = resolve_path(dir);
     for candidate in start.ancestors() {
         let dot_git = candidate.join(".git");
