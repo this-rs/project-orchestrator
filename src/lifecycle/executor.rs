@@ -425,7 +425,6 @@ mod tests {
             oidc_client: None,
             neural_router: crate::test_helpers::mock_neural_router(),
             trajectory_collector: std::sync::RwLock::new(None),
-            trajectory_store_neo4j: None,
             trajectory_store: None,
             identity: None,
             reactor_counters: std::sync::OnceLock::new(),

@@ -1250,7 +1250,6 @@ pub struct AppState {
     pub trajectory_collector:
         Arc<std::sync::RwLock<Option<Arc<neural_routing_runtime::TrajectoryCollector>>>>,
     /// Concrete Neo4j store — needed for lazy TrajectoryCollector creation.
-    pub trajectory_store_neo4j: Option<Arc<crate::neo4j::trajectory_store::Neo4jTrajectoryStore>>,
     /// Trajectory store — Neo4j CRUD + vector search for stored trajectories.
     pub trajectory_store: Arc<dyn neural_routing_runtime::TrajectoryStore>,
     /// MCP Federation registry — external MCP server connections.
@@ -1280,10 +1279,7 @@ impl AppState {
         // Initialize trajectory collector (fire-and-forget decision capture)
         let trajectory_collector_inner = if config.neural_routing.collection.enabled {
             let (collector, _handle) = neural_routing_runtime::TrajectoryCollector::new(
-                backend
-                    .trajectory_store_concrete
-                    .clone()
-                    .expect("the default storage backend provides the concrete trajectory store"),
+                backend.trajectories.clone(),
                 &config.neural_routing.collection,
                 None, // use default DecisionVectorBuilder
             );
@@ -1303,7 +1299,6 @@ impl AppState {
             config: Arc::new(config),
             neural_router,
             trajectory_collector: Arc::new(std::sync::RwLock::new(trajectory_collector_inner)),
-            trajectory_store_neo4j: backend.trajectory_store_concrete,
             trajectory_store: backend.trajectories,
             mcp_registry: mcp_federation::registry::new_shared_registry(),
         })
@@ -1493,12 +1488,11 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Same for graph events (events.graph): cross-instance graph mutations.
     event_bus.start_graph_nats_bridge();
 
-    // Extract neural_router, trajectory_collector, trajectory_store, trajectory_store_neo4j,
+    // Extract neural_router, trajectory_collector, trajectory_store
     // and mcp_registry before state is moved into Orchestrator
     let neural_router = state.neural_router.clone();
     let trajectory_collector = state.trajectory_collector.clone();
     let trajectory_store = state.trajectory_store.clone();
-    let trajectory_store_neo4j = state.trajectory_store_neo4j.clone();
     let mcp_registry = state.mcp_registry.clone();
 
     // Create orchestrator with hybrid emitter
@@ -2315,7 +2309,6 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         registry_remote_url: config.registry_remote_url.clone(),
         neural_router: neural_router.clone(),
         trajectory_collector: std::sync::RwLock::new(trajectory_collector.read().unwrap().clone()),
-        trajectory_store_neo4j,
         trajectory_store: Some(trajectory_store),
         oidc_client,
         identity: {
