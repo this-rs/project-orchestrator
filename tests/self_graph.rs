@@ -648,7 +648,10 @@ async fn a_causal_walk_follows_a_real_chain_and_refuses_a_stranger_label() {
         .await
         .unwrap();
     assert_eq!(clamped.max_depth, 4);
-    assert!(!clamped.truncated, "a 4-hop bound reaches the end: {clamped:?}");
+    assert!(
+        !clamped.truncated,
+        "a 4-hop bound reaches the end: {clamped:?}"
+    );
 
     // An agent the graph does not have is absent, not invented.
     assert!(e.client.find_agent(Uuid::new_v4()).await.unwrap().is_none());
