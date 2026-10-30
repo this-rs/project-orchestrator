@@ -4,6 +4,7 @@ use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use super::models::*;
+use super::symbol_key::stable_symbol_key;
 use anyhow::Result;
 use neo4rs::query;
 use uuid::Uuid;
@@ -506,6 +507,7 @@ impl Neo4jClient {
     /// Create or update a function node
     pub async fn upsert_function(&self, func: &FunctionNode) -> Result<()> {
         let id = format!("{}:{}:{}", func.file_path, func.name, func.line_start);
+        let stable_key = stable_symbol_key(&func.file_path, &func.name, &func.params);
         let q = query(
             r#"
             MERGE (f:Function {id: $id})
@@ -520,13 +522,15 @@ impl Neo4jClient {
                 f.file_path = $file_path,
                 f.line_start = $line_start,
                 f.line_end = $line_end,
-                f.docstring = $docstring
+                f.docstring = $docstring,
+                f.stable_key = $stable_key
             WITH f
             MATCH (file:File {path: $file_path})
             MERGE (file)-[:CONTAINS]->(f)
             "#,
         )
         .param("id", id)
+        .param("stable_key", stable_key)
         .param("name", func.name.clone())
         .param("visibility", format!("{:?}", func.visibility))
         .param("params", serde_json::to_string(&func.params)?)
@@ -1165,6 +1169,10 @@ impl Neo4jClient {
                     "id".into(),
                     format!("{}:{}:{}", func.file_path, func.name, func.line_start).into(),
                 );
+                m.insert(
+                    "stable_key".into(),
+                    stable_symbol_key(&func.file_path, &func.name, &func.params).into(),
+                );
                 m.insert("name".into(), func.name.clone().into());
                 m.insert("visibility".into(), format!("{:?}", func.visibility).into());
                 m.insert(
@@ -1207,7 +1215,8 @@ impl Neo4jClient {
                 f.file_path = func.file_path,
                 f.line_start = func.line_start,
                 f.line_end = func.line_end,
-                f.docstring = func.docstring
+                f.docstring = func.docstring,
+                f.stable_key = func.stable_key
             WITH f, func
             MATCH (file:File {path: func.file_path})
             MERGE (file)-[:CONTAINS]->(f)

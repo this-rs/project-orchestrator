@@ -324,6 +324,24 @@ pub struct MigrationOutcome {
     pub error: Option<String>,
 }
 
+/// Backfill the stable identity of functions (see `symbol_key.rs`).
+///
+/// The legacy `id` embeds the line number, so the same function accumulated
+/// one node per edit. The stable key (`file_path::name`, plus a parameter-type
+/// signature only when there are parameters) is written as a shadow property
+/// first — reversible, and the prerequisite of the deduplication migration.
+const BACKFILL_STABLE_KEY: &str = r#"
+MATCH (n:Function)
+WHERE n.stable_key IS NULL
+  AND ($scope IS NULL OR n.project_id = $scope)
+WITH n LIMIT $batch
+WITH n, apoc.convert.fromJsonList(coalesce(n.params, '[]')) AS ps
+WITH n, [x IN ps | coalesce(x.type_name, '?')] AS types
+SET n.stable_key = n.file_path + '::' + n.name +
+  CASE WHEN size(types) = 0 THEN '' ELSE '(' + apoc.text.join(types, ',') + ')' END
+RETURN count(n) AS processed
+"#;
+
 impl Neo4jClient {
     /// The ordered list of data migrations.
     pub fn data_migrations() -> Vec<DataMigration> {
@@ -370,6 +388,13 @@ impl Neo4jClient {
                 description:
                     "Delete the code graph of git worktrees (copies of the same repository)",
                 batch: PURGE_WORKTREE_NODES.to_string(),
+                finalize: None,
+            },
+            DataMigration {
+                id: "2026-10-backfill-stable-key",
+                description:
+                    "Write the stable identity of functions as a shadow property (line removed from id)",
+                batch: BACKFILL_STABLE_KEY.to_string(),
                 finalize: None,
             },
         ]
