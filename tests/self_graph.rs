@@ -511,6 +511,9 @@ async fn the_catalog_says_what_the_graph_really_has() {
     let mut note = a_note("api");
     note.project_id = Some(e.project.id);
     e.client.create_note(&note).await.unwrap();
+    // The subject must exist or `link_agent_knows` is a silent no-op — and a test that
+    // believes otherwise proves nothing about the catalog.
+    e.client.ensure_agent(agent, None).await.unwrap();
     e.client
         .link_agent_knows(
             agent,

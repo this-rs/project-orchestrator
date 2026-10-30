@@ -92,10 +92,20 @@ impl SchemaCatalog {
     }
 
     /// Whether the graph actually carries this type. An agent that asks before it writes
-    /// needs this answer, so it comes from the source that cannot lag: the declared types.
-    /// The shapes are a separate, best-effort answer — see [`Self::shapes_of`].
+    /// needs this answer, so it comes from the ONE source that is exact: the declared types.
+    ///
+    /// The shapes are deliberately NOT consulted. Measured on CI: `apoc.meta.schema` keeps
+    /// describing a type after its last edge is deleted, while `db.relationshipTypes()` stops
+    /// listing it. Trusting the union made `has_edge` answer « yes » for a type the graph no
+    /// longer had — the inverse of the freshness problem, and the same lie.
+    ///
+    /// `types` empty means the catalog was built without that read; only then do the shapes
+    /// answer, and they do so as witnesses, not as authorities.
     pub fn has_edge(&self, edge: &str) -> bool {
-        self.types.iter().any(|t| t == edge) || self.edges.iter().any(|s| s.edge == edge)
+        if self.types.is_empty() {
+            return self.edges.iter().any(|s| s.edge == edge);
+        }
+        self.types.iter().any(|t| t == edge)
     }
 
     /// The label pairs measured for a type. Empty does NOT mean the type is absent — it may
@@ -220,6 +230,33 @@ mod tests {
         assert_eq!(c.shapes_of("KNOWS").len(), 2);
         assert_eq!(c.edge_types(), 1, "one type, two shapes");
         assert_eq!(c.volume("KNOWS"), Some(792));
+    }
+
+    #[test]
+    fn a_stale_shape_does_not_make_a_type_exist() {
+        // Measured on CI: apoc kept describing KNOWS after its last edge was deleted, while
+        // `db.relationshipTypes()` no longer listed it. The exact source decides; a shape is
+        // a witness, never an authority.
+        let c = SchemaCatalog {
+            labels: vec!["Agent".into()],
+            types: vec!["CONTAINS".into()],
+            edges: vec![shape("KNOWS", "Agent", "Note")],
+            volumes: [("CONTAINS".to_string(), 1u64)].into_iter().collect(),
+        };
+        assert!(
+            !c.has_edge("KNOWS"),
+            "a shape alone must not answer « this type exists »"
+        );
+        assert!(c.has_edge("CONTAINS"));
+
+        // Without the exact read at all, the shapes are all we have — and they answer.
+        let fallback = SchemaCatalog {
+            labels: vec![],
+            types: vec![],
+            edges: vec![shape("KNOWS", "Agent", "Note")],
+            volumes: Default::default(),
+        };
+        assert!(fallback.has_edge("KNOWS"));
     }
 
     #[test]
