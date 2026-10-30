@@ -103,8 +103,23 @@ pub enum KeepReason {
     UncommittedChanges,
     /// Commits neither in the base nor on any remote-tracking branch.
     UnpushedCommits { count: usize },
+    /// Commits pushed to a remote but not merged into the default line (a pull
+    /// request is likely still open): removing the worktree would lose the local
+    /// checkout the review round may still need.
+    UnmergedCommits { count: usize },
     /// The state could not be read: nothing is removed on a guess.
     Unverifiable { error: String },
+}
+
+/// The release-relevant state of the worktree's commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorktreeStatus {
+    /// Nothing to keep: no commits beyond the base, or all of them merged.
+    Clean,
+    /// Commits beyond the base that no remote-tracking branch has.
+    Unpushed { count: usize },
+    /// Commits pushed to a remote but not merged into the default line.
+    Unmerged { count: usize },
 }
 
 /// What [`EphemeralWorktree::release`] did.
@@ -268,42 +283,102 @@ impl EphemeralWorktree {
         self.planned.path.to_string_lossy().to_string()
     }
 
-    /// Commits reachable from the worktree's `HEAD` or its branch that are neither in the base
-    /// nor on any remote-tracking branch.
-    async fn unpushed(&self) -> Result<usize, String> {
+    /// The release-relevant state of the worktree's commits (see [`WorktreeStatus`]).
+    async fn status(&self) -> Result<WorktreeStatus, String> {
         let branch = format!("refs/heads/{}", self.planned.branch);
         let base = format!("^{}", self.planned.base_sha);
-        let mut args = vec!["rev-list", "--count"];
-        // The worktree's HEAD covers a detached checkout the agent may have committed on.
-        let head = if self.planned.path.is_dir() {
-            git(&self.planned.path, &["rev-parse", "--verify", "HEAD"])
-                .await
-                .ok()
-        } else {
-            None
-        };
-        if let Some(head) = head.as_deref() {
-            args.push(head);
+
+        // The tips the work may hang from: the checkout's HEAD (covers a detached
+        // checkout the agent may have committed on) and the branch, when they exist.
+        let mut tips: Vec<String> = Vec::new();
+        if self.planned.path.is_dir() {
+            if let Ok(head) = git(&self.planned.path, &["rev-parse", "--verify", "HEAD"]).await {
+                if !head.is_empty() {
+                    tips.push(head);
+                }
+            }
         }
-        let branch_exists = git(
+        if git(
             &self.planned.repository,
             &["rev-parse", "--verify", "--quiet", &branch],
         )
         .await
-        .is_ok();
-        if branch_exists {
-            args.push(&branch);
+        .is_ok()
+        {
+            let tip = git(
+                &self.planned.repository,
+                &["rev-parse", "--verify", &branch],
+            )
+            .await?;
+            if !tip.is_empty() {
+                tips.push(tip);
+            }
         }
-        if head.is_none() && !branch_exists {
-            return Ok(0);
+        if tips.is_empty() {
+            return Ok(WorktreeStatus::Clean);
+        }
+
+        // Commits reachable from any tip but not from the base.
+        let mut args: Vec<&str> = vec!["rev-list", "--count"];
+        for tip in &tips {
+            args.push(tip.as_str());
+        }
+        args.push(&base);
+        let work = git(&self.planned.repository, &args).await?;
+        let work: usize = work.parse().map_err(|e| format!("rev-list --count: {e}"))?;
+        if work == 0 {
+            return Ok(WorktreeStatus::Clean);
+        }
+
+        // Among those, the ones no remote-tracking branch has.
+        let mut args: Vec<&str> = vec!["rev-list", "--count"];
+        for tip in &tips {
+            args.push(tip.as_str());
         }
         args.push(&base);
         args.push("--not");
         args.push("--remotes");
-        let count = git(&self.planned.repository, &args).await?;
-        count
-            .parse::<usize>()
-            .map_err(|e| format!("rev-list --count: {e}"))
+        let unpushed = git(&self.planned.repository, &args).await?;
+        let unpushed: usize = unpushed
+            .parse()
+            .map_err(|e| format!("rev-list --count: {e}"))?;
+        if unpushed > 0 {
+            return Ok(WorktreeStatus::Unpushed { count: unpushed });
+        }
+
+        // All work is pushed: merged when every tip is an ancestor of the default line.
+        let default = match git(
+            &self.planned.repository,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/remotes/origin/HEAD^{commit}",
+            ],
+        )
+        .await
+        {
+            Ok(sha) if !sha.is_empty() => sha,
+            _ => {
+                git(
+                    &self.planned.repository,
+                    &["rev-parse", "--verify", "HEAD^{commit}"],
+                )
+                .await?
+            }
+        };
+        for tip in &tips {
+            let merged = git(
+                &self.planned.repository,
+                &["merge-base", "--is-ancestor", tip.as_str(), &default],
+            )
+            .await
+            .is_ok();
+            if !merged {
+                return Ok(WorktreeStatus::Unmerged { count: work });
+            }
+        }
+        Ok(WorktreeStatus::Clean)
     }
 
     /// Remove the worktree and its branch, unless that could lose work (see the module).
@@ -318,9 +393,14 @@ impl EphemeralWorktree {
                 Err(error) => return kept(KeepReason::Unverifiable { error }),
             }
         }
-        match self.unpushed().await {
-            Ok(0) => {}
-            Ok(count) => return kept(KeepReason::UnpushedCommits { count }),
+        match self.status().await {
+            Ok(WorktreeStatus::Clean) => {}
+            Ok(WorktreeStatus::Unpushed { count }) => {
+                return kept(KeepReason::UnpushedCommits { count });
+            }
+            Ok(WorktreeStatus::Unmerged { count }) => {
+                return kept(KeepReason::UnmergedCommits { count });
+            }
             Err(error) => return kept(KeepReason::Unverifiable { error }),
         }
         let repo = &self.planned.repository;
@@ -532,7 +612,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pushed_commits_do_not_keep_the_worktree() {
+    async fn pushed_but_unmerged_commits_keep_the_worktree() {
         let (origin, root) = repo();
         let clone_parent = tempfile::tempdir().unwrap();
         run(
@@ -555,6 +635,47 @@ mod tests {
                 &format!("HEAD:refs/heads/{}", wt.planned().branch),
             ],
         );
+        // Pushed, but origin's default line does not contain it yet: the PR is open.
+        assert_eq!(
+            wt.release().await,
+            ReleaseOutcome::Kept {
+                reason: KeepReason::UnmergedCommits { count: 1 }
+            }
+        );
+        assert!(path.exists(), "an open PR must keep its worktree");
+    }
+
+    #[tokio::test]
+    async fn merged_commits_do_not_keep_the_worktree() {
+        let (origin, root) = repo();
+        let clone_parent = tempfile::tempdir().unwrap();
+        run(
+            clone_parent.path(),
+            &["clone", "-q", &origin.path().to_string_lossy(), "c"],
+        );
+        let clone = clone_parent.path().join("c");
+        let wt = made(&clone, root.path()).await;
+        let path = wt.planned().path.clone();
+        run(
+            &path,
+            &["commit", "-q", "--allow-empty", "-m", "pushed work"],
+        );
+        run(
+            &path,
+            &[
+                "push",
+                "-q",
+                "origin",
+                &format!("HEAD:refs/heads/{}", wt.planned().branch),
+            ],
+        );
+        // The PR is merged into origin's default line.
+        run(
+            origin.path(),
+            &["merge", "-q", "--no-ff", &wt.planned().branch],
+        );
+        // The clone learns of the merge before release reads the state.
+        run(&clone, &["fetch", "-q", "origin"]);
         assert_eq!(wt.release().await, ReleaseOutcome::Removed);
         assert!(!path.exists());
     }

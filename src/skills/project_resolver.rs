@@ -193,6 +193,27 @@ pub async fn infer_project_slug_for_cwd(graph_store: &dyn GraphStore, cwd: &str)
     infer_project_slug(&entries, cwd)
 }
 
+/// Project owning `cwd`, with git-worktree awareness. When `cwd` is not under any
+/// project root but IS inside a linked worktree (its `.git` is a file pointing to a
+/// common dir), the project is resolved from the worktree's MAIN repository. Returns
+/// the slug and whether the cwd is a worktree of that project (`true`), or a plain
+/// checkout (`false`).
+pub async fn infer_project_slug_worktree_aware(
+    graph_store: &dyn GraphStore,
+    cwd: &str,
+) -> Option<(String, bool)> {
+    if cwd.is_empty() {
+        return None;
+    }
+    let entries = load_project_entries(graph_store).await.ok()?;
+    if let Some(slug) = infer_project_slug(&entries, cwd) {
+        return Some((slug, false));
+    }
+    let (_, main_repo) = crate::chat::envelope::worktree_repository(cwd)?;
+    let slug = infer_project_slug(&entries, &main_repo.to_string_lossy())?;
+    Some((slug, true))
+}
+
 /// The forms of a tool's file path to match against a project's skill
 /// triggers: relative to each of the project's roots first (file-glob
 /// triggers are root-relative, e.g. `src/neo4j/**`), then the absolute
