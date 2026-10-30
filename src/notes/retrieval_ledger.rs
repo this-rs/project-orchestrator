@@ -140,10 +140,11 @@ impl Snapshot {
 /// atomiques.
 pub fn record(source: Source, trigger: Trigger, hits: usize, ok: bool, latency_ms: u64) {
     LEDGER.calls.fetch_add(1, Ordering::Relaxed);
+    // Un échec et un résultat vide sont deux choses différentes : une lecture qui
+    // a échoué n'a rien répondu, elle n'a pas répondu « rien ».
     if !ok {
         LEDGER.failures.fetch_add(1, Ordering::Relaxed);
-    }
-    if hits == 0 {
+    } else if hits == 0 {
         LEDGER.empty_results.fetch_add(1, Ordering::Relaxed);
     }
     LEDGER.hits.fetch_add(hits as u64, Ordering::Relaxed);
