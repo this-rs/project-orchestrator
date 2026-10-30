@@ -119,6 +119,51 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Record a decision attached to no task.
+    ///
+    /// Unlike [`create_decision`], there is no task to link: the node is created
+    /// on its own. This is the path for a choice made outside any plan; the
+    /// task-bound path keeps its integrity check (bug 3693617b).
+    pub async fn create_decision_global(&self, decision: &DecisionNode) -> Result<()> {
+        let q = query(
+            r#"
+            CREATE (d:Decision {
+                id: $id,
+                description: $description,
+                rationale: $rationale,
+                alternatives: $alternatives,
+                chosen_option: $chosen_option,
+                decided_by: $decided_by,
+                decided_at: datetime($decided_at),
+                status: $status,
+                sharing_consent: $sharing_consent
+            })
+            RETURN d.id AS created_id
+            "#,
+        )
+        .param("id", decision.id.to_string())
+        .param("description", decision.description.clone())
+        .param("rationale", decision.rationale.clone())
+        .param("alternatives", decision.alternatives.clone())
+        .param(
+            "chosen_option",
+            decision.chosen_option.clone().unwrap_or_default(),
+        )
+        .param("decided_by", decision.decided_by.clone())
+        .param("decided_at", decision.decided_at.to_rfc3339())
+        .param("status", decision.status.to_string())
+        .param(
+            "sharing_consent",
+            decision.sharing_consent.as_db_str().to_string(),
+        );
+
+        let mut result = self.graph.execute(q).await?;
+        if result.next().await?.is_none() {
+            anyhow::bail!("Failed to create decision: nothing was created");
+        }
+        Ok(())
+    }
+
     /// Get a single decision by ID
     pub async fn get_decision(&self, decision_id: Uuid) -> Result<Option<DecisionNode>> {
         let q = query(
@@ -1047,6 +1092,19 @@ mod parent_existence_tests {
             err.to_string().contains("not found in Neo4j"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A decision attached to no task is accepted and readable (PR4).
+    ///
+    /// The task-bound path is untouched: the test above still guards bug 3693617b.
+    #[tokio::test]
+    async fn create_decision_global_accepts_decision_without_task() {
+        let db = MockGraphStore::new();
+        let d = dummy_decision(Uuid::new_v4());
+        let id = d.id;
+        db.create_decision_global(&d).await.unwrap();
+        let got = db.get_decision(id).await.unwrap();
+        assert!(got.is_some(), "une decision sans tache doit etre relisible");
     }
 
     /// create_decision must succeed when the task exists.

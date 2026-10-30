@@ -10243,6 +10243,14 @@ impl DecisionStore for MockGraphStore {
         Ok(())
     }
 
+    async fn create_decision_global(&self, decision: &DecisionNode) -> Result<()> {
+        self.decisions
+            .write()
+            .await
+            .insert(decision.id, decision.clone());
+        Ok(())
+    }
+
     async fn get_decision(&self, decision_id: Uuid) -> Result<Option<DecisionNode>> {
         Ok(self.decisions.read().await.get(&decision_id).cloned())
     }
