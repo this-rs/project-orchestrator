@@ -290,6 +290,11 @@ async fn run_agent_uses_activated(
         });
     }
 
+    // The rule names a subject: it makes it. A rule that silently wrote nothing because the
+    // node happened to be missing would report « 0 written » on a graph where it should have
+    // written — the failure mode that looks like a successful empty run.
+    graph.ensure_agent(agent, None).await?;
+
     let measure = format!(
         "{} persona(s) et {} skill(s) activés dans la session {session}",
         personas.len(),
@@ -348,6 +353,11 @@ async fn pinned_notes_everywhere(graph: &dyn GraphStore) -> anyhow::Result<(Vec<
 
 async fn run_agent_knows_core(graph: &dyn GraphStore) -> anyhow::Result<RuleOutcome> {
     let self_id = graph.agent_identity_namespace().await?;
+    // The rule names a subject, so it makes it. Without this, a graph where the root has no
+    // `:Agent` node yet answers « 0 written » — a successful-looking empty run on a graph
+    // that should have been written to. Measured: the primitive MATCHes both ends, so a
+    // missing subject is a silent no-op.
+    graph.ensure_agent(self_id, None).await?;
     let (ids, scopes) = pinned_notes_everywhere(graph).await?;
 
     let measure = format!("{scopes} portées lues, {} note(s) épinglée(s)", ids.len());

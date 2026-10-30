@@ -3651,6 +3651,10 @@ pub trait AnalyticsStore: Send + Sync {
     ///
     /// A missing target draws nothing (`Ok(false)`), never a dangling edge: a pin naming
     /// a deleted note is a skip, not a failure.
+    ///
+    /// The SUBJECT must already exist: the statement MATCHes both ends, so an agent with no
+    /// node yet is a silent no-op (`Ok(false)`). Callers make it first ([`Self::ensure_agent`])
+    /// — the rules do, and a caller that forgets gets an empty run that looks successful.
     async fn link_agent_knows(
         &self,
         agent_id: Uuid,

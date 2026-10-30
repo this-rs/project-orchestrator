@@ -90,6 +90,7 @@ impl Neo4jClient {
 
         Ok(SchemaCatalog {
             labels,
+            types,
             edges,
             volumes,
         })

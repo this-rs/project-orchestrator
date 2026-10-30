@@ -1072,18 +1072,23 @@ impl Neo4jClient {
         target_id: Uuid,
     ) -> Result<bool> {
         // Both labels come from this file's own call sites, never from input.
+        // « Created » must mean « created by THIS call », not « recent ». A window would
+        // call a two-second-old edge new, which is precisely what a backfill re-run does.
+        // The stamp is ours, so equality is the proof.
+        let now = chrono::Utc::now().to_rfc3339();
         let statement = format!(
             "MATCH (a:Agent {{id: $agent}}), (t:{target_label} {{id: $target}}) \
              MERGE (a)-[r:{edge}]->(t) \
-             ON CREATE SET r.created_at = datetime() \
-             RETURN r.created_at IS NOT NULL AND r.created_at >= datetime() - duration('PT2S') AS created"
+             ON CREATE SET r.created_at = $now \
+             RETURN r.created_at = $now AS created"
         );
         let mut result = self
             .graph
             .execute(
                 query(&statement)
                     .param("agent", agent_id.to_string())
-                    .param("target", target_id.to_string()),
+                    .param("target", target_id.to_string())
+                    .param("now", now),
             )
             .await?;
         match result.next().await? {
@@ -1099,18 +1104,20 @@ impl Neo4jClient {
         note_id: Uuid,
         provenance: &crate::graph::rules::Provenance,
     ) -> Result<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
         let mut result = self
             .graph
             .execute(
                 query(
                     "MATCH (a:Agent {id: $agent}), (n:Note {id: $note}) \
                      MERGE (a)-[r:KNOWS]->(n) \
-                     ON CREATE SET r.created_at = datetime() \
+                     ON CREATE SET r.created_at = $now \
                      SET r.rule = $rule, r.measure = $measure, r.at = $at \
-                     RETURN r.created_at IS NOT NULL AND r.created_at >= datetime() - duration('PT2S') AS created",
+                     RETURN r.created_at = $now AS created",
                 )
                 .param("agent", agent_id.to_string())
                 .param("note", note_id.to_string())
+                .param("now", now)
                 .param("rule", provenance.rule.clone())
                 .param("measure", provenance.measure.clone())
                 .param("at", provenance.at.clone()),
@@ -1136,12 +1143,13 @@ impl Neo4jClient {
                 crate::graph::rules::USABLE_LABELS.join(", ")
             );
         }
+        let now = chrono::Utc::now().to_rfc3339();
         let statement = format!(
             "MATCH (a:Agent {{id: $agent}}), (t:{label} {{id: $target}}) \
              MERGE (a)-[r:USES]->(t) \
-             ON CREATE SET r.created_at = datetime() \
+             ON CREATE SET r.created_at = $now \
              SET r.rule = $rule, r.measure = $measure, r.at = $at \
-             RETURN r.created_at IS NOT NULL AND r.created_at >= datetime() - duration('PT2S') AS created"
+             RETURN r.created_at = $now AS created"
         );
         let mut result = self
             .graph
@@ -1149,6 +1157,7 @@ impl Neo4jClient {
                 query(&statement)
                     .param("agent", agent_id.to_string())
                     .param("target", target_id.to_string())
+                    .param("now", now)
                     .param("rule", provenance.rule.clone())
                     .param("measure", provenance.measure.clone())
                     .param("at", provenance.at.clone()),

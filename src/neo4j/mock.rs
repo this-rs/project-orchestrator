@@ -13717,6 +13717,7 @@ impl AnalyticsStore for MockGraphStore {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            types: edges.iter().map(|s| s.edge.clone()).collect(),
             edges,
             volumes,
         })

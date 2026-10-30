@@ -75,6 +75,10 @@ pub struct RelationShape {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchemaCatalog {
     pub labels: Vec<String>,
+    /// The relationship types the graph declares, from `db.relationshipTypes()` — **exact**,
+    /// unlike the shapes: `apoc.meta.schema` reads statistics and does not see an edge
+    /// written a second ago (measured: a fresh `KNOWS` was absent from its report).
+    pub types: Vec<String>,
     pub edges: Vec<RelationShape>,
     /// Edges per type, from the count store. A type absent from this map has an unknown
     /// volume — which is not the same as zero, and is never published as zero.
@@ -88,9 +92,16 @@ impl SchemaCatalog {
     }
 
     /// Whether the graph actually carries this type. An agent that asks before it writes
-    /// needs this answer: a type it invents is absent here.
+    /// needs this answer, so it comes from the source that cannot lag: the declared types.
+    /// The shapes are a separate, best-effort answer — see [`Self::shapes_of`].
     pub fn has_edge(&self, edge: &str) -> bool {
-        self.edges.iter().any(|s| s.edge == edge)
+        self.types.iter().any(|t| t == edge) || self.edges.iter().any(|s| s.edge == edge)
+    }
+
+    /// The label pairs measured for a type. Empty does NOT mean the type is absent — it may
+    /// simply be younger than the statistics. [`Self::has_edge`] is the answer to existence.
+    pub fn shapes_of_measured(&self, edge: &str) -> Vec<&RelationShape> {
+        self.shapes_of(edge)
     }
 
     /// The measured volume of a type, when it is known.
@@ -169,6 +180,7 @@ mod tests {
     fn catalog(edges: Vec<RelationShape>, volumes: &[(&str, u64)]) -> SchemaCatalog {
         SchemaCatalog {
             labels: vec![],
+            types: edges.iter().map(|s| s.edge.clone()).collect(),
             edges,
             volumes: volumes
                 .iter()

@@ -3028,7 +3028,7 @@ impl Neo4jClient {
                 s2.reinforcement_count = coalesce(s2.reinforcement_count, 0) + 1
             SET s2.last_reinforced_at = datetime(), s2.rule = $rule,
                 s2.measure = $measure, s2.at = $at, s2.last_session = $session
-            RETURN count(s1) AS n
+            RETURN count(s1) + count(s2) AS n
         "#;
         let mut result = self
             .graph
