@@ -100,6 +100,13 @@ pub trait GraphStore:
     + ReleaseStore
     + NoteStore
     + AnalyticsStore
+    + TriggerStore
+    + FeatureGraphStore
+    + SharingStore
+    + PlanRunStore
+    + ProtocolRunStore
+    + FederationStore
+    + ProtocolStore
     + PersonaStore
     + SkillStore
     + AuthStore
@@ -2304,90 +2311,6 @@ pub trait AnalyticsStore: Send + Sync {
         limit: usize,
     ) -> Result<(Vec<ChatGraphSession>, Vec<ChatGraphDiscussed>)>;
 
-    // ================================================================
-    // Feature Graphs
-    // ================================================================
-
-    /// Create a feature graph
-    async fn create_feature_graph(&self, graph: &FeatureGraphNode) -> Result<()>;
-
-    /// Get a feature graph by ID (without entities)
-    async fn get_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphNode>>;
-
-    /// Get a feature graph with all its included entities
-    async fn get_feature_graph_detail(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>>;
-
-    /// List feature graphs, optionally filtered by project
-    async fn list_feature_graphs(&self, project_id: Option<Uuid>) -> Result<Vec<FeatureGraphNode>>;
-
-    /// Delete a feature graph and all its INCLUDES_ENTITY relationships
-    async fn delete_feature_graph(&self, id: Uuid) -> Result<bool>;
-
-    /// Add an entity (file, function, struct, trait) to a feature graph.
-    /// When `project_id` is provided, MATCH queries for Function/Struct/Trait/Enum
-    /// are scoped to that project to avoid cross-project contamination.
-    async fn add_entity_to_feature_graph(
-        &self,
-        feature_graph_id: Uuid,
-        entity_type: &str,
-        entity_id: &str,
-        role: Option<&str>,
-        project_id: Option<Uuid>,
-    ) -> Result<()>;
-
-    /// Remove an entity from a feature graph
-    async fn remove_entity_from_feature_graph(
-        &self,
-        feature_graph_id: Uuid,
-        entity_type: &str,
-        entity_id: &str,
-    ) -> Result<bool>;
-
-    /// Automatically build a feature graph from a function entry point.
-    /// Uses the call graph (callers + callees) to discover related functions and files,
-    /// creates a FeatureGraph, and populates it with the discovered entities.
-    #[allow(clippy::too_many_arguments)]
-    async fn auto_build_feature_graph(
-        &self,
-        name: &str,
-        description: Option<&str>,
-        project_id: Uuid,
-        entry_function: &str,
-        depth: u32,
-        include_relations: Option<&[String]>,
-        filter_community: Option<bool>,
-    ) -> Result<FeatureGraphDetail>;
-
-    /// Refresh an auto-built feature graph by re-running the BFS with the
-    /// same parameters (entry_function, depth, include_relations).
-    /// Returns None if the graph was manually created (no entry_function).
-    /// Returns Err if the graph doesn't exist.
-    async fn refresh_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>>;
-
-    /// Get the top N most connected functions for a project, ranked by
-    /// (callers + callees). Used for auto-generating feature graphs after sync.
-    async fn get_top_entry_functions(&self, project_id: Uuid, limit: usize) -> Result<Vec<String>>;
-
-    /// Compute statistics for a feature graph: coupling, cohesion, complexity metrics.
-    async fn get_feature_graph_statistics(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<FeatureGraphStatistics>>;
-
-    /// Compare two feature graphs: shared entities, unique entities, similarity score.
-    async fn compare_feature_graphs(
-        &self,
-        id_a: Uuid,
-        id_b: Uuid,
-    ) -> Result<Option<FeatureGraphComparison>>;
-
-    /// Find feature graphs that overlap with a reference graph (same project).
-    async fn find_overlapping_feature_graphs(
-        &self,
-        id: Uuid,
-        min_overlap: f64,
-    ) -> Result<Vec<FeatureGraphOverlap>>;
-
     // ========================================================================
     // Bulk graph extraction (for graph analytics)
     // ========================================================================
@@ -2848,36 +2771,6 @@ pub trait AnalyticsStore: Send + Sync {
     ) -> Result<bool>;
 
     // ========================================================================
-    // Conversation segments (episodic memory)
-    // ========================================================================
-
-    /// Stores (replacing) the conversation segments of a conversation.
-    async fn put_segments(
-        &self,
-        conversation: &str,
-        segments: &[crate::chat::provider::cognitive::segment::Segment],
-    ) -> Result<()>;
-
-    /// The stored conversation segments of a conversation, empty when none.
-    async fn get_segments(
-        &self,
-        conversation: &str,
-    ) -> Result<Vec<crate::chat::provider::cognitive::segment::Segment>>;
-
-    /// Stores (replacing) the boundaries of a conversation.
-    async fn put_boundaries(
-        &self,
-        conversation: &str,
-        boundaries: &[crate::chat::provider::cognitive::segment::Boundary],
-    ) -> Result<()>;
-
-    /// The stored boundaries of a conversation, empty when none.
-    async fn get_boundaries(
-        &self,
-        conversation: &str,
-    ) -> Result<Vec<crate::chat::provider::cognitive::segment::Boundary>>;
-
-    // ========================================================================
     // Health check
     // ========================================================================
 
@@ -2939,176 +2832,12 @@ pub trait AnalyticsStore: Send + Sync {
     ) -> Result<Vec<NoteEmbeddingPoint>>;
 
     // ========================================================================
-    // Protocol operations (Pattern Federation)
-    // ========================================================================
-
-    /// Create a new protocol with its BELONGS_TO relationship to project.
-    /// Also creates HAS_STATE and HAS_TRANSITION relationships for sub-entities.
-    async fn upsert_protocol(&self, protocol: &Protocol) -> Result<()>;
-
-    /// Get a protocol by ID, including its states and transitions.
-    async fn get_protocol(&self, id: Uuid) -> Result<Option<Protocol>>;
-
-    /// List protocols for a project with optional category filter and pagination.
-    /// Returns (protocols, total_count).
-    ///
-    /// The scope rule is the one of the transverse library, the same skills follow: with
-    /// a project, the listing is that project's protocols PLUS the instance's transverse
-    /// ones (`project_id IS NULL`), and never another project's; with no project, the
-    /// transverse set alone. `total_count` counts what the listing covers, transverse
-    /// protocols included — it is NOT the size of one project's own set, so a caller that
-    /// wants that count filters on `project_id` itself.
-    async fn list_protocols(
-        &self,
-        project_id: Option<Uuid>,
-        category: Option<crate::protocol::ProtocolCategory>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<Protocol>, usize)>;
-
-    /// Delete a protocol and all its states, transitions, and relationships.
-    /// Returns true if the protocol existed and was deleted.
-    async fn delete_protocol(&self, id: Uuid) -> Result<bool>;
-
-    /// Upsert a protocol state and create its HAS_STATE relationship.
-    async fn upsert_protocol_state(&self, state: &ProtocolState) -> Result<()>;
-
-    /// Get all states for a protocol.
-    async fn get_protocol_states(&self, protocol_id: Uuid) -> Result<Vec<ProtocolState>>;
-
-    /// Check if a protocol with the given name already exists in the project.
-    /// Returns the existing protocol's UUID if found.
-    async fn get_protocol_by_name_and_project(
-        &self,
-        name: &str,
-        project_id: Uuid,
-    ) -> Result<Option<Uuid>>;
-
-    /// Delete a protocol state and its relationships.
-    async fn delete_protocol_state(&self, state_id: Uuid) -> Result<bool>;
-
-    /// Upsert a protocol transition and create its HAS_TRANSITION relationship.
-    async fn upsert_protocol_transition(&self, transition: &ProtocolTransition) -> Result<()>;
-
-    /// Get all transitions for a protocol.
-    async fn get_protocol_transitions(&self, protocol_id: Uuid) -> Result<Vec<ProtocolTransition>>;
-
-    /// Delete a protocol transition.
-    async fn delete_protocol_transition(&self, transition_id: Uuid) -> Result<bool>;
-
-    // ========================================================================
-    // ProtocolRun operations (FSM Runtime)
-    // ========================================================================
-
-    /// Create a new protocol run node with INSTANCE_OF relationship to its protocol.
-    async fn create_protocol_run(&self, run: &ProtocolRun) -> Result<()>;
-
-    /// Get a protocol run by ID.
-    async fn get_protocol_run(&self, run_id: Uuid) -> Result<Option<ProtocolRun>>;
-
-    /// Update an existing protocol run (current_state, states_visited, status, etc.).
-    /// On success, bumps `run.version` in-place to match the persisted value.
-    /// Returns `OptimisticLockError` if the run was modified concurrently.
-    async fn update_protocol_run(&self, run: &mut ProtocolRun) -> Result<()>;
-
-    /// List protocol runs for a protocol with optional status filter and pagination.
-    /// Returns (runs, total_count).
-    async fn list_protocol_runs(
-        &self,
-        protocol_id: Uuid,
-        status: Option<RunStatus>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<ProtocolRun>, usize)>;
-
-    /// List protocol runs across ALL protocols (cross-cutting), newest first.
-    ///
-    /// `project_id` wins over `workspace_slug`; with neither, every project is
-    /// included. Returns (page, total).
-    async fn list_all_protocol_runs(
-        &self,
-        status: Option<RunStatus>,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<ProtocolRun>, usize)>;
-
-    /// List child runs for a given parent run.
-    async fn list_child_runs(&self, parent_run_id: Uuid) -> Result<Vec<ProtocolRun>>;
-
-    /// Count children for a given run.
-    async fn count_child_runs(&self, parent_run_id: Uuid) -> Result<usize>;
-
-    /// Get the full run tree rooted at a given run (recursive, depth limit 5).
-    /// Returns root + all descendants, ordered by depth then started_at.
-    async fn get_run_tree(&self, root_run_id: Uuid) -> Result<Vec<ProtocolRun>>;
-
-    /// Delete a protocol run.
-    /// Returns true if the run existed and was deleted.
-    async fn delete_protocol_run(&self, run_id: Uuid) -> Result<bool>;
-
-    /// Create a PRODUCED_DURING relation between a Note/Decision and a ProtocolRun.
-    /// entity_type must be "Note" or "Decision".
-    async fn create_produced_during(
-        &self,
-        entity_type: &str,
-        entity_id: Uuid,
-        run_id: Uuid,
-    ) -> Result<bool>;
-
-    /// Get all notes and decisions produced during a protocol run.
-    async fn get_run_outcomes(
-        &self,
-        run_id: Uuid,
-    ) -> Result<Vec<crate::neo4j::protocol::ProducedArtefact>>;
-
-    /// Find the most recently started active (running) protocol run for a project.
-    async fn find_active_run_for_project(&self, project_id: Uuid) -> Result<Option<Uuid>>;
-
-    /// Persist a ReasoningTree to Neo4j as a PersistedReasoningTree node.
-    /// Optionally links it to an entity via REASONING_FOR relation.
-    async fn persist_reasoning_tree(
-        &self,
-        tree: &crate::reasoning::ReasoningTree,
-        linked_entity_type: Option<&str>,
-        linked_entity_id: Option<Uuid>,
-    ) -> Result<Uuid>;
-
-    /// Get the ID of a persisted reasoning tree linked to a protocol run.
-    async fn get_run_reasoning_tree_id(&self, run_id: Uuid) -> Result<Option<Uuid>>;
-
-    /// List completed protocol runs for a project (most recent first).
-    async fn list_completed_runs_for_project(
-        &self,
-        project_id: Uuid,
-        limit: usize,
-    ) -> Result<Vec<crate::protocol::models::ProtocolRun>>;
-
-    // ========================================================================
-    // RuntimeState operations (Generator-produced dynamic states)
-    // ========================================================================
-
-    /// Create a new RuntimeState node with HAS_RUNTIME_STATE and GENERATED_BY relationships.
-    async fn create_runtime_state(&self, state: &RuntimeState) -> Result<()>;
-
-    /// Get all RuntimeStates for a protocol run, ordered by index.
-    async fn get_runtime_states(&self, run_id: Uuid) -> Result<Vec<RuntimeState>>;
-
-    /// Delete all RuntimeStates for a protocol run.
-    async fn delete_runtime_states(&self, run_id: Uuid) -> Result<()>;
-
-    // ========================================================================
     // System Inference — Audit Gaps
     // ========================================================================
 
     /// Audit the knowledge graph for gaps: orphan notes, decisions without AFFECTS,
     /// commits without TOUCHES, skills without members.
     async fn audit_knowledge_gaps(&self, project_id: Uuid) -> Result<AuditGapsReport>;
-
-    // ========================================================================
-    // Skill Registry
-    // ========================================================================
 
     // ========================================================================
     // Graph visualization helpers (sub-file symbols, inheritance, constraints)
@@ -3137,279 +2866,6 @@ pub trait AnalyticsStore: Send + Sync {
     ) -> Result<Vec<(crate::neo4j::models::ConstraintNode, Uuid)>>;
 
     // ========================================================================
-    // PlanRun operations (Runner execution state)
-    // ========================================================================
-
-    /// Create a new PlanRun node linked to a Plan via (:PlanRun)-[:RUNS]->(:Plan).
-    async fn create_plan_run(&self, state: &crate::runner::RunnerState) -> Result<()>;
-
-    /// Update an existing PlanRun with current execution state.
-    async fn update_plan_run(&self, state: &crate::runner::RunnerState) -> Result<()>;
-
-    /// Get a PlanRun by its run_id.
-    async fn get_plan_run(&self, run_id: Uuid) -> Result<Option<crate::runner::RunnerState>>;
-
-    /// List all PlanRuns with status=Running (for crash recovery at boot).
-    async fn list_active_plan_runs(&self) -> Result<Vec<crate::runner::RunnerState>>;
-
-    /// List all PlanRuns across all plans, ordered by started_at desc.
-    /// If `workspace_slug` is provided, only returns runs for plans belonging to
-    /// projects in that workspace.
-    async fn list_all_plan_runs(
-        &self,
-        limit: i64,
-        offset: i64,
-        status: Option<&str>,
-        workspace_slug: Option<&str>,
-    ) -> Result<Vec<crate::runner::RunnerState>>;
-
-    /// List all PlanRuns for a given plan, ordered by started_at desc.
-    async fn list_plan_runs(
-        &self,
-        plan_id: Uuid,
-        limit: i64,
-    ) -> Result<Vec<crate::runner::RunnerState>>;
-
-    // ── Triggers ──────────────────────────────────────────────────────────
-
-    /// Create a trigger node linked to a plan via (:Trigger)-[:TRIGGERS]->(:Plan).
-    async fn create_trigger(
-        &self,
-        trigger: &crate::runner::Trigger,
-    ) -> Result<crate::runner::Trigger>;
-
-    /// Get a trigger by its UUID.
-    async fn get_trigger(&self, trigger_id: Uuid) -> Result<Option<crate::runner::Trigger>>;
-
-    /// List all triggers for a given plan.
-    async fn list_triggers(&self, plan_id: Uuid) -> Result<Vec<crate::runner::Trigger>>;
-
-    /// Disable a trigger, with the reason when the system does it (`None`:
-    /// someone disabled it). The only way back is [`Self::enable_trigger_as`],
-    /// which records who enables it: there is no enable without an author.
-    async fn disable_trigger(
-        &self,
-        trigger_id: Uuid,
-        reason: Option<&str>,
-    ) -> Result<Option<crate::runner::Trigger>>;
-
-    /// Record that a third-party session wrote `content` (the plan itself, or
-    /// one of its tasks, steps, constraints or decisions): the plan it belongs
-    /// to gets `third_party_written_at = now`. Returns that plan, `None` when
-    /// the content belongs to no plan (or does not exist).
-    async fn mark_third_party_write(
-        &self,
-        content: crate::runner::PlanContent,
-    ) -> Result<Option<Uuid>>;
-
-    /// When a third-party session last wrote the plan or its content (see
-    /// [`Self::mark_third_party_write`]); `None` if never.
-    async fn plan_third_party_written_at(
-        &self,
-        plan_id: Uuid,
-    ) -> Result<Option<chrono::DateTime<chrono::Utc>>>;
-
-    /// Delete a trigger by its UUID.
-    async fn delete_trigger(&self, trigger_id: Uuid) -> Result<()>;
-
-    /// Record a trigger firing event (`fire_count` + 1). `last_fired` is left
-    /// to [`Self::reserve_trigger_signal`]: a firing refused before the
-    /// reservation consumes no cooldown.
-    async fn record_trigger_firing(&self, firing: &crate::runner::TriggerFiring) -> Result<()>;
-
-    /// Enable a trigger and record `author` as the identity its runs start as,
-    /// in one write. `None` when there is no such trigger.
-    async fn enable_trigger_as(
-        &self,
-        trigger_id: Uuid,
-        author: &crate::runner::TriggerAuthor,
-    ) -> Result<Option<crate::runner::Trigger>>;
-
-    /// Reserve the signal `key` of trigger `trigger_id`, atomically, across
-    /// instances: `Reserved` for the one caller that sees `key` for the first
-    /// time (one `TriggerSignal` per key, kept 24 h) AND finds the trigger out
-    /// of its `cooldown_secs` — `last_fired` then moves to now in the same
-    /// write; `Duplicate` when `key` was already reserved (or no such trigger);
-    /// `Cooldown` when the trigger fired less than `cooldown_secs` ago.
-    async fn reserve_trigger_signal(
-        &self,
-        trigger_id: Uuid,
-        key: &str,
-        cooldown_secs: u64,
-    ) -> Result<crate::runner::SignalReservation>;
-
-    /// List all triggers across all plans, optionally filtered by type.
-    async fn list_all_triggers(
-        &self,
-        trigger_type: Option<&str>,
-    ) -> Result<Vec<crate::runner::Trigger>>;
-
-    /// List trigger firings for a given trigger, ordered by fired_at desc.
-    async fn list_trigger_firings(
-        &self,
-        trigger_id: Uuid,
-        limit: i64,
-    ) -> Result<Vec<crate::runner::TriggerFiring>>;
-
-    /// Journalise une livraison reçue (accepted ou rejected), sans son corps.
-    async fn record_external_event(&self, event: &crate::ingress::ExternalEvent) -> Result<()>;
-
-    /// Derniers événements externes journalisés pour un déclencheur, le plus récent d'abord.
-    async fn list_external_events(
-        &self,
-        trigger_id: Uuid,
-        limit: i64,
-    ) -> Result<Vec<crate::ingress::ExternalEvent>>;
-
-    /// Réserve la livraison `delivery_key` pour `trigger_id`: `true` au premier appel, `false` au rejeu.
-    async fn claim_external_delivery(&self, trigger_id: Uuid, delivery_key: &str) -> Result<bool>;
-
-    /// Libère une réservation de livraison (la livraison n'a pas pu être journalisée) :
-    /// une relivraison sera de nouveau acceptée. `true` si une réservation existait.
-    async fn release_external_delivery(&self, trigger_id: Uuid, delivery_key: &str)
-        -> Result<bool>;
-
-    /// Purge les événements externes reçus avant `before` (rétention). Rend le nombre
-    /// d'événements supprimés. Les réservations de livraison sont conservées (sans
-    /// elles, un corps signé capturé redeviendrait rejouable).
-    async fn purge_external_events_before(
-        &self,
-        before: chrono::DateTime<chrono::Utc>,
-    ) -> Result<u64>;
-
-    // ── AgentExecution ──────────────────────────────────────────────────────
-
-    /// Create an AgentExecution node linked to a PlanRun and Task.
-    async fn create_agent_execution(
-        &self,
-        ae: &crate::neo4j::agent_execution::AgentExecutionNode,
-    ) -> Result<()>;
-
-    /// Update an existing AgentExecution with final results.
-    async fn update_agent_execution(
-        &self,
-        ae: &crate::neo4j::agent_execution::AgentExecutionNode,
-    ) -> Result<()>;
-
-    /// Get all AgentExecution nodes for a given PlanRun.
-    async fn get_agent_executions_for_run(
-        &self,
-        run_id: Uuid,
-    ) -> Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>>;
-
-    /// Record the per-check verification result on one execution.
-    ///
-    /// A narrow write on purpose: verification runs after the attempt is
-    /// closed, so rewriting the whole node from a stale copy would race with
-    /// the close and could put `status` back to `running`.
-    async fn record_agent_execution_verification(
-        &self,
-        agent_execution_id: Uuid,
-        verification_json: &str,
-    ) -> Result<()>;
-
-    /// Every AgentExecution still `running`, across all runs (oldest first).
-    ///
-    /// Used by the reconciliation sweep to close the ones whose process is gone.
-    async fn list_running_agent_executions(
-        &self,
-    ) -> Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>>;
-
-    /// Cost, tokens, first-attempt verification and median duration of the
-    /// executions started in `[from, to)`, one row per `group_by` key (B35).
-    /// Marginal and notional amounts are summed apart and an unknown cost is
-    /// counted, never summed (A21). Sorted by key.
-    async fn agent_execution_cost_breakdown(
-        &self,
-        group_by: crate::neo4j::agent_execution::CostGroupBy,
-        from: chrono::DateTime<chrono::Utc>,
-        to: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<crate::neo4j::agent_execution::CostBreakdownRow>>;
-
-    // ========================================================================
-    // rs-stats data providers — bulk metric retrieval for statistical analysis
-    // ========================================================================
-
-    /// Fetch all PageRank values for a project as a flat vector.
-    async fn get_all_pagerank_values(&self, project_id: Uuid) -> Result<Vec<f64>>;
-
-    /// Fetch risk scores grouped by community (for ANOVA analysis).
-    async fn get_community_risk_vectors(&self, project_id: Uuid) -> Result<Vec<Vec<f64>>>;
-
-    /// Fetch all risk scores for a project as a flat vector.
-    async fn get_all_risk_score_values(&self, project_id: Uuid) -> Result<Vec<f64>>;
-
-    // ========================================================================
-    // Sharing & Privacy operations (RFC Privacy MVP)
-    // ========================================================================
-
-    /// Get the sharing policy for a project. Returns None if no policy is set.
-    async fn get_sharing_policy(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Option<crate::episodes::distill_models::SharingPolicy>>;
-
-    /// Update the sharing policy for a project.
-    async fn update_sharing_policy(
-        &self,
-        project_id: Uuid,
-        policy: &crate::episodes::distill_models::SharingPolicy,
-    ) -> Result<()>;
-
-    /// Get the sharing consent for a note.
-    async fn get_sharing_consent(
-        &self,
-        note_id: Uuid,
-    ) -> Result<crate::episodes::distill_models::SharingConsent>;
-
-    /// Update the sharing consent for a note.
-    async fn update_sharing_consent(
-        &self,
-        note_id: Uuid,
-        consent: &crate::episodes::distill_models::SharingConsent,
-    ) -> Result<()>;
-
-    /// Set the sharing consent of a decision (`NotSet` for every pre-existing one).
-    async fn update_decision_sharing_consent(
-        &self,
-        decision_id: Uuid,
-        consent: &crate::episodes::distill_models::SharingConsent,
-    ) -> Result<()>;
-
-    /// Count notes per consent value, optionally for one project. Measures the
-    /// real `NotSet` population (read-only; no data is changed).
-    async fn count_notes_by_consent(
-        &self,
-        project_id: Option<Uuid>,
-    ) -> Result<crate::episodes::distill_models::ConsentCounts>;
-
-    /// Create a sharing event (audit trail).
-    async fn create_sharing_event(
-        &self,
-        event: &crate::episodes::distill_models::SharingEvent,
-    ) -> Result<()>;
-
-    /// List sharing events for a project (newest first).
-    async fn list_sharing_events(
-        &self,
-        project_id: Uuid,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<crate::episodes::distill_models::SharingEvent>>;
-
-    /// Persist a signed tombstone to the graph.
-    async fn persist_tombstone(
-        &self,
-        tombstone: &crate::reception::anchor::SignedTombstone,
-    ) -> Result<()>;
-
-    /// List all persisted tombstones.
-    async fn list_tombstones(&self) -> Result<Vec<crate::reception::anchor::SignedTombstone>>;
-
-    /// Check if a content hash has been tombstoned.
-    async fn is_tombstoned(&self, content_hash: &str) -> Result<bool>;
-
-    // ========================================================================
     // UserProfile operations (adaptive behavioral profiles)
     // ========================================================================
 
@@ -3432,168 +2888,6 @@ pub trait AnalyticsStore: Send + Sync {
 
     /// Get all WORKS_ON relationships for a user.
     async fn get_works_on(&self, user_id: &str) -> Result<Vec<crate::profile::WorksOnRelation>>;
-
-    // ========================================================================
-    // Alert operations (Heartbeat Engine)
-    // ========================================================================
-
-    /// Create a new alert node.
-    async fn create_alert(&self, alert: &AlertNode) -> Result<()>;
-
-    /// List pending (unacknowledged) alerts, optionally filtered by project.
-    /// Returns alerts ordered by created_at DESC.
-    async fn list_pending_alerts(
-        &self,
-        project_id: Option<Uuid>,
-        limit: usize,
-    ) -> Result<Vec<AlertNode>>;
-
-    /// Acknowledge an alert by ID. Sets acknowledged=true and records who/when.
-    async fn acknowledge_alert(&self, alert_id: Uuid, acknowledged_by: &str) -> Result<()>;
-
-    /// Get a single alert by ID.
-    async fn get_alert(&self, alert_id: Uuid) -> Result<Option<AlertNode>>;
-
-    /// List all alerts (including acknowledged), optionally filtered by project.
-    async fn list_alerts(
-        &self,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<AlertNode>, usize)>;
-
-    // ========================================================================
-    // EventTrigger operations
-    // ========================================================================
-
-    /// List EventTriggers, optionally filtered by project scope and/or enabled status.
-    async fn list_event_triggers(
-        &self,
-        project_scope: Option<Uuid>,
-        enabled_only: bool,
-    ) -> Result<Vec<EventTrigger>>;
-
-    /// Create an EventTrigger node. Returns the generated UUID.
-    async fn create_event_trigger(&self, trigger: &EventTrigger) -> Result<Uuid>;
-
-    /// Get an EventTrigger by its UUID.
-    async fn get_event_trigger(&self, id: Uuid) -> Result<Option<EventTrigger>>;
-
-    /// Update an EventTrigger's fields. Only provided fields are updated.
-    /// Returns `true` if the trigger was found and updated, `false` if not found.
-    #[allow(clippy::too_many_arguments)]
-    async fn update_event_trigger(
-        &self,
-        id: Uuid,
-        enabled: Option<bool>,
-        name: Option<String>,
-        entity_type_pattern: Option<Option<String>>,
-        action_pattern: Option<Option<String>>,
-        payload_conditions: Option<Option<serde_json::Value>>,
-        cooldown_secs: Option<u32>,
-        project_scope: Option<Option<Uuid>>,
-    ) -> Result<bool>;
-
-    /// Delete an EventTrigger by its UUID.
-    /// Returns `true` if a node was deleted, `false` if not found.
-    async fn delete_event_trigger(&self, id: Uuid) -> Result<bool>;
-
-    // ========================================================================
-    // LifecycleHook operations
-    // ========================================================================
-
-    /// Create a lifecycle hook
-    async fn create_lifecycle_hook(&self, hook: &LifecycleHook) -> Result<()>;
-
-    /// Get a lifecycle hook by ID
-    async fn get_lifecycle_hook(&self, id: Uuid) -> Result<Option<LifecycleHook>>;
-
-    /// List lifecycle hooks, optionally filtered by project_id
-    async fn list_lifecycle_hooks(&self, project_id: Option<Uuid>) -> Result<Vec<LifecycleHook>>;
-
-    /// Update a lifecycle hook
-    async fn update_lifecycle_hook(
-        &self,
-        id: Uuid,
-        updates: &UpdateLifecycleHookRequest,
-    ) -> Result<()>;
-
-    /// Delete a lifecycle hook (builtin hooks cannot be deleted)
-    async fn delete_lifecycle_hook(&self, id: Uuid) -> Result<()>;
-
-    /// List hooks matching scope and on_status, including global hooks
-    async fn list_hooks_for_scope(
-        &self,
-        scope: &LifecycleScope,
-        on_status: &str,
-        project_id: Option<Uuid>,
-    ) -> Result<Vec<LifecycleHook>>;
-
-    // ========================================================================
-    // MCP Federation operations
-    // ========================================================================
-
-    /// Create an MCP server node
-    async fn create_mcp_server(&self, server: &McpServerNode) -> Result<()>;
-
-    /// Get an MCP server by UUID
-    async fn get_mcp_server(&self, id: Uuid) -> Result<Option<McpServerNode>>;
-
-    /// List MCP servers for a project
-    async fn list_mcp_servers(&self, project_id: Uuid) -> Result<Vec<McpServerNode>>;
-
-    /// List ALL MCP servers across all projects (used for startup bootstrap)
-    async fn list_all_mcp_servers(&self) -> Result<Vec<McpServerNode>>;
-
-    /// Delete an MCP server and its tools
-    async fn delete_mcp_server(&self, id: Uuid) -> Result<()>;
-
-    /// Delete an MCP server by its string server_id (e.g. "discord")
-    async fn delete_mcp_server_by_server_id(&self, server_id: &str) -> Result<()>;
-
-    /// Update MCP server connection status
-    async fn update_mcp_server_status(&self, id: Uuid, status: &str) -> Result<()>;
-
-    /// Create an MCP tool node
-    async fn create_mcp_tool(&self, tool: &McpToolNode) -> Result<()>;
-
-    /// List tools for an MCP server
-    async fn list_mcp_tools_for_server(&self, server_id: &str) -> Result<Vec<McpToolNode>>;
-
-    /// Delete all tools for an MCP server
-    async fn delete_mcp_tools_for_server(&self, server_id: &str) -> Result<()>;
-
-    /// Create SIMILAR_TO relation between two MCP tools
-    async fn create_mcp_similar_to(
-        &self,
-        tool_fqn: &str,
-        similar_to_fqn: &str,
-        score: f64,
-    ) -> Result<()>;
-
-    /// Create CO_ACTIVATED_WITH relation (tools used in the same session)
-    async fn create_mcp_co_activated(
-        &self,
-        tool_fqn_a: &str,
-        tool_fqn_b: &str,
-        count: i64,
-    ) -> Result<()>;
-
-    /// Create OFTEN_FOLLOWS relation (tool B called after tool A)
-    async fn create_mcp_often_follows(
-        &self,
-        tool_fqn_a: &str,
-        tool_fqn_b: &str,
-        count: i64,
-        avg_delta_ms: f64,
-    ) -> Result<()>;
-
-    /// Backfill CO_ACTIVATED_WITH relations from chat event history
-    async fn backfill_co_activated_with(&self) -> Result<usize>;
-
-    /// Backfill OFTEN_FOLLOWS relations from consecutive tool use events
-    async fn backfill_often_follows(&self) -> Result<usize>;
 
     // ========================================================================
     // Entity neighbourhood (ego-graph)
@@ -4273,6 +3567,35 @@ pub trait ChatStore: Send + Sync {
     ) -> Result<Vec<(crate::episodes::models::Episode, f64)>> {
         Ok(Vec::new())
     }
+    // ========================================================================
+    // Conversation segments (episodic memory)
+    // ========================================================================
+
+    /// Stores (replacing) the conversation segments of a conversation.
+    async fn put_segments(
+        &self,
+        conversation: &str,
+        segments: &[crate::chat::provider::cognitive::segment::Segment],
+    ) -> Result<()>;
+
+    /// The stored conversation segments of a conversation, empty when none.
+    async fn get_segments(
+        &self,
+        conversation: &str,
+    ) -> Result<Vec<crate::chat::provider::cognitive::segment::Segment>>;
+
+    /// Stores (replacing) the boundaries of a conversation.
+    async fn put_boundaries(
+        &self,
+        conversation: &str,
+        boundaries: &[crate::chat::provider::cognitive::segment::Boundary],
+    ) -> Result<()>;
+
+    /// The stored boundaries of a conversation, empty when none.
+    async fn get_boundaries(
+        &self,
+        conversation: &str,
+    ) -> Result<Vec<crate::chat::provider::cognitive::segment::Boundary>>;
 }
 
 // ============================================================================
@@ -4726,6 +4049,744 @@ pub trait SkillStore: Send + Sync {
         skill_id: Uuid,
         result: &str,
     ) -> Result<()>;
+    // ========================================================================
+    // Skill Registry
+    // ========================================================================
+}
+
+// ============================================================================
+// ProtocolStore
+// ============================================================================
+
+/// The protocol domain: RFCs and their lifecycle FSM.
+#[async_trait]
+pub trait ProtocolStore: Send + Sync {
+    // ========================================================================
+    // Protocol operations (Pattern Federation)
+    // ========================================================================
+
+    /// Create a new protocol with its BELONGS_TO relationship to project.
+    /// Also creates HAS_STATE and HAS_TRANSITION relationships for sub-entities.
+    async fn upsert_protocol(&self, protocol: &Protocol) -> Result<()>;
+
+    /// Get a protocol by ID, including its states and transitions.
+    async fn get_protocol(&self, id: Uuid) -> Result<Option<Protocol>>;
+
+    /// List protocols for a project with optional category filter and pagination.
+    /// Returns (protocols, total_count).
+    ///
+    /// The scope rule is the one of the transverse library, the same skills follow: with
+    /// a project, the listing is that project's protocols PLUS the instance's transverse
+    /// ones (`project_id IS NULL`), and never another project's; with no project, the
+    /// transverse set alone. `total_count` counts what the listing covers, transverse
+    /// protocols included — it is NOT the size of one project's own set, so a caller that
+    /// wants that count filters on `project_id` itself.
+    async fn list_protocols(
+        &self,
+        project_id: Option<Uuid>,
+        category: Option<crate::protocol::ProtocolCategory>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Protocol>, usize)>;
+
+    /// Delete a protocol and all its states, transitions, and relationships.
+    /// Returns true if the protocol existed and was deleted.
+    async fn delete_protocol(&self, id: Uuid) -> Result<bool>;
+
+    /// Upsert a protocol state and create its HAS_STATE relationship.
+    async fn upsert_protocol_state(&self, state: &ProtocolState) -> Result<()>;
+
+    /// Get all states for a protocol.
+    async fn get_protocol_states(&self, protocol_id: Uuid) -> Result<Vec<ProtocolState>>;
+
+    /// Check if a protocol with the given name already exists in the project.
+    /// Returns the existing protocol's UUID if found.
+    async fn get_protocol_by_name_and_project(
+        &self,
+        name: &str,
+        project_id: Uuid,
+    ) -> Result<Option<Uuid>>;
+
+    /// Delete a protocol state and its relationships.
+    async fn delete_protocol_state(&self, state_id: Uuid) -> Result<bool>;
+
+    /// Upsert a protocol transition and create its HAS_TRANSITION relationship.
+    async fn upsert_protocol_transition(&self, transition: &ProtocolTransition) -> Result<()>;
+
+    /// Get all transitions for a protocol.
+    async fn get_protocol_transitions(&self, protocol_id: Uuid) -> Result<Vec<ProtocolTransition>>;
+
+    /// Delete a protocol transition.
+    async fn delete_protocol_transition(&self, transition_id: Uuid) -> Result<bool>;
+}
+
+// ============================================================================
+// FederationStore
+// ============================================================================
+
+/// The federation domain: remote MCP servers, their resources and tools as graph entities.
+#[async_trait]
+pub trait FederationStore: Send + Sync {
+    // ========================================================================
+    // MCP Federation operations
+    // ========================================================================
+
+    /// Create an MCP server node
+    async fn create_mcp_server(&self, server: &McpServerNode) -> Result<()>;
+
+    /// Get an MCP server by UUID
+    async fn get_mcp_server(&self, id: Uuid) -> Result<Option<McpServerNode>>;
+
+    /// List MCP servers for a project
+    async fn list_mcp_servers(&self, project_id: Uuid) -> Result<Vec<McpServerNode>>;
+
+    /// List ALL MCP servers across all projects (used for startup bootstrap)
+    async fn list_all_mcp_servers(&self) -> Result<Vec<McpServerNode>>;
+
+    /// Delete an MCP server and its tools
+    async fn delete_mcp_server(&self, id: Uuid) -> Result<()>;
+
+    /// Delete an MCP server by its string server_id (e.g. "discord")
+    async fn delete_mcp_server_by_server_id(&self, server_id: &str) -> Result<()>;
+
+    /// Update MCP server connection status
+    async fn update_mcp_server_status(&self, id: Uuid, status: &str) -> Result<()>;
+
+    /// Create an MCP tool node
+    async fn create_mcp_tool(&self, tool: &McpToolNode) -> Result<()>;
+
+    /// List tools for an MCP server
+    async fn list_mcp_tools_for_server(&self, server_id: &str) -> Result<Vec<McpToolNode>>;
+
+    /// Delete all tools for an MCP server
+    async fn delete_mcp_tools_for_server(&self, server_id: &str) -> Result<()>;
+
+    /// Create SIMILAR_TO relation between two MCP tools
+    async fn create_mcp_similar_to(
+        &self,
+        tool_fqn: &str,
+        similar_to_fqn: &str,
+        score: f64,
+    ) -> Result<()>;
+
+    /// Create CO_ACTIVATED_WITH relation (tools used in the same session)
+    async fn create_mcp_co_activated(
+        &self,
+        tool_fqn_a: &str,
+        tool_fqn_b: &str,
+        count: i64,
+    ) -> Result<()>;
+
+    /// Create OFTEN_FOLLOWS relation (tool B called after tool A)
+    async fn create_mcp_often_follows(
+        &self,
+        tool_fqn_a: &str,
+        tool_fqn_b: &str,
+        count: i64,
+        avg_delta_ms: f64,
+    ) -> Result<()>;
+
+    /// Backfill CO_ACTIVATED_WITH relations from chat event history
+    async fn backfill_co_activated_with(&self) -> Result<usize>;
+
+    /// Backfill OFTEN_FOLLOWS relations from consecutive tool use events
+    async fn backfill_often_follows(&self) -> Result<usize>;
+}
+
+// ============================================================================
+// ProtocolRunStore
+// ============================================================================
+
+/// The protocol-run domain: FSM execution state and the dynamic states a generator produces.
+#[async_trait]
+pub trait ProtocolRunStore: Send + Sync {
+    // ========================================================================
+    // ProtocolRun operations (FSM Runtime)
+    // ========================================================================
+
+    /// Create a new protocol run node with INSTANCE_OF relationship to its protocol.
+    async fn create_protocol_run(&self, run: &ProtocolRun) -> Result<()>;
+
+    /// Get a protocol run by ID.
+    async fn get_protocol_run(&self, run_id: Uuid) -> Result<Option<ProtocolRun>>;
+
+    /// Update an existing protocol run (current_state, states_visited, status, etc.).
+    /// On success, bumps `run.version` in-place to match the persisted value.
+    /// Returns `OptimisticLockError` if the run was modified concurrently.
+    async fn update_protocol_run(&self, run: &mut ProtocolRun) -> Result<()>;
+
+    /// List protocol runs for a protocol with optional status filter and pagination.
+    /// Returns (runs, total_count).
+    async fn list_protocol_runs(
+        &self,
+        protocol_id: Uuid,
+        status: Option<RunStatus>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<ProtocolRun>, usize)>;
+
+    /// List protocol runs across ALL protocols (cross-cutting), newest first.
+    ///
+    /// `project_id` wins over `workspace_slug`; with neither, every project is
+    /// included. Returns (page, total).
+    async fn list_all_protocol_runs(
+        &self,
+        status: Option<RunStatus>,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<ProtocolRun>, usize)>;
+
+    /// List child runs for a given parent run.
+    async fn list_child_runs(&self, parent_run_id: Uuid) -> Result<Vec<ProtocolRun>>;
+
+    /// Count children for a given run.
+    async fn count_child_runs(&self, parent_run_id: Uuid) -> Result<usize>;
+
+    /// Get the full run tree rooted at a given run (recursive, depth limit 5).
+    /// Returns root + all descendants, ordered by depth then started_at.
+    async fn get_run_tree(&self, root_run_id: Uuid) -> Result<Vec<ProtocolRun>>;
+
+    /// Delete a protocol run.
+    /// Returns true if the run existed and was deleted.
+    async fn delete_protocol_run(&self, run_id: Uuid) -> Result<bool>;
+
+    /// Create a PRODUCED_DURING relation between a Note/Decision and a ProtocolRun.
+    /// entity_type must be "Note" or "Decision".
+    async fn create_produced_during(
+        &self,
+        entity_type: &str,
+        entity_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<bool>;
+
+    /// Get all notes and decisions produced during a protocol run.
+    async fn get_run_outcomes(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::protocol::ProducedArtefact>>;
+
+    /// Find the most recently started active (running) protocol run for a project.
+    async fn find_active_run_for_project(&self, project_id: Uuid) -> Result<Option<Uuid>>;
+
+    /// Persist a ReasoningTree to Neo4j as a PersistedReasoningTree node.
+    /// Optionally links it to an entity via REASONING_FOR relation.
+    async fn persist_reasoning_tree(
+        &self,
+        tree: &crate::reasoning::ReasoningTree,
+        linked_entity_type: Option<&str>,
+        linked_entity_id: Option<Uuid>,
+    ) -> Result<Uuid>;
+
+    /// Get the ID of a persisted reasoning tree linked to a protocol run.
+    async fn get_run_reasoning_tree_id(&self, run_id: Uuid) -> Result<Option<Uuid>>;
+
+    /// List completed protocol runs for a project (most recent first).
+    async fn list_completed_runs_for_project(
+        &self,
+        project_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<crate::protocol::models::ProtocolRun>>;
+
+    // ========================================================================
+    // RuntimeState operations (Generator-produced dynamic states)
+    // ========================================================================
+
+    /// Create a new RuntimeState node with HAS_RUNTIME_STATE and GENERATED_BY relationships.
+    async fn create_runtime_state(&self, state: &RuntimeState) -> Result<()>;
+
+    /// Get all RuntimeStates for a protocol run, ordered by index.
+    async fn get_runtime_states(&self, run_id: Uuid) -> Result<Vec<RuntimeState>>;
+
+    /// Delete all RuntimeStates for a protocol run.
+    async fn delete_runtime_states(&self, run_id: Uuid) -> Result<()>;
+}
+
+// ============================================================================
+// PlanRunStore
+// ============================================================================
+
+/// The plan-run domain: what the autonomous runner executes, task by task.
+#[async_trait]
+pub trait PlanRunStore: Send + Sync {
+    // ========================================================================
+    // PlanRun operations (Runner execution state)
+    // ========================================================================
+
+    /// Create a new PlanRun node linked to a Plan via (:PlanRun)-[:RUNS]->(:Plan).
+    async fn create_plan_run(&self, state: &crate::runner::RunnerState) -> Result<()>;
+
+    /// Update an existing PlanRun with current execution state.
+    async fn update_plan_run(&self, state: &crate::runner::RunnerState) -> Result<()>;
+
+    /// Get a PlanRun by its run_id.
+    async fn get_plan_run(&self, run_id: Uuid) -> Result<Option<crate::runner::RunnerState>>;
+
+    /// List all PlanRuns with status=Running (for crash recovery at boot).
+    async fn list_active_plan_runs(&self) -> Result<Vec<crate::runner::RunnerState>>;
+
+    /// List all PlanRuns across all plans, ordered by started_at desc.
+    /// If `workspace_slug` is provided, only returns runs for plans belonging to
+    /// projects in that workspace.
+    async fn list_all_plan_runs(
+        &self,
+        limit: i64,
+        offset: i64,
+        status: Option<&str>,
+        workspace_slug: Option<&str>,
+    ) -> Result<Vec<crate::runner::RunnerState>>;
+
+    /// List all PlanRuns for a given plan, ordered by started_at desc.
+    async fn list_plan_runs(
+        &self,
+        plan_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<crate::runner::RunnerState>>;
+
+    // ── Triggers ──────────────────────────────────────────────────────────
+
+    /// Create a trigger node linked to a plan via (:Trigger)-[:TRIGGERS]->(:Plan).
+    async fn create_trigger(
+        &self,
+        trigger: &crate::runner::Trigger,
+    ) -> Result<crate::runner::Trigger>;
+
+    /// Get a trigger by its UUID.
+    async fn get_trigger(&self, trigger_id: Uuid) -> Result<Option<crate::runner::Trigger>>;
+
+    /// List all triggers for a given plan.
+    async fn list_triggers(&self, plan_id: Uuid) -> Result<Vec<crate::runner::Trigger>>;
+
+    /// Disable a trigger, with the reason when the system does it (`None`:
+    /// someone disabled it). The only way back is [`Self::enable_trigger_as`],
+    /// which records who enables it: there is no enable without an author.
+    async fn disable_trigger(
+        &self,
+        trigger_id: Uuid,
+        reason: Option<&str>,
+    ) -> Result<Option<crate::runner::Trigger>>;
+
+    /// Record that a third-party session wrote `content` (the plan itself, or
+    /// one of its tasks, steps, constraints or decisions): the plan it belongs
+    /// to gets `third_party_written_at = now`. Returns that plan, `None` when
+    /// the content belongs to no plan (or does not exist).
+    async fn mark_third_party_write(
+        &self,
+        content: crate::runner::PlanContent,
+    ) -> Result<Option<Uuid>>;
+
+    /// When a third-party session last wrote the plan or its content (see
+    /// [`Self::mark_third_party_write`]); `None` if never.
+    async fn plan_third_party_written_at(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>>;
+
+    /// Delete a trigger by its UUID.
+    async fn delete_trigger(&self, trigger_id: Uuid) -> Result<()>;
+
+    /// Record a trigger firing event (`fire_count` + 1). `last_fired` is left
+    /// to [`Self::reserve_trigger_signal`]: a firing refused before the
+    /// reservation consumes no cooldown.
+    async fn record_trigger_firing(&self, firing: &crate::runner::TriggerFiring) -> Result<()>;
+
+    /// Enable a trigger and record `author` as the identity its runs start as,
+    /// in one write. `None` when there is no such trigger.
+    async fn enable_trigger_as(
+        &self,
+        trigger_id: Uuid,
+        author: &crate::runner::TriggerAuthor,
+    ) -> Result<Option<crate::runner::Trigger>>;
+
+    /// Reserve the signal `key` of trigger `trigger_id`, atomically, across
+    /// instances: `Reserved` for the one caller that sees `key` for the first
+    /// time (one `TriggerSignal` per key, kept 24 h) AND finds the trigger out
+    /// of its `cooldown_secs` — `last_fired` then moves to now in the same
+    /// write; `Duplicate` when `key` was already reserved (or no such trigger);
+    /// `Cooldown` when the trigger fired less than `cooldown_secs` ago.
+    async fn reserve_trigger_signal(
+        &self,
+        trigger_id: Uuid,
+        key: &str,
+        cooldown_secs: u64,
+    ) -> Result<crate::runner::SignalReservation>;
+
+    /// List all triggers across all plans, optionally filtered by type.
+    async fn list_all_triggers(
+        &self,
+        trigger_type: Option<&str>,
+    ) -> Result<Vec<crate::runner::Trigger>>;
+
+    /// List trigger firings for a given trigger, ordered by fired_at desc.
+    async fn list_trigger_firings(
+        &self,
+        trigger_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<crate::runner::TriggerFiring>>;
+
+    /// Journalise une livraison reçue (accepted ou rejected), sans son corps.
+    async fn record_external_event(&self, event: &crate::ingress::ExternalEvent) -> Result<()>;
+
+    /// Derniers événements externes journalisés pour un déclencheur, le plus récent d'abord.
+    async fn list_external_events(
+        &self,
+        trigger_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<crate::ingress::ExternalEvent>>;
+
+    /// Réserve la livraison `delivery_key` pour `trigger_id`: `true` au premier appel, `false` au rejeu.
+    async fn claim_external_delivery(&self, trigger_id: Uuid, delivery_key: &str) -> Result<bool>;
+
+    /// Libère une réservation de livraison (la livraison n'a pas pu être journalisée) :
+    /// une relivraison sera de nouveau acceptée. `true` si une réservation existait.
+    async fn release_external_delivery(&self, trigger_id: Uuid, delivery_key: &str)
+        -> Result<bool>;
+
+    /// Purge les événements externes reçus avant `before` (rétention). Rend le nombre
+    /// d'événements supprimés. Les réservations de livraison sont conservées (sans
+    /// elles, un corps signé capturé redeviendrait rejouable).
+    async fn purge_external_events_before(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64>;
+
+    // ── AgentExecution ──────────────────────────────────────────────────────
+
+    /// Create an AgentExecution node linked to a PlanRun and Task.
+    async fn create_agent_execution(
+        &self,
+        ae: &crate::neo4j::agent_execution::AgentExecutionNode,
+    ) -> Result<()>;
+
+    /// Update an existing AgentExecution with final results.
+    async fn update_agent_execution(
+        &self,
+        ae: &crate::neo4j::agent_execution::AgentExecutionNode,
+    ) -> Result<()>;
+
+    /// Get all AgentExecution nodes for a given PlanRun.
+    async fn get_agent_executions_for_run(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>>;
+
+    /// Record the per-check verification result on one execution.
+    ///
+    /// A narrow write on purpose: verification runs after the attempt is
+    /// closed, so rewriting the whole node from a stale copy would race with
+    /// the close and could put `status` back to `running`.
+    async fn record_agent_execution_verification(
+        &self,
+        agent_execution_id: Uuid,
+        verification_json: &str,
+    ) -> Result<()>;
+
+    /// Every AgentExecution still `running`, across all runs (oldest first).
+    ///
+    /// Used by the reconciliation sweep to close the ones whose process is gone.
+    async fn list_running_agent_executions(
+        &self,
+    ) -> Result<Vec<crate::neo4j::agent_execution::AgentExecutionNode>>;
+
+    /// Cost, tokens, first-attempt verification and median duration of the
+    /// executions started in `[from, to)`, one row per `group_by` key (B35).
+    /// Marginal and notional amounts are summed apart and an unknown cost is
+    /// counted, never summed (A21). Sorted by key.
+    async fn agent_execution_cost_breakdown(
+        &self,
+        group_by: crate::neo4j::agent_execution::CostGroupBy,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<crate::neo4j::agent_execution::CostBreakdownRow>>;
+
+    // ========================================================================
+    // rs-stats data providers — bulk metric retrieval for statistical analysis
+    // ========================================================================
+
+    /// Fetch all PageRank values for a project as a flat vector.
+    async fn get_all_pagerank_values(&self, project_id: Uuid) -> Result<Vec<f64>>;
+
+    /// Fetch risk scores grouped by community (for ANOVA analysis).
+    async fn get_community_risk_vectors(&self, project_id: Uuid) -> Result<Vec<Vec<f64>>>;
+
+    /// Fetch all risk scores for a project as a flat vector.
+    async fn get_all_risk_score_values(&self, project_id: Uuid) -> Result<Vec<f64>>;
+}
+
+// ============================================================================
+// SharingStore
+// ============================================================================
+
+/// The sharing domain: what a project exposes, to whom, under which consent.
+#[async_trait]
+pub trait SharingStore: Send + Sync {
+    // ========================================================================
+    // Sharing & Privacy operations (RFC Privacy MVP)
+    // ========================================================================
+
+    /// Get the sharing policy for a project. Returns None if no policy is set.
+    async fn get_sharing_policy(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Option<crate::episodes::distill_models::SharingPolicy>>;
+
+    /// Update the sharing policy for a project.
+    async fn update_sharing_policy(
+        &self,
+        project_id: Uuid,
+        policy: &crate::episodes::distill_models::SharingPolicy,
+    ) -> Result<()>;
+
+    /// Get the sharing consent for a note.
+    async fn get_sharing_consent(
+        &self,
+        note_id: Uuid,
+    ) -> Result<crate::episodes::distill_models::SharingConsent>;
+
+    /// Update the sharing consent for a note.
+    async fn update_sharing_consent(
+        &self,
+        note_id: Uuid,
+        consent: &crate::episodes::distill_models::SharingConsent,
+    ) -> Result<()>;
+
+    /// Set the sharing consent of a decision (`NotSet` for every pre-existing one).
+    async fn update_decision_sharing_consent(
+        &self,
+        decision_id: Uuid,
+        consent: &crate::episodes::distill_models::SharingConsent,
+    ) -> Result<()>;
+
+    /// Count notes per consent value, optionally for one project. Measures the
+    /// real `NotSet` population (read-only; no data is changed).
+    async fn count_notes_by_consent(
+        &self,
+        project_id: Option<Uuid>,
+    ) -> Result<crate::episodes::distill_models::ConsentCounts>;
+
+    /// Create a sharing event (audit trail).
+    async fn create_sharing_event(
+        &self,
+        event: &crate::episodes::distill_models::SharingEvent,
+    ) -> Result<()>;
+
+    /// List sharing events for a project (newest first).
+    async fn list_sharing_events(
+        &self,
+        project_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<crate::episodes::distill_models::SharingEvent>>;
+
+    /// Persist a signed tombstone to the graph.
+    async fn persist_tombstone(
+        &self,
+        tombstone: &crate::reception::anchor::SignedTombstone,
+    ) -> Result<()>;
+
+    /// List all persisted tombstones.
+    async fn list_tombstones(&self) -> Result<Vec<crate::reception::anchor::SignedTombstone>>;
+
+    /// Check if a content hash has been tombstoned.
+    async fn is_tombstoned(&self, content_hash: &str) -> Result<bool>;
+}
+
+// ============================================================================
+// FeatureGraphStore
+// ============================================================================
+
+/// The feature-graph domain: the cross-cutting features a project declares, their code anchors and their similarity.
+#[async_trait]
+pub trait FeatureGraphStore: Send + Sync {
+    // ================================================================
+    // Feature Graphs
+    // ================================================================
+
+    /// Create a feature graph
+    async fn create_feature_graph(&self, graph: &FeatureGraphNode) -> Result<()>;
+
+    /// Get a feature graph by ID (without entities)
+    async fn get_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphNode>>;
+
+    /// Get a feature graph with all its included entities
+    async fn get_feature_graph_detail(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>>;
+
+    /// List feature graphs, optionally filtered by project
+    async fn list_feature_graphs(&self, project_id: Option<Uuid>) -> Result<Vec<FeatureGraphNode>>;
+
+    /// Delete a feature graph and all its INCLUDES_ENTITY relationships
+    async fn delete_feature_graph(&self, id: Uuid) -> Result<bool>;
+
+    /// Add an entity (file, function, struct, trait) to a feature graph.
+    /// When `project_id` is provided, MATCH queries for Function/Struct/Trait/Enum
+    /// are scoped to that project to avoid cross-project contamination.
+    async fn add_entity_to_feature_graph(
+        &self,
+        feature_graph_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+        role: Option<&str>,
+        project_id: Option<Uuid>,
+    ) -> Result<()>;
+
+    /// Remove an entity from a feature graph
+    async fn remove_entity_from_feature_graph(
+        &self,
+        feature_graph_id: Uuid,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<bool>;
+
+    /// Automatically build a feature graph from a function entry point.
+    /// Uses the call graph (callers + callees) to discover related functions and files,
+    /// creates a FeatureGraph, and populates it with the discovered entities.
+    #[allow(clippy::too_many_arguments)]
+    async fn auto_build_feature_graph(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        project_id: Uuid,
+        entry_function: &str,
+        depth: u32,
+        include_relations: Option<&[String]>,
+        filter_community: Option<bool>,
+    ) -> Result<FeatureGraphDetail>;
+
+    /// Refresh an auto-built feature graph by re-running the BFS with the
+    /// same parameters (entry_function, depth, include_relations).
+    /// Returns None if the graph was manually created (no entry_function).
+    /// Returns Err if the graph doesn't exist.
+    async fn refresh_feature_graph(&self, id: Uuid) -> Result<Option<FeatureGraphDetail>>;
+
+    /// Get the top N most connected functions for a project, ranked by
+    /// (callers + callees). Used for auto-generating feature graphs after sync.
+    async fn get_top_entry_functions(&self, project_id: Uuid, limit: usize) -> Result<Vec<String>>;
+
+    /// Compute statistics for a feature graph: coupling, cohesion, complexity metrics.
+    async fn get_feature_graph_statistics(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<FeatureGraphStatistics>>;
+
+    /// Compare two feature graphs: shared entities, unique entities, similarity score.
+    async fn compare_feature_graphs(
+        &self,
+        id_a: Uuid,
+        id_b: Uuid,
+    ) -> Result<Option<FeatureGraphComparison>>;
+
+    /// Find feature graphs that overlap with a reference graph (same project).
+    async fn find_overlapping_feature_graphs(
+        &self,
+        id: Uuid,
+        min_overlap: f64,
+    ) -> Result<Vec<FeatureGraphOverlap>>;
+}
+
+// ============================================================================
+// TriggerStore
+// ============================================================================
+
+/// The trigger domain: alerts raised by the heartbeat, event triggers and lifecycle hooks, and the budget they share.
+#[async_trait]
+pub trait TriggerStore: Send + Sync {
+    // ========================================================================
+    // Alert operations (Heartbeat Engine)
+    // ========================================================================
+
+    /// Create a new alert node.
+    async fn create_alert(&self, alert: &AlertNode) -> Result<()>;
+
+    /// List pending (unacknowledged) alerts, optionally filtered by project.
+    /// Returns alerts ordered by created_at DESC.
+    async fn list_pending_alerts(
+        &self,
+        project_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<AlertNode>>;
+
+    /// Acknowledge an alert by ID. Sets acknowledged=true and records who/when.
+    async fn acknowledge_alert(&self, alert_id: Uuid, acknowledged_by: &str) -> Result<()>;
+
+    /// Get a single alert by ID.
+    async fn get_alert(&self, alert_id: Uuid) -> Result<Option<AlertNode>>;
+
+    /// List all alerts (including acknowledged), optionally filtered by project.
+    async fn list_alerts(
+        &self,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<AlertNode>, usize)>;
+
+    // ========================================================================
+    // EventTrigger operations
+    // ========================================================================
+
+    /// List EventTriggers, optionally filtered by project scope and/or enabled status.
+    async fn list_event_triggers(
+        &self,
+        project_scope: Option<Uuid>,
+        enabled_only: bool,
+    ) -> Result<Vec<EventTrigger>>;
+
+    /// Create an EventTrigger node. Returns the generated UUID.
+    async fn create_event_trigger(&self, trigger: &EventTrigger) -> Result<Uuid>;
+
+    /// Get an EventTrigger by its UUID.
+    async fn get_event_trigger(&self, id: Uuid) -> Result<Option<EventTrigger>>;
+
+    /// Update an EventTrigger's fields. Only provided fields are updated.
+    /// Returns `true` if the trigger was found and updated, `false` if not found.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_event_trigger(
+        &self,
+        id: Uuid,
+        enabled: Option<bool>,
+        name: Option<String>,
+        entity_type_pattern: Option<Option<String>>,
+        action_pattern: Option<Option<String>>,
+        payload_conditions: Option<Option<serde_json::Value>>,
+        cooldown_secs: Option<u32>,
+        project_scope: Option<Option<Uuid>>,
+    ) -> Result<bool>;
+
+    /// Delete an EventTrigger by its UUID.
+    /// Returns `true` if a node was deleted, `false` if not found.
+    async fn delete_event_trigger(&self, id: Uuid) -> Result<bool>;
+
+    // ========================================================================
+    // LifecycleHook operations
+    // ========================================================================
+
+    /// Create a lifecycle hook
+    async fn create_lifecycle_hook(&self, hook: &LifecycleHook) -> Result<()>;
+
+    /// Get a lifecycle hook by ID
+    async fn get_lifecycle_hook(&self, id: Uuid) -> Result<Option<LifecycleHook>>;
+
+    /// List lifecycle hooks, optionally filtered by project_id
+    async fn list_lifecycle_hooks(&self, project_id: Option<Uuid>) -> Result<Vec<LifecycleHook>>;
+
+    /// Update a lifecycle hook
+    async fn update_lifecycle_hook(
+        &self,
+        id: Uuid,
+        updates: &UpdateLifecycleHookRequest,
+    ) -> Result<()>;
+
+    /// Delete a lifecycle hook (builtin hooks cannot be deleted)
+    async fn delete_lifecycle_hook(&self, id: Uuid) -> Result<()>;
+
+    /// List hooks matching scope and on_status, including global hooks
+    async fn list_hooks_for_scope(
+        &self,
+        scope: &LifecycleScope,
+        on_status: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<LifecycleHook>>;
 }
 
 #[cfg(test)]
