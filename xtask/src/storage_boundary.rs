@@ -503,6 +503,19 @@ pub fn render(
 /// Recursively collect the relative `/`-separated paths of every `*.rs` file
 /// under `dir`, skipping directories that are never source (build output,
 /// generated code, or the `xtask/` tooling itself).
+/// Directories the scan never descends into.
+const SKIPPED_DIRS: [&str; 9] = [
+    ".git",
+    ".rlwt",
+    ".wl",
+    "_wt",
+    "gen",
+    "node_modules",
+    "target",
+    "worktrees",
+    "xtask",
+];
+
 fn collect_rs_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -512,17 +525,11 @@ fn collect_rs_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         if path.is_dir() {
-            // Build output and local copies of the tree. `target-*` covers the per-task
-            // build directories this repository uses; `.wl`, `_wt` and `worktrees` are
-            // working copies of the same sources, and counting them multiplies every
-            // reference by the number of copies a developer happens to have.
-            if name == "target"
-                || name.starts_with("target-")
-                || matches!(
-                    name.as_str(),
-                    ".git" | "node_modules" | "gen" | ".rlwt" | "_wt" | ".wl" | "worktrees" | "xtask"
-                )
-            {
+            // Build output, dependency caches and local working copies of the tree.
+            // Counting the copies would multiply every reference by the number of
+            // checkouts a developer happens to have; `target-*` covers the per-task
+            // build directories this repository uses.
+            if SKIPPED_DIRS.contains(&name.as_str()) || name.starts_with("target-") {
                 continue;
             }
             collect_rs_files(root, &path, out);
