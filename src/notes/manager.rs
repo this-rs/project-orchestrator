@@ -1040,7 +1040,44 @@ impl NoteManager {
     /// * `project_id` - Optional filter by project UUID
     /// * `workspace_slug` - Optional filter by workspace (includes all projects in workspace + global notes)
     /// * `limit` - Maximum number of results (default 20)
+    ///
+    /// Entrée instrumentée : comportement identique, plus une ligne de registre.
+    /// Le registre ne peut pas faire échouer l'appel (voir retrieval_ledger::record).
     pub async fn semantic_search_notes(
+        &self,
+        query: &str,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: Option<usize>,
+        min_similarity: Option<f64>,
+        profile: Option<&str>,
+    ) -> Result<Vec<NoteSearchHit>> {
+        let started = std::time::Instant::now();
+        let out = self
+            .semantic_search_notes_inner(
+                query,
+                project_id,
+                workspace_slug,
+                limit,
+                min_similarity,
+                profile,
+            )
+            .await;
+        let (hits, ok) = match &out {
+            Ok(v) => (v.len(), true),
+            Err(_) => (0, false),
+        };
+        crate::notes::retrieval_ledger::record(
+            crate::notes::retrieval_ledger::Source::Semantic,
+            crate::notes::retrieval_ledger::Trigger::Explicit,
+            hits,
+            ok,
+            started.elapsed().as_millis() as u64,
+        );
+        out
+    }
+
+    async fn semantic_search_notes_inner(
         &self,
         query: &str,
         project_id: Option<Uuid>,
