@@ -9228,6 +9228,7 @@ impl ChatManager {
                     "Session {} no longer in active_sessions at stream start",
                     session_id
                 );
+                release_unstarted_turn(&is_streaming, &events_tx, &nats, &session_id);
                 return;
             }
         };
@@ -19698,6 +19699,43 @@ mod runner_spawn_tests {
             r#"{"type":"user","note":"runner"}"#
         )));
         assert!(!is_runner_spawned(Some("runner")));
+    }
+}
+
+/// Release a streaming claim for a turn that will not run: `stream_response`
+/// found the session gone from `active_sessions` before the turn started. The
+/// caller (OOB trigger, drain) may already have set `is_streaming`; without
+/// this, the session reads "streaming" forever and nothing finalizes it.
+pub(crate) fn release_unstarted_turn(
+    is_streaming: &AtomicBool,
+    events_tx: &broadcast::Sender<ChatEvent>,
+    nats: &Option<Arc<crate::events::NatsEmitter>>,
+    session_id: &str,
+) {
+    is_streaming.store(false, Ordering::SeqCst);
+    let event = ChatEvent::StreamingStatus {
+        is_streaming: false,
+    };
+    let _ = events_tx.send(event.clone());
+    if let Some(nats) = nats {
+        nats.publish_chat_event(session_id, event);
+    }
+}
+
+#[cfg(test)]
+mod unstarted_turn_tests {
+    use super::*;
+
+    #[test]
+    fn releasing_an_unstarted_turn_clears_the_claim_and_says_so() {
+        let is_streaming = AtomicBool::new(true);
+        let (tx, mut rx) = broadcast::channel(4);
+        release_unstarted_turn(&is_streaming, &tx, &None, "s-1");
+        assert!(!is_streaming.load(Ordering::SeqCst));
+        match rx.try_recv() {
+            Ok(ChatEvent::StreamingStatus { is_streaming }) => assert!(!is_streaming),
+            other => panic!("expected StreamingStatus(false), got {other:?}"),
+        }
     }
 }
 
