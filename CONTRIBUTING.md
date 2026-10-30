@@ -135,9 +135,9 @@ Never bypass the hooks with `--no-verify`.
 
 ### Patch coverage gate
 
-`codecov.yml` enforces a patch coverage target (currently 80%) on the lines a
+`codecov.yml` enforces a patch coverage target (currently 95%) on the lines a
 PR adds or modifies. The target lives in a single place (`coverage.status.patch.default.target`)
-and is meant to ratchet 80% -> 90% -> 100%.
+and is meant to ratchet 80% -> 95% -> 100%.
 
 On top of it, `src/refs/` has a BLOCKING gate in the `coverage` job
 (`scripts/lcov_gate.rs`, std only): every file under the directory is read from
