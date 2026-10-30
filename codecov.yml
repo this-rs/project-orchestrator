@@ -11,11 +11,13 @@ coverage:
       default:
         # PATCH COVERAGE GATE - SINGLE PLACE TO RATCHET.
         # New/modified lines must be covered at least at `target`.
-        # Planned ratchet: 80% -> 90% -> 100%. Change ONLY this value
+        # Planned ratchet: 80% -> 95% -> 100%. Change ONLY this value
         # (and the matching mention in CONTRIBUTING.md) when raising the bar.
         # Do not add `ignore` entries to make the number pass.
-        target: 80%
-        threshold: 5%
+        # threshold 0%: the bar IS the target — 95% must mean 95%, not 90%
+        # (a 5% threshold under a 95% target would gate at 90%).
+        target: 95%
+        threshold: 0%
 
 ignore:
   # Desktop Tauri app — separate crate, not compiled by cargo llvm-cov
