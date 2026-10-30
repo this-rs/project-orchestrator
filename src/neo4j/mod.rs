@@ -60,7 +60,8 @@ pub use models::*;
 pub use segment::Neo4jSegmentStore;
 pub use traits::{
     AnalyticsStore, AuthStore, ChatStore, CodeStore, CommitStore, DecisionStore, GraphStore,
-    NoteStore, PlanStore, ProjectStore, ReleaseStore, StoreCapabilities, WorkspaceStore,
+    NoteStore, PersonaStore, PlanStore, ProjectStore, ReleaseStore, SkillStore, StoreCapabilities,
+    WorkspaceStore,
 };
 
 // The in-memory store. Unit tests get it through `cfg(test)`; the integration
