@@ -181,7 +181,7 @@ multibase = "0.9"
 # Self-update (archive extraction)
 flate2 = "1"
 tar = "0.4"
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # DOCX text extraction (feature `docx`). A .docx is a ZIP of XML parts, so the
 # container is handled by `zip` above and the parsing by quick-xml. 0.39 is
