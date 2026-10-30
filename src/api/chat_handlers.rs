@@ -6903,6 +6903,47 @@ pub mod anchors {
             }
         }
 
+        /// The backfill reports the `:Agent` nodes it rebuilt, not just the sessions it
+        /// touched: a caller that cannot see them cannot tell « nothing to do » from « done ».
+        #[tokio::test]
+        async fn the_backfill_previews_reports_the_agents_it_found() {
+            use crate::notes::{Note, NoteStatus, NoteType};
+
+            let f = fx().await;
+            let agent = Uuid::new_v4();
+            let mut note = Note::new(
+                None,
+                NoteType::Guideline,
+                "a foundation".into(),
+                format!("agent:{agent}"),
+            );
+            note.status = NoteStatus::Active;
+            f.graph.create_note(&note).await.unwrap();
+
+            let ask = Request::builder()
+                .method("POST")
+                .uri("/api/chat/sessions/backfill-previews")
+                .header("content-type", "application/json")
+                .header("authorization", test_bearer_token())
+                .body(Body::from("{}"))
+                .unwrap();
+            let res = f.app.clone().oneshot(ask).await.unwrap();
+            assert_eq!(res.status(), axum::http::StatusCode::OK);
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+
+            let agents = &json["agents"];
+            assert_eq!(agents["from_notes"], 1, "{json}");
+            assert!(
+                agents["after"].as_u64().unwrap_or(0) >= 1,
+                "the node was made and counted: {json}"
+            );
+            assert!(agents["authored"].is_number(), "{json}");
+            assert!(agents["lived"].is_number(), "{json}");
+        }
+
         /// A person's own session token.
         fn human() -> String {
             test_bearer_token()

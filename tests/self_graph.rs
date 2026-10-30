@@ -21,6 +21,16 @@ use project_orchestrator::neo4j::models::{ChatSessionNode, ProjectNode};
 use project_orchestrator::notes::models::{Note, NoteType};
 use uuid::Uuid;
 
+/// These tests share SINGLETON nodes (the durable `:Agent` root) and the same Neo4j: run in
+/// parallel they deadlock on it — measured in CI, `Neo.TransientError.Transaction.DeadlockDetected`
+/// on `MERGE (:Agent {id: <root>})`. The suite is therefore serial with itself. Cross-suite
+/// parallelism is unaffected: the coverage job runs each `--test` binary one after the other.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().await
+}
+
 struct Env {
     client: Neo4jClient,
     raw: Graph,
@@ -108,6 +118,7 @@ fn a_note(written_by: &str) -> Note {
 
 #[tokio::test]
 async fn a_write_makes_its_agent_a_node_and_gives_it_the_note() {
+    let _serial = serial().await;
     // The edge is drawn at the write, by the real Cypher, not only reconstructed later.
     let Some(e) = env("authored").await else {
         return;
@@ -145,6 +156,7 @@ async fn a_write_makes_its_agent_a_node_and_gives_it_the_note() {
 
 #[tokio::test]
 async fn the_backfill_rebuilds_the_attribution_and_says_what_it_did() {
+    let _serial = serial().await;
     // The same edges the write draws, rebuilt from what is already written: one path.
     let Some(e) = env("backfill").await else {
         return;
@@ -183,6 +195,7 @@ async fn the_backfill_rebuilds_the_attribution_and_says_what_it_did() {
 
 #[tokio::test]
 async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
+    let _serial = serial().await;
     let Some(e) = env("knows").await else {
         return;
     };
@@ -258,6 +271,7 @@ async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
 
 #[tokio::test]
 async fn a_knows_edge_to_a_missing_note_draws_nothing() {
+    let _serial = serial().await;
     let Some(e) = env("knows-missing").await else {
         return;
     };
@@ -277,6 +291,7 @@ async fn a_knows_edge_to_a_missing_note_draws_nothing() {
 
 #[tokio::test]
 async fn what_a_subject_applies_becomes_a_uses_edge_with_its_provenance() {
+    let _serial = serial().await;
     let Some(e) = env("uses").await else {
         return;
     };
@@ -339,6 +354,7 @@ async fn what_a_subject_applies_becomes_a_uses_edge_with_its_provenance() {
 
 #[tokio::test]
 async fn a_session_welds_the_notes_it_really_had_in_context() {
+    let _serial = serial().await;
     let Some(e) = env("coact").await else {
         return;
     };
@@ -417,6 +433,7 @@ async fn a_session_welds_the_notes_it_really_had_in_context() {
 
 #[tokio::test]
 async fn a_session_episode_belongs_to_the_agent_that_lived_it() {
+    let _serial = serial().await;
     // The whole real path: the collector names the agent of the session, `save_session_episode`
     // writes the episode and draws `LIVED` in the same statement.
     let Some(e) = env("lived").await else {
@@ -503,6 +520,7 @@ fn live_session(e: &Env, label: &str) -> ChatSessionNode {
 
 #[tokio::test]
 async fn the_catalog_says_what_the_graph_really_has() {
+    let _serial = serial().await;
     let Some(e) = env("catalog").await else {
         return;
     };
@@ -549,6 +567,7 @@ async fn the_catalog_says_what_the_graph_really_has() {
 
 #[tokio::test]
 async fn a_causal_walk_follows_a_real_chain_and_refuses_a_stranger_label() {
+    let _serial = serial().await;
     let Some(e) = env("walk").await else {
         return;
     };
@@ -597,6 +616,7 @@ async fn a_causal_walk_follows_a_real_chain_and_refuses_a_stranger_label() {
 
 #[tokio::test]
 async fn a_rule_that_needs_its_caller_says_so_instead_of_pretending() {
+    let _serial = serial().await;
     // `run()` reads the graph. A rule whose measurement lives in memory is reported as
     // not runnable there, with a reason — never silently skipped, never faked.
     let Some(e) = env("rules").await else {
