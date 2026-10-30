@@ -541,6 +541,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_with_refuses_a_rule_it_does_not_know() {
+        let graph = MockGraphStore::new();
+        let err = run_with(
+            &graph,
+            "agent-knows-everything",
+            Measurement::SessionNotes {
+                session: Uuid::new_v4(),
+                project: None,
+                notes: vec![],
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown rule"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_with_refuses_a_measurement_the_rule_does_not_take() {
+        // A rule that reads the graph refuses a caller-held measurement, and says so: the
+        // alternative — accepting it and ignoring it — would report a run that never happened.
+        let graph = MockGraphStore::new();
+        let err = run_with(
+            &graph,
+            AGENT_KNOWS_CORE.name,
+            Measurement::SessionNotes {
+                session: Uuid::new_v4(),
+                project: None,
+                notes: vec![],
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("does not take this measurement"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rule_refuses_a_measurement_it_does_not_take() {
+        // Delivering the wrong measurement must fail loudly: a rule that silently ignored it
+        // would report « 0 written » on a run that never measured anything.
+        let graph = MockGraphStore::new();
+        let err = run_with(
+            &graph,
+            AGENT_KNOWS_CORE.name,
+            Measurement::SessionNotes {
+                session: Uuid::new_v4(),
+                project: None,
+                notes: vec![Uuid::new_v4(), Uuid::new_v4()],
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("does not take"), "{err}");
+    }
+
+    #[tokio::test]
     async fn an_unknown_rule_is_refused_not_ignored() {
         let graph = MockGraphStore::new();
         let err = run(&graph, &["agent-knows-everything"]).await.unwrap_err();

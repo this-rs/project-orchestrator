@@ -228,6 +228,41 @@ pub mod provenance {
     mod tests {
         use super::*;
         use crate::neo4j::mock::MockGraphStore;
+
+        /// An activation is written on the agent of its session, with its provenance.
+        #[tokio::test]
+        async fn an_activation_becomes_an_edge_of_the_agent_that_applied_it() {
+            use crate::neo4j::traits::*;
+
+            let graph = MockGraphStore::new();
+            let session = crate::test_helpers::test_chat_session(None);
+            let sid = session.id;
+            graph.create_chat_session(&session).await.unwrap();
+            let persona = Uuid::new_v4();
+
+            record_agent_uses(&graph, sid, "Persona", persona).await;
+
+            let uses = graph.agent_uses.read().await;
+            let key = uses
+                .keys()
+                .find(|(_, label, target)| label == "Persona" && *target == persona)
+                .expect("the activation is an edge");
+            let provenance = uses.get(key).unwrap();
+            assert!(provenance.is_accountable());
+            assert_eq!(
+                provenance.rule,
+                crate::graph::rules::AGENT_USES_ACTIVATED.name
+            );
+        }
+
+        /// A session the graph does not know writes nothing — « never fail without a socle »:
+        /// a bookkeeping edge must not be able to fail a turn.
+        #[tokio::test]
+        async fn an_activation_of_an_unknown_session_writes_nothing() {
+            let graph = MockGraphStore::new();
+            record_agent_uses(&graph, Uuid::new_v4(), "Persona", Uuid::new_v4()).await;
+            assert!(graph.agent_uses.read().await.is_empty());
+        }
         #[allow(unused_imports)]
         use crate::neo4j::traits::*;
 
