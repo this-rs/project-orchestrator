@@ -211,3 +211,44 @@ async fn un_session_id_invalide_est_refuse() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
+
+/// Revue 31/10 (2) : le canal de notes de `POST /api/skills/search` est une
+/// lecture que le système décide pour son compte — il ne doit pas se compter en
+/// « explicite », motif réservé à une requête que l'agent a formulée pour la
+/// mémoire.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn le_canal_de_notes_de_la_recherche_de_skills_n_est_pas_explicite() {
+    let _serial = retrieval_ledger::serial_guard();
+    let saved_capacity = retrieval_ledger::journal_capacity();
+    retrieval_ledger::set_journal_capacity(4096);
+
+    let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+    let app = router_with_auth(graph).await;
+    let query = format!("affinite-{}", uuid::Uuid::new_v4());
+    let response = app
+        .oneshot(
+            Request::post("/api/skills/search")
+                .header("authorization", test_bearer_token())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "query": query }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mine: Vec<_> = retrieval_ledger::recent(4096)
+        .into_iter()
+        .filter(|e| e.query == query)
+        .collect();
+    retrieval_ledger::set_journal_capacity(saved_capacity);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(mine.len(), 1, "une récupération, une ligne : {mine:?}");
+    assert_ne!(
+        mine[0].trigger,
+        Trigger::Explicit,
+        "une lecture système ne gonfle pas « explicite »"
+    );
+    assert_eq!(mine[0].trigger.as_str(), "system");
+}

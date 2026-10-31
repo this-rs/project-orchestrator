@@ -746,6 +746,13 @@ impl KnowledgeInjectionStage {
         let slug1 = project_slug.map(|s| s.to_string());
         let max_notes = config.max_notes;
 
+        // Le registre : chaque canal écrit sa ligne lui-même. La ligne BM25 est le
+        // dernier pas de son avenir — interrompu par le délai, il n'a rien écrit,
+        // et le délai écrit la sienne. La ligne dense, elle, précède la recherche
+        // de décisions : un délai qui expire pendant celle-ci trouverait la ligne
+        // déjà écrite. `dense_recorded` le dit au délai, qui n'écrit alors pas.
+        let dense_recorded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         let notes_future = async move {
             let started = std::time::Instant::now();
             let result = search_clone
@@ -758,9 +765,7 @@ impl KnowledgeInjectionStage {
                     None,           // importance
                 )
                 .await;
-            // La ligne de registre est le dernier pas avant le retour : un
-            // avenir interrompu par le délai n'a donc jamais écrit la sienne, et
-            // le délai écrit la sienne (échec) sans jamais compter deux fois.
+            // Dernier pas avant le retour : voir `dense_recorded` ci-dessus.
             ledger_injection(
                 retrieval_ledger::Source::Bm25,
                 &msg1,
@@ -1085,6 +1090,7 @@ impl KnowledgeInjectionStage {
             let max_notes = config.max_notes;
             let max_decisions = config.max_decisions;
             let project_id = _project_id;
+            let dense_recorded = dense_recorded.clone();
             async move {
                 let provider = provider?;
                 let started = std::time::Instant::now();
@@ -1105,6 +1111,7 @@ impl KnowledgeInjectionStage {
                             started.elapsed().as_millis() as u64,
                             session,
                         );
+                        dense_recorded.store(true, std::sync::atomic::Ordering::Release);
                         return None;
                     }
                 };
@@ -1125,6 +1132,7 @@ impl KnowledgeInjectionStage {
                     started.elapsed().as_millis() as u64,
                     session,
                 );
+                dense_recorded.store(true, std::sync::atomic::Ordering::Release);
                 let notes = match notes {
                     Ok(notes) => notes,
                     Err(e) => {
@@ -1173,8 +1181,12 @@ impl KnowledgeInjectionStage {
             Err(_) => {
                 debug!("[knowledge_injection] Dense retrieval timed out; BM25 only");
                 // Le canal dense existait (un plongeur est configuré) et n'a pas
-                // répondu dans le budget : une récupération qui a échoué.
-                if self.embeddings.is_some() {
+                // répondu dans le budget : une récupération qui a échoué — sauf si
+                // la recherche de notes avait déjà écrit sa ligne (le délai a
+                // expiré pendant la recherche de décisions qui la suit).
+                if self.embeddings.is_some()
+                    && !dense_recorded.load(std::sync::atomic::Ordering::Acquire)
+                {
                     let head: String = message.chars().take(config.embed_query_chars).collect();
                     ledger_injection(
                         retrieval_ledger::Source::Semantic,
@@ -1719,6 +1731,10 @@ fn map_intent_mode(mode: QueryIntentMode) -> &'static str {
 impl ParallelEnrichmentStage for KnowledgeInjectionStage {
     async fn execute(&self, input: &EnrichmentInput) -> Result<StageOutput> {
         let mut output = StageOutput::new(self.name());
+        // Un tour commence : ce qu'un tour précédent de cette session a laissé en
+        // attente au registre de récupération (post-stream interrompu) est
+        // abandonné, pas attribué aux citations de ce tour. Non bloquant.
+        retrieval_ledger::begin_turn(input.session_id);
 
         // Resolve the project scope first: the pinned notes below may be global
         // notes (no owning project), so they must be injectable without one.
@@ -3886,6 +3902,115 @@ mod tests {
             "chemin nominal : aucun orphelin"
         );
         retrieval_ledger::set_journal_capacity(saved_capacity);
+    }
+
+    fn turn_input(session: Uuid, corpus: &Corpus, message: &str) -> EnrichmentInput {
+        EnrichmentInput {
+            message: message.to_string(),
+            session_id: session,
+            project_slug: Some(PROJECT_SLUG.to_string()),
+            project_id: Some(corpus.project),
+            cwd: None,
+            protocol_run_id: None,
+            protocol_state: None,
+            excluded_note_ids: Default::default(),
+            restricted_content: false,
+            reasoning_path_tracker: None,
+        }
+    }
+
+    /// Revue 31/10 (1) : le délai du canal dense expire APRÈS que la recherche de
+    /// notes a écrit sa ligne — pendant la recherche de décisions qui la suit.
+    /// La ligne « échec » du délai ne doit pas s'ajouter à la ligne « ok » déjà
+    /// écrite : une récupération, une ligne.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn un_delai_dense_apres_la_recherche_de_notes_n_ecrit_pas_une_seconde_ligne() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
+        let _env = crate::chat::stages::intent_weights::lock_env();
+        let _serial = retrieval_ledger::serial_guard();
+        let saved_capacity = retrieval_ledger::journal_capacity();
+        retrieval_ledger::set_journal_capacity(4096);
+
+        let corpus = corpus(&["gather_resolver_symbols walks the call graph"]).await;
+        // La recherche de décisions dure plus que le budget du tour.
+        *corpus.graph.slow_decision_vector_search.lock().unwrap() =
+            Some(Duration::from_millis(400));
+        let mut stage = hybrid_stage(&corpus, Some(Arc::new(ConceptProvider)));
+        stage.config.query_timeout_ms = 60;
+        let session = Uuid::new_v4();
+        stage
+            .execute(&turn_input(session, &corpus, "gather_resolver_symbols"))
+            .await
+            .unwrap();
+
+        let mine = retrieval_ledger::recent_for_session(session, 100);
+        retrieval_ledger::set_journal_capacity(saved_capacity);
+        let semantic: Vec<_> = mine
+            .iter()
+            .filter(|e| e.source == retrieval_ledger::Source::Semantic)
+            .collect();
+        assert_eq!(
+            semantic.len(),
+            1,
+            "une récupération dense, une ligne — pas une ligne « ok » plus une ligne « délai » : {mine:?}"
+        );
+        assert!(semantic[0].ok, "la recherche de notes a répondu");
+        assert_eq!(mine.len(), 2, "BM25 + dense : {mine:?}");
+    }
+
+    /// Revue 31/10 (5) : le tour 1 n'a pas été réglé (post-stream interrompu).
+    /// Le règlement du tour 2 ne doit PAS attribuer les citations du tour 2 aux
+    /// récupérations du tour 1 : celles-ci sont abandonnées, comptées à part.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn un_tour_non_regle_n_est_pas_attribue_au_tour_suivant() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
+        let _env = crate::chat::stages::intent_weights::lock_env();
+        let _serial = retrieval_ledger::serial_guard();
+        let saved_capacity = retrieval_ledger::journal_capacity();
+        retrieval_ledger::set_journal_capacity(4096);
+
+        let symbol_note = "gather_resolver_symbols walks the call graph";
+        let corpus = corpus(&[symbol_note]).await;
+        let symbol_id = corpus.id_of(symbol_note);
+        let stage = hybrid_stage(&corpus, Some(Arc::new(ConceptProvider)));
+        let session = Uuid::new_v4();
+
+        // Tour 1, jamais réglé.
+        stage
+            .execute(&turn_input(session, &corpus, "gather_resolver_symbols"))
+            .await
+            .unwrap();
+        // Tour 2, réglé avec une citation.
+        stage
+            .execute(&turn_input(session, &corpus, "gather_resolver_symbols"))
+            .await
+            .unwrap();
+        let settled = retrieval_ledger::settle_turn(session, std::slice::from_ref(&symbol_id));
+        let all = retrieval_ledger::recent_for_session(session, 100);
+        let snap = retrieval_ledger::snapshot_for_session(session);
+        retrieval_ledger::set_journal_capacity(saved_capacity);
+
+        assert_eq!(all.len(), 4, "{all:?}");
+        assert_eq!(
+            settled,
+            retrieval_ledger::Settled { events: 2, used: 2 },
+            "seul le tour courant est réglé"
+        );
+        for e in &all[..2] {
+            assert!(
+                e.usage.is_none(),
+                "le tour 1 ne reçoit pas les citations du tour 2 : {e:?}"
+            );
+            assert!(e.abandoned, "le tour 1 est abandonné, dit tel");
+        }
+        for e in &all[2..] {
+            assert_eq!(e.usage.as_ref().unwrap().used_ids, vec![symbol_id.clone()]);
+        }
+        assert_eq!(snap.abandoned, 2);
+        assert_eq!(snap.pending, 0, "un abandonné n'est plus « en attente »");
+        assert_eq!(snap.used, 2);
     }
 
     /// Sans plongeur, seul BM25 récupère : une ligne par tour, pas deux — le

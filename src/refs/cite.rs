@@ -124,7 +124,18 @@ fn scan(text: &str, skip_code: bool) -> Vec<Cited> {
 /// refuse to draw. Deduplicated in order of appearance, capped at
 /// [`MAX_CITED_PER_MESSAGE`]; tokens inside code are not citations.
 pub fn cited_refs(text: &str) -> Vec<EntityRef> {
-    let mut out: Vec<EntityRef> = scan(text, true).into_iter().map(|c| c.r).collect();
+    cited_refs_where(text, |_| true)
+}
+
+/// [`cited_refs`], restreint aux sortes que `keep` accepte — le filtre s'applique
+/// **avant** le plafond [`MAX_CITED_PER_MESSAGE`], pour qu'une note citée après
+/// vingt plans ne soit pas perdue.
+pub fn cited_refs_where(text: &str, keep: impl Fn(RefKind) -> bool) -> Vec<EntityRef> {
+    let mut out: Vec<EntityRef> = scan(text, true)
+        .into_iter()
+        .map(|c| c.r)
+        .filter(|r| keep(r.kind))
+        .collect();
     out.truncate(MAX_CITED_PER_MESSAGE);
     out
 }

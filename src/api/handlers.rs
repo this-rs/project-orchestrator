@@ -2450,8 +2450,8 @@ pub async fn get_retrieval_ledger(
     let limit = params.limit.unwrap_or(20).min(200);
 
     if let Some(session_id) = params.session_id {
-        let snapshot = retrieval_ledger::snapshot_for_session(session_id);
-        let events = retrieval_ledger::recent_for_session(session_id, limit);
+        // Un seul verrou : l'agrégat et les événements décrivent le même état.
+        let (snapshot, events) = retrieval_ledger::session_view(session_id, limit);
         return Ok(Json(serde_json::json!({
             "snapshot": snapshot,
             "derived": {
@@ -4501,10 +4501,16 @@ pub async fn persist_health_report(
         tags: Some(vec!["health-check".to_string()]),
         ..Default::default()
     };
+    // Une lecture que le système fait pour son compte : motif `System` au
+    // registre de récupération, pas « explicite » (aucun agent n'a décidé).
     let previous_notes = state
         .orchestrator
         .note_manager()
-        .search_notes("health-check", &filters)
+        .search_notes_with_trigger(
+            "health-check",
+            &filters,
+            crate::notes::retrieval_ledger::Trigger::System,
+        )
         .await
         .unwrap_or_default();
 

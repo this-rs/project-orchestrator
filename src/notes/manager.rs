@@ -1117,29 +1117,6 @@ impl NoteManager {
         profile: Option<&str>,
         trigger: retrieval_ledger::Trigger,
     ) -> Result<Vec<NoteSearchHit>> {
-        self.semantic_search_notes_inner(
-            query,
-            project_id,
-            workspace_slug,
-            limit,
-            min_similarity,
-            profile,
-            trigger,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn semantic_search_notes_inner(
-        &self,
-        query: &str,
-        project_id: Option<Uuid>,
-        workspace_slug: Option<&str>,
-        limit: Option<usize>,
-        min_similarity: Option<f64>,
-        profile: Option<&str>,
-        trigger: retrieval_ledger::Trigger,
-    ) -> Result<Vec<NoteSearchHit>> {
         let limit = limit.unwrap_or(20);
         let started = std::time::Instant::now();
 

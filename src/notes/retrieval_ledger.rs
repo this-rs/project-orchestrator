@@ -102,6 +102,13 @@ pub enum Trigger {
     /// production — qui alimente chaque tour — ne se compte pas en « explicite »
     /// et n'écrase pas les quatre motifs sous son volume.
     Injection,
+    /// Lecture système : un traitement interne interroge l'index pour son propre
+    /// compte — rapport de santé, canal de notes de la recherche de skills.
+    ///
+    /// Aucun agent n'a décidé cette récupération, aucun tour ne la porte :
+    /// cataloguée à part pour ne pas gonfler « explicite », motif réservé à une
+    /// requête que l'agent a formulée pour la mémoire.
+    System,
 }
 
 impl Trigger {
@@ -113,16 +120,18 @@ impl Trigger {
             Trigger::Contradiction => "contradiction",
             Trigger::Hook => "hook",
             Trigger::Injection => "injection",
+            Trigger::System => "system",
         }
     }
 
-    const ALL: [Trigger; 6] = [
+    const ALL: [Trigger; 7] = [
         Trigger::Explicit,
         Trigger::TaskBoundary,
         Trigger::Uncertainty,
         Trigger::Contradiction,
         Trigger::Hook,
         Trigger::Injection,
+        Trigger::System,
     ];
 
     fn index(self) -> usize {
@@ -133,6 +142,7 @@ impl Trigger {
             Trigger::Contradiction => 3,
             Trigger::Hook => 4,
             Trigger::Injection => 5,
+            Trigger::System => 6,
         }
     }
 }
@@ -261,8 +271,11 @@ pub struct RetrievalEvent {
     pub session_id: Option<Uuid>,
     pub source: Source,
     pub trigger: Trigger,
-    /// Champ (2).
+    /// Champ (2) : la requête, plafonnée à [`QUERY_HEAD_CHARS`] caractères.
     pub query: String,
+    /// Longueur d'origine de la requête, en caractères : dit ce que le plafond a
+    /// coupé.
+    pub query_chars: usize,
     /// Champ (3).
     pub results: Vec<RetrievedItem>,
     /// La lecture a-t-elle abouti (distinct d'un résultat vide).
@@ -270,6 +283,10 @@ pub struct RetrievalEvent {
     pub latency_ms: u64,
     /// Champs (4) à (7), `None` tant que le tour suivant ne les a pas fournis.
     pub usage: Option<Usage>,
+    /// Le tour qui a récupéré s'est terminé sans règlement (post-stream
+    /// interrompu) : les champs (4) à (7) ne seront jamais connus, et l'événement
+    /// n'est pas attribué au tour suivant.
+    pub abandoned: bool,
 }
 
 /// Compteurs cumulés depuis le démarrage du processus.
@@ -283,7 +300,7 @@ struct Counters {
     bm25_calls: AtomicU64,
     skill_calls: AtomicU64,
     other_calls: AtomicU64,
-    triggers: [AtomicU64; 6],
+    triggers: [AtomicU64; 7],
     /// Événements jetés faute de journal disponible (verrou pris, capacité nulle).
     dropped: AtomicU64,
     /// Événements sortis du journal par la capacité : ils ont été comptés, mais
@@ -295,6 +312,8 @@ struct Counters {
     evicted_unsettled: AtomicU64,
     /// `outcome` appelé sur un identifiant inconnu (purgé du journal borné).
     orphan_outcomes: AtomicU64,
+    /// Événements dont le tour s'est terminé sans règlement (voir `begin_turn`).
+    abandoned: AtomicU64,
     used: AtomicU64,
     unused: AtomicU64,
     stale_hits: AtomicU64,
@@ -322,11 +341,13 @@ impl Counters {
                 AtomicU64::new(0),
                 AtomicU64::new(0),
                 AtomicU64::new(0),
+                AtomicU64::new(0),
             ],
             dropped: AtomicU64::new(0),
             evicted: AtomicU64::new(0),
             evicted_unsettled: AtomicU64::new(0),
             orphan_outcomes: AtomicU64::new(0),
+            abandoned: AtomicU64::new(0),
             used: AtomicU64::new(0),
             unused: AtomicU64::new(0),
             stale_hits: AtomicU64::new(0),
@@ -342,6 +363,10 @@ static LEDGER: Counters = Counters::new();
 /// Capacité du journal borné. 0 = journal désactivé (les compteurs continuent).
 static CAPACITY: AtomicUsize = AtomicUsize::new(DEFAULT_CAPACITY);
 const DEFAULT_CAPACITY: usize = 256;
+/// Plafond de la requête stockée, en caractères. Un prompt entier par ligne
+/// ferait peser le journal 256 prompts ; la tête suffit à reconnaître la requête,
+/// et [`RetrievalEvent::query_chars`] dit ce qui a été coupé.
+pub const QUERY_HEAD_CHARS: usize = 1000;
 
 /// Le journal borné et, sous le **même** verrou, les événements de chaque session
 /// qui attendent leur règlement. Un seul verrou : `record` n'a qu'un `try_lock`
@@ -355,7 +380,16 @@ struct Journal {
     pending: HashMap<Uuid, Vec<u64>>,
     /// Le côté lecture du débordement ([`Store::overflow`]) : absorbé dans
     /// `events` par quiconque tient le verrou, avant toute lecture ou écriture.
-    overflow: std::sync::mpsc::Receiver<RetrievalEvent>,
+    overflow: std::sync::mpsc::Receiver<Entry>,
+}
+
+/// Ce qui transite par le débordement quand le verrou est pris : un événement,
+/// ou le début d'un tour d'une session ([`begin_turn`]). Les deux dans le même
+/// canal, pour que l'ordre « début de tour, puis ses événements » soit gardé.
+enum Entry {
+    /// En `Box` : un événement pèse des centaines d'octets, le marqueur seize.
+    Event(Box<RetrievalEvent>),
+    TurnBegin(Uuid),
 }
 
 impl Journal {
@@ -390,7 +424,36 @@ impl Journal {
         if let Some(session) = event.session_id {
             self.pending.entry(session).or_default().push(event.id);
         }
-        self.events.push_back(event);
+        // Par identifiant, pas par arrivée : un événement absorbé après coup (ou
+        // un écrivain préempté entre son identifiant et son `push`) reprend sa
+        // place, pour que « dernier = plus récent » et « premier = plus ancien »
+        // restent vrais pour `recent` comme pour l'éviction.
+        let at = self.events.partition_point(|e| e.id < event.id);
+        self.events.insert(at, event);
+    }
+
+    /// Un nouveau tour de `session` commence : ce qui attendait encore son
+    /// règlement appartient à un tour qui s'est terminé sans post-stream
+    /// (interruption, annulation, erreur). Ces événements sont **abandonnés** —
+    /// marqués, comptés à part, retirés de l'attente — et jamais attribués aux
+    /// citations du tour qui commence.
+    fn abandon_pending(&mut self, session: Uuid) {
+        let Some(ids) = self.pending.remove(&session) else {
+            return;
+        };
+        for id in ids {
+            if let Some(event) = self.events.iter_mut().find(|e| e.id == id) {
+                event.abandoned = true;
+                LEDGER.abandoned.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn apply(&mut self, entry: Entry, capacity: usize) {
+        match entry {
+            Entry::Event(event) => self.push(*event, capacity),
+            Entry::TurnBegin(session) => self.abandon_pending(session),
+        }
     }
 
     /// Absorbe les événements partis dans le débordement pendant que le verrou
@@ -398,8 +461,8 @@ impl Journal {
     /// d'écrire : le journal est alors complet, dans l'ordre d'arrivée.
     fn absorb_overflow(&mut self) {
         let capacity = CAPACITY.load(Ordering::Relaxed);
-        while let Ok(event) = self.overflow.try_recv() {
-            self.push(event, capacity);
+        while let Ok(entry) = self.overflow.try_recv() {
+            self.apply(entry, capacity);
         }
     }
 }
@@ -415,7 +478,7 @@ impl Journal {
 /// [`OVERFLOW_CAPACITY`] collisions) jette, et compte.
 struct Store {
     journal: Mutex<Journal>,
-    overflow: std::sync::mpsc::SyncSender<RetrievalEvent>,
+    overflow: std::sync::mpsc::SyncSender<Entry>,
 }
 
 /// Capacité du débordement. Il ne se remplit que par collisions successives
@@ -440,9 +503,57 @@ fn store() -> &'static Store {
 /// Prend le verrou du journal (en attendant) et absorbe le débordement : la vue
 /// rendue est complète. Pour les lecteurs et les règlements, jamais pour `record`.
 fn lock_journal() -> std::sync::MutexGuard<'static, Journal> {
-    let mut journal = store().journal.lock().unwrap_or_else(|e| e.into_inner());
+    let mut journal = store().journal.lock().unwrap_or_else(recover_poison);
     journal.absorb_overflow();
     journal
+}
+
+/// Reprend un verrou empoisonné (une panique sous le verrou) et **efface le
+/// poison** : sans cela, `try_lock` rendrait `Err` à jamais et chaque `record`
+/// partirait au débordement jusqu'à le remplir. Le journal est une mesure, pas
+/// un invariant : un état à moitié écrit se lit quand même.
+fn recover_poison(
+    poisoned: std::sync::PoisonError<std::sync::MutexGuard<'static, Journal>>,
+) -> std::sync::MutexGuard<'static, Journal> {
+    store().journal.clear_poison();
+    poisoned.into_inner()
+}
+
+/// Applique `entry` sans attendre : directement sous le verrou s'il est libre
+/// (ou empoisonné : récupéré), sinon par le débordement. `false` si le
+/// débordement est plein — l'entrée est perdue, à l'appelant de le compter.
+fn apply_or_overflow(entry: Entry, capacity: usize) -> bool {
+    use std::sync::TryLockError;
+    match store().journal.try_lock() {
+        Ok(mut journal) => {
+            journal.absorb_overflow();
+            journal.apply(entry, capacity);
+            true
+        }
+        Err(TryLockError::Poisoned(poisoned)) => {
+            let mut journal = recover_poison(poisoned);
+            journal.absorb_overflow();
+            journal.apply(entry, capacity);
+            true
+        }
+        Err(TryLockError::WouldBlock) => store().overflow.try_send(entry).is_ok(),
+    }
+}
+
+/// Un tour de `session` commence. Ce qui attendait encore son règlement vient
+/// d'un tour terminé sans post-stream : abandonné, compté ([`Snapshot::abandoned`]),
+/// jamais attribué aux citations du tour qui commence. Non bloquant, comme
+/// [`record`]. Un débordement plein perd le marqueur, et c'est compté dans
+/// `dropped` : les événements concernés seront alors réglés par le tour courant,
+/// et le compteur dit que la mesure a été incomplète.
+pub fn begin_turn(session: Uuid) {
+    let capacity = CAPACITY.load(Ordering::Relaxed);
+    if capacity == 0 {
+        return;
+    }
+    if !apply_or_overflow(Entry::TurnBegin(session), capacity) {
+        LEDGER.dropped.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -533,27 +644,21 @@ pub fn record_for_session(
         session_id,
         source,
         trigger,
-        query: query.to_string(),
+        query: query.chars().take(QUERY_HEAD_CHARS).collect(),
+        query_chars: query.chars().count(),
         results,
         ok,
         latency_ms,
         usage: None,
+        abandoned: false,
     };
     let id = event.id;
     // `try_lock` : jamais d'attente sur le chemin chaud. Verrou pris → le
     // débordement sans verrou, que le prochain détenteur absorbe ; débordement
     // plein → jeté, et compté, pas perdu en silence.
-    match store().journal.try_lock() {
-        Ok(mut journal) => {
-            journal.absorb_overflow();
-            journal.push(event, capacity);
-        }
-        Err(_) => {
-            if store().overflow.try_send(event).is_err() {
-                LEDGER.dropped.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-        }
+    if !apply_or_overflow(Entry::Event(Box::new(event)), capacity) {
+        LEDGER.dropped.fetch_add(1, Ordering::Relaxed);
+        return None;
     }
     Some(id)
 }
@@ -678,6 +783,8 @@ pub struct Snapshot {
     pub hook_calls: u64,
     /// Injections automatiques par tour de chat — à part, comme `hook_calls`.
     pub injection_calls: u64,
+    /// Lectures système — à part, comme `hook_calls`.
+    pub system_calls: u64,
     /// Événements jetés : journal indisponible (débordement plein, capacité
     /// nulle). Un chiffre > 0 dit que la mesure est incomplète — il ne se lit pas
     /// comme « rien à signaler ».
@@ -687,6 +794,9 @@ pub struct Snapshot {
     /// Évincés avant leur règlement : `used`/`unused` sous-comptent d'autant.
     pub evicted_unsettled: u64,
     pub orphan_outcomes: u64,
+    /// Événements dont le tour s'est terminé sans règlement : leurs champs (4)
+    /// à (7) ne seront jamais connus, et `used`/`unused` ne les comptent pas.
+    pub abandoned: u64,
     /// Récupérations dont au moins un contenu a servi.
     pub used: u64,
     /// Récupérations dont aucun contenu n'a servi — les appels inutiles.
@@ -768,8 +878,11 @@ pub struct SessionSnapshot {
     pub contradiction_calls: u64,
     pub hook_calls: u64,
     pub injection_calls: u64,
+    pub system_calls: u64,
     /// Événements dont le tour n'a pas encore réglé l'issue.
     pub pending: u64,
+    /// Événements dont le tour s'est terminé sans règlement.
+    pub abandoned: u64,
     pub used: u64,
     pub unused: u64,
     pub stale_hits: u64,
@@ -798,7 +911,9 @@ impl SessionSnapshot {
             contradiction_calls: 0,
             hook_calls: 0,
             injection_calls: 0,
+            system_calls: 0,
             pending: 0,
+            abandoned: 0,
             used: 0,
             unused: 0,
             stale_hits: 0,
@@ -831,9 +946,14 @@ impl SessionSnapshot {
             Trigger::Contradiction => self.contradiction_calls += 1,
             Trigger::Hook => self.hook_calls += 1,
             Trigger::Injection => self.injection_calls += 1,
+            Trigger::System => self.system_calls += 1,
         }
         let Some(usage) = &event.usage else {
-            self.pending += 1;
+            if event.abandoned {
+                self.abandoned += 1;
+            } else {
+                self.pending += 1;
+            }
             return;
         };
         if usage.used_ids.is_empty() {
@@ -873,10 +993,9 @@ impl SessionSnapshot {
     }
 }
 
-/// L'agrégat récent de `session_id`, calculé depuis le journal borné. Une
-/// session inconnue rend des zéros avec sa fenêtre : « rien de récent », ce qui
-/// n'est pas « rien depuis le début ».
-pub fn snapshot_for_session(session_id: Uuid) -> SessionSnapshot {
+/// L'agrégat récent de `session_id` ET ses `limit` derniers événements, lus
+/// sous **un seul** verrou : les deux décrivent le même état du journal.
+pub fn session_view(session_id: Uuid, limit: usize) -> (SessionSnapshot, Vec<RetrievalEvent>) {
     let journal = lock_journal();
     let window = JournalWindow {
         capacity: CAPACITY.load(Ordering::Relaxed),
@@ -884,26 +1003,27 @@ pub fn snapshot_for_session(session_id: Uuid) -> SessionSnapshot {
         evicted_total: LEDGER.evicted.load(Ordering::Relaxed),
     };
     let mut snapshot = SessionSnapshot::empty(session_id, window);
-    for event in journal
-        .events
-        .iter()
-        .filter(|e| e.session_id == Some(session_id))
-    {
-        snapshot.add(event);
-    }
-    snapshot
-}
-
-/// Les `limit` derniers événements de `session_id`, du plus ancien au plus récent.
-pub fn recent_for_session(session_id: Uuid, limit: usize) -> Vec<RetrievalEvent> {
-    let journal = lock_journal();
     let mine: Vec<&RetrievalEvent> = journal
         .events
         .iter()
         .filter(|e| e.session_id == Some(session_id))
+        .inspect(|e| snapshot.add(e))
         .collect();
     let skip = mine.len().saturating_sub(limit);
-    mine.into_iter().skip(skip).cloned().collect()
+    let recent = mine.into_iter().skip(skip).cloned().collect();
+    (snapshot, recent)
+}
+
+/// L'agrégat récent de `session_id`, calculé depuis le journal borné. Une
+/// session inconnue rend des zéros avec sa fenêtre : « rien de récent », ce qui
+/// n'est pas « rien depuis le début ».
+pub fn snapshot_for_session(session_id: Uuid) -> SessionSnapshot {
+    session_view(session_id, 0).0
+}
+
+/// Les `limit` derniers événements de `session_id`, du plus ancien au plus récent.
+pub fn recent_for_session(session_id: Uuid, limit: usize) -> Vec<RetrievalEvent> {
+    session_view(session_id, limit).1
 }
 
 /// Lit l'état courant des compteurs.
@@ -925,10 +1045,12 @@ pub fn snapshot() -> Snapshot {
         contradiction_calls: t(3),
         hook_calls: t(4),
         injection_calls: t(5),
+        system_calls: t(6),
         dropped: LEDGER.dropped.load(Ordering::Relaxed),
         evicted: LEDGER.evicted.load(Ordering::Relaxed),
         evicted_unsettled: LEDGER.evicted_unsettled.load(Ordering::Relaxed),
         orphan_outcomes: LEDGER.orphan_outcomes.load(Ordering::Relaxed),
+        abandoned: LEDGER.abandoned.load(Ordering::Relaxed),
         used: LEDGER.used.load(Ordering::Relaxed),
         unused: LEDGER.unused.load(Ordering::Relaxed),
         stale_hits: LEDGER.stale_hits.load(Ordering::Relaxed),
@@ -975,6 +1097,7 @@ mod tests {
             &LEDGER.evicted,
             &LEDGER.evicted_unsettled,
             &LEDGER.orphan_outcomes,
+            &LEDGER.abandoned,
             &LEDGER.used,
             &LEDGER.unused,
             &LEDGER.stale_hits,
@@ -1395,7 +1518,7 @@ mod tests {
         assert_eq!(s.explicit_calls, 0);
         assert_eq!(s.hook_calls, 0);
         assert_eq!(Trigger::Injection.as_str(), "injection");
-        assert_eq!(triggers().len(), 6, "six motifs catalogués");
+        assert_eq!(triggers().len(), 7, "sept motifs catalogués");
         assert_eq!(triggers()[5], Trigger::Injection);
         assert_eq!(
             serde_json::to_value(Trigger::Injection).unwrap(),
@@ -1613,6 +1736,162 @@ mod tests {
         assert_eq!(snap.benefit_yes, 1);
         assert_eq!(snap.benefit_no, 1);
         assert_eq!(snap.cost_per_correct(), Some(2.0));
+    }
+
+    /// Revue 31/10 (2) : une lecture système a sa colonne, à part d'« explicite ».
+    #[test]
+    fn une_lecture_systeme_n_est_ni_explicite_ni_un_hook() {
+        let _g = serial_guard();
+        reset();
+        record(
+            Source::Bm25,
+            Trigger::System,
+            "health-check",
+            vec![],
+            true,
+            1,
+        );
+        let s = snapshot();
+        assert_eq!(s.system_calls, 1);
+        assert_eq!(s.explicit_calls, 0);
+        assert_eq!(s.hook_calls, 0);
+        assert_eq!(Trigger::System.as_str(), "system");
+        assert_eq!(triggers()[6], Trigger::System);
+    }
+
+    /// Revue 31/10 (5) : le début d'un tour abandonne ce qu'un tour précédent a
+    /// laissé en attente — compté à part, jamais réglé par le tour courant.
+    #[test]
+    fn le_debut_d_un_tour_abandonne_l_attente_du_tour_precedent() {
+        let _g = serial_guard();
+        reset();
+        let s = Uuid::new_v4();
+        let old = for_session(Some(s), vec![item("a", 1.0)]);
+        begin_turn(s);
+        let new = for_session(Some(s), vec![item("a", 1.0)]);
+        assert_eq!(
+            settle_turn(s, &["a".to_string()]),
+            Settled { events: 1, used: 1 },
+            "seul l'événement du tour courant est réglé"
+        );
+        let events = recent(10);
+        let find = |id: u64| events.iter().find(|e| e.id == id).unwrap();
+        assert!(find(old).abandoned && find(old).usage.is_none());
+        assert!(!find(new).abandoned && find(new).usage.is_some());
+        let snap = snapshot();
+        assert_eq!(snap.abandoned, 1);
+        assert_eq!(snap.used, 1);
+        assert_eq!(snap.unused, 0, "un abandon n'est pas un « inutile »");
+        let mine = snapshot_for_session(s);
+        assert_eq!(mine.abandoned, 1);
+        assert_eq!(mine.pending, 0);
+        // Un début de tour sans attente ne change rien.
+        begin_turn(Uuid::new_v4());
+        assert_eq!(snapshot().abandoned, 1);
+    }
+
+    /// Le marqueur de début de tour passe aussi par le débordement quand le
+    /// verrou est pris, dans l'ordre : un événement envoyé APRÈS lui n'est pas
+    /// abandonné.
+    #[test]
+    fn le_debut_de_tour_sous_verrou_garde_l_ordre() {
+        let _g = serial_guard();
+        reset();
+        let s = Uuid::new_v4();
+        let old = for_session(Some(s), vec![]);
+        let held = store().journal.lock().unwrap_or_else(|e| e.into_inner());
+        begin_turn(s);
+        let new = for_session(Some(s), vec![]);
+        drop(held);
+        let events = recent(10);
+        assert!(events.iter().find(|e| e.id == old).unwrap().abandoned);
+        assert!(!events.iter().find(|e| e.id == new).unwrap().abandoned);
+        assert_eq!(settle_turn(s, &[]), Settled { events: 1, used: 0 });
+    }
+
+    /// Revue 31/10 (3) : la requête stockée est plafonnée — le journal ne peut
+    /// pas peser 256 prompts entiers — et sa longueur d'origine est gardée.
+    #[test]
+    fn la_requete_stockee_est_plafonnee_et_sa_longueur_gardee() {
+        let _g = serial_guard();
+        reset();
+        let long: String = "é".repeat(5_000);
+        record(Source::Bm25, Trigger::Injection, &long, vec![], true, 0);
+        let event = recent(1).pop().unwrap();
+        assert_eq!(event.query.chars().count(), QUERY_HEAD_CHARS);
+        assert_eq!(event.query_chars, 5_000, "la longueur d'origine est dite");
+        let short = record(Source::Bm25, Trigger::Explicit, "court", vec![], true, 0);
+        assert!(short.is_some());
+        let event = recent(1).pop().unwrap();
+        assert_eq!(event.query, "court");
+        assert_eq!(event.query_chars, 5);
+    }
+
+    /// Revue 31/10 (4) : un mutex empoisonné (panique sous le verrou) ne doit
+    /// pas envoyer chaque `record` au débordement pour toujours : la
+    /// récupération efface le poison et le chemin direct revient.
+    #[test]
+    fn un_verrou_empoisonne_est_recupere_et_le_chemin_direct_revient() {
+        let _g = serial_guard();
+        reset();
+        let poisoner = std::thread::spawn(|| {
+            let _guard = store().journal.lock().unwrap();
+            panic!("panique sous le verrou (voulue)");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(
+            store().journal.is_poisoned(),
+            "le mutex est bien empoisonné"
+        );
+
+        let id = record(
+            Source::Bm25,
+            Trigger::Explicit,
+            "après poison",
+            vec![],
+            true,
+            0,
+        );
+        assert!(id.is_some(), "l'appel aboutit");
+        assert!(
+            !store().journal.is_poisoned(),
+            "le poison est effacé : le chemin direct revient"
+        );
+        assert!(store().journal.try_lock().is_ok());
+        assert_eq!(recent(1).pop().unwrap().query, "après poison");
+        assert_eq!(snapshot().dropped, 0);
+    }
+
+    /// Revue 31/10 (8) : un événement absorbé après coup garde sa place par
+    /// identifiant — « dernier = plus récent » et « premier = plus ancien »
+    /// restent vrais pour `recent` et pour l'éviction.
+    #[test]
+    fn le_journal_reste_ordonne_par_identifiant() {
+        let (_tx, rx) = std::sync::mpsc::sync_channel(4);
+        let mut journal = Journal {
+            events: VecDeque::new(),
+            pending: HashMap::new(),
+            overflow: rx,
+        };
+        let ev = |id: u64| RetrievalEvent {
+            id,
+            at: String::new(),
+            session_id: None,
+            source: Source::Other,
+            trigger: Trigger::Explicit,
+            query: String::new(),
+            query_chars: 0,
+            results: vec![],
+            ok: true,
+            latency_ms: 0,
+            usage: None,
+            abandoned: false,
+        };
+        for id in [1, 3, 2, 5, 4] {
+            journal.push(ev(id), 3);
+        }
+        let ids: Vec<u64> = journal.events.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![3, 4, 5], "ordonné, et les plus anciens évincés");
     }
 
     #[test]

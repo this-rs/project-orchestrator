@@ -811,9 +811,10 @@ pub(crate) async fn record_turn_feedback(
 /// récupération : une note injectée dans le prompt n'est pas pour autant utilisée.
 pub(crate) fn cited_note_ids(answer: &str) -> Vec<String> {
     use crate::refs::RefKind;
-    crate::refs::cite::cited_refs(answer)
+    // Filtre par sorte AVANT le plafond par message : vingt plans cités ne
+    // doivent pas cacher la note citée ensuite.
+    crate::refs::cite::cited_refs_where(answer, |k| matches!(k, RefKind::Note | RefKind::Rfc))
         .into_iter()
-        .filter(|r| matches!(r.kind, RefKind::Note | RefKind::Rfc))
         .map(|r| r.id.to_string())
         .collect()
 }
@@ -2553,6 +2554,19 @@ mod retrieval_settlement_tests {
             vec![note.to_string(), rfc.to_string()]
         );
         assert!(cited_note_ids("rien de cité").is_empty());
+    }
+
+    /// Revue 31/10 (6) : le plafond de citations par message (toutes sortes)
+    /// ne doit pas faire perdre une note citée après vingt plans.
+    #[test]
+    fn une_note_citee_apres_vingt_plans_est_lue() {
+        let note = Uuid::new_v4();
+        let mut text = (0..crate::refs::cite::MAX_CITED_PER_MESSAGE + 1)
+            .map(|_| format!("#plan:{}", Uuid::new_v4()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        text.push_str(&format!(" et #note:{note}"));
+        assert_eq!(cited_note_ids(&text), vec![note.to_string()]);
     }
 
     /// La fin de tour règle les récupérations de la session avec ce que la
