@@ -1749,21 +1749,25 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             None => None,
         };
         let is_first_sync = project.as_ref().map(|p| p.last_synced.is_none());
-        // The root as the user declared it — the form every stored path takes.
-        let declared_root = project.as_ref().and_then(|p| p.expanded_root_path());
+        // The stored form of this project's paths — canonical until the project
+        // is marked by `migrate file-paths --apply`, declared after — resolved
+        // ONCE for the run. A sync that cannot read it does not guess: writing
+        // in the wrong vocabulary creates a twin for every symbol it touches.
+        let policy = match project_id {
+            Some(pid) => self.state.neo4j.path_policy(pid).await?,
+            None => crate::neo4j::file_uid::PathPolicy::none(),
+        };
 
         // ── Phase 1: Scan ──────────────────────────────────────────
         ingestion.enter_phase(IngestionPhase::Scanning, IngestionCounters::default());
-        // `dir_path` may be the canonical root (the watcher resolves the roots
-        // it watches): every path is brought under the DECLARED root here,
-        // before the parser copies it into each symbol. A rescan must never
-        // recreate the alias the rename removed (T7).
+        // `dir_path` may be the declared root or the canonical one (the watcher
+        // resolves the roots it watches): every path is brought to the stored
+        // form here, before the parser copies it into each symbol. A rescan
+        // must never recreate a vocabulary the project does not use (T7).
         let entries: Vec<FileEntry> = scan_files(dir_path)
             .into_iter()
             .map(|mut e| {
-                if let Some(root) = declared_root.as_deref() {
-                    e.path = crate::neo4j::file_uid::under_declared_root(root, &e.path);
-                }
+                e.path = policy.stored(&e.path);
                 e
             })
             .collect();
@@ -2012,16 +2016,13 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .context("Failed to read file")?;
 
         // Normalize path to absolute form for consistent Neo4j storage, then
-        // bring it under the project's DECLARED root: the watcher hands over
-        // real paths (it canonicalizes the roots it watches), and a file written
-        // under the alias would be a second node for every symbol it contains.
+        // bring it to the project's STORED form: the watcher hands over real
+        // paths (it canonicalizes the roots it watches), and a file written in
+        // the other vocabulary would be a second node for every symbol it
+        // contains.
         let mut path_str = normalize_path(&path.to_string_lossy());
         if let Some(pid) = project_id {
-            if let Ok(Some(project)) = self.state.neo4j.get_project(pid).await {
-                if let Some(root) = project.expanded_root_path() {
-                    path_str = crate::neo4j::file_uid::under_declared_root(&root, &path_str);
-                }
-            }
+            path_str = self.state.neo4j.path_policy(pid).await?.stored(&path_str);
         }
         if !force {
             if let Some(existing) = self.state.neo4j.get_file(&path_str).await? {
@@ -5549,6 +5550,9 @@ pub fn scan_files(root: &Path) -> Vec<FileEntry> {
 
     let start = std::time::Instant::now();
     let mut entries = Vec::new();
+    // The real root is resolved ONCE: one chain of syscalls per scan, not per
+    // file (33 000 on the backend).
+    let real_root = crate::neo4j::file_uid::RealRoot::new(root);
 
     for entry in WalkDir::new(root)
         .follow_links(true)
@@ -5578,7 +5582,7 @@ pub fn scan_files(root: &Path) -> Vec<FileEntry> {
         // under the project root. The name-based list above cannot see a
         // symlink that points outside the repository — and `follow_links(true)`
         // happily walks through it. Measured rule, not a list of names.
-        if !crate::neo4j::file_uid::realpath_within_root(root, path) {
+        if !real_root.contains(path) {
             tracing::debug!(path = %path_str, "scan_files: outside the project's real root");
             continue;
         }
@@ -9278,9 +9282,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_stored_path_is_the_declared_form_and_the_uid_does_not_see_the_link() {
-        use crate::neo4j::file_uid::{
-            canonical_root, file_uid, relative_to_root, under_declared_root,
-        };
+        use crate::neo4j::file_uid::{canonical_root, file_uid, relative_to_root, PathPolicy};
 
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().join("real-repo");
@@ -9295,7 +9297,7 @@ mod tests {
         // Scanning FROM the link: the lexical normalization keeps the declared form.
         let via_link = scan_files(&link);
         assert_eq!(via_link.len(), 1);
-        let stored_from_link = under_declared_root(&declared, &via_link[0].path);
+        let stored_from_link = PathPolicy::new(&declared, "", true).stored(&via_link[0].path);
         assert_eq!(stored_from_link, format!("{declared}/src/main.rs"));
         assert!(
             !stored_from_link.starts_with(&canonical),
@@ -9306,7 +9308,7 @@ mod tests {
         // declared mapping brings it back to the same stored form.
         let via_real = scan_files(&real);
         assert_eq!(via_real.len(), 1);
-        let stored_from_real = under_declared_root(&declared, &via_real[0].path);
+        let stored_from_real = PathPolicy::new(&declared, "", true).stored(&via_real[0].path);
         assert_eq!(stored_from_real, stored_from_link);
 
         // And the identity is the same whichever path was walked.
@@ -9335,6 +9337,60 @@ mod tests {
             normalize_path(&input),
             format!("{}/src/a.rs", link.display()),
             "dots are cleaned, the link is kept"
+        );
+    }
+
+    /// Le verrou : un projet NON marqué garde son vocabulaire (canonique) même
+    /// quand le sync part de la racine déclarée ; marqué, il écrit la forme
+    /// déclarée. Sans ce verrou, un sync entre le déploiement et
+    /// `migrate file-paths --apply` créait un jumeau sous la racine déclarée
+    /// pour chaque symbole touché, puis la passe des fichiers périmés
+    /// supprimait les originaux avec leurs 28 833 arêtes de notes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unmarked_project_keeps_its_vocabulary_until_migrated() {
+        use crate::neo4j::file_uid::PathPolicy;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-repo");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/main.rs"), "fn main() {}").unwrap();
+        let link = tmp.path().join("declared-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let declared = link.to_string_lossy().to_string();
+        let canonical = PathPolicy::new(&declared, "", false).canonical_root;
+        assert_ne!(canonical, declared, "the fixture must go through a link");
+
+        let (state, neo4j, _meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+        let mut project = crate::test_helpers::test_project_named("linked");
+        project.root_path = declared.clone();
+        let pid = project.id;
+        // Inserted directly: an EXISTING project, not marked (create_project marks).
+        neo4j.projects.write().await.insert(pid, project);
+
+        orch.sync_directory_for_project_with_options(&link, Some(pid), Some("linked"), false)
+            .await
+            .unwrap();
+        let paths: Vec<String> = neo4j.files.read().await.keys().cloned().collect();
+        assert!(!paths.is_empty(), "the sync stored the file");
+        assert!(
+            paths
+                .iter()
+                .all(|p| p.starts_with(&format!("{canonical}/"))),
+            "unmarked: the canonical vocabulary, got {paths:?}"
+        );
+
+        // Marked (what `migrate file-paths --apply` does): the declared form.
+        neo4j.paths_declared.write().await.insert(pid, true);
+        orch.sync_directory_for_project_with_options(&link, Some(pid), Some("linked"), true)
+            .await
+            .unwrap();
+        let paths: Vec<String> = neo4j.files.read().await.keys().cloned().collect();
+        assert!(
+            paths.iter().any(|p| p.starts_with(&format!("{declared}/"))),
+            "marked: the declared vocabulary, got {paths:?}"
         );
     }
 

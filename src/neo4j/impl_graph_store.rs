@@ -47,6 +47,10 @@ impl ProjectStore for Neo4jClient {
         self.get_project(id).await
     }
 
+    async fn path_policy(&self, id: Uuid) -> anyhow::Result<crate::neo4j::file_uid::PathPolicy> {
+        self.path_policy(id).await
+    }
+
     async fn get_project_by_slug(&self, slug: &str) -> anyhow::Result<Option<ProjectNode>> {
         self.get_project_by_slug(slug).await
     }
