@@ -626,6 +626,43 @@ fn import_items(row: &Row) -> Result<HashMap<String, BoltType>> {
     Ok(m)
 }
 
+/// Backfill `File.uid` — the identity of a file, independent of its mount point.
+///
+/// The stored path is canonical (the sync resolves links) while
+/// `Project.root_path` is what the user declared, often a symlink: the relative
+/// path therefore comes from `canonical_path`, filled in Rust just before this
+/// run (`ensure_project_canonical_paths`). Without it, `strip_prefix` has
+/// nothing to strip and every file of such a project would keep its absolute
+/// path in the identity — the very defect this series removes.
+const BACKFILL_FILE_UID: &str = r#"
+MATCH (p:Project)
+WHERE p.canonical_path IS NOT NULL AND p.canonical_path <> ''
+  AND ($scope IS NULL OR p.id = $scope)
+MATCH (f:File {project_id: p.id})
+WHERE f.uid IS NULL
+WITH f, p LIMIT $batch
+WITH f, p, CASE WHEN f.path STARTS WITH p.canonical_path + '/'
+                THEN substring(f.path, size(p.canonical_path) + 1)
+                ELSE f.path END AS rel
+SET f.uid = p.id + ':' + rel
+RETURN count(f) AS processed
+"#;
+
+/// Backfill `File.uid` for the files that belong to no project.
+///
+/// The owner is `-`, exactly like `neo4j::file_uid(None, path)`: one grammar,
+/// two call sites, and a file that later joins a project gets a new identity
+/// rather than a silent reuse of the project-less one.
+const BACKFILL_FILE_UID_ORPHANS: &str = r#"
+MATCH (f:File)
+WHERE f.uid IS NULL
+  AND (f.project_id IS NULL OR f.project_id = '')
+  AND ($scope IS NULL OR f.project_id = $scope)
+WITH f LIMIT $batch
+SET f.uid = '-:' + f.path
+RETURN count(f) AS processed
+"#;
+
 impl Neo4jClient {
     /// The ordered list of data migrations.
     pub fn data_migrations() -> Vec<DataMigration> {
@@ -723,6 +760,19 @@ impl Neo4jClient {
                     items: import_items,
                     write: WRITE_IMPORT_STABLE_KEY,
                 }),
+                finalize: None,
+            },
+            DataMigration {
+                id: "2026-10-backfill-file-uid",
+                description:
+                    "Give every file a mount-independent identity (project + relative path)",
+                batch: BACKFILL_FILE_UID.to_string(),
+                finalize: None,
+            },
+            DataMigration {
+                id: "2026-10-backfill-file-uid-orphans",
+                description: "Same identity for the files that belong to no project",
+                batch: BACKFILL_FILE_UID_ORPHANS.to_string(),
                 finalize: None,
             },
         ]
@@ -1011,6 +1061,8 @@ mod tests {
                 "2026-10-backfill-stable-key-types",
                 "2026-10-backfill-stable-key-impls",
                 "2026-10-backfill-stable-key-imports",
+                "2026-10-backfill-file-uid",
+                "2026-10-backfill-file-uid-orphans",
             ]
         );
     }
@@ -1128,6 +1180,38 @@ mod tests {
             .unwrap()
             .write
             .contains("n.occurrence = 0"));
+    }
+
+    /// `File.uid` n'a de valeur que si la migration qui le remplit lit la même
+    /// racine que l'écriture : sinon les fichiers d'un projet monté par un lien
+    /// garderaient leur chemin absolu dans l'identité.
+    #[test]
+    fn test_file_uid_backfills_read_the_canonical_root() {
+        let migrations = Neo4jClient::data_migrations();
+        let by_id = |id: &str| -> String {
+            migrations
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("{id} is registered"))
+                .batch
+                .clone()
+        };
+
+        let projects = by_id("2026-10-backfill-file-uid");
+        assert!(projects.contains("n.canonical_path") || projects.contains("p.canonical_path"));
+        assert!(
+            projects.contains("substring("),
+            "the relative path is a suffix"
+        );
+        assert!(projects.contains("f.uid IS NULL"), "idempotent");
+        assert!(projects.contains("SET f.uid"));
+
+        let orphans = by_id("2026-10-backfill-file-uid-orphans");
+        assert!(
+            orphans.contains("'-:'"),
+            "an ownerless file is owned by `-`, like file_uid(None, path)"
+        );
+        assert!(orphans.contains("f.uid IS NULL"));
     }
 
     /// The worktree purge deletes COPIES of the project's code, never the code

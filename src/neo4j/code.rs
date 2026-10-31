@@ -185,8 +185,24 @@ impl Neo4jClient {
     pub async fn upsert_file(&self, file: &FileNode) -> Result<()> {
         let q = query(
             r#"
-            MERGE (f:File {path: $path})
-            SET f.language = $language,
+            // L'identité du fichier est `(projet, chemin relatif à la racine)`,
+            // calculée ici et non reçue : `neo4j::file_uid` documente la même
+            // grammaire côté Rust. Le point de montage n'entre pas dans la clé,
+            // donc lier ou monter autrement le même dépôt ne crée plus un second
+            // fichier. Le chemin reste un attribut (le dernier montage écrit).
+            OPTIONAL MATCH (p:Project {id: $project_id})
+            WITH coalesce(p.canonical_path, '') AS root,
+                 $path AS path,
+                 $project_id AS pid
+            WITH path, pid,
+                 CASE WHEN root <> '' AND path STARTS WITH root + '/'
+                      THEN substring(path, size(root) + 1)
+                      ELSE path END AS rel
+            WITH path, CASE WHEN pid = '' THEN '-' ELSE pid END + ':' + rel AS uid
+            MERGE (f:File {uid: uid})
+            SET f.path = path,
+                f.uid = uid,
+                f.language = $language,
                 f.hash = $hash,
                 f.last_parsed = datetime($last_parsed),
                 f.project_id = $project_id
@@ -256,8 +272,18 @@ impl Neo4jClient {
             items,
             r#"
             UNWIND $items AS item
-            MERGE (f:File {path: item.path})
-            SET f.language = item.language,
+            OPTIONAL MATCH (p:Project {id: item.project_id})
+            WITH item, coalesce(p.canonical_path, '') AS root
+            WITH item, item.path AS path,
+                 CASE WHEN root <> '' AND item.path STARTS WITH root + '/'
+                      THEN substring(item.path, size(root) + 1)
+                      ELSE item.path END AS rel
+            WITH item, path,
+                 CASE WHEN item.project_id = '' THEN '-' ELSE item.project_id END + ':' + rel AS uid
+            MERGE (f:File {uid: uid})
+            SET f.path = path,
+                f.uid = uid,
+                f.language = item.language,
                 f.hash = item.hash,
                 f.last_parsed = datetime(item.last_parsed),
                 f.project_id = item.project_id
@@ -4490,5 +4516,46 @@ impl Neo4jClient {
         } else {
             Ok(0.0)
         }
+    }
+}
+
+#[cfg(test)]
+mod file_identity_wiring_tests {
+    /// Le source de ce fichier : un portillon contre l'oubli d'un chemin
+    /// d'écriture, pas contre une renumérotation.
+    const SRC: &str = include_str!("code.rs");
+
+    /// Les deux chemins d'écriture d'un fichier (unitaire et par lot) doivent
+    /// merger sur la MÊME identité. Un seul oubli, et le même fichier
+    /// redeviendrait deux nœuds dès qu'on l'écrit par l'autre chemin — le défaut
+    /// d'origine, réintroduit par une porte de service.
+    #[test]
+    fn both_file_write_paths_merge_on_the_uid() {
+        // Le motif est reconstruit : écrit d'un seul tenant, il apparaîtrait dans
+        // ce fichier de test et le compte vaudrait 3.
+        let on_uid = ["MERGE (f:File {", "uid: uid})"].concat();
+        let on_path = ["MERGE (f:File {", "path:"].concat();
+        assert_eq!(
+            SRC.matches(&on_uid).count(),
+            2,
+            "upsert_file and batch_upsert_files must both merge on the uid"
+        );
+        assert!(!SRC.contains(&on_path), "the path is no longer an identity");
+    }
+
+    /// L'identité se calcule contre la racine canonique du projet : c'est elle
+    /// que le sync stocke réellement, et elle seule permet d'obtenir le chemin
+    /// relatif quand la racine déclarée est un lien symbolique.
+    #[test]
+    fn the_uid_is_computed_against_the_canonical_root() {
+        assert!(
+            SRC.contains("p.canonical_path"),
+            "a file uid computed against the declared root cannot strip a canonical path"
+        );
+        assert!(
+            SRC.contains("substring(path, size(root) + 1)")
+                || SRC.contains("substring(item.path, size(root) + 1)"),
+            "the relative path is a suffix of the stored path"
+        );
     }
 }

@@ -2497,6 +2497,13 @@ pub trait AnalyticsStore: Send + Sync {
         Vec::new()
     }
 
+    /// Fill `Project.canonical_path` where it is missing (see the Neo4j
+    /// implementation): the `File.uid` backfill reads it, and it cannot be
+    /// computed in Cypher. Returns `(scanned, updated)`.
+    async fn ensure_project_canonical_paths(&self) -> Result<(usize, usize)> {
+        Ok((0, 0))
+    }
+
     /// Decay and prune the synapses of one project's notes (see the Neo4j
     /// implementation). Per-project maintenance MUST use this rather than the
     /// global `decay_synapses`. Defaults to the global decay for stores

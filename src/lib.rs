@@ -2239,6 +2239,16 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         // the same skills the migrations archive and purge.
         boot.start("migrations");
         tokio::spawn(async move {
+            // La racine canonique se calcule en Rust (aucun `realpath` en
+            // Cypher) : elle doit exister AVANT le backfill de `File.uid`, qui
+            // en dérive le chemin relatif — donc l'identité des fichiers.
+            match graph.ensure_project_canonical_paths().await {
+                Ok((scanned, updated)) if updated > 0 => {
+                    tracing::info!(scanned, updated, "Project roots: canonical path filled")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "Project roots: canonical path repair failed"),
+            }
             let outcomes = graph.run_data_migrations().await;
             for o in outcomes.iter().filter(|o| !o.skipped) {
                 tracing::info!(
