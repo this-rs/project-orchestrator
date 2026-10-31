@@ -112,11 +112,12 @@ RETURN count(f) AS processed
 /// same prefix replacement. A symbol whose declared twin (`id`) already exists
 /// is skipped — the `<label>_id` constraint would refuse it.
 ///
-/// Ownership is the path prefix, with the project id **when present**: the batch
-/// upserts stamp `project_id` on Function/Struct/Trait/Enum only — measured
-/// 31/10/2026, 9 640 `Impl` and 15 863 `Import` under the alias carry none. A
-/// pass keyed on `{project_id}` alone would have left those two labels in the
-/// old vocabulary, silently.
+/// Ownership is the path prefix, with the project id **when present**: until
+/// #1045 the batch upserts stamped `project_id` on Function/Struct/Trait/Enum
+/// only — measured 31/10/2026, 9 640 `Impl` and 15 863 `Import` under the alias
+/// carry none, and they keep none until they are rewritten. A pass keyed on
+/// `{project_id}` alone would have left those two labels in the old vocabulary,
+/// silently.
 fn rename_symbols_query(label: &str) -> String {
     format!(
         r#"{RENAMABLE_PROJECT}
@@ -418,6 +419,7 @@ pub fn rename_passes() -> Vec<DataMigration> {
         description: "File.path: alias → declared root (in place)",
         batch: rename_files_query(),
         finalize: None,
+        compute: None,
     }];
     for label in SYMBOL_LABELS {
         passes.push(DataMigration {
@@ -425,6 +427,7 @@ pub fn rename_passes() -> Vec<DataMigration> {
             description: "file_path, id and stable_key: alias → declared root",
             batch: rename_symbols_query(label),
             finalize: None,
+            compute: None,
         });
     }
     passes.push(DataMigration {
@@ -432,6 +435,7 @@ pub fn rename_passes() -> Vec<DataMigration> {
         description: "Anchor.target_id (file, function): alias → declared root",
         batch: rename_anchors_query(),
         finalize: None,
+        compute: None,
     });
     passes
 }
@@ -444,18 +448,21 @@ pub fn purge_passes() -> Vec<DataMigration> {
             description: "Knowledge edges of .wl copies → declared twin (only when it exists)",
             batch: rehome_wl_knowledge_query(),
             finalize: None,
+            compute: None,
         },
         DataMigration {
             id: "file-paths/purge-wl-files",
             description: "DETACH DELETE the .wl files and their symbols",
             batch: purge_wl_files_query(),
             finalize: None,
+            compute: None,
         },
         DataMigration {
             id: "file-paths/purge-wl-symbols",
             description: "DETACH DELETE the .wl symbols no file reached",
             batch: purge_wl_symbols_query(),
             finalize: None,
+            compute: None,
         },
     ]
 }
@@ -518,6 +525,7 @@ pub fn merge_twin_passes() -> Vec<DataMigration> {
         description: "Fold an alias File into its declared twin (edges move, alias deleted)",
         batch: merge_file_twins_query(),
         finalize: None,
+        compute: None,
     }];
     for label in SYMBOL_LABELS {
         passes.push(DataMigration {
@@ -525,6 +533,7 @@ pub fn merge_twin_passes() -> Vec<DataMigration> {
             description: "Fold an alias symbol into its declared twin (edges move, alias deleted)",
             batch: merge_symbol_twins_query(label),
             finalize: None,
+            compute: None,
         });
     }
     passes
@@ -1118,13 +1127,20 @@ mod tests {
     /// grammaire commence par `file_path::` — c'est le cas des quatre.
     #[test]
     fn the_stable_key_prefix_rewrite_matches_the_grammar() {
+        use crate::neo4j::models::SymbolOwner;
         use crate::neo4j::symbol_key::*;
         let fp = "/Users/x/.openclaw/repo/src/a.rs";
+        let owner = SymbolOwner {
+            type_name: "Parser".into(),
+            trait_name: Some("Debug".into()),
+        };
         for key in [
-            stable_symbol_key(fp, "f", &[]),
+            stable_symbol_key(fp, None, "f", &[]),
+            // La méthode porte son propriétaire APRÈS le chemin : le préfixe tient.
+            stable_symbol_key(fp, Some(&owner), "fmt", &[]),
             stable_type_key(fp, "T"),
             stable_impl_key(fp, "T", Some("Debug")),
-            stable_import_key(fp, 3, "std::fmt"),
+            stable_import_key(fp, "std::fmt", 0),
         ] {
             assert!(key.starts_with(&format!("{fp}::")), "{key}");
             // Le même remplacement que sur file_path donne la clé recalculée.
@@ -1134,6 +1150,14 @@ mod tests {
             );
             assert!(renamed.starts_with("/Users/x/projects/repo/src/a.rs::"));
         }
+        // Un trait externe n'a pas de chemin : sa clé (et son id) ne commencent
+        // pas par la racine canonique, donc aucune passe ne les touche.
+        let external = stable_external_trait_key("std::fmt::Debug");
+        assert!(external.starts_with("external:trait:"));
+        assert!(!external.starts_with('/'));
+        let q = rename_symbols_query("Trait");
+        assert!(q.contains("n.stable_key STARTS WITH p.canonical_path + '/'"));
+        assert!(q.contains("n.id STARTS WITH p.canonical_path + '/'"));
     }
 
     #[test]
