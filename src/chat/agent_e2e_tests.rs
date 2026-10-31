@@ -4280,6 +4280,64 @@ mod provider_switch {
         assert_eq!(note["from_provider"], "local");
     }
 
+    /// A move made while the answer is still streaming keeps what was produced: the text lives
+    /// only in the session's buffer until its turn ends, and the target must read it in the relay.
+    #[tokio::test]
+    async fn a_switch_during_a_streamed_answer_keeps_the_text_already_produced() {
+        let w = world().await;
+        let old = first_turn(&w).await;
+        // A turn still streaming: its text is in the buffer, not yet stored as the answer.
+        let handle = w
+            .manager
+            .agent_runtime
+            .get(&old)
+            .await
+            .expect("a live agent session");
+        handle
+            .streaming_text
+            .lock()
+            .await
+            .push_str("the half answer");
+        handle
+            .is_streaming
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let moved = w
+            .manager
+            .switch_session_provider(&old, "local2", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+
+        // The target answers the moved turn: wait for that answer, as the sibling test does.
+        stored_until(&w, &moved.session_id, |events| {
+            events
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains("the answer"))
+        })
+        .await;
+        let chats = w.fake.chat_requests();
+        let turn = chats
+            .iter()
+            .find(|r| r["body"].to_string().contains("second question"))
+            .expect("the relayed turn");
+        assert!(
+            turn["body"].to_string().contains("the half answer"),
+            "the target must read the answer the user was reading: {}",
+            turn["body"]
+        );
+        let stored = w
+            .graph
+            .get_chat_events(Uuid::parse_str(&moved.session_id).unwrap(), 0, 5_000)
+            .await
+            .unwrap();
+        assert!(
+            stored
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains("the half answer")),
+            "the thread keeps the cut answer too"
+        );
+    }
+
     #[tokio::test]
     async fn a_refused_switch_leaves_the_old_session_untouched() {
         let w = world().await;
