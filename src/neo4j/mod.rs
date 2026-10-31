@@ -33,6 +33,7 @@ mod milestone;
 pub mod models;
 mod neighborhood;
 mod note;
+pub mod path_migration;
 mod persona;
 pub mod plan;
 mod plan_run;

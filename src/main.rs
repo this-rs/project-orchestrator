@@ -63,6 +63,28 @@ enum Commands {
     /// Use a secret granted to this chat session (agents only; needs PO_VAULT_TOKEN)
     #[command(subcommand)]
     Secret(SecretCommand),
+
+    /// Data migrations that are triggered, never run at boot
+    #[command(subcommand)]
+    Migrate(MigrateCommand),
+}
+
+#[derive(Subcommand)]
+enum MigrateCommand {
+    /// Rename a project's code graph from the canonical (alias) path to its declared root (T7).
+    /// Without --apply: a dry-run that prints the control measures and what would be done.
+    /// Example: orchestrator migrate file-paths --project project-orchestrator-backend
+    FilePaths {
+        /// Slug of the project to migrate
+        #[arg(long)]
+        project: String,
+        /// Write: rename File.path, the symbols' file_path/id/stable_key and the anchors, by batches of 2 000
+        #[arg(long)]
+        apply: bool,
+        /// After the rename: re-anchor the knowledge of the `.wl` worktree copies on their twin, then delete the copies (needs --apply; refused when the measures are wrong)
+        #[arg(long, requires = "apply")]
+        purge_wl: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -145,7 +167,36 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Commands::Secret(_) => unreachable!("handled before startup"),
+        Commands::Migrate(MigrateCommand::FilePaths {
+            project,
+            apply,
+            purge_wl,
+        }) => run_migrate_file_paths(&config, &project, apply, purge_wl).await,
     }
+}
+
+/// `orchestrator migrate file-paths` — the graph only, no Meilisearch, no
+/// orchestrator: a migration that is triggered must not start anything else.
+async fn run_migrate_file_paths(
+    config: &Config,
+    project: &str,
+    apply: bool,
+    purge_wl: bool,
+) -> Result<()> {
+    use project_orchestrator::neo4j::client::Neo4jClient;
+    use project_orchestrator::neo4j::path_migration;
+
+    let client = Neo4jClient::new(
+        &config.neo4j_uri,
+        &config.neo4j_user,
+        &config.neo4j_password,
+    )
+    .await?;
+    let code = path_migration::run(&client, project, apply, purge_wl).await?;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 fn run_setup_claude(config: &Config, port: u16) {
