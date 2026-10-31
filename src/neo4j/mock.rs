@@ -235,6 +235,9 @@ pub struct MockGraphStore {
     pub plan_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub task_steps: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub task_decisions: RwLock<HashMap<Uuid, Vec<Uuid>>>,
+    /// `(Project)-[:HAS_DECISION]->(Decision)`: decisions recorded with no task but a
+    /// project (`create_decision_global` with a project).
+    pub project_decisions: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub task_dependencies: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub plan_constraints: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub project_plans: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -340,6 +343,9 @@ pub struct MockGraphStore {
     pub persona_notes: RwLock<HashMap<Uuid, HashMap<Uuid, f64>>>,
     /// persona_id -> Map<decision_id, weight>
     pub persona_decisions: RwLock<HashMap<Uuid, HashMap<Uuid, f64>>>,
+    /// What `find_relevant_personas_for_decision` answers per project (a test sets it;
+    /// empty by default, like a project whose personas know none of the decision's files).
+    pub relevant_personas: RwLock<HashMap<Uuid, Vec<(Uuid, f64)>>>,
     /// persona_id -> Vec<parent_persona_id> (EXTENDS chain)
     pub persona_extends: RwLock<HashMap<Uuid, Vec<Uuid>>>,
 
@@ -486,6 +492,7 @@ impl MockGraphStore {
             plan_tasks: RwLock::new(HashMap::new()),
             task_steps: RwLock::new(HashMap::new()),
             task_decisions: RwLock::new(HashMap::new()),
+            project_decisions: RwLock::new(HashMap::new()),
             task_dependencies: RwLock::new(HashMap::new()),
             plan_constraints: RwLock::new(HashMap::new()),
             project_plans: RwLock::new(HashMap::new()),
@@ -551,6 +558,7 @@ impl MockGraphStore {
             persona_functions: RwLock::new(HashMap::new()),
             persona_notes: RwLock::new(HashMap::new()),
             persona_decisions: RwLock::new(HashMap::new()),
+            relevant_personas: RwLock::new(HashMap::new()),
             persona_extends: RwLock::new(HashMap::new()),
             user_profiles: RwLock::new(HashMap::new()),
             works_on: RwLock::new(HashMap::new()),
@@ -10239,7 +10247,25 @@ impl DecisionStore for MockGraphStore {
         Ok(())
     }
 
-    async fn create_decision_global(&self, decision: &DecisionNode) -> Result<()> {
+    async fn create_decision_global(
+        &self,
+        decision: &DecisionNode,
+        project_id: Option<Uuid>,
+    ) -> Result<()> {
+        if let Some(pid) = project_id {
+            if !self.projects.read().await.contains_key(&pid) {
+                anyhow::bail!(
+                    "Failed to create decision: Project {} not found in Neo4j",
+                    pid
+                );
+            }
+            self.project_decisions
+                .write()
+                .await
+                .entry(pid)
+                .or_default()
+                .push(decision.id);
+        }
         self.decisions
             .write()
             .await
@@ -10265,6 +10291,7 @@ impl DecisionStore for MockGraphStore {
         let task_decisions = self.task_decisions.read().await;
         let plan_tasks = self.plan_tasks.read().await;
         let project_plans = self.project_plans.read().await;
+        let project_decisions = self.project_decisions.read().await;
 
         let mut items: Vec<DecisionListItem> = decisions
             .values()
@@ -10274,16 +10301,25 @@ impl DecisionStore for MockGraphStore {
                     .iter()
                     .find(|(_, ds)| ds.contains(&d.id))
                     .map(|(t, _)| *t);
-                let project_id = task_id.and_then(|t| {
-                    let plan = plan_tasks
-                        .iter()
-                        .find(|(_, ts)| ts.contains(&t))
-                        .map(|(p, _)| *p)?;
-                    project_plans
-                        .iter()
-                        .find(|(_, ps)| ps.contains(&plan))
-                        .map(|(pr, _)| *pr)
-                });
+                // The task's plan's project, else the project the decision is
+                // attached to directly (`coalesce(link.project, direct)` in Cypher).
+                let project_id = task_id
+                    .and_then(|t| {
+                        let plan = plan_tasks
+                            .iter()
+                            .find(|(_, ts)| ts.contains(&t))
+                            .map(|(p, _)| *p)?;
+                        project_plans
+                            .iter()
+                            .find(|(_, ps)| ps.contains(&plan))
+                            .map(|(pr, _)| *pr)
+                    })
+                    .or_else(|| {
+                        project_decisions
+                            .iter()
+                            .find(|(_, ds)| ds.contains(&d.id))
+                            .map(|(p, _)| *p)
+                    });
                 DecisionListItem {
                     decision: d.clone(),
                     task_id,
@@ -10310,13 +10346,18 @@ impl DecisionStore for MockGraphStore {
     }
 
     async fn get_decision_project_ids(&self, decision_ids: &[Uuid]) -> Result<HashMap<Uuid, Uuid>> {
-        // Same chain as the Cypher (Project→Plan→Task→Decision); several
-        // projects → the smallest id, like `min(proj.id)`.
+        // Same paths as the Cypher (Project→Plan→Task→Decision, or the direct
+        // Project→Decision edge); several projects → the smallest id, like `min(proj.id)`.
         let task_decisions = self.task_decisions.read().await;
         let plan_tasks = self.plan_tasks.read().await;
         let project_plans = self.project_plans.read().await;
+        let project_decisions = self.project_decisions.read().await;
         let mut out = HashMap::new();
         for did in decision_ids {
+            let direct = project_decisions
+                .iter()
+                .filter(|(_, ds)| ds.contains(did))
+                .map(|(p, _)| *p);
             let project = task_decisions
                 .iter()
                 .filter(|(_, ds)| ds.contains(did))
@@ -10332,6 +10373,7 @@ impl DecisionStore for MockGraphStore {
                         .filter(move |(_, ps)| ps.contains(&plan))
                         .map(|(pr, _)| *pr)
                 })
+                .chain(direct)
                 .min_by_key(|p| p.to_string());
             if let Some(p) = project {
                 out.insert(*did, p);
@@ -10369,6 +10411,10 @@ impl DecisionStore for MockGraphStore {
         self.decisions.write().await.remove(&decision_id);
         let mut td = self.task_decisions.write().await;
         for ids in td.values_mut() {
+            ids.retain(|id| *id != decision_id);
+        }
+        let mut pd = self.project_decisions.write().await;
+        for ids in pd.values_mut() {
             ids.retain(|id| *id != decision_id);
         }
         Ok(())
@@ -16725,9 +16771,16 @@ impl PersonaStore for MockGraphStore {
     async fn find_relevant_personas_for_decision(
         &self,
         _decision_id: Uuid,
-        _project_id: Uuid,
+        project_id: Uuid,
     ) -> Result<Vec<(Uuid, f64)>> {
-        Ok(vec![])
+        self.log_read("find_relevant_personas_for_decision")?;
+        Ok(self
+            .relevant_personas
+            .read()
+            .await
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_default())
     }
     async fn auto_link_note_to_persona(
         &self,
@@ -16739,10 +16792,16 @@ impl PersonaStore for MockGraphStore {
     }
     async fn auto_link_decision_to_persona(
         &self,
-        _persona_id: Uuid,
-        _decision_id: Uuid,
-        _weight: f64,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
     ) -> Result<()> {
+        self.persona_decisions
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(decision_id, weight);
         Ok(())
     }
     async fn auto_link_file_to_persona(

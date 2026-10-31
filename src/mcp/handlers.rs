@@ -6,7 +6,7 @@
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
 use super::http_client::{extract_id, extract_optional_string, extract_string, McpHttpClient};
@@ -1897,19 +1897,17 @@ impl ToolHandler {
                     .and_then(|v| v.as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
-                match named_task {
-                    Some(_) => {
-                        let task_id = extract_id(args, "task_id")?;
-                        let result = http
-                            .post(&format!("/api/tasks/{}/decisions", task_id), args)
-                            .await?;
-                        Ok(Some(result))
+                // The trimmed value is the one that passed the filter: it is the one
+                // validated and put in the URL (a padded `" uuid "` must not reach it).
+                let url = match named_task {
+                    Some(task_id) => {
+                        uuid::Uuid::parse_str(task_id).context("task_id must be a valid UUID")?;
+                        format!("/api/tasks/{}/decisions", task_id)
                     }
-                    None => {
-                        let result = http.post("/api/decisions", args).await?;
-                        Ok(Some(result))
-                    }
-                }
+                    None => "/api/decisions".to_string(),
+                };
+                let result = http.post(&url, args).await?;
+                Ok(Some(result))
             }
 
             // ── P4: Steps (6 tools) ────────────────────────────────────
@@ -7880,6 +7878,30 @@ mod tests {
             .unwrap();
         assert_eq!(result["method"], "POST");
         assert_eq!(result["path"], "/api/decisions");
+    }
+
+    /// A padded `task_id` (`" uuid "`) names the task: it passes the emptiness
+    /// filter, so the URL must carry it trimmed, not with its spaces. (Review of
+    /// 31/10/2026, point 9.)
+    #[tokio::test]
+    async fn test_http_add_decision_with_padded_task_id_is_trimmed() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_decision",
+                Some(json!({
+                    "task_id": " 550e8400-e29b-41d4-a716-446655440000 ",
+                    "description": "d",
+                    "rationale": "r"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(
+            result["path"],
+            "/api/tasks/550e8400-e29b-41d4-a716-446655440000/decisions"
+        );
     }
 
     /// An empty `task_id` is the same as no task: it names nothing, so it must
