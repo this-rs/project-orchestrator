@@ -774,12 +774,14 @@ impl Neo4jClient {
                 description:
                     "Give every file a mount-independent identity (project + relative path)",
                 batch: BACKFILL_FILE_UID.to_string(),
+                compute: None,
                 finalize: None,
             },
             DataMigration {
                 id: "2026-10-backfill-file-uid-orphans",
                 description: "Same identity for the files that belong to no project",
                 batch: BACKFILL_FILE_UID_ORPHANS.to_string(),
+                compute: None,
                 finalize: None,
             },
         ]
