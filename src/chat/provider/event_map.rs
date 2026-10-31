@@ -94,7 +94,9 @@ impl EventMapper {
     }
 
     /// Remember the name of an announced tool call: its result names no tool.
-    /// Bounded (`MAX_REMEMBERED_TOOL_NAMES`), oldest forgotten first.
+    /// Bounded to `MAX_REMEMBERED_TOOL_NAMES`: past it ONE entry is dropped (a
+    /// `HashMap` has no order, so which one is arbitrary — the point is that a
+    /// long session's memory does not grow, not which name is lost first).
     pub fn remember_tool_name(&mut self, id: &str, name: &str) {
         if self.pending_tool_names.len() >= MAX_REMEMBERED_TOOL_NAMES {
             if let Some(oldest) = self.pending_tool_names.keys().next().cloned() {
@@ -1894,6 +1896,42 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_result_head_is_short_or_absent_and_never_the_whole_blob() {
+        // Blocks (an image, a structured result): serialised, then capped like text.
+        let blocks = ToolOutput::Blocks(vec![]);
+        assert_eq!(result_head(Some(&blocks)).as_deref(), Some("[]"));
+        // An empty or whitespace result has NO head — not an empty string (the
+        // client would draw an empty second line under the tool).
+        assert!(result_head(Some(&ToolOutput::Text("   \n ".into()))).is_none());
+        assert!(result_head(None).is_none());
+        // A short result travels whole, without an ellipsis.
+        assert_eq!(
+            result_head(Some(&ToolOutput::Text("ok".into()))).as_deref(),
+            Some("ok")
+        );
+    }
+
+    #[test]
+    fn remembered_tool_names_are_bounded() {
+        // A long-lived session calls thousands of tools: the memory of names
+        // must not grow with the session, and forgetting must not panic.
+        let mut mapper = EventMapper::new();
+        for i in 0..(MAX_REMEMBERED_TOOL_NAMES + 5) {
+            mapper.remember_tool_name(&format!("t{i}"), "Bash");
+        }
+        assert_eq!(mapper.pending_tool_names.len(), MAX_REMEMBERED_TOOL_NAMES);
+        // The newest still answers; the memory simply stops growing.
+        assert_eq!(
+            mapper.take_tool_name(&format!("t{}", MAX_REMEMBERED_TOOL_NAMES + 4)),
+            Some("Bash".into())
+        );
+        assert_eq!(
+            mapper.pending_tool_names.len(),
+            MAX_REMEMBERED_TOOL_NAMES - 1
+        );
     }
 
     #[test]
