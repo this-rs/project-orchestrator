@@ -2422,6 +2422,65 @@ pub async fn add_decision(
     Ok(Json(decision))
 }
 
+// ============================================================================
+// Retrieval ledger (PR1 of the mémoire mobilisable plan, 42d49a31)
+// ============================================================================
+
+/// Query of the retrieval-ledger route.
+#[derive(Debug, Deserialize)]
+pub struct RetrievalLedgerQuery {
+    /// How many recent events to return (default 20, capped at 200).
+    pub limit: Option<usize>,
+    /// One chat session: the aggregate and the events of that session only,
+    /// computed from the bounded journal (recent, not since start — the
+    /// response's `snapshot.window` says what it may have missed).
+    pub session_id: Option<Uuid>,
+}
+
+/// The retrieval ledger: the aggregate, and the last events.
+///
+/// The journal lives in memory (decision `8703a794`) and would otherwise be
+/// write-only: this route is what makes it a measurement rather than a counter
+/// nobody reads. It contains note identifiers and scores, never note bodies.
+pub async fn get_retrieval_ledger(
+    Query(params): Query<RetrievalLedgerQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::notes::retrieval_ledger;
+
+    let limit = params.limit.unwrap_or(20).min(200);
+
+    if let Some(session_id) = params.session_id {
+        // Un seul verrou : l'agrégat et les événements décrivent le même état.
+        let (snapshot, events) = retrieval_ledger::session_view(session_id, limit);
+        return Ok(Json(serde_json::json!({
+            "snapshot": snapshot,
+            "derived": {
+                "calls_per_nonempty": snapshot.calls_per_nonempty(),
+                "mean_latency_ms": snapshot.mean_latency_ms(),
+                "cost_per_correct": snapshot.cost_per_correct(),
+            },
+            "recent": events,
+            "note": "per-session aggregate computed from the bounded in-memory journal: recent, not since start; `snapshot.window.evicted_total` > 0 means events of this session may have left the journal",
+        })));
+    }
+
+    let snapshot = retrieval_ledger::snapshot();
+    let events = retrieval_ledger::recent(limit);
+
+    Ok(Json(serde_json::json!({
+        "snapshot": snapshot,
+        // Les ratios ne se recalculent pas à la main : `null` veut dire « pas
+        // encore mesurable », jamais zéro.
+        "derived": {
+            "calls_per_nonempty": snapshot.calls_per_nonempty(),
+            "mean_latency_ms": snapshot.mean_latency_ms(),
+            "cost_per_correct": snapshot.cost_per_correct(),
+        },
+        "recent": events,
+        "note": "journal in-memory and bounded; `snapshot.dropped` > 0 means the measurement is incomplete",
+    })))
+}
+
 /// Get a single decision by ID
 pub async fn get_decision(
     State(state): State<OrchestratorState>,
@@ -4442,10 +4501,16 @@ pub async fn persist_health_report(
         tags: Some(vec!["health-check".to_string()]),
         ..Default::default()
     };
+    // Une lecture que le système fait pour son compte : motif `System` au
+    // registre de récupération, pas « explicite » (aucun agent n'a décidé).
     let previous_notes = state
         .orchestrator
         .note_manager()
-        .search_notes("health-check", &filters)
+        .search_notes_with_trigger(
+            "health-check",
+            &filters,
+            crate::notes::retrieval_ledger::Trigger::System,
+        )
         .await
         .unwrap_or_default();
 
