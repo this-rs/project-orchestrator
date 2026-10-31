@@ -1393,6 +1393,7 @@ mod tests {
             line_start,
             line_end: line_start + 10,
             docstring: None,
+            owner: None,
         }
     }
 
@@ -3971,6 +3972,7 @@ mod tests {
             items: vec!["Item1".to_string()],
             file_path: file_path.to_string(),
             line,
+            occurrence: 0,
         }
     }
 
@@ -4400,6 +4402,7 @@ mod tests {
             line_start: 1,
             line_end: 10,
             docstring: None,
+            owner: None,
         };
         store.upsert_function(&caller).await.unwrap();
 
@@ -4416,6 +4419,7 @@ mod tests {
             line_start: 12,
             line_end: 20,
             docstring: None,
+            owner: None,
         };
         store.upsert_function(&real_callee).await.unwrap();
 
@@ -4432,6 +4436,7 @@ mod tests {
             line_start: 22,
             line_end: 24,
             docstring: None,
+            owner: None,
         };
         store.upsert_function(&builtin_callee).await.unwrap();
 

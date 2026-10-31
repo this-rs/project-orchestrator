@@ -542,6 +542,26 @@ impl Neo4jClient {
             "CREATE INDEX trait_project_id IF NOT EXISTS FOR (t:Trait) ON (t.project_id)",
             "CREATE INDEX enum_project_id IF NOT EXISTS FOR (e:Enum) ON (e.project_id)",
             "CREATE INDEX impl_for_type IF NOT EXISTS FOR (i:Impl) ON (i.for_type)",
+            // Impl.file_path / Struct.file_path — the stable-key backfill finds the
+            // block that owns a legacy Function by line inclusion in the Impl and
+            // Struct nodes of ITS file (data_migrations.rs); without these two
+            // indexes that lookup is a label scan per function (60k x 490k).
+            "CREATE INDEX impl_file_path IF NOT EXISTS FOR (i:Impl) ON (i.file_path)",
+            "CREATE INDEX struct_file_path IF NOT EXISTS FOR (s:Struct) ON (s.file_path)",
+            // The same backfills page by file_path (an index-backed range seek per
+            // batch instead of a label scan per batch): every keyed label needs it.
+            "CREATE INDEX trait_file_path IF NOT EXISTS FOR (t:Trait) ON (t.file_path)",
+            "CREATE INDEX enum_file_path IF NOT EXISTS FOR (e:Enum) ON (e.file_path)",
+            "CREATE INDEX import_file_path IF NOT EXISTS FOR (i:Import) ON (i.file_path)",
+            // stable_key (symbol_key.rs): the identity T2 deduplicates on and T3
+            // switches the id to. Not unique YET — until T2 runs, the versions of
+            // one function legitimately share a key.
+            "CREATE INDEX function_stable_key IF NOT EXISTS FOR (f:Function) ON (f.stable_key)",
+            "CREATE INDEX struct_stable_key IF NOT EXISTS FOR (s:Struct) ON (s.stable_key)",
+            "CREATE INDEX trait_stable_key IF NOT EXISTS FOR (t:Trait) ON (t.stable_key)",
+            "CREATE INDEX enum_stable_key IF NOT EXISTS FOR (e:Enum) ON (e.stable_key)",
+            "CREATE INDEX impl_stable_key IF NOT EXISTS FOR (i:Impl) ON (i.stable_key)",
+            "CREATE INDEX import_stable_key IF NOT EXISTS FOR (i:Import) ON (i.stable_key)",
             "CREATE INDEX task_status IF NOT EXISTS FOR (t:Task) ON (t.status)",
             "CREATE INDEX task_priority IF NOT EXISTS FOR (t:Task) ON (t.priority)",
             "CREATE INDEX step_status IF NOT EXISTS FOR (s:Step) ON (s.status)",

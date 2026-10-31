@@ -124,6 +124,7 @@ fn extract_function(
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
+        owner: None,
     })
 }
 
@@ -259,6 +260,7 @@ fn extract_import(node: &tree_sitter::Node, source: &str, file_path: &str) -> Op
         items: vec![],
         file_path: file_path.to_string(),
         line: node.start_position().row as u32 + 1,
+        occurrence: 0,
     })
 }
 
