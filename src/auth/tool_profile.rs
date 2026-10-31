@@ -600,6 +600,7 @@ const CLOSED_ROUTE_PREFIXES: &[&str] = &[
     // a pinned note reaches every turn: only a person pins, no tool calls it
     "/api/knowledge/pinned-notes",
     // no kept tool calls these
+    "/api/activity",
     "/api/agents",
     "/api/alerts",
     "/api/attention",
@@ -1441,6 +1442,7 @@ mod tests {
             "/api/notes/update-energy",
             "/api/execution-places/x/confirm",
             "/api/knowledge/pinned-notes",
+            "/api/activity",
             "/api/agents",
             "/api/alerts",
             "/api/attention",
