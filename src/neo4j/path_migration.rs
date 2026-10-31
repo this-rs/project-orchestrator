@@ -1160,6 +1160,26 @@ mod tests {
         assert!(q.contains("n.id STARTS WITH p.canonical_path + '/'"));
     }
 
+    /// Un nœud périmé (`key_deferred = true`, `stable_key` NULL — #1045) doit
+    /// quand même être renommé : la passe (b) réécrit `file_path`/`id` sans
+    /// condition sur la clé, et la passe (d) laisse une clé NULL à NULL
+    /// (`CASE … ELSE n.stable_key`), sans erreur et sans toucher `key_deferred`.
+    #[test]
+    fn a_node_without_a_stable_key_is_still_renamed_and_its_key_stays_null() {
+        let q = rename_symbols_query("Function");
+        let where_clause =
+            &q[q.find("WHERE n.file_path").unwrap()..q.find("WITH n, p LIMIT").unwrap()];
+        assert!(
+            !where_clause.contains("stable_key"),
+            "the key is no condition of the rename"
+        );
+        assert!(q.contains("ELSE n.stable_key END"), "a NULL key stays NULL");
+        assert!(
+            !q.contains("key_deferred"),
+            "the backfill owns that marker, not the rename"
+        );
+    }
+
     #[test]
     fn the_anchor_pass_covers_file_and_function_anchors() {
         let q = rename_anchors_query();
