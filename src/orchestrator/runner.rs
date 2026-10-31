@@ -29,11 +29,20 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use super::context::ContextBuilder;
-/// Normalize a file path to an absolute canonical form.
+/// Normalize a file path to an absolute, lexically clean form.
 /// - Resolves `~` to home directory
 /// - Resolves `.` and `..`
 /// - Makes relative paths absolute using current_dir
-/// - Returns the path as a String
+/// - **Never resolves symlinks.** The stored path is the one the user declared
+///   (`Project.root_path`), and this function is the funnel every written path
+///   goes through — directly for `File.path`, through the parser for every
+///   symbol's `file_path`, and again in the import resolvers. Resolving links
+///   here is what indexed the backend under `~/.openclaw/…` while its root was
+///   declared as `~/projects/…/backend` (T7): a declared form applied upstream
+///   was undone by the next call downstream. Not resolving is the only place
+///   where the rule cannot be bypassed by a future call site.
+///   The real-path perimeter is still enforced where it belongs:
+///   `scan_files` (`file_uid::realpath_within_root`).
 pub(crate) fn normalize_path(path: &str) -> String {
     let expanded = if let Some(rest) = path.strip_prefix('~') {
         if let Some(home) = dirs::home_dir() {
@@ -48,39 +57,28 @@ pub(crate) fn normalize_path(path: &str) -> String {
     };
 
     let p = std::path::Path::new(&expanded);
-    if p.is_absolute() {
-        // Try to canonicalize (resolves symlinks and ..)
-        match p.canonicalize() {
-            Ok(canonical) => canonical.to_string_lossy().to_string(),
-            Err(_) => {
-                // File might not exist yet — do manual cleanup of . and ..
-                let mut components = Vec::new();
-                for component in p.components() {
-                    match component {
-                        std::path::Component::ParentDir => {
-                            components.pop();
-                        }
-                        std::path::Component::CurDir => {}
-                        other => components.push(other),
-                    }
-                }
-                let cleaned: std::path::PathBuf = components.iter().collect();
-                cleaned.to_string_lossy().to_string()
-            }
-        }
+    let abs: std::path::PathBuf = if p.is_absolute() {
+        p.to_path_buf()
     } else {
-        // Relative path — prepend current_dir
         match std::env::current_dir() {
-            Ok(cwd) => {
-                let abs = cwd.join(p);
-                match abs.canonicalize() {
-                    Ok(canonical) => canonical.to_string_lossy().to_string(),
-                    Err(_) => abs.to_string_lossy().to_string(),
-                }
+            Ok(cwd) => cwd.join(p),
+            Err(_) => return expanded,
+        }
+    };
+
+    // Lexical cleanup of `.` and `..` — no filesystem access, no link resolved.
+    let mut components = Vec::new();
+    for component in abs.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                components.pop();
             }
-            Err(_) => expanded,
+            std::path::Component::CurDir => {}
+            other => components.push(other),
         }
     }
+    let cleaned: std::path::PathBuf = components.iter().collect();
+    cleaned.to_string_lossy().to_string()
 }
 
 /// Resolve a relative path (like `./foo` or `../bar`) against a base directory.
@@ -1746,21 +1744,29 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let sync_started = std::time::Instant::now();
         // Read before the sync writes anything: once the caller has bumped
         // `last_synced`, the answer is "not first" for every subsequent sync.
-        let is_first_sync = match project_id {
-            Some(pid) => self
-                .state
-                .neo4j
-                .get_project(pid)
-                .await
-                .ok()
-                .flatten()
-                .map(|project| project.last_synced.is_none()),
+        let project = match project_id {
+            Some(pid) => self.state.neo4j.get_project(pid).await.ok().flatten(),
             None => None,
         };
+        let is_first_sync = project.as_ref().map(|p| p.last_synced.is_none());
+        // The root as the user declared it — the form every stored path takes.
+        let declared_root = project.as_ref().and_then(|p| p.expanded_root_path());
 
         // ── Phase 1: Scan ──────────────────────────────────────────
         ingestion.enter_phase(IngestionPhase::Scanning, IngestionCounters::default());
-        let entries = scan_files(dir_path);
+        // `dir_path` may be the canonical root (the watcher resolves the roots
+        // it watches): every path is brought under the DECLARED root here,
+        // before the parser copies it into each symbol. A rescan must never
+        // recreate the alias the rename removed (T7).
+        let entries: Vec<FileEntry> = scan_files(dir_path)
+            .into_iter()
+            .map(|mut e| {
+                if let Some(root) = declared_root.as_deref() {
+                    e.path = crate::neo4j::file_uid::under_declared_root(root, &e.path);
+                }
+                e
+            })
+            .collect();
         let scanned_total = entries.len();
 
         // Track all scanned paths for stale-file cleanup
@@ -2005,8 +2011,18 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .await
             .context("Failed to read file")?;
 
-        // Normalize path to absolute form for consistent Neo4j storage
-        let path_str = normalize_path(&path.to_string_lossy());
+        // Normalize path to absolute form for consistent Neo4j storage, then
+        // bring it under the project's DECLARED root: the watcher hands over
+        // real paths (it canonicalizes the roots it watches), and a file written
+        // under the alias would be a second node for every symbol it contains.
+        let mut path_str = normalize_path(&path.to_string_lossy());
+        if let Some(pid) = project_id {
+            if let Ok(Some(project)) = self.state.neo4j.get_project(pid).await {
+                if let Some(root) = project.expanded_root_path() {
+                    path_str = crate::neo4j::file_uid::under_declared_root(&root, &path_str);
+                }
+            }
+        }
         if !force {
             if let Some(existing) = self.state.neo4j.get_file(&path_str).await? {
                 use sha2::{Digest, Sha256};
@@ -9251,6 +9267,74 @@ mod tests {
         assert!(
             std::path::Path::new(&entries[0].path).is_absolute(),
             "scan_files should return absolute paths"
+        );
+    }
+
+    /// T7, sous-tâche 4 — « un rescan ne recrée aucun chemin openclaw ». Le
+    /// dépôt réel est atteint par un lien (la racine DÉCLARÉE) ; le chemin
+    /// stocké doit être la forme déclarée, que le scan parte du lien ou du
+    /// dossier réel (le watcher résout les racines qu'il surveille), et
+    /// `file_uid` doit être identique par les deux chemins.
+    #[cfg(unix)]
+    #[test]
+    fn the_stored_path_is_the_declared_form_and_the_uid_does_not_see_the_link() {
+        use crate::neo4j::file_uid::{
+            canonical_root, file_uid, relative_to_root, under_declared_root,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-repo");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/main.rs"), "fn main() {}").unwrap();
+        let link = tmp.path().join("declared-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let declared = link.to_string_lossy().to_string();
+        let canonical = canonical_root(Some(&declared));
+        assert_ne!(canonical, declared, "the fixture must go through a link");
+
+        // Scanning FROM the link: the lexical normalization keeps the declared form.
+        let via_link = scan_files(&link);
+        assert_eq!(via_link.len(), 1);
+        let stored_from_link = under_declared_root(&declared, &via_link[0].path);
+        assert_eq!(stored_from_link, format!("{declared}/src/main.rs"));
+        assert!(
+            !stored_from_link.starts_with(&canonical),
+            "the real path must not leak into the stored form"
+        );
+
+        // Scanning FROM the real directory (what the watcher hands over): the
+        // declared mapping brings it back to the same stored form.
+        let via_real = scan_files(&real);
+        assert_eq!(via_real.len(), 1);
+        let stored_from_real = under_declared_root(&declared, &via_real[0].path);
+        assert_eq!(stored_from_real, stored_from_link);
+
+        // And the identity is the same whichever path was walked.
+        let project = Uuid::parse_str("00333b5f-2d0a-4467-9c98-155e55d2b7e5").unwrap();
+        let rel_declared = relative_to_root(&declared, &stored_from_link).unwrap();
+        let rel_real = relative_to_root(&real.to_string_lossy(), &via_real[0].path).unwrap();
+        assert_eq!(
+            file_uid(Some(project), &rel_declared),
+            file_uid(Some(project), &rel_real)
+        );
+    }
+
+    /// `normalize_path` est l'entonnoir de tout chemin écrit : s'il résolvait
+    /// les liens, la forme déclarée appliquée en amont serait défaite par le
+    /// premier appel en aval (il y en a huit dans le pipeline).
+    #[cfg(unix)]
+    #[test]
+    fn normalize_path_never_resolves_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let input = format!("{}/./src/../src/a.rs", link.display());
+        assert_eq!(
+            normalize_path(&input),
+            format!("{}/src/a.rs", link.display()),
+            "dots are cleaned, the link is kept"
         );
     }
 

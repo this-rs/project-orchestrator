@@ -634,6 +634,11 @@ fn import_items(row: &Row) -> Result<HashMap<String, BoltType>> {
 /// run (`ensure_project_canonical_paths`). Without it, `strip_prefix` has
 /// nothing to strip and every file of such a project would keep its absolute
 /// path in the identity — the very defect this series removes.
+///
+/// Both roots strip: the sync now writes the **declared** form
+/// (`file_uid::under_declared_root`), the older nodes hold the canonical one,
+/// and the two must yield the same relative path — hence the same uid — or the
+/// rename of lot 3/3 would turn one file into two.
 const BACKFILL_FILE_UID: &str = r#"
 MATCH (p:Project)
 WHERE p.canonical_path IS NOT NULL AND p.canonical_path <> ''
@@ -641,7 +646,9 @@ WHERE p.canonical_path IS NOT NULL AND p.canonical_path <> ''
 MATCH (f:File {project_id: p.id})
 WHERE f.uid IS NULL
 WITH f, p LIMIT $batch
-WITH f, p, CASE WHEN f.path STARTS WITH p.canonical_path + '/'
+WITH f, p, CASE WHEN p.root_path IS NOT NULL AND p.root_path <> '' AND f.path STARTS WITH p.root_path + '/'
+                THEN substring(f.path, size(p.root_path) + 1)
+                WHEN f.path STARTS WITH p.canonical_path + '/'
                 THEN substring(f.path, size(p.canonical_path) + 1)
                 ELSE f.path END AS rel
 SET f.uid = p.id + ':' + rel
@@ -866,7 +873,7 @@ impl Neo4jClient {
         Ok(total)
     }
 
-    async fn run_migration_batches(
+    pub(crate) async fn run_migration_batches(
         &self,
         migration: &DataMigration,
         scope: Option<String>,
@@ -1199,6 +1206,13 @@ mod tests {
 
         let projects = by_id("2026-10-backfill-file-uid");
         assert!(projects.contains("n.canonical_path") || projects.contains("p.canonical_path"));
+        // Les deux racines retirent le préfixe : le sync écrit désormais la forme
+        // déclarée, les anciens nœuds portent la canonique, et l'uid doit être
+        // le même par les deux chemins — sinon le renommage ferait deux fichiers.
+        assert!(
+            projects.contains("f.path STARTS WITH p.root_path + '/'"),
+            "the declared root strips too"
+        );
         assert!(
             projects.contains("substring("),
             "the relative path is a suffix"

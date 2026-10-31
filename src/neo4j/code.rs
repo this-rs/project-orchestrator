@@ -190,12 +190,17 @@ impl Neo4jClient {
             // grammaire côté Rust. Le point de montage n'entre pas dans la clé,
             // donc lier ou monter autrement le même dépôt ne crée plus un second
             // fichier. Le chemin reste un attribut (le dernier montage écrit).
+            // Les deux racines retirent le préfixe : le sync écrit la forme
+            // déclarée (`root_path`), les nœuds antérieurs portent la canonique.
             OPTIONAL MATCH (p:Project {id: $project_id})
             WITH coalesce(p.canonical_path, '') AS root,
+                 coalesce(p.root_path, '') AS declared,
                  $path AS path,
                  $project_id AS pid
             WITH path, pid,
-                 CASE WHEN root <> '' AND path STARTS WITH root + '/'
+                 CASE WHEN declared <> '' AND path STARTS WITH declared + '/'
+                      THEN substring(path, size(declared) + 1)
+                      WHEN root <> '' AND path STARTS WITH root + '/'
                       THEN substring(path, size(root) + 1)
                       ELSE path END AS rel
             WITH path, CASE WHEN pid = '' THEN '-' ELSE pid END + ':' + rel AS uid
@@ -273,9 +278,12 @@ impl Neo4jClient {
             r#"
             UNWIND $items AS item
             OPTIONAL MATCH (p:Project {id: item.project_id})
-            WITH item, coalesce(p.canonical_path, '') AS root
+            WITH item, coalesce(p.canonical_path, '') AS root,
+                 coalesce(p.root_path, '') AS declared
             WITH item, item.path AS path,
-                 CASE WHEN root <> '' AND item.path STARTS WITH root + '/'
+                 CASE WHEN declared <> '' AND item.path STARTS WITH declared + '/'
+                      THEN substring(item.path, size(declared) + 1)
+                      WHEN root <> '' AND item.path STARTS WITH root + '/'
                       THEN substring(item.path, size(root) + 1)
                       ELSE item.path END AS rel
             WITH item, path,
@@ -4557,5 +4565,22 @@ mod file_identity_wiring_tests {
                 || SRC.contains("substring(item.path, size(root) + 1)"),
             "the relative path is a suffix of the stored path"
         );
+    }
+
+    /// Le sync écrit désormais la forme DÉCLARÉE (`under_declared_root`) ; les
+    /// nœuds antérieurs portent la canonique. Les deux chemins d'écriture
+    /// doivent retirer l'une OU l'autre racine, sinon le même fichier aurait
+    /// deux uids selon la forme reçue — et le renommage du lot 3/3 en ferait deux.
+    #[test]
+    fn the_uid_strips_the_declared_root_as_well() {
+        // Motif reconstruit : écrit d'un tenant, ce test le compterait aussi.
+        let reads_declared = ["coalesce(p.root_path, '')", " AS declared"].concat();
+        assert_eq!(
+            SRC.matches(&reads_declared).count(),
+            2,
+            "both write paths read the declared root"
+        );
+        assert!(SRC.contains("path STARTS WITH declared + '/'"));
+        assert!(SRC.contains("item.path STARTS WITH declared + '/'"));
     }
 }
