@@ -5558,6 +5558,15 @@ pub fn scan_files(root: &Path) -> Vec<FileEntry> {
             continue;
         }
 
+        // The durable perimeter: a file is accepted only if its REAL path is
+        // under the project root. The name-based list above cannot see a
+        // symlink that points outside the repository — and `follow_links(true)`
+        // happily walks through it. Measured rule, not a list of names.
+        if !crate::neo4j::file_uid::realpath_within_root(root, path) {
+            tracing::debug!(path = %path_str, "scan_files: outside the project's real root");
+            continue;
+        }
+
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
         let normalized = normalize_path(&path_str);
 

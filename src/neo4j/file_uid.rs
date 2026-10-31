@@ -57,6 +57,50 @@ pub fn canonical_root(declared: Option<&str>) -> String {
         .unwrap_or_else(|_| declared.to_string())
 }
 
+/// Rewrite a stored (canonical) path under the project's **declared** root.
+///
+/// The sync resolves links before writing, so the graph holds `/alias/…` while
+/// the user configured `/declared/…`. Both name one directory; only the second
+/// one is what a human reads in the graph, in a note anchor, or in a picker.
+/// This is the mapping that makes a rename possible and keeps it from being
+/// undone: applied at the write boundary, every later sync produces the
+/// declared form instead of the alias.
+///
+/// Returns `None` when `path` is not under `canonical_root` — the caller then
+/// keeps the stored path rather than inventing one.
+pub fn declared_path(declared_root: &str, canonical_root: &str, path: &str) -> Option<String> {
+    let declared = declared_root.trim_end_matches('/');
+    let canonical = canonical_root.trim_end_matches('/');
+    if declared.is_empty() || canonical.is_empty() || declared == canonical {
+        return None;
+    }
+    let rest = path.strip_prefix(canonical)?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(format!("{}{}", declared, rest))
+}
+
+/// Is `path` really inside `root`, once links are resolved?
+///
+/// The name-based ignore list ([`crate::orchestrator::IGNORED_PATH_SEGMENTS`])
+/// cannot answer this: it excludes directories *by name*, and a project reached
+/// through a link is walked with `follow_links(true)`, so a symlink pointing
+/// outside the repository would be indexed as if it were part of it. The durable
+/// rule is not a list of names — it is this predicate.
+///
+/// Never answers `false` on a resolution failure: an unreadable path is kept,
+/// because dropping files silently is worse than indexing one too many.
+pub fn realpath_within_root(root: &std::path::Path, path: &std::path::Path) -> bool {
+    let Ok(root_real) = root.canonicalize() else {
+        return path.starts_with(root);
+    };
+    match path.canonicalize() {
+        Ok(real) => real.starts_with(&root_real),
+        Err(_) => path.starts_with(root),
+    }
+}
+
 /// Strip `root` from `path`, both expected to be canonical.
 ///
 /// Returns `None` when `path` is not under `root` — callers then keep the
@@ -136,6 +180,44 @@ mod tests {
             canonical_root(Some("/definitely/not/a/real/path-42")),
             "/definitely/not/a/real/path-42"
         );
+    }
+
+    #[test]
+    fn a_canonical_path_is_rewritten_under_the_declared_root() {
+        let declared = "/Users/triviere/projects/project-orchestrator/backend";
+        let canonical = "/Users/triviere/.openclaw/workspace/skills/project-orchestrator";
+        let stored = format!("{canonical}/src/main.rs");
+
+        assert_eq!(
+            declared_path(declared, canonical, &stored).as_deref(),
+            Some("/Users/triviere/projects/project-orchestrator/backend/src/main.rs"),
+            "the alias becomes the path the user configured"
+        );
+        // Same roots: nothing to rewrite, and silence is not a rewrite.
+        assert_eq!(declared_path(declared, declared, &stored), None);
+        // Outside the canonical root: no mapping, no invention.
+        assert_eq!(declared_path(declared, canonical, "/elsewhere/a.rs"), None);
+        // Empty roots are not a licence to rewrite everything.
+        assert_eq!(declared_path("", canonical, &stored), None);
+    }
+
+    #[test]
+    fn the_perimeter_is_the_real_path_not_the_name() {
+        let base = std::env::temp_dir().join("po-perimetre-test");
+        let _ = std::fs::create_dir_all(base.join("inside"));
+        let inside = base.join("inside/a.rs");
+        let _ = std::fs::write(&inside, "fn a() {}");
+        let outside = base.join("../outside.rs");
+        let _ = std::fs::write(&outside, "fn b() {}");
+
+        assert!(realpath_within_root(&base, &inside));
+        assert!(
+            !realpath_within_root(&base, &outside),
+            "a path that only looks like it belongs must not pass"
+        );
+        // A path that cannot be resolved is kept, never dropped by accident.
+        assert!(realpath_within_root(&base, &base.join("nope.rs")));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
