@@ -1,0 +1,105 @@
+%% name: po-activity-hub
+%% covers: backend:src/events/activity.rs backend:src/api/activity_handlers.rs backend:src/api/ws_activity_handler.rs
+%% verified: f991112f
+%% ---
+%% PROUVE : ce qu'est le flux d'activite — UNE entree normalisee et sequencee par mutation,
+%%   plus un instantane de ce qui tourne — et ce qu'il n'est pas.
+%%   PAS UNE SECONDE SOURCE. L'ActivityHub est alimente DANS EventBus::emit, l'entonnoir unique
+%%   par lequel passe deja toute mutation : aucun emetteur ne publie deux fois, et un nouvel
+%%   emetteur est couvert le jour ou il emet son premier CrudEvent.
+%%   UN SEUL COMPTEUR. Le seq est un AtomicU64 du hub ; l'anneau de rejeu (1000) et le broadcast
+%%   (1024) sont deux usages du meme evenement deja numerote.
+%%   POURQUOI UN ENDPOINT DE PLUS. /ws/events filtre deja par ?project_id=, mais les evenements
+%%   qui comptent le plus arrivent SANS projet : le runner emet ses RunnerEvent avec
+%%   project_id: None, et le chat manager fait de meme sur streaming_status. Un filtre projet
+%%   la perdrait tous. /ws/activity REPARE l'attribution (run -> projet, session -> slug) avant
+%%   de filtrer, au lieu de jeter les evenements.
+%%   UN PORTEE = UN ENSEMBLE DE PROJETS. Un workspace n'est pas un champ sur un run : il est
+%%   resolu une fois a la connexion en (ids, slugs) et les evenements sont filtres sur
+%%   l'appartenance. Un evenement non attribuable est JETE, jamais laisse passer.
+%%   REJEU SANS TROU NI DOUBLON. L'abonnement est ouvert AVANT la lecture du rejeu, et les
+%%   doublons sont retires par le plus grand seq deja envoye : un evenement publie pendant la
+%%   passation part exactement une fois. Un client en retard recoit lag_dropped, jamais un flux
+%%   qui prétend etre complet.
+%%   L'INSTANTANE EST LA VERITE. Les cartes affichent des valeurs derivees cote serveur
+%%   (taches faites/total, vague, cout, etat FSM) : le front les relit au lieu de les
+%%   reconstruire depuis le flux.
+%% ---
+%% SOURCES LUES (backend@f991112f) :
+%%   src/events/activity.rs        — ActivityCategory::of/parse, ActivityEvent::from_crud, wire_name,
+%%                                   ActivityHub::{new,publish,replay_since,lost_before,subscribe,
+%%                                   latest_seq,buffered}
+%%   src/events/bus.rs             — EventBus { sender, activity } ; emit = publish(activity) PUIS send(crud)
+%%   src/events/hybrid.rs          — HybridEmitter::activity (bus local, alimente aussi par le pont NATS)
+%%   src/api/activity_handlers.rs  — get_activity_snapshot : list_active_plan_runs, get_plan,
+%%                                   list_all_protocol_runs(Running), StateVisit.state_name,
+%%                                   ChatManager::session_activity_map, get_chat_session,
+%%                                   get_workspace_by_slug + list_workspace_projects
+%%   src/api/ws_activity_handler.rs — ws_activity (filtres + resolution du workspace AVANT upgrade),
+%%                                   handle_activity_ws (ready -> rejeu -> live), AttributionIndex
+%%                                   (10 s, ou 2 s sur un id inconnu), Filters::accepts
+%%   src/runner/runner.rs          — le bridge RunnerEvent -> CrudEvent avec project_id: None
+%%   src/chat/manager.rs           — publish() : ChatSession/Updated { is_streaming }, project_id: None
+%%   Tests : src/events/activity.rs (7), src/events/bus.rs (1), src/api/activity_handlers.rs (2),
+%%           src/api/ws_activity_handler.rs (8)
+%% ---
+%% NON ETABLI :
+%%   la boucle WebSocket elle-meme n'a pas de test de bout en bout : les tests portent sur la
+%%   logique pure (filtres, attribution, index, DTO). Le cablage `route -> handler -> socket` est
+%%   relu, pas exerce.
+%%   get_activity_snapshot n'est pas exerce contre un graphe : seuls ses DTO et son plafond de
+%%   limite sont testes. Les requetes qu'il enchaine (N+1 sur les titres de plans et les noms de
+%%   protocoles, caches par protocole) ne sont pas mesurees.
+%%   Aucune mesure de charge : la contrainte du plan (« >50 runs, latence <200 ms ») n'est pas
+%%   verifiee par un banc.
+%% ---
+%% LEGENDE
+%%   ✅ verifie (le noeud dit par quel test)  🟠 ecrit, sans test  🔴 defaut constate  ⚪ amont
+
+flowchart TD
+    subgraph legend["Legende"]
+        direction LR
+        L1["✅ verifie : test nomme"]
+        L2["🟠 ecrit, sans test"]
+        L3["🔴 defaut constate"]
+        L4["⚪ amont / autre domaine"]
+    end
+
+    MUT["⚪ Toute mutation<br/>handlers, runner, chat manager, protocoles"]
+    BUS["✅ EventBus::emit<br/>test every_emitted_event_lands_on_the_activity_feed"]
+    HUB["✅ ActivityHub (events/activity.rs)<br/>seq AtomicU64 · anneau 1000 · broadcast 1024<br/>tests sequence_numbers_are_monotonic, replay_returns_only_newer_events,<br/>buffer_evicts_oldest_past_capacity, live_subscriber_receives_published_event"]
+    FROM["✅ ActivityEvent::from_crud<br/>categorie, titre, statut, detail brut<br/>test from_crud_maps_categories_and_labels (+ unscoped_crud_event_keeps_project_none)"]
+
+    MUT --> BUS
+    BUS -->|"publish (numero + bufferise + diffuse)"| HUB
+    HUB --> FROM
+    BUS -->|"send (inchange)"| WSEV["⚪ /ws/events — CRUD brut, filtre ?project_id=<br/>PERD les evenements runner/chat non attribues"]
+
+    subgraph WSA["/ws/activity (api/ws_activity_handler.rs)"]
+        direction TB
+        UP["🟠 Upgrade : auth cookie/ticket PUIS resolution du workspace<br/>workspace inconnu = 404 (jamais une connexion qui filtre tout)"]
+        IDX["✅ AttributionIndex<br/>run/protocole -> projet · session -> slug<br/>rafraichi 10 s, ou 2 s sur un id inconnu (au plus)<br/>tests attribution_fills_the_missing_project, index_knows_only_what_it_indexed"]
+        ATT["✅ attribute() : remplit project_id absent"]
+        FIL["✅ Filters::accepts — categories, statuts, portee<br/>tests project_filter_drops_unattributed_events,<br/>workspace_filter_keeps_only_its_own_projects,<br/>conversation_is_matched_on_its_project_slug,<br/>status_filter_keeps_events_without_a_status"]
+        READY["⚪ ready -> auth_ok -> {kind:ready,seq,replayed}"]
+        REPLAY["🟠 rejeu : abonnement AVANT lecture, doublons retires par max(seq)"]
+        LIVE["🟠 live : RecvError::Lagged -> {kind:lag_dropped,skipped}<br/>unknown id -> refresh d'index borne"]
+        UP --> READY --> REPLAY --> IDX --> ATT --> FIL --> LIVE
+    end
+
+    FROM --> REPLAY
+    HUB -->|"broadcast"| LIVE
+
+    SNAP["🟠 GET /api/activity/snapshot<br/>DTO ✅ (snapshot_dtos_serialize_with_stable_names, limit_is_clamped_to_the_hard_ceiling)<br/>plan_runs (agents, vague, cout) · protocol_runs (etat courant nomme) · chat_sessions (streaming, permissions en attente, taches de fond)<br/>+ last_event_seq = curseur"]
+    GDB["⚪ Neo4j (runs actifs, titres, protocoles, sessions)<br/>+ ChatManager::session_activity_map"]
+
+    SNAP --> GDB
+
+    FE["⚪ ActivityHubPage (frontend)<br/>1 snapshot -> 2 /ws/activity?last_seq= -> 3 journal + impulsion<br/>4 relecture debouncee 3 s"]
+
+    SNAP -->|"derniere verite + curseur"| FE
+    FIL -->|"deltas filtres"| FE
+    FE -->|"apres lag_dropped"| SNAP
+
+    PAS["🔴 NON fait ici (documente)<br/>project_id n'est PAS estampille a la source par le runner ni le chat manager :<br/>l'index repare. Condition de revisite : si /ws/activity devient le seul consommateur."]
+    HUB -.->|"ne fait pas"| PAS

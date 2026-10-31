@@ -110,6 +110,15 @@ impl HybridEmitter {
         &self.local_bus
     }
 
+    /// The activity feed of the local bus (sequence numbers, replay, `/ws/activity`).
+    ///
+    /// Local only on purpose: the feed is a *local* replay buffer, and events
+    /// relayed from other instances arrive on this bus too (NATS→local bridge),
+    /// so one instance's feed carries the whole fleet's activity.
+    pub fn activity(&self) -> &std::sync::Arc<super::ActivityHub> {
+        self.local_bus.activity()
+    }
+
     /// Get a reference to the NatsEmitter, if configured.
     pub fn nats_emitter(&self) -> Option<&Arc<NatsEmitter>> {
         self.nats.as_ref()

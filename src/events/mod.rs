@@ -72,6 +72,7 @@
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
+pub mod activity;
 pub mod attention;
 pub mod builtin_triggers;
 mod bus;
@@ -89,6 +90,10 @@ pub mod trigger;
 pub mod trigger_routing;
 mod types;
 
+pub use activity::{
+    ActivityCategory, ActivityEvent, ActivityHub, ACTIVITY_BROADCAST_CAPACITY,
+    ACTIVITY_BUFFER_CAPACITY,
+};
 pub use bus::EventBus;
 pub use graph::{ActivationTarget, GraphEvent, GraphEventType, GraphLayer};
 pub use hybrid::HybridEmitter;
