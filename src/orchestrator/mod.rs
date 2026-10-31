@@ -96,6 +96,20 @@ mod tests {
         }
     }
 
+    /// La racine réelle du backend vit sous `~/.openclaw/…`. Ajouter `.openclaw`
+    /// à `IGNORED_PATH_SEGMENTS` — le réflexe évident en voyant les chemins du
+    /// graphe — **effacerait le backend entier** au prochain sync. Ce test est là
+    /// pour que ce réflexe échoue bruyamment.
+    #[test]
+    fn the_backend_real_root_is_never_ignored() {
+        assert!(
+            !should_ignore_path(
+                "/Users/triviere/.openclaw/workspace/skills/project-orchestrator/src/main.rs"
+            ),
+            "`.openclaw` must never become an ignored segment: it is the backend's real root"
+        );
+    }
+
     #[test]
     fn test_should_not_ignore_normal_paths() {
         assert!(!should_ignore_path("/project/src/main.rs"));
