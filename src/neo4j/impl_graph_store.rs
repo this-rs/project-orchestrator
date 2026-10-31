@@ -1263,8 +1263,12 @@ impl DecisionStore for Neo4jClient {
         self.create_decision(task_id, decision).await
     }
 
-    async fn create_decision_global(&self, decision: &DecisionNode) -> anyhow::Result<()> {
-        self.create_decision_global(decision).await
+    async fn create_decision_global(
+        &self,
+        decision: &DecisionNode,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<()> {
+        self.create_decision_global(decision, project_id).await
     }
 
     async fn get_decision(&self, decision_id: Uuid) -> anyhow::Result<Option<DecisionNode>> {

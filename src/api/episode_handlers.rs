@@ -182,29 +182,40 @@ pub struct AnonymizeEpisodeResponse {
 /// - Run status (validation)
 ///
 /// With `session_id`, takes the episode the session would leave at its close
-/// (`collector::collect_session_episode`) as it stands now. Its `close_reason` is
+/// (`collector::snapshot_session_episode`) as it stands now. Its `close_reason` is
 /// `open` while the session runs on this instance, `unknown` otherwise
 /// ([`snapshot_close_reason`]): the route closes nothing and invents no ending.
-/// Neither path saves: the close of the session is what writes its episode.
+///
+/// Neither path saves the episode: the close of the session is what writes it. The
+/// session path writes nothing at all (not even the `:Agent` node the close upserts)
+/// and emits no event — nothing was created, and for a closed session the id is
+/// that of the saved episode, which a `created` event would re-announce to every
+/// subscriber on every call. The run path keeps its `Episode created` event
+/// (pre-existing behaviour: a run episode is a derived view, listed by
+/// `GET /api/episodes` without being saved, and the event is what tells the
+/// cockpit to refresh that list).
 pub async fn collect_episode(
     State(state): State<OrchestratorState>,
     Json(body): Json<CollectEpisodeRequest>,
 ) -> Result<Json<CollectEpisodeResponse>, AppError> {
     let graph = state.orchestrator.neo4j();
-    let (episode, entity_id, payload, project_id) = match body.target()? {
+    let episode = match body.target()? {
         CollectTarget::Run { run_id, project_id } => {
             let episode = collector::collect_episode(graph, run_id, project_id)
                 .await
                 .map_err(AppError::Internal)?;
-            (
-                episode,
-                run_id.to_string(),
-                serde_json::json!({
-                    "run_id": run_id.to_string(),
-                    "project_id": project_id.to_string(),
-                }),
-                project_id,
-            )
+            if episode.is_some() {
+                state.event_bus.emit_created(
+                    crate::events::EntityType::Episode,
+                    &run_id.to_string(),
+                    serde_json::json!({
+                        "run_id": run_id.to_string(),
+                        "project_id": project_id.to_string(),
+                    }),
+                    Some(project_id.to_string()),
+                );
+            }
+            episode
         }
         CollectTarget::Session {
             session_id,
@@ -215,13 +226,10 @@ pub async fn collect_episode(
                 None => false,
             };
             let episode =
-                collector::collect_session_episode(graph, session_id, snapshot_close_reason(live))
+                collector::snapshot_session_episode(graph, session_id, snapshot_close_reason(live))
                     .await
                     .map_err(AppError::Internal)?;
-            let Some(episode) = episode else {
-                return Ok(Json(CollectEpisodeResponse { episode: None }));
-            };
-            if let Some(asked) = project_id {
+            if let (Some(asked), Some(episode)) = (project_id, episode.as_ref()) {
                 if asked != episode.project_id {
                     return Err(AppError::BadRequest(format!(
                         "session {session_id} belongs to project {}, not {asked}",
@@ -229,27 +237,9 @@ pub async fn collect_episode(
                     )));
                 }
             }
-            let project_id = episode.project_id;
-            (
-                Some(episode),
-                collector::session_episode_id(session_id).to_string(),
-                serde_json::json!({
-                    "session_id": session_id.to_string(),
-                    "project_id": project_id.to_string(),
-                }),
-                project_id,
-            )
+            episode
         }
     };
-
-    if episode.is_some() {
-        state.event_bus.emit_created(
-            crate::events::EntityType::Episode,
-            &entity_id,
-            payload,
-            Some(project_id.to_string()),
-        );
-    }
 
     Ok(Json(CollectEpisodeResponse { episode }))
 }

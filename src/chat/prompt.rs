@@ -75,7 +75,7 @@ Workspace
 - Persona → Skill: `persona(action: "add_skill")` — HAS_SKILL
 - Persona → Protocol: `persona(action: "add_protocol")` — HAS_PROTOCOL
 - Persona → Persona: `persona(action: "add_extends")` — inheritance (child inherits parent's KNOWS)
-- Episode ← ProtocolRun: `episode(action: "collect", run_id)` — PRODUCED_DURING; Episode ← chat session: `episode(action: "collect", session_id)`
+- Episode ← ProtocolRun: `episode(action: "collect", run_id, project_id)` — PRODUCED_DURING; Episode ← chat session: `episode(action: "collect", session_id)`
 
 ### Code Graph — Structural Relations
 

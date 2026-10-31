@@ -106,15 +106,21 @@ async fn an_episode_is_collected_from_a_session() {
         .unwrap();
     assert!(stored.is_empty(), "a collect must not save: {stored:?}");
 
-    // The event of the run path, with the session's episode as its id.
-    let event = events.try_recv().expect("an Episode event is emitted");
-    assert_eq!(event.entity_type, crate::events::EntityType::Episode);
-    assert_eq!(
-        event.entity_id,
-        session_episode_id(fx.session_id).to_string()
+    // A snapshot announces nothing: nothing was created. For a closed session
+    // the id is that of the saved episode, which a `created` event would
+    // re-announce to every subscriber on every call. (Review of 31/10/2026,
+    // point 4.)
+    assert!(
+        events.try_recv().is_err(),
+        "a snapshot of a session emits no Episode event"
     );
-    assert_eq!(event.payload["session_id"], fx.session_id.to_string());
-    assert_eq!(event.project_id, Some(fx.project_id.to_string()));
+
+    // A snapshot reads: it does not even upsert the `:Agent` node of the
+    // session's model, which the close does. (Point 5.)
+    assert!(
+        fx.graph.agents.lock().unwrap().is_empty(),
+        "a snapshot must not write an agent node"
+    );
 }
 
 /// `project_id` is not needed to find a session's project (the session names it).
@@ -142,15 +148,13 @@ async fn a_session_collect_with_a_foreign_project_is_refused() {
     assert!(message.contains(&fx.project_id.to_string()), "{message}");
 }
 
-/// A session that left nothing (unknown here) yields no episode and no event.
+/// A session that left nothing (unknown here) yields no episode.
 #[tokio::test]
-async fn an_unknown_session_yields_no_episode_and_no_event() {
+async fn an_unknown_session_yields_no_episode() {
     let fx = fixture().await;
-    let mut events = fx.bus.subscribe();
     let (status, body) = call(&fx, json!({"session_id": Uuid::new_v4()})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["episode"].is_null(), "{body}");
-    assert!(events.try_recv().is_err(), "no episode, no event");
 }
 
 /// Neither a run nor a session: the refusal names both fields, so the caller
@@ -269,4 +273,27 @@ async fn a_chat_manager_is_asked_whether_the_session_runs() {
         close_reason::UNKNOWN,
         "the manager does not run this session"
     );
+}
+
+/// The close still names the agent: the real close keeps its upsert, only the
+/// on-demand snapshot is read-only. (Point 5.)
+#[tokio::test]
+async fn the_close_still_writes_the_agent_node_the_snapshot_does_not() {
+    use crate::episodes::collector::{collect_session_episode, snapshot_session_episode};
+    let fx = fixture().await;
+    let snapshot = snapshot_session_episode(fx.graph.as_ref(), fx.session_id, "open")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        snapshot.session.unwrap().agent_id.is_some(),
+        "named, not written"
+    );
+    assert!(fx.graph.agents.lock().unwrap().is_empty());
+
+    collect_session_episode(fx.graph.as_ref(), fx.session_id, "user_closed")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fx.graph.agents.lock().unwrap().len(), 1);
 }

@@ -269,6 +269,37 @@ pub async fn collect_session_episode(
     session_id: Uuid,
     close_reason: &str,
 ) -> Result<Option<Episode>> {
+    session_episode(neo4j, session_id, close_reason, AgentNode::Ensure).await
+}
+
+/// The episode of a session as it stands now, WITHOUT writing anything: the
+/// on-demand snapshot (`POST /api/episodes/collect` with a `session_id`). Same
+/// content as [`collect_session_episode`], but the `:Agent` node of the session's
+/// model is only named, never upserted — a read is a read. `close_reason` is the
+/// snapshot's (`open` / `unknown`), since the session is not closing.
+pub async fn snapshot_session_episode(
+    neo4j: &dyn GraphStore,
+    session_id: Uuid,
+    close_reason: &str,
+) -> Result<Option<Episode>> {
+    session_episode(neo4j, session_id, close_reason, AgentNode::ReadOnly).await
+}
+
+/// Whether the collection may write the `:Agent` node of the session's model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentNode {
+    /// The close: the agent that lived the episode becomes a node (upsert).
+    Ensure,
+    /// A snapshot: the agent is named in the episode, the graph is not touched.
+    ReadOnly,
+}
+
+async fn session_episode(
+    neo4j: &dyn GraphStore,
+    session_id: Uuid,
+    close_reason: &str,
+    agent_node: AgentNode,
+) -> Result<Option<Episode>> {
     let Some(session) = neo4j.get_chat_session(session_id).await? else {
         return Ok(None);
     };
@@ -299,8 +330,9 @@ pub async fn collect_session_episode(
         }
     };
 
-    // The agent that lived it is a node, and the model it ran on a dated fact beside it.
-    if let Some(id) = agent_id {
+    // The agent that lived it is a node, and the model it ran on a dated fact beside it
+    // — written at the close only, never by a snapshot.
+    if let (Some(id), AgentNode::Ensure) = (agent_id, agent_node) {
         if let Err(e) = neo4j.ensure_agent(id, Some(&session.model)).await {
             tracing::warn!(session_id = %session_id, error = %e, "the node of the agent of a closed session could not be made");
         }

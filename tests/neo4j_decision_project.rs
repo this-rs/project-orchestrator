@@ -49,11 +49,11 @@ async fn decision_in(e: &Env, project: Option<Uuid>, ids: &mut Vec<String>) -> (
     let cypher = if project.is_some() {
         "MERGE (proj:Project {id: $proj})
          CREATE (proj)-[:HAS_PLAN]->(:Plan {id: $plan})-[:HAS_TASK]->(t:Task {id: $task})
-         CREATE (t)-[:INFORMED_BY]->(:Decision {id: $d, decided_at: datetime(), status: 'Accepted',
+         CREATE (t)-[:INFORMED_BY]->(:Decision {id: $d, decided_at: datetime(), status: 'accepted',
                                                 description: 't0f-bis', rationale: 'r'})"
     } else {
         "CREATE (:Plan {id: $plan})-[:HAS_TASK]->(t:Task {id: $task})
-         CREATE (t)-[:INFORMED_BY]->(:Decision {id: $d, decided_at: datetime(), status: 'Accepted',
+         CREATE (t)-[:INFORMED_BY]->(:Decision {id: $d, decided_at: datetime(), status: 'accepted',
                                                 description: 't0f-bis', rationale: 'r'})"
     };
     e.raw
@@ -200,4 +200,105 @@ async fn backfill_produced_during_cypher_is_valid() {
             .unwrap(),
         0
     );
+}
+
+/// A decision recorded with no task but a project (`POST /api/decisions` with
+/// `project_id`) must be visible wherever the project's decisions are read:
+/// the list by status scoped to the project, the timeline, the project graph,
+/// and the batched decision→project lookup. Before the direct
+/// `(Project)-[:HAS_DECISION]->(Decision)` edge, its project lived only in the
+/// Meilisearch document and every one of these reads missed it (review of
+/// 31/10/2026, point 1; the timeline required a task, point 2).
+#[tokio::test]
+async fn a_global_decision_scoped_to_a_project_is_read_with_the_project() {
+    use project_orchestrator::neo4j::models::{DecisionNode, DecisionStatus};
+    let Some(e) = env().await else { return };
+    let mut ids = Vec::new();
+    let (me, other) = (Uuid::new_v4(), Uuid::new_v4());
+    // A task-bound decision of the same project, to show both paths are read together.
+    let (bound, _) = decision_in(&e, Some(me), &mut ids).await;
+    let (foreign, _) = decision_in(&e, Some(other), &mut ids).await;
+    let global = DecisionNode {
+        id: Uuid::new_v4(),
+        description: "global, scoped to a project".into(),
+        rationale: "r".into(),
+        alternatives: vec![],
+        chosen_option: None,
+        decided_by: "agent".into(),
+        decided_at: chrono::Utc::now(),
+        status: DecisionStatus::Accepted,
+        embedding: None,
+        embedding_model: None,
+        scar_intensity: 0.0,
+        sharing_consent: Default::default(),
+    };
+    ids.push(global.id.to_string());
+    e.client
+        .create_decision_global(&global, Some(me))
+        .await
+        .unwrap();
+
+    // Unknown project: refused, nothing created.
+    let ghost = Uuid::new_v4();
+    let mut unscoped = global.clone();
+    unscoped.id = Uuid::new_v4();
+    let refused = e
+        .client
+        .create_decision_global(&unscoped, Some(ghost))
+        .await;
+    let ghost_created = e.client.get_decision(unscoped.id).await.unwrap();
+
+    let (listed, total) = e
+        .client
+        .list_decisions_by_status(DecisionStatus::Accepted, Some(me), None, 50, 0)
+        .await
+        .unwrap();
+    let listed_ids: Vec<Uuid> = listed.iter().map(|i| i.decision.id).collect();
+    let global_item = listed.iter().find(|i| i.decision.id == global.id).cloned();
+    let timeline: Vec<Uuid> = e
+        .client
+        .get_decision_timeline(None, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.decision.id)
+        .collect();
+    let graph: Vec<Uuid> = e
+        .client
+        .get_project_decisions_for_graph(me)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(d, _)| d.id)
+        .collect();
+    let projects = e
+        .client
+        .get_decision_project_ids(&[global.id, bound, foreign])
+        .await
+        .unwrap();
+    cleanup(&e, ids).await;
+
+    assert!(
+        refused.is_err(),
+        "a project that does not exist is not a scope"
+    );
+    assert!(ghost_created.is_none());
+    assert_eq!(total, 2, "{listed_ids:?}");
+    assert!(listed_ids.contains(&global.id), "{listed_ids:?}");
+    assert!(listed_ids.contains(&bound), "{listed_ids:?}");
+    assert!(!listed_ids.contains(&foreign), "{listed_ids:?}");
+    let global_item = global_item.expect("listed");
+    assert_eq!(global_item.project_id, Some(me));
+    assert_eq!(global_item.task_id, None);
+    assert!(
+        timeline.contains(&global.id),
+        "the timeline shows a decision without task"
+    );
+    assert!(timeline.contains(&bound));
+    assert!(graph.contains(&global.id), "{graph:?}");
+    assert!(graph.contains(&bound), "{graph:?}");
+    assert!(!graph.contains(&foreign), "{graph:?}");
+    assert_eq!(projects.get(&global.id), Some(&me));
+    assert_eq!(projects.get(&bound), Some(&me));
+    assert_eq!(projects.get(&foreign), Some(&other));
 }

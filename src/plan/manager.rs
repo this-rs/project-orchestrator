@@ -347,61 +347,26 @@ impl PlanManager {
         req: CreateDecisionRequest,
         decided_by: &str,
     ) -> Result<DecisionNode> {
-        let decision = DecisionNode {
-            id: Uuid::new_v4(),
-            description: req.description.clone(),
-            rationale: req.rationale.clone(),
-            alternatives: req.alternatives.unwrap_or_default(),
-            chosen_option: req.chosen_option.clone(),
-            decided_by: decided_by.to_string(),
-            decided_at: chrono::Utc::now(),
-            status: DecisionStatus::Proposed,
-            embedding: None,
-            embedding_model: None,
-            scar_intensity: 0.0,
-            sharing_consent: Default::default(),
-        };
+        let decision = Self::new_decision(
+            req.description,
+            req.rationale,
+            req.alternatives,
+            req.chosen_option,
+            decided_by,
+        );
 
         self.neo4j.create_decision(task_id, &decision).await?;
 
         // Resolve project via Task → Plan → Project chain
-        let project_for_task = self
+        let project = self
             .neo4j
             .get_project_for_task(task_id)
             .await
             .ok()
             .flatten();
-        let (project_id, project_slug) = match &project_for_task {
-            Some(project) => (Some(project.id.to_string()), Some(project.slug.clone())),
-            None => (None, None),
-        };
 
-        // Index in Meilisearch for search
-        let doc = DecisionDocument {
-            id: decision.id.to_string(),
-            description: decision.description.clone(),
-            rationale: decision.rationale.clone(),
-            task_id: Some(task_id.to_string()),
-            agent: decided_by.to_string(),
-            timestamp: decision.decided_at.to_rfc3339(),
-            tags: vec![],
-            project_id,
-            project_slug,
-        };
-        self.meili.index_decision(&doc).await?;
-
-        // Generate and store embedding (best-effort, non-blocking)
-        self.embed_decision(decision.id, &decision.description, &decision.rationale)
-            .await;
-
-        self.emit(
-            CrudEvent::new(EntityType::Decision, CrudAction::Created, decision.id.to_string())
-                .with_payload(serde_json::json!({"task_id": task_id.to_string(), "description": &decision.description})),
-        );
-
-        // Auto-anchor decision to files mentioned in content (fire-and-forget)
-        self.spawn_auto_anchor_decision(&decision, project_for_task.as_ref());
-
+        self.record_decision(&decision, Some(task_id), project.as_ref(), decided_by)
+            .await?;
         Ok(decision)
     }
 
@@ -411,17 +376,59 @@ impl PlanManager {
     /// its integrity check (bug 3693617b — a decision naming a task that does not
     /// exist is still rejected). This path exists because a choice made outside
     /// any plan had nowhere to go, and was therefore never recorded at all.
+    ///
+    /// A `project_id` is a scope, not a hint: it must name a project. The decision
+    /// is then attached to it in the graph (`(Project)-[:HAS_DECISION]->(Decision)`),
+    /// so it is read wherever the project's decisions are, and the search document
+    /// and the auto-anchoring are scoped to it. An unknown project is an error
+    /// (`not found`, a 404 at the route) and nothing is recorded; a graph that fails
+    /// to answer is an error too — never a decision silently recorded without the
+    /// scope the caller asked for.
     pub async fn add_decision_global(
         &self,
         req: CreateGlobalDecisionRequest,
         decided_by: &str,
     ) -> Result<DecisionNode> {
-        let decision = DecisionNode {
+        let project = match req.project_id {
+            Some(project_id) => Some(
+                self.neo4j
+                    .get_project(project_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Project {project_id} not found in Neo4j"))?,
+            ),
+            None => None,
+        };
+        let decision = Self::new_decision(
+            req.description,
+            req.rationale,
+            req.alternatives,
+            req.chosen_option,
+            decided_by,
+        );
+
+        self.neo4j
+            .create_decision_global(&decision, project.as_ref().map(|p| p.id))
+            .await?;
+
+        self.record_decision(&decision, None, project.as_ref(), decided_by)
+            .await?;
+        Ok(decision)
+    }
+
+    /// A new, proposed decision as both paths build it.
+    fn new_decision(
+        description: String,
+        rationale: String,
+        alternatives: Option<Vec<String>>,
+        chosen_option: Option<String>,
+        decided_by: &str,
+    ) -> DecisionNode {
+        DecisionNode {
             id: Uuid::new_v4(),
-            description: req.description.clone(),
-            rationale: req.rationale.clone(),
-            alternatives: req.alternatives.unwrap_or_default(),
-            chosen_option: req.chosen_option.clone(),
+            description,
+            rationale,
+            alternatives: alternatives.unwrap_or_default(),
+            chosen_option,
             decided_by: decided_by.to_string(),
             decided_at: chrono::Utc::now(),
             status: DecisionStatus::Proposed,
@@ -429,32 +436,30 @@ impl PlanManager {
             embedding_model: None,
             scar_intensity: 0.0,
             sharing_consent: Default::default(),
-        };
+        }
+    }
 
-        self.neo4j.create_decision_global(&decision).await?;
-
-        // A decision taken outside a plan still belongs to a project when the
-        // caller says so. Without it the search document is simply not scoped —
-        // and the auto-anchoring has no root to resolve paths against.
-        let project = match req.project_id {
-            Some(project_id) => self.neo4j.get_project(project_id).await.ok().flatten(),
-            None => None,
-        };
-        let (project_id, project_slug) = match &project {
-            Some(project) => (Some(project.id.to_string()), Some(project.slug.clone())),
-            None => (None, None),
-        };
-
+    /// What follows the creation of a decision node, on both paths: the search
+    /// document (scoped to `project` when known), the embedding, the CRUD event
+    /// (naming the task and the project it has), and the auto-anchoring to the
+    /// files its text names.
+    async fn record_decision(
+        &self,
+        decision: &DecisionNode,
+        task_id: Option<Uuid>,
+        project: Option<&ProjectNode>,
+        decided_by: &str,
+    ) -> Result<()> {
         let doc = DecisionDocument {
             id: decision.id.to_string(),
             description: decision.description.clone(),
             rationale: decision.rationale.clone(),
-            task_id: None,
+            task_id: task_id.map(|t| t.to_string()),
             agent: decided_by.to_string(),
             timestamp: decision.decided_at.to_rfc3339(),
             tags: vec![],
-            project_id,
-            project_slug,
+            project_id: project.map(|p| p.id.to_string()),
+            project_slug: project.map(|p| p.slug.clone()),
         };
         self.meili.index_decision(&doc).await?;
 
@@ -462,19 +467,24 @@ impl PlanManager {
         self.embed_decision(decision.id, &decision.description, &decision.rationale)
             .await;
 
-        self.emit(
-            CrudEvent::new(
-                EntityType::Decision,
-                CrudAction::Created,
-                decision.id.to_string(),
-            )
-            .with_payload(serde_json::json!({"description": &decision.description})),
-        );
+        let mut payload = serde_json::json!({"description": &decision.description});
+        if let Some(task_id) = task_id {
+            payload["task_id"] = serde_json::Value::String(task_id.to_string());
+        }
+        let mut event = CrudEvent::new(
+            EntityType::Decision,
+            CrudAction::Created,
+            decision.id.to_string(),
+        )
+        .with_payload(payload);
+        if let Some(project) = project {
+            event = event.with_project_id(project.id.to_string());
+        }
+        self.emit(event);
 
         // Auto-anchor decision to files mentioned in content (fire-and-forget)
-        self.spawn_auto_anchor_decision(&decision, project.as_ref());
-
-        Ok(decision)
+        self.spawn_auto_anchor_decision(decision, project);
+        Ok(())
     }
 
     /// Automatically create AFFECTS anchors from file paths mentioned in decision content.
