@@ -514,7 +514,7 @@ jobs:
           HARNESS_NEO4J_REQUIRED=1 cargo test --test integration_tests --test data_migrations \
             --test workspace_tests --test neo4j_store_tests --test harness_neo4j \
             --test neo4j_note_consent --test neo4j_decision_project --test neural_routing_indexes \
-            --test neo4j_synapse_shadow --test store_conformance \
+            --test neo4j_synapse_shadow --test store_conformance --test code_graph_stable_key \
             --test neural_routing_sampler
 
   # ==========================================================================
@@ -797,6 +797,7 @@ jobs:
             --test harness_neo4j \
             --test neo4j_decision_project \
             --test self_graph \
+            --test code_graph_stable_key \
             --test neural_routing_sampler \
             --test store_conformance
 
