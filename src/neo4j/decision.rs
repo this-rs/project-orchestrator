@@ -10,12 +10,24 @@ use neo4rs::query;
 use std::str::FromStr;
 use uuid::Uuid;
 
-/// The one traversal from a decision to its project, binding `d` and `proj`:
-/// a plan is attached to its project by `(Project)-[:HAS_PLAN]->(Plan)` (no
-/// `(Plan)-[:BELONGS_TO]->(Project)` edge is ever written, and a task carries
-/// no `plan_id` property: a filter written that way matched nothing).
+/// The one traversal from a decision to its project, binding `d` and `proj`.
+///
+/// Two ways a decision belongs to a project, in ONE pattern (a variable-length
+/// union over the four edge types, 1 to 3 hops):
+/// - through its task: `(Project)-[:HAS_PLAN]->(Plan)-[:HAS_TASK]->(Task)-[:INFORMED_BY]->(Decision)`
+///   — a plan is attached to its project by `HAS_PLAN` (no `(Plan)-[:BELONGS_TO]->(Project)`
+///   edge is ever written, and a task carries no `plan_id` property: a filter written
+///   that way matched nothing);
+/// - directly: `(Project)-[:HAS_DECISION]->(Decision)`, written by
+///   [`Neo4jClient::create_decision_global`] for a decision recorded with no task but
+///   a project. Before this edge the project of such a decision lived only in its
+///   search document, and every project-scoped read missed it.
+///
+/// No other chain of these types reaches a `Decision` from a `Project` in 1–3 hops
+/// (`HAS_DECISION` is written from a Project only, `INFORMED_BY` from a Task only), so
+/// the union adds no spurious path.
 pub(crate) const DECISION_PROJECT_PATH: &str =
-    "(proj:Project)-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(:Task)-[:INFORMED_BY]->(d:Decision)";
+    "(proj:Project)-[:HAS_DECISION|HAS_PLAN|HAS_TASK|INFORMED_BY*1..3]->(d:Decision)";
 
 /// Map a client-supplied entity type to its Neo4j label. The label is spliced
 /// into the Cypher (labels cannot be parameters), so anything that is not a
@@ -115,6 +127,89 @@ impl Neo4jClient {
                 "Failed to create decision: Task {} not found in Neo4j",
                 task_id
             );
+        }
+        Ok(())
+    }
+
+    /// Record a decision attached to no task.
+    ///
+    /// Unlike [`create_decision`], there is no task to link: the node is created
+    /// on its own. This is the path for a choice made outside any plan; the
+    /// task-bound path keeps its integrity check (bug 3693617b).
+    ///
+    /// With a `project_id`, the decision is attached to the project by a direct
+    /// `(Project)-[:HAS_DECISION]->(Decision)` edge, the second branch of
+    /// [`DECISION_PROJECT_PATH`]: it is then read wherever the project's decisions
+    /// are (list by status, timeline, project graph, vector search, backfill). A
+    /// project that does not exist is an error — an identifier that names nothing is
+    /// not a scope — and nothing is created.
+    pub async fn create_decision_global(
+        &self,
+        decision: &DecisionNode,
+        project_id: Option<Uuid>,
+    ) -> Result<()> {
+        let cypher = if project_id.is_some() {
+            r#"
+            MATCH (p:Project {id: $project_id})
+            CREATE (d:Decision {
+                id: $id,
+                description: $description,
+                rationale: $rationale,
+                alternatives: $alternatives,
+                chosen_option: $chosen_option,
+                decided_by: $decided_by,
+                decided_at: datetime($decided_at),
+                status: $status,
+                sharing_consent: $sharing_consent
+            })
+            CREATE (p)-[:HAS_DECISION]->(d)
+            RETURN d.id AS created_id
+            "#
+        } else {
+            r#"
+            CREATE (d:Decision {
+                id: $id,
+                description: $description,
+                rationale: $rationale,
+                alternatives: $alternatives,
+                chosen_option: $chosen_option,
+                decided_by: $decided_by,
+                decided_at: datetime($decided_at),
+                status: $status,
+                sharing_consent: $sharing_consent
+            })
+            RETURN d.id AS created_id
+            "#
+        };
+        let mut q = query(cypher).param("id", decision.id.to_string());
+        if let Some(pid) = project_id {
+            q = q.param("project_id", pid.to_string());
+        }
+        let q = q
+            .param("description", decision.description.clone())
+            .param("rationale", decision.rationale.clone())
+            .param("alternatives", decision.alternatives.clone())
+            .param(
+                "chosen_option",
+                decision.chosen_option.clone().unwrap_or_default(),
+            )
+            .param("decided_by", decision.decided_by.clone())
+            .param("decided_at", decision.decided_at.to_rfc3339())
+            .param("status", decision.status.to_string())
+            .param(
+                "sharing_consent",
+                decision.sharing_consent.as_db_str().to_string(),
+            );
+
+        let mut result = self.graph.execute(q).await?;
+        if result.next().await?.is_none() {
+            match project_id {
+                Some(pid) => anyhow::bail!(
+                    "Failed to create decision: Project {} not found in Neo4j",
+                    pid
+                ),
+                None => anyhow::bail!("Failed to create decision: nothing was created"),
+            }
         }
         Ok(())
     }
@@ -743,6 +838,11 @@ impl Neo4jClient {
     /// For each decision, resolves the SUPERSEDES chain (decisions it supersedes)
     /// and checks if it has been superseded by a newer decision.
     /// Returns entries ordered by decided_at DESC.
+    ///
+    /// The task is optional on the decision too: a decision recorded with no task
+    /// (`create_decision_global`) is in the timeline unless a `task_id` filter asks
+    /// for one task's decisions. (It used to be excluded by a mandatory `MATCH` on
+    /// the task.)
     pub async fn get_decision_timeline(
         &self,
         task_id: Option<Uuid>,
@@ -768,8 +868,11 @@ impl Neo4jClient {
 
         let cypher = format!(
             r#"
-            MATCH (t:Task)-[:INFORMED_BY]->(d:Decision)
+            MATCH (d:Decision)
+            OPTIONAL MATCH (t:Task)-[:INFORMED_BY]->(d)
+            WITH d, t
             {}
+            WITH DISTINCT d
             OPTIONAL MATCH chain = (d)-[:SUPERSEDES*]->(old)
             WITH d, [n IN nodes(chain) WHERE n <> d | n.id] AS chain_ids
             OPTIONAL MATCH (newer)-[:SUPERSEDES]->(d)
@@ -795,7 +898,20 @@ impl Neo4jClient {
 
         while let Some(row) = result.next().await? {
             let node: neo4rs::Node = row.get("d")?;
-            let decision = Self::node_to_decision(&node)?;
+            // The timeline now reaches every decision, including ones no task informs:
+            // a node that cannot be decoded (a property missing) is skipped and logged,
+            // it does not take the whole timeline down.
+            let decision = match Self::node_to_decision(&node) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(
+                        decision_id = %node.get::<String>("id").unwrap_or_default(),
+                        error = %e,
+                        "decision left out of the timeline: it cannot be decoded"
+                    );
+                    continue;
+                }
+            };
 
             let chain_ids: Vec<Uuid> = row
                 .get::<Vec<String>>("chain_ids")
@@ -820,7 +936,9 @@ impl Neo4jClient {
     }
 
     /// List decisions with a given status, newest first, with the recording
-    /// task and owning project.
+    /// task and owning project. The project is the task's plan's, or — for a
+    /// decision recorded with no task — the one it is attached to directly
+    /// (`HAS_DECISION`).
     ///
     /// Default scope is every project. `project_id` wins over
     /// `workspace_slug`. All values are bound parameters; the only
@@ -859,7 +977,9 @@ impl Neo4jClient {
             OPTIONAL MATCH (t:Task)-[:INFORMED_BY]->(d)
             OPTIONAL MATCH (proj:Project)-[:HAS_PLAN]->(:Plan)-[:HAS_TASK]->(t)
             WITH d, head(collect({task: t.id, project: proj.id})) AS link
-            WITH d, link.task AS task_id, link.project AS project_id
+            OPTIONAL MATCH (direct:Project)-[:HAS_DECISION]->(d)
+            WITH d, link, head(collect(direct.id)) AS direct_project
+            WITH d, link.task AS task_id, coalesce(link.project, direct_project) AS project_id
         "#;
 
         let count_cypher = format!("{} {} RETURN count(d) AS total", head, scope);
@@ -935,25 +1055,28 @@ impl Neo4jClient {
     // Graph visualization batch queries
     // ========================================================================
 
-    /// Get all decisions scoped to a project (via Plan→Task→Decision chain)
-    /// along with their AFFECTS relations. Used by the graph visualization endpoint.
+    /// Get all decisions scoped to a project — through its tasks or attached
+    /// directly ([`DECISION_PROJECT_PATH`]) — along with their AFFECTS relations.
+    /// Used by the graph visualization endpoint.
     pub async fn get_project_decisions_for_graph(
         &self,
         project_id: Uuid,
     ) -> Result<Vec<(DecisionNode, Vec<AffectsRelation>)>> {
-        // Step 1: Get all decisions for this project
-        let q = query(
+        // Step 1: Get all decisions for this project (one row per decision: a
+        // decision informing several tasks of the project is one node).
+        let cypher = format!(
             r#"
-            MATCH (p:Project {id: $pid})-[:HAS_PLAN]->(plan:Plan)
-                  -[:HAS_TASK]->(task:Task)-[:INFORMED_BY]->(d:Decision)
+            MATCH {DECISION_PROJECT_PATH}
+            WHERE proj.id = $pid
+            WITH DISTINCT d
             RETURN d.id AS id, d.description AS description, d.rationale AS rationale,
                    d.alternatives AS alternatives, d.chosen_option AS chosen_option,
                    d.decided_by AS decided_by, d.decided_at AS decided_at,
                    d.status AS status,
                    d.sharing_consent AS sharing_consent
-            "#,
-        )
-        .param("pid", project_id.to_string());
+            "#
+        );
+        let q = query(&cypher).param("pid", project_id.to_string());
 
         let mut result = self.graph.execute(q).await?;
         let mut decisions: Vec<DecisionNode> = Vec::new();
@@ -1047,6 +1170,19 @@ mod parent_existence_tests {
             err.to_string().contains("not found in Neo4j"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A decision attached to no task is accepted and readable (PR4).
+    ///
+    /// The task-bound path is untouched: the test above still guards bug 3693617b.
+    #[tokio::test]
+    async fn create_decision_global_accepts_decision_without_task() {
+        let db = MockGraphStore::new();
+        let d = dummy_decision(Uuid::new_v4());
+        let id = d.id;
+        db.create_decision_global(&d, None).await.unwrap();
+        let got = db.get_decision(id).await.unwrap();
+        assert!(got.is_some(), "une decision sans tache doit etre relisible");
     }
 
     /// create_decision must succeed when the task exists.

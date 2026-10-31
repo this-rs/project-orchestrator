@@ -881,7 +881,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/agents/live",
             get(super::attention_aggregate::get_live_agents),
         )
-        .route("/api/decisions", get(handlers::list_decisions))
+        .route(
+            "/api/decisions",
+            get(handlers::list_decisions).post(handlers::add_decision_global),
+        )
         .route(
             "/api/decisions/affecting",
             get(handlers::get_decisions_affecting),

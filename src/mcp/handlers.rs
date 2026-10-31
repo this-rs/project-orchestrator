@@ -6,7 +6,7 @@
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
 use super::http_client::{extract_id, extract_optional_string, extract_string, McpHttpClient};
@@ -1888,10 +1888,25 @@ impl ToolHandler {
             }
 
             "add_decision" => {
-                let task_id = extract_id(args, "task_id")?;
-                let result = http
-                    .post(&format!("/api/tasks/{}/decisions", task_id), args)
-                    .await?;
+                // A decision may belong to no task: `POST /api/decisions` creates
+                // the node on its own. Without this branch the loosening is
+                // invisible from the tool, and an agent recording an
+                // infrastructure choice would still have to invent a task.
+                let named_task = args
+                    .get("task_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                // The trimmed value is the one that passed the filter: it is the one
+                // validated and put in the URL (a padded `" uuid "` must not reach it).
+                let url = match named_task {
+                    Some(task_id) => {
+                        uuid::Uuid::parse_str(task_id).context("task_id must be a valid UUID")?;
+                        format!("/api/tasks/{}/decisions", task_id)
+                    }
+                    None => "/api/decisions".to_string(),
+                };
+                let result = http.post(&url, args).await?;
                 Ok(Some(result))
             }
 
@@ -7844,7 +7859,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["method"], "POST");
-        assert!(result["path"].as_str().unwrap().ends_with("/decisions"));
+        // The task-bound path is unchanged: the decision is filed under the task.
+        assert_eq!(result["path"], format!("/api/tasks/{}/decisions", UUID1));
+    }
+
+    /// A decision may belong to no task (PR4): without `task_id` the tool must
+    /// reach `POST /api/decisions`. Before this, the call failed on a missing
+    /// `task_id`, so an infrastructure choice could not be recorded at all.
+    #[tokio::test]
+    async fn test_http_add_decision_without_task_takes_the_global_route() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_decision",
+                Some(json!({"description": "zip 9.1.3", "rationale": "advisory"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/decisions");
+    }
+
+    /// A padded `task_id` (`" uuid "`) names the task: it passes the emptiness
+    /// filter, so the URL must carry it trimmed, not with its spaces. (Review of
+    /// 31/10/2026, point 9.)
+    #[tokio::test]
+    async fn test_http_add_decision_with_padded_task_id_is_trimmed() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_decision",
+                Some(json!({
+                    "task_id": " 550e8400-e29b-41d4-a716-446655440000 ",
+                    "description": "d",
+                    "rationale": "r"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(
+            result["path"],
+            "/api/tasks/550e8400-e29b-41d4-a716-446655440000/decisions"
+        );
+    }
+
+    /// An empty `task_id` is the same as no task: it names nothing, so it must
+    /// not become a task URL of its own.
+    #[tokio::test]
+    async fn test_http_add_decision_with_blank_task_takes_the_global_route() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_decision",
+                Some(json!({"task_id": "", "description": "d", "rationale": "r"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["path"], "/api/decisions");
     }
 
     #[tokio::test]
@@ -12288,6 +12360,30 @@ mod tests {
         assert_eq!(result["path"], "/api/episodes/collect");
     }
 
+    /// `episode collect` with a `session_id` and no `run_id` reaches the same route,
+    /// the session carried in the body: the route decides, the tool does not refuse.
+    #[tokio::test]
+    async fn test_http_collect_episode_from_a_session() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "episode",
+                Some(json!({
+                    "action": "collect",
+                    "session_id": "770e8400-e29b-41d4-a716-446655440000"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/episodes/collect");
+        assert_eq!(
+            result["body"]["session_id"],
+            "770e8400-e29b-41d4-a716-446655440000"
+        );
+        assert!(result["body"].get("run_id").is_none(), "{result}");
+    }
+
     #[tokio::test]
     async fn test_http_list_episodes() {
         let (handler, _) = make_http_handler().await;
@@ -12997,7 +13093,7 @@ mod schema_drift_tests {
         // CreateDecisionRequest
         ("decision", "alternatives"), ("decision", "run_id"),
         // CollectEpisodeRequest / ExportArtifactRequest
-        ("episode", "include_structure"), ("episode", "max_episodes"), ("episode", "run_id"),
+        ("episode", "include_structure"), ("episode", "max_episodes"), ("episode", "run_id"), ("episode", "session_id"),
         // CreateLifecycleHookRequest
         ("lifecycle_hook", "action_type"), ("lifecycle_hook", "scope"),
         // ConnectServerBody

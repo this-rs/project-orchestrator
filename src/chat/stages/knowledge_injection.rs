@@ -3663,7 +3663,7 @@ mod tests {
                 id: decision.id.to_string(),
                 description: decision.description.clone(),
                 rationale: decision.rationale.clone(),
-                task_id: String::new(),
+                task_id: None,
                 agent: "test".to_string(),
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 tags: vec![],

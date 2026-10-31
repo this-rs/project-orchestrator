@@ -174,7 +174,7 @@ mod tests {
             id: Uuid::new_v4().to_string(),
             description: description.to_string(),
             rationale: rationale.to_string(),
-            task_id: Uuid::new_v4().to_string(),
+            task_id: Some(Uuid::new_v4().to_string()),
             agent: "test".to_string(),
             timestamp: Utc::now().to_rfc3339(),
             tags: vec!["architecture".to_string()],
