@@ -2431,6 +2431,10 @@ pub async fn add_decision(
 pub struct RetrievalLedgerQuery {
     /// How many recent events to return (default 20, capped at 200).
     pub limit: Option<usize>,
+    /// One chat session: the aggregate and the events of that session only,
+    /// computed from the bounded journal (recent, not since start — the
+    /// response's `snapshot.window` says what it may have missed).
+    pub session_id: Option<Uuid>,
 }
 
 /// The retrieval ledger: the aggregate, and the last events.
@@ -2444,6 +2448,22 @@ pub async fn get_retrieval_ledger(
     use crate::notes::retrieval_ledger;
 
     let limit = params.limit.unwrap_or(20).min(200);
+
+    if let Some(session_id) = params.session_id {
+        let snapshot = retrieval_ledger::snapshot_for_session(session_id);
+        let events = retrieval_ledger::recent_for_session(session_id, limit);
+        return Ok(Json(serde_json::json!({
+            "snapshot": snapshot,
+            "derived": {
+                "calls_per_nonempty": snapshot.calls_per_nonempty(),
+                "mean_latency_ms": snapshot.mean_latency_ms(),
+                "cost_per_correct": snapshot.cost_per_correct(),
+            },
+            "recent": events,
+            "note": "per-session aggregate computed from the bounded in-memory journal: recent, not since start; `snapshot.window.evicted_total` > 0 means events of this session may have left the journal",
+        })));
+    }
+
     let snapshot = retrieval_ledger::snapshot();
     let events = retrieval_ledger::recent(limit);
 

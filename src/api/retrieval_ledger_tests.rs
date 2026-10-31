@@ -109,3 +109,105 @@ async fn la_route_borne_le_nombre_d_evenements() {
         "le plafond de 200 s'applique"
     );
 }
+
+/// `?session_id=<uuid>` : l'agrégat et les événements de CETTE session, calculés
+/// depuis le journal borné — et la fenêtre qui dit ce qu'il a pu manquer.
+// Le garde est tenu à travers l'appel observé : c'est son rôle.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn la_route_filtre_par_session_et_dit_sa_fenetre() {
+    let _serial = retrieval_ledger::serial_guard();
+    let saved_capacity = retrieval_ledger::journal_capacity();
+    retrieval_ledger::set_journal_capacity(4096);
+
+    let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+    let app = router_with_auth(graph).await;
+
+    let session = uuid::Uuid::new_v4();
+    let other = uuid::Uuid::new_v4();
+    let cited = uuid::Uuid::new_v4();
+    let record = |session: uuid::Uuid, source: Source, items: Vec<RetrievedItem>| {
+        retrieval_ledger::record_for_session(
+            source,
+            Trigger::Injection,
+            "prompt du tour",
+            items,
+            true,
+            3,
+            Some(session),
+        )
+        .expect("le journal accepte l'événement")
+    };
+    record(
+        session,
+        Source::Bm25,
+        vec![RetrievedItem::new(cited.to_string(), "note", Some(0.9))],
+    );
+    record(
+        session,
+        Source::Semantic,
+        vec![RetrievedItem::new("autre", "note", Some(0.2))],
+    );
+    record(other, Source::Bm25, vec![]);
+    // Fin du tour : la réponse a cité `cited`.
+    retrieval_ledger::settle_turn(session, &[cited.to_string()]);
+
+    let response = app
+        .oneshot(get(&format!(
+            "/api/retrieval-ledger?session_id={session}&limit=200"
+        )))
+        .await
+        .unwrap();
+    retrieval_ledger::set_journal_capacity(saved_capacity);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+
+    let snapshot = &body["snapshot"];
+    assert_eq!(snapshot["session_id"], session.to_string());
+    assert_eq!(snapshot["calls"], 2, "l'autre session n'entre pas : {body}");
+    assert_eq!(snapshot["injection_calls"], 2);
+    assert_eq!(snapshot["bm25_calls"], 1);
+    assert_eq!(snapshot["semantic_calls"], 1);
+    assert_eq!(snapshot["used"], 1);
+    assert_eq!(snapshot["unused"], 1);
+    assert_eq!(snapshot["pending"], 0);
+    assert!(
+        snapshot["window"]["capacity"].as_u64().unwrap_or(0) >= 3,
+        "la fenêtre est exposée : {body}"
+    );
+    assert!(snapshot["window"]["evicted_total"].is_u64());
+    assert!(
+        snapshot.get("dropped").is_none(),
+        "un compteur global ne se déguise pas en compteur de session"
+    );
+    assert!(
+        body["derived"]["cost_per_correct"].is_null(),
+        "aucun bénéfice attribué : null, pas 0"
+    );
+    assert_eq!(body["derived"]["mean_latency_ms"], 3.0);
+
+    let events = body["recent"].as_array().expect("une liste");
+    assert_eq!(events.len(), 2, "{body}");
+    assert!(events
+        .iter()
+        .all(|e| e["session_id"] == session.to_string()));
+    let bm25 = events
+        .iter()
+        .find(|e| e["source"] == "bm25")
+        .expect("la ligne BM25");
+    assert_eq!(bm25["trigger"], "injection");
+    assert_eq!(bm25["usage"]["used_ids"][0], cited.to_string());
+    assert!(bm25["usage"]["benefit"].is_null(), "inconnu reste null");
+}
+
+/// Un `session_id` qui n'est pas un UUID est refusé, pas interprété.
+#[tokio::test]
+async fn un_session_id_invalide_est_refuse() {
+    let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+    let app = router_with_auth(graph).await;
+    let response = app
+        .oneshot(get("/api/retrieval-ledger?session_id=pas-un-uuid"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
