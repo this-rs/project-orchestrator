@@ -39,6 +39,8 @@ pub mod refs_handlers;
 #[cfg(test)]
 mod refs_ws_tests;
 pub mod registry_handlers;
+#[cfg(test)]
+mod retrieval_ledger_tests;
 pub mod rfc_handlers;
 pub mod routes;
 pub mod routing_handlers;

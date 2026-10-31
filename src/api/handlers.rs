@@ -2422,6 +2422,45 @@ pub async fn add_decision(
     Ok(Json(decision))
 }
 
+// ============================================================================
+// Retrieval ledger (PR1 of the mémoire mobilisable plan, 42d49a31)
+// ============================================================================
+
+/// Query of the retrieval-ledger route.
+#[derive(Debug, Deserialize)]
+pub struct RetrievalLedgerQuery {
+    /// How many recent events to return (default 20, capped at 200).
+    pub limit: Option<usize>,
+}
+
+/// The retrieval ledger: the aggregate, and the last events.
+///
+/// The journal lives in memory (decision `8703a794`) and would otherwise be
+/// write-only: this route is what makes it a measurement rather than a counter
+/// nobody reads. It contains note identifiers and scores, never note bodies.
+pub async fn get_retrieval_ledger(
+    Query(params): Query<RetrievalLedgerQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::notes::retrieval_ledger;
+
+    let limit = params.limit.unwrap_or(20).min(200);
+    let snapshot = retrieval_ledger::snapshot();
+    let events = retrieval_ledger::recent(limit);
+
+    Ok(Json(serde_json::json!({
+        "snapshot": snapshot,
+        // Les ratios ne se recalculent pas à la main : `null` veut dire « pas
+        // encore mesurable », jamais zéro.
+        "derived": {
+            "calls_per_nonempty": snapshot.calls_per_nonempty(),
+            "mean_latency_ms": snapshot.mean_latency_ms(),
+            "cost_per_correct": snapshot.cost_per_correct(),
+        },
+        "recent": events,
+        "note": "journal in-memory and bounded; `snapshot.dropped` > 0 means the measurement is incomplete",
+    })))
+}
+
 /// Get a single decision by ID
 pub async fn get_decision(
     State(state): State<OrchestratorState>,
