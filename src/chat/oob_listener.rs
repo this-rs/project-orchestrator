@@ -457,6 +457,7 @@ async fn handle_oob_message(
         content: content.clone(),
         received_at: Utc::now(),
         correlation_id,
+        tool: None,
     };
 
     info!(

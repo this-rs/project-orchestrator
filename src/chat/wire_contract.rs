@@ -22,7 +22,7 @@ use crate::neo4j::traits::*;
 
 use crate::api::ws_chat_handler::WsChatClientMessage;
 use crate::chat::message_attachments::MessageAttachment;
-use crate::chat::types::{BackgroundTaskInfo, BackgroundTaskKind, ChatEvent, PendingQueueEntry};
+use crate::chat::types::{BackgroundTool, BackgroundTaskInfo, BackgroundTaskKind, ChatEvent, PendingQueueEntry};
 use crate::refs::wire::{RefResolution, RefStatus, ScopeLabel};
 use crate::refs::{EntityRef, RefKind};
 use serde_json::{json, Value};
@@ -672,16 +672,22 @@ fn server_examples() -> Vec<ServerExample> {
         }),
         ServerExample::new(
             ChatEvent::BackgroundOutput {
-                source: s("Monitor"),
-                content: s("ERROR upload failed: connection reset"),
+                source: s("tool"),
+                content: s("[tool_use: Read]"),
                 received_at: ts("2026-01-15T10:31:12Z"),
                 correlation_id: Some(s(TOOL_USE_ID)),
+                // The structured tick a client draws a real tool card from.
+                tool: Some(BackgroundTool::call(
+                    s("Read"),
+                    Some(serde_json::json!({ "file_path": "src/chat/manager.rs" })),
+                )),
             },
             ChatEvent::BackgroundOutput {
                 source: s("system"),
                 content: s("ERROR upload failed: connection reset"),
                 received_at: ts("2026-01-15T10:31:12Z"),
                 correlation_id: None,
+                tool: None,
             },
         ),
         ServerExample::new(

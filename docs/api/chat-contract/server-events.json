@@ -212,10 +212,16 @@
     "background_output": {
       "examples": {
         "full": {
-          "content": "ERROR upload failed: connection reset",
+          "content": "[tool_use: Read]",
           "correlation_id": "toolu_01Example0000000000000",
           "received_at": "2026-01-15T10:31:12Z",
-          "source": "Monitor",
+          "source": "tool",
+          "tool": {
+            "input": {
+              "file_path": "src/chat/manager.rs"
+            },
+            "name": "Read"
+          },
           "type": "background_output"
         },
         "minimal": {
@@ -241,6 +247,10 @@
         "source": {
           "required": true,
           "type": "string"
+        },
+        "tool": {
+          "required": false,
+          "type": "object"
         },
         "type": {
           "required": true,
