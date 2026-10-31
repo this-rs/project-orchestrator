@@ -1558,6 +1558,7 @@ mod tests {
                     content: "log line matched".to_string(),
                     received_at: chrono::Utc::now(),
                     correlation_id: None,
+                    tool: None,
                 });
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -1651,6 +1652,7 @@ mod tests {
                     content: "bg noise".to_string(),
                     received_at: chrono::Utc::now(),
                     correlation_id: None,
+                    tool: None,
                 });
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

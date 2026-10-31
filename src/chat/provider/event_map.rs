@@ -13,7 +13,7 @@
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use nexus_claude::agent::{
@@ -27,7 +27,13 @@ use super::endpoint_guard::redact_error_body;
 use super::errors::open_failure;
 use super::policy::{legacy_name, neutral_name};
 use crate::chat::manager::{MASKING_FAILED_MESSAGE, MASKING_FAILED_SUBTYPE};
-use crate::chat::types::{BackgroundTaskInfo, BackgroundTaskKind, ChatEvent};
+use crate::chat::types::{BackgroundTaskInfo, BackgroundTaskKind, BackgroundTool, ChatEvent};
+
+/** How many announced tool names are remembered while waiting for their result. */
+pub const MAX_REMEMBERED_TOOL_NAMES: usize = 64;
+
+/** How much of a background tool result travels as its head (the rest stays out). */
+pub const RESULT_HEAD_CHARS: usize = 400;
 
 /// What the mapping remembers from one event to the next.
 #[derive(Debug, Default, Clone)]
@@ -41,6 +47,9 @@ pub struct EventMapper {
     /// `active_tasks_update` shows, and how a wire task id (the `tool_use` that
     /// started the task, as on the Claude Code engine) finds the provider's own id.
     background_tasks: Vec<BackgroundTask>,
+    /// Name of each announced tool call still waiting for its result — a
+    /// background `ToolResult` names no tool (see `remember_tool_name`).
+    pending_tool_names: HashMap<String, String>,
 }
 
 /// The id a background task has on the wire: the `tool_use` that started it,
@@ -82,6 +91,25 @@ impl EventMapper {
     /// A fresh mapper (one per session).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Remember the name of an announced tool call: its result names no tool.
+    /// Bounded to `MAX_REMEMBERED_TOOL_NAMES`: past it ONE entry is dropped (a
+    /// `HashMap` has no order, so which one is arbitrary — the point is that a
+    /// long session's memory does not grow, not which name is lost first).
+    pub fn remember_tool_name(&mut self, id: &str, name: &str) {
+        if self.pending_tool_names.len() >= MAX_REMEMBERED_TOOL_NAMES {
+            if let Some(oldest) = self.pending_tool_names.keys().next().cloned() {
+                self.pending_tool_names.remove(&oldest);
+            }
+        }
+        self.pending_tool_names
+            .insert(id.to_string(), name.to_string());
+    }
+
+    /// The name of the call a result answers, consumed as it is read.
+    pub fn take_tool_name(&mut self, id: &str) -> Option<String> {
+        self.pending_tool_names.remove(id)
     }
 
     /// The background tasks still running, as `active_tasks_update` carries them
@@ -174,6 +202,10 @@ impl EventMapper {
                 ..
             } => {
                 let (category, canonical) = (Some(category_name(*category)), canonical.clone());
+                // A `ToolResult` of a background sub-agent carries the call's id,
+                // never its name: keep it so the flattened tick can say which
+                // tool returned what (bounded, oldest dropped).
+                self.remember_tool_name(id, name);
                 if *input_complete && self.announced_tools.remove(id) {
                     vec![ChatEvent::ToolUseInputResolved {
                         id: id.clone(),
@@ -310,6 +342,7 @@ impl EventMapper {
                         content,
                         received_at: Utc::now(),
                         correlation_id: Some(correlation_id),
+                        tool: None,
                     }];
                 }
                 vec![ChatEvent::Workflow {
@@ -625,8 +658,30 @@ impl Group {
             content: self.lines.join("\n"),
             received_at: at,
             correlation_id: self.parent,
+            tool: None,
         });
     }
+}
+
+/// The head of a tool result: the first `RESULT_HEAD_CHARS` characters of what
+/// the tool returned. A background tick carries this, never the whole blob (a
+/// `Read` of a large file would otherwise travel twice, once here and once in
+/// the mirror).
+fn result_head(output: Option<&ToolOutput>) -> Option<String> {
+    let text = match output? {
+        ToolOutput::Text(s) => s.clone(),
+        ToolOutput::Blocks(blocks) => serde_json::to_string(blocks).ok()?,
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() <= RESULT_HEAD_CHARS {
+        return Some(trimmed.to_string());
+    }
+    let mut head: String = trimmed.chars().take(RESULT_HEAD_CHARS).collect();
+    head.push('…');
+    Some(head)
 }
 
 fn result_line(output: Option<&ToolOutput>) -> String {
@@ -676,6 +731,59 @@ pub fn out_of_band_to_chat_events(
     let mut group: Option<Group> = None;
 
     for event in events {
+        // A tool call, or its result, is a TICK OF ITS OWN carrying the
+        // structure: the client can then draw the real per-tool card (a diff
+        // for `Edit`, a path and a range for `Read`) instead of reading a
+        // flattened `[tool_use: Bash]` marker.
+        match event {
+            AgentEvent::ToolCall {
+                id,
+                name,
+                input,
+                input_complete: true,
+                parent,
+                ..
+            } => {
+                mapper.remember_tool_name(id, name);
+                if let Some(done) = group.take() {
+                    done.flush(received_at, &mut out);
+                }
+                out.push(ChatEvent::BackgroundOutput {
+                    source: "tool".to_string(),
+                    content: format!("[tool_use: {name}]"),
+                    received_at,
+                    correlation_id: parent.clone(),
+                    tool: Some(BackgroundTool::call(name.clone(), Some(input.clone()))),
+                });
+                continue;
+            }
+            AgentEvent::ToolResult {
+                id,
+                output,
+                is_error,
+                parent,
+                ..
+            } => {
+                let name = mapper.take_tool_name(id).unwrap_or_default();
+                if let Some(done) = group.take() {
+                    done.flush(received_at, &mut out);
+                }
+                out.push(ChatEvent::BackgroundOutput {
+                    source: "tool_result".to_string(),
+                    content: result_line(output.as_ref()),
+                    received_at,
+                    correlation_id: parent.clone(),
+                    tool: Some(BackgroundTool::result(
+                        name,
+                        result_head(output.as_ref()),
+                        *is_error,
+                    )),
+                });
+                continue;
+            }
+            _ => {}
+        }
+
         // (seq, parent, line, is_user, is_result) of a text-like event.
         let line: Option<TextLine> = match event {
             AgentEvent::Text {
@@ -689,31 +797,6 @@ pub fn out_of_band_to_chat_events(
                 format!("[thinking] {text}"),
                 false,
                 false,
-            )),
-            AgentEvent::ToolCall {
-                name,
-                seq,
-                parent,
-                input_complete: true,
-                ..
-            } => Some((
-                *seq,
-                parent.clone(),
-                format!("[tool_use: {name}]"),
-                false,
-                false,
-            )),
-            AgentEvent::ToolResult {
-                output,
-                seq,
-                parent,
-                ..
-            } => Some((
-                *seq,
-                parent.clone(),
-                result_line(output.as_ref()),
-                false,
-                true,
             )),
             AgentEvent::UserEcho {
                 text, seq, parent, ..
@@ -752,6 +835,7 @@ pub fn out_of_band_to_chat_events(
                             content: serde_json::to_string_pretty(data).unwrap_or_default(),
                             received_at,
                             correlation_id: None,
+                            tool: None,
                         });
                     }
                     // A stream fragment or an announced-but-incomplete tool call
@@ -1718,21 +1802,136 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             })
             .collect();
+        // A tool call is NO LONGER folded into the text group: it is a tick of
+        // its own, so the client can draw the real tool card (the text group
+        // used to swallow it as a `[tool_use: …]` line).
+        assert_eq!(rows[0], ("assistant".into(), "a".into(), None));
+        assert_eq!(rows[1], ("tool".into(), "[tool_use: Monitor]".into(), None));
         assert_eq!(
-            rows[0],
-            ("assistant".into(), "a\n[tool_use: Monitor]".into(), None)
-        );
-        assert_eq!(
-            rows[1],
+            rows[2],
             (
                 "tool_result".into(),
                 "[tool_result] line".into(),
                 Some("p".into())
             )
         );
-        assert_eq!(rows[2], ("user".into(), "hello".into(), None));
-        assert_eq!(rows[3].0, "system:status");
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[3], ("user".into(), "hello".into(), None));
+        assert_eq!(rows[4].0, "system:status");
+        assert_eq!(rows.len(), 5);
+    }
+
+    #[test]
+    fn a_background_tool_tick_carries_its_call_and_its_result() {
+        // Why this exists: the client can only draw a REAL per-tool card (a
+        // path for Read, a diff for Edit) if the call's input survives the
+        // flattening. Measured before this: 3 989 `[tool_use: …]` markers in
+        // three days, with no argument attached to any of them.
+        let at = Utc::now();
+        let events = vec![
+            AgentEvent::ToolCall {
+                id: "t1".into(),
+                name: "Read".into(),
+                input: json!({"file_path": "src/a.rs"}),
+                category: Default::default(),
+                canonical: None,
+                input_complete: true,
+                seq: Some(1),
+                parent: Some("p".into()),
+            },
+            AgentEvent::ToolResult {
+                id: "t1".into(),
+                output: Some(ToolOutput::Text("x".repeat(1000))),
+                is_error: false,
+                seq: Some(2),
+                parent: Some("p".into()),
+            },
+            AgentEvent::ToolResult {
+                id: "unknown".into(),
+                output: None,
+                is_error: true,
+                seq: Some(3),
+                parent: None,
+            },
+        ];
+        let out = out_of_band_to_chat_events(&events, &mut EventMapper::new(), at);
+        assert_eq!(out.len(), 3);
+        match &out[0] {
+            ChatEvent::BackgroundOutput {
+                tool: Some(tool),
+                content,
+                ..
+            } => {
+                assert_eq!(tool.name, "Read");
+                assert_eq!(tool.input, Some(json!({"file_path": "src/a.rs"})));
+                assert!(!tool.is_error);
+                assert!(tool.result_head.is_none(), "a call has no result yet");
+                // The marker stays, so an older client still shows something.
+                assert_eq!(content, "[tool_use: Read]");
+            }
+            other => panic!("{other:?}"),
+        }
+        match &out[1] {
+            ChatEvent::BackgroundOutput {
+                tool: Some(tool), ..
+            } => {
+                // The result names the call it answers: the provider does not
+                // repeat the tool name on a result.
+                assert_eq!(tool.name, "Read");
+                let head = tool.result_head.as_deref().expect("a head");
+                assert!(head.ends_with('…'));
+                // Capped: never the whole blob (a Read of a big file).
+                assert_eq!(head.chars().count(), RESULT_HEAD_CHARS + 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        match &out[2] {
+            ChatEvent::BackgroundOutput {
+                tool: Some(tool), ..
+            } => {
+                // A result whose call is unknown still reports the failure; the
+                // client attaches it to the call above it.
+                assert_eq!(tool.name, "");
+                assert!(tool.is_error);
+                assert!(tool.result_head.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_result_head_is_short_or_absent_and_never_the_whole_blob() {
+        // Blocks (an image, a structured result): serialised, then capped like text.
+        let blocks = ToolOutput::Blocks(vec![]);
+        assert_eq!(result_head(Some(&blocks)).as_deref(), Some("[]"));
+        // An empty or whitespace result has NO head — not an empty string (the
+        // client would draw an empty second line under the tool).
+        assert!(result_head(Some(&ToolOutput::Text("   \n ".into()))).is_none());
+        assert!(result_head(None).is_none());
+        // A short result travels whole, without an ellipsis.
+        assert_eq!(
+            result_head(Some(&ToolOutput::Text("ok".into()))).as_deref(),
+            Some("ok")
+        );
+    }
+
+    #[test]
+    fn remembered_tool_names_are_bounded() {
+        // A long-lived session calls thousands of tools: the memory of names
+        // must not grow with the session, and forgetting must not panic.
+        let mut mapper = EventMapper::new();
+        for i in 0..(MAX_REMEMBERED_TOOL_NAMES + 5) {
+            mapper.remember_tool_name(&format!("t{i}"), "Bash");
+        }
+        assert_eq!(mapper.pending_tool_names.len(), MAX_REMEMBERED_TOOL_NAMES);
+        // The newest still answers; the memory simply stops growing.
+        assert_eq!(
+            mapper.take_tool_name(&format!("t{}", MAX_REMEMBERED_TOOL_NAMES + 4)),
+            Some("Bash".into())
+        );
+        assert_eq!(
+            mapper.pending_tool_names.len(),
+            MAX_REMEMBERED_TOOL_NAMES - 1
+        );
     }
 
     #[test]

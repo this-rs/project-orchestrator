@@ -652,6 +652,58 @@ pub struct ConsentSubject {
     pub destinations: Vec<String>,
 }
 
+/// One tool call of a background stream, in the shape a client needs to draw it.
+///
+/// Why this exists: the provider flattens an out-of-turn sub-agent into TEXT
+/// lines (`[tool_use: Read]`, `[tool_result] …`). Measured on the stored chat
+/// events (week of 2026-10-24: 3 989 such markers in three days), the panel
+/// could therefore name a tool and show what it returned, but never WHAT IT WAS
+/// ASKED — no path for a `Read`, no pattern for a `Grep`, no diff for an `Edit`.
+/// The structured event was there (`AgentEvent::ToolCall { input, .. }`), it was
+/// just thrown away when flattening. This carries it across instead.
+///
+/// `input` is the call's own input, exactly as the in-turn `tool_use` event
+/// already sends it (same masking, same truncation) — nothing new is exposed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackgroundTool {
+    /// Name the provider gave the tool (`Bash`, `Read`, `Edit`, `Task`…), else
+    /// the canonical one. Empty when a result arrives with no call to name.
+    pub name: String,
+    /// The call's input, when this tick IS a call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+    /// True when the tool reported a failure.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_error: bool,
+    /// What the tool returned, head only (`RESULT_HEAD_CHARS`, first lines).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_head: Option<String>,
+}
+
+impl BackgroundTool {
+    /// A tool CALL: its name and its input.
+    pub fn call(name: impl Into<String>, input: Option<serde_json::Value>) -> Self {
+        Self {
+            name: name.into(),
+            input,
+            is_error: false,
+            result_head: None,
+        }
+    }
+
+    /// A tool RESULT: what came back, and whether it failed. The name is the
+    /// call's when the mapper still knows it, empty otherwise (the client
+    /// attaches a result to the call above it).
+    pub fn result(name: impl Into<String>, head: Option<String>, is_error: bool) -> Self {
+        Self {
+            name: name.into(),
+            input: None,
+            is_error,
+            result_head: head,
+        }
+    }
+}
+
 /// Events emitted by the chat system (sent via WebSocket / broadcast)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1060,6 +1112,16 @@ pub enum ChatEvent {
         /// (e.g. the background bash ID, the parent task ID).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
+        /// The tool call this tick IS, when the provider handed it over in its
+        /// structured form (a background sub-agent's `tool_use` / `tool_result`).
+        ///
+        /// Additive: absent when the provider only gave text (a Monitor line, a
+        /// `system:*` notice) and on every frame stored before it existed. Its
+        /// purpose is that the client draws a REAL per-tool card in the
+        /// background panel — the same one the transcript draws — instead of
+        /// guessing the tool from a flattened `[tool_use: Bash]` marker.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<BackgroundTool>,
     },
     /// A message relayed from a peer session in the same team (TEAM-1).
     ///
@@ -3980,6 +4042,7 @@ mod tests {
             content: "[epoch 50] cos=0.871".into(),
             received_at,
             correlation_id: Some("bg-abc123".into()),
+            tool: None,
         };
 
         let json = serde_json::to_string(&event).unwrap();
@@ -4017,6 +4080,7 @@ mod tests {
             content: "build complete".into(),
             received_at: chrono::Utc::now(),
             correlation_id: None,
+            tool: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         // None correlation_id should be skipped, not serialized as null

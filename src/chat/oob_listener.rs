@@ -457,6 +457,10 @@ async fn handle_oob_message(
         content: content.clone(),
         received_at: Utc::now(),
         correlation_id,
+        // This path relays a RAW provider message between turns: it carries no
+        // structured tool call (that form only exists on the `AgentEvent` side,
+        // which `event_map::out_of_band_to_chat_events` maps and stamps).
+        tool: None,
     };
 
     info!(
