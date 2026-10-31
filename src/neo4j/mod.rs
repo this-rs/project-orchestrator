@@ -19,6 +19,10 @@ mod environment;
 mod event_trigger;
 mod execution_place;
 mod feature_graph;
+/// Identité de fichier indépendante du point de montage (T7). Branché dans
+/// `upsert_file` au commit suivant : d'ici là, l'API est testée mais pas appelée.
+#[allow(dead_code)]
+mod file_uid;
 pub mod graph_sampler;
 pub mod graph_schema;
 mod impl_graph_store;
