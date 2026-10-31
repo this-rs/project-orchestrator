@@ -342,6 +342,53 @@ SET n.stable_key = n.file_path + '::' + n.name +
 RETURN count(n) AS processed
 "#;
 
+/// Same shadow key for the type declarations (struct, trait, enum).
+///
+/// Their legacy id was already `<file>:<name>` — no line, so they never
+/// accumulated versions. The key is still written: the identity must be one
+/// grammar for every declaration, otherwise a reader cannot tell "no stable key"
+/// from "this label was forgotten".
+const BACKFILL_STABLE_KEY_TYPES: &str = r#"
+MATCH (n)
+WHERE (n:Struct OR n:Trait OR n:Enum)
+  AND n.stable_key IS NULL
+  AND ($scope IS NULL OR n.project_id = $scope)
+WITH n LIMIT $batch
+SET n.stable_key = n.file_path + '::' + n.name
+RETURN count(n) AS processed
+"#;
+
+/// Same shadow key for `impl` blocks.
+///
+/// The line leaves the key: moving an impl must not create a second impl of the
+/// same type. `trait_name` is stored as an empty string when there is no trait,
+/// so the CASE tests both shapes — an empty name is not a trait called "".
+const BACKFILL_STABLE_KEY_IMPLS: &str = r#"
+MATCH (n:Impl)
+WHERE n.stable_key IS NULL
+  AND ($scope IS NULL OR n.project_id = $scope)
+WITH n LIMIT $batch
+SET n.stable_key = n.file_path + '::impl ' +
+  CASE WHEN n.trait_name IS NULL OR n.trait_name = ''
+       THEN n.for_type
+       ELSE n.trait_name + ' for ' + n.for_type END
+RETURN count(n) AS processed
+"#;
+
+/// Same shadow key for imports — **the line stays** here.
+///
+/// Two identical `use` statements on two lines are two distinct facts: a
+/// duplicate import is a finding to report, not a node to merge away. Removing
+/// the line from this identity would hide exactly what one wants to see.
+const BACKFILL_STABLE_KEY_IMPORTS: &str = r#"
+MATCH (n:Import)
+WHERE n.stable_key IS NULL
+  AND ($scope IS NULL OR n.project_id = $scope)
+WITH n LIMIT $batch
+SET n.stable_key = n.file_path + '::import:' + toString(n.line) + ':' + n.path
+RETURN count(n) AS processed
+"#;
+
 impl Neo4jClient {
     /// The ordered list of data migrations.
     pub fn data_migrations() -> Vec<DataMigration> {
@@ -395,6 +442,27 @@ impl Neo4jClient {
                 description:
                     "Write the stable identity of functions as a shadow property (line removed from id)",
                 batch: BACKFILL_STABLE_KEY.to_string(),
+                finalize: None,
+            },
+            DataMigration {
+                id: "2026-10-backfill-stable-key-types",
+                description:
+                    "Write the stable identity of structs, traits and enums as a shadow property",
+                batch: BACKFILL_STABLE_KEY_TYPES.to_string(),
+                finalize: None,
+            },
+            DataMigration {
+                id: "2026-10-backfill-stable-key-impls",
+                description:
+                    "Write the stable identity of impl blocks as a shadow property (line removed)",
+                batch: BACKFILL_STABLE_KEY_IMPLS.to_string(),
+                finalize: None,
+            },
+            DataMigration {
+                id: "2026-10-backfill-stable-key-imports",
+                description:
+                    "Write the stable identity of imports as a shadow property (line kept on purpose)",
+                batch: BACKFILL_STABLE_KEY_IMPORTS.to_string(),
                 finalize: None,
             },
         ]
@@ -616,8 +684,84 @@ mod tests {
                 "2026-09-purge-empty-archived-skills",
                 "2026-10-rehome-worktree-knowledge",
                 "2026-10-purge-worktree-nodes",
+                "2026-10-backfill-stable-key",
+                "2026-10-backfill-stable-key-types",
+                "2026-10-backfill-stable-key-impls",
+                "2026-10-backfill-stable-key-imports",
             ]
         );
+    }
+
+    /// The identity is one grammar for every declaration: a label left without a
+    /// backfill would be indistinguishable from a label with nothing to write.
+    #[test]
+    fn test_stable_key_backfills_cover_every_label() {
+        let migrations = Neo4jClient::data_migrations();
+        let backfills: Vec<&str> = migrations
+            .iter()
+            .filter(|m| m.id.starts_with("2026-10-backfill-stable-key"))
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(
+            backfills.len(),
+            4,
+            "one backfill per identity shape — types, impls, imports and functions"
+        );
+
+        let by_id = |id: &str| -> String {
+            migrations
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("{id} is registered"))
+                .batch
+                .clone()
+        };
+
+        let functions = by_id("2026-10-backfill-stable-key");
+        assert!(functions.contains("(n:Function)"));
+        // The line left the identity, the parameter types entered it: two
+        // overloads of one name must stay distinct.
+        assert!(functions.contains("params"));
+        assert!(!functions.contains("line_start"));
+
+        let types = by_id("2026-10-backfill-stable-key-types");
+        for label in ["n:Struct", "n:Trait", "n:Enum"] {
+            assert!(
+                types.contains(label),
+                "the type backfill must cover {label}"
+            );
+        }
+
+        let impls = by_id("2026-10-backfill-stable-key-impls");
+        assert!(impls.contains("(n:Impl)"));
+        assert!(impls.contains("trait_name"));
+        assert!(impls.contains("for_type"));
+        assert!(!impls.contains("line_start"), "the line leaves an impl key");
+
+        let imports = by_id("2026-10-backfill-stable-key-imports");
+        assert!(imports.contains("(n:Import)"));
+        // The line STAYS for imports: two identical imports on two lines are two
+        // facts, and removing the line would hide the duplicate one wants to see.
+        assert!(
+            imports.contains("n.line"),
+            "the import key keeps the line on purpose"
+        );
+
+        for m in migrations
+            .iter()
+            .filter(|m| m.id.starts_with("2026-10-backfill-stable-key"))
+        {
+            assert!(
+                m.batch.contains("SET n.stable_key"),
+                "{} must write the shadow key",
+                m.id
+            );
+            assert!(
+                m.batch.contains("stable_key IS NULL"),
+                "{} must be idempotent",
+                m.id
+            );
+        }
     }
 
     /// The worktree purge deletes COPIES of the project's code, never the code

@@ -4,7 +4,7 @@ use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use super::models::*;
-use super::symbol_key::stable_symbol_key;
+use super::symbol_key::{stable_impl_key, stable_import_key, stable_symbol_key, stable_type_key};
 use anyhow::Result;
 use neo4rs::query;
 use uuid::Uuid;
@@ -597,7 +597,8 @@ impl Neo4jClient {
         let q = query(
             r#"
             MERGE (t:Trait {id: $id})
-            SET t.name = $name,
+            SET t.stable_key = $stable_key,
+                t.name = $name,
                 t.visibility = $visibility,
                 t.generics = $generics,
                 t.file_path = $file_path,
@@ -616,7 +617,8 @@ impl Neo4jClient {
         .param("file_path", t.file_path.clone())
         .param("line_start", t.line_start as i64)
         .param("line_end", t.line_end as i64)
-        .param("docstring", t.docstring.clone().unwrap_or_default());
+        .param("docstring", t.docstring.clone().unwrap_or_default())
+        .param("stable_key", stable_type_key(&t.file_path, &t.name));
 
         self.graph.run(q).await?;
         Ok(())
@@ -651,7 +653,8 @@ impl Neo4jClient {
         let q = query(
             r#"
             MERGE (e:Enum {id: $id})
-            SET e.name = $name,
+            SET e.stable_key = $stable_key,
+                e.name = $name,
                 e.visibility = $visibility,
                 e.variants = $variants,
                 e.file_path = $file_path,
@@ -667,6 +670,7 @@ impl Neo4jClient {
         .param("name", e.name.clone())
         .param("visibility", format!("{:?}", e.visibility))
         .param("variants", e.variants.clone())
+        .param("stable_key", stable_type_key(&e.file_path, &e.name))
         .param("file_path", e.file_path.clone())
         .param("line_start", e.line_start as i64)
         .param("line_end", e.line_end as i64)
@@ -988,7 +992,8 @@ impl Neo4jClient {
         let q = query(
             r#"
             MERGE (i:Import {id: $id})
-            SET i.path = $path,
+            SET i.stable_key = $stable_key,
+                i.path = $path,
                 i.alias = $alias,
                 i.items = $items,
                 i.file_path = $file_path,
@@ -999,6 +1004,10 @@ impl Neo4jClient {
             "#,
         )
         .param("id", id)
+        .param(
+            "stable_key",
+            stable_import_key(&import.file_path, import.line, &import.path),
+        )
         .param("path", import.path.clone())
         .param("alias", import.alias.clone().unwrap_or_default())
         .param("items", import.items.clone())
@@ -1240,6 +1249,10 @@ impl Neo4jClient {
             .map(|s| {
                 let mut m = std::collections::HashMap::new();
                 m.insert("id".into(), format!("{}:{}", s.file_path, s.name).into());
+                m.insert(
+                    "stable_key".into(),
+                    stable_type_key(&s.file_path, &s.name).into(),
+                );
                 m.insert("name".into(), s.name.clone().into());
                 m.insert("visibility".into(), format!("{:?}", s.visibility).into());
                 m.insert("generics".into(), s.generics.clone().into());
@@ -1263,7 +1276,8 @@ impl Neo4jClient {
             r#"
             UNWIND $items AS s
             MERGE (st:Struct {id: s.id})
-            SET st.name = s.name,
+            SET st.stable_key = s.stable_key,
+                st.name = s.name,
                 st.visibility = s.visibility,
                 st.generics = s.generics,
                 st.file_path = s.file_path,
@@ -1295,6 +1309,10 @@ impl Neo4jClient {
             .map(|t| {
                 let mut m = std::collections::HashMap::new();
                 m.insert("id".into(), format!("{}:{}", t.file_path, t.name).into());
+                m.insert(
+                    "stable_key".into(),
+                    stable_type_key(&t.file_path, &t.name).into(),
+                );
                 m.insert("name".into(), t.name.clone().into());
                 m.insert("visibility".into(), format!("{:?}", t.visibility).into());
                 m.insert("generics".into(), t.generics.clone().into());
@@ -1313,7 +1331,8 @@ impl Neo4jClient {
             r#"
             UNWIND $items AS t
             MERGE (tr:Trait {id: t.id})
-            SET tr.name = t.name,
+            SET tr.stable_key = t.stable_key,
+                tr.name = t.name,
                 tr.visibility = t.visibility,
                 tr.generics = t.generics,
                 tr.file_path = t.file_path,
@@ -1343,6 +1362,10 @@ impl Neo4jClient {
             .map(|e| {
                 let mut m = std::collections::HashMap::new();
                 m.insert("id".into(), format!("{}:{}", e.file_path, e.name).into());
+                m.insert(
+                    "stable_key".into(),
+                    stable_type_key(&e.file_path, &e.name).into(),
+                );
                 m.insert("name".into(), e.name.clone().into());
                 m.insert("visibility".into(), format!("{:?}", e.visibility).into());
                 m.insert("variants".into(), e.variants.clone().into());
@@ -1361,7 +1384,8 @@ impl Neo4jClient {
             r#"
             UNWIND $items AS e
             MERGE (en:Enum {id: e.id})
-            SET en.name = e.name,
+            SET en.stable_key = e.stable_key,
+                en.name = e.name,
                 en.visibility = e.visibility,
                 en.variants = e.variants,
                 en.file_path = e.file_path,
@@ -1401,6 +1425,11 @@ impl Neo4jClient {
                 );
                 let mut m = std::collections::HashMap::new();
                 m.insert("id".into(), id.into());
+                m.insert(
+                    "stable_key".into(),
+                    stable_impl_key(&imp.file_path, &imp.for_type, imp.trait_name.as_deref())
+                        .into(),
+                );
                 m.insert("for_type".into(), imp.for_type.clone().into());
                 m.insert(
                     "trait_name".into(),
@@ -1427,7 +1456,8 @@ impl Neo4jClient {
             r#"
             UNWIND $items AS imp
             MERGE (i:Impl {id: imp.id})
-            SET i.for_type = imp.for_type,
+            SET i.stable_key = imp.stable_key,
+                i.for_type = imp.for_type,
                 i.trait_name = imp.trait_name,
                 i.generics = imp.generics,
                 i.where_clause = imp.where_clause,
@@ -1601,6 +1631,10 @@ impl Neo4jClient {
                 let id = format!("{}:{}:{}", imp.file_path, imp.line, imp.path);
                 let mut m = std::collections::HashMap::new();
                 m.insert("id".into(), id.into());
+                m.insert(
+                    "stable_key".into(),
+                    stable_import_key(&imp.file_path, imp.line, &imp.path).into(),
+                );
                 m.insert("path".into(), imp.path.clone().into());
                 m.insert("alias".into(), imp.alias.clone().unwrap_or_default().into());
                 m.insert("items".into(), imp.items.clone().into());
@@ -1614,7 +1648,8 @@ impl Neo4jClient {
             r#"
             UNWIND $items AS imp
             MERGE (i:Import {id: imp.id})
-            SET i.path = imp.path,
+            SET i.stable_key = imp.stable_key,
+                i.path = imp.path,
                 i.alias = imp.alias,
                 i.items = imp.items,
                 i.file_path = imp.file_path,

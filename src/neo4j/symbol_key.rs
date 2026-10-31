@@ -27,6 +27,37 @@ pub fn stable_symbol_key(file_path: &str, name: &str, params: &[Parameter]) -> S
     }
 }
 
+/// Stable key of a type declaration — struct, trait or enum.
+///
+/// Grammar: `<file_path>::<name>`. A type cannot be overloaded in the same file,
+/// so no signature suffix is needed; a rename is a new type, and that is correct.
+pub fn stable_type_key(file_path: &str, name: &str) -> String {
+    format!("{}::{}", file_path, name)
+}
+
+/// Stable key of an `impl` block.
+///
+/// Grammar: `<file_path>::impl <Type>` or `<file_path>::impl <Trait> for <Type>`.
+/// The line is not part of it: moving an impl must not create a second impl of
+/// the same type. Two impls of the same trait for the same type in one file are
+/// already a compile error in Rust, so no disambiguating suffix is needed.
+pub fn stable_impl_key(file_path: &str, for_type: &str, trait_name: Option<&str>) -> String {
+    match trait_name {
+        Some(t) if !t.trim().is_empty() => format!("{}::impl {} for {}", file_path, t, for_type),
+        _ => format!("{}::impl {}", file_path, for_type),
+    }
+}
+
+/// Stable key of an import.
+///
+/// Grammar: `<file_path>::import:<line>:<path>`. Unlike symbols, the **line stays**
+/// here: two identical `use` statements on two lines are two distinct facts
+/// (a duplicate import is a finding, not a duplicate node), and the line is what
+/// tells them apart.
+pub fn stable_import_key(file_path: &str, line: u32, path: &str) -> String {
+    format!("{}::import:{}:{}", file_path, line, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -36,6 +67,47 @@ mod tests {
             name: name.to_string(),
             type_name: ty.map(|s| s.to_string()),
         }
+    }
+
+    #[test]
+    fn a_type_key_does_not_depend_on_its_position() {
+        assert_eq!(stable_type_key("src/a.rs", "Parser"), "src/a.rs::Parser");
+        // The same type seen through two mount points is two files, not one:
+        // that is T7's job, and the key must not paper over it.
+        assert_ne!(
+            stable_type_key("src/a.rs", "Parser"),
+            stable_type_key("src/b.rs", "Parser")
+        );
+    }
+
+    #[test]
+    fn an_impl_key_names_the_trait_and_the_type() {
+        assert_eq!(
+            stable_impl_key("src/a.rs", "Parser", Some("Debug")),
+            "src/a.rs::impl Debug for Parser"
+        );
+        assert_eq!(
+            stable_impl_key("src/a.rs", "Parser", None),
+            "src/a.rs::impl Parser"
+        );
+        // An empty trait name is no trait at all, not "impl  for Parser".
+        assert_eq!(
+            stable_impl_key("src/a.rs", "Parser", Some("  ")),
+            "src/a.rs::impl Parser"
+        );
+    }
+
+    #[test]
+    fn an_import_key_keeps_the_line_on_purpose() {
+        assert_eq!(
+            stable_import_key("src/a.rs", 12, "std::fmt"),
+            "src/a.rs::import:12:std::fmt"
+        );
+        assert_ne!(
+            stable_import_key("src/a.rs", 12, "std::fmt"),
+            stable_import_key("src/a.rs", 13, "std::fmt"),
+            "two identical imports on two lines are two facts"
+        );
     }
 
     #[test]
