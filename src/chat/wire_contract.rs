@@ -22,7 +22,9 @@ use crate::neo4j::traits::*;
 
 use crate::api::ws_chat_handler::WsChatClientMessage;
 use crate::chat::message_attachments::MessageAttachment;
-use crate::chat::types::{BackgroundTool, BackgroundTaskInfo, BackgroundTaskKind, ChatEvent, PendingQueueEntry};
+use crate::chat::types::{
+    BackgroundTaskInfo, BackgroundTaskKind, BackgroundTool, ChatEvent, PendingQueueEntry,
+};
 use crate::refs::wire::{RefResolution, RefStatus, ScopeLabel};
 use crate::refs::{EntityRef, RefKind};
 use serde_json::{json, Value};

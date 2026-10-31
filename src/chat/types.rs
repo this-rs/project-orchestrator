@@ -683,14 +683,24 @@ pub struct BackgroundTool {
 impl BackgroundTool {
     /// A tool CALL: its name and its input.
     pub fn call(name: impl Into<String>, input: Option<serde_json::Value>) -> Self {
-        Self { name: name.into(), input, is_error: false, result_head: None }
+        Self {
+            name: name.into(),
+            input,
+            is_error: false,
+            result_head: None,
+        }
     }
 
     /// A tool RESULT: what came back, and whether it failed. The name is the
     /// call's when the mapper still knows it, empty otherwise (the client
     /// attaches a result to the call above it).
     pub fn result(name: impl Into<String>, head: Option<String>, is_error: bool) -> Self {
-        Self { name: name.into(), input: None, is_error, result_head: head }
+        Self {
+            name: name.into(),
+            input: None,
+            is_error,
+            result_head: head,
+        }
     }
 }
 

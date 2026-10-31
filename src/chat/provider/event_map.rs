@@ -101,7 +101,8 @@ impl EventMapper {
                 self.pending_tool_names.remove(&oldest);
             }
         }
-        self.pending_tool_names.insert(id.to_string(), name.to_string());
+        self.pending_tool_names
+            .insert(id.to_string(), name.to_string());
     }
 
     /// The name of the call a result answers, consumed as it is read.
