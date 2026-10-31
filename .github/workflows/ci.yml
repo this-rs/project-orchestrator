@@ -55,11 +55,59 @@ env:
   CACHE_SAVE: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
 
 jobs:
+
+  # ==========================================================================
+  # Resolve runner - self-hosted fleet or hosted runners?
+  # ==========================================================================
+  # The three heavy jobs (Build, Unit Tests, Code Coverage) pin to a
+  # self-hosted runner by the repository variable CI_SELF_HOSTED_LABEL
+  # (<label>-build, -unit, -cov). GitHub does NOT fall back when that machine
+  # is offline: the job then queues forever. This probe asks the runners API
+  # whether any runner with the label is online; when none is, the heavy jobs
+  # route to ubuntu-latest. GITHUB_TOKEN cannot list self-hosted runners
+  # (needs the administration read permission), so this uses RUNNERS_READ_TOKEN
+  # (a PAT). Without the token, or when the API cannot answer, it keeps the
+  # current behaviour (the label decides).
+  resolve-runner:
+    name: Resolve runner
+    runs-on: ubuntu-latest
+    outputs:
+      self_hosted: ${{ steps.check.outputs.self_hosted }}
+    steps:
+      - name: Is a self-hosted runner online?
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.RUNNERS_READ_TOKEN }}
+        run: |
+          label="${{ vars.CI_SELF_HOSTED_LABEL }}"
+          # No label -> every heavy job already routes to ubuntu-latest.
+          if [ -z "$label" ]; then
+            echo "self_hosted=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # No token -> cannot ask the API; keep the current behaviour.
+          if [ -z "$GH_TOKEN" ]; then
+            echo "self_hosted=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          online=$(gh api "repos/$GITHUB_REPOSITORY/actions/runners" \
+            --jq "[.runners[] | select(.status == \"online\") | .labels[].name | select(startswith(\"${label}-\"))] | length" 2>/dev/null || echo -1)
+          if [ "$online" = "-1" ]; then
+            echo "::warning::Cannot list self-hosted runners (RUNNERS_READ_TOKEN scope?); keeping label '${label}'"
+            echo "self_hosted=true" >> "$GITHUB_OUTPUT"
+          elif [ "$online" -gt 0 ]; then
+            echo "self_hosted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No online runner for label '${label}'; heavy jobs fall back to ubuntu-latest"
+            echo "self_hosted=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # ==========================================================================
   # Build - Compile once, share artifacts and cache
   # ==========================================================================
   build:
     name: Build
+    needs: [resolve-runner]
     # FULL tier only: a READY (non-draft) PR into main, pushes to main, nightly and manual runs.
     # A DRAFT PR into main (an integration branch accumulating its lot) runs the fast tier only;
     # "Ready for review" starts the full tier once.
@@ -72,7 +120,7 @@ jobs:
     # workspace crates by their absolute path, and each instance has its own work dir, so a
     # job that moved to another instance recompiled the whole workspace (Build: 4 min 53 s
     # on an empty commit, 19/10/2026).
-    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-build', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
+    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && needs.resolve-runner.outputs.self_hosted == 'true' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-build', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -336,6 +384,7 @@ jobs:
   # ==========================================================================
   unit-tests:
     name: Unit Tests
+    needs: [resolve-runner]
     # On the self-hosted runner (ffs-n2, label in the repository variable CI_SELF_HOSTED_LABEL)
     # when that variable is set, for pushes and for PRs from THIS repository only: the repository
     # is public, a fork's code never runs on that machine. Nightly and `fresh` runs stay on a
@@ -344,7 +393,7 @@ jobs:
     # workspace crates by their absolute path, and each instance has its own work dir, so a
     # job that moved to another instance recompiled the whole workspace (Build: 4 min 53 s
     # on an empty commit, 19/10/2026).
-    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-unit', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
+    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && needs.resolve-runner.outputs.self_hosted == 'true' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-unit', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
     # A hung test used to hold a job for 1-2 hours; nextest kills it after 5 min (see
     # .config/nextest.toml), this is the backstop.
     timeout-minutes: 40
@@ -633,6 +682,7 @@ jobs:
   # ==========================================================================
   coverage:
     name: Code Coverage
+    needs: [resolve-runner]
     # FULL tier only: a READY (non-draft) PR into main, pushes to main, nightly and manual runs.
     # A DRAFT PR into main (an integration branch accumulating its lot) runs the fast tier only;
     # "Ready for review" starts the full tier once.
@@ -645,7 +695,7 @@ jobs:
     # workspace crates by their absolute path, and each instance has its own work dir, so a
     # job that moved to another instance recompiled the whole workspace (Build: 4 min 53 s
     # on an empty commit, 19/10/2026).
-    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-cov', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
+    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && needs.resolve-runner.outputs.self_hosted == 'true' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-cov', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
     # Backstop: a hung test used to keep this job alive for 1-2 hours.
     timeout-minutes: 50
     permissions:
