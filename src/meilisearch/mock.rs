@@ -319,7 +319,7 @@ impl SearchStore for MockSearchStore {
 
     async fn delete_decisions_for_task(&self, task_id: &str) -> Result<()> {
         let mut docs = self.decision_documents.write().await;
-        docs.retain(|d| d.task_id != task_id);
+        docs.retain(|d| d.task_id.as_deref() != Some(task_id));
         Ok(())
     }
 
@@ -512,7 +512,7 @@ mod tests {
             id: id.to_string(),
             description: "Use async/await for all IO operations".to_string(),
             rationale: "Better performance under load".to_string(),
-            task_id: task_id.to_string(),
+            task_id: Some(task_id.to_string()),
             agent: "claude".to_string(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             tags: vec!["architecture".to_string()],

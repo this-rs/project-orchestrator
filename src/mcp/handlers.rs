@@ -1888,11 +1888,28 @@ impl ToolHandler {
             }
 
             "add_decision" => {
-                let task_id = extract_id(args, "task_id")?;
-                let result = http
-                    .post(&format!("/api/tasks/{}/decisions", task_id), args)
-                    .await?;
-                Ok(Some(result))
+                // A decision may belong to no task: `POST /api/decisions` creates
+                // the node on its own. Without this branch the loosening is
+                // invisible from the tool, and an agent recording an
+                // infrastructure choice would still have to invent a task.
+                let named_task = args
+                    .get("task_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                match named_task {
+                    Some(_) => {
+                        let task_id = extract_id(args, "task_id")?;
+                        let result = http
+                            .post(&format!("/api/tasks/{}/decisions", task_id), args)
+                            .await?;
+                        Ok(Some(result))
+                    }
+                    None => {
+                        let result = http.post("/api/decisions", args).await?;
+                        Ok(Some(result))
+                    }
+                }
             }
 
             // ── P4: Steps (6 tools) ────────────────────────────────────
@@ -7844,7 +7861,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["method"], "POST");
-        assert!(result["path"].as_str().unwrap().ends_with("/decisions"));
+        // The task-bound path is unchanged: the decision is filed under the task.
+        assert_eq!(result["path"], format!("/api/tasks/{}/decisions", UUID1));
+    }
+
+    /// A decision may belong to no task (PR4): without `task_id` the tool must
+    /// reach `POST /api/decisions`. Before this, the call failed on a missing
+    /// `task_id`, so an infrastructure choice could not be recorded at all.
+    #[tokio::test]
+    async fn test_http_add_decision_without_task_takes_the_global_route() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_decision",
+                Some(json!({"description": "zip 9.1.3", "rationale": "advisory"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/decisions");
+    }
+
+    /// An empty `task_id` is the same as no task: it names nothing, so it must
+    /// not become a task URL of its own.
+    #[tokio::test]
+    async fn test_http_add_decision_with_blank_task_takes_the_global_route() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "add_decision",
+                Some(json!({"task_id": "", "description": "d", "rationale": "r"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["path"], "/api/decisions");
     }
 
     #[tokio::test]

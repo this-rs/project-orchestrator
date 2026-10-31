@@ -381,7 +381,7 @@ impl PlanManager {
             id: decision.id.to_string(),
             description: decision.description.clone(),
             rationale: decision.rationale.clone(),
-            task_id: task_id.to_string(),
+            task_id: Some(task_id.to_string()),
             agent: decided_by.to_string(),
             timestamp: decision.decided_at.to_rfc3339(),
             tags: vec![],
@@ -401,6 +401,78 @@ impl PlanManager {
 
         // Auto-anchor decision to files mentioned in content (fire-and-forget)
         self.spawn_auto_anchor_decision(&decision, project_for_task.as_ref());
+
+        Ok(decision)
+    }
+
+    /// Record a decision attached to NO task.
+    ///
+    /// The task-bound path is left exactly as it was: [`Self::add_decision`] keeps
+    /// its integrity check (bug 3693617b — a decision naming a task that does not
+    /// exist is still rejected). This path exists because a choice made outside
+    /// any plan had nowhere to go, and was therefore never recorded at all.
+    pub async fn add_decision_global(
+        &self,
+        req: CreateGlobalDecisionRequest,
+        decided_by: &str,
+    ) -> Result<DecisionNode> {
+        let decision = DecisionNode {
+            id: Uuid::new_v4(),
+            description: req.description.clone(),
+            rationale: req.rationale.clone(),
+            alternatives: req.alternatives.unwrap_or_default(),
+            chosen_option: req.chosen_option.clone(),
+            decided_by: decided_by.to_string(),
+            decided_at: chrono::Utc::now(),
+            status: DecisionStatus::Proposed,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+            sharing_consent: Default::default(),
+        };
+
+        self.neo4j.create_decision_global(&decision).await?;
+
+        // A decision taken outside a plan still belongs to a project when the
+        // caller says so. Without it the search document is simply not scoped —
+        // and the auto-anchoring has no root to resolve paths against.
+        let project = match req.project_id {
+            Some(project_id) => self.neo4j.get_project(project_id).await.ok().flatten(),
+            None => None,
+        };
+        let (project_id, project_slug) = match &project {
+            Some(project) => (Some(project.id.to_string()), Some(project.slug.clone())),
+            None => (None, None),
+        };
+
+        let doc = DecisionDocument {
+            id: decision.id.to_string(),
+            description: decision.description.clone(),
+            rationale: decision.rationale.clone(),
+            task_id: None,
+            agent: decided_by.to_string(),
+            timestamp: decision.decided_at.to_rfc3339(),
+            tags: vec![],
+            project_id,
+            project_slug,
+        };
+        self.meili.index_decision(&doc).await?;
+
+        // Generate and store embedding (best-effort, non-blocking)
+        self.embed_decision(decision.id, &decision.description, &decision.rationale)
+            .await;
+
+        self.emit(
+            CrudEvent::new(
+                EntityType::Decision,
+                CrudAction::Created,
+                decision.id.to_string(),
+            )
+            .with_payload(serde_json::json!({"description": &decision.description})),
+        );
+
+        // Auto-anchor decision to files mentioned in content (fire-and-forget)
+        self.spawn_auto_anchor_decision(&decision, project.as_ref());
 
         Ok(decision)
     }
@@ -544,7 +616,7 @@ impl PlanManager {
                 id: decision.id.to_string(),
                 description: decision.description.clone(),
                 rationale: decision.rationale.clone(),
-                task_id: task_id.to_string(),
+                task_id: Some(task_id.to_string()),
                 agent: decision.decided_by.clone(),
                 timestamp: decision.decided_at.to_rfc3339(),
                 tags: vec![],
@@ -588,18 +660,22 @@ impl PlanManager {
                 continue;
             }
 
-            // Parse task_id and resolve project
-            let task_id: Uuid = match doc.task_id.parse() {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::warn!(
-                        decision_id = %doc.id,
-                        task_id = %doc.task_id,
-                        error = %e,
-                        "Failed to parse task_id during backfill, skipping"
-                    );
-                    continue;
-                }
+            // Parse task_id and resolve project. A global decision has no task:
+            // there is nothing to backfill, and it is not an error.
+            let task_id: Uuid = match doc.task_id.as_deref() {
+                None => continue,
+                Some(raw) => match raw.parse() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!(
+                            decision_id = %doc.id,
+                            task_id = %raw,
+                            error = %e,
+                            "Failed to parse task_id during backfill, skipping"
+                        );
+                        continue;
+                    }
+                },
             };
 
             match self.neo4j.get_project_for_task(task_id).await {
@@ -622,7 +698,7 @@ impl PlanManager {
                 Ok(None) => {
                     tracing::debug!(
                         decision_id = %doc.id,
-                        task_id = %doc.task_id,
+                        task_id = ?doc.task_id,
                         "No project found for decision's task, skipping"
                     );
                 }
@@ -1717,7 +1793,7 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             description: "Old decision without project".to_string(),
             rationale: "Some rationale".to_string(),
-            task_id: task.id.to_string(),
+            task_id: Some(task.id.to_string()),
             agent: "old-agent".to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
             tags: vec![],

@@ -2422,6 +2422,64 @@ pub async fn add_decision(
     Ok(Json(decision))
 }
 
+/// Record a decision that belongs to NO task.
+///
+/// A choice of infrastructure made outside any plan had no way in: the
+/// task-bound route (`POST /api/tasks/{id}/decisions`) requires a task, so such
+/// a decision was either lost or forced into an unrelated task. This route
+/// creates the node on its own. The optional `project_id` of the body scopes the
+/// search document and lets the auto-anchoring resolve paths; it refuses nothing,
+/// so a caller that does not know the project can still record the decision.
+pub async fn add_decision_global(
+    State(state): State<OrchestratorState>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<CreateGlobalDecisionRequest>,
+) -> Result<Json<DecisionNode>, AppError> {
+    let explicit_run_id = req.run_id;
+    // The agent of the calling session; `agent`, as before, for anyone else.
+    let author = crate::api::note_handlers::caller_author(
+        &state,
+        claims.as_ref().map(|c| &c.0),
+        &headers,
+        "agent",
+    )
+    .await;
+
+    let decision = state
+        .orchestrator
+        .plan_manager()
+        .add_decision_global(req, &author)
+        .await?;
+
+    // No task means no project, so there is no active run to auto-detect from:
+    // only an explicitly named run is honoured here.
+    if let Some(rid) = explicit_run_id {
+        if let Err(e) = state
+            .orchestrator
+            .neo4j()
+            .create_produced_during("Decision", decision.id, rid)
+            .await
+        {
+            tracing::warn!(
+                decision_id = %decision.id,
+                run_id = %rid,
+                error = %e,
+                "Failed to create PRODUCED_DURING relation for global decision"
+            );
+        }
+    }
+
+    state.event_bus.emit_created(
+        crate::events::EntityType::Decision,
+        &decision.id.to_string(),
+        serde_json::json!({"description": &decision.description}),
+        None,
+    );
+
+    Ok(Json(decision))
+}
+
 /// Get a single decision by ID
 pub async fn get_decision(
     State(state): State<OrchestratorState>,

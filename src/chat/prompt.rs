@@ -773,7 +773,7 @@ Manage architectural decisions.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
-| add | `task_id` (req), `description` (req), `rationale`, `alternatives`, `chosen_option` | Record a decision |
+| add | `description` (req), `rationale`, `alternatives`, `chosen_option`, `task_id`, `project_id` | Record a decision. With no `task_id` it belongs to no task; `project_id` then only scopes search |
 | get | `decision_id` (req) | Get decision by UUID |
 | update | `decision_id` (req), `description`, `rationale`, `chosen_option`, `status` (proposed/accepted/deprecated/superseded) | Update decision |
 | delete | `decision_id` (req) | Delete a decision |
