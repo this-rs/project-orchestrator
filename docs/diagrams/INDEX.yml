@@ -244,7 +244,7 @@ diagrams:
     owner: theotime
     status: planned
     covers:
-      - "backend:src/neo4j/{mod,client,traits,impl_graph_store,data_migrations,batch,registry,analytics,symbol_key}.rs"
+      - "backend:src/neo4j/{mod,client,traits,impl_graph_store,data_migrations,batch,registry,analytics,symbol_key,file_uid}.rs"
       - "backend:migrations/**"
   - name: po-knowledge-notes
     owner: theotime
