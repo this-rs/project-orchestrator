@@ -38,9 +38,25 @@ pub mod close_reason {
     /// The session was torn down for an in-place provider switch. It writes no episode:
     /// the same thread must see only `provider_switched`.
     pub const SWITCHED: &str = "switched";
+    /// Not a close. The episode was taken on demand (`POST /api/episodes/collect` with a
+    /// `session_id`) while the session was still running on this instance: it is in
+    /// progress, and the snapshot says so instead of inventing an ending.
+    pub const OPEN: &str = "open";
+    /// Not a close either. The episode was taken on demand for a session this instance
+    /// does not run: it may have closed (its stored episode, listed by
+    /// `GET /api/episodes?source=session`, carries the real reason), died without a close,
+    /// or run elsewhere. The snapshot does not pretend to know.
+    pub const UNKNOWN: &str = "unknown";
 
-    /// Every reason this instance can write, for the test that counts them.
-    pub const ALL: &[&str] = &[USER_CLOSED, PROCESS_DIED, SUBAGENT_FINISHED, SWITCHED];
+    /// Every reason this instance can write or report, for the test that counts them.
+    pub const ALL: &[&str] = &[
+        USER_CLOSED,
+        PROCESS_DIED,
+        SUBAGENT_FINISHED,
+        SWITCHED,
+        OPEN,
+        UNKNOWN,
+    ];
 }
 
 // ============================================================================
