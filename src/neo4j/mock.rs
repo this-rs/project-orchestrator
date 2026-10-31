@@ -6225,6 +6225,7 @@ impl ProjectStore for MockGraphStore {
 
     async fn path_policy(&self, id: Uuid) -> Result<crate::neo4j::file_uid::PathPolicy> {
         use crate::neo4j::file_uid::PathPolicy;
+        self.count_read();
         let projects = self.projects.read().await;
         let Some(project) = projects.get(&id) else {
             return Ok(PathPolicy::none());

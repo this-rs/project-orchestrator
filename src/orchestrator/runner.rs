@@ -164,6 +164,10 @@ pub struct Orchestrator {
     /// LRU cache for parsed AST results, avoiding re-parsing unchanged files
     /// across consecutive syncs.
     ast_cache: tokio::sync::Mutex<crate::parser::ast_cache::AstCache>,
+    /// The stored form of each project's paths, one graph round trip per
+    /// project and TTL (see `file_uid::PathPolicyCache`), invalidated when a
+    /// project is updated.
+    path_policies: crate::neo4j::file_uid::PathPolicyCache,
 }
 
 /// Create an embedding provider from resolved [`Config`] fields.
@@ -376,6 +380,7 @@ impl Orchestrator {
             event_emitter: None,
             embedding_provider: embedding_provider.clone(),
             ast_cache: tokio::sync::Mutex::new(crate::parser::ast_cache::AstCache::new()),
+            path_policies: crate::neo4j::file_uid::PathPolicyCache::new(),
         })
     }
 
@@ -478,6 +483,7 @@ impl Orchestrator {
             event_emitter: Some(emitter),
             embedding_provider: embedding_provider.clone(),
             ast_cache: tokio::sync::Mutex::new(crate::parser::ast_cache::AstCache::new()),
+            path_policies: crate::neo4j::file_uid::PathPolicyCache::new(),
         })
     }
 
@@ -582,6 +588,7 @@ impl Orchestrator {
             event_emitter: Some(emitter),
             embedding_provider: embedding_provider.clone(),
             ast_cache: tokio::sync::Mutex::new(crate::parser::ast_cache::AstCache::new()),
+            path_policies: crate::neo4j::file_uid::PathPolicyCache::new(),
         })
     }
 
@@ -625,6 +632,14 @@ impl Orchestrator {
     /// Get the graph store as Arc (for sharing with ChatManager etc.)
     pub fn neo4j_arc(&self) -> Arc<dyn crate::neo4j::GraphStore> {
         self.state.neo4j.clone()
+    }
+
+    /// The stored form of a project's paths, from the per-project cache.
+    pub async fn path_policy(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::file_uid::PathPolicy> {
+        self.path_policies.get(&*self.state.neo4j, project_id).await
     }
 
     /// The resolved runtime configuration.
@@ -1754,7 +1769,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         // ONCE for the run. A sync that cannot read it does not guess: writing
         // in the wrong vocabulary creates a twin for every symbol it touches.
         let policy = match project_id {
-            Some(pid) => self.state.neo4j.path_policy(pid).await?,
+            Some(pid) => self.path_policies.get(&*self.state.neo4j, pid).await?,
             None => crate::neo4j::file_uid::PathPolicy::none(),
         };
 
@@ -2020,10 +2035,16 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         // paths (it canonicalizes the roots it watches), and a file written in
         // the other vocabulary would be a second node for every symbol it
         // contains.
-        let mut path_str = normalize_path(&path.to_string_lossy());
-        if let Some(pid) = project_id {
-            path_str = self.state.neo4j.path_policy(pid).await?.stored(&path_str);
-        }
+        let path_str = normalize_path(&path.to_string_lossy());
+        let path_str = match project_id {
+            Some(pid) => self
+                .path_policies
+                .get(&*self.state.neo4j, pid)
+                .await?
+                .stored(&path_str),
+            // No project: the canonical form, the invariant these syncs always had.
+            None => crate::neo4j::file_uid::PathPolicy::none().stored(&path_str),
+        };
         if !force {
             if let Some(existing) = self.state.neo4j.get_file(&path_str).await? {
                 use sha2::{Digest, Sha256};
@@ -4644,6 +4665,8 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         self.neo4j()
             .update_project(id, name.clone(), description, root_path.clone(), profile)
             .await?;
+        // The roots may have changed: the cached stored form must not outlive them.
+        self.path_policies.invalidate(id).await;
         let mut payload = serde_json::Map::new();
         if let Some(ref n) = name {
             payload.insert("name".into(), serde_json::json!(n));
@@ -5550,13 +5573,25 @@ pub fn scan_files(root: &Path) -> Vec<FileEntry> {
 
     let start = std::time::Instant::now();
     let mut entries = Vec::new();
-    // The real root is resolved ONCE: one chain of syscalls per scan, not per
-    // file (33 000 on the backend).
+    // The real root is resolved ONCE, and asked only about the LINKS the walk
+    // meets: a plain entry under a directory already inside the root cannot
+    // leave it, so 33 000 files cost 33 000 `realpath` only if each is a link.
+    // A link that points outside the repository is pruned with its subtree —
+    // the name-based list below cannot see it, and `follow_links(true)` would
+    // happily walk through it. Measured rule, not a list of names.
     let real_root = crate::neo4j::file_uid::RealRoot::new(root);
 
     for entry in WalkDir::new(root)
         .follow_links(true)
         .into_iter()
+        .filter_entry(|e| {
+            if !e.path_is_symlink() || real_root.contains(e.path()) {
+                true
+            } else {
+                tracing::debug!(path = %e.path().display(), "scan_files: link outside the project's real root");
+                false
+            }
+        })
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
     {
@@ -5575,15 +5610,6 @@ pub fn scan_files(root: &Path) -> Vec<FileEntry> {
         // Skip ignored directories (shared constant with watcher.rs)
         let path_str = path.to_string_lossy();
         if super::should_ignore_path(&path_str) {
-            continue;
-        }
-
-        // The durable perimeter: a file is accepted only if its REAL path is
-        // under the project root. The name-based list above cannot see a
-        // symlink that points outside the repository — and `follow_links(true)`
-        // happily walks through it. Measured rule, not a list of names.
-        if !real_root.contains(path) {
-            tracing::debug!(path = %path_str, "scan_files: outside the project's real root");
             continue;
         }
 
@@ -9383,7 +9409,10 @@ mod tests {
         );
 
         // Marked (what `migrate file-paths --apply` does): the declared form.
+        // `--apply` runs in another process: the server sees the marker when its
+        // cached policy expires (PATH_POLICY_TTL); here the cache is dropped.
         neo4j.paths_declared.write().await.insert(pid, true);
+        orch.path_policies.invalidate(pid).await;
         orch.sync_directory_for_project_with_options(&link, Some(pid), Some("linked"), true)
             .await
             .unwrap();

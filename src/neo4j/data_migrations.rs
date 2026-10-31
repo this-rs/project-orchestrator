@@ -635,25 +635,67 @@ fn import_items(row: &Row) -> Result<HashMap<String, BoltType>> {
 /// nothing to strip and every file of such a project would keep its absolute
 /// path in the identity — the very defect this series removes.
 ///
-/// Both roots strip: the sync now writes the **declared** form
-/// (`file_uid::under_declared_root`), the older nodes hold the canonical one,
-/// and the two must yield the same relative path — hence the same uid — or the
-/// rename of lot 3/3 would turn one file into two.
-const BACKFILL_FILE_UID: &str = r#"
+/// Computed in Rust (`PathPolicy::uid`), by the very function the write paths
+/// use: one grammar, nothing to keep in step. Both roots strip (the normalized
+/// `declared_path`, never the raw `root_path`): a declared and a canonical
+/// path of the same file yield the same uid, or the rename of lot 3/3 would
+/// turn one file into two. Paged by `path` from a cursor, like the stable-key
+/// backfills.
+const SELECT_FILES_WITHOUT_UID: &str = r#"
 MATCH (p:Project)
 WHERE p.canonical_path IS NOT NULL AND p.canonical_path <> ''
   AND ($scope IS NULL OR p.id = $scope)
-MATCH (f:File {project_id: p.id})
-WHERE f.uid IS NULL
-WITH f, p LIMIT $batch
-WITH f, p, CASE WHEN p.root_path IS NOT NULL AND p.root_path <> '' AND f.path STARTS WITH p.root_path + '/'
-                THEN substring(f.path, size(p.root_path) + 1)
-                WHEN f.path STARTS WITH p.canonical_path + '/'
-                THEN substring(f.path, size(p.canonical_path) + 1)
-                ELSE f.path END AS rel
-SET f.uid = p.id + ':' + rel
-RETURN count(f) AS processed
+MATCH (n:File {project_id: p.id})
+WHERE n.path >= $after
+  AND n.uid IS NULL AND n.uid_conflict IS NULL
+  AND n.path IS NOT NULL
+WITH n, p ORDER BY n.path LIMIT $batch
+RETURN elementId(n) AS eid, n.path AS cursor, n.path AS path, p.id AS pid,
+       coalesce(p.declared_path, p.root_path, '') AS declared,
+       p.canonical_path AS canonical
 "#;
+
+/// Another `File` may already hold the computed uid: the same file indexed
+/// through two mounts (real + link) before this series. Writing it would
+/// violate `file_uid`, fail the batch `MAX_RETRIES` times and — the filter
+/// being `uid IS NULL` — fail again at every boot. The second node is marked
+/// `uid_conflict` instead and leaves the selection; `migrate file-paths` folds
+/// it into its twin, and the uid coverage measure shows it until then.
+const WRITE_FILE_UID: &str = r#"
+UNWIND $items AS item
+MATCH (n:File) WHERE elementId(n) = item.eid
+OPTIONAL MATCH (o:File {uid: item.uid}) WHERE o <> n
+// The two duplicates usually sit in the SAME batch, and Cypher evaluates every
+// OPTIONAL MATCH before the first SET: the second row would not see the first
+// one's uid. Within the batch, the first row for a uid wins; the others are
+// conflicts, like a holder already in the graph.
+WITH collect({n: n, uid: item.uid, held: o IS NOT NULL}) AS rows
+UNWIND range(0, size(rows) - 1) AS i
+WITH rows[i] AS row,
+     rows[i].held OR any(r IN rows[0..i] WHERE r.uid = rows[i].uid) AS conflict
+WITH row.n AS n, row.uid AS uid, conflict
+SET n.uid = CASE WHEN conflict THEN n.uid ELSE uid END,
+    n.uid_conflict = CASE WHEN conflict THEN uid ELSE n.uid_conflict END
+RETURN count(n) AS processed,
+       sum(CASE WHEN conflict THEN 1 ELSE 0 END) AS deferred
+"#;
+
+fn file_uid_items(row: &Row) -> Result<HashMap<String, BoltType>> {
+    use crate::neo4j::file_uid::PathPolicy;
+    let eid: String = row.get("eid")?;
+    let path: String = row.get("path")?;
+    let pid: String = row.get("pid")?;
+    let declared: String = row.get("declared")?;
+    let canonical: String = row.get("canonical")?;
+    let project = Uuid::parse_str(&pid).with_context(|| format!("project id {pid}"))?;
+    // `declared=false`: the stored form of an unmigrated project is canonical,
+    // but `uid` strips either root, so the flag does not matter here.
+    let uid = PathPolicy::new(&declared, &canonical, false).uid(Some(project), &path);
+    let mut m = HashMap::new();
+    m.insert("eid".into(), eid.into());
+    m.insert("uid".into(), uid.into());
+    Ok(m)
+}
 
 /// Backfill `File.uid` for the files that belong to no project.
 ///
@@ -773,8 +815,11 @@ impl Neo4jClient {
                 id: "2026-10-backfill-file-uid",
                 description:
                     "Give every file a mount-independent identity (project + relative path)",
-                batch: BACKFILL_FILE_UID.to_string(),
-                compute: None,
+                batch: SELECT_FILES_WITHOUT_UID.to_string(),
+                compute: Some(ComputedBatch {
+                    items: file_uid_items,
+                    write: WRITE_FILE_UID,
+                }),
                 finalize: None,
             },
             DataMigration {
@@ -1207,20 +1252,42 @@ mod tests {
         };
 
         let projects = by_id("2026-10-backfill-file-uid");
-        assert!(projects.contains("n.canonical_path") || projects.contains("p.canonical_path"));
-        // Les deux racines retirent le préfixe : le sync écrit désormais la forme
-        // déclarée, les anciens nœuds portent la canonique, et l'uid doit être
-        // le même par les deux chemins — sinon le renommage ferait deux fichiers.
+        assert!(projects.contains("p.canonical_path"));
+        // Les deux racines retirent le préfixe — la forme déclarée NORMALISÉE
+        // (`declared_path`), jamais `root_path` brut — et l'uid est calculé en
+        // Rust par `PathPolicy::uid`, la fonction des chemins d'écriture.
         assert!(
-            projects.contains("f.path STARTS WITH p.root_path + '/'"),
-            "the declared root strips too"
+            projects.contains("coalesce(p.declared_path, p.root_path, '') AS declared"),
+            "the normalized declared root is read, the raw root_path only as a fallback"
         );
         assert!(
-            projects.contains("substring("),
-            "the relative path is a suffix"
+            !projects.contains("substring("),
+            "no Cypher re-implementation of the grammar"
         );
-        assert!(projects.contains("f.uid IS NULL"), "idempotent");
-        assert!(projects.contains("SET f.uid"));
+        assert!(
+            projects.contains("n.uid IS NULL AND n.uid_conflict IS NULL"),
+            "idempotent, and a conflicting node leaves the selection"
+        );
+        let compute = migrations
+            .iter()
+            .find(|m| m.id == "2026-10-backfill-file-uid")
+            .and_then(|m| m.compute.as_ref())
+            .expect("the uid is computed in Rust");
+        assert!(compute
+            .write
+            .contains("OPTIONAL MATCH (o:File {uid: item.uid}) WHERE o <> n"));
+        assert!(
+            compute
+                .write
+                .contains("n.uid_conflict = CASE WHEN conflict THEN uid"),
+            "a uid another file already holds is recorded as a conflict, never written twice"
+        );
+        assert!(
+            compute
+                .write
+                .contains("any(r IN rows[0..i] WHERE r.uid = rows[i].uid)"),
+            "two duplicates in one batch: the first wins, the other is a conflict"
+        );
 
         let orphans = by_id("2026-10-backfill-file-uid-orphans");
         assert!(

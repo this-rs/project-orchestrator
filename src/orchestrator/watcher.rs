@@ -625,10 +625,17 @@ async fn flush_pending_files(
 
         // Invalidate GraIL computed properties on changed files + neighbors
         {
-            let invalidation_paths: Vec<String> = files
-                .iter()
-                .map(|p| super::runner::normalize_path(&p.to_string_lossy()))
-                .collect();
+            let invalidation_paths = match orchestrator.path_policy(pid).await {
+                Ok(policy) => stored_paths(&policy, &files),
+                Err(e) => {
+                    tracing::warn!(
+                        "Cannot read the path policy of '{}': {} — invalidation skipped",
+                        ctx.project_slug,
+                        e
+                    );
+                    Vec::new()
+                }
+            };
             match orchestrator
                 .neo4j()
                 .invalidate_computed_properties(pid, &invalidation_paths)
@@ -702,7 +709,7 @@ async fn flush_pending_files(
         // The watcher hands over REAL paths (it canonicalizes the roots it
         // watches) while the graph holds the project's vocabulary: a lookup in
         // the wrong form deletes nothing and would count as a success.
-        let policy = match orchestrator.neo4j().path_policy(pid).await {
+        let policy = match orchestrator.path_policy(pid).await {
             Ok(policy) => policy,
             Err(e) => {
                 tracing::warn!(
@@ -715,9 +722,7 @@ async fn flush_pending_files(
             }
         };
 
-        for path in &files {
-            let path_str = policy.stored(&super::runner::normalize_path(&path.to_string_lossy()));
-
+        for path_str in stored_paths(&policy, &files) {
             // Remove from Neo4j (File node + all children symbols + relationships)
             if let Err(e) = orchestrator.neo4j().delete_file(&path_str).await {
                 tracing::warn!("Failed to delete {} from Neo4j: {}", path_str, e);
@@ -745,10 +750,7 @@ async fn flush_pending_files(
 
         // Invalidate GraIL computed properties on deleted files + neighbors
         {
-            let deletion_paths: Vec<String> = files
-                .iter()
-                .map(|p| super::runner::normalize_path(&p.to_string_lossy()))
-                .collect();
+            let deletion_paths = stored_paths(&policy, &files);
             match orchestrator
                 .neo4j()
                 .invalidate_computed_properties(pid, &deletion_paths)
@@ -821,8 +823,9 @@ async fn flush_pending_files(
             "Deleting {} orphan file(s) from graph (no project)",
             orphan_deletions.len()
         );
-        for path in &orphan_deletions {
-            let path_str = super::runner::normalize_path(&path.to_string_lossy());
+        // No project: the canonical form, like the orphan syncs.
+        let none = crate::neo4j::file_uid::PathPolicy::none();
+        for path_str in stored_paths(&none, &orphan_deletions) {
             if let Err(e) = orchestrator.neo4j().delete_file(&path_str).await {
                 tracing::warn!("Failed to delete orphan {} from Neo4j: {}", path_str, e);
             }
@@ -835,6 +838,23 @@ async fn flush_pending_files(
             }
         }
     }
+}
+
+/// The stored form of each path, for the project `policy` describes.
+///
+/// Every exit of the watcher toward the graph (sync, deletion, GraIL
+/// invalidation of changed and deleted files, orphan deletion) goes through
+/// here: notify hands over REAL paths (the watched roots are canonicalized),
+/// and a lookup in the other vocabulary finds nothing — a deletion counted as a
+/// success, computed properties left "fresh" after an edit.
+fn stored_paths<'a>(
+    policy: &crate::neo4j::file_uid::PathPolicy,
+    files: impl IntoIterator<Item = &'a PathBuf>,
+) -> Vec<String> {
+    files
+        .into_iter()
+        .map(|p| policy.stored(&super::runner::normalize_path(&p.to_string_lossy())))
+        .collect()
 }
 
 /// Resolve which project a file belongs to by finding the longest matching
@@ -1222,22 +1242,48 @@ async fn handle_project_updated(
 mod tests {
     use super::*;
 
-    /// Une suppression cherche le nœud par `File.path` : le chemin doit être
-    /// mis dans la forme STOCKÉE du projet avant `delete_file`, sinon la
-    /// recherche ne trouve rien et la suppression est comptée réussie.
+    /// Les quatre sorties du watcher vers le graphe (sync, suppression, deux
+    /// invalidations GraIL) passent par `stored_paths` : le watcher livre des
+    /// chemins RÉELS (il canonicalise les racines qu'il surveille), le graphe
+    /// tient le vocabulaire du projet — une recherche dans la mauvaise forme ne
+    /// trouve rien et compte un succès.
+    #[cfg(unix)]
     #[test]
-    fn a_deletion_looks_up_the_stored_form_of_the_path() {
-        let src = include_str!("watcher.rs");
-        let policy = src
-            .find(".path_policy(pid)")
-            .expect("the deletion reads the project's path policy");
-        let stored = src
-            .find("policy.stored(&super::runner::normalize_path(")
-            .expect("the deletion maps the path to the stored form");
-        let delete = src
-            .find(".delete_file(&path_str)")
-            .expect("the deletion by path");
-        assert!(policy < stored && stored < delete);
+    fn the_watcher_hands_the_graph_the_stored_form_of_every_path() {
+        use crate::neo4j::file_uid::PathPolicy;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/a.rs"), "fn a() {}").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let declared = link.to_string_lossy().to_string();
+        // What notify hands over: the real path (the watched root is canonical),
+        // for a file that still exists and for one that is already gone.
+        let real_root = real.canonicalize().unwrap();
+        let real_file = real_root.join("src/a.rs");
+        let files = vec![real_file.clone(), real_root.join("src/./gone.rs")];
+
+        let marked = PathPolicy::new(&declared, "", true);
+        assert_eq!(
+            stored_paths(&marked, &files),
+            vec![
+                format!("{declared}/src/a.rs"),
+                format!("{declared}/src/gone.rs")
+            ],
+            "a marked project is looked up in the declared form, deleted files included"
+        );
+        let unmarked = PathPolicy::new(&declared, "", false);
+        assert_eq!(
+            stored_paths(&unmarked, &files)[0],
+            real_file.display().to_string(),
+            "an unmarked project keeps the canonical form"
+        );
+        assert_eq!(
+            stored_paths(&PathPolicy::none(), &[link.join("src/a.rs")])[0],
+            real_file.display().to_string(),
+            "no project: the canonical form, like the orphan syncs"
+        );
     }
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;

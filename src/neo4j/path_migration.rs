@@ -6,7 +6,7 @@
 //! `~/.openclaw/workspace/skills/project-orchestrator/…`: 815 `File`, 132 111
 //! `Function` and 1 878 notes anchored on paths no user ever typed (measured
 //! 31/10/2026). The write boundary now produces the declared form
-//! (`file_uid::under_declared_root`); this module brings the existing nodes to
+//! (`file_uid::PathPolicy`, once the project is marked); this module brings the existing nodes to
 //! the same form, in place.
 //!
 //! # Why a command and not a `DataMigration`
@@ -82,11 +82,15 @@ const KNOWLEDGE_EDGES: &str =
 
 /// The project clause shared by every rename pass: the project is read by
 /// `$scope`, and nothing happens when the two roots are the same (no alias).
+/// Both roots are the NORMALIZED properties written in Rust (`declared_path`:
+/// tilde expanded, no trailing `/`; `canonical_path`) — never the raw
+/// `root_path`, whose tilde or trailing slash would make every `STARTS WITH`
+/// false and every rewritten path a `~/…` no scan ever produces.
 const RENAMABLE_PROJECT: &str = r#"
 MATCH (p:Project {id: $scope})
 WHERE p.canonical_path IS NOT NULL AND p.canonical_path <> ''
-  AND p.root_path IS NOT NULL AND p.root_path <> ''
-  AND p.root_path <> p.canonical_path
+  AND p.declared_path IS NOT NULL AND p.declared_path <> ''
+  AND p.declared_path <> p.canonical_path
 "#;
 
 /// (a) `File.path`: alias → declared. In place (`SET`), never recreated.
@@ -100,9 +104,9 @@ fn rename_files_query() -> String {
 MATCH (f:File {{project_id: p.id}})
 WHERE f.path STARTS WITH p.canonical_path + '/'
   AND none(seg IN {WORKTREE_SEGMENTS} WHERE f.path CONTAINS seg)
-  AND NOT EXISTS {{ MATCH (:File {{path: p.root_path + substring(f.path, size(p.canonical_path))}}) }}
+  AND NOT EXISTS {{ MATCH (:File {{path: p.declared_path + substring(f.path, size(p.canonical_path))}}) }}
 WITH f, p LIMIT $batch
-SET f.path = p.root_path + substring(f.path, size(p.canonical_path))
+SET f.path = p.declared_path + substring(f.path, size(p.canonical_path))
 RETURN count(f) AS processed
 "#
     )
@@ -126,14 +130,14 @@ WHERE n.file_path STARTS WITH p.canonical_path + '/'
   AND (n.project_id = p.id OR n.project_id IS NULL OR n.project_id = '')
   AND none(seg IN {WORKTREE_SEGMENTS} WHERE n.file_path CONTAINS seg)
   AND NOT (n.id STARTS WITH p.canonical_path + '/'
-           AND EXISTS {{ MATCH (:{label} {{id: p.root_path + substring(n.id, size(p.canonical_path))}}) }})
+           AND EXISTS {{ MATCH (:{label} {{id: p.declared_path + substring(n.id, size(p.canonical_path))}}) }})
 WITH n, p LIMIT $batch
-SET n.file_path = p.root_path + substring(n.file_path, size(p.canonical_path)),
+SET n.file_path = p.declared_path + substring(n.file_path, size(p.canonical_path)),
     n.id = CASE WHEN n.id STARTS WITH p.canonical_path + '/'
-                THEN p.root_path + substring(n.id, size(p.canonical_path))
+                THEN p.declared_path + substring(n.id, size(p.canonical_path))
                 ELSE n.id END,
     n.stable_key = CASE WHEN n.stable_key STARTS WITH p.canonical_path + '/'
-                        THEN p.root_path + substring(n.stable_key, size(p.canonical_path))
+                        THEN p.declared_path + substring(n.stable_key, size(p.canonical_path))
                         ELSE n.stable_key END
 RETURN count(n) AS processed
 "#
@@ -151,11 +155,11 @@ WHERE a.target_type IN ['file', 'function']
   AND a.target_id STARTS WITH p.canonical_path + '/'
   AND none(seg IN {WORKTREE_SEGMENTS} WHERE a.target_id CONTAINS seg)
   AND NOT EXISTS {{ MATCH (:Anchor {{session_id: a.session_id, target_type: a.target_type,
-                                   target_id: p.root_path + substring(a.target_id, size(p.canonical_path))}}) }}
+                                   target_id: p.declared_path + substring(a.target_id, size(p.canonical_path))}}) }}
 WITH a, p LIMIT $batch
-SET a.target_id = p.root_path + substring(a.target_id, size(p.canonical_path)),
+SET a.target_id = p.declared_path + substring(a.target_id, size(p.canonical_path)),
     a.snapshot_path = CASE WHEN a.snapshot_path STARTS WITH p.canonical_path + '/'
-                           THEN p.root_path + substring(a.snapshot_path, size(p.canonical_path))
+                           THEN p.declared_path + substring(a.snapshot_path, size(p.canonical_path))
                            ELSE a.snapshot_path END
 RETURN count(a) AS processed
 "#
@@ -178,11 +182,11 @@ fn wl_twin_expr(path: &str, root: &str) -> String {
 /// once its replacement exists. A copy without a twin keeps its edges until the
 /// purge gate decides what they are worth — never a silent `DETACH`.
 fn rehome_wl_knowledge_query() -> String {
-    let twin = wl_twin_expr("w.path", "p.root_path");
+    let twin = wl_twin_expr("w.path", "p.declared_path");
     format!(
         r#"
 MATCH (p:Project {{id: $scope}})
-WHERE p.root_path IS NOT NULL AND p.root_path <> ''
+WHERE p.declared_path IS NOT NULL AND p.declared_path <> ''
 MATCH (k)-[r]->(w:File {{project_id: p.id}})
 WHERE w.path CONTAINS '{WL_SEGMENT}'
   AND type(r) IN {KNOWLEDGE_EDGES}
@@ -226,7 +230,7 @@ WHERE p.canonical_path IS NOT NULL AND p.canonical_path <> ''
 MATCH (n)
 WHERE {labels}
   AND n.file_path CONTAINS '{WL_SEGMENT}'
-  AND (n.file_path STARTS WITH p.canonical_path + '/' OR n.file_path STARTS WITH p.root_path + '/')
+  AND (n.file_path STARTS WITH p.canonical_path + '/' OR n.file_path STARTS WITH p.declared_path + '/')
 WITH n LIMIT $batch
 WITH collect(n) AS doomed
 FOREACH (x IN doomed | DETACH DELETE x)
@@ -479,7 +483,7 @@ fn merge_file_twins_query() -> String {
 MATCH (n:File {{project_id: p.id}})
 WHERE n.path STARTS WITH p.canonical_path + '/'
   AND none(seg IN {WORKTREE_SEGMENTS} WHERE n.path CONTAINS seg)
-MATCH (t:File {{path: p.root_path + substring(n.path, size(p.canonical_path))}})
+MATCH (t:File {{path: p.declared_path + substring(n.path, size(p.canonical_path))}})
 WITH n, t LIMIT $batch
 CALL apoc.refactor.mergeNodes([t, n], {{properties: 'discard', mergeRels: true}}) YIELD node
 RETURN count(node) AS processed
@@ -496,7 +500,7 @@ WHERE n.file_path STARTS WITH p.canonical_path + '/'
   AND (n.project_id = p.id OR n.project_id IS NULL OR n.project_id = '')
   AND none(seg IN {WORKTREE_SEGMENTS} WHERE n.file_path CONTAINS seg)
   AND n.id STARTS WITH p.canonical_path + '/'
-MATCH (t:{label} {{id: p.root_path + substring(n.id, size(p.canonical_path))}})
+MATCH (t:{label} {{id: p.declared_path + substring(n.id, size(p.canonical_path))}})
 WITH n, t LIMIT $batch
 CALL apoc.refactor.mergeNodes([t, n], {{properties: 'discard', mergeRels: true}}) YIELD node
 RETURN count(node) AS processed
@@ -828,20 +832,64 @@ impl Neo4jClient {
     /// Run the rename passes (a)–(d). Writes `canonical_path` first, because
     /// the passes read it from the node. Stops at the first failed pass.
     pub async fn file_path_rename(&self, plan: &RenamePlan) -> Result<Vec<MigrationOutcome>> {
+        // APOC first, before ANY write: the merge and purge passes need it, and
+        // failing after the rename had started would leave two vocabularies.
+        self.require_apoc().await?;
         self.ensure_project_canonical_paths()
             .await
             .context("canonical_path repair")?;
-        // The marker FIRST: from here every sync writes the declared form, the
-        // form the passes below converge to. A sync that runs during the
-        // migration can at worst create a declared twin of an alias node — the
-        // merge passes fold it. Marking last would let such a sync create new
-        // alias nodes after the rename had passed them.
-        self.mark_paths_declared(plan.project_id)
+        // Hard precondition: every file of the project carries its uid. A file
+        // without one would, after the marker, be re-created under the declared
+        // path by the next sync (MERGE on a uid no node has) and the original
+        // deleted as stale with its knowledge edges.
+        let before = self.file_path_measures(plan).await?;
+        anyhow::ensure!(
+            before.files_with_uid == before.files_total,
+            "couverture uid incomplète ({}/{}) : le backfill `2026-10-backfill-file-uid` doit \
+             avoir tourné (et les conflits `uid_conflict` être résolus) avant le renommage",
+            before.files_with_uid,
+            before.files_total
+        );
+        let passes = async {
+            let mut outcomes = self.run_passes(plan, rename_passes()).await?;
+            outcomes.extend(self.run_passes(plan, merge_twin_passes()).await?);
+            Ok::<_, anyhow::Error>(outcomes)
+        }
+        .await;
+        match passes {
+            Ok(outcomes) => {
+                // The marker LAST, once every node is in the declared form: from
+                // here the sync writes that form. A sync that ran DURING the
+                // passes wrote the canonical one; `run` re-measures and says
+                // "rejouer" when alias nodes remain (every pass is idempotent).
+                self.mark_paths_declared(plan.project_id)
+                    .await
+                    .context("paths_declared marker")?;
+                Ok(outcomes)
+            }
+            Err(e) => {
+                // Never leave the marker on a half-renamed project.
+                if let Err(u) = self.unmark_paths_declared(plan.project_id).await {
+                    tracing::warn!(error = %u, "paths_declared could not be removed");
+                }
+                Err(e.context(
+                    "renommage interrompu : le marqueur paths_declared est retiré, le sync garde \
+                     la forme canonique ; corriger la cause puis REJOUER `--apply` (idempotent)",
+                ))
+            }
+        }
+    }
+
+    /// The migration passes use APOC (`apoc.refactor.mergeNodes`,
+    /// `apoc.merge.relationship`), like `2026-10-rehome-worktree-knowledge` at
+    /// boot. Refuse before the first write when it is absent.
+    pub async fn require_apoc(&self) -> Result<()> {
+        // `apoc.version()` is a FUNCTION in APOC 5.x (not a procedure).
+        self.graph
+            .run(query("RETURN apoc.version() AS version"))
             .await
-            .context("paths_declared marker")?;
-        let mut outcomes = self.run_passes(plan, rename_passes()).await?;
-        outcomes.extend(self.run_passes(plan, merge_twin_passes()).await?);
-        Ok(outcomes)
+            .context("APOC est requis par `migrate file-paths` (apoc.refactor.mergeNodes, apoc.merge.relationship) et n'est pas installé sur ce Neo4j")?;
+        Ok(())
     }
 
     /// Run the purge passes — the caller has checked [`purge_gate`].
@@ -882,6 +930,8 @@ pub async fn run(client: &Neo4jClient, slug: &str, apply: bool, purge_wl: bool) 
         return Ok(0);
     }
 
+    // APOC before any write (the merge and purge passes need it).
+    client.require_apoc().await?;
     println!("== Renommage (--apply)");
     for o in client.file_path_rename(&plan).await? {
         println!(
@@ -891,6 +941,12 @@ pub async fn run(client: &Neo4jClient, slug: &str, apply: bool, purge_wl: bool) 
     }
     let after = client.file_path_measures(&plan).await?;
     print!("{}", render_measures("Mesures après renommage", &after));
+    if after.alias_files > 0 || after.alias_symbols.iter().any(|(_, n)| *n > 0) {
+        println!(
+            "Des chemins de l'alias subsistent (un sync a écrit pendant la migration) : \
+             REJOUER `--apply` (idempotent) jusqu'à 0."
+        );
+    }
 
     if !purge_wl {
         if after.wl_files > 0 {
@@ -950,7 +1006,7 @@ mod tests {
         for pass in &passes {
             assert!(pass.id.starts_with("file-paths/merge-"), "{}", pass.id);
             assert!(pass.batch.contains("p.canonical_path"));
-            assert!(pass.batch.contains("p.root_path <> p.canonical_path"));
+            assert!(pass.batch.contains("p.declared_path <> p.canonical_path"));
             // Le jumeau d'abord dans la liste : c'est lui qui survit.
             assert!(
                 pass.batch.contains(
@@ -971,22 +1027,12 @@ mod tests {
             );
         }
         assert!(merge_file_twins_query()
-            .contains("MATCH (t:File {path: p.root_path + substring(n.path"));
+            .contains("MATCH (t:File {path: p.declared_path + substring(n.path"));
         for label in SYMBOL_LABELS {
             assert!(merge_symbol_twins_query(label).contains(&format!(
-                "MATCH (t:{label} {{id: p.root_path + substring(n.id"
+                "MATCH (t:{label} {{id: p.declared_path + substring(n.id"
             )));
         }
-    }
-
-    #[test]
-    fn the_merge_runs_after_the_rename_and_the_marker_is_set_first() {
-        let src = include_str!("path_migration.rs");
-        let body = &src[src.find("pub async fn file_path_rename").unwrap()..];
-        let mark = body.find("mark_paths_declared(plan.project_id)").unwrap();
-        let rename = body.find("run_passes(plan, rename_passes())").unwrap();
-        let merge = body.find("run_passes(plan, merge_twin_passes())").unwrap();
-        assert!(mark < rename && rename < merge);
     }
 
     /// Hors du chemin de boot : aucune passe n'est une `DataMigration` enregistrée.
@@ -1053,9 +1099,9 @@ mod tests {
     fn the_rename_passes_read_both_roots_from_the_project() {
         for pass in rename_passes() {
             assert!(pass.batch.contains("p.canonical_path"), "{}", pass.id);
-            assert!(pass.batch.contains("p.root_path"), "{}", pass.id);
+            assert!(pass.batch.contains("p.declared_path"), "{}", pass.id);
             assert!(
-                pass.batch.contains("p.root_path <> p.canonical_path"),
+                pass.batch.contains("p.declared_path <> p.canonical_path"),
                 "{}",
                 pass.id
             );
@@ -1066,7 +1112,7 @@ mod tests {
                 pass.id
             );
             assert!(
-                pass.batch.contains("p.root_path + substring("),
+                pass.batch.contains("p.declared_path + substring("),
                 "{}",
                 pass.id
             );
@@ -1076,13 +1122,15 @@ mod tests {
     #[test]
     fn the_file_pass_renames_the_path_and_leaves_the_uid_alone() {
         let q = rename_files_query();
-        assert!(q.contains("SET f.path = p.root_path + substring(f.path, size(p.canonical_path))"));
+        assert!(
+            q.contains("SET f.path = p.declared_path + substring(f.path, size(p.canonical_path))")
+        );
         assert!(
             !q.contains("uid"),
             "File.uid is computed on the relative path: untouched"
         );
         // Un jumeau déjà présent bloque le renommage au lieu de violer la contrainte.
-        assert!(q.contains("NOT EXISTS { MATCH (:File {path: p.root_path + substring("));
+        assert!(q.contains("NOT EXISTS { MATCH (:File {path: p.declared_path + substring("));
     }
 
     /// Une copie de worktree n'est jamais renommée : elle est purgée.
@@ -1111,13 +1159,13 @@ mod tests {
             // sous l'alias) : l'appartenance est le préfixe, l'id quand il existe.
             assert!(q.contains("n.project_id = p.id OR n.project_id IS NULL"));
             assert!(!q.contains(&format!("(n:{label} {{project_id")));
-            assert!(q.contains("SET n.file_path = p.root_path + substring(n.file_path"));
+            assert!(q.contains("SET n.file_path = p.declared_path + substring(n.file_path"));
             assert!(q.contains("n.id = CASE WHEN n.id STARTS WITH p.canonical_path + '/'"));
             assert!(q.contains(
                 "n.stable_key = CASE WHEN n.stable_key STARTS WITH p.canonical_path + '/'"
             ));
             assert!(q.contains(&format!(
-                "MATCH (:{label} {{id: p.root_path + substring(n.id"
+                "MATCH (:{label} {{id: p.declared_path + substring(n.id"
             )));
         }
         assert_eq!(SYMBOL_LABELS.len(), 7);
@@ -1184,7 +1232,7 @@ mod tests {
     fn the_anchor_pass_covers_file_and_function_anchors() {
         let q = rename_anchors_query();
         assert!(q.contains("a.target_type IN ['file', 'function']"));
-        assert!(q.contains("SET a.target_id = p.root_path + substring(a.target_id"));
+        assert!(q.contains("SET a.target_id = p.declared_path + substring(a.target_id"));
         assert!(q.contains("a.snapshot_path"));
         // La contrainte (session_id, target_type, target_id) est respectée.
         assert!(q.contains("session_id: a.session_id, target_type: a.target_type"));
@@ -1229,8 +1277,8 @@ mod tests {
 
     #[test]
     fn the_wl_twin_strips_one_level_of_scaffolding() {
-        let e = wl_twin_expr("w.path", "p.root_path");
-        assert!(e.starts_with("p.root_path + '/' + substring(split(w.path, '/.wl/')[1]"));
+        let e = wl_twin_expr("w.path", "p.declared_path");
+        assert!(e.starts_with("p.declared_path + '/' + substring(split(w.path, '/.wl/')[1]"));
     }
 
     #[test]

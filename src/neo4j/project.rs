@@ -3,7 +3,9 @@
 use crate::neo4j::traits::*;
 
 use super::client::{Neo4jClient, WhereBuilder};
-use super::file_uid::{canonical_path_update, canonical_root, try_canonical_root, PathPolicy};
+use super::file_uid::{
+    canonical_path_update, canonical_root, declared_root_of, try_canonical_root, PathPolicy,
+};
 use super::models::*;
 use anyhow::Result;
 use neo4rs::query;
@@ -24,6 +26,7 @@ impl Neo4jClient {
                 slug: $slug,
                 root_path: $root_path,
                 canonical_path: $canonical_path,
+                declared_path: $declared_path,
                 paths_declared: true,
                 description: $description,
                 created_at: datetime($created_at),
@@ -40,6 +43,9 @@ impl Neo4jClient {
         // (le sync résout les liens) : sans elle, on ne sait pas calculer le
         // chemin relatif d'un fichier, donc pas son identité (`file_uid`).
         .param("canonical_path", canonical_root(Some(&project.root_path)))
+        // La forme déclarée NORMALISÉE (tilde étendu, sans `/` final) : c'est
+        // elle que tout le Cypher lit, jamais `root_path` brut.
+        .param("declared_path", declared_root_of(&project.root_path))
         .param(
             "description",
             project.description.clone().unwrap_or_default(),
@@ -135,6 +141,7 @@ impl Neo4jClient {
             // La racine déclarée a changé : la canonique aussi, sans quoi les
             // identités de fichiers resteraient calculées contre l'ancienne.
             set_clauses.push("p.canonical_path = $canonical_path");
+            set_clauses.push("p.declared_path = $declared_path");
         }
         if profile.is_some() {
             set_clauses.push("p.profile = $profile");
@@ -159,6 +166,7 @@ impl Neo4jClient {
             q = q.param("description", desc.unwrap_or_default());
         }
         if let Some(root_path) = root_path {
+            q = q.param("declared_path", declared_root_of(&root_path));
             q = q.param("root_path", root_path);
             q = q.param("canonical_path", canonical);
         }
@@ -183,7 +191,8 @@ impl Neo4jClient {
             r#"
             MATCH (p:Project)
             WHERE p.root_path IS NOT NULL AND p.root_path <> ''
-            RETURN p.id AS id, p.root_path AS root_path, p.canonical_path AS canonical_path
+            RETURN p.id AS id, p.root_path AS root_path, p.canonical_path AS canonical_path,
+                   p.declared_path AS declared_path
             "#,
         );
         let mut result = self.graph.execute(q).await?;
@@ -197,6 +206,12 @@ impl Neo4jClient {
             };
             let declared = row.get::<String>("root_path").unwrap_or_default();
             let stored = row.get::<String>("canonical_path").unwrap_or_default();
+            let stored_declared = row.get::<String>("declared_path").unwrap_or_default();
+            // The normalized declared root (tilde expanded, no trailing `/`):
+            // the only form the Cypher side reads, never the raw `root_path`.
+            let normalized = declared_root_of(&declared);
+            let declared_update =
+                (!normalized.is_empty() && normalized != stored_declared).then_some(normalized);
             // A root that cannot be resolved at THIS boot (a volume not mounted)
             // never overwrites a value computed when it was: that would change
             // how every uid of the project is derived, in silence.
@@ -209,17 +224,36 @@ impl Neo4jClient {
                     "Project root cannot be resolved at this boot: canonical_path kept as stored"
                 );
             }
-            let Some(next) = canonical_path_update(&stored, resolved.as_deref(), &declared) else {
+            let canonical_update = canonical_path_update(&stored, resolved.as_deref(), &declared);
+            if declared_update.is_none() && canonical_update.is_none() {
                 continue;
-            };
-            let q = query("MATCH (p:Project {id: $id}) SET p.canonical_path = $canonical")
-                .param("id", id)
-                .param("canonical", next);
+            }
+            let q = query(
+                "MATCH (p:Project {id: $id})
+                 SET p.canonical_path = coalesce($canonical, p.canonical_path),
+                     p.declared_path = coalesce($declared, p.declared_path)",
+            )
+            .param("id", id)
+            .param("canonical", canonical_update)
+            .param("declared", declared_update);
             if self.graph.run(q).await.is_ok() {
                 updated += 1;
             }
         }
         Ok((scanned, updated))
+    }
+
+    /// Forget that this project's paths are in the declared form — after a
+    /// rename pass failed, so that no sync writes a vocabulary the nodes do not
+    /// have yet. The next `migrate file-paths --apply` sets it again.
+    pub async fn unmark_paths_declared(&self, id: Uuid) -> Result<()> {
+        self.graph
+            .run(
+                query("MATCH (p:Project {id: $id}) REMOVE p.paths_declared")
+                    .param("id", id.to_string()),
+            )
+            .await?;
+        Ok(())
     }
 
     /// The stored form of this project's paths — see [`PathPolicy`]. A project
@@ -228,7 +262,7 @@ impl Neo4jClient {
         let q = query(
             r#"
             MATCH (p:Project {id: $id})
-            RETURN coalesce(p.root_path, '') AS root,
+            RETURN coalesce(p.declared_path, p.root_path, '') AS root,
                    coalesce(p.canonical_path, '') AS canonical,
                    coalesce(p.paths_declared, false) AS declared
             "#,

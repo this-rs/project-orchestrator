@@ -87,6 +87,9 @@ pub(crate) struct SkillActivationHook {
     /// The resolved project of the session (mode `on`); `None`: the historical
     /// project-from-tool-cwd resolution.
     session_project: Option<Arc<super::anchor_resolver::SessionProject>>,
+    /// The stored form of each project's paths — one graph round trip per
+    /// project and TTL, not one per Read/Edit/Write.
+    path_policies: crate::neo4j::file_uid::PathPolicyCache,
 }
 
 impl SkillActivationHook {
@@ -106,6 +109,7 @@ impl SkillActivationHook {
             persona_index: RwLock::new(HashMap::new()),
             ledger,
             session_project: None,
+            path_policies: crate::neo4j::file_uid::PathPolicyCache::new(),
         }
     }
 
@@ -520,8 +524,8 @@ impl nexus_claude::HookCallback for SkillActivationHook {
         let file_path = match extract_file_context(&pre_tool.tool_name, &pre_tool.tool_input) {
             Some(fp) => {
                 let policy = self
-                    .graph_store
-                    .path_policy(project_id)
+                    .path_policies
+                    .get(&*self.graph_store, project_id)
                     .await
                     .unwrap_or_default();
                 Some(crate::skills::project_resolver::graph_file_path(
