@@ -12338,6 +12338,30 @@ mod tests {
         assert_eq!(result["path"], "/api/episodes/collect");
     }
 
+    /// `episode collect` with a `session_id` and no `run_id` reaches the same route,
+    /// the session carried in the body: the route decides, the tool does not refuse.
+    #[tokio::test]
+    async fn test_http_collect_episode_from_a_session() {
+        let (handler, _) = make_http_handler().await;
+        let result = handler
+            .handle(
+                "episode",
+                Some(json!({
+                    "action": "collect",
+                    "session_id": "770e8400-e29b-41d4-a716-446655440000"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["method"], "POST");
+        assert_eq!(result["path"], "/api/episodes/collect");
+        assert_eq!(
+            result["body"]["session_id"],
+            "770e8400-e29b-41d4-a716-446655440000"
+        );
+        assert!(result["body"].get("run_id").is_none(), "{result}");
+    }
+
     #[tokio::test]
     async fn test_http_list_episodes() {
         let (handler, _) = make_http_handler().await;
@@ -13047,7 +13071,7 @@ mod schema_drift_tests {
         // CreateDecisionRequest
         ("decision", "alternatives"), ("decision", "run_id"),
         // CollectEpisodeRequest / ExportArtifactRequest
-        ("episode", "include_structure"), ("episode", "max_episodes"), ("episode", "run_id"),
+        ("episode", "include_structure"), ("episode", "max_episodes"), ("episode", "run_id"), ("episode", "session_id"),
         // CreateLifecycleHookRequest
         ("lifecycle_hook", "action_type"), ("lifecycle_hook", "scope"),
         // ConnectServerBody

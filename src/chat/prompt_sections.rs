@@ -385,7 +385,7 @@ Workspace
 - Persona → Skill: `persona(action: "add_skill")` — HAS_SKILL
 - Persona → Protocol: `persona(action: "add_protocol")` — HAS_PROTOCOL
 - Persona → Persona: `persona(action: "add_extends")` — inheritance (child inherits parent's KNOWS)
-- Episode ← ProtocolRun: `episode(action: "collect", run_id)` — PRODUCED_DURING
+- Episode ← ProtocolRun: `episode(action: "collect", run_id)` — PRODUCED_DURING; Episode ← chat session: `episode(action: "collect", session_id)`
 
 ### Code Graph — Structural Relations
 
@@ -878,9 +878,10 @@ Personas are adaptive knowledge agents scoped to code regions. They accumulate K
 
 ### Episodic Memory
 
-Episodes are cognitive snapshots collected from protocol runs: stimulus (what triggered it), process (what happened), outcome (result + learnings).
+Episodes are cognitive snapshots collected from protocol runs or chat sessions: stimulus (what triggered it), process (what happened), outcome (result + learnings).
 
-- `episode(action: "collect", run_id)` — collect episode from a completed protocol run
+- `episode(action: "collect", run_id, project_id)` — collect episode from a completed protocol run
+- `episode(action: "collect", session_id)` — collect the episode of a chat session as it stands now (`close_reason` is `open` while it runs); a closed session's episode is already saved and listed with `source: "session"`
 - `episode(action: "list", project_id)` — list episodes for a project
 - `episode(action: "get", episode_id)` — get episode details
 - `episode(action: "export", episode_id)` — export for cross-instance portability
@@ -1018,7 +1019,7 @@ pub const SECTION_BP_PERSONAS_COMPACT: &str = r#"### Personas & Advanced Feature
 - Workflow: detect → auto_build → (optional refinement) → find_for_file/activate during work
 
 **Episodic Memory** — Cognitive snapshots from protocol runs (stimulus → process → outcome):
-- `episode(action: "collect", run_id)` — collect after significant protocol runs (system-inference, code-review, wave-execution)
+- `episode(action: "collect", run_id)` — collect after significant protocol runs (system-inference, code-review, wave-execution); `episode(action: "collect", session_id)` — the episode of a chat session as it stands
 - `episode(action: "list/get/export")` — retrieval and cross-instance portability
 - Episodes feed pattern recognition for future similar situations
 

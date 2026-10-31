@@ -1121,8 +1121,9 @@ fn episode_tool() -> ToolDefinition {
                     "enum": ["collect", "list", "anonymize", "export_artifact"],
                     "description": "Operation to perform"
                 },
-                "run_id": {"type": "string", "description": "ProtocolRun UUID to collect episode from (collect/anonymize)"},
-                "project_id": {"type": "string", "description": "Project UUID (collect/list/anonymize/export_artifact)"},
+                "run_id": {"type": "string", "description": "ProtocolRun UUID to collect episode from (collect: one of run_id/session_id, needs project_id; anonymize)"},
+                "session_id": {"type": "string", "description": "Chat session UUID to collect its episode from, as it stands now (collect: one of run_id/session_id; the session names its project)"},
+                "project_id": {"type": "string", "description": "Project UUID (collect with run_id/list/anonymize/export_artifact)"},
                 "limit": {"type": "integer", "description": "Max episodes to return (list, default 20)"},
                 "source": {"type": "string", "enum": ["run", "session", "all"], "description": "Which episodes to list: from protocol runs (default), from closed chat sessions, or both (list)"},
                 "max_episodes": {"type": "integer", "description": "Max episodes in artifact (export_artifact, default 50)"},
