@@ -664,7 +664,7 @@ Note: Full file content is NOT stored in Meilisearch. Use Neo4j for structural q
 
 1. Add handler in `src/api/handlers.rs` or `src/api/code_handlers.rs`
 2. Add route in `src/api/routes.rs`
-3. Add test in `tests/api_tests.rs`
+3. Add tests in `src/api/<feature>_tests.rs` (in-process router from `test_helpers::router_with_auth`, mock stores) — the living pattern since 2026-10 (`list_routes_tests.rs`, `chat_times_tests.rs`, `refs_ws_tests.rs`, `retrieval_ledger_tests.rs`…); `tests/api_tests.rs` is the historical suite and receives no new route
 
 ### Adding a new language to parser
 

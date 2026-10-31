@@ -6,6 +6,7 @@
 use crate::neo4j::traits::*;
 
 use super::models::*;
+use super::retrieval_ledger;
 use crate::embeddings::EmbeddingProvider;
 use crate::events::graph::{GraphEvent, GraphEventType, GraphLayer};
 use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter};
@@ -980,6 +981,44 @@ impl NoteManager {
         query: &str,
         filters: &NoteFilters,
     ) -> Result<Vec<NoteSearchHit>> {
+        self.search_notes_with_trigger(query, filters, retrieval_ledger::Trigger::Explicit)
+            .await
+    }
+
+    /// [`Self::search_notes`] (BM25, Meilisearch), avec le motif déclaré par
+    /// l'appelant. C'est le seul point d'entrée BM25 : il enregistre une ligne de
+    /// registre par appel, réussite comme échec.
+    pub async fn search_notes_with_trigger(
+        &self,
+        query: &str,
+        filters: &NoteFilters,
+        trigger: retrieval_ledger::Trigger,
+    ) -> Result<Vec<NoteSearchHit>> {
+        let started = std::time::Instant::now();
+        let out = self.search_notes_inner(query, filters).await;
+        let (items, ok) = match &out {
+            Ok(hits) => (note_items(hits), true),
+            Err(_) => (Vec::new(), false),
+        };
+        retrieval_ledger::record(
+            retrieval_ledger::Source::Bm25,
+            trigger,
+            query,
+            items,
+            ok,
+            started.elapsed().as_millis() as u64,
+        );
+        out
+    }
+
+    /// Le corps de la recherche BM25, sans registre : appelé par l'enveloppe
+    /// instrumentée et par le canal lexical de la recherche fusionnée, qui ne doit
+    /// pas compter une seconde récupération.
+    async fn search_notes_inner(
+        &self,
+        query: &str,
+        filters: &NoteFilters,
+    ) -> Result<Vec<NoteSearchHit>> {
         let project_slug = filters.search.as_deref(); // This is a simplification
         let note_type = filters
             .note_type
@@ -1040,6 +1079,9 @@ impl NoteManager {
     /// * `project_id` - Optional filter by project UUID
     /// * `workspace_slug` - Optional filter by workspace (includes all projects in workspace + global notes)
     /// * `limit` - Maximum number of results (default 20)
+    ///
+    /// Entrée instrumentée : comportement identique, plus une ligne de registre.
+    /// Le registre ne peut pas faire échouer l'appel (voir retrieval_ledger::record).
     pub async fn semantic_search_notes(
         &self,
         query: &str,
@@ -1049,7 +1091,34 @@ impl NoteManager {
         min_similarity: Option<f64>,
         profile: Option<&str>,
     ) -> Result<Vec<NoteSearchHit>> {
+        self.semantic_search_notes_with_trigger(
+            query,
+            project_id,
+            workspace_slug,
+            limit,
+            min_similarity,
+            profile,
+            retrieval_ledger::Trigger::Explicit,
+        )
+        .await
+    }
+
+    /// [`Self::semantic_search_notes`], avec le motif de déclenchement déclaré par
+    /// l'appelant (champ (1) du registre). Le motif par défaut est « explicite » :
+    /// une récupération que personne n'a déclenchée ne doit pas se dire telle.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn semantic_search_notes_with_trigger(
+        &self,
+        query: &str,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: Option<usize>,
+        min_similarity: Option<f64>,
+        profile: Option<&str>,
+        trigger: retrieval_ledger::Trigger,
+    ) -> Result<Vec<NoteSearchHit>> {
         let limit = limit.unwrap_or(20);
+        let started = std::time::Instant::now();
 
         if let Some(profile_name) = profile {
             tracing::debug!(
@@ -1070,19 +1139,36 @@ impl NoteManager {
                     limit: Some(limit as i64),
                     ..Default::default()
                 };
-                return self.search_notes(query, &filters).await;
+                // The fallback is a BM25 retrieval and is recorded as such, with
+                // the caller's motif: recording it twice, once as semantic, would
+                // invent an index call that never happened.
+                return self
+                    .search_notes_with_trigger(query, &filters, trigger)
+                    .await;
             }
         };
 
         // Embed the query text
-        let query_embedding = provider
-            .embed_text(query)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to embed search query: {}", e))?;
+        let query_embedding = match provider.embed_text(query).await {
+            Ok(embedding) => embedding,
+            Err(e) => {
+                // An embedding that fails is a retrieval that returned nothing:
+                // the registry must say "failed", not "empty".
+                retrieval_ledger::record(
+                    retrieval_ledger::Source::Semantic,
+                    trigger,
+                    query,
+                    Vec::new(),
+                    false,
+                    started.elapsed().as_millis() as u64,
+                );
+                return Err(anyhow::anyhow!("Failed to embed search query: {}", e));
+            }
+        };
 
         // Channel 1 — dense cosine over the note embeddings, scoped by
         // project_id / workspace_slug in the Cypher and floored by min_similarity.
-        let dense = self
+        let dense = match self
             .neo4j
             .vector_search_notes(
                 &query_embedding,
@@ -1091,15 +1177,34 @@ impl NoteManager {
                 workspace_slug,
                 min_similarity,
             )
-            .await?;
+            .await
+        {
+            Ok(hits) => hits,
+            Err(e) => {
+                retrieval_ledger::record(
+                    retrieval_ledger::Source::Semantic,
+                    trigger,
+                    query,
+                    Vec::new(),
+                    false,
+                    started.elapsed().as_millis() as u64,
+                );
+                return Err(e);
+            }
+        };
 
         // Channel 2 — lexical BM25. It is fetched unscoped, then confined to the
         // *same* scope as the dense channel: fusing an unscoped lexical list
         // would reintroduce the cross-project leak that project_id closes.
         // A Meilisearch hiccup must not sink the dense answer, hence
         // `unwrap_or_default` (degrade to dense-only).
+        //
+        // `search_notes_inner`, et non `search_notes` : le canal lexical est un
+        // moyen interne de CETTE récupération, pas une seconde récupération. Le
+        // compter comme telle doublerait le nombre d'appels et rendrait le coût
+        // par résultat non vide ininterprétable.
         let lexical: Vec<NoteSearchHit> = self
-            .search_notes(
+            .search_notes_inner(
                 query,
                 &NoteFilters {
                     limit: Some(limit as i64),
@@ -1112,7 +1217,16 @@ impl NoteManager {
             .filter(|hit| note_in_scope(hit.note.project_id, project_id, workspace_slug.is_some()))
             .collect();
 
-        Ok(fuse_dense_and_lexical(dense, lexical, limit))
+        let fused = fuse_dense_and_lexical(dense, lexical, limit);
+        retrieval_ledger::record(
+            retrieval_ledger::Source::Semantic,
+            trigger,
+            query,
+            note_items(&fused),
+            true,
+            started.elapsed().as_millis() as u64,
+        );
+        Ok(fused)
     }
 
     // ========================================================================
@@ -2194,6 +2308,16 @@ fn note_in_scope(
     }
 }
 
+/// Les identifiants et scores rendus, tels que le registre les conserve
+/// (champ (3) : un compteur ne dit pas *quoi* a été rendu).
+fn note_items(hits: &[NoteSearchHit]) -> Vec<retrieval_ledger::RetrievedItem> {
+    hits.iter()
+        .map(|hit| {
+            retrieval_ledger::RetrievedItem::new(hit.note.id.to_string(), "note", Some(hit.score))
+        })
+        .collect()
+}
+
 /// Fuse the dense and lexical channels of a note search by Reciprocal Rank
 /// Fusion, then map ids back to notes and re-apply the scar penalty.
 ///
@@ -2271,6 +2395,105 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::test_helpers::*;
+
+    // -- Registre de récupération : le branchement, pas seulement le compteur --
+
+    /// Une recherche BM25 écrit une ligne de registre. La requête est unique par
+    /// test : les compteurs sont globaux, et une assertion par delta serait
+    /// brouillée par les tests voisins.
+    // Le garde sérialise un registre GLOBAL à travers l'appel observé : le
+    // tenir pendant l'await est le but, pas un oubli.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn une_recherche_bm25_ecrit_dans_le_registre() {
+        // Le registre est global : ce test le sérialise avec les autres et
+        // agrandit le journal pour qu'aucun événement voisin ne l'évince.
+        let _serial = retrieval_ledger::serial_guard();
+        let saved_capacity = retrieval_ledger::journal_capacity();
+        retrieval_ledger::set_journal_capacity(4096);
+
+        let state = mock_app_state_with_stores().0;
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        let query = format!("bruit-bm25-{}", Uuid::new_v4());
+
+        let _ = mgr.search_notes(&query, &NoteFilters::default()).await;
+
+        let mine: Vec<_> = retrieval_ledger::recent(256)
+            .into_iter()
+            .filter(|e| e.query == query)
+            .collect();
+        retrieval_ledger::set_journal_capacity(saved_capacity);
+
+        assert_eq!(mine.len(), 1, "une récupération, un événement");
+        assert_eq!(mine[0].source, retrieval_ledger::Source::Bm25);
+        assert_eq!(mine[0].trigger, retrieval_ledger::Trigger::Explicit);
+    }
+
+    /// Sans fournisseur d'embedding, la recherche « sémantique » est servie par
+    /// BM25. Le registre doit le dire : une récupération comptée deux fois, dont
+    /// une fois sous un nom qui n'a pas eu lieu, fausse tout l'agrégat.
+    // Le garde sérialise un registre GLOBAL à travers l'appel observé : le
+    // tenir pendant l'await est le but, pas un oubli.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn le_repli_bm25_ne_se_degulse_pas_en_semantique() {
+        let _serial = retrieval_ledger::serial_guard();
+        let saved_capacity = retrieval_ledger::journal_capacity();
+        retrieval_ledger::set_journal_capacity(4096);
+
+        let state = mock_app_state_with_stores().0;
+        // `NoteManager::new` n'installe aucun fournisseur d'embedding.
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        let query = format!("repli-{}", Uuid::new_v4());
+
+        let _ = mgr
+            .semantic_search_notes(&query, None, None, None, None, None)
+            .await;
+
+        let mine: Vec<_> = retrieval_ledger::recent(256)
+            .into_iter()
+            .filter(|e| e.query == query)
+            .collect();
+        retrieval_ledger::set_journal_capacity(saved_capacity);
+        assert_eq!(mine.len(), 1, "une seule récupération, un seul événement");
+        assert_eq!(
+            mine[0].source,
+            retrieval_ledger::Source::Bm25,
+            "le repli est une récupération BM25, pas une récupération sémantique"
+        );
+    }
+
+    /// Le motif déclaré par l'appelant est celui qui est enregistré : c'est la
+    /// prise que le déclencheur (PR3) branchera.
+    // Le garde sérialise un registre GLOBAL à travers l'appel observé : le
+    // tenir pendant l'await est le but, pas un oubli.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn le_motif_declare_est_celui_qui_est_enregistre() {
+        let _serial = retrieval_ledger::serial_guard();
+        let saved_capacity = retrieval_ledger::journal_capacity();
+        retrieval_ledger::set_journal_capacity(4096);
+
+        let state = mock_app_state_with_stores().0;
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        let query = format!("frontiere-{}", Uuid::new_v4());
+
+        let _ = mgr
+            .search_notes_with_trigger(
+                &query,
+                &NoteFilters::default(),
+                retrieval_ledger::Trigger::TaskBoundary,
+            )
+            .await;
+
+        let mine: Vec<_> = retrieval_ledger::recent(256)
+            .into_iter()
+            .filter(|e| e.query == query)
+            .collect();
+        retrieval_ledger::set_journal_capacity(saved_capacity);
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].trigger, retrieval_ledger::Trigger::TaskBoundary);
+    }
 
     // -- Hybrid ranking: dense ∪ lexical, fused by RRF ----------------------
 

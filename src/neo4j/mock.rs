@@ -198,6 +198,9 @@ pub struct MockGraphStore {
     pub fail_external_event_writes: std::sync::atomic::AtomicBool,
     /// Makes `plan_third_party_written_at` fail (a graph error).
     pub fail_mark_read: std::sync::atomic::AtomicBool,
+    /// Stall injection: `search_decisions_by_vector` sleeps this long before
+    /// answering — a dense decision search slower than the turn's budget.
+    pub slow_decision_vector_search: std::sync::Mutex<Option<std::time::Duration>>,
     /// Makes `update_chat_session_harness` fail (the capability snapshot is not stored).
     pub fail_harness_writes: std::sync::atomic::AtomicBool,
     /// Makes `save_session_episode` fail (a session closes even when its episode cannot be
@@ -470,6 +473,7 @@ impl MockGraphStore {
             trigger_reservations: RwLock::new(HashMap::new()),
             plan_third_party_writes: RwLock::new(HashMap::new()),
             fail_mark_read: std::sync::atomic::AtomicBool::new(false),
+            slow_decision_vector_search: std::sync::Mutex::new(None),
             fail_harness_writes: std::sync::atomic::AtomicBool::new(false),
             fail_session_episode_writes: std::sync::atomic::AtomicBool::new(false),
             session_episode_save_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -10439,6 +10443,13 @@ impl DecisionStore for MockGraphStore {
         _limit: usize,
         _project_id: Option<&str>,
     ) -> Result<Vec<(DecisionNode, f64)>> {
+        let delay = *self
+            .slow_decision_vector_search
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         // Mock: return empty — vector search requires real Neo4j index
         Ok(vec![])
     }

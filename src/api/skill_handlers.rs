@@ -1141,10 +1141,21 @@ async fn note_affinity(
     project_id: Option<Uuid>,
     query: &str,
 ) -> std::collections::HashMap<Uuid, f64> {
+    // Le canal de notes d'une recherche de skills est une lecture que le système
+    // décide pour son compte : motif `System` au registre de récupération, pas
+    // « explicite » — l'agent a demandé une compétence, pas sa mémoire.
     let hits = match state
         .orchestrator
         .note_manager()
-        .semantic_search_notes(query, project_id, None, Some(20), None, None)
+        .semantic_search_notes_with_trigger(
+            query,
+            project_id,
+            None,
+            Some(20),
+            None,
+            None,
+            crate::notes::retrieval_ledger::Trigger::System,
+        )
         .await
     {
         Ok(hits) => hits,
