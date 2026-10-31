@@ -533,7 +533,8 @@ impl Neo4jClient {
                 f.docstring = $docstring,
                 f.owner_type = $owner_type,
                 f.owner_trait = $owner_trait,
-                f.stable_key = $stable_key
+                f.stable_key = $stable_key,
+                f.key_deferred = null
             WITH f
             MATCH (file:File {path: $file_path})
             MERGE (file)-[:CONTAINS]->(f)
@@ -1283,7 +1284,8 @@ impl Neo4jClient {
                 f.docstring = func.docstring,
                 f.owner_type = func.owner_type,
                 f.owner_trait = func.owner_trait,
-                f.stable_key = func.stable_key
+                f.stable_key = func.stable_key,
+                f.key_deferred = null
             WITH f, func
             MATCH (file:File {path: func.file_path})
             MERGE (file)-[:CONTAINS]->(f)

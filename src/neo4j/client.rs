@@ -548,6 +548,11 @@ impl Neo4jClient {
             // indexes that lookup is a label scan per function (60k x 490k).
             "CREATE INDEX impl_file_path IF NOT EXISTS FOR (i:Impl) ON (i.file_path)",
             "CREATE INDEX struct_file_path IF NOT EXISTS FOR (s:Struct) ON (s.file_path)",
+            // The same backfills page by file_path (an index-backed range seek per
+            // batch instead of a label scan per batch): every keyed label needs it.
+            "CREATE INDEX trait_file_path IF NOT EXISTS FOR (t:Trait) ON (t.file_path)",
+            "CREATE INDEX enum_file_path IF NOT EXISTS FOR (e:Enum) ON (e.file_path)",
+            "CREATE INDEX import_file_path IF NOT EXISTS FOR (i:Import) ON (i.file_path)",
             // stable_key (symbol_key.rs): the identity T2 deduplicates on and T3
             // switches the id to. Not unique YET — until T2 runs, the versions of
             // one function legitimately share a key.

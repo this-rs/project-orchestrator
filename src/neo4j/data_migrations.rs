@@ -79,9 +79,17 @@ pub struct ComputedBatch {
     /// same page until `MAX_BATCHES`.
     pub items: fn(&Row) -> Result<HashMap<String, BoltType>>,
     /// `UNWIND $items AS item MATCH (n) WHERE elementId(n) = item.eid SET ...
-    /// RETURN count(n) AS processed`. Must write the property the SELECT
-    /// tests for `IS NULL`, on every item, or the migration cannot converge.
+    /// RETURN count(n) AS processed[, ... AS deferred]`. Must write the property
+    /// the SELECT tests for `IS NULL`, on every item, or the migration cannot
+    /// converge.
     pub write: &'static str,
+}
+
+/// What one batch reports back.
+#[derive(Debug, Default, Clone, Copy)]
+struct Progress {
+    processed: i64,
+    deferred: i64,
 }
 
 /// Fold append-only legacy alerts (no `dedup_key`) into one node per
@@ -350,6 +358,9 @@ pub struct MigrationOutcome {
     /// Already completed on a previous start.
     pub skipped: bool,
     pub processed: i64,
+    /// Nodes the migration deliberately left without a value because the graph
+    /// cannot settle it (`key_deferred`, see the stable-key backfill).
+    pub deferred: i64,
     pub batches: u32,
     pub completed: bool,
     pub error: Option<String>,
@@ -369,22 +380,43 @@ pub struct MigrationOutcome {
 /// 7 168 (file, signature) groups mixed functions of different impls —
 /// 19 885 keys needed where one would have been set.
 ///
+/// **A guess is refused when it could be wrong.** `Impl`/`Struct` ids carry
+/// no line, so their ranges are those of the LAST sync; a `Function` node of
+/// an older version (never deleted) may now sit inside another block. When a
+/// file holds several `Function` nodes of one name at different lines, the
+/// graph cannot tell the current one from the stale ones, so none of them
+/// gets a key: `key_deferred = true`, and the next sync writes the current
+/// version with its true owner (the write path clears the flag); T2 deletes
+/// the still-flagged ones without folding them into anything. Measured on
+/// 31/10/2026: 40 584 (file, name) groups hold several line versions —
+/// 223 492 of 504 571 Function nodes (44 %) are deferred, 281 079 keyed.
+/// The same deferral applies when a block of the file has no lines (it
+/// could own the function and nobody can tell; measured: 0 of 59 994 Impl,
+/// 0 of 50 407 Struct).
+///
 /// Scope: `Impl` and `Import` nodes carry no `project_id` (0 of 59 994 and
 /// 0 of 289 491 on 31/10/2026 — only the Function/Struct/Trait/Enum batch
 /// paths denormalised it), so `n.project_id = $scope` alone was a no-op for
 /// them: a scoped run also reaches a node through its `File`.
 ///
+/// Paging: `stable_key IS NULL` is not indexable, so a batch that restarted
+/// from `MATCH (n:Function)` scanned every node again (245 scans of 490 k
+/// nodes). Each batch instead seeks the `file_path` index from the cursor
+/// `$after` (the last file_path of the previous batch, `>=` because a file
+/// can hold more than one batch) and stops at `$batch` rows.
+///
 /// Convergence: the SELECT only returns nodes whose `file_path` and `name`
-/// exist, and the Rust key is total on those — every selected node leaves
-/// the selection once written. (None of the 490 672 functions lacks either;
-/// the guard is for the day one does.)
+/// exist and that carry neither a key nor the flag; every selected node
+/// leaves the selection once written (key or flag). A row the grammar cannot
+/// decode is an error, not a silent unqualified key.
 const SELECT_FUNCTIONS_WITHOUT_STABLE_KEY: &str = r#"
 MATCH (n:Function)
-WHERE n.stable_key IS NULL
+WHERE n.file_path >= $after
+  AND n.stable_key IS NULL AND n.key_deferred IS NULL
   AND n.file_path IS NOT NULL AND n.name IS NOT NULL
   AND ($scope IS NULL OR n.project_id = $scope
        OR EXISTS { (n)<-[:CONTAINS|HAS_IMPORT]-(:File {project_id: $scope}) })
-WITH n LIMIT $batch
+WITH n ORDER BY n.file_path LIMIT $batch
 OPTIONAL MATCH (i:Impl)
 WHERE i.file_path = n.file_path
   AND i.line_start <= n.line_start AND n.line_end <= i.line_end
@@ -394,13 +426,18 @@ WHERE s.file_path = n.file_path
   AND s.line_start <= n.line_start AND n.line_end <= s.line_end
 WITH n, impls, collect(s) AS structs
 WITH n, impls + structs AS blocks
-RETURN elementId(n) AS eid,
+RETURN elementId(n) AS eid, n.file_path AS cursor,
        n.file_path AS file_path, n.name AS name, n.params AS params,
        n.line_start AS line_start, n.line_end AS line_end,
-       [b IN blocks | toInteger(b.line_start)] AS block_starts,
-       [b IN blocks | toInteger(b.line_end)] AS block_ends,
-       [b IN blocks | coalesce(b.for_type, b.name, '')] AS block_types,
-       [b IN blocks | CASE WHEN b:Impl THEN coalesce(b.trait_name, '') ELSE '' END] AS block_traits
+       [b IN blocks | {start: b.line_start, end: b.line_end,
+                       type_name: coalesce(b.for_type, b.name, ''),
+                       trait_name: CASE WHEN b:Impl THEN coalesce(b.trait_name, '') ELSE '' END}] AS blocks,
+       EXISTS { MATCH (m:Function)
+                WHERE m.file_path = n.file_path AND m.name = n.name
+                  AND m.line_start <> n.line_start } AS has_sibling,
+       EXISTS { MATCH (b:Impl|Struct)
+                WHERE b.file_path = n.file_path
+                  AND (b.line_start IS NULL OR b.line_end IS NULL) } AS broken_blocks
 "#;
 
 const WRITE_FUNCTION_STABLE_KEY: &str = r#"
@@ -408,37 +445,57 @@ UNWIND $items AS item
 MATCH (n:Function) WHERE elementId(n) = item.eid
 SET n.stable_key = item.stable_key,
     n.owner_type = item.owner_type,
-    n.owner_trait = item.owner_trait
-RETURN count(n) AS processed
+    n.owner_trait = item.owner_trait,
+    n.key_deferred = item.key_deferred
+RETURN count(n) AS processed,
+       sum(CASE WHEN item.key_deferred = true THEN 1 ELSE 0 END) AS deferred
 "#;
+
+/// A block of the function's file that encloses it, as the SELECT returns it.
+/// Strictly typed on purpose: a block with no lines cannot be here (the
+/// SELECT's inclusion test excludes it and `broken_blocks` reports it), so a
+/// decoding failure is a real defect and fails the batch loudly.
+#[derive(Debug, serde::Deserialize)]
+struct OwnerBlock {
+    start: i64,
+    end: i64,
+    type_name: String,
+    trait_name: String,
+}
 
 fn function_items(row: &Row) -> Result<HashMap<String, BoltType>> {
     let eid: String = row.get("eid")?;
+    let mut m = HashMap::new();
+    m.insert("eid".into(), eid.into());
+
+    let has_sibling: bool = row.get("has_sibling")?;
+    let broken_blocks: bool = row.get("broken_blocks")?;
+    if has_sibling || broken_blocks {
+        m.insert("stable_key".into(), Option::<String>::None.into());
+        m.insert("owner_type".into(), Option::<String>::None.into());
+        m.insert("owner_trait".into(), Option::<String>::None.into());
+        m.insert("key_deferred".into(), true.into());
+        return Ok(m);
+    }
+
     let file_path: String = row.get("file_path")?;
     let name: String = row.get("name")?;
     let params: Option<String> = row.get("params").ok();
-    let line_start = row.get::<i64>("line_start").unwrap_or(0) as u32;
-    let line_end = row.get::<i64>("line_end").unwrap_or(line_start as i64) as u32;
-    let starts: Vec<i64> = row.get("block_starts").unwrap_or_default();
-    let ends: Vec<i64> = row.get("block_ends").unwrap_or_default();
-    let types: Vec<String> = row.get("block_types").unwrap_or_default();
-    let traits: Vec<String> = row.get("block_traits").unwrap_or_default();
-    let candidates = starts
-        .iter()
-        .zip(ends.iter())
-        .zip(types.iter().zip(traits.iter()))
-        .filter(|((_, _), (ty, _))| !ty.is_empty())
-        .map(|((st, en), (ty, tr))| {
+    let line_start: i64 = row.get("line_start")?;
+    let line_end: i64 = row.get("line_end")?;
+    let blocks: Vec<OwnerBlock> = row.get("blocks").context("decoding the enclosing blocks")?;
+    let candidates = blocks
+        .into_iter()
+        .filter(|b| !b.type_name.is_empty())
+        .map(|b| {
             (
-                *st as u32,
-                *en as u32,
-                SymbolOwner::new(ty.clone(), Some(tr.clone())),
+                b.start as u32,
+                b.end as u32,
+                SymbolOwner::new(b.type_name, Some(b.trait_name)),
             )
         });
-    let owner = enclosing_owner(line_start, line_end, candidates);
+    let owner = enclosing_owner(line_start as u32, line_end as u32, candidates);
     let key = stable_symbol_key_from_graph(&file_path, owner.as_ref(), &name, params.as_deref());
-    let mut m = HashMap::new();
-    m.insert("eid".into(), eid.into());
     m.insert("stable_key".into(), key.into());
     m.insert(
         "owner_type".into(),
@@ -448,6 +505,7 @@ fn function_items(row: &Row) -> Result<HashMap<String, BoltType>> {
         "owner_trait".into(),
         owner.and_then(|o| o.trait_name).into(),
     );
+    m.insert("key_deferred".into(), Option::<bool>::None.into());
     Ok(m)
 }
 
@@ -464,12 +522,13 @@ fn function_items(row: &Row) -> Result<HashMap<String, BoltType>> {
 /// of the database per batch.
 const SELECT_TYPES_WITHOUT_STABLE_KEY: &str = r#"
 MATCH (n:Struct|Trait|Enum)
-WHERE n.stable_key IS NULL
+WHERE n.file_path >= $after
+  AND n.stable_key IS NULL
   AND n.file_path IS NOT NULL AND n.name IS NOT NULL
   AND ($scope IS NULL OR n.project_id = $scope
        OR EXISTS { (n)<-[:CONTAINS|HAS_IMPORT]-(:File {project_id: $scope}) })
-WITH n LIMIT $batch
-RETURN elementId(n) AS eid, n.file_path AS file_path, n.name AS name,
+WITH n ORDER BY n.file_path LIMIT $batch
+RETURN elementId(n) AS eid, n.file_path AS cursor, n.file_path AS file_path, n.name AS name,
        coalesce(n.is_external, false) AS is_external, n.full_path AS full_path
 "#;
 
@@ -505,13 +564,14 @@ fn type_items(row: &Row) -> Result<HashMap<String, BoltType>> {
 /// blank name as no trait, the same way for this backfill and for the write path.
 const SELECT_IMPLS_WITHOUT_STABLE_KEY: &str = r#"
 MATCH (n:Impl)
-WHERE n.stable_key IS NULL
+WHERE n.file_path >= $after
+  AND n.stable_key IS NULL
   AND n.file_path IS NOT NULL AND n.for_type IS NOT NULL
   AND ($scope IS NULL OR n.project_id = $scope
        OR EXISTS { (n)<-[:CONTAINS|HAS_IMPORT]-(:File {project_id: $scope}) })
-WITH n LIMIT $batch
-RETURN elementId(n) AS eid, n.file_path AS file_path, n.for_type AS for_type,
-       n.trait_name AS trait_name
+WITH n ORDER BY n.file_path LIMIT $batch
+RETURN elementId(n) AS eid, n.file_path AS cursor, n.file_path AS file_path,
+       n.for_type AS for_type, n.trait_name AS trait_name
 "#;
 
 fn impl_items(row: &Row) -> Result<HashMap<String, BoltType>> {
@@ -537,12 +597,13 @@ fn impl_items(row: &Row) -> Result<HashMap<String, BoltType>> {
 /// ranks true duplicates (`parser::assign_import_occurrences`).
 const SELECT_IMPORTS_WITHOUT_STABLE_KEY: &str = r#"
 MATCH (n:Import)
-WHERE n.stable_key IS NULL
+WHERE n.file_path >= $after
+  AND n.stable_key IS NULL
   AND n.file_path IS NOT NULL AND n.path IS NOT NULL
   AND ($scope IS NULL OR n.project_id = $scope
        OR EXISTS { (n)<-[:CONTAINS|HAS_IMPORT]-(:File {project_id: $scope}) })
-WITH n LIMIT $batch
-RETURN elementId(n) AS eid, n.file_path AS file_path, n.path AS path
+WITH n ORDER BY n.file_path LIMIT $batch
+RETURN elementId(n) AS eid, n.file_path AS cursor, n.file_path AS file_path, n.path AS path
 "#;
 
 const WRITE_IMPORT_STABLE_KEY: &str = r#"
@@ -745,7 +806,8 @@ impl Neo4jClient {
                         .param("batch", BATCH)
                         .param("before", archived_before.to_rfc3339()),
                 )
-                .await?;
+                .await?
+                .processed;
             total += processed;
             if processed == 0 {
                 break;
@@ -765,24 +827,40 @@ impl Neo4jClient {
             ..Default::default()
         };
         let mut failures = 0;
+        // Cursor of a computed migration: the last `file_path` of the previous
+        // batch (`""` sorts before every path). A plain migration ignores it.
+        let mut after = String::new();
         while outcome.batches < MAX_BATCHES {
             let q = query(&migration.batch)
                 .param("scope", scope.clone())
                 .param("batch", BATCH)
+                .param("after", after.clone())
                 .param("before", Option::<String>::None);
             let step = match &migration.compute {
                 None => self.batch_processed(q).await,
-                Some(compute) => self.computed_batch(q, compute).await,
+                Some(compute) => match self.computed_batch(q, compute).await {
+                    Ok((progress, cursor)) => {
+                        if let Some(c) = cursor {
+                            after = c;
+                        }
+                        Ok(progress)
+                    }
+                    Err(e) => Err(e),
+                },
             };
             match step {
-                Ok(0) => {
+                Ok(Progress { processed: 0, .. }) => {
                     outcome.completed = true;
                     break;
                 }
-                Ok(n) => {
+                Ok(Progress {
+                    processed,
+                    deferred,
+                }) => {
                     failures = 0;
                     outcome.batches += 1;
-                    outcome.processed += n;
+                    outcome.processed += processed;
+                    outcome.deferred += deferred;
                     info!(
                         id = migration.id,
                         batch = outcome.batches,
@@ -831,32 +909,48 @@ impl Neo4jClient {
     /// and the WRITE disagree on what a node is, and re-selecting the same
     /// page forever is exactly the non-convergence this guards against — so
     /// it is an error, retried `MAX_RETRIES` times, then reported.
-    async fn computed_batch(&self, select: neo4rs::Query, compute: &ComputedBatch) -> Result<i64> {
+    async fn computed_batch(
+        &self,
+        select: neo4rs::Query,
+        compute: &ComputedBatch,
+    ) -> Result<(Progress, Option<String>)> {
         let mut result = self.graph.execute(select).await?;
         let mut items = Vec::new();
+        let mut cursor: Option<String> = None;
         while let Some(row) = result.next().await? {
             items.push((compute.items)(&row).context("computing the new value of a selected row")?);
+            if let Ok(c) = row.get::<String>("cursor") {
+                if cursor.as_deref().is_none_or(|prev| prev < c.as_str()) {
+                    cursor = Some(c);
+                }
+            }
         }
         if items.is_empty() {
-            return Ok(0);
+            return Ok((Progress::default(), None));
         }
         let selected = items.len() as i64;
         let written = self
             .batch_processed(query(compute.write).param("items", items))
             .await?;
-        if written != selected {
-            bail!("the write reached {written} of the {selected} selected nodes");
+        if written.processed != selected {
+            bail!(
+                "the write reached {} of the {selected} selected nodes",
+                written.processed
+            );
         }
-        Ok(written)
+        Ok((written, cursor))
     }
 
-    async fn batch_processed(&self, q: neo4rs::Query) -> Result<i64> {
+    async fn batch_processed(&self, q: neo4rs::Query) -> Result<Progress> {
         let mut result = self.graph.execute(q).await?;
         let row = result
             .next()
             .await?
             .context("migration batch returned no row")?;
-        Ok(row.get::<i64>("processed").unwrap_or(0))
+        Ok(Progress {
+            processed: row.get::<i64>("processed").unwrap_or(0),
+            deferred: row.get::<i64>("deferred").unwrap_or(0),
+        })
     }
 
     async fn migration_completed(&self, id: &str) -> Result<bool> {
@@ -953,6 +1047,15 @@ mod tests {
                 "{} must be idempotent",
                 m.id
             );
+            // Review 2, point 6: a batch seeks the file_path index from a cursor
+            // instead of scanning the label again.
+            assert!(
+                m.batch.contains("n.file_path >= $after")
+                    && m.batch.contains("ORDER BY n.file_path LIMIT $batch")
+                    && m.batch.contains("n.file_path AS cursor"),
+                "{} must page by file_path",
+                m.id
+            );
             // Finding 3 of the review (31/10/2026): a selected node the grammar
             // cannot key would be re-selected until MAX_BATCHES. The SELECT must
             // exclude every node lacking a property the grammar reads.
@@ -987,6 +1090,18 @@ mod tests {
         let write = functions.compute.as_ref().unwrap().write;
         assert!(write.contains("n.owner_type = item.owner_type"));
         assert!(write.contains("n.owner_trait = item.owner_trait"));
+        // Review 2, point 2: a node whose owner would be a guess (another
+        // Function of the same name at another line of the file, or a block of
+        // the file without lines) is flagged, never keyed — and the flag keeps
+        // it out of the next selection, so the migration still converges.
+        assert!(functions.batch.contains("n.key_deferred IS NULL"));
+        assert!(functions.batch.contains("AS has_sibling"));
+        assert!(functions.batch.contains("AS broken_blocks"));
+        assert!(write.contains("n.key_deferred = item.key_deferred"));
+        assert!(write.contains("AS deferred"));
+        // Point 7: the blocks travel as one list of maps, not four parallel lists.
+        assert!(functions.batch.contains("}] AS blocks"));
+        assert!(!functions.batch.contains("block_starts"));
 
         let types = by_id("2026-10-backfill-stable-key-types");
         // A label expression, not `MATCH (n) WHERE n:Struct OR ...` (an
@@ -1049,6 +1164,7 @@ mod tests {
                 ),
                 Some(c) => {
                     assert!(m.batch.contains("elementId(n) AS eid"), "{}", m.id);
+                    assert!(m.batch.contains("$after"), "{} must take the cursor", m.id);
                     assert!(c.write.contains("UNWIND $items AS item"), "{}", m.id);
                     assert!(c.write.contains("elementId(n) = item.eid"), "{}", m.id);
                     assert!(c.write.contains("AS processed"), "{}", m.id);
