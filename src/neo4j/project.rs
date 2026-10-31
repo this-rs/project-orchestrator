@@ -3,6 +3,7 @@
 use crate::neo4j::traits::*;
 
 use super::client::{Neo4jClient, WhereBuilder};
+use super::file_uid::canonical_root;
 use super::models::*;
 use anyhow::Result;
 use neo4rs::query;
@@ -22,6 +23,7 @@ impl Neo4jClient {
                 name: $name,
                 slug: $slug,
                 root_path: $root_path,
+                canonical_path: $canonical_path,
                 description: $description,
                 created_at: datetime($created_at),
                 watch_enabled: $watch_enabled,
@@ -33,6 +35,10 @@ impl Neo4jClient {
         .param("name", project.name.clone())
         .param("slug", project.slug.clone())
         .param("root_path", project.root_path.clone())
+        // La racine canonique est ce que le graphe stocke réellement comme chemin
+        // (le sync résout les liens) : sans elle, on ne sait pas calculer le
+        // chemin relatif d'un fichier, donc pas son identité (`file_uid`).
+        .param("canonical_path", canonical_root(Some(&project.root_path)))
         .param(
             "description",
             project.description.clone().unwrap_or_default(),
@@ -125,6 +131,9 @@ impl Neo4jClient {
         }
         if root_path.is_some() {
             set_clauses.push("p.root_path = $root_path");
+            // La racine déclarée a changé : la canonique aussi, sans quoi les
+            // identités de fichiers resteraient calculées contre l'ancienne.
+            set_clauses.push("p.canonical_path = $canonical_path");
         }
         if profile.is_some() {
             set_clauses.push("p.profile = $profile");
@@ -134,6 +143,7 @@ impl Neo4jClient {
             return Ok(());
         }
 
+        let canonical = canonical_root(root_path.as_deref());
         let cypher = format!(
             "MATCH (p:Project {{id: $id}}) SET {}",
             set_clauses.join(", ")
@@ -149,6 +159,7 @@ impl Neo4jClient {
         }
         if let Some(root_path) = root_path {
             q = q.param("root_path", root_path);
+            q = q.param("canonical_path", canonical);
         }
         if let Some(profile) = profile {
             q = q.param("profile", profile.as_str());
@@ -156,6 +167,47 @@ impl Neo4jClient {
 
         self.graph.run(q).await?;
         Ok(())
+    }
+
+    /// Fill `canonical_path` for projects that predate it.
+    ///
+    /// The canonical root cannot be computed in Cypher (no `realpath`), so the
+    /// existing projects are repaired here, in Rust, at boot — before the
+    /// `File.uid` backfill, which reads it. Idempotent: only the projects whose
+    /// value is missing or differs from the resolved one are written.
+    ///
+    /// Returns `(scanned, updated)`.
+    pub async fn ensure_project_canonical_paths(&self) -> Result<(usize, usize)> {
+        let q = query(
+            r#"
+            MATCH (p:Project)
+            WHERE p.root_path IS NOT NULL AND p.root_path <> ''
+            RETURN p.id AS id, p.root_path AS root_path, p.canonical_path AS canonical_path
+            "#,
+        );
+        let mut result = self.graph.execute(q).await?;
+
+        let mut scanned = 0usize;
+        let mut updated = 0usize;
+        while let Some(row) = result.next().await? {
+            scanned += 1;
+            let Ok(id) = row.get::<String>("id") else {
+                continue;
+            };
+            let declared = row.get::<String>("root_path").unwrap_or_default();
+            let stored = row.get::<String>("canonical_path").unwrap_or_default();
+            let resolved = canonical_root(Some(&declared));
+            if resolved.is_empty() || resolved == stored {
+                continue;
+            }
+            let q = query("MATCH (p:Project {id: $id}) SET p.canonical_path = $canonical")
+                .param("id", id)
+                .param("canonical", resolved);
+            if self.graph.run(q).await.is_ok() {
+                updated += 1;
+            }
+        }
+        Ok((scanned, updated))
     }
 
     /// Update project last_synced timestamp

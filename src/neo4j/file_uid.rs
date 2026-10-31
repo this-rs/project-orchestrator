@@ -12,26 +12,49 @@
 
 use uuid::Uuid;
 
-/// Length of the hex digest kept for a uid (128 bits).
-const UID_HEX_LEN: usize = 32;
-
-/// Compute the stable uid of a file: `sha256(project:relative_path)`.
+/// Compute the stable uid of a file: `<project>:<relative_path>`.
 ///
 /// `relative_path` MUST be relative to the project root and use `/` as
 /// separator, so that the same file reached through another mount produces
 /// the same uid. When there is no project (an ad-hoc sync), the absolute
-/// relative path is still used — identity stays stable for that call site.
+/// path is still used — identity stays stable for that call site.
+///
+/// # Why a readable form and not a hash
+///
+/// The backfill of the 33 499 files that already exist has to run **in Cypher**,
+/// at startup, with no Rust pass over the graph. A digest is not expressible
+/// there (`apoc.util.sha256` is not guaranteed on every install), so a hashed
+/// uid could only be backfilled by a second implementation — two grammars for
+/// one identity, which is exactly the defect this series removes. A
+/// concatenation is expressible on both sides *and* verifiable by eye: when a
+/// duplicate shows up, the reader can see which part differs.
+///
+/// The owner is the hyphenated project id, or `-` when there is none.
 pub fn file_uid(project_id: Option<Uuid>, relative_path: &str) -> String {
-    use sha2::{Digest, Sha256};
     let owner = project_id
         .map(|id| id.hyphenated().to_string())
         .unwrap_or_else(|| "-".to_string());
-    let mut hasher = Sha256::new();
-    hasher.update(owner.as_bytes());
-    hasher.update(b":");
-    hasher.update(relative_path.trim_start_matches('/').as_bytes());
-    let digest = hasher.finalize();
-    hex::encode(digest)[..UID_HEX_LEN].to_string()
+    format!("{}:{}", owner, relative_path.trim_start_matches('/'))
+}
+
+/// Canonical form of a project root: the path the graph actually stores.
+///
+/// `Project.root_path` keeps the path as the user declared it (often a symlink);
+/// the sync resolves links before writing, so the stored file paths are
+/// canonical. Without this second value, `strip_prefix` (or its Cypher
+/// equivalent) fails on every project configured through a link — and the
+/// relative path, hence the identity, cannot be computed.
+///
+/// Falls back to the declared path when canonicalisation fails (a missing
+/// directory, a path that is not yet reachable): a project we cannot resolve is
+/// still a project, and an empty value would silently drop it from the backfill.
+pub fn canonical_root(declared: Option<&str>) -> String {
+    let Some(declared) = declared.map(str::trim).filter(|r| !r.is_empty()) else {
+        return String::new();
+    };
+    std::fs::canonicalize(declared)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| declared.to_string())
 }
 
 /// Strip `root` from `path`, both expected to be canonical.
@@ -86,6 +109,32 @@ mod tests {
         assert_ne!(
             file_uid(Some(project()), "src/main.rs"),
             file_uid(Some(other), "src/main.rs")
+        );
+    }
+
+    /// La forme est celle que le Cypher de `upsert_file` recalcule : une
+    /// identité qu'on doit pouvoir relire, pas une empreinte opaque.
+    #[test]
+    fn the_uid_is_readable_and_names_its_project() {
+        assert_eq!(
+            file_uid(Some(project()), "src/neo4j/mod.rs"),
+            format!("{}:src/neo4j/mod.rs", project())
+        );
+        assert_eq!(file_uid(None, "/tmp/a.rs"), "-:tmp/a.rs");
+    }
+
+    #[test]
+    fn a_canonical_root_is_resolved_and_never_empty_when_declared() {
+        // A directory that exists: canonicalisation resolves it.
+        let here = canonical_root(Some("src"));
+        assert!(here.ends_with("src"), "got {here}");
+        // Nothing declared: nothing canonical.
+        assert_eq!(canonical_root(None), "");
+        assert_eq!(canonical_root(Some("   ")), "");
+        // Unresolvable: the declared path is kept, not dropped.
+        assert_eq!(
+            canonical_root(Some("/definitely/not/a/real/path-42")),
+            "/definitely/not/a/real/path-42"
         );
     }
 

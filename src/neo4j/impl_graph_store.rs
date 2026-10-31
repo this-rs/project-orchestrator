@@ -2922,6 +2922,10 @@ impl AnalyticsStore for Neo4jClient {
         self.run_data_migrations().await
     }
 
+    async fn ensure_project_canonical_paths(&self) -> anyhow::Result<(usize, usize)> {
+        self.ensure_project_canonical_paths().await
+    }
+
     async fn get_synapse_graph(
         &self,
         project_id: uuid::Uuid,
