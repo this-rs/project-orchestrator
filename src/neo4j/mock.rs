@@ -239,6 +239,9 @@ pub struct MockGraphStore {
     pub plan_constraints: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub project_plans: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub project_files: RwLock<HashMap<Uuid, Vec<String>>>,
+    /// `Project.paths_declared` — the marker `migrate file-paths --apply` sets
+    /// (and `create_project` sets for a new project). Absent: canonical form.
+    pub paths_declared: RwLock<HashMap<Uuid, bool>>,
     pub file_symbols: RwLock<HashMap<String, Vec<String>>>,
     pub task_files: RwLock<HashMap<Uuid, Vec<String>>>,
     pub task_commits: RwLock<HashMap<Uuid, Vec<String>>>,
@@ -490,6 +493,7 @@ impl MockGraphStore {
             plan_constraints: RwLock::new(HashMap::new()),
             project_plans: RwLock::new(HashMap::new()),
             project_files: RwLock::new(HashMap::new()),
+            paths_declared: RwLock::new(HashMap::new()),
             file_symbols: RwLock::new(HashMap::new()),
             task_files: RwLock::new(HashMap::new()),
             task_commits: RwLock::new(HashMap::new()),
@@ -6209,12 +6213,30 @@ impl ProjectStore for MockGraphStore {
             .write()
             .await
             .insert(project.id, project.clone());
+        // Mirrors Neo4j: a NEW project is born in the declared vocabulary.
+        self.paths_declared.write().await.insert(project.id, true);
         Ok(())
     }
 
     async fn get_project(&self, id: Uuid) -> Result<Option<ProjectNode>> {
         self.count_read();
         Ok(self.projects.read().await.get(&id).cloned())
+    }
+
+    async fn path_policy(&self, id: Uuid) -> Result<crate::neo4j::file_uid::PathPolicy> {
+        use crate::neo4j::file_uid::PathPolicy;
+        let projects = self.projects.read().await;
+        let Some(project) = projects.get(&id) else {
+            return Ok(PathPolicy::none());
+        };
+        let declared = self
+            .paths_declared
+            .read()
+            .await
+            .get(&id)
+            .copied()
+            .unwrap_or(false);
+        Ok(PathPolicy::new(&project.root_path, "", declared))
     }
 
     async fn get_project_by_slug(&self, slug: &str) -> Result<Option<ProjectNode>> {

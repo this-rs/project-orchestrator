@@ -185,8 +185,46 @@ impl Neo4jClient {
     pub async fn upsert_file(&self, file: &FileNode) -> Result<()> {
         let q = query(
             r#"
-            MERGE (f:File {path: $path})
-            SET f.language = $language,
+            // L'identité du fichier est `(projet, chemin relatif à la racine)`,
+            // calculée ici et non reçue : `neo4j::file_uid` documente la même
+            // grammaire côté Rust. Le point de montage n'entre pas dans la clé,
+            // donc lier ou monter autrement le même dépôt ne crée plus un second
+            // fichier. Le chemin reste un attribut (le dernier montage écrit).
+            // Les deux racines retirent le préfixe : le sync écrit la forme
+            // déclarée (`root_path`), les nœuds antérieurs portent la canonique.
+            OPTIONAL MATCH (p:Project {id: $project_id})
+            WITH coalesce(p.canonical_path, '') AS root,
+                 coalesce(p.root_path, '') AS declared,
+                 $path AS path,
+                 $project_id AS pid
+            WITH path, pid,
+                 CASE WHEN declared <> '' AND path STARTS WITH declared + '/'
+                      THEN substring(path, size(declared) + 1)
+                      WHEN root <> '' AND path STARTS WITH root + '/'
+                      THEN substring(path, size(root) + 1)
+                      ELSE path END AS rel
+            WITH path, CASE WHEN pid = '' THEN '-' ELSE pid END + ':' + rel AS uid
+            // Un nœud existe déjà à CE chemin sous un autre uid (projet recréé →
+            // nouvel uuid, projets imbriqués, fichier pas encore backfillé) : la
+            // contrainte `file_path` refuserait un second nœud, et tout le sync
+            // échouerait. On l'ADOPTE — c'est lui qui porte les arêtes — au lieu
+            // de créer. Un autre nœud qui tiendrait déjà cet uid à un autre chemin
+            // est une copie stale : il perd l'identité (visible dans la couverture
+            // uid de `migrate file-paths`), jamais ses arêtes.
+            OPTIONAL MATCH (byPath:File {path: path})
+            OPTIONAL MATCH (byUid:File {uid: uid})
+            WITH path, uid,
+                 CASE WHEN byPath IS NOT NULL AND byUid IS NOT NULL AND byUid <> byPath
+                      THEN [byUid] ELSE [] END AS stale,
+                 CASE WHEN byPath IS NOT NULL AND (byPath.uid IS NULL OR byPath.uid <> uid)
+                      THEN [byPath] ELSE [] END AS adopt
+            FOREACH (x IN stale | REMOVE x.uid)
+            FOREACH (x IN adopt | SET x.uid = uid)
+            WITH path, uid
+            MERGE (f:File {uid: uid})
+            SET f.path = path,
+                f.uid = uid,
+                f.language = $language,
                 f.hash = $hash,
                 f.last_parsed = datetime($last_parsed),
                 f.project_id = $project_id
@@ -256,8 +294,33 @@ impl Neo4jClient {
             items,
             r#"
             UNWIND $items AS item
-            MERGE (f:File {path: item.path})
-            SET f.language = item.language,
+            OPTIONAL MATCH (p:Project {id: item.project_id})
+            WITH item, coalesce(p.canonical_path, '') AS root,
+                 coalesce(p.root_path, '') AS declared
+            WITH item, item.path AS path,
+                 CASE WHEN declared <> '' AND item.path STARTS WITH declared + '/'
+                      THEN substring(item.path, size(declared) + 1)
+                      WHEN root <> '' AND item.path STARTS WITH root + '/'
+                      THEN substring(item.path, size(root) + 1)
+                      ELSE item.path END AS rel
+            WITH item, path,
+                 CASE WHEN item.project_id = '' THEN '-' ELSE item.project_id END + ':' + rel AS uid
+            // Même adoption qu'`upsert_file` : un nœud déjà présent à ce chemin
+            // est repris, jamais doublé (la contrainte `file_path` le refuserait).
+            OPTIONAL MATCH (byPath:File {path: path})
+            OPTIONAL MATCH (byUid:File {uid: uid})
+            WITH item, path, uid,
+                 CASE WHEN byPath IS NOT NULL AND byUid IS NOT NULL AND byUid <> byPath
+                      THEN [byUid] ELSE [] END AS stale,
+                 CASE WHEN byPath IS NOT NULL AND (byPath.uid IS NULL OR byPath.uid <> uid)
+                      THEN [byPath] ELSE [] END AS adopt
+            FOREACH (x IN stale | REMOVE x.uid)
+            FOREACH (x IN adopt | SET x.uid = uid)
+            WITH item, path, uid
+            MERGE (f:File {uid: uid})
+            SET f.path = path,
+                f.uid = uid,
+                f.language = item.language,
                 f.hash = item.hash,
                 f.last_parsed = datetime(item.last_parsed),
                 f.project_id = item.project_id
@@ -4490,5 +4553,94 @@ impl Neo4jClient {
         } else {
             Ok(0.0)
         }
+    }
+}
+
+#[cfg(test)]
+mod file_identity_wiring_tests {
+    /// Le source de ce fichier : un portillon contre l'oubli d'un chemin
+    /// d'écriture, pas contre une renumérotation.
+    const SRC: &str = include_str!("code.rs");
+
+    /// Les deux chemins d'écriture d'un fichier (unitaire et par lot) doivent
+    /// merger sur la MÊME identité. Un seul oubli, et le même fichier
+    /// redeviendrait deux nœuds dès qu'on l'écrit par l'autre chemin — le défaut
+    /// d'origine, réintroduit par une porte de service.
+    #[test]
+    fn both_file_write_paths_merge_on_the_uid() {
+        // Le motif est reconstruit : écrit d'un seul tenant, il apparaîtrait dans
+        // ce fichier de test et le compte vaudrait 3.
+        let on_uid = ["MERGE (f:File {", "uid: uid})"].concat();
+        let on_path = ["MERGE (f:File {", "path:"].concat();
+        assert_eq!(
+            SRC.matches(&on_uid).count(),
+            2,
+            "upsert_file and batch_upsert_files must both merge on the uid"
+        );
+        assert!(!SRC.contains(&on_path), "the path is no longer an identity");
+    }
+
+    /// L'identité se calcule contre la racine canonique du projet : c'est elle
+    /// que le sync stocke réellement, et elle seule permet d'obtenir le chemin
+    /// relatif quand la racine déclarée est un lien symbolique.
+    #[test]
+    fn the_uid_is_computed_against_the_canonical_root() {
+        assert!(
+            SRC.contains("p.canonical_path"),
+            "a file uid computed against the declared root cannot strip a canonical path"
+        );
+        assert!(
+            SRC.contains("substring(path, size(root) + 1)")
+                || SRC.contains("substring(item.path, size(root) + 1)"),
+            "the relative path is a suffix of the stored path"
+        );
+    }
+
+    /// Le sync écrit désormais la forme DÉCLARÉE (`under_declared_root`) ; les
+    /// nœuds antérieurs portent la canonique. Les deux chemins d'écriture
+    /// doivent retirer l'une OU l'autre racine, sinon le même fichier aurait
+    /// deux uids selon la forme reçue — et le renommage du lot 3/3 en ferait deux.
+    #[test]
+    fn the_uid_strips_the_declared_root_as_well() {
+        // Motif reconstruit : écrit d'un tenant, ce test le compterait aussi.
+        let reads_declared = ["coalesce(p.root_path, '')", " AS declared"].concat();
+        assert_eq!(
+            SRC.matches(&reads_declared).count(),
+            2,
+            "both write paths read the declared root"
+        );
+        assert!(SRC.contains("path STARTS WITH declared + '/'"));
+        assert!(SRC.contains("item.path STARTS WITH declared + '/'"));
+    }
+
+    /// Un nœud déjà présent à ce chemin sous un autre uid (projet recréé, projets
+    /// imbriqués, fichier pas encore backfillé) est ADOPTÉ avant le MERGE : sinon
+    /// `SET f.path` viole la contrainte `file_path` et tout le sync échoue — là
+    /// où le MERGE sur le chemin réassignait simplement `project_id`.
+    #[test]
+    fn a_node_at_the_same_path_is_adopted_never_duplicated() {
+        let by_path = ["OPTIONAL MATCH (byPath:File {", "path: path})"].concat();
+        assert_eq!(
+            SRC.matches(&by_path).count(),
+            2,
+            "both write paths look up the node at the path first"
+        );
+        // Motifs reconstruits : écrits d'un tenant, ce test les compterait aussi.
+        let adopt = ["FOREACH (x IN adopt | ", "SET x.uid = uid)"].concat();
+        assert_eq!(SRC.matches(&adopt).count(), 2);
+        // A stale holder of the identity loses the uid, never its edges.
+        let demote = ["FOREACH (x IN stale | ", "REMOVE x.uid)"].concat();
+        assert_eq!(SRC.matches(&demote).count(), 2);
+        let destroy = ["DETACH DELETE ", "byUid"].concat();
+        assert!(
+            !SRC.contains(&destroy),
+            "a stale node is demoted, never destroyed"
+        );
+        // The adoption happens BEFORE the merge on the uid, in the same query.
+        let first_adopt = SRC.find(&adopt).unwrap();
+        let first_merge = SRC
+            .find(&["MERGE (f:File {", "uid: uid})"].concat())
+            .unwrap();
+        assert!(first_adopt < first_merge);
     }
 }

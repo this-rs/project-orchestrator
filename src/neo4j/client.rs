@@ -16,6 +16,7 @@ const EXPECTED_CONSTRAINTS: &[&str] = &[
     "project_id",
     "project_slug",
     "file_path",
+    "file_uid",
     "function_id",
     "struct_id",
     "trait_id",
@@ -448,6 +449,11 @@ impl Neo4jClient {
             "CREATE CONSTRAINT project_slug IF NOT EXISTS FOR (p:Project) REQUIRE p.slug IS UNIQUE",
             // Code structure constraints
             "CREATE CONSTRAINT file_path IF NOT EXISTS FOR (f:File) REQUIRE f.path IS UNIQUE",
+            // A file is identified by (project, path relative to the project
+            // root) — see `neo4j::file_uid`. The path stays unique too: one node
+            // per mount, and two mounts of the same file are one node whose
+            // `path` follows the last writer (the VFS is a later subject).
+            "CREATE CONSTRAINT file_uid IF NOT EXISTS FOR (f:File) REQUIRE f.uid IS UNIQUE",
             "CREATE CONSTRAINT function_id IF NOT EXISTS FOR (f:Function) REQUIRE f.id IS UNIQUE",
             "CREATE CONSTRAINT struct_id IF NOT EXISTS FOR (s:Struct) REQUIRE s.id IS UNIQUE",
             "CREATE CONSTRAINT trait_id IF NOT EXISTS FOR (t:Trait) REQUIRE t.id IS UNIQUE",
