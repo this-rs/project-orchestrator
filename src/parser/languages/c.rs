@@ -112,6 +112,7 @@ fn extract_function(
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
+        owner: None,
     })
 }
 
@@ -159,6 +160,7 @@ fn extract_function_declaration(
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
+        owner: None,
     })
 }
 
@@ -310,6 +312,7 @@ fn extract_include(node: &tree_sitter::Node, source: &str, file_path: &str) -> O
         items: vec![],
         file_path: file_path.to_string(),
         line: node.start_position().row as u32 + 1,
+        occurrence: 0,
     })
 }
 
@@ -329,6 +332,7 @@ fn extract_macro(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring: get_c_doc(node, source),
+        owner: None,
     })
 }
 

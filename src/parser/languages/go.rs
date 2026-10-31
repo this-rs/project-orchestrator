@@ -101,6 +101,7 @@ fn extract_function(
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
+        owner: None,
     })
 }
 
@@ -149,6 +150,7 @@ fn extract_method(node: &tree_sitter::Node, source: &str, file_path: &str) -> Op
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
+        owner: None,
     })
 }
 
@@ -260,6 +262,7 @@ fn extract_imports(
                         items: vec![],
                         file_path: file_path.to_string(),
                         line: child.start_position().row as u32 + 1,
+                        occurrence: 0,
                     });
                 }
             }
@@ -284,6 +287,7 @@ fn extract_imports(
                                 items: vec![],
                                 file_path: file_path.to_string(),
                                 line: spec.start_position().row as u32 + 1,
+                                occurrence: 0,
                             });
                         }
                     }

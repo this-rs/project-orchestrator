@@ -6982,6 +6982,7 @@ mod tests {
             line_start: 1,
             line_end: 10,
             docstring: None,
+            owner: None,
         }
     }
 
@@ -7430,6 +7431,7 @@ mod tests {
                     line_start: 1,
                     line_end: 10,
                     docstring: None,
+                    owner: None,
                 },
                 FunctionNode {
                     name: "bar".to_string(),
@@ -7444,6 +7446,7 @@ mod tests {
                     line_start: 20,
                     line_end: 30,
                     docstring: None,
+                    owner: None,
                 },
             ],
             structs: vec![StructNode {
@@ -7492,6 +7495,7 @@ mod tests {
                 items: vec!["Display".to_string()],
                 file_path: file_path.clone(),
                 line: 1,
+                occurrence: 0,
             }],
             function_calls: vec![FunctionCall {
                 caller_id: format!("{}:foo:1", file_path),
@@ -7584,6 +7588,7 @@ mod tests {
                 line_start: 10,
                 line_end: 50,
                 docstring: None,
+                owner: None,
             }],
             structs: vec![StructNode {
                 name: "PlanRequest".to_string(),
@@ -7631,6 +7636,7 @@ mod tests {
             line_start: 100,
             line_end: 200,
             docstring: Some("Generate implementation phases from code analysis".to_string()),
+            owner: None,
         };
 
         let text = Orchestrator::build_function_embedding_text(&func);
@@ -7657,6 +7663,7 @@ mod tests {
             line_start: 1,
             line_end: 3,
             docstring: None,
+            owner: None,
         };
 
         let text = Orchestrator::build_function_embedding_text(&func);
@@ -8850,6 +8857,7 @@ mod tests {
                     line_start: (i as u32 + 1) * 10,
                     line_end: (i as u32 + 1) * 10 + 5,
                     docstring: None,
+                    owner: None,
                 })
                 .collect(),
             structs: vec![],
@@ -9069,6 +9077,7 @@ mod tests {
                 line_start: 1,
                 line_end: 10,
                 docstring: None,
+                owner: None,
             }],
             structs: vec![StructNode {
                 name: "MyStruct".to_string(),
@@ -9667,6 +9676,7 @@ mod tests {
                     is_unsafe: false,
                     complexity: 1,
                     docstring: None,
+                    owner: None,
                 }],
                 structs: vec![],
                 traits: vec![],
@@ -9693,6 +9703,7 @@ mod tests {
                     is_unsafe: false,
                     complexity: 1,
                     docstring: None,
+                    owner: None,
                 }],
                 structs: vec![],
                 traits: vec![],
@@ -10164,6 +10175,7 @@ mod tests {
                 line_start: 10,
                 line_end: 30,
                 docstring: Some("Handle request".to_string()),
+                owner: None,
             }],
             structs: vec![StructNode {
                 name: "Config".to_string(),
@@ -10185,6 +10197,7 @@ mod tests {
                 items: vec!["Deserialize".to_string()],
                 file_path: file_path.clone(),
                 line: 1,
+                occurrence: 0,
             }],
             function_calls: vec![],
             symbols: vec!["handler".to_string(), "Config".to_string()],
@@ -10249,6 +10262,7 @@ mod tests {
                 line_start: 1,
                 line_end: 5,
                 docstring: None,
+                owner: None,
             }],
             structs: vec![],
             traits: vec![],
@@ -10328,6 +10342,7 @@ mod tests {
                 line_start: 1,
                 line_end: 5,
                 docstring: None,
+                owner: None,
             }],
             structs: vec![],
             traits: vec![],
@@ -10371,6 +10386,7 @@ mod tests {
                 line_start: 1,
                 line_end: 5,
                 docstring: None,
+                owner: None,
             }],
             structs: vec![],
             traits: vec![],
@@ -10563,6 +10579,7 @@ mod tests {
                     line_start: 1,
                     line_end: 5,
                     docstring: None,
+                    owner: None,
                 }],
                 structs: vec![],
                 traits: vec![],
@@ -10610,6 +10627,7 @@ mod tests {
                     line_start: 1,
                     line_end: 5,
                     docstring: None,
+                    owner: None,
                 },
                 FunctionNode {
                     name: "new_func".to_string(),
@@ -10624,6 +10642,7 @@ mod tests {
                     line_start: 10,
                     line_end: 15,
                     docstring: None,
+                    owner: None,
                 },
             ],
             structs: vec![],
@@ -10687,6 +10706,7 @@ mod tests {
                 line_start: 1,
                 line_end: 10,
                 docstring: None,
+                owner: None,
             }],
             structs: vec![],
             traits: vec![],
@@ -10698,6 +10718,7 @@ mod tests {
                 items: vec![],
                 file_path: importer.clone(),
                 line: 1,
+                occurrence: 0,
             }],
             function_calls: vec![],
             symbols: vec!["main".to_string()],
@@ -10720,6 +10741,7 @@ mod tests {
                 line_start: 1,
                 line_end: 5,
                 docstring: None,
+                owner: None,
             }],
             structs: vec![],
             traits: vec![],
@@ -10786,6 +10808,7 @@ mod tests {
                     line_start: 1,
                     line_end: 5,
                     docstring: None,
+                    owner: None,
                 }],
                 structs: vec![],
                 traits: vec![],
@@ -10877,6 +10900,7 @@ mod tests {
                     line_start: func_idx * 10 + 1,
                     line_end: func_idx * 10 + 9,
                     docstring: None,
+                    owner: None,
                 })
                 .collect();
 
@@ -11035,6 +11059,7 @@ mod tests {
                     line_start: func_idx * 10 + 1,
                     line_end: func_idx * 10 + 9,
                     docstring: None,
+                    owner: None,
                 })
                 .collect();
 

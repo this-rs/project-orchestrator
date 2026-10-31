@@ -4,7 +4,10 @@ use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
 use super::models::*;
-use super::symbol_key::{stable_impl_key, stable_import_key, stable_symbol_key, stable_type_key};
+use super::symbol_key::{
+    stable_external_trait_key, stable_impl_key, stable_import_key, stable_symbol_key,
+    stable_type_key,
+};
 use anyhow::Result;
 use neo4rs::query;
 use uuid::Uuid;
@@ -507,7 +510,12 @@ impl Neo4jClient {
     /// Create or update a function node
     pub async fn upsert_function(&self, func: &FunctionNode) -> Result<()> {
         let id = format!("{}:{}:{}", func.file_path, func.name, func.line_start);
-        let stable_key = stable_symbol_key(&func.file_path, &func.name, &func.params);
+        let stable_key = stable_symbol_key(
+            &func.file_path,
+            func.owner.as_ref(),
+            &func.name,
+            &func.params,
+        );
         let q = query(
             r#"
             MERGE (f:Function {id: $id})
@@ -523,14 +531,25 @@ impl Neo4jClient {
                 f.line_start = $line_start,
                 f.line_end = $line_end,
                 f.docstring = $docstring,
+                f.owner_type = $owner_type,
+                f.owner_trait = $owner_trait,
                 f.stable_key = $stable_key
             WITH f
             MATCH (file:File {path: $file_path})
             MERGE (file)-[:CONTAINS]->(f)
+            SET f.project_id = file.project_id
             "#,
         )
         .param("id", id)
         .param("stable_key", stable_key)
+        .param(
+            "owner_type",
+            func.owner.as_ref().map(|o| o.type_name.clone()),
+        )
+        .param(
+            "owner_trait",
+            func.owner.as_ref().and_then(|o| o.trait_name.clone()),
+        )
         .param("name", func.name.clone())
         .param("visibility", format!("{:?}", func.visibility))
         .param("params", serde_json::to_string(&func.params)?)
@@ -558,7 +577,8 @@ impl Neo4jClient {
         let q = query(
             r#"
             MERGE (s:Struct {id: $id})
-            SET s.name = $name,
+            SET s.stable_key = $stable_key,
+                s.name = $name,
                 s.visibility = $visibility,
                 s.generics = $generics,
                 s.file_path = $file_path,
@@ -570,9 +590,11 @@ impl Neo4jClient {
             WITH s
             MATCH (file:File {path: $file_path})
             MERGE (file)-[:CONTAINS]->(s)
+            SET s.project_id = file.project_id
             "#,
         )
         .param("id", id)
+        .param("stable_key", stable_type_key(&s.file_path, &s.name))
         .param("name", s.name.clone())
         .param("visibility", format!("{:?}", s.visibility))
         .param("generics", s.generics.clone())
@@ -608,6 +630,7 @@ impl Neo4jClient {
             WITH t
             MATCH (file:File {path: $file_path})
             MERGE (file)-[:CONTAINS]->(t)
+            SET t.project_id = file.project_id
             "#,
         )
         .param("id", id)
@@ -664,6 +687,7 @@ impl Neo4jClient {
             WITH e
             MATCH (file:File {path: $file_path})
             MERGE (file)-[:CONTAINS]->(e)
+            SET e.project_id = file.project_id
             "#,
         )
         .param("id", id)
@@ -696,7 +720,8 @@ impl Neo4jClient {
         let q = query(
             r#"
             MERGE (i:Impl {id: $id})
-            SET i.for_type = $for_type,
+            SET i.stable_key = $stable_key,
+                i.for_type = $for_type,
                 i.trait_name = $trait_name,
                 i.generics = $generics,
                 i.where_clause = $where_clause,
@@ -706,9 +731,18 @@ impl Neo4jClient {
             WITH i
             MATCH (file:File {path: $file_path})
             MERGE (file)-[:CONTAINS]->(i)
+            SET i.project_id = file.project_id
             "#,
         )
         .param("id", id.clone())
+        .param(
+            "stable_key",
+            stable_impl_key(
+                &impl_node.file_path,
+                &impl_node.for_type,
+                impl_node.trait_name.as_deref(),
+            ),
+        )
         .param("for_type", impl_node.for_type.clone())
         .param(
             "trait_name",
@@ -806,6 +840,7 @@ impl Neo4jClient {
                     r#"
                     MERGE (t:Trait {id: $trait_id})
                     ON CREATE SET
+                        t.stable_key = $stable_key,
                         t.name = $name,
                         t.full_path = $full_path,
                         t.is_external = true,
@@ -822,6 +857,7 @@ impl Neo4jClient {
                     MERGE (i)-[:IMPLEMENTS_TRAIT]->(t)
                     "#,
                 )
+                .param("stable_key", stable_external_trait_key(trait_name))
                 .param("trait_id", external_id)
                 .param("name", simple_name)
                 .param("full_path", trait_name.clone())
@@ -997,17 +1033,20 @@ impl Neo4jClient {
                 i.alias = $alias,
                 i.items = $items,
                 i.file_path = $file_path,
-                i.line = $line
+                i.line = $line,
+                i.occurrence = $occurrence
             WITH i
             MATCH (file:File {path: $file_path})
             MERGE (file)-[:HAS_IMPORT]->(i)
+            SET i.project_id = file.project_id
             "#,
         )
         .param("id", id)
         .param(
             "stable_key",
-            stable_import_key(&import.file_path, import.line, &import.path),
+            stable_import_key(&import.file_path, &import.path, import.occurrence),
         )
+        .param("occurrence", import.occurrence as i64)
         .param("path", import.path.clone())
         .param("alias", import.alias.clone().unwrap_or_default())
         .param("items", import.items.clone())
@@ -1180,7 +1219,24 @@ impl Neo4jClient {
                 );
                 m.insert(
                     "stable_key".into(),
-                    stable_symbol_key(&func.file_path, &func.name, &func.params).into(),
+                    stable_symbol_key(
+                        &func.file_path,
+                        func.owner.as_ref(),
+                        &func.name,
+                        &func.params,
+                    )
+                    .into(),
+                );
+                m.insert(
+                    "owner_type".into(),
+                    func.owner.as_ref().map(|o| o.type_name.clone()).into(),
+                );
+                m.insert(
+                    "owner_trait".into(),
+                    func.owner
+                        .as_ref()
+                        .and_then(|o| o.trait_name.clone())
+                        .into(),
                 );
                 m.insert("name".into(), func.name.clone().into());
                 m.insert("visibility".into(), format!("{:?}", func.visibility).into());
@@ -1225,6 +1281,8 @@ impl Neo4jClient {
                 f.line_start = func.line_start,
                 f.line_end = func.line_end,
                 f.docstring = func.docstring,
+                f.owner_type = func.owner_type,
+                f.owner_trait = func.owner_trait,
                 f.stable_key = func.stable_key
             WITH f, func
             MATCH (file:File {path: func.file_path})
@@ -1467,6 +1525,7 @@ impl Neo4jClient {
             WITH i, imp
             MATCH (file:File {path: imp.file_path})
             MERGE (file)-[:CONTAINS]->(i)
+            SET i.project_id = file.project_id
             "#,
         )
         .param("items", items.clone());
@@ -1548,6 +1607,10 @@ impl Neo4jClient {
                 m.insert("source".into(), source.into());
                 m.insert("full_path".into(), trait_name.to_string().into());
                 m.insert("external_id".into(), external_id.into());
+                m.insert(
+                    "external_stable_key".into(),
+                    stable_external_trait_key(trait_name).into(),
+                );
                 m
             })
             .collect();
@@ -1594,6 +1657,7 @@ impl Neo4jClient {
                     UNWIND $items AS imp
                     MERGE (t:Trait {id: imp.external_id})
                     ON CREATE SET
+                        t.stable_key = imp.external_stable_key,
                         t.name = imp.simple_name,
                         t.full_path = imp.full_path,
                         t.is_external = true,
@@ -1633,8 +1697,9 @@ impl Neo4jClient {
                 m.insert("id".into(), id.into());
                 m.insert(
                     "stable_key".into(),
-                    stable_import_key(&imp.file_path, imp.line, &imp.path).into(),
+                    stable_import_key(&imp.file_path, &imp.path, imp.occurrence).into(),
                 );
+                m.insert("occurrence".into(), (imp.occurrence as i64).into());
                 m.insert("path".into(), imp.path.clone().into());
                 m.insert("alias".into(), imp.alias.clone().unwrap_or_default().into());
                 m.insert("items".into(), imp.items.clone().into());
@@ -1653,10 +1718,12 @@ impl Neo4jClient {
                 i.alias = imp.alias,
                 i.items = imp.items,
                 i.file_path = imp.file_path,
-                i.line = imp.line
+                i.line = imp.line,
+                i.occurrence = imp.occurrence
             WITH i, imp
             MATCH (file:File {path: imp.file_path})
             MERGE (file)-[:HAS_IMPORT]->(i)
+            SET i.project_id = file.project_id
             "#,
         )
         .param("items", items);
@@ -2457,6 +2524,10 @@ impl Neo4jClient {
                 line_start: node.get::<i64>("line_start")? as u32,
                 line_end: node.get::<i64>("line_end")? as u32,
                 docstring: node.get("docstring").ok(),
+                owner: node
+                    .get::<String>("owner_type")
+                    .ok()
+                    .map(|t| SymbolOwner::new(t, node.get::<String>("owner_trait").ok())),
             });
         }
 
@@ -3898,6 +3969,10 @@ impl Neo4jClient {
                 line_start: node.get::<i64>("line_start")? as u32,
                 line_end: node.get::<i64>("line_end")? as u32,
                 docstring: node.get("docstring").ok(),
+                owner: node
+                    .get::<String>("owner_type")
+                    .ok()
+                    .map(|t| SymbolOwner::new(t, node.get::<String>("owner_trait").ok())),
             });
         }
 

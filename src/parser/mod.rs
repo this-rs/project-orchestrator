@@ -275,6 +275,9 @@ impl CodeParser {
             }
         }
 
+        assign_owners(&mut parsed);
+        assign_import_occurrences(&mut parsed);
+
         Ok((parsed, tree))
     }
 
@@ -384,6 +387,195 @@ pub struct FunctionCall {
     pub confidence: f64,
     /// Reason for the confidence level (e.g., "import-resolved", "same-file", "fuzzy-unique", "fuzzy-ambiguous")
     pub reason: String,
+}
+
+/// Give every method its owner, for every language at once.
+///
+/// A method pushed by a language extractor carries a bare name; the block
+/// that owns it — an `impl` (Rust, Swift/Dart extension) or a class (modelled
+/// as a `StructNode`) — is the innermost one whose lines enclose the
+/// method's, by the ONE rule of `symbol_key::enclosing_owner`, which the
+/// backfill of legacy nodes applies to the `Impl`/`Struct` nodes of the graph.
+/// An owner an extractor set itself (Rust's `extract_impl`, which knows the
+/// trait) is kept.
+pub fn assign_owners(parsed: &mut ParsedFile) {
+    let candidates: Vec<(u32, u32, SymbolOwner)> = parsed
+        .impl_blocks
+        .iter()
+        .map(|i| {
+            (
+                i.line_start,
+                i.line_end,
+                SymbolOwner::new(i.for_type.clone(), i.trait_name.clone()),
+            )
+        })
+        .chain(parsed.structs.iter().map(|s| {
+            (
+                s.line_start,
+                s.line_end,
+                SymbolOwner::new(s.name.clone(), None::<String>),
+            )
+        }))
+        .collect();
+    for func in parsed.functions.iter_mut().filter(|f| f.owner.is_none()) {
+        func.owner = crate::neo4j::symbol_key::enclosing_owner(
+            func.line_start,
+            func.line_end,
+            candidates.iter().cloned(),
+        );
+    }
+}
+
+/// Rank the imports of one path within the file, in source order: the first
+/// is `0`, a genuine duplicate (`use std::fmt;` at the top and again in
+/// `mod tests`) is `1`, ... The rank replaces the line in the import's stable
+/// identity (`symbol_key::stable_import_key`).
+pub fn assign_import_occurrences(parsed: &mut ParsedFile) {
+    let mut seen: HashMap<&str, u32> = HashMap::new();
+    let mut imports = std::mem::take(&mut parsed.imports);
+    imports.sort_by_key(|i| i.line);
+    for import in imports.iter_mut() {
+        let n = seen.entry(import.path.as_str()).or_insert(0);
+        import.occurrence = *n;
+        *n += 1;
+    }
+    parsed.imports = imports;
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    fn func(name: &str, start: u32, end: u32) -> FunctionNode {
+        FunctionNode {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/a.rs".to_string(),
+            line_start: start,
+            line_end: end,
+            docstring: None,
+            owner: None,
+        }
+    }
+
+    fn parsed() -> ParsedFile {
+        ParsedFile {
+            path: "src/a.rs".to_string(),
+            language: "rust".to_string(),
+            hash: String::new(),
+            functions: vec![],
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            imports: vec![],
+            impl_blocks: vec![],
+            function_calls: vec![],
+            symbols: vec![],
+        }
+    }
+
+    // The review's defect: two `new` in two impls of one file shared a key.
+    // The owner is deduced from the enclosing block, the same way for every
+    // language and for the backfill of legacy nodes.
+    #[test]
+    fn methods_take_the_innermost_enclosing_block_as_owner() {
+        let mut p = parsed();
+        p.impl_blocks.push(ImplNode {
+            for_type: "A".into(),
+            trait_name: None,
+            generics: vec![],
+            where_clause: None,
+            file_path: "src/a.rs".into(),
+            line_start: 10,
+            line_end: 20,
+        });
+        p.impl_blocks.push(ImplNode {
+            for_type: "A".into(),
+            trait_name: Some("Display".into()),
+            generics: vec![],
+            where_clause: None,
+            file_path: "src/a.rs".into(),
+            line_start: 30,
+            line_end: 40,
+        });
+        p.structs.push(StructNode {
+            name: "Klass".into(),
+            visibility: Visibility::Public,
+            generics: vec![],
+            file_path: "src/a.py".into(),
+            line_start: 50,
+            line_end: 70,
+            docstring: None,
+            parent_class: None,
+            interfaces: vec![],
+        });
+        p.functions.push(func("new", 11, 15));
+        p.functions.push(func("fmt", 31, 35));
+        p.functions.push(func("__init__", 51, 55));
+        p.functions.push(func("free", 80, 85));
+        // An extractor that already knows the owner is not second-guessed.
+        let mut known = func("known", 12, 13);
+        known.owner = Some(SymbolOwner::new("Given", None::<&str>));
+        p.functions.push(known);
+
+        assign_owners(&mut p);
+
+        let owner = |n: &str| {
+            p.functions
+                .iter()
+                .find(|f| f.name == n)
+                .unwrap()
+                .owner
+                .clone()
+        };
+        assert_eq!(owner("new"), Some(SymbolOwner::new("A", None::<&str>)));
+        assert_eq!(owner("fmt"), Some(SymbolOwner::new("A", Some("Display"))));
+        assert_eq!(
+            owner("__init__"),
+            Some(SymbolOwner::new("Klass", None::<&str>))
+        );
+        assert_eq!(owner("free"), None);
+        assert_eq!(
+            owner("known"),
+            Some(SymbolOwner::new("Given", None::<&str>))
+        );
+    }
+
+    #[test]
+    fn duplicate_imports_are_ranked_in_source_order() {
+        let mut p = parsed();
+        let imp = |path: &str, line: u32| ImportNode {
+            path: path.into(),
+            alias: None,
+            items: vec![],
+            file_path: "src/a.rs".into(),
+            line,
+            occurrence: 0,
+        };
+        p.imports.push(imp("std::fmt", 90));
+        p.imports.push(imp("std::fmt", 3));
+        p.imports.push(imp("std::io", 4));
+        assign_import_occurrences(&mut p);
+        let occ: Vec<(String, u32, u32)> = p
+            .imports
+            .iter()
+            .map(|i| (i.path.clone(), i.line, i.occurrence))
+            .collect();
+        assert_eq!(
+            occ,
+            vec![
+                ("std::fmt".to_string(), 3, 0),
+                ("std::io".to_string(), 4, 0),
+                ("std::fmt".to_string(), 90, 1),
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

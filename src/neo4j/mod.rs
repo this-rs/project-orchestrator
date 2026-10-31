@@ -43,7 +43,7 @@ pub mod segment;
 mod sharing;
 mod skill;
 mod step;
-mod symbol_key;
+pub mod symbol_key;
 mod synapse_shadow;
 mod task;
 mod topology;

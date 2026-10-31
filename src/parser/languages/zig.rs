@@ -111,6 +111,7 @@ fn extract_function(
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
+        owner: None,
     })
 }
 
@@ -143,6 +144,7 @@ fn extract_test(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opti
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring: None,
+        owner: None,
     })
 }
 
@@ -171,6 +173,7 @@ fn extract_import_from_decl(
         items: vec![],
         file_path: file_path.to_string(),
         line: node.start_position().row as u32 + 1,
+        occurrence: 0,
     })
 }
 

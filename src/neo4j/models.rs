@@ -756,6 +756,47 @@ pub struct FunctionNode {
     pub line_start: u32,
     pub line_end: u32,
     pub docstring: Option<String>,
+    /// The block that owns this function when it is a method: the `impl` (Rust,
+    /// Swift extension, Dart extension) or the class (every other language).
+    /// `None` for a free function. It is part of the stable identity
+    /// (`symbol_key::stable_symbol_key`): `impl A { fn new() }` and
+    /// `impl B { fn new() }` in one file are two symbols, not one.
+    #[serde(default)]
+    pub owner: Option<SymbolOwner>,
+}
+
+/// The owner of a method: the type it is implemented on and, for a trait
+/// implementation, the trait — `fmt` of `Display for A` and `fmt` of
+/// `Debug for A` are two methods.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolOwner {
+    pub type_name: String,
+    #[serde(default)]
+    pub trait_name: Option<String>,
+}
+
+impl SymbolOwner {
+    /// A blank trait name is no trait at all — the graph stores `''` for
+    /// "no trait" on `Impl` nodes, and the two shapes must be one owner.
+    pub fn new(type_name: impl Into<String>, trait_name: Option<impl Into<String>>) -> Self {
+        let trait_name = trait_name
+            .map(Into::into)
+            .filter(|t: &String| !t.trim().is_empty());
+        Self {
+            type_name: type_name.into(),
+            trait_name,
+        }
+    }
+
+    /// The qualifier that goes before the method name in its stable key:
+    /// `Type` for an inherent method, `<Type as Trait>` (Rust's own fully
+    /// qualified syntax) for a trait method.
+    pub fn qualifier(&self) -> String {
+        match &self.trait_name {
+            Some(t) => format!("<{} as {}>", self.type_name, t),
+            None => self.type_name.clone(),
+        }
+    }
 }
 
 /// A function parameter
@@ -794,6 +835,13 @@ pub struct ImportNode {
     pub items: Vec<String>,
     pub file_path: String,
     pub line: u32,
+    /// Rank of this import among the imports of the SAME path in the same
+    /// file, in source order: 0 for the first (the usual case), 1 for a
+    /// genuine duplicate (`use std::fmt;` at the top and again in
+    /// `mod tests`). Part of the stable identity instead of the line, which
+    /// changes with every edit above the import.
+    #[serde(default)]
+    pub occurrence: u32,
 }
 
 /// Visibility level

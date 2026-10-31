@@ -31,6 +31,7 @@ pub fn extract(
         items: vec![],
         file_path: file_path.to_string(),
         line: 0,
+        occurrence: 0,
     });
 
     Ok(())
@@ -303,6 +304,7 @@ fn extract_module(
                 items: vec![],
                 file_path: file_path.to_string(),
                 line: node.start_position().row as u32 + 1,
+                occurrence: 0,
             });
         }
     }

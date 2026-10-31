@@ -575,6 +575,7 @@ mod tests {
                 line_start: (i * 10) as u32,
                 line_end: (i * 10 + 9) as u32,
                 docstring: None,
+                owner: None,
             };
             store.upsert_function(&func).await.unwrap();
         }
