@@ -2,6 +2,7 @@
 //!
 //! Provides endpoints:
 //! - `POST /api/episodes/collect` — Collect an episode from a completed ProtocolRun
+//!   (`run_id`) or from a chat session (`session_id`)
 //! - `GET /api/episodes` — List episodes for a project
 //! - `POST /api/episodes/anonymize` — Convert an episode to portable format
 //! - `POST /api/episodes/export-artifact` — Export enriched artifact (structure + episodes)
@@ -24,13 +25,68 @@ use uuid::Uuid;
 // Request / Response types
 // ============================================================================
 
-/// Request body for `POST /api/episodes/collect`.
+/// Request body for `POST /api/episodes/collect`: exactly one of `run_id` and
+/// `session_id`.
 #[derive(Debug, Deserialize)]
 pub struct CollectEpisodeRequest {
-    /// The ProtocolRun ID to collect an episode from.
-    pub run_id: Uuid,
-    /// The project ID.
-    pub project_id: Uuid,
+    /// The ProtocolRun ID to collect an episode from. Needs `project_id`.
+    #[serde(default)]
+    pub run_id: Option<Uuid>,
+    /// The chat session ID to collect an episode from. The session names its own
+    /// project, so `project_id` is optional here — and refused when it is another one.
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+    /// The project ID. Required with `run_id`.
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
+}
+
+/// What a collect request asks for, once validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectTarget {
+    Run {
+        run_id: Uuid,
+        project_id: Uuid,
+    },
+    Session {
+        session_id: Uuid,
+        project_id: Option<Uuid>,
+    },
+}
+
+impl CollectEpisodeRequest {
+    /// Exactly one of `run_id` and `session_id`; `project_id` with `run_id`.
+    pub fn target(&self) -> Result<CollectTarget, AppError> {
+        match (self.run_id, self.session_id) {
+            (Some(_), Some(_)) => Err(AppError::BadRequest(
+                "give either run_id or session_id, not both".to_string(),
+            )),
+            (None, None) => Err(AppError::BadRequest(
+                "run_id (a protocol run) or session_id (a chat session) is required".to_string(),
+            )),
+            (Some(run_id), None) => {
+                let project_id = self.project_id.ok_or_else(|| {
+                    AppError::BadRequest("project_id is required with run_id".to_string())
+                })?;
+                Ok(CollectTarget::Run { run_id, project_id })
+            }
+            (None, Some(session_id)) => Ok(CollectTarget::Session {
+                session_id,
+                project_id: self.project_id,
+            }),
+        }
+    }
+}
+
+/// The `close_reason` of an episode taken on demand from a session: `open` while the
+/// session runs on this instance, `unknown` otherwise (see `close_reason`). Never a
+/// real close reason — the snapshot closes nothing.
+pub fn snapshot_close_reason(live: bool) -> &'static str {
+    if live {
+        crate::episodes::models::close_reason::OPEN
+    } else {
+        crate::episodes::models::close_reason::UNKNOWN
+    }
 }
 
 /// Response for `POST /api/episodes/collect`.
@@ -115,35 +171,75 @@ pub struct AnonymizeEpisodeResponse {
 // Handlers
 // ============================================================================
 
-/// Collect an episode from a completed ProtocolRun.
+/// Collect an episode from a completed ProtocolRun, or from a chat session.
 ///
 /// POST /api/episodes/collect
 ///
-/// Queries the knowledge graph to assemble a complete Episode from:
+/// With `run_id`, queries the knowledge graph to assemble a complete Episode from:
 /// - ProtocolRun (stimulus + states_visited)
 /// - PRODUCED_DURING relations (outcome: notes + decisions)
 /// - REASONING_FOR relation (process: reasoning tree)
 /// - Run status (validation)
+///
+/// With `session_id`, takes the episode the session would leave at its close
+/// (`collector::snapshot_session_episode`) as it stands now. Its `close_reason` is
+/// `open` while the session runs on this instance, `unknown` otherwise
+/// ([`snapshot_close_reason`]): the route closes nothing and invents no ending.
+///
+/// Neither path saves the episode: the close of the session is what writes it. The
+/// session path writes nothing at all (not even the `:Agent` node the close upserts)
+/// and emits no event — nothing was created, and for a closed session the id is
+/// that of the saved episode, which a `created` event would re-announce to every
+/// subscriber on every call. The run path keeps its `Episode created` event
+/// (pre-existing behaviour: a run episode is a derived view, listed by
+/// `GET /api/episodes` without being saved, and the event is what tells the
+/// cockpit to refresh that list).
 pub async fn collect_episode(
     State(state): State<OrchestratorState>,
     Json(body): Json<CollectEpisodeRequest>,
 ) -> Result<Json<CollectEpisodeResponse>, AppError> {
-    let episode =
-        collector::collect_episode(state.orchestrator.neo4j(), body.run_id, body.project_id)
-            .await
-            .map_err(AppError::Internal)?;
-
-    if episode.is_some() {
-        state.event_bus.emit_created(
-            crate::events::EntityType::Episode,
-            &body.run_id.to_string(),
-            serde_json::json!({
-                "run_id": body.run_id.to_string(),
-                "project_id": body.project_id.to_string(),
-            }),
-            Some(body.project_id.to_string()),
-        );
-    }
+    let graph = state.orchestrator.neo4j();
+    let episode = match body.target()? {
+        CollectTarget::Run { run_id, project_id } => {
+            let episode = collector::collect_episode(graph, run_id, project_id)
+                .await
+                .map_err(AppError::Internal)?;
+            if episode.is_some() {
+                state.event_bus.emit_created(
+                    crate::events::EntityType::Episode,
+                    &run_id.to_string(),
+                    serde_json::json!({
+                        "run_id": run_id.to_string(),
+                        "project_id": project_id.to_string(),
+                    }),
+                    Some(project_id.to_string()),
+                );
+            }
+            episode
+        }
+        CollectTarget::Session {
+            session_id,
+            project_id,
+        } => {
+            let live = match state.chat_manager.as_ref() {
+                Some(manager) => manager.is_session_active(&session_id.to_string()).await,
+                None => false,
+            };
+            let episode =
+                collector::snapshot_session_episode(graph, session_id, snapshot_close_reason(live))
+                    .await
+                    .map_err(AppError::Internal)?;
+            if let (Some(asked), Some(episode)) = (project_id, episode.as_ref()) {
+                if asked != episode.project_id {
+                    return Err(AppError::BadRequest(format!(
+                        "session {session_id} belongs to project {}, not {asked}",
+                        episode.project_id
+                    )));
+                }
+            }
+            episode
+        }
+    };
 
     Ok(Json(CollectEpisodeResponse { episode }))
 }
@@ -359,13 +455,14 @@ mod tests {
         });
         let req: CollectEpisodeRequest = serde_json::from_value(json).unwrap();
         assert_eq!(
-            req.run_id.to_string(),
+            req.run_id.unwrap().to_string(),
             "550e8400-e29b-41d4-a716-446655440000"
         );
         assert_eq!(
-            req.project_id.to_string(),
+            req.project_id.unwrap().to_string(),
             "660e8400-e29b-41d4-a716-446655440000"
         );
+        assert!(req.session_id.is_none());
     }
 
     #[test]

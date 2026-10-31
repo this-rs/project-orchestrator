@@ -2288,6 +2288,63 @@ pub async fn enrich_task(
 // Decisions
 // ============================================================================
 
+/// Growth hook of a new decision: link it to the personas of `project_id` that
+/// are RELEVANT to it (relevance = a persona KNOWS files that overlap with the
+/// decision's AFFECTS entities), never to every active persona. Non-fatal: a graph
+/// that cannot answer is logged. Returns how many personas were linked.
+///
+/// Shared by the task-bound route (project resolved from the task) and the global
+/// route (project named by the request): a decision that has a project gets the
+/// hook whichever door it came through.
+pub(crate) async fn link_decision_to_relevant_personas(
+    neo4j: &dyn crate::neo4j::GraphStore,
+    decision_id: Uuid,
+    project_id: Uuid,
+) -> usize {
+    match neo4j
+        .find_relevant_personas_for_decision(decision_id, project_id)
+        .await
+    {
+        Ok(relevant) if !relevant.is_empty() => {
+            for (persona_id, avg_weight) in &relevant {
+                let link_weight = (*avg_weight * 0.8).max(0.3);
+                if let Err(e) = neo4j
+                    .auto_link_decision_to_persona(*persona_id, decision_id, link_weight)
+                    .await
+                {
+                    tracing::debug!(
+                        persona_id = %persona_id,
+                        decision_id = %decision_id,
+                        error = %e,
+                        "Growth hook: auto_link_decision failed (non-fatal)"
+                    );
+                }
+            }
+            tracing::debug!(
+                decision_id = %decision_id,
+                count = relevant.len(),
+                "Growth hook: linked decision to relevant personas"
+            );
+            relevant.len()
+        }
+        Ok(_) => {
+            tracing::debug!(
+                decision_id = %decision_id,
+                "Growth hook: no relevant personas found for decision (skipped)"
+            );
+            0
+        }
+        Err(e) => {
+            tracing::debug!(
+                project_id = %project_id,
+                error = %e,
+                "Growth hook: find_relevant_personas_for_decision failed (non-fatal)"
+            );
+            0
+        }
+    }
+}
+
 /// Add a decision to a task
 pub async fn add_decision(
     State(state): State<OrchestratorState>,
@@ -2358,56 +2415,13 @@ pub async fn add_decision(
     }
 
     // Growth hook: auto-link decision to RELEVANT personas only (not all active ones).
-    // Relevance = persona KNOWS files that overlap with decision's AFFECTS entities.
     {
         let neo4j = state.orchestrator.neo4j_arc();
         let decision_id = decision.id;
         tokio::spawn(async move {
             // Resolve project from task
             if let Ok(Some(project)) = neo4j.get_project_for_task(task_id).await {
-                match neo4j
-                    .find_relevant_personas_for_decision(decision_id, project.id)
-                    .await
-                {
-                    Ok(relevant) if !relevant.is_empty() => {
-                        for (persona_id, avg_weight) in &relevant {
-                            let link_weight = (*avg_weight * 0.8).max(0.3);
-                            if let Err(e) = neo4j
-                                .auto_link_decision_to_persona(
-                                    *persona_id,
-                                    decision_id,
-                                    link_weight,
-                                )
-                                .await
-                            {
-                                tracing::debug!(
-                                    persona_id = %persona_id,
-                                    decision_id = %decision_id,
-                                    error = %e,
-                                    "Growth hook: auto_link_decision failed (non-fatal)"
-                                );
-                            }
-                        }
-                        tracing::debug!(
-                            decision_id = %decision_id,
-                            count = relevant.len(),
-                            "Growth hook: linked decision to relevant personas"
-                        );
-                    }
-                    Ok(_) => {
-                        tracing::debug!(
-                            decision_id = %decision_id,
-                            "Growth hook: no relevant personas found for decision (skipped)"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            project_id = %project.id,
-                            error = %e,
-                            "Growth hook: find_relevant_personas_for_decision failed (non-fatal)"
-                        );
-                    }
-                }
+                link_decision_to_relevant_personas(neo4j.as_ref(), decision_id, project.id).await;
             }
         });
     }
@@ -2479,6 +2493,83 @@ pub async fn get_retrieval_ledger(
         "recent": events,
         "note": "journal in-memory and bounded; `snapshot.dropped` > 0 means the measurement is incomplete",
     })))
+}
+
+/// Record a decision that belongs to NO task.
+///
+/// A choice of infrastructure made outside any plan had no way in: the
+/// task-bound route (`POST /api/tasks/{id}/decisions`) requires a task, so such
+/// a decision was either lost or forced into an unrelated task. This route
+/// creates the node on its own. The optional `project_id` of the body attaches
+/// the decision to that project (`HAS_DECISION`), scopes the search document and
+/// the event, lets the auto-anchoring resolve paths and runs the persona growth
+/// hook — and must name a project: an unknown one is a `404`, nothing recorded.
+/// A caller that does not know the project omits it and still records the decision.
+pub async fn add_decision_global(
+    State(state): State<OrchestratorState>,
+    claims: Option<axum::Extension<crate::auth::jwt::Claims>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<CreateGlobalDecisionRequest>,
+) -> Result<Json<DecisionNode>, AppError> {
+    let explicit_run_id = req.run_id;
+    // Captured before `req` moves: the event and the growth hook need it.
+    let project_id = req.project_id;
+    // The agent of the calling session; `agent`, as before, for anyone else.
+    let author = crate::api::note_handlers::caller_author(
+        &state,
+        claims.as_ref().map(|c| &c.0),
+        &headers,
+        "agent",
+    )
+    .await;
+
+    let decision = state
+        .orchestrator
+        .plan_manager()
+        .add_decision_global(req, &author)
+        .await
+        .map_err(|e| match project_id {
+            Some(pid) if e.to_string().contains("not found in Neo4j") => {
+                AppError::NotFound(format!("Project {pid} not found"))
+            }
+            _ => AppError::Internal(e),
+        })?;
+
+    // Growth hook, as on the task-bound route: the project is known here too.
+    if let Some(pid) = project_id {
+        let neo4j = state.orchestrator.neo4j_arc();
+        let decision_id = decision.id;
+        tokio::spawn(async move {
+            link_decision_to_relevant_personas(neo4j.as_ref(), decision_id, pid).await;
+        });
+    }
+
+    // No task means no project, so there is no active run to auto-detect from:
+    // only an explicitly named run is honoured here.
+    if let Some(rid) = explicit_run_id {
+        if let Err(e) = state
+            .orchestrator
+            .neo4j()
+            .create_produced_during("Decision", decision.id, rid)
+            .await
+        {
+            tracing::warn!(
+                decision_id = %decision.id,
+                run_id = %rid,
+                error = %e,
+                "Failed to create PRODUCED_DURING relation for global decision"
+            );
+        }
+    }
+
+    state.event_bus.emit_created(
+        crate::events::EntityType::Decision,
+        &decision.id.to_string(),
+        serde_json::json!({"description": &decision.description}),
+        project_id.map(|p| p.to_string()),
+    );
+
+    Ok(Json(decision))
 }
 
 /// Get a single decision by ID

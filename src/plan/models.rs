@@ -146,6 +146,27 @@ pub struct CreateDecisionRequest {
     pub run_id: Option<Uuid>,
 }
 
+/// Request to record a decision that belongs to no task.
+///
+/// Same content as [`CreateDecisionRequest`] — the task-bound path is untouched —
+/// plus an optional `project_id`. A decision taken outside any plan is still
+/// usually *about* a project: naming it is what scopes the search document and
+/// lets the auto-anchoring find the repository root. Omitted, the decision is
+/// global to the whole graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateGlobalDecisionRequest {
+    pub description: String,
+    pub rationale: String,
+    pub alternatives: Option<Vec<String>>,
+    pub chosen_option: Option<String>,
+    /// Optional protocol run ID for PRODUCED_DURING relation
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<Uuid>,
+    /// Project the decision is about, if the caller knows it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+}
+
 /// Full plan details including tasks
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanDetails {
