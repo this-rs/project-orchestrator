@@ -81,6 +81,36 @@ pub fn declared_path(declared_root: &str, canonical_root: &str, path: &str) -> O
     Some(format!("{}{}", declared, rest))
 }
 
+/// Bring a path under the project's **declared** root, resolving that root on the spot.
+///
+/// This is [`declared_path`] with `canonical_root(declared_root)` computed here,
+/// for the write boundary of the sync: a path that is not under the root (or a
+/// root that is not a link) comes back unchanged — the sync never invents a
+/// path. Applied where the sync produces `File.path` (and, through the parser,
+/// every symbol's `file_path`), it is what keeps a rescan from re-creating the
+/// alias form the migration just removed.
+///
+/// A path may reach the directory through a *third* alias — neither the
+/// declared root nor its canonical form (`/var/…` vs `/private/var/…` on macOS,
+/// a second link elsewhere). When the prefix does not match, the path itself is
+/// resolved and mapped from its real form; a path that cannot be resolved is
+/// kept as given.
+pub fn under_declared_root(declared_root: &str, path: &str) -> String {
+    let declared = declared_root.trim_end_matches('/');
+    if declared.is_empty() || path.starts_with(&format!("{declared}/")) {
+        return path.to_string();
+    }
+    let canonical = canonical_root(Some(declared));
+    if let Some(mapped) = declared_path(declared, &canonical, path) {
+        return mapped;
+    }
+    match std::fs::canonicalize(path) {
+        Ok(real) => declared_path(declared, &canonical, &real.to_string_lossy())
+            .unwrap_or_else(|| path.to_string()),
+        Err(_) => path.to_string(),
+    }
+}
+
 /// Is `path` really inside `root`, once links are resolved?
 ///
 /// The name-based ignore list ([`crate::orchestrator::IGNORED_PATH_SEGMENTS`])
