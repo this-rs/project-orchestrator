@@ -204,6 +204,23 @@ impl Neo4jClient {
                       THEN substring(path, size(root) + 1)
                       ELSE path END AS rel
             WITH path, CASE WHEN pid = '' THEN '-' ELSE pid END + ':' + rel AS uid
+            // Un nœud existe déjà à CE chemin sous un autre uid (projet recréé →
+            // nouvel uuid, projets imbriqués, fichier pas encore backfillé) : la
+            // contrainte `file_path` refuserait un second nœud, et tout le sync
+            // échouerait. On l'ADOPTE — c'est lui qui porte les arêtes — au lieu
+            // de créer. Un autre nœud qui tiendrait déjà cet uid à un autre chemin
+            // est une copie stale : il perd l'identité (visible dans la couverture
+            // uid de `migrate file-paths`), jamais ses arêtes.
+            OPTIONAL MATCH (byPath:File {path: path})
+            OPTIONAL MATCH (byUid:File {uid: uid})
+            WITH path, uid,
+                 CASE WHEN byPath IS NOT NULL AND byUid IS NOT NULL AND byUid <> byPath
+                      THEN [byUid] ELSE [] END AS stale,
+                 CASE WHEN byPath IS NOT NULL AND (byPath.uid IS NULL OR byPath.uid <> uid)
+                      THEN [byPath] ELSE [] END AS adopt
+            FOREACH (x IN stale | REMOVE x.uid)
+            FOREACH (x IN adopt | SET x.uid = uid)
+            WITH path, uid
             MERGE (f:File {uid: uid})
             SET f.path = path,
                 f.uid = uid,
@@ -288,6 +305,18 @@ impl Neo4jClient {
                       ELSE item.path END AS rel
             WITH item, path,
                  CASE WHEN item.project_id = '' THEN '-' ELSE item.project_id END + ':' + rel AS uid
+            // Même adoption qu'`upsert_file` : un nœud déjà présent à ce chemin
+            // est repris, jamais doublé (la contrainte `file_path` le refuserait).
+            OPTIONAL MATCH (byPath:File {path: path})
+            OPTIONAL MATCH (byUid:File {uid: uid})
+            WITH item, path, uid,
+                 CASE WHEN byPath IS NOT NULL AND byUid IS NOT NULL AND byUid <> byPath
+                      THEN [byUid] ELSE [] END AS stale,
+                 CASE WHEN byPath IS NOT NULL AND (byPath.uid IS NULL OR byPath.uid <> uid)
+                      THEN [byPath] ELSE [] END AS adopt
+            FOREACH (x IN stale | REMOVE x.uid)
+            FOREACH (x IN adopt | SET x.uid = uid)
+            WITH item, path, uid
             MERGE (f:File {uid: uid})
             SET f.path = path,
                 f.uid = uid,
@@ -4582,5 +4611,36 @@ mod file_identity_wiring_tests {
         );
         assert!(SRC.contains("path STARTS WITH declared + '/'"));
         assert!(SRC.contains("item.path STARTS WITH declared + '/'"));
+    }
+
+    /// Un nœud déjà présent à ce chemin sous un autre uid (projet recréé, projets
+    /// imbriqués, fichier pas encore backfillé) est ADOPTÉ avant le MERGE : sinon
+    /// `SET f.path` viole la contrainte `file_path` et tout le sync échoue — là
+    /// où le MERGE sur le chemin réassignait simplement `project_id`.
+    #[test]
+    fn a_node_at_the_same_path_is_adopted_never_duplicated() {
+        let by_path = ["OPTIONAL MATCH (byPath:File {", "path: path})"].concat();
+        assert_eq!(
+            SRC.matches(&by_path).count(),
+            2,
+            "both write paths look up the node at the path first"
+        );
+        // Motifs reconstruits : écrits d'un tenant, ce test les compterait aussi.
+        let adopt = ["FOREACH (x IN adopt | ", "SET x.uid = uid)"].concat();
+        assert_eq!(SRC.matches(&adopt).count(), 2);
+        // A stale holder of the identity loses the uid, never its edges.
+        let demote = ["FOREACH (x IN stale | ", "REMOVE x.uid)"].concat();
+        assert_eq!(SRC.matches(&demote).count(), 2);
+        let destroy = ["DETACH DELETE ", "byUid"].concat();
+        assert!(
+            !SRC.contains(&destroy),
+            "a stale node is demoted, never destroyed"
+        );
+        // The adoption happens BEFORE the merge on the uid, in the same query.
+        let first_adopt = SRC.find(&adopt).unwrap();
+        let first_merge = SRC
+            .find(&["MERGE (f:File {", "uid: uid})"].concat())
+            .unwrap();
+        assert!(first_adopt < first_merge);
     }
 }

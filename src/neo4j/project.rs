@@ -3,7 +3,7 @@
 use crate::neo4j::traits::*;
 
 use super::client::{Neo4jClient, WhereBuilder};
-use super::file_uid::canonical_root;
+use super::file_uid::{canonical_path_update, canonical_root, try_canonical_root, PathPolicy};
 use super::models::*;
 use anyhow::Result;
 use neo4rs::query;
@@ -24,6 +24,7 @@ impl Neo4jClient {
                 slug: $slug,
                 root_path: $root_path,
                 canonical_path: $canonical_path,
+                paths_declared: true,
                 description: $description,
                 created_at: datetime($created_at),
                 watch_enabled: $watch_enabled,
@@ -196,18 +197,65 @@ impl Neo4jClient {
             };
             let declared = row.get::<String>("root_path").unwrap_or_default();
             let stored = row.get::<String>("canonical_path").unwrap_or_default();
-            let resolved = canonical_root(Some(&declared));
-            if resolved.is_empty() || resolved == stored {
-                continue;
+            // A root that cannot be resolved at THIS boot (a volume not mounted)
+            // never overwrites a value computed when it was: that would change
+            // how every uid of the project is derived, in silence.
+            let resolved = try_canonical_root(Some(&declared));
+            if resolved.is_none() && !stored.is_empty() {
+                tracing::warn!(
+                    project = %id,
+                    declared = %declared,
+                    stored = %stored,
+                    "Project root cannot be resolved at this boot: canonical_path kept as stored"
+                );
             }
+            let Some(next) = canonical_path_update(&stored, resolved.as_deref(), &declared) else {
+                continue;
+            };
             let q = query("MATCH (p:Project {id: $id}) SET p.canonical_path = $canonical")
                 .param("id", id)
-                .param("canonical", resolved);
+                .param("canonical", next);
             if self.graph.run(q).await.is_ok() {
                 updated += 1;
             }
         }
         Ok((scanned, updated))
+    }
+
+    /// The stored form of this project's paths — see [`PathPolicy`]. A project
+    /// that does not exist has no vocabulary: paths are kept as given.
+    pub async fn path_policy(&self, id: Uuid) -> Result<PathPolicy> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $id})
+            RETURN coalesce(p.root_path, '') AS root,
+                   coalesce(p.canonical_path, '') AS canonical,
+                   coalesce(p.paths_declared, false) AS declared
+            "#,
+        )
+        .param("id", id.to_string());
+        let mut result = self.graph.execute(q).await?;
+        Ok(match result.next().await? {
+            Some(row) => PathPolicy::new(
+                &row.get::<String>("root").unwrap_or_default(),
+                &row.get::<String>("canonical").unwrap_or_default(),
+                row.get::<bool>("declared").unwrap_or(false),
+            ),
+            None => PathPolicy::none(),
+        })
+    }
+
+    /// Record that this project's paths are stored in the DECLARED form. Set by
+    /// `migrate file-paths --apply` before the rename passes, so a sync that
+    /// runs during the migration writes the form the rename converges to.
+    pub async fn mark_paths_declared(&self, id: Uuid) -> Result<()> {
+        self.graph
+            .run(
+                query("MATCH (p:Project {id: $id}) SET p.paths_declared = true")
+                    .param("id", id.to_string()),
+            )
+            .await?;
+        Ok(())
     }
 
     /// Update project last_synced timestamp

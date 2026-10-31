@@ -699,8 +699,24 @@ async fn flush_pending_files(
         let mut deleted = 0usize;
         let mut errors = 0usize;
 
+        // The watcher hands over REAL paths (it canonicalizes the roots it
+        // watches) while the graph holds the project's vocabulary: a lookup in
+        // the wrong form deletes nothing and would count as a success.
+        let policy = match orchestrator.neo4j().path_policy(pid).await {
+            Ok(policy) => policy,
+            Err(e) => {
+                tracing::warn!(
+                    "Cannot read the path policy of '{}': {} — {} deletion(s) skipped",
+                    ctx.project_slug,
+                    e,
+                    file_count
+                );
+                continue;
+            }
+        };
+
         for path in &files {
-            let path_str = super::runner::normalize_path(&path.to_string_lossy());
+            let path_str = policy.stored(&super::runner::normalize_path(&path.to_string_lossy()));
 
             // Remove from Neo4j (File node + all children symbols + relationships)
             if let Err(e) = orchestrator.neo4j().delete_file(&path_str).await {
@@ -1205,6 +1221,24 @@ async fn handle_project_updated(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Une suppression cherche le nœud par `File.path` : le chemin doit être
+    /// mis dans la forme STOCKÉE du projet avant `delete_file`, sinon la
+    /// recherche ne trouve rien et la suppression est comptée réussie.
+    #[test]
+    fn a_deletion_looks_up_the_stored_form_of_the_path() {
+        let src = include_str!("watcher.rs");
+        let policy = src
+            .find(".path_policy(pid)")
+            .expect("the deletion reads the project's path policy");
+        let stored = src
+            .find("policy.stored(&super::runner::normalize_path(")
+            .expect("the deletion maps the path to the stored form");
+        let delete = src
+            .find(".delete_file(&path_str)")
+            .expect("the deletion by path");
+        assert!(policy < stored && stored < delete);
+    }
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 

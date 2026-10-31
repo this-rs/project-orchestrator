@@ -460,6 +460,76 @@ pub fn purge_passes() -> Vec<DataMigration> {
     ]
 }
 
+/// A `File` of the alias whose declared twin already exists: the rename pass
+/// skipped it (the `file_path` constraint). The twin is the fresher node (a
+/// sync wrote it), the alias carries the older edges: fold the alias INTO the
+/// twin — every edge moves, deduplicated, the twin's properties win — and the
+/// alias disappears. Never skipped in silence: a skipped alias would keep two
+/// vocabularies in the graph and the purge gate would never open.
+fn merge_file_twins_query() -> String {
+    format!(
+        r#"{RENAMABLE_PROJECT}
+MATCH (n:File {{project_id: p.id}})
+WHERE n.path STARTS WITH p.canonical_path + '/'
+  AND none(seg IN {WORKTREE_SEGMENTS} WHERE n.path CONTAINS seg)
+MATCH (t:File {{path: p.root_path + substring(n.path, size(p.canonical_path))}})
+WITH n, t LIMIT $batch
+CALL apoc.refactor.mergeNodes([t, n], {{properties: 'discard', mergeRels: true}}) YIELD node
+RETURN count(node) AS processed
+"#
+    )
+}
+
+/// Same fold for the symbols of one label whose declared twin (`id`) exists.
+fn merge_symbol_twins_query(label: &str) -> String {
+    format!(
+        r#"{RENAMABLE_PROJECT}
+MATCH (n:{label})
+WHERE n.file_path STARTS WITH p.canonical_path + '/'
+  AND (n.project_id = p.id OR n.project_id IS NULL OR n.project_id = '')
+  AND none(seg IN {WORKTREE_SEGMENTS} WHERE n.file_path CONTAINS seg)
+  AND n.id STARTS WITH p.canonical_path + '/'
+MATCH (t:{label} {{id: p.root_path + substring(n.id, size(p.canonical_path))}})
+WITH n, t LIMIT $batch
+CALL apoc.refactor.mergeNodes([t, n], {{properties: 'discard', mergeRels: true}}) YIELD node
+RETURN count(node) AS processed
+"#
+    )
+}
+
+fn merge_pass_id(label: &str) -> &'static str {
+    match label {
+        "Function" => "file-paths/merge-function-twins",
+        "Struct" => "file-paths/merge-struct-twins",
+        "Trait" => "file-paths/merge-trait-twins",
+        "Enum" => "file-paths/merge-enum-twins",
+        "Impl" => "file-paths/merge-impl-twins",
+        "Import" => "file-paths/merge-import-twins",
+        "Module" => "file-paths/merge-module-twins",
+        other => unreachable!("unknown symbol label {other}"),
+    }
+}
+
+/// The twin-merge passes, run AFTER [`rename_passes`]: what the rename had to
+/// skip because a declared twin existed is folded into that twin.
+pub fn merge_twin_passes() -> Vec<DataMigration> {
+    let mut passes = vec![DataMigration {
+        id: "file-paths/merge-file-twins",
+        description: "Fold an alias File into its declared twin (edges move, alias deleted)",
+        batch: merge_file_twins_query(),
+        finalize: None,
+    }];
+    for label in SYMBOL_LABELS {
+        passes.push(DataMigration {
+            id: merge_pass_id(label),
+            description: "Fold an alias symbol into its declared twin (edges move, alias deleted)",
+            batch: merge_symbol_twins_query(label),
+            finalize: None,
+        });
+    }
+    passes
+}
+
 /// What the command knows about the project before touching anything.
 #[derive(Debug, Clone, Serialize)]
 pub struct RenamePlan {
@@ -471,6 +541,8 @@ pub struct RenamePlan {
     pub canonical_root: String,
     /// `Project.canonical_path` as stored — `None` when never filled.
     pub stored_canonical: Option<String>,
+    /// `Project.paths_declared`: the sync already writes the declared form.
+    pub paths_declared: bool,
 }
 
 impl RenamePlan {
@@ -596,12 +668,17 @@ pub fn render_measures(title: &str, m: &PathMeasures) -> String {
 pub fn render_plan(plan: &RenamePlan, m: &PathMeasures, purge_wl: bool) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "== Projet `{}` ({})\n  racine déclarée  : {}\n  racine canonique : {}\n  canonical_path stocké : {}\n",
+        "== Projet `{}` ({})\n  racine déclarée  : {}\n  racine canonique : {}\n  canonical_path stocké : {}\n  paths_declared        : {}\n",
         plan.slug,
         plan.project_id,
         plan.declared_root,
         plan.canonical_root,
-        plan.stored_canonical.as_deref().unwrap_or("(absent — sera posé par --apply)")
+        plan.stored_canonical.as_deref().unwrap_or("(absent — sera posé par --apply)"),
+        if plan.paths_declared {
+            "true (le sync écrit déjà la forme déclarée)"
+        } else {
+            "absent (le sync écrit la forme canonique jusqu'à --apply)"
+        }
     ));
     if !plan.has_alias() {
         out.push_str("  La racine déclarée n'est pas un lien : rien à renommer.\n");
@@ -627,6 +704,11 @@ pub fn render_plan(plan: &RenamePlan, m: &PathMeasures, purge_wl: bool) -> Strin
         "  (d) stable_key réécrit par le même remplacement de préfixe, dans la passe (b)\n",
     );
     out.push_str("  (e) File.uid : intact (calculé sur le chemin relatif)\n");
+    out.push_str(&format!(
+        "  (f) fusion des jumeaux : {} File de l'alias ont déjà un jumeau déclaré — arêtes déplacées, alias supprimé (jamais sauté)\n",
+        m.alias_files_blocked_by_twin
+    ));
+    out.push_str("  marqueur Project.paths_declared posé AVANT (a) : un sync pendant la migration écrit la forme d'arrivée\n");
     if purge_wl {
         out.push_str(&format!(
             "  --purge-wl : réancrer {} arête(s) sur le jumeau déclaré, puis DETACH DELETE {} File .wl et {} symboles\n",
@@ -648,32 +730,44 @@ impl Neo4jClient {
             .get_project_by_slug(slug)
             .await?
             .with_context(|| format!("aucun projet avec le slug `{slug}`"))?;
-        let declared_root = project.root_path.trim_end_matches('/').to_string();
+        // `~` expanded: a tilde root is what the user typed, not a prefix any
+        // stored path starts with.
+        let declared_root = crate::expand_tilde(project.root_path.trim())
+            .trim_end_matches('/')
+            .to_string();
         anyhow::ensure!(
             !declared_root.is_empty(),
             "le projet `{slug}` n'a pas de root_path : rien à renommer"
         );
-        let stored_canonical = self.stored_canonical_path(project.id).await?;
+        let (stored_canonical, paths_declared) = self.project_markers(project.id).await?;
         Ok(RenamePlan {
             project_id: project.id,
             slug: project.slug,
             canonical_root: canonical_root(Some(&declared_root)),
             declared_root,
             stored_canonical,
+            paths_declared,
         })
     }
 
-    async fn stored_canonical_path(&self, project_id: Uuid) -> Result<Option<String>> {
+    /// `(canonical_path as stored, paths_declared)`.
+    async fn project_markers(&self, project_id: Uuid) -> Result<(Option<String>, bool)> {
         let mut result = self
             .graph
             .execute(
-                query("MATCH (p:Project {id: $id}) RETURN p.canonical_path AS c")
-                    .param("id", project_id.to_string()),
+                query(
+                    "MATCH (p:Project {id: $id}) \
+                     RETURN p.canonical_path AS c, coalesce(p.paths_declared, false) AS d",
+                )
+                .param("id", project_id.to_string()),
             )
             .await?;
         Ok(match result.next().await? {
-            Some(row) => row.get::<String>("c").ok().filter(|c| !c.is_empty()),
-            None => None,
+            Some(row) => (
+                row.get::<String>("c").ok().filter(|c| !c.is_empty()),
+                row.get::<bool>("d").unwrap_or(false),
+            ),
+            None => (None, false),
         })
     }
 
@@ -728,7 +822,17 @@ impl Neo4jClient {
         self.ensure_project_canonical_paths()
             .await
             .context("canonical_path repair")?;
-        self.run_passes(plan, rename_passes()).await
+        // The marker FIRST: from here every sync writes the declared form, the
+        // form the passes below converge to. A sync that runs during the
+        // migration can at worst create a declared twin of an alias node — the
+        // merge passes fold it. Marking last would let such a sync create new
+        // alias nodes after the rename had passed them.
+        self.mark_paths_declared(plan.project_id)
+            .await
+            .context("paths_declared marker")?;
+        let mut outcomes = self.run_passes(plan, rename_passes()).await?;
+        outcomes.extend(self.run_passes(plan, merge_twin_passes()).await?);
+        Ok(outcomes)
     }
 
     /// Run the purge passes — the caller has checked [`purge_gate`].
@@ -821,8 +925,59 @@ mod tests {
 
     fn all_passes() -> Vec<DataMigration> {
         let mut v = rename_passes();
+        v.extend(merge_twin_passes());
         v.extend(purge_passes());
         v
+    }
+
+    /// Un jumeau déclaré existant n'est jamais sauté en silence : l'alias est
+    /// FONDU dans le jumeau (arêtes déplacées et dédupliquées, propriétés du
+    /// jumeau conservées), puis disparaît. Sinon deux vocabulaires subsistent et
+    /// le portillon de purge ne s'ouvre jamais.
+    #[test]
+    fn an_alias_with_a_declared_twin_is_folded_into_it() {
+        let passes = merge_twin_passes();
+        assert_eq!(passes.len(), 1 + SYMBOL_LABELS.len());
+        for pass in &passes {
+            assert!(pass.id.starts_with("file-paths/merge-"), "{}", pass.id);
+            assert!(pass.batch.contains("p.canonical_path"));
+            assert!(pass.batch.contains("p.root_path <> p.canonical_path"));
+            // Le jumeau d'abord dans la liste : c'est lui qui survit.
+            assert!(
+                pass.batch.contains(
+                    "apoc.refactor.mergeNodes([t, n], {properties: 'discard', mergeRels: true})"
+                ),
+                "{}",
+                pass.id
+            );
+            assert!(
+                pass.batch.contains("MATCH (t:"),
+                "the twin MUST exist (MATCH)"
+            );
+            assert!(!pass.batch.contains("OPTIONAL MATCH"));
+            assert!(!pass.batch.contains("CREATE"));
+            assert!(
+                pass.batch.contains("none(seg IN"),
+                "copies are never folded"
+            );
+        }
+        assert!(merge_file_twins_query()
+            .contains("MATCH (t:File {path: p.root_path + substring(n.path"));
+        for label in SYMBOL_LABELS {
+            assert!(merge_symbol_twins_query(label).contains(&format!(
+                "MATCH (t:{label} {{id: p.root_path + substring(n.id"
+            )));
+        }
+    }
+
+    #[test]
+    fn the_merge_runs_after_the_rename_and_the_marker_is_set_first() {
+        let src = include_str!("path_migration.rs");
+        let body = &src[src.find("pub async fn file_path_rename").unwrap()..];
+        let mark = body.find("mark_paths_declared(plan.project_id)").unwrap();
+        let rename = body.find("run_passes(plan, rename_passes())").unwrap();
+        let merge = body.find("run_passes(plan, merge_twin_passes())").unwrap();
+        assert!(mark < rename && rename < merge);
     }
 
     /// Hors du chemin de boot : aucune passe n'est une `DataMigration` enregistrée.
@@ -1127,6 +1282,7 @@ mod tests {
             canonical_root: "/Users/triviere/.openclaw/workspace/skills/project-orchestrator"
                 .into(),
             stored_canonical: None,
+            paths_declared: false,
         }
     }
 
