@@ -65,4 +65,37 @@ mod tests {
         let k = stable_symbol_key("src/a.rs", "foo", &[p("x", None)]);
         assert_eq!(k, "src/a.rs::foo(?)");
     }
+
+    // The regression this module exists for: a function parsed at two
+    // different lines (an edit above it) is the SAME symbol. If someone ever
+    // puts the line back into the identity, this test fails.
+    #[test]
+    fn moving_a_function_does_not_change_its_identity() {
+        use crate::neo4j::models::{FunctionNode, Visibility};
+
+        fn node(line: u32) -> FunctionNode {
+            FunctionNode {
+                name: "build".to_string(),
+                visibility: Visibility::default(),
+                params: vec![p("x", Some("i32"))],
+                return_type: None,
+                generics: vec![],
+                is_async: false,
+                is_unsafe: false,
+                complexity: 1,
+                file_path: "src/a.rs".to_string(),
+                line_start: line,
+                line_end: line + 5,
+                docstring: None,
+            }
+        }
+
+        let at_line_10 = node(10);
+        let at_line_12 = node(12);
+        assert_eq!(
+            stable_symbol_key(&at_line_10.file_path, &at_line_10.name, &at_line_10.params),
+            stable_symbol_key(&at_line_12.file_path, &at_line_12.name, &at_line_12.params),
+            "an edit above the function must not change its identity"
+        );
+    }
 }
