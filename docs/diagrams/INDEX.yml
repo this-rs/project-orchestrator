@@ -56,6 +56,18 @@ diagrams:
     # sur la taxonomie CRUD, et un seul fichier le porte : le reporter et sa cadence.
     covers:
       - "backend:src/events/ingestion.rs"
+  - name: po-activity-hub
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-activity-hub.mmd
+    # Arbitrage : le flux d'activite n'appartient ni a po-api (surface HTTP administrative) ni a
+    # po-autonomic (cycle automatique du PO). C'est un sujet propre — « tout ce qui tourne, vu
+    # d'un seul flux » — porte par deux fichiers de surface et l'anneau qui les alimente.
+    # Il n'emprunte pas po-api-* : ses deux handlers ne sont pas des routes d'entite.
+    covers:
+      - "backend:src/events/activity.rs"
+      - "backend:src/api/activity_handlers.rs"
+      - "backend:src/api/ws_activity_handler.rs"
   - name: po-chat-manager
     owner: theotime
     status: verified

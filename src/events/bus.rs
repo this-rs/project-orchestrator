@@ -2,7 +2,9 @@
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
+use super::activity::{ActivityEvent, ActivityHub};
 use super::{CrudEvent, EventEmitter};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::debug;
 
@@ -13,21 +15,36 @@ const DEFAULT_CAPACITY: usize = 1024;
 ///
 /// Fire-and-forget: emitting never blocks, never panics.
 /// If no subscribers are connected, events are silently dropped.
+///
+/// Every emitted event is also normalized onto the [`ActivityHub`] (sequence
+/// number + replay buffer + `/ws/activity` feed). Doing it here — in the one
+/// funnel every mutation already goes through — is what keeps the activity
+/// stream complete: no emitter can forget to publish to it, and a new emitter
+/// is covered the day it emits its first CRUD event.
 #[derive(Debug, Clone)]
 pub struct EventBus {
     sender: broadcast::Sender<CrudEvent>,
+    activity: Arc<ActivityHub>,
 }
 
 impl EventBus {
     /// Create a new EventBus with the given channel capacity
     pub fn new(capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
-        Self { sender }
+        Self {
+            sender,
+            activity: Arc::new(ActivityHub::default()),
+        }
     }
 
     /// Subscribe to receive events (for WebSocket clients)
     pub fn subscribe(&self) -> broadcast::Receiver<CrudEvent> {
         self.sender.subscribe()
+    }
+
+    /// The activity feed fed by this bus (sequence numbers, replay, `/ws/activity`).
+    pub fn activity(&self) -> &Arc<ActivityHub> {
+        &self.activity
     }
 
     /// Number of active subscribers
@@ -40,6 +57,10 @@ impl EventEmitter for EventBus {
     fn emit(&self, event: CrudEvent) {
         let entity = format!("{:?}", event.entity_type);
         let action = format!("{:?}", event.action);
+        // Normalize first: the activity feed keeps its own sequence, and it must
+        // carry the event even when no CRUD subscriber is connected (the replay
+        // buffer is what a reconnecting client reads from).
+        self.activity.publish(ActivityEvent::from_crud(&event, 0));
         match self.sender.send(event) {
             Ok(n) => {
                 debug!(
@@ -202,5 +223,26 @@ mod tests {
 
         let event = rx.try_recv().unwrap();
         assert_eq!(event.entity_type, EntityType::Workspace);
+    }
+
+    #[test]
+    fn every_emitted_event_lands_on_the_activity_feed() {
+        let bus = EventBus::default();
+        // No CRUD subscriber: the activity feed must still see the event — that
+        // is what a reconnecting client replays from.
+        bus.emit_updated(
+            EntityType::Runner,
+            "run-1",
+            serde_json::json!({"type": "task_completed"}),
+            None,
+        );
+
+        let feed = bus.activity();
+        assert_eq!(feed.latest_seq(), 1);
+        let replay = feed.replay_since(0);
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].entity_type, "runner");
+        assert_eq!(replay[0].entity_id, "run-1");
+        assert_eq!(replay[0].category, crate::events::ActivityCategory::PlanRun);
     }
 }
