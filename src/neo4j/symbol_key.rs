@@ -122,9 +122,12 @@ pub fn stable_import_key(file_path: &str, path: &str, occurrence: u32) -> String
     }
 }
 
-/// The block that owns a function, among the candidate blocks of the same
-/// file: the innermost one (largest `line_start`) whose lines enclose the
-/// function's. `None` when no block encloses it — a free function.
+/// The owner of a function, among the candidate blocks of the same file:
+/// the blocks whose lines enclose the function's, chained from the outermost
+/// to the innermost (`Foo::Config` for `class Foo { class Config { load } }`
+/// — the innermost alone would merge `Foo::Config::load` with
+/// `Bar::Config::load`). The trait, if any, is the innermost block's. `None`
+/// when no block encloses it — a free function.
 ///
 /// This is the ONE rule, used at parse time for every language
 /// (`parser::assign_owners`) and by the backfill of existing nodes
@@ -135,14 +138,21 @@ pub fn enclosing_owner<I>(line_start: u32, line_end: u32, candidates: I) -> Opti
 where
     I: IntoIterator<Item = (u32, u32, SymbolOwner)>,
 {
-    candidates
+    let mut enclosing: Vec<(u32, u32, SymbolOwner)> = candidates
         .into_iter()
         .filter(|(start, end, _)| *start <= line_start && line_end <= *end)
-        // Innermost = the latest start; on a tie, the tightest end. A derive
-        // is modelled as an Impl spanning the struct's declaration line only,
-        // and no function can sit on that line, so it never wins here.
-        .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
-        .map(|(_, _, owner)| owner)
+        .collect();
+    // Outer to inner: earliest start first; on a tie, the widest first.
+    enclosing.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    let (_, _, innermost) = enclosing.last()?.clone();
+    let chain: Vec<&str> = enclosing
+        .iter()
+        .map(|(_, _, o)| o.type_name.as_str())
+        .collect();
+    Some(SymbolOwner {
+        type_name: chain.join("::"),
+        trait_name: innermost.trait_name,
+    })
 }
 
 #[cfg(test)]
@@ -311,19 +321,21 @@ mod tests {
     }
 
     #[test]
-    fn the_owner_is_the_innermost_enclosing_block() {
+    fn the_owner_is_the_chain_of_enclosing_blocks() {
         let candidates = vec![
             (1, 100, inherent("Outer")),
             (10, 50, inherent("Inner")),
             (60, 90, of_trait("Other", "Debug")),
         ];
+        // Nested blocks chain outer to inner (review 2, point 5: two nested
+        // `Config` classes in two outer classes must not share a key).
         assert_eq!(
             enclosing_owner(20, 30, candidates.clone()),
-            Some(inherent("Inner"))
+            Some(inherent("Outer::Inner"))
         );
         assert_eq!(
             enclosing_owner(70, 80, candidates.clone()),
-            Some(of_trait("Other", "Debug"))
+            Some(of_trait("Outer::Other", "Debug"))
         );
         assert_eq!(
             enclosing_owner(55, 58, candidates.clone()),
@@ -332,15 +344,14 @@ mod tests {
         assert_eq!(enclosing_owner(200, 210, candidates), None);
         // A function that straddles the block's end is not inside it.
         assert_eq!(enclosing_owner(45, 55, vec![(10, 50, inherent("X"))]), None);
-        // Same start: the tighter block wins (a one-line `impl A { fn x() {} }`
-        // sits inside a wider class-like block in some languages).
+        // Same start: the wider block is the outer one of the chain.
         assert_eq!(
             enclosing_owner(
                 5,
                 5,
                 vec![(5, 5, inherent("Tight")), (5, 9, inherent("Wide"))]
             ),
-            Some(inherent("Tight"))
+            Some(inherent("Wide::Tight"))
         );
     }
 

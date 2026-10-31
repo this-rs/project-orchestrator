@@ -132,10 +132,15 @@ fn extract_method(node: &tree_sitter::Node, source: &str, file_path: &str) -> Op
     let docstring = get_go_doc(node, source);
     let generics = extract_go_type_params(node, source);
 
-    // Extract receiver type for context
-    let _receiver = node
+    // The receiver IS the owner: `func (a A) String()` and `func (b *B) String()`
+    // in one file are two methods (review of 31/10/2026, point 1). A Go type
+    // is a StructNode spanning its own `type` line, so line inclusion would
+    // never find it — the receiver has to be read here.
+    let owner = node
         .child_by_field_name("receiver")
-        .and_then(|r| get_text(&r, source));
+        .and_then(|r| get_text(&r, source))
+        .and_then(receiver_type_name)
+        .map(|t| SymbolOwner::new(t, None::<String>));
 
     Some(FunctionNode {
         name,
@@ -150,8 +155,21 @@ fn extract_method(node: &tree_sitter::Node, source: &str, file_path: &str) -> Op
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
-        owner: None,
+        owner,
     })
+}
+
+/// The type a receiver names: `(a A)` → `A`, `(b *B)` → `B`, `(g Gen[T])` → `Gen`,
+/// `(*B)` → `B`. The pointer and the type arguments are not part of the identity.
+fn receiver_type_name(receiver: &str) -> Option<String> {
+    let inner = receiver
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
+    let ty = inner.split_whitespace().last()?;
+    let ty = ty.trim_start_matches('*');
+    let ty = ty.split('[').next().unwrap_or(ty).trim();
+    (!ty.is_empty()).then(|| ty.to_string())
 }
 
 fn extract_type_declaration(
