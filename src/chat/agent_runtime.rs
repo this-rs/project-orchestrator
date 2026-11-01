@@ -15,7 +15,7 @@
 use crate::neo4j::traits::*;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -206,6 +206,11 @@ fn interrupted_done() -> AgentEvent {
 /// budgets come first.
 pub const AFTER_TURN_BACKSTOP: Duration =
     Duration::from_secs(5 * super::post_stream::POST_STREAM_STEP_BUDGET.as_secs() + 5);
+
+/// How long a stopped turn may take to end on the provider's own terminal event before the
+/// runtime abandons it. The historical engine's grace (`manager::INTERRUPT_GRACE`), so the two
+/// engines stop a stuck turn at the same moment.
+pub const INTERRUPT_GRACE_DEFAULT: Duration = Duration::from_secs(10);
 
 /// Whether a provider of `kind` keeps a turn it ended `interrupted` (no error) in its
 /// history, so what `prepare` put in front of it was delivered ([`TurnOutcome::answered`]).
@@ -806,9 +811,24 @@ pub struct AgentSessionHandle {
     /// killed stayed live, holding its child slot (ZOMBIE-CLI, agent engine). The manager's
     /// dead-CLI watchdog closes such a session with the reason `process_died`.
     provider_dead: AtomicBool,
+    /// How long a stopped turn may take to end on the provider's own terminal event before
+    /// it is abandoned here (milliseconds). Past it, the provider is closed and the next
+    /// message resumes the session (the agent engine's watchdog, as the historical engine's
+    /// `abandon_turn_if_stuck`).
+    stop_grace_ms: AtomicU64,
 }
 
 impl AgentSessionHandle {
+    /// Sets how long a stopped turn may take to end before it is abandoned.
+    pub fn configure_stop_grace(&self, grace: Duration) {
+        self.stop_grace_ms
+            .store(grace.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    fn stop_grace(&self) -> Duration {
+        Duration::from_millis(self.stop_grace_ms.load(Ordering::SeqCst))
+    }
+
     /// Persists (except transient events) and broadcasts one event, then the timing
     /// of the tool call it ends, if it ends one. A permission request a grant of this
     /// session covers (an earlier `session` answer) is answered here, `once`, its
@@ -1773,6 +1793,39 @@ impl AgentSessionHandle {
         next
     }
 
+    /// The provider's next event of a turn. Once the turn was stopped, the provider has
+    /// `stop_grace` to end it on its own terminal event; past it the runtime ends it here
+    /// with the stop it makes itself (`interrupted_done`) and sets `abandoned`. A provider
+    /// that never answers an interrupt (a CLI stuck in a hook or a tool) must not hold the
+    /// session streaming for good: the queued message would wait for ever.
+    async fn next_event_or_abandon(
+        &self,
+        current: &mut nexus_claude::agent::EventStream,
+        stopped_since: &mut Option<Instant>,
+        abandoned: &mut bool,
+    ) -> Option<AgentEvent> {
+        const POLL: Duration = Duration::from_millis(50);
+        loop {
+            tokio::select! {
+                next = current.next() => return next,
+                () = tokio::time::sleep(POLL) => {},
+            }
+            if !self.interrupted.load(Ordering::SeqCst) {
+                continue;
+            }
+            let since = *stopped_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= self.stop_grace() {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    grace_ms = self.stop_grace().as_millis() as u64,
+                    "Stop ignored by the provider: the turn is abandoned, the session is closed and resumed by the next message"
+                );
+                *abandoned = true;
+                return Some(interrupted_done());
+            }
+        }
+    }
+
     /// Plays one turn to its terminal event, retrying a failure that showed nothing.
     /// Answers what the turn did, and the tool calls it left without a result
     /// (id, parent).
@@ -1848,7 +1901,12 @@ impl AgentSessionHandle {
             // did, and is not retried, must not read as the instance answering (that
             // would reset the detector and hide the outage).
             let mut failed = false;
-            while let Some(event) = current.next().await {
+            let mut stopped_since: Option<Instant> = None;
+            let mut abandoned = false;
+            while let Some(event) = self
+                .next_event_or_abandon(&mut current, &mut stopped_since, &mut abandoned)
+                .await
+            {
                 // Terminal-ness is read on the original: a withheld terminal event
                 // still ends the turn.
                 let terminal = event.is_terminal();
@@ -1942,6 +2000,14 @@ impl AgentSessionHandle {
                 }
                 if terminal {
                     break;
+                }
+            }
+            if abandoned {
+                // The provider never ended the stopped turn: it is closed here and the
+                // session detached, so the next message resumes it (as after a dead process).
+                exited = true;
+                if let Err(error) = self.session.close().await {
+                    tracing::warn!(session_id = %self.session_id, %error, "closing the provider of an abandoned turn failed");
                 }
             }
             let Some(error) = retry else {
@@ -2971,6 +3037,7 @@ impl AgentRuntime {
             last_activity: std::sync::Mutex::new(Instant::now()),
             registry: Arc::downgrade(&self.sessions),
             provider_dead: AtomicBool::new(false),
+            stop_grace_ms: AtomicU64::new(INTERRUPT_GRACE_DEFAULT.as_millis() as u64),
         });
         let replaced = {
             let mut sessions = self.sessions.write().await;
@@ -3219,6 +3286,9 @@ pub(crate) mod fake {
         pub hold_allows: StdMutex<Option<Arc<tokio::sync::Notify>>>,
         /// The instructions of every `compact` asked (ISO3).
         pub compactions: StdMutex<Vec<Option<String>>>,
+        /// When set, `interrupt` is written but the turn does not end on its own: the
+        /// provider never answers the stop (a CLI stuck in a hook or a tool).
+        pub ignore_interrupts: AtomicBool,
     }
 
     impl FakeState {
@@ -3330,7 +3400,11 @@ pub(crate) mod fake {
             self.state.interrupts.lock().unwrap().push(scope);
             // Report whether a turn was actually running: the manager surfaces
             // this as `InterruptOutcome.delivered` so an idle stop reads false.
-            let turn_interrupted = self.state.turn_tx.lock().unwrap().take().is_some();
+            let turn_interrupted = if self.state.ignore_interrupts.load(Ordering::SeqCst) {
+                self.state.turn_tx.lock().unwrap().is_some()
+            } else {
+                self.state.turn_tx.lock().unwrap().take().is_some()
+            };
             Ok(InterruptOutcome {
                 turn_interrupted,
                 tools_cancelled: 0,
@@ -6438,6 +6512,39 @@ mod answered_tests {
         let (provider, handle, host) = session(0).await;
         play(&provider, &handle, vec![interrupted_done()]).await;
         assert_eq!(host.seen(), [true]);
+    }
+
+    /// The stuck Stop (observed on Claude Code chats): the CLI never answers the
+    /// interrupt, so the turn never ends. A message sent meanwhile is queued and the
+    /// Stop is written, but nothing may leave that message waiting for ever.
+    #[tokio::test]
+    async fn a_message_sent_during_a_turn_whose_stop_is_ignored_still_goes_out() {
+        let (provider, handle, _host) = session(0).await;
+        handle.configure_stop_grace(Duration::from_millis(200));
+        provider
+            .state
+            .ignore_interrupts
+            .store(true, Ordering::SeqCst);
+        handle.send_message("first").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while provider.state.turns_started.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the first turn never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        handle.send_message("second").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while provider.state.turns_started.lock().unwrap().len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the message sent during a turn never went out: the stop was ignored and nothing ended the turn"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap()[1],
+            "second",
+            "the queued message is the one that goes out"
+        );
     }
 
     /// R0: the terminal result of a turn is captured from its `done`, so the
