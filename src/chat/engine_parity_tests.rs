@@ -39,7 +39,7 @@
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -1071,6 +1071,74 @@ const WAIT: Duration = Duration::from_secs(20);
 /// under `cargo llvm-cov` (the Code Coverage job) even though it passes in the
 /// plain Unit Tests job.
 const ENGINE_RESULT_WAIT: Duration = Duration::from_secs(90);
+
+/// Waits for the `Result` of one turn — and NEVER times out mutely.
+///
+/// Two things were wrong with the inline loops this replaces, and the second
+/// one is why a red `the_same_scenario_on_both_engines_gives_the_parity_matrix`
+/// on 01/11/2026 said nothing: `ChatEvent::Error` fell into the
+/// `Ok(Ok(_)) => continue` arm, so an engine that FAILED produced ninety
+/// seconds of silence and a panic that read `timed out waiting for Codex
+/// Result` — naming no cause at all. It now fails at once, on the message the
+/// engine emitted, and a real timeout appends the tail of the fake's own record
+/// (what it received), which is where the answer usually is.
+async fn await_turn_result(
+    rx: &mut tokio::sync::broadcast::Receiver<ChatEvent>,
+    phase: &str,
+    deadline: Duration,
+    record: &Path,
+) {
+    let mut seen = 0usize;
+    loop {
+        match tokio::time::timeout(deadline, rx.recv()).await {
+            Ok(Ok(ChatEvent::Result { .. })) => return,
+            Ok(Ok(ChatEvent::Error { message, code, .. })) => panic!(
+                "{phase}: the engine reported an error instead of a Result: {message} (code: {code:?})\n{}",
+                record_tail(record)
+            ),
+            Ok(Ok(_)) => seen += 1,
+            Ok(Err(err)) => panic!(
+                "{phase}: the event channel closed after {seen} event(s): {err}\n{}",
+                record_tail(record)
+            ),
+            Err(_) => panic!(
+                "{phase}: no event for {}s, after {seen} event(s)\n{}",
+                deadline.as_secs(),
+                record_tail(record)
+            ),
+        }
+    }
+}
+
+/// The last lines the fake wrote: the requests it received, so a stuck turn
+/// shows whether the engine ever reached it.
+fn record_tail(path: &Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let from = lines.len().saturating_sub(4);
+    if lines.is_empty() {
+        return format!(
+            "fake record {}: EMPTY — the engine never wrote a request",
+            path.display()
+        );
+    }
+    format!(
+        "fake record {} (last {} of {}):\n{}",
+        path.display(),
+        lines.len() - from,
+        lines.len(),
+        lines[from..].join("\n")
+    )
+}
+
+/// Deadline for the FIRST turn of a freshly started engine, AFTER a provider
+/// switch (ACP and Codex columns). Measured on 01/11/2026: two runs on hosted
+/// runners failed here at the same time while four runs were building, and the
+/// same commit passed again on a rerun — the column stands up a NEW process
+/// (the fake CLI plus its handshake) on a machine that is already saturated, so
+/// 90 s of silence was not a hang but a slow spawn. The fake is scripted: a
+/// real stall still surfaces, and `await_turn_result` now names it.
+const ENGINE_SWITCH_RESULT_WAIT: Duration = Duration::from_secs(180);
 
 /// The end of a turn AFTER an interruption gets its own, wider deadline than
 /// `WAIT`. The interruption travels three hops (the other instance publishing
@@ -5391,13 +5459,13 @@ async fn run_acp_column() -> Measures {
         .unwrap_or_else(|e| panic!("run_acp_column: native create_session failed: {e:#}"));
     let sid = created.session_id;
     let mut rx = manager.subscribe(&sid).await.unwrap();
-    loop {
-        match tokio::time::timeout(ENGINE_RESULT_WAIT, rx.recv()).await {
-            Ok(Ok(ChatEvent::Result { .. })) => break,
-            Ok(Ok(_)) => continue,
-            Ok(Err(_)) | Err(_) => panic!("run_acp_column: timed out waiting for native Result"),
-        }
-    }
+    await_turn_result(
+        &mut rx,
+        "run_acp_column/native",
+        ENGINE_RESULT_WAIT,
+        &record_path,
+    )
+    .await;
 
     // Switch to ACP.
     manager
@@ -5409,13 +5477,13 @@ async fn run_acp_column() -> Measures {
     let mut rx = manager.subscribe(&sid).await.unwrap();
 
     // Wait for ACP answer.
-    loop {
-        match tokio::time::timeout(ENGINE_RESULT_WAIT, rx.recv()).await {
-            Ok(Ok(ChatEvent::Result { .. })) => break,
-            Ok(Ok(_)) => continue,
-            Ok(Err(_)) | Err(_) => panic!("run_acp_column: timed out waiting for ACP Result"),
-        }
-    }
+    await_turn_result(
+        &mut rx,
+        "run_acp_column/acp",
+        ENGINE_SWITCH_RESULT_WAIT,
+        &record_path,
+    )
+    .await;
 
     // Verify relay.
     let recorded: Vec<Value> = std::fs::read_to_string(&record_path)
@@ -5578,13 +5646,13 @@ async fn run_codex_column() -> Measures {
         .unwrap_or_else(|e| panic!("run_codex_column: native create_session failed: {e:#}"));
     let sid = created.session_id;
     let mut rx = manager.subscribe(&sid).await.unwrap();
-    loop {
-        match tokio::time::timeout(ENGINE_RESULT_WAIT, rx.recv()).await {
-            Ok(Ok(ChatEvent::Result { .. })) => break,
-            Ok(Ok(_)) => continue,
-            Ok(Err(_)) | Err(_) => panic!("run_codex_column: timed out waiting for native Result"),
-        }
-    }
+    await_turn_result(
+        &mut rx,
+        "run_codex_column/native",
+        ENGINE_RESULT_WAIT,
+        &record_path,
+    )
+    .await;
 
     // Switch to Codex.
     manager
@@ -5596,13 +5664,13 @@ async fn run_codex_column() -> Measures {
     let mut rx = manager.subscribe(&sid).await.unwrap();
 
     // Wait for Codex answer.
-    loop {
-        match tokio::time::timeout(ENGINE_RESULT_WAIT, rx.recv()).await {
-            Ok(Ok(ChatEvent::Result { .. })) => break,
-            Ok(Ok(_)) => continue,
-            Ok(Err(_)) | Err(_) => panic!("run_codex_column: timed out waiting for Codex Result"),
-        }
-    }
+    await_turn_result(
+        &mut rx,
+        "run_codex_column/codex",
+        ENGINE_SWITCH_RESULT_WAIT,
+        &record_path,
+    )
+    .await;
 
     // Verify relay.
     let recorded: Vec<Value> = std::fs::read_to_string(&record_path)
