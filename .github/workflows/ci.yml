@@ -898,6 +898,32 @@ jobs:
             src/neo4j/client.rs \
             src/neo4j/chat.rs
 
+      # Codecov's `patch` status is ADVISORY here (`require_ci_to_pass: false`,
+      # `fail_ci_if_error: false`) and it reports ONE percentage, never the lines
+      # behind it. This applies the SAME bar before the upload — the target read
+      # from `codecov.yml` (95 %, threshold 0 %) — and NAMES every uncovered line
+      # of the diff, so a red patch status stops being an unexplained number.
+      # Calibration: on PR #1048 the gate measured 29/32 instrumented lines, i.e.
+      # 90.62 %, the exact figure codecov printed for that commit.
+      - name: Patch coverage of this PR's diff (the bar codecov applies)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          # The gate diffs the PR against its base, which needs the merge base: a
+          # depth-1 checkout has no history at all (`--unshallow` on a complete
+          # clone is an error, hence the test).
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+            git fetch --no-tags --unshallow origin "+refs/heads/${BASE}:refs/remotes/origin/${BASE}"
+          else
+            git fetch --no-tags origin "+refs/heads/${BASE}:refs/remotes/origin/${BASE}"
+          fi
+          rustc --test scripts/patch_coverage.rs -o "$RUNNER_TEMP/patch_coverage_test"
+          "$RUNNER_TEMP/patch_coverage_test"
+          rustc -O scripts/patch_coverage.rs -o "$RUNNER_TEMP/patch_coverage"
+          "$RUNNER_TEMP/patch_coverage" lcov.info \
+            --base "origin/${BASE}" --min 95 --repo .
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
         with:

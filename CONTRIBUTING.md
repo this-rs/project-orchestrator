@@ -147,6 +147,23 @@ pure decision modules (`access.rs`, `validate.rs`, `registry.rs`) must reach
 Add a directory to the gate by extending that step; never by adding an `ignore`
 entry to `codecov.yml`.
 
+The same bar is enforced by a SECOND blocking gate, `scripts/patch_coverage.rs`
+(std only), so a red `codecov/patch` is never the first time you hear about it:
+it reads the merged lcov and the git diff, and it NAMES the uncovered lines.
+Run it locally before pushing, with any lcov you have (a unit-test-only report
+is a lower bound — if it passes, the CI passes):
+
+```bash
+cargo llvm-cov --lib --lcov --output-path lcov.info --no-fail-fast
+rustc -O scripts/patch_coverage.rs -o /tmp/patch_coverage
+/tmp/patch_coverage lcov.info --base origin/main --min 95
+```
+
+It prints, per file, the ranges still to cover
+(`49.67%  src/api/ws_activity_handler.rs (229/461 lines) uncovered: 111-126,128-143`).
+A line that the report does not instrument (comment, blank, declaration) is never
+counted as covered, and a file absent from the report can never raise the number.
+
 ## Pull Request Process
 
 1. **Create a branch** from `main`:
