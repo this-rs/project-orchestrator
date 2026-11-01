@@ -398,4 +398,18 @@ mod tests {
             "an edit above the function must not change its identity"
         );
     }
+
+    #[test]
+    fn an_external_trait_is_keyed_by_its_full_path_not_its_simple_name() {
+        // Two external traits with one simple name (`fmt::Debug` and a user
+        // `Debug`) must not merge: the key carries the full path.
+        assert_eq!(
+            stable_external_trait_key("std::fmt::Debug"),
+            "external:trait:std::fmt::Debug"
+        );
+        assert_ne!(
+            stable_external_trait_key("std::fmt::Debug"),
+            stable_external_trait_key("crate::Debug"),
+        );
+    }
 }

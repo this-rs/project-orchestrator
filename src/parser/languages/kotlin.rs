@@ -401,3 +401,36 @@ fn get_kdoc(node: &tree_sitter::Node, source: &str) -> Option<String> {
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The grammar (tree-sitter-kotlin-ng 1.1) names an import `import`, not
+    /// `import_header`, so the root walk of `extract` never calls
+    /// `extract_import` on real input. The function itself is tested here on
+    /// the node the grammar produces.
+    fn first_import(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+        if node.kind() == "import" {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        let found = node.children(&mut cursor).find_map(first_import);
+        found
+    }
+
+    #[test]
+    fn an_aliased_import_has_occurrence_zero_and_its_alias() {
+        let code = "import kotlin.math.max as m\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_kotlin_ng::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        let node = first_import(tree.root_node()).expect("an import node");
+        let imp = extract_import(&node, code, "App.kt").expect("an import");
+        assert_eq!(imp.path, "kotlin.math.max");
+        assert_eq!(imp.alias.as_deref(), Some("m"));
+        assert_eq!(imp.occurrence, 0);
+    }
+}
