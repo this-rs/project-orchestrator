@@ -393,6 +393,19 @@ impl NoteManager {
 
     /// Create a new note
     pub async fn create_note(&self, input: CreateNoteRequest, created_by: &str) -> Result<Note> {
+        self.create_note_with(input, created_by, NoteExtras::default())
+            .await
+    }
+
+    /// [`Self::create_note`] with the validity window and revision provenance a
+    /// plain creation never carries. Kept apart so that the 17 sites building a
+    /// `CreateNoteRequest` do not all change for a feature most notes do not use.
+    pub async fn create_note_with(
+        &self,
+        input: CreateNoteRequest,
+        created_by: &str,
+        extras: NoteExtras,
+    ) -> Result<Note> {
         // RFC auto-template: use structured template if content is empty
         let content = if input.note_type == NoteType::Rfc && input.content.trim().is_empty() {
             Self::RFC_TEMPLATE.to_string()
@@ -421,6 +434,9 @@ impl NoteManager {
         if let Some(consent) = input.sharing_consent {
             note.sharing_consent = consent;
         }
+        note.valid_from = extras.valid_from;
+        note.valid_until = extras.valid_until;
+        note.revision = extras.revision;
 
         // Apply project-level default_note_energy if set (homeostasis throttle).
         // When note_density is high, homeostasis sets a lower initial energy
@@ -941,6 +957,70 @@ impl NoteManager {
             ),
         );
 
+        Ok(new_note)
+    }
+
+    /// Revise a note: the new version replaces `old_note_id` and carries WHO revised,
+    /// WHEN and on WHAT EVIDENCE.
+    ///
+    /// This is how a note outside its validity window (or already superseded) comes
+    /// back into use: not refused, revised. A revision with no evidence is refused —
+    /// it would be a silent rewrite, the very thing the window exists to prevent.
+    /// The new version opens a fresh window (`valid_from` / `valid_until` as given;
+    /// both `None` = unbounded).
+    pub async fn revise_note(
+        &self,
+        old_note_id: Uuid,
+        new_note_input: CreateNoteRequest,
+        revised_by: &str,
+        evidence: &str,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Note> {
+        let evidence = evidence.trim();
+        if evidence.is_empty() {
+            anyhow::bail!(
+                "a revision needs its evidence (a commit, a test, an output): none was given"
+            );
+        }
+        if let (Some(from), Some(until)) = (valid_from, valid_until) {
+            if until <= from {
+                anyhow::bail!("valid_until must be after valid_from");
+            }
+        }
+        if self.neo4j.get_note(old_note_id).await?.is_none() {
+            anyhow::bail!("note {old_note_id} not found: nothing to revise");
+        }
+        let extras = NoteExtras {
+            valid_from,
+            valid_until,
+            revision: Some(NoteRevision {
+                revised_by: revised_by.to_string(),
+                revised_at: chrono::Utc::now(),
+                evidence: evidence.to_string(),
+                revises: old_note_id,
+            }),
+        };
+        let mut new_note = self
+            .create_note_with(new_note_input, revised_by, extras)
+            .await?;
+        new_note.supersedes = Some(old_note_id);
+        self.neo4j.supersede_note(old_note_id, new_note.id).await?;
+        self.meilisearch
+            .update_note_status(&old_note_id.to_string(), "archived")
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Note,
+                CrudAction::Updated,
+                old_note_id.to_string(),
+            )
+            .with_payload(serde_json::json!({
+                "status": "archived",
+                "superseded_by": new_note.id.to_string(),
+                "revised_by": revised_by,
+            })),
+        );
         Ok(new_note)
     }
 
@@ -2859,6 +2939,111 @@ mod tests {
         let old_after = mgr.get_note(old_note.id).await.unwrap().unwrap();
         assert_eq!(old_after.status, NoteStatus::Obsolete);
         assert_eq!(old_after.superseded_by, Some(new_note.id));
+    }
+
+    #[tokio::test]
+    async fn a_revision_records_who_when_and_on_what_evidence() {
+        let (mgr, pid) = create_note_manager().await;
+        let old = mgr
+            .create_note(make_create_request(pid, "Deploy via script A"), "agent-1")
+            .await
+            .unwrap();
+
+        let until = chrono::Utc::now() + chrono::Duration::days(30);
+        let new = mgr
+            .revise_note(
+                old.id,
+                make_create_request(pid, "Deploy via script B"),
+                "agent-2",
+                "  commit 1a2b3c4: script A removed  ",
+                None,
+                Some(until),
+            )
+            .await
+            .unwrap();
+
+        // The persisted version carries the provenance, not just the returned value.
+        let stored = mgr.get_note(new.id).await.unwrap().unwrap();
+        let rev = stored
+            .revision
+            .clone()
+            .expect("a revision must be recorded");
+        assert_eq!(rev.revised_by, "agent-2");
+        assert_eq!(rev.evidence, "commit 1a2b3c4: script A removed");
+        assert_eq!(rev.revises, old.id);
+        assert_eq!(stored.valid_until, Some(until));
+
+        let old_after = mgr.get_note(old.id).await.unwrap().unwrap();
+        assert_eq!(old_after.superseded_by, Some(new.id));
+        assert!(
+            !crate::notes::is_current_knowledge(&old_after),
+            "the replaced version no longer reaches the agent"
+        );
+        assert!(crate::notes::is_current_knowledge(&stored));
+    }
+
+    #[tokio::test]
+    async fn a_revision_without_evidence_is_refused_and_changes_nothing() {
+        let (mgr, pid) = create_note_manager().await;
+        let old = mgr
+            .create_note(make_create_request(pid, "Keep me"), "agent-1")
+            .await
+            .unwrap();
+
+        for blank in ["", "   ", "\n\t"] {
+            let err = mgr
+                .revise_note(
+                    old.id,
+                    make_create_request(pid, "Silent rewrite"),
+                    "agent-2",
+                    blank,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("evidence"), "{err}");
+        }
+        let after = mgr.get_note(old.id).await.unwrap().unwrap();
+        assert!(
+            after.superseded_by.is_none(),
+            "a refused revision must not supersede the note"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revision_of_an_unknown_note_or_an_inverted_window_is_refused() {
+        let (mgr, pid) = create_note_manager().await;
+        let missing = mgr
+            .revise_note(
+                Uuid::new_v4(),
+                make_create_request(pid, "x"),
+                "agent-2",
+                "proof",
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("not found"), "{missing}");
+
+        let old = mgr
+            .create_note(make_create_request(pid, "y"), "agent-1")
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let inverted = mgr
+            .revise_note(
+                old.id,
+                make_create_request(pid, "z"),
+                "agent-2",
+                "proof",
+                Some(now),
+                Some(now - chrono::Duration::days(1)),
+            )
+            .await
+            .unwrap_err();
+        assert!(inverted.to_string().contains("valid_until"), "{inverted}");
     }
 
     #[tokio::test]

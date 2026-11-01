@@ -1801,28 +1801,37 @@ pub(crate) async fn enrichment_for_turn(
         reasoning_path_tracker: protocol.reasoning_path_tracker,
     };
     let ctx = pipeline.execute(&input).await;
-    if !ctx.has_content() {
-        return (!live_block.is_empty()).then_some(live_block);
+    let mut parts: Vec<String> = Vec::new();
+    if !live_block.is_empty() {
+        // The live block opens the enrichment, like the other stages: never the prefix.
+        parts.push(live_block);
     }
-    debug!(
-        "[enrichment] Prompt enriched: {} sections, {}ms (hints: {:?})",
-        ctx.sections.len(),
-        ctx.total_time_ms,
-        ctx.hints.keys().collect::<Vec<_>>()
-    );
-    // Clean markdown prepended to the user message (replaces the old XML-wrapped
-    // <enrichment_context> format).
-    let md =
-        ctx.to_system_prompt_markdown_capped(super::composer::turn_enrichment_cap(window_tokens));
-    if live_block.is_empty() {
-        return (!md.is_empty()).then_some(md);
+    if ctx.has_content() {
+        debug!(
+            "[enrichment] Prompt enriched: {} sections, {}ms (hints: {:?})",
+            ctx.sections.len(),
+            ctx.total_time_ms,
+            ctx.hints.keys().collect::<Vec<_>>()
+        );
+        // Clean markdown prepended to the user message (replaces the old XML-wrapped
+        // <enrichment_context> format).
+        let md = ctx
+            .to_system_prompt_markdown_capped(super::composer::turn_enrichment_cap(window_tokens));
+        if !md.is_empty() {
+            parts.push(md);
+        }
     }
-    // The live block opens the enrichment, like the other stages: never the prefix.
-    Some(if md.is_empty() {
-        live_block
-    } else {
-        format!("{live_block}\n\n{md}")
-    })
+    // The retrieval trigger (PR3 of plan 42d49a31): an INVITATION to consult the graph,
+    // appended to the user turn — never to the system prompt, whose prefix must stay
+    // byte-identical for the cache. Off by default (`RETRIEVAL_TRIGGER`): off, `parts`
+    // holds exactly what the three branches above held before.
+    if let Some(invite) = super::retrieval_trigger::for_turn(super::retrieval_trigger::Facts {
+        message,
+        first_turn: node.message_count <= 1,
+    }) {
+        parts.push(invite);
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 /// What the manager does around a turn of the agent engine
