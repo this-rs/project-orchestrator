@@ -187,7 +187,7 @@ bcrypt = "0.19"
 # P2P Identity (M4)
 ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
 rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
-pasetors = "0.7"
+pasetors = "0.8"
 multibase = "0.9"
 
 # Self-update (archive extraction)
