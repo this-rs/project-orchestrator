@@ -2613,4 +2613,162 @@ mod tests {
         assert_eq!(watcher.watched_paths().await.len(), 0);
         assert_eq!(watcher.registered_project_count().await, 0);
     }
+
+    // ── flush : les chemins livrés au graphe sont dans la forme du projet ──
+
+    /// Un projet dont la racine déclarée est un lien, déjà migré (marqué).
+    #[cfg(unix)]
+    struct LinkedFlush {
+        _tmp: tempfile::TempDir,
+        orch: Arc<crate::orchestrator::runner::Orchestrator>,
+        neo4j: Arc<crate::neo4j::mock::MockGraphStore>,
+        ctx: ProjectContext,
+        project_map: Arc<RwLock<HashMap<PathBuf, ProjectContext>>>,
+        real: PathBuf,
+        declared: String,
+        canonical: String,
+    }
+
+    #[cfg(unix)]
+    async fn linked_flush() -> LinkedFlush {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-repo");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        let link = tmp.path().join("declared-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (state, neo4j, _meili) = crate::test_helpers::mock_app_state_with_stores();
+        let orch = Arc::new(
+            crate::orchestrator::runner::Orchestrator::new(state)
+                .await
+                .unwrap(),
+        );
+        let mut project = crate::test_helpers::test_project_named("flush");
+        project.root_path = link.to_string_lossy().to_string();
+        let pid = project.id;
+        neo4j.projects.write().await.insert(pid, project);
+        neo4j.paths_declared.write().await.insert(pid, true);
+        let real = real.canonicalize().unwrap();
+        LinkedFlush {
+            canonical: real.to_string_lossy().to_string(),
+            declared: link.to_string_lossy().to_string(),
+            ctx: ProjectContext {
+                project_id: pid,
+                project_slug: "flush".into(),
+            },
+            project_map: Arc::new(RwLock::new(HashMap::new())),
+            real,
+            orch,
+            neo4j,
+            _tmp: tmp,
+        }
+    }
+
+    #[cfg(unix)]
+    fn graph_file(path: &str, project: Option<Uuid>) -> crate::neo4j::models::FileNode {
+        crate::neo4j::models::FileNode {
+            path: path.to_string(),
+            language: "rust".into(),
+            hash: "h".into(),
+            last_parsed: chrono::Utc::now(),
+            project_id: project,
+        }
+    }
+
+    /// Le watcher livre le chemin RÉEL d'un fichier supprimé ; le graphe le
+    /// tient sous la forme déclarée du projet. La suppression doit le trouver —
+    /// et un fichier sans projet se supprime sous la forme canonique.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_flushed_deletion_is_looked_up_in_the_stored_form() {
+        let t = linked_flush().await;
+        let declared_file = format!("{}/src/gone.rs", t.declared);
+        let orphan_file = format!("{}/src/orphan.rs", t.canonical);
+        let kept = format!("{}/src/kept.rs", t.declared);
+        {
+            let mut files = t.neo4j.files.write().await;
+            for p in [&declared_file, &kept] {
+                files.insert(p.clone(), graph_file(p, Some(t.ctx.project_id)));
+            }
+            files.insert(orphan_file.clone(), graph_file(&orphan_file, None));
+        }
+
+        let mut pending_files = HashMap::new();
+        let mut pending_deletions = HashMap::new();
+        pending_deletions.insert(
+            t.ctx.project_id,
+            (t.ctx.clone(), HashSet::from([t.real.join("src/gone.rs")])),
+        );
+        let mut pending_orphans = HashSet::new();
+        let mut pending_orphan_deletions = HashSet::from([t.real.join("src/orphan.rs")]);
+        flush_pending_files(
+            &mut pending_files,
+            &mut pending_deletions,
+            &mut pending_orphans,
+            &mut pending_orphan_deletions,
+            &t.orch,
+            &t.project_map,
+        )
+        .await;
+
+        let files = t.neo4j.files.read().await;
+        assert!(
+            !files.contains_key(&declared_file),
+            "found in the declared form"
+        );
+        assert!(!files.contains_key(&orphan_file), "orphan: canonical form");
+        assert!(files.contains_key(&kept), "an unrelated file is untouched");
+    }
+
+    /// Sans lecture possible de la politique de chemins, une suppression est
+    /// SAUTÉE (jamais cherchée dans la mauvaise forme et comptée en succès), et
+    /// l'invalidation d'une modification aussi.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_flush_without_a_path_policy_skips_instead_of_guessing() {
+        let t = linked_flush().await;
+        let declared_file = format!("{}/src/gone.rs", t.declared);
+        t.neo4j.files.write().await.insert(
+            declared_file.clone(),
+            graph_file(&declared_file, Some(t.ctx.project_id)),
+        );
+        std::fs::write(t.real.join("src/changed.rs"), "fn c() {}").unwrap();
+        t.neo4j.fail_reads.lock().unwrap().insert("path_policy");
+
+        let mut pending_files = HashMap::new();
+        pending_files.insert(
+            t.ctx.project_id,
+            (
+                t.ctx.clone(),
+                HashSet::from([t.real.join("src/changed.rs")]),
+            ),
+        );
+        let mut pending_deletions = HashMap::new();
+        pending_deletions.insert(
+            t.ctx.project_id,
+            (t.ctx.clone(), HashSet::from([t.real.join("src/gone.rs")])),
+        );
+        let mut pending_orphans = HashSet::new();
+        let mut pending_orphan_deletions = HashSet::new();
+        flush_pending_files(
+            &mut pending_files,
+            &mut pending_deletions,
+            &mut pending_orphans,
+            &mut pending_orphan_deletions,
+            &t.orch,
+            &t.project_map,
+        )
+        .await;
+
+        let files = t.neo4j.files.read().await;
+        assert!(
+            files.contains_key(&declared_file),
+            "the deletion was skipped, not applied in a guessed form"
+        );
+        assert_eq!(
+            files.len(),
+            1,
+            "the changed file was not synced either: {:?}",
+            files.keys()
+        );
+    }
 }

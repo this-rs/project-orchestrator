@@ -9423,6 +9423,118 @@ mod tests {
         );
     }
 
+    /// `Orchestrator::path_policy` reads the project's vocabulary through the
+    /// cache: the declared form once marked, kept as given for an unknown project.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_orchestrator_exposes_the_cached_path_policy() {
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-repo");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        let link = tmp.path().join("declared-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let declared = link.to_string_lossy().to_string();
+
+        let (state, neo4j, _meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+        let mut project = crate::test_helpers::test_project_named("policy");
+        project.root_path = declared.clone();
+        let pid = project.id;
+        neo4j.projects.write().await.insert(pid, project);
+        neo4j.paths_declared.write().await.insert(pid, true);
+
+        let policy = orch.path_policy(pid).await.unwrap();
+        assert!(policy.declared, "the marker is read");
+        let real_file = format!("{}/src/a.rs", real.canonicalize().unwrap().display());
+        assert_eq!(policy.stored(&real_file), format!("{declared}/src/a.rs"));
+
+        let unknown = orch.path_policy(Uuid::new_v4()).await.unwrap();
+        assert!(!unknown.declared);
+        assert_eq!(unknown.stored("/x/y.rs"), "/x/y.rs", "kept as given");
+    }
+
+    /// A single-file sync stores the file in the project's form when it has a
+    /// project, and in the canonical form when it has none.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_single_file_sync_follows_the_project_vocabulary() {
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-repo");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/a.rs"), "fn a() {}").unwrap();
+        std::fs::write(real.join("src/b.rs"), "fn b() {}").unwrap();
+        let link = tmp.path().join("declared-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let declared = link.to_string_lossy().to_string();
+        let canonical = real.canonicalize().unwrap().to_string_lossy().to_string();
+
+        let (state, neo4j, _meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+        let mut project = crate::test_helpers::test_project_named("single");
+        project.root_path = declared.clone();
+        let pid = project.id;
+        neo4j.projects.write().await.insert(pid, project);
+        neo4j.paths_declared.write().await.insert(pid, true);
+
+        // With the project (marked): the declared form.
+        orch.sync_file_for_project(&link.join("src/a.rs"), Some(pid), Some("single"))
+            .await
+            .unwrap();
+        // Without a project: the canonical form, whatever path was handed over.
+        orch.sync_file(&link.join("src/b.rs")).await.unwrap();
+
+        let paths: Vec<String> = neo4j.files.read().await.keys().cloned().collect();
+        assert!(
+            paths.contains(&format!("{declared}/src/a.rs")),
+            "project file in the declared form: {paths:?}"
+        );
+        assert!(
+            paths.contains(&format!("{canonical}/src/b.rs")),
+            "project-less file in the canonical form: {paths:?}"
+        );
+        assert_eq!(paths.len(), 2, "one node per file: {paths:?}");
+    }
+
+    /// A relative path is anchored on the working directory, then cleaned.
+    #[test]
+    fn normalize_path_anchors_a_relative_path_on_the_working_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            normalize_path("src/../src/a.rs"),
+            cwd.join("src/a.rs").to_string_lossy().to_string()
+        );
+    }
+
+    /// The scan prunes a link that leaves the project's real root — with its
+    /// subtree — and keeps a link that stays inside it.
+    #[cfg(unix)]
+    #[test]
+    fn scan_files_prunes_a_link_that_leaves_the_real_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.rs"), "fn secret() {}").unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/in.rs"), "fn inside() {}").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        std::os::unix::fs::symlink(root.join("src"), root.join("alias")).unwrap();
+
+        let names: Vec<String> = scan_files(&root).iter().map(|e| e.path.clone()).collect();
+        assert!(
+            !names.iter().any(|p| p.contains("secret.rs")),
+            "the link to the outside is pruned: {names:?}"
+        );
+        assert!(
+            names.iter().any(|p| p.ends_with("alias/in.rs")),
+            "a link inside the root is walked: {names:?}"
+        );
+    }
+
     #[test]
     fn test_scan_files_all_language_extensions() {
         // Verify that scan_files uses SupportedLanguage::from_extension

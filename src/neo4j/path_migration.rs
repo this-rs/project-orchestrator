@@ -1406,4 +1406,85 @@ mod tests {
         assert!(out.contains("Function"));
         assert!(out.contains("631 File"));
     }
+
+    fn rename_plan(paths_declared: bool) -> RenamePlan {
+        RenamePlan {
+            project_id: Uuid::nil(),
+            slug: "demo".into(),
+            declared_root: "/home/u/link".into(),
+            canonical_root: "/data/real".into(),
+            stored_canonical: Some("/data/real".into()),
+            paths_declared,
+        }
+    }
+
+    /// Une étiquette inconnue est une erreur de programmation, pas un identifiant
+    /// de passe fabriqué : les deux tables échouent bruyamment.
+    #[test]
+    #[should_panic(expected = "unknown symbol label Nope")]
+    fn an_unknown_label_has_no_rename_pass() {
+        symbol_pass_id("Nope");
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown symbol label Nope")]
+    fn an_unknown_label_has_no_merge_pass() {
+        merge_pass_id("Nope");
+    }
+
+    /// Chaque étiquette connue a ses deux identifiants de passe, distincts.
+    #[test]
+    fn every_known_label_has_distinct_pass_ids() {
+        let mut ids: Vec<&str> = SYMBOL_LABELS
+            .iter()
+            .flat_map(|l| [symbol_pass_id(l), merge_pass_id(l)])
+            .collect();
+        let n = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), n);
+    }
+
+    /// Le plan dit si le marqueur est déjà posé : le lecteur sait si le sync
+    /// écrit déjà la forme déclarée.
+    #[test]
+    fn the_plan_states_whether_the_marker_is_set() {
+        let m = PathMeasures::default();
+        assert!(render_plan(&rename_plan(true), &m, false).contains("true (le sync écrit déjà"));
+        assert!(render_plan(&rename_plan(false), &m, false)
+            .contains("absent (le sync écrit la forme canonique"));
+    }
+
+    /// `--purge-wl` annonce ce qu'il supprimera, avec les chiffres des mesures ;
+    /// sans lui, les copies `.wl` restantes sont signalées.
+    #[test]
+    fn the_plan_announces_the_purge_with_its_numbers() {
+        let m = PathMeasures {
+            wl_files: 7,
+            wl_symbols: 11,
+            wl_knowledge_edges_with_twin: 3,
+            ..Default::default()
+        };
+        let with = render_plan(&rename_plan(false), &m, true);
+        assert!(with.contains("réancrer 3 arête(s)"), "{with}");
+        assert!(
+            with.contains("DETACH DELETE 7 File .wl et 11 symboles"),
+            "{with}"
+        );
+        let without = render_plan(&rename_plan(false), &m, false);
+        assert!(
+            without.contains("(7 File .wl et 11 symboles restent"),
+            "{without}"
+        );
+        assert!(!without.contains("DETACH DELETE"), "{without}");
+    }
+
+    /// Un backend qui ne répare rien (le défaut du trait) le dit : `(0, 0)`, et
+    /// aucune migration n'est lancée — le boot n'invente pas de travail.
+    #[tokio::test]
+    async fn a_backend_without_roots_to_repair_reports_nothing() {
+        use crate::neo4j::traits::AnalyticsStore;
+        let mock = crate::neo4j::mock::MockGraphStore::new();
+        assert_eq!(mock.ensure_project_canonical_paths().await.unwrap(), (0, 0));
+    }
 }
