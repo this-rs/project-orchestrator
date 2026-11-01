@@ -47,3 +47,10 @@ updates:
     labels:
       - "dependencies"
       - "ci"
+    # dtolnay/rust-toolchain is versioned by the RUST version it installs
+    # (tag 1.95.0 = Rust 1.95.0), not by the action's own releases: Dependabot
+    # reads 1.120.0 as an action version and proposes a tag that rustup cannot
+    # download (PR #1054: "could not download nonexistent rust version").
+    # The toolchain is bumped by hand, with rust-toolchain.toml.
+    ignore:
+      - dependency-name: "dtolnay/rust-toolchain"
