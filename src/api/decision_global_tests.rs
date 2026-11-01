@@ -365,3 +365,157 @@ async fn the_growth_hook_links_relevant_personas_and_survives_a_failing_graph() 
         "a failing graph is logged, not propagated"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Branches rares : échecs non fatals et crochets spawnés. Un abonné `debug`
+// est posé pour que les champs des traces soient évalués (sans abonné, le
+// niveau est désactivé et leurs lignes ne s'exécutent jamais).
+// ---------------------------------------------------------------------------
+
+/// Pose un abonné `debug` pour la durée du test (fils courant : les tâches
+/// spawnées par un `#[tokio::test]` tournent sur le même fil).
+fn debug_tracing() -> tracing::subscriber::DefaultGuard {
+    tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::sink)
+            .finish(),
+    )
+}
+
+/// Un lien décision → persona qui échoue est consigné, et le crochet continue.
+#[tokio::test]
+async fn the_growth_hook_survives_a_failing_persona_link() {
+    use crate::api::handlers::link_decision_to_relevant_personas;
+    let _tracing = debug_tracing();
+    let fx = fixture().await;
+    let decision = Uuid::new_v4();
+    fx.graph
+        .relevant_personas
+        .write()
+        .await
+        .insert(fx.project_id, vec![(Uuid::new_v4(), 0.5)]);
+    fx.graph
+        .fail_reads
+        .lock()
+        .unwrap()
+        .insert("auto_link_decision_to_persona");
+    assert_eq!(
+        link_decision_to_relevant_personas(fx.graph.as_ref(), decision, fx.project_id).await,
+        1,
+        "the persona counts as relevant even when its link failed"
+    );
+    assert!(fx.graph.persona_decisions.read().await.is_empty());
+}
+
+/// La route liée à une tâche résout le projet de la tâche et lance le crochet.
+#[tokio::test]
+async fn the_task_bound_route_runs_the_growth_hook_of_the_task_project() {
+    let _tracing = debug_tracing();
+    let fx = fixture().await;
+    let persona = Uuid::new_v4();
+    fx.graph
+        .relevant_personas
+        .write()
+        .await
+        .insert(fx.project_id, vec![(persona, 0.9)]);
+    let response = fx
+        .app
+        .clone()
+        .oneshot(post(
+            &format!("/api/tasks/{}/decisions", fx.task_id),
+            json!({"description": "d", "rationale": "r"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let created = body_json(response).await;
+    let decision_id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+
+    let mut linked = None;
+    for _ in 0..200 {
+        linked = fx
+            .graph
+            .persona_decisions
+            .read()
+            .await
+            .get(&persona)
+            .and_then(|m| m.get(&decision_id).copied());
+        if linked.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(linked.is_some(), "the hook linked the relevant persona");
+}
+
+/// Un échec du magasin qui n'est pas « projet introuvable » reste une 500.
+#[tokio::test]
+async fn a_store_failure_on_a_global_decision_is_an_internal_error() {
+    let fx = fixture().await;
+    fx.graph
+        .fail_reads
+        .lock()
+        .unwrap()
+        .insert("create_decision_global");
+    let response = fx
+        .app
+        .clone()
+        .oneshot(post(
+            "/api/decisions",
+            json!({"description": "d", "rationale": "r"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// Une décision globale qui nomme un run le relie (PRODUCED_DURING) ; si le lien
+/// échoue, la décision est tout de même enregistrée (avertissement seulement).
+#[tokio::test]
+async fn a_global_decision_naming_a_run_links_it_and_survives_a_failing_link() {
+    let _tracing = debug_tracing();
+    let fx = fixture().await;
+    let body = json!({"description": "d", "rationale": "r", "run_id": Uuid::new_v4()});
+
+    let response = fx
+        .app
+        .clone()
+        .oneshot(post("/api/decisions", body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(fx.graph.reads().contains(&"create_produced_during"));
+
+    fx.graph
+        .fail_reads
+        .lock()
+        .unwrap()
+        .insert("create_produced_during");
+    let response = fx
+        .app
+        .clone()
+        .oneshot(post("/api/decisions", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "the link is best-effort");
+}
+
+/// Le rapport de santé cherche l'ancienne note `health-check` (lecture système
+/// du registre de récupération) pour en tirer un delta.
+#[tokio::test]
+async fn the_health_report_looks_up_the_previous_health_check_note() {
+    let fx = fixture().await;
+    let response = fx
+        .app
+        .clone()
+        .oneshot(post(
+            "/api/admin/persist-health-report",
+            json!({"project_id": fx.project_id}),
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = body_json(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}

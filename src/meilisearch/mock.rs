@@ -17,6 +17,9 @@ pub struct MockSearchStore {
     pub code_documents: RwLock<Vec<CodeDocument>>,
     pub decision_documents: RwLock<Vec<DecisionDocument>>,
     pub note_documents: RwLock<Vec<NoteDocument>>,
+    /// When set, `search_notes_with_scores` fails (a Meilisearch error surfaces
+    /// as a failed retrieval, not an empty one).
+    pub fail_note_search: std::sync::atomic::AtomicBool,
 }
 
 impl MockSearchStore {
@@ -26,6 +29,7 @@ impl MockSearchStore {
             code_documents: RwLock::new(Vec::new()),
             decision_documents: RwLock::new(Vec::new()),
             note_documents: RwLock::new(Vec::new()),
+            fail_note_search: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -409,6 +413,12 @@ impl SearchStore for MockSearchStore {
         status: Option<&str>,
         importance: Option<&str>,
     ) -> Result<Vec<SearchHit<NoteDocument>>> {
+        if self
+            .fail_note_search
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected note search failure (test)");
+        }
         let docs = self.note_documents.read().await;
         let mut results: Vec<SearchHit<NoteDocument>> = docs
             .iter()

@@ -1984,4 +1984,204 @@ mod tests {
         assert_eq!(mine[1].query, "trois");
         assert!(mine.iter().all(|e| e.session_id == Some(s)));
     }
+
+    /// Chaque motif et chaque source disent leur texte et leur rang. Un `match`
+    /// exhaustif que personne ne parcourt laisse des bras que la couverture ne
+    /// voit jamais : ce test les exécute tous, et il attrape aussi un rang
+    /// dupliqué (le rang indexe le tableau des compteurs).
+    #[test]
+    fn chaque_motif_et_chaque_source_se_nomment() {
+        let texts = [
+            "explicit",
+            "task_boundary",
+            "uncertainty",
+            "contradiction",
+            "hook",
+            "injection",
+            "system",
+        ];
+        for (rank, trigger) in Trigger::ALL.into_iter().enumerate() {
+            assert_eq!(trigger.as_str(), texts[rank], "texte de {trigger:?}");
+            assert_eq!(trigger.index(), rank, "rang de {trigger:?}");
+        }
+        assert_eq!(Source::Semantic.as_str(), "semantic");
+        assert_eq!(Source::Bm25.as_str(), "bm25");
+        assert_eq!(Source::SkillActivate.as_str(), "skill_activate");
+        assert_eq!(Source::Other.as_str(), "other");
+    }
+
+    /// Une validation dit sa nature ET sa valeur ; un bénéfice « non » porte sa
+    /// raison. Trois variantes de validation, deux de bénéfice : aucune ne doit
+    /// rester un bras mort.
+    #[test]
+    fn une_validation_et_un_benefice_disent_leur_nature() {
+        let anchor = Validation::Anchor("src/a.rs::f".to_string());
+        let sha = Validation::Sha("abc123".to_string());
+        let test = Validation::Test("gate_est_vert".to_string());
+        assert_eq!(anchor.kind(), "anchor");
+        assert_eq!(sha.kind(), "sha");
+        assert_eq!(test.kind(), "test");
+        assert_eq!(anchor.value(), "src/a.rs::f");
+        assert_eq!(sha.value(), "abc123");
+        assert_eq!(test.value(), "gate_est_vert");
+
+        assert_eq!(Benefit::Yes.as_str(), "yes");
+        assert_eq!(Benefit::Yes.reason(), None);
+        let no = Benefit::No {
+            reason: "jamais cité".to_string(),
+        };
+        assert_eq!(no.as_str(), "no");
+        assert_eq!(no.reason(), Some("jamais cité"));
+    }
+
+    /// `Counters::new()` est un `const fn` : LLVM l'évalue à la compilation pour
+    /// `LEDGER`, donc aucune de ses lignes n'est « exécutée » du point de vue de
+    /// la couverture. L'appeler à l'exécution exécute vraiment son corps — et
+    /// vérifie au passage qu'un registre neuf est à zéro partout, ce qui est la
+    /// seule chose qu'un `static` mal initialisé pourrait casser en silence.
+    #[test]
+    fn un_registre_neuf_est_a_zero_partout() {
+        let fresh = Counters::new();
+        assert_eq!(fresh.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.failures.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.empty_results.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.hits.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.latency_ms_total.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.semantic_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.bm25_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.skill_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.other_calls.load(Ordering::Relaxed), 0);
+        for (rank, counter) in fresh.triggers.iter().enumerate() {
+            assert_eq!(counter.load(Ordering::Relaxed), 0, "motif {rank}");
+        }
+        assert_eq!(fresh.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.evicted.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.evicted_unsettled.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.orphan_outcomes.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.abandoned.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.used.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.unused.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.stale_hits.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.blocked.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.benefit_yes.load(Ordering::Relaxed), 0);
+        assert_eq!(fresh.benefit_no.load(Ordering::Relaxed), 0);
+    }
+
+    /// L'agrégat d'une session range chaque événement dans SA colonne : une
+    /// source `Other` et les motifs sans récupération explicite (`contradiction`,
+    /// `hook`, `injection`, `system`) ont leur propre compteur, et un motif rangé
+    /// dans la mauvaise colonne fausserait la politique de récupération.
+    #[test]
+    fn un_agregat_de_session_compte_chaque_source_et_chaque_motif() {
+        let _g = serial_guard();
+        reset();
+        let session = uuid::Uuid::new_v4();
+        for (source, trigger) in [
+            (Source::Semantic, Trigger::Explicit),
+            (Source::Bm25, Trigger::TaskBoundary),
+            (Source::SkillActivate, Trigger::Uncertainty),
+            (Source::Other, Trigger::Contradiction),
+            (Source::Other, Trigger::Hook),
+            (Source::Other, Trigger::Injection),
+            (Source::Other, Trigger::System),
+        ] {
+            record_for_session(source, trigger, "q", vec![], true, 1, Some(session));
+        }
+        let s = snapshot_for_session(session);
+        assert_eq!(s.calls, 7);
+        assert_eq!(s.semantic_calls, 1);
+        assert_eq!(s.bm25_calls, 1);
+        assert_eq!(s.skill_calls, 1);
+        assert_eq!(s.other_calls, 4);
+        assert_eq!(s.explicit_calls, 1);
+        assert_eq!(s.task_boundary_calls, 1);
+        assert_eq!(s.uncertainty_calls, 1);
+        assert_eq!(s.contradiction_calls, 1);
+        assert_eq!(s.hook_calls, 1);
+        assert_eq!(s.injection_calls, 1);
+        assert_eq!(s.system_calls, 1);
+    }
+
+    /// Capacité nulle = journal désactivé : le marqueur de tour rend la main
+    /// sans rien écrire ni compter (le journal n'est pas « plein », il est éteint).
+    #[test]
+    fn un_marqueur_de_tour_a_capacite_nulle_ne_fait_rien() {
+        let _g = serial_guard();
+        reset();
+        set_journal_capacity(0);
+        begin_turn(uuid::Uuid::new_v4());
+        assert_eq!(snapshot().dropped, 0, "journal éteint : rien n'est perdu");
+        assert!(recent(10).is_empty());
+        reset();
+    }
+
+    /// Le marqueur de tour peut lui aussi tomber dans un débordement plein : il
+    /// est alors jeté ET compté, comme un appel d'index — sans ce compteur, une
+    /// mesure incomplète se lirait comme complète.
+    #[test]
+    fn un_marqueur_de_tour_qui_deborde_est_compte() {
+        let _g = serial_guard();
+        reset();
+        let held = store().journal.lock().unwrap_or_else(|e| e.into_inner());
+        for i in 0..OVERFLOW_CAPACITY {
+            assert!(
+                record(
+                    Source::Other,
+                    Trigger::Explicit,
+                    &i.to_string(),
+                    vec![],
+                    true,
+                    0
+                )
+                .is_some(),
+                "le débordement a la place pour {i}"
+            );
+        }
+        begin_turn(uuid::Uuid::new_v4());
+        let dropped = snapshot().dropped;
+        drop(held);
+        reset();
+        assert_eq!(dropped, 1, "le marqueur de tour perdu est compté");
+    }
+
+    /// Une attente dont l'événement n'est plus dans le journal (évincé) est un
+    /// orphelin : le règlement le constate et le compte, au lieu de rendre un
+    /// « zéro événement réglé » qui se lirait comme « rien à régler ».
+    #[test]
+    fn un_reglement_orphelin_est_compte() {
+        let _g = serial_guard();
+        reset();
+        let session = uuid::Uuid::new_v4();
+        {
+            let mut journal = store().journal.lock().unwrap_or_else(|e| e.into_inner());
+            journal.pending.entry(session).or_default().push(999_999);
+        }
+        let settled = settle_turn(session, &[]);
+        assert_eq!(settled.events, 0);
+        assert_eq!(settled.used, 0);
+        assert_eq!(snapshot().orphan_outcomes, 1, "l'orphelin est compté");
+    }
+
+    /// Hors du thread qui tient l'isolation des tests, toute écriture rend la main
+    /// sans toucher au registre : c'est ce qui empêche un test de voler les
+    /// événements d'un autre. Le refus de chaque entrée était le seul chemin que
+    /// personne n'exerçait.
+    #[test]
+    fn hors_isolation_une_ecriture_est_ignoree() {
+        let _g = serial_guard();
+        reset();
+        let (outcome_applied, settled_events, dropped) = std::thread::spawn(|| {
+            begin_turn(uuid::Uuid::new_v4());
+            let settled = settle_turn(uuid::Uuid::new_v4(), &[]);
+            let applied = outcome(u64::MAX, Usage::default());
+            (applied, settled.events, snapshot().dropped)
+        })
+        .join()
+        .expect("le fil ne panique pas");
+
+        assert!(!outcome_applied, "un règlement hors isolation est refusé");
+        assert_eq!(settled_events, 0, "aucun événement n'est réglé");
+        assert_eq!(dropped, 0, "et rien n'est compté comme perdu");
+        assert_eq!(snapshot().calls, 0, "le registre du test reste intact");
+    }
 }

@@ -696,4 +696,74 @@ mod tests {
             );
         }
     }
+
+    /// Un critère qui rate doit RENDRE SA MESURE : « manqué » sans chiffre ne dit
+    /// pas de combien, et c'est ce chiffre qui décide de la correction.
+    #[test]
+    fn un_critere_sous_la_barre_est_manque_et_dit_sa_mesure() {
+        // 1 récupération servie sur 4 réglées : 0.25, sous les 0.30 enregistrés.
+        let snapshot = Snapshot {
+            used: 1,
+            unused: 3,
+            ..Default::default()
+        };
+        let report = evaluate(&snapshot, &[]);
+        assert!(
+            report.correction.is_missed(),
+            "0.25 est sous la barre : {report:?}"
+        );
+        assert_eq!(report.correction.measured(), Some(0.25));
+        assert_eq!(
+            Verdict::NotMeasurable { reason: "rien" }.measured(),
+            None,
+            "un critère non mesurable n'a pas de valeur, pas zéro"
+        );
+    }
+
+    /// La médiane d'un échantillon vide n'existe pas (ce n'est pas zéro), et
+    /// celle d'un nombre pair de valeurs est la moyenne des deux du milieu.
+    #[test]
+    fn une_mediane_sans_valeur_n_existe_pas_et_celle_d_un_pair_est_une_moyenne() {
+        assert_eq!(median(Vec::new()), None, "pas de médiane sans valeur");
+        assert_eq!(median(vec![4.0, 1.0, 3.0, 2.0]), Some(2.5));
+        assert_eq!(median(vec![3.0, 1.0, 2.0]), Some(2.0));
+    }
+
+    /// Un bras de référence trop maigre ne mesure rien : comparer un regret à
+    /// cinq récupérations explicites serait un chiffre inventé.
+    #[test]
+    fn un_regret_sans_bras_de_reference_garni_n_est_pas_mesurable() {
+        let mut events = Vec::new();
+        for i in 0..(MIN_ARM / 2) as u64 {
+            events.push(settled(event(i + 1, Trigger::Explicit, 0), &["n1"], None));
+        }
+        for i in 0..MIN_ARM as u64 {
+            events.push(settled(event(i + 100, Trigger::Injection, 5), &[], None));
+        }
+        let refs: Vec<&RetrievalEvent> = events.iter().collect();
+        let (_, verdict) = regret_against_reference(&refs);
+        assert!(
+            matches!(verdict, Verdict::NotMeasurable { .. }),
+            "moins de MIN_ARM récupérations explicites : {verdict:?}"
+        );
+    }
+
+    /// Le bras de référence est garni mais aucun autre motif ne l'est : il n'y a
+    /// rien à comparer, et ce n'est pas un regret nul.
+    #[test]
+    fn un_regret_sans_autre_bras_garni_n_est_pas_mesurable() {
+        let mut events = Vec::new();
+        for i in 0..MIN_ARM as u64 {
+            events.push(settled(event(i + 1, Trigger::Explicit, 0), &["n1"], None));
+        }
+        for i in 0..(MIN_ARM / 2) as u64 {
+            events.push(settled(event(i + 100, Trigger::Injection, 5), &[], None));
+        }
+        let refs: Vec<&RetrievalEvent> = events.iter().collect();
+        let (_, verdict) = regret_against_reference(&refs);
+        assert!(
+            matches!(verdict, Verdict::NotMeasurable { .. }),
+            "aucun autre motif n'atteint MIN_ARM : {verdict:?}"
+        );
+    }
 }
