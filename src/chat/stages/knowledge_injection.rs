@@ -387,10 +387,26 @@ async fn keep_current_notes(
                     .superseded_by
                     .map(|id| format!(", superseded by note {id}"))
                     .unwrap_or_default();
-                scored.content = format!(
-                    "[NO LONGER APPLIES — status {}{}] {}",
-                    note.status, replacement, scored.content
-                );
+                scored.content = match note.validity_at(chrono::Utc::now()) {
+                    // Active but outside its window: it is not archived, it needs a
+                    // REVISION (new version + who/when/evidence), not a silent reuse.
+                    crate::notes::Validity::Expired(until) if replacement.is_empty() => format!(
+                        "[OUTSIDE ITS VALIDITY WINDOW — expired {}; revise it before relying on it] {}",
+                        until.format("%Y-%m-%d"),
+                        scored.content
+                    ),
+                    crate::notes::Validity::NotYetValid(from) if replacement.is_empty() => {
+                        format!(
+                            "[NOT VALID YET — starts {}; revise it before relying on it] {}",
+                            from.format("%Y-%m-%d"),
+                            scored.content
+                        )
+                    }
+                    _ => format!(
+                        "[NO LONGER APPLIES — status {}{}] {}",
+                        note.status, replacement, scored.content
+                    ),
+                };
             }
             let freshest = note
                 .last_confirmed_at
