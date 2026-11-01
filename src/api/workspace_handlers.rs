@@ -9,6 +9,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use futures::StreamExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -1785,11 +1786,128 @@ pub async fn get_workspace_graph(
     }))
 }
 
+// ============================================================================
+// Workspace intelligence summary — admission control and cache
+// ============================================================================
+
+/// How many projects the workspace intelligence summary may process at once.
+///
+/// Each project fires 14 queries concurrently (see `build_intelligence_summary`),
+/// and the Neo4j pool holds `NEO4J_MAX_CONNECTIONS` (50 by default). What matters
+/// is the product of the two, because every one of those queries holds a pool
+/// connection: an unbounded `join_all` asked a 12-project workspace for ~170
+/// connections at once, starved the pool, and made every other request —
+/// `/auth/refresh`, `/health`, the Claude Code hooks — wait tens of seconds for a
+/// free connection (measured 2026-10-31: 57 s on `/auth/refresh` while Neo4j
+/// itself answered in 5 ms). Raising the pool does not fix it: the demand grows
+/// with the number of projects, the pool is fixed.
+///
+/// With the default of 3, the fan-out never holds more than 3 × 14 = 42 of the
+/// 50 connections, so the rest of the server keeps 8 connections whatever the
+/// size of the workspace. Override with `WORKSPACE_INTELLIGENCE_CONCURRENCY`.
+fn workspace_intelligence_concurrency() -> usize {
+    std::env::var("WORKSPACE_INTELLIGENCE_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(3)
+}
+
+/// A cached workspace intelligence summary and the instant it was computed.
+struct CachedIntelligence {
+    computed_at: std::time::Instant,
+    response: WorkspaceIntelligenceSummaryResponse,
+}
+
+/// Process-local cache for the workspace intelligence summary.
+///
+/// The overview page asks for this summary on every load, and building it costs
+/// the whole workspace (14 queries per project). Without a cache, a reload, a
+/// client-side navigation or a second tab re-fires the entire fan-out — that is
+/// the burst that starved the pool. A short TTL turns those into a map lookup
+/// without pretending the numbers are real-time.
+static INTELLIGENCE_CACHE: LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, CachedIntelligence>>,
+> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// TTL of the cached summary, in seconds. `0` disables the cache entirely.
+fn intelligence_cache_ttl() -> u64 {
+    std::env::var("WORKSPACE_INTELLIGENCE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(20)
+}
+
+/// Fresh cached summary for `slug`, if there is one.
+///
+/// The lock is taken and released without crossing an `.await`, and a poisoned
+/// lock only means "no cache" — it must never turn a read into a 500.
+fn cached_intelligence(
+    slug: &str,
+    ttl: std::time::Duration,
+) -> Option<WorkspaceIntelligenceSummaryResponse> {
+    if ttl.is_zero() {
+        return None;
+    }
+    let cache = INTELLIGENCE_CACHE.lock().ok()?;
+    let entry = cache.get(slug)?;
+    (entry.computed_at.elapsed() < ttl).then(|| entry.response.clone())
+}
+
+/// Cache a freshly computed summary for `slug`.
+fn store_intelligence(
+    slug: &str,
+    response: &WorkspaceIntelligenceSummaryResponse,
+    ttl: std::time::Duration,
+) {
+    if ttl.is_zero() {
+        return;
+    }
+    if let Ok(mut cache) = INTELLIGENCE_CACHE.lock() {
+        // Bound the map: one entry per existing workspace is small, but a
+        // long-lived server must not keep deleted workspaces forever.
+        if cache.len() > 64 {
+            cache.retain(|_, entry| entry.computed_at.elapsed() < ttl);
+        }
+        cache.insert(
+            slug.to_string(),
+            CachedIntelligence {
+                computed_at: std::time::Instant::now(),
+                response: response.clone(),
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+mod intelligence_cache_tests {
+    use super::*;
+
+    #[test]
+    fn zero_ttl_disables_the_cache() {
+        // `WORKSPACE_INTELLIGENCE_TTL_SECS=0` must mean "always recompute", so an
+        // operator can turn the cache off without rebuilding.
+        assert!(cached_intelligence("any-slug", std::time::Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn concurrency_is_never_zero() {
+        // `buffered(0)` would never make progress; the helper must refuse it.
+        assert!(workspace_intelligence_concurrency() >= 1);
+    }
+}
+
 /// GET /api/workspaces/{slug}/intelligence/summary — Aggregated intelligence summary across all workspace projects
 pub async fn get_workspace_intelligence_summary(
     State(state): State<OrchestratorState>,
     Path(slug): Path<String>,
 ) -> Result<Json<WorkspaceIntelligenceSummaryResponse>, AppError> {
+    // A reload within the TTL must not re-fire the whole workspace fan-out.
+    let ttl = std::time::Duration::from_secs(intelligence_cache_ttl());
+    if let Some(cached) = cached_intelligence(&slug, ttl) {
+        return Ok(Json(cached));
+    }
+
     let neo4j = state.orchestrator.neo4j_arc();
 
     let workspace = neo4j
@@ -1799,21 +1917,24 @@ pub async fn get_workspace_intelligence_summary(
 
     let projects = neo4j.list_workspace_projects(workspace.id).await?;
 
-    // Build intelligence summary for each project in parallel
-    let summary_futures: Vec<_> = projects
-        .iter()
-        .map(|project| {
-            let neo4j = neo4j.clone();
-            let project = project.clone();
-            async move {
-                let result =
-                    super::graph_types::build_intelligence_summary(&*neo4j, project.id).await;
-                (project, result)
-            }
-        })
-        .collect();
-
-    let results = futures::future::join_all(summary_futures).await;
+    // Build the per-project summaries with BOUNDED concurrency.
+    //
+    // `buffered` (not `buffer_unordered`) keeps the projects in their original
+    // order while never running more than `concurrency` of them at once, which
+    // caps the number of pool connections this handler can check out. See
+    // `workspace_intelligence_concurrency` for the arithmetic and for what an
+    // unbounded `join_all` used to cost the rest of the server.
+    let concurrency = workspace_intelligence_concurrency();
+    let results: Vec<_> = futures::stream::iter(projects.into_iter().map(|project| {
+        let neo4j = neo4j.clone();
+        async move {
+            let result = super::graph_types::build_intelligence_summary(&*neo4j, project.id).await;
+            (project, result)
+        }
+    }))
+    .buffered(concurrency)
+    .collect()
+    .await;
 
     let mut per_project = Vec::new();
     let mut total_files: i64 = 0;
@@ -2016,10 +2137,12 @@ pub async fn get_workspace_intelligence_summary(
         },
     };
 
-    Ok(Json(WorkspaceIntelligenceSummaryResponse {
+    let response = WorkspaceIntelligenceSummaryResponse {
         aggregated,
         per_project,
-    }))
+    };
+    store_intelligence(&slug, &response, ttl);
+    Ok(Json(response))
 }
 
 #[cfg(test)]
