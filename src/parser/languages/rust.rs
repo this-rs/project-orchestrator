@@ -95,6 +95,7 @@ pub fn extract(
                             items: vec![],
                             file_path: file_path.to_string(),
                             line: node.start_position().row as u32 + 1,
+                            occurrence: 0,
                         });
                     }
                 }
@@ -145,6 +146,7 @@ fn extract_function(
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
+        owner: None,
     })
 }
 
@@ -225,6 +227,7 @@ fn extract_import(node: &tree_sitter::Node, source: &str, file_path: &str) -> Op
         items: vec![],
         file_path: file_path.to_string(),
         line: node.start_position().row as u32 + 1,
+        occurrence: 0,
     })
 }
 
@@ -237,7 +240,7 @@ fn extract_impl(
     let for_type = get_impl_type(node, source);
     let trait_name = get_impl_trait(node, source);
 
-    if let Some(for_type) = for_type {
+    if let Some(for_type) = &for_type {
         let generics = extract_rust_type_parameters(node, source);
 
         parsed.impl_blocks.push(ImplNode {
@@ -251,11 +254,17 @@ fn extract_impl(
         });
     }
 
-    // Extract methods from the body
+    // Extract methods from the body. Each one carries its owner: `impl A {
+    // fn new() }` and `impl B { fn new() }` are two symbols, and `fmt` of
+    // `Display for A` is not `fmt` of `Debug for A` (see symbol_key.rs).
+    let owner = for_type
+        .as_ref()
+        .map(|t| SymbolOwner::new(t.clone(), trait_name.clone()));
     if let Some(body) = node.child_by_field_name("body") {
         for child in body.children(&mut body.walk()) {
             if child.kind() == "function_item" {
-                if let Some(func) = extract_function(&child, source, file_path) {
+                if let Some(mut func) = extract_function(&child, source, file_path) {
+                    func.owner = owner.clone();
                     let func_id = format!("{}:{}:{}", file_path, func.name, func.line_start);
                     let calls = extract_function_calls(&child, source, &func_id);
                     parsed.function_calls.extend(calls);

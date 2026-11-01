@@ -38,6 +38,7 @@ use super::trigger_handlers;
 use super::update_handlers;
 use super::vault_handlers;
 use super::workspace_handlers;
+use super::ws_activity_handler;
 use super::ws_chat_handler;
 use super::ws_handlers;
 use super::ws_run_handler;
@@ -72,20 +73,39 @@ pub fn create_router(state: OrchestratorState) -> Router {
     // and /oauth/* fall through to the 404/SPA fallback — no exposure by default.
     let remote_mcp_enabled = state.remote_mcp.enabled;
 
-    let mut public = public_routes();
-    if remote_mcp_enabled {
-        public = public.merge(remote_mcp_public_routes());
-    }
+    let public = public_routes();
     // External events ingestion is opt-in too (`ingress.enabled`, off by default):
     // when off, the route is not mounted and answers exactly like an unknown path.
+    // It joins the bounded group: it writes to Neo4j and needs a deadline too.
+    let mut bounded_public = bounded_public_routes();
+    if remote_mcp_enabled {
+        bounded_public = bounded_public.merge(remote_mcp_public_routes());
+    }
     if state.ingress.config.enabled {
-        public = public.merge(ingress_routes());
+        bounded_public = bounded_public.merge(ingress_routes());
     }
 
-    // Request timeout on protected REST routes only. Hung requests (e.g. a
-    // handler blocked waiting for a saturated Neo4j pool) return 408 instead of
-    // freezing the tab forever. WS routes live in `public_routes` and are NOT
-    // wrapped — a blanket timeout would kill long-lived sockets.
+    // Public routes that reach Neo4j get their own deadline: they are unauthenticated,
+    // so nothing else bounded them, and a saturated pool turned them into multi-minute
+    // waits (see `bounded_public_routes`). WebSocket upgrades stay untimed, so they are
+    // merged separately. Generous enough for an OAuth handshake, short enough to fail
+    // while the user is still looking at the screen.
+    //
+    // 503, not 408: the client was not slow, the server is out of Neo4j connections.
+    let public_timeout_secs = std::env::var("PUBLIC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(20);
+    let bounded_public = bounded_public.layer(tower_http::timeout::TimeoutLayer::with_status_code(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        std::time::Duration::from_secs(public_timeout_secs),
+    ));
+
+    // Request timeout on protected REST routes. Hung requests (e.g. a handler
+    // blocked waiting for a saturated Neo4j pool) return 408 instead of freezing
+    // the tab forever. WS routes are NOT wrapped — a blanket timeout would kill
+    // long-lived sockets.
     // Heavy admin/sync ops spawn background work and return fast, so the
     // generous default (60s) does not clip them. Tune via env if needed.
     let timeout_secs = std::env::var("HTTP_REQUEST_TIMEOUT_SECS")
@@ -106,6 +126,8 @@ pub fn create_router(state: OrchestratorState) -> Router {
         ));
 
     let router = public
+        .merge(bounded_public)
+        .merge(websocket_routes())
         .merge(protected)
         .layer(TraceLayer::new_for_http())
         .layer(cors)
@@ -336,6 +358,21 @@ fn public_routes() -> Router<OrchestratorState> {
         // and the 12h server-side cache means an anonymous caller cannot
         // amplify traffic to Anthropic.
         .route("/api/chat/models", get(chat_handlers::get_model_catalog))
+}
+
+/// Public routes that reach Neo4j, and must therefore be bounded in time.
+///
+/// The protected routes have had a `TimeoutLayer` for a while (see
+/// `create_router`); these ones did not, because they are public. That gap is
+/// how `/auth/refresh` ended up waiting 57 s for a Neo4j connection while the
+/// workspace fan-out was draining the pool (measured 2026-10-31): the request
+/// was neither authenticated nor bounded, so nothing ever interrupted it.
+///
+/// A saturated pool is a server-side condition, hence `503 Service Unavailable`
+/// rather than `408 Request Timeout` — the client was not slow, the server was
+/// out of connections.
+fn bounded_public_routes() -> Router<OrchestratorState> {
+    Router::new()
         // ================================================================
         // Auth (public — login flow + discovery)
         // ================================================================
@@ -362,12 +399,6 @@ fn public_routes() -> Router<OrchestratorState> {
         // WS ticket (public — reads cookie to issue a short-lived WS auth ticket.
         // Workaround for WKWebView not sending cookies on WebSocket upgrades.)
         .route("/auth/ws-ticket", post(auth_handlers::ws_ticket))
-        // ================================================================
-        // WebSocket (public — auth via cookie or ticket fallback)
-        // ================================================================
-        .route("/ws/events", get(ws_handlers::ws_events))
-        .route("/ws/chat/{session_id}", get(ws_chat_handler::ws_chat))
-        .route("/ws/run/{run_id}", get(ws_run_handler::ws_run))
         // NOTE: `/hooks/wake` and `/internal/events` are NOT public. They mutate
         // state (complete a task, inject an event into the bus), so they live in
         // `protected_routes` behind `require_auth`.
@@ -384,6 +415,19 @@ fn public_routes() -> Router<OrchestratorState> {
             "/api/hooks/resolve-project",
             get(hook_handlers::resolve_project),
         )
+}
+
+/// Public WebSocket upgrades.
+///
+/// Deliberately NOT under any request timeout: a blanket timeout kills a
+/// long-lived socket mid-conversation. These authenticate themselves inside the
+/// handler (cookie, or the one-time ticket from `/auth/ws-ticket`).
+fn websocket_routes() -> Router<OrchestratorState> {
+    Router::new()
+        .route("/ws/events", get(ws_handlers::ws_events))
+        .route("/ws/activity", get(ws_activity_handler::ws_activity))
+        .route("/ws/chat/{session_id}", get(ws_chat_handler::ws_chat))
+        .route("/ws/run/{run_id}", get(ws_run_handler::ws_run))
 }
 
 // ============================================================================
@@ -875,6 +919,12 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/attention",
             get(super::attention_aggregate::get_attention),
+        )
+        // Live Activity Hub: what every run of the scope is doing, in one
+        // request, plus the sequence number the live feed resumes from.
+        .route(
+            "/api/activity/snapshot",
+            get(super::activity_handlers::get_activity_snapshot),
         )
         // Every agent whose CLI is running right now, whatever started it.
         .route(

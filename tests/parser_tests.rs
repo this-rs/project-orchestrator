@@ -2218,3 +2218,107 @@ class Documented {
     let do_stuff = parsed.functions.iter().find(|f| f.name == "doStuff");
     assert!(do_stuff.is_some(), "Should find doStuff method");
 }
+
+// Extractor branches added by the stable-key work that no other test reaches:
+// the owner and occurrence fields they set must be the ones the key relies on.
+
+#[test]
+fn rust_file_module_declaration_is_an_import_with_occurrence_zero() {
+    let mut parser = CodeParser::new().unwrap();
+    let parsed = parser
+        .parse_file(Path::new("lib.rs"), "mod storage;\n")
+        .unwrap();
+    let imp = parsed
+        .imports
+        .iter()
+        .find(|i| i.path == "self::storage")
+        .expect("`mod storage;` should be an import");
+    assert_eq!(imp.occurrence, 0);
+}
+
+#[test]
+fn c_prototype_and_macro_are_functions_without_an_owner() {
+    let mut parser = CodeParser::new().unwrap();
+    let code = "int add(int a, int b);\n#define SQUARE(x) ((x) * (x))\n";
+    let parsed = parser.parse_file(Path::new("util.h"), code).unwrap();
+    let proto = parsed
+        .functions
+        .iter()
+        .find(|f| f.name == "add")
+        .expect("a C prototype should be a function");
+    assert!(proto.owner.is_none(), "a free C declaration has no owner");
+    assert!(
+        parsed.functions.iter().any(|f| f.name == "SQUARE"),
+        "a function-like macro should be a function"
+    );
+}
+
+#[test]
+fn cpp_prototype_is_a_function_without_an_owner() {
+    let mut parser = CodeParser::new().unwrap();
+    let parsed = parser
+        .parse_file(Path::new("util.hpp"), "int add(int a, int b);\n")
+        .unwrap();
+    let proto = parsed
+        .functions
+        .iter()
+        .find(|f| f.name == "add")
+        .expect("a C++ prototype should be a function");
+    assert!(proto.owner.is_none());
+}
+
+#[test]
+fn zig_test_block_is_a_function_without_an_owner() {
+    let mut parser = CodeParser::new().unwrap();
+    let code = "test \"adds\" {\n    _ = 1 + 1;\n}\n";
+    let parsed = parser.parse_file(Path::new("math.zig"), code).unwrap();
+    let t = parsed
+        .functions
+        .first()
+        .expect("a Zig test block should be a function");
+    assert!(t.owner.is_none());
+}
+
+#[test]
+fn dart_import_has_occurrence_zero() {
+    let mut parser = CodeParser::new().unwrap();
+    let parsed = parser
+        .parse_file(
+            Path::new("main.dart"),
+            "import 'dart:async';\nimport 'package:x/y.dart' as y;\n",
+        )
+        .unwrap();
+    assert!(
+        !parsed.imports.is_empty(),
+        "Dart imports should be extracted"
+    );
+    assert!(parsed.imports.iter().all(|i| i.occurrence == 0));
+}
+
+#[test]
+fn go_grouped_imports_each_have_occurrence_zero() {
+    let mut parser = CodeParser::new().unwrap();
+    let code = "package main\n\nimport (\n    \"fmt\"\n    str \"strings\"\n)\n";
+    let parsed = parser.parse_file(Path::new("main.go"), code).unwrap();
+    let strings = parsed
+        .imports
+        .iter()
+        .find(|i| i.path == "strings")
+        .expect("aliased grouped import should be extracted");
+    assert_eq!(strings.alias.as_deref(), Some("str"));
+    assert_eq!(strings.occurrence, 0);
+    assert!(parsed.imports.iter().any(|i| i.path == "fmt"));
+}
+
+#[test]
+fn typescript_import_has_occurrence_zero() {
+    let mut parser = CodeParser::new().unwrap();
+    let code = "import { a, b } from './x';\n";
+    let parsed = parser.parse_file(Path::new("main.ts"), code).unwrap();
+    let imp = parsed
+        .imports
+        .iter()
+        .find(|i| i.path == "./x")
+        .expect("TypeScript import should be extracted");
+    assert_eq!(imp.occurrence, 0);
+}

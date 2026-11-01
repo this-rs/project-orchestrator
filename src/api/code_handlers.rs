@@ -4900,6 +4900,7 @@ mod tests {
             line_start: 0,
             line_end: 10,
             docstring: None,
+            owner: None,
         };
         graph.upsert_function(&func).await.unwrap();
 
@@ -5762,6 +5763,7 @@ mod tests {
             line_start: 10,
             line_end: 30,
             docstring: Some("Handle incoming request".to_string()),
+            owner: None,
         };
         graph.upsert_function(&func).await.unwrap();
 
@@ -5786,6 +5788,7 @@ mod tests {
             items: vec![],
             file_path: "src/handler.rs".to_string(),
             line: 1,
+            occurrence: 0,
         };
         graph.upsert_import(&imp).await.unwrap();
 
@@ -5920,6 +5923,7 @@ mod tests {
             line_start: 5,
             line_end: 15,
             docstring: None,
+            owner: None,
         };
         graph.upsert_function(&caller).await.unwrap();
 
@@ -6114,6 +6118,7 @@ mod tests {
             line_start: 1,
             line_end: 10,
             docstring: None,
+            owner: None,
         };
         graph.upsert_function(&caller).await.unwrap();
 
@@ -6130,6 +6135,7 @@ mod tests {
             line_start: 1,
             line_end: 10,
             docstring: None,
+            owner: None,
         };
         graph.upsert_function(&target).await.unwrap();
 
@@ -6283,6 +6289,7 @@ mod tests {
             line_start: 10,
             line_end: 20,
             docstring: None,
+            owner: None,
         };
         graph.upsert_function(&target_fn).await.unwrap();
 
@@ -6300,6 +6307,7 @@ mod tests {
             line_start: 1,
             line_end: 5,
             docstring: None,
+            owner: None,
         };
         graph.upsert_function(&caller_fn).await.unwrap();
 

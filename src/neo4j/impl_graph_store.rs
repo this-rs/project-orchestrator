@@ -47,6 +47,10 @@ impl ProjectStore for Neo4jClient {
         self.get_project(id).await
     }
 
+    async fn path_policy(&self, id: Uuid) -> anyhow::Result<crate::neo4j::file_uid::PathPolicy> {
+        self.path_policy(id).await
+    }
+
     async fn get_project_by_slug(&self, slug: &str) -> anyhow::Result<Option<ProjectNode>> {
         self.get_project_by_slug(slug).await
     }
@@ -2930,6 +2934,10 @@ impl AnalyticsStore for Neo4jClient {
         self.run_data_migrations().await
     }
 
+    async fn ensure_project_canonical_paths(&self) -> anyhow::Result<(usize, usize)> {
+        self.ensure_project_canonical_paths().await
+    }
+
     async fn get_synapse_graph(
         &self,
         project_id: uuid::Uuid,
@@ -3808,6 +3816,18 @@ impl AuthStore for Neo4jClient {
 
     async fn revoke_refresh_token(&self, token_hash: &str) -> anyhow::Result<bool> {
         self.revoke_refresh_token(token_hash).await
+    }
+
+    async fn consume_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> anyhow::Result<
+        Option<(
+            crate::neo4j::models::RefreshTokenNode,
+            Option<crate::neo4j::models::UserNode>,
+        )>,
+    > {
+        self.consume_refresh_token(token_hash).await
     }
 
     async fn revoke_all_user_tokens(&self, user_id: Uuid) -> anyhow::Result<u64> {

@@ -207,6 +207,26 @@ pub async fn create_session(
     }
 
     // ── Create path (no session_id) ────────────────────────────────────────
+    // An AGENT caller (a chat session calling through its MCP server) gets the id at once
+    // and the opening goes on in the background (issue #1056). Why not for a person: their
+    // client shows the refusal inline (`no_cwd`, a provider that refuses, the session limit)
+    // and needs the place and the access in the same answer. An agent has no such screen and
+    // can be told later, in its own conversation; what it cannot afford is a call that never
+    // returns — measured at 107 s before the session was even persisted, against a 120 s
+    // client budget, with the parent left `streaming` for half an hour.
+    if let envelope::SpawnCaller::Agent {
+        session_id: caller_session,
+        ..
+    } = &caller
+    {
+        let response =
+            chat_manager.create_session_detached(request, Some(caller_session.clone()), opening);
+        // No entity extraction here, unlike the synchronous path below: it writes DISCUSSED
+        // relations FROM the session, and a refused opening now leaves no session to hang
+        // them on.
+        return Ok(Json(response));
+    }
+
     let response = chat_manager
         .create_session(&request)
         .await
@@ -4905,6 +4925,9 @@ mod tests {
 
     struct ActionHarness {
         app: axum::Router,
+        /// The state the router carries, so a handler can also be called directly — with
+        /// claims the HTTP middleware would have to mint a token for (an agent caller).
+        state: OrchestratorState,
         manager: Arc<ChatManager>,
         graph: Arc<dyn crate::neo4j::traits::GraphStore>,
         mock: Arc<crate::neo4j::mock::MockGraphStore>,
@@ -4979,11 +5002,50 @@ mod tests {
             vault: crate::vault::VaultService::ephemeral(),
         });
         ActionHarness {
-            app: create_router(state),
+            app: create_router(state.clone()),
+            state,
             manager,
             graph,
             mock,
         }
+    }
+
+    // issue #1056, correctif A, par le handler : un appelant AGENT (jeton de session lié à une
+    // conversation) est répondu SANS attendre l'ouverture de l'enfant — la réponse porte l'id
+    // et dit que l'ouverture continue ; c'est ce qui rend l'appel MCP borné.
+    #[tokio::test]
+    async fn test_an_agent_caller_is_answered_before_its_child_opens() {
+        use crate::runner::dispatch::tests::agent_session_claims;
+        let h = action_harness(None).await;
+        // The conversation the token is bound to: its envelope is read before anything opens.
+        let parent = crate::test_helpers::test_chat_session(None);
+        h.graph.create_chat_session(&parent).await.unwrap();
+        let claims = agent_session_claims(&parent.id.to_string(), false, None, "bypassPermissions");
+        let request: crate::chat::types::ChatRequest = serde_json::from_value(serde_json::json!({
+            "message": "open a child",
+            // Inside the calling session's own directories: the envelope refuses anything else.
+            "cwd": "/tmp/test",
+        }))
+        .expect("a minimal request");
+
+        let Json(response) = create_session(
+            State(h.state.clone()),
+            Some(axum::Extension(claims)),
+            axum::http::HeaderMap::new(),
+            Json(request),
+        )
+        .await
+        .expect("an agent's opening is answered, never held");
+
+        assert!(
+            response.notices.iter().any(|n| n.contains("background")),
+            "the caller is told the opening goes on without it: {:?}",
+            response.notices
+        );
+        assert!(
+            Uuid::parse_str(&response.session_id).is_ok(),
+            "the id is answered at once"
+        );
     }
 
     async fn seed_session(h: &ActionHarness) -> Uuid {

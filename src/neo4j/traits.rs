@@ -164,6 +164,11 @@ pub trait ProjectStore: Send + Sync {
     /// Get a project by ID
     async fn get_project(&self, id: Uuid) -> Result<Option<ProjectNode>>;
 
+    /// The stored form of this project's file paths (see `file_uid::PathPolicy`):
+    /// canonical until `migrate file-paths --apply` marks the project, declared
+    /// after. Every site that writes or reads a `File.path` goes through it.
+    async fn path_policy(&self, id: Uuid) -> Result<crate::neo4j::file_uid::PathPolicy>;
+
     /// Get a project by slug
     async fn get_project_by_slug(&self, slug: &str) -> Result<Option<ProjectNode>>;
 
@@ -2511,6 +2516,13 @@ pub trait AnalyticsStore: Send + Sync {
         Vec::new()
     }
 
+    /// Fill `Project.canonical_path` where it is missing (see the Neo4j
+    /// implementation): the `File.uid` backfill reads it, and it cannot be
+    /// computed in Cypher. Returns `(scanned, updated)`.
+    async fn ensure_project_canonical_paths(&self) -> Result<(usize, usize)> {
+        Ok((0, 0))
+    }
+
     /// Decay and prune the synapses of one project's notes (see the Neo4j
     /// implementation). Per-project maintenance MUST use this rather than the
     /// global `decay_synapses`. Defaults to the global decay for stores
@@ -3682,6 +3694,23 @@ pub trait AuthStore: Send + Sync {
 
     /// Revoke a single refresh token by its hash.
     async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool>;
+
+    /// Validate AND revoke a refresh token in a single round trip, returning the
+    /// token and its user row (when it exists in the graph).
+    ///
+    /// This is the rotation path of `POST /auth/refresh`: one pool checkout
+    /// instead of three, and no window where two concurrent refreshes both see
+    /// the token as still valid. `None` covers unknown, expired and already-used
+    /// tokens alike.
+    async fn consume_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<
+        Option<(
+            crate::neo4j::models::RefreshTokenNode,
+            Option<crate::neo4j::models::UserNode>,
+        )>,
+    >;
 
     /// Revoke all refresh tokens for a given user (e.g. on password change).
     async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64>;

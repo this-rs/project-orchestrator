@@ -16,15 +16,21 @@
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
+use std::collections::HashMap;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
-use neo4rs::query;
+use anyhow::{bail, Context, Result};
+use neo4rs::{query, BoltType, Row};
 use serde::Serialize;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::client::Neo4jClient;
+use super::models::SymbolOwner;
+use super::symbol_key::{
+    enclosing_owner, stable_external_trait_key, stable_impl_key, stable_import_key,
+    stable_symbol_key_from_graph, stable_type_key,
+};
 
 /// Batch size for data migrations — small enough to keep each transaction
 /// short while the server is serving requests.
@@ -46,11 +52,44 @@ const SKILL_REFERENCES: &str = "MASTERS|USED_SKILL|BELONGS_TO_SKILL|LINKED_TO|HA
 pub struct DataMigration {
     pub id: &'static str,
     pub description: &'static str,
-    /// Batch query. Params: `$scope` (string or null), `$batch`. Must return
-    /// one row with a `processed` integer column.
+    /// Batch query. Params: `$scope` (string or null), `$batch`.
+    ///
+    /// Without `compute`, it does the work itself and returns one row with a
+    /// `processed` integer column. With `compute`, it only SELECTS up to
+    /// `$batch` rows still needing the work; `compute.items` turns each row
+    /// into the properties to write and `compute.write` writes them.
     pub batch: String,
+    /// The Rust half of a computed migration — see [`ComputedBatch`].
+    pub compute: Option<ComputedBatch>,
     /// Optional query run once after the last batch. Param: `$scope`.
     pub finalize: Option<&'static str>,
+}
+
+/// A migration whose new values are computed in Rust, by the very functions
+/// the write paths use, instead of re-implemented in Cypher.
+///
+/// The stable-key backfills are the reason this exists: four Cypher constants
+/// re-implementing four Rust functions of `symbol_key.rs` had already drifted
+/// (`Some("  ")` was no trait for Rust and a trait called `  ` for Cypher).
+/// With one grammar there is nothing to keep in step.
+pub struct ComputedBatch {
+    /// One selected row → the properties to write (`eid` + the new values).
+    /// An error here is a bug in the SELECT (it returned a row the grammar
+    /// cannot key) and fails the migration loudly instead of re-selecting the
+    /// same page until `MAX_BATCHES`.
+    pub items: fn(&Row) -> Result<HashMap<String, BoltType>>,
+    /// `UNWIND $items AS item MATCH (n) WHERE elementId(n) = item.eid SET ...
+    /// RETURN count(n) AS processed[, ... AS deferred]`. Must write the property
+    /// the SELECT tests for `IS NULL`, on every item, or the migration cannot
+    /// converge.
+    pub write: &'static str,
+}
+
+/// What one batch reports back.
+#[derive(Debug, Default, Clone, Copy)]
+struct Progress {
+    processed: i64,
+    deferred: i64,
 }
 
 /// Fold append-only legacy alerts (no `dedup_key`) into one node per
@@ -319,10 +358,359 @@ pub struct MigrationOutcome {
     /// Already completed on a previous start.
     pub skipped: bool,
     pub processed: i64,
+    /// Nodes the migration deliberately left without a value because the graph
+    /// cannot settle it (`key_deferred`, see the stable-key backfill).
+    pub deferred: i64,
     pub batches: u32,
     pub completed: bool,
     pub error: Option<String>,
 }
+
+/// Backfill the stable identity of functions (see `symbol_key.rs`).
+///
+/// The legacy `id` embeds the line number, so the same function accumulated
+/// one node per edit. The stable key (`file::[Owner::]name[(types)]`) is
+/// written as a shadow property first — reversible, and the prerequisite of
+/// the deduplication migration.
+///
+/// The owner of a legacy node is not an edge (`DEFINED_IN`: 0 relations on
+/// 31/10/2026) — it is deduced by line inclusion in the `Impl` and `Struct`
+/// nodes of the same file, the rule `parser::assign_owners` applies at parse
+/// time (`symbol_key::enclosing_owner`). Measured without this qualifier:
+/// 7 168 (file, signature) groups mixed functions of different impls —
+/// 19 885 keys needed where one would have been set.
+///
+/// **A guess is refused when it could be wrong.** `Impl`/`Struct` ids carry
+/// no line, so their ranges are those of the LAST sync; a `Function` node of
+/// an older version (never deleted) may now sit inside another block. When a
+/// file holds several `Function` nodes of one name at different lines, the
+/// graph cannot tell the current one from the stale ones, so none of them
+/// gets a key: `key_deferred = true`, and the next sync writes the current
+/// version with its true owner (the write path clears the flag); T2 deletes
+/// the still-flagged ones without folding them into anything. Measured on
+/// 31/10/2026: 40 584 (file, name) groups hold several line versions —
+/// 223 492 of 504 571 Function nodes (44 %) are deferred, 281 079 keyed.
+/// The same deferral applies when a block of the file has no lines (it
+/// could own the function and nobody can tell; measured: 0 of 59 994 Impl,
+/// 0 of 50 407 Struct).
+///
+/// Scope: `Impl` and `Import` nodes carry no `project_id` (0 of 59 994 and
+/// 0 of 289 491 on 31/10/2026 — only the Function/Struct/Trait/Enum batch
+/// paths denormalised it), so `n.project_id = $scope` alone was a no-op for
+/// them: a scoped run also reaches a node through its `File`.
+///
+/// Paging: `stable_key IS NULL` is not indexable, so a batch that restarted
+/// from `MATCH (n:Function)` scanned every node again (245 scans of 490 k
+/// nodes). Each batch instead seeks the `file_path` index from the cursor
+/// `$after` (the last file_path of the previous batch, `>=` because a file
+/// can hold more than one batch) and stops at `$batch` rows.
+///
+/// Convergence: the SELECT only returns nodes whose `file_path` and `name`
+/// exist and that carry neither a key nor the flag; every selected node
+/// leaves the selection once written (key or flag). A row the grammar cannot
+/// decode is an error, not a silent unqualified key.
+const SELECT_FUNCTIONS_WITHOUT_STABLE_KEY: &str = r#"
+MATCH (n:Function)
+WHERE n.file_path >= $after
+  AND n.stable_key IS NULL AND n.key_deferred IS NULL
+  AND n.file_path IS NOT NULL AND n.name IS NOT NULL
+  AND ($scope IS NULL OR n.project_id = $scope
+       OR EXISTS { (n)<-[:CONTAINS|HAS_IMPORT]-(:File {project_id: $scope}) })
+WITH n ORDER BY n.file_path LIMIT $batch
+OPTIONAL MATCH (i:Impl)
+WHERE i.file_path = n.file_path
+  AND i.line_start <= n.line_start AND n.line_end <= i.line_end
+WITH n, collect(i) AS impls
+OPTIONAL MATCH (s:Struct)
+WHERE s.file_path = n.file_path
+  AND s.line_start <= n.line_start AND n.line_end <= s.line_end
+WITH n, impls, collect(s) AS structs
+WITH n, impls + structs AS blocks
+RETURN elementId(n) AS eid, n.file_path AS cursor,
+       n.file_path AS file_path, n.name AS name, n.params AS params,
+       n.line_start AS line_start, n.line_end AS line_end,
+       [b IN blocks | {start: b.line_start, end: b.line_end,
+                       type_name: coalesce(b.for_type, b.name, ''),
+                       trait_name: CASE WHEN b:Impl THEN coalesce(b.trait_name, '') ELSE '' END}] AS blocks,
+       EXISTS { MATCH (m:Function)
+                WHERE m.file_path = n.file_path AND m.name = n.name
+                  AND m.line_start <> n.line_start } AS has_sibling,
+       EXISTS { MATCH (b:Impl|Struct)
+                WHERE b.file_path = n.file_path
+                  AND (b.line_start IS NULL OR b.line_end IS NULL) } AS broken_blocks
+"#;
+
+const WRITE_FUNCTION_STABLE_KEY: &str = r#"
+UNWIND $items AS item
+MATCH (n:Function) WHERE elementId(n) = item.eid
+SET n.stable_key = item.stable_key,
+    n.owner_type = item.owner_type,
+    n.owner_trait = item.owner_trait,
+    n.key_deferred = item.key_deferred
+RETURN count(n) AS processed,
+       sum(CASE WHEN item.key_deferred = true THEN 1 ELSE 0 END) AS deferred
+"#;
+
+/// A block of the function's file that encloses it, as the SELECT returns it.
+/// Strictly typed on purpose: a block with no lines cannot be here (the
+/// SELECT's inclusion test excludes it and `broken_blocks` reports it), so a
+/// decoding failure is a real defect and fails the batch loudly.
+#[derive(Debug, serde::Deserialize)]
+struct OwnerBlock {
+    start: i64,
+    end: i64,
+    type_name: String,
+    trait_name: String,
+}
+
+fn function_items(row: &Row) -> Result<HashMap<String, BoltType>> {
+    let eid: String = row.get("eid")?;
+    let mut m = HashMap::new();
+    m.insert("eid".into(), eid.into());
+
+    let has_sibling: bool = row.get("has_sibling")?;
+    let broken_blocks: bool = row.get("broken_blocks")?;
+    if has_sibling || broken_blocks {
+        m.insert("stable_key".into(), Option::<String>::None.into());
+        m.insert("owner_type".into(), Option::<String>::None.into());
+        m.insert("owner_trait".into(), Option::<String>::None.into());
+        m.insert("key_deferred".into(), true.into());
+        return Ok(m);
+    }
+
+    let file_path: String = row.get("file_path")?;
+    let name: String = row.get("name")?;
+    let params: Option<String> = row.get("params").ok();
+    let line_start: i64 = row.get("line_start")?;
+    let line_end: i64 = row.get("line_end")?;
+    let blocks: Vec<OwnerBlock> = row.get("blocks").context("decoding the enclosing blocks")?;
+    let candidates = blocks
+        .into_iter()
+        .filter(|b| !b.type_name.is_empty())
+        .map(|b| {
+            (
+                b.start as u32,
+                b.end as u32,
+                SymbolOwner::new(b.type_name, Some(b.trait_name)),
+            )
+        });
+    let owner = enclosing_owner(line_start as u32, line_end as u32, candidates);
+    let key = stable_symbol_key_from_graph(&file_path, owner.as_ref(), &name, params.as_deref());
+    m.insert("stable_key".into(), key.into());
+    m.insert(
+        "owner_type".into(),
+        owner.as_ref().map(|o| o.type_name.clone()).into(),
+    );
+    m.insert(
+        "owner_trait".into(),
+        owner.and_then(|o| o.trait_name).into(),
+    );
+    m.insert("key_deferred".into(), Option::<bool>::None.into());
+    Ok(m)
+}
+
+/// Same shadow key for the type declarations (struct, trait, enum).
+///
+/// Their legacy id was already `<file>:<name>` — no line, so they never
+/// accumulated versions. The key is still written: the identity must be one
+/// grammar for every declaration, otherwise a reader cannot tell "no stable key"
+/// from "this label was forgotten". The placeholder of an external trait
+/// (`is_external`, no file) keeps its id as key, see `stable_external_trait_key`.
+///
+/// `(n:Struct|Trait|Enum)` is a label expression (Neo4j 5): three label scans
+/// unioned, where `MATCH (n) WHERE n:Struct OR ...` was a scan of EVERY node
+/// of the database per batch.
+const SELECT_TYPES_WITHOUT_STABLE_KEY: &str = r#"
+MATCH (n:Struct|Trait|Enum)
+WHERE n.file_path >= $after
+  AND n.stable_key IS NULL
+  AND n.file_path IS NOT NULL AND n.name IS NOT NULL
+  AND ($scope IS NULL OR n.project_id = $scope
+       OR EXISTS { (n)<-[:CONTAINS|HAS_IMPORT]-(:File {project_id: $scope}) })
+WITH n ORDER BY n.file_path LIMIT $batch
+RETURN elementId(n) AS eid, n.file_path AS cursor, n.file_path AS file_path, n.name AS name,
+       coalesce(n.is_external, false) AS is_external, n.full_path AS full_path
+"#;
+
+const WRITE_STABLE_KEY: &str = r#"
+UNWIND $items AS item
+MATCH (n) WHERE elementId(n) = item.eid
+SET n.stable_key = item.stable_key
+RETURN count(n) AS processed
+"#;
+
+fn type_items(row: &Row) -> Result<HashMap<String, BoltType>> {
+    let eid: String = row.get("eid")?;
+    let file_path: String = row.get("file_path")?;
+    let name: String = row.get("name")?;
+    let is_external: bool = row.get("is_external").unwrap_or(false);
+    let full_path: Option<String> = row.get("full_path").ok();
+    let key = if is_external {
+        stable_external_trait_key(full_path.as_deref().unwrap_or(&name))
+    } else {
+        stable_type_key(&file_path, &name)
+    };
+    let mut m = HashMap::new();
+    m.insert("eid".into(), eid.into());
+    m.insert("stable_key".into(), key.into());
+    Ok(m)
+}
+
+/// Same shadow key for `impl` blocks.
+///
+/// The line leaves the key: moving an impl must not create a second impl of the
+/// same type. `trait_name` is stored as an empty string when there is no trait
+/// (7 284 of 59 994 on 31/10/2026, none NULL) — `stable_impl_key` treats a
+/// blank name as no trait, the same way for this backfill and for the write path.
+const SELECT_IMPLS_WITHOUT_STABLE_KEY: &str = r#"
+MATCH (n:Impl)
+WHERE n.file_path >= $after
+  AND n.stable_key IS NULL
+  AND n.file_path IS NOT NULL AND n.for_type IS NOT NULL
+  AND ($scope IS NULL OR n.project_id = $scope
+       OR EXISTS { (n)<-[:CONTAINS|HAS_IMPORT]-(:File {project_id: $scope}) })
+WITH n ORDER BY n.file_path LIMIT $batch
+RETURN elementId(n) AS eid, n.file_path AS cursor, n.file_path AS file_path,
+       n.for_type AS for_type, n.trait_name AS trait_name
+"#;
+
+fn impl_items(row: &Row) -> Result<HashMap<String, BoltType>> {
+    let eid: String = row.get("eid")?;
+    let file_path: String = row.get("file_path")?;
+    let for_type: String = row.get("for_type")?;
+    let trait_name: Option<String> = row.get("trait_name").ok();
+    let mut m = HashMap::new();
+    m.insert("eid".into(), eid.into());
+    m.insert(
+        "stable_key".into(),
+        stable_impl_key(&file_path, &for_type, trait_name.as_deref()).into(),
+    );
+    Ok(m)
+}
+
+/// Same shadow key for imports — the line leaves it too (`stable_import_key`
+/// has the measure: 38 555 of 289 491 nodes exist only because a line moved).
+///
+/// A legacy node gets occurrence 0: the graph cannot tell the versions of one
+/// import apart from a genuine duplicate in the current file, so they all get
+/// the bare key and T2 folds them into one. From this version on, the parser
+/// ranks true duplicates (`parser::assign_import_occurrences`).
+const SELECT_IMPORTS_WITHOUT_STABLE_KEY: &str = r#"
+MATCH (n:Import)
+WHERE n.file_path >= $after
+  AND n.stable_key IS NULL
+  AND n.file_path IS NOT NULL AND n.path IS NOT NULL
+  AND ($scope IS NULL OR n.project_id = $scope
+       OR EXISTS { (n)<-[:CONTAINS|HAS_IMPORT]-(:File {project_id: $scope}) })
+WITH n ORDER BY n.file_path LIMIT $batch
+RETURN elementId(n) AS eid, n.file_path AS cursor, n.file_path AS file_path, n.path AS path
+"#;
+
+const WRITE_IMPORT_STABLE_KEY: &str = r#"
+UNWIND $items AS item
+MATCH (n:Import) WHERE elementId(n) = item.eid
+SET n.stable_key = item.stable_key, n.occurrence = 0
+RETURN count(n) AS processed
+"#;
+
+fn import_items(row: &Row) -> Result<HashMap<String, BoltType>> {
+    let eid: String = row.get("eid")?;
+    let file_path: String = row.get("file_path")?;
+    let path: String = row.get("path")?;
+    let mut m = HashMap::new();
+    m.insert("eid".into(), eid.into());
+    m.insert(
+        "stable_key".into(),
+        stable_import_key(&file_path, &path, 0).into(),
+    );
+    Ok(m)
+}
+
+/// Backfill `File.uid` — the identity of a file, independent of its mount point.
+///
+/// The stored path is canonical (the sync resolves links) while
+/// `Project.root_path` is what the user declared, often a symlink: the relative
+/// path therefore comes from `canonical_path`, filled in Rust just before this
+/// run (`ensure_project_canonical_paths`). Without it, `strip_prefix` has
+/// nothing to strip and every file of such a project would keep its absolute
+/// path in the identity — the very defect this series removes.
+///
+/// Computed in Rust (`PathPolicy::uid`), by the very function the write paths
+/// use: one grammar, nothing to keep in step. Both roots strip (the normalized
+/// `declared_path`, never the raw `root_path`): a declared and a canonical
+/// path of the same file yield the same uid, or the rename of lot 3/3 would
+/// turn one file into two. Paged by `path` from a cursor, like the stable-key
+/// backfills.
+const SELECT_FILES_WITHOUT_UID: &str = r#"
+MATCH (p:Project)
+WHERE p.canonical_path IS NOT NULL AND p.canonical_path <> ''
+  AND ($scope IS NULL OR p.id = $scope)
+MATCH (n:File {project_id: p.id})
+WHERE n.path >= $after
+  AND n.uid IS NULL AND n.uid_conflict IS NULL
+  AND n.path IS NOT NULL
+WITH n, p ORDER BY n.path LIMIT $batch
+RETURN elementId(n) AS eid, n.path AS cursor, n.path AS path, p.id AS pid,
+       coalesce(p.declared_path, p.root_path, '') AS declared,
+       p.canonical_path AS canonical
+"#;
+
+/// Another `File` may already hold the computed uid: the same file indexed
+/// through two mounts (real + link) before this series. Writing it would
+/// violate `file_uid`, fail the batch `MAX_RETRIES` times and — the filter
+/// being `uid IS NULL` — fail again at every boot. The second node is marked
+/// `uid_conflict` instead and leaves the selection; `migrate file-paths` folds
+/// it into its twin, and the uid coverage measure shows it until then.
+const WRITE_FILE_UID: &str = r#"
+UNWIND $items AS item
+MATCH (n:File) WHERE elementId(n) = item.eid
+OPTIONAL MATCH (o:File {uid: item.uid}) WHERE o <> n
+// The two duplicates usually sit in the SAME batch, and Cypher evaluates every
+// OPTIONAL MATCH before the first SET: the second row would not see the first
+// one's uid. Within the batch, the first row for a uid wins; the others are
+// conflicts, like a holder already in the graph.
+WITH collect({n: n, uid: item.uid, held: o IS NOT NULL}) AS rows
+UNWIND range(0, size(rows) - 1) AS i
+WITH rows[i] AS row,
+     rows[i].held OR any(r IN rows[0..i] WHERE r.uid = rows[i].uid) AS conflict
+WITH row.n AS n, row.uid AS uid, conflict
+SET n.uid = CASE WHEN conflict THEN n.uid ELSE uid END,
+    n.uid_conflict = CASE WHEN conflict THEN uid ELSE n.uid_conflict END
+RETURN count(n) AS processed,
+       sum(CASE WHEN conflict THEN 1 ELSE 0 END) AS deferred
+"#;
+
+fn file_uid_items(row: &Row) -> Result<HashMap<String, BoltType>> {
+    use crate::neo4j::file_uid::PathPolicy;
+    let eid: String = row.get("eid")?;
+    let path: String = row.get("path")?;
+    let pid: String = row.get("pid")?;
+    let declared: String = row.get("declared")?;
+    let canonical: String = row.get("canonical")?;
+    let project = Uuid::parse_str(&pid).with_context(|| format!("project id {pid}"))?;
+    // `declared=false`: the stored form of an unmigrated project is canonical,
+    // but `uid` strips either root, so the flag does not matter here.
+    let uid = PathPolicy::new(&declared, &canonical, false).uid(Some(project), &path);
+    let mut m = HashMap::new();
+    m.insert("eid".into(), eid.into());
+    m.insert("uid".into(), uid.into());
+    Ok(m)
+}
+
+/// Backfill `File.uid` for the files that belong to no project.
+///
+/// The owner is `-`, exactly like `neo4j::file_uid(None, path)`: one grammar,
+/// two call sites, and a file that later joins a project gets a new identity
+/// rather than a silent reuse of the project-less one.
+const BACKFILL_FILE_UID_ORPHANS: &str = r#"
+MATCH (f:File)
+WHERE f.uid IS NULL
+  AND (f.project_id IS NULL OR f.project_id = '')
+  AND ($scope IS NULL OR f.project_id = $scope)
+WITH f LIMIT $batch
+SET f.uid = '-:' + f.path
+RETURN count(f) AS processed
+"#;
 
 impl Neo4jClient {
     /// The ordered list of data migrations.
@@ -332,30 +720,35 @@ impl Neo4jClient {
                 id: "2026-09-fold-legacy-alerts",
                 description: "Fold append-only legacy alerts into one node per condition",
                 batch: FOLD_LEGACY_ALERTS.to_string(),
+                compute: None,
                 finalize: Some(RECOMPUTE_ALERT_PRIORITY),
             },
             DataMigration {
                 id: "2026-09-archive-duplicate-skills",
                 description: "Archive duplicate skills created by the truncated evolution snapshot",
                 batch: archive_duplicate_skills_query(),
+                compute: None,
                 finalize: None,
             },
             DataMigration {
                 id: "2026-09-restore-energy-decay-victims",
                 description: "Restore notes archived by the compounding energy-decay bug",
                 batch: RESTORE_ENERGY_DECAY_VICTIMS.to_string(),
+                compute: None,
                 finalize: None,
             },
             DataMigration {
                 id: "2026-09-rebase-active-note-energy",
                 description: "Raise over-decayed energy of active notes to the intended value",
                 batch: REBASE_ACTIVE_NOTE_ENERGY.to_string(),
+                compute: None,
                 finalize: None,
             },
             DataMigration {
                 id: "2026-09-purge-empty-archived-skills",
                 description: "Delete archived skills with no member and no reference",
                 batch: purge_archived_empty_skills_query(),
+                compute: None,
                 finalize: None,
             },
             DataMigration {
@@ -363,6 +756,7 @@ impl Neo4jClient {
                 description:
                     "Re-point knowledge that links a worktree copy onto the canonical file",
                 batch: REHOME_WORKTREE_KNOWLEDGE.to_string(),
+                compute: None,
                 finalize: None,
             },
             DataMigration {
@@ -370,6 +764,69 @@ impl Neo4jClient {
                 description:
                     "Delete the code graph of git worktrees (copies of the same repository)",
                 batch: PURGE_WORKTREE_NODES.to_string(),
+                compute: None,
+                finalize: None,
+            },
+            DataMigration {
+                id: "2026-10-backfill-stable-key",
+                description:
+                    "Write the stable identity of functions as a shadow property (owner-qualified, line removed)",
+                batch: SELECT_FUNCTIONS_WITHOUT_STABLE_KEY.to_string(),
+                compute: Some(ComputedBatch {
+                    items: function_items,
+                    write: WRITE_FUNCTION_STABLE_KEY,
+                }),
+                finalize: None,
+            },
+            DataMigration {
+                id: "2026-10-backfill-stable-key-types",
+                description:
+                    "Write the stable identity of structs, traits and enums as a shadow property",
+                batch: SELECT_TYPES_WITHOUT_STABLE_KEY.to_string(),
+                compute: Some(ComputedBatch {
+                    items: type_items,
+                    write: WRITE_STABLE_KEY,
+                }),
+                finalize: None,
+            },
+            DataMigration {
+                id: "2026-10-backfill-stable-key-impls",
+                description:
+                    "Write the stable identity of impl blocks as a shadow property (line removed)",
+                batch: SELECT_IMPLS_WITHOUT_STABLE_KEY.to_string(),
+                compute: Some(ComputedBatch {
+                    items: impl_items,
+                    write: WRITE_STABLE_KEY,
+                }),
+                finalize: None,
+            },
+            DataMigration {
+                id: "2026-10-backfill-stable-key-imports",
+                description:
+                    "Write the stable identity of imports as a shadow property (line removed)",
+                batch: SELECT_IMPORTS_WITHOUT_STABLE_KEY.to_string(),
+                compute: Some(ComputedBatch {
+                    items: import_items,
+                    write: WRITE_IMPORT_STABLE_KEY,
+                }),
+                finalize: None,
+            },
+            DataMigration {
+                id: "2026-10-backfill-file-uid",
+                description:
+                    "Give every file a mount-independent identity (project + relative path)",
+                batch: SELECT_FILES_WITHOUT_UID.to_string(),
+                compute: Some(ComputedBatch {
+                    items: file_uid_items,
+                    write: WRITE_FILE_UID,
+                }),
+                finalize: None,
+            },
+            DataMigration {
+                id: "2026-10-backfill-file-uid-orphans",
+                description: "Same identity for the files that belong to no project",
+                batch: BACKFILL_FILE_UID_ORPHANS.to_string(),
+                compute: None,
                 finalize: None,
             },
         ]
@@ -453,7 +910,8 @@ impl Neo4jClient {
                         .param("batch", BATCH)
                         .param("before", archived_before.to_rfc3339()),
                 )
-                .await?;
+                .await?
+                .processed;
             total += processed;
             if processed == 0 {
                 break;
@@ -462,7 +920,7 @@ impl Neo4jClient {
         Ok(total)
     }
 
-    async fn run_migration_batches(
+    pub(crate) async fn run_migration_batches(
         &self,
         migration: &DataMigration,
         scope: Option<String>,
@@ -473,20 +931,40 @@ impl Neo4jClient {
             ..Default::default()
         };
         let mut failures = 0;
+        // Cursor of a computed migration: the last `file_path` of the previous
+        // batch (`""` sorts before every path). A plain migration ignores it.
+        let mut after = String::new();
         while outcome.batches < MAX_BATCHES {
             let q = query(&migration.batch)
                 .param("scope", scope.clone())
                 .param("batch", BATCH)
+                .param("after", after.clone())
                 .param("before", Option::<String>::None);
-            match self.batch_processed(q).await {
-                Ok(0) => {
+            let step = match &migration.compute {
+                None => self.batch_processed(q).await,
+                Some(compute) => match self.computed_batch(q, compute).await {
+                    Ok((progress, cursor)) => {
+                        if let Some(c) = cursor {
+                            after = c;
+                        }
+                        Ok(progress)
+                    }
+                    Err(e) => Err(e),
+                },
+            };
+            match step {
+                Ok(Progress { processed: 0, .. }) => {
                     outcome.completed = true;
                     break;
                 }
-                Ok(n) => {
+                Ok(Progress {
+                    processed,
+                    deferred,
+                }) => {
                     failures = 0;
                     outcome.batches += 1;
-                    outcome.processed += n;
+                    outcome.processed += processed;
+                    outcome.deferred += deferred;
                     info!(
                         id = migration.id,
                         batch = outcome.batches,
@@ -528,13 +1006,55 @@ impl Neo4jClient {
         outcome
     }
 
-    async fn batch_processed(&self, q: neo4rs::Query) -> Result<i64> {
+    /// One batch of a computed migration: select the rows, compute their new
+    /// values in Rust, write them. Returns how many nodes were written.
+    ///
+    /// The write must reach every selected node: a shortfall means the SELECT
+    /// and the WRITE disagree on what a node is, and re-selecting the same
+    /// page forever is exactly the non-convergence this guards against — so
+    /// it is an error, retried `MAX_RETRIES` times, then reported.
+    async fn computed_batch(
+        &self,
+        select: neo4rs::Query,
+        compute: &ComputedBatch,
+    ) -> Result<(Progress, Option<String>)> {
+        let mut result = self.graph.execute(select).await?;
+        let mut items = Vec::new();
+        let mut cursor: Option<String> = None;
+        while let Some(row) = result.next().await? {
+            items.push((compute.items)(&row).context("computing the new value of a selected row")?);
+            if let Ok(c) = row.get::<String>("cursor") {
+                if cursor.as_deref().is_none_or(|prev| prev < c.as_str()) {
+                    cursor = Some(c);
+                }
+            }
+        }
+        if items.is_empty() {
+            return Ok((Progress::default(), None));
+        }
+        let selected = items.len() as i64;
+        let written = self
+            .batch_processed(query(compute.write).param("items", items))
+            .await?;
+        if written.processed != selected {
+            bail!(
+                "the write reached {} of the {selected} selected nodes",
+                written.processed
+            );
+        }
+        Ok((written, cursor))
+    }
+
+    async fn batch_processed(&self, q: neo4rs::Query) -> Result<Progress> {
         let mut result = self.graph.execute(q).await?;
         let row = result
             .next()
             .await?
             .context("migration batch returned no row")?;
-        Ok(row.get::<i64>("processed").unwrap_or(0))
+        Ok(Progress {
+            processed: row.get::<i64>("processed").unwrap_or(0),
+            deferred: row.get::<i64>("deferred").unwrap_or(0),
+        })
     }
 
     async fn migration_completed(&self, id: &str) -> Result<bool> {
@@ -591,8 +1111,190 @@ mod tests {
                 "2026-09-purge-empty-archived-skills",
                 "2026-10-rehome-worktree-knowledge",
                 "2026-10-purge-worktree-nodes",
+                "2026-10-backfill-stable-key",
+                "2026-10-backfill-stable-key-types",
+                "2026-10-backfill-stable-key-impls",
+                "2026-10-backfill-stable-key-imports",
+                "2026-10-backfill-file-uid",
+                "2026-10-backfill-file-uid-orphans",
             ]
         );
+    }
+
+    /// The identity is one grammar for every declaration: a label left without a
+    /// backfill would be indistinguishable from a label with nothing to write.
+    /// The grammar itself lives in `symbol_key.rs` (one implementation for the
+    /// write paths and the backfill); what this pins is the SHAPE of the four
+    /// backfills: computed in Rust, one per label family, convergent.
+    #[test]
+    fn test_stable_key_backfills_cover_every_label() {
+        let migrations = Neo4jClient::data_migrations();
+        let backfills: Vec<&DataMigration> = migrations
+            .iter()
+            .filter(|m| m.id.starts_with("2026-10-backfill-stable-key"))
+            .collect();
+        assert_eq!(
+            backfills.len(),
+            4,
+            "one backfill per identity shape — functions, types, impls, imports"
+        );
+        for m in &backfills {
+            let compute = m
+                .compute
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} computes its key in Rust, not in Cypher", m.id));
+            assert!(
+                compute.write.contains("SET n.stable_key = item.stable_key"),
+                "{} must write the shadow key",
+                m.id
+            );
+            assert!(
+                m.batch.contains("n.stable_key IS NULL"),
+                "{} must be idempotent",
+                m.id
+            );
+            // Review 2, point 6: a batch seeks the file_path index from a cursor
+            // instead of scanning the label again.
+            assert!(
+                m.batch.contains("n.file_path >= $after")
+                    && m.batch.contains("ORDER BY n.file_path LIMIT $batch")
+                    && m.batch.contains("n.file_path AS cursor"),
+                "{} must page by file_path",
+                m.id
+            );
+            // Finding 3 of the review (31/10/2026): a selected node the grammar
+            // cannot key would be re-selected until MAX_BATCHES. The SELECT must
+            // exclude every node lacking a property the grammar reads.
+            assert!(
+                m.batch.contains("n.file_path IS NOT NULL"),
+                "{} must not select a node it cannot key",
+                m.id
+            );
+            assert!(
+                !m.batch.contains("line_start") || m.id == "2026-10-backfill-stable-key",
+                "{}: the line is not part of any identity",
+                m.id
+            );
+        }
+
+        let by_id = |id: &str| -> &DataMigration {
+            backfills
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("{id} is registered"))
+        };
+
+        let functions = by_id("2026-10-backfill-stable-key");
+        assert!(functions.batch.contains("(n:Function)"));
+        assert!(functions.batch.contains("n.name IS NOT NULL"));
+        // The owner of a legacy function is deduced by line inclusion in the
+        // Impl and Struct nodes of ITS file — the rule of `enclosing_owner`.
+        assert!(functions.batch.contains("(i:Impl)"));
+        assert!(functions.batch.contains("(s:Struct)"));
+        assert!(functions.batch.contains("i.file_path = n.file_path"));
+        assert!(functions.batch.contains("s.file_path = n.file_path"));
+        let write = functions.compute.as_ref().unwrap().write;
+        assert!(write.contains("n.owner_type = item.owner_type"));
+        assert!(write.contains("n.owner_trait = item.owner_trait"));
+        // Review 2, point 2: a node whose owner would be a guess (another
+        // Function of the same name at another line of the file, or a block of
+        // the file without lines) is flagged, never keyed — and the flag keeps
+        // it out of the next selection, so the migration still converges.
+        assert!(functions.batch.contains("n.key_deferred IS NULL"));
+        assert!(functions.batch.contains("AS has_sibling"));
+        assert!(functions.batch.contains("AS broken_blocks"));
+        assert!(write.contains("n.key_deferred = item.key_deferred"));
+        assert!(write.contains("AS deferred"));
+        // Point 7: the blocks travel as one list of maps, not four parallel lists.
+        assert!(functions.batch.contains("}] AS blocks"));
+        assert!(!functions.batch.contains("block_starts"));
+
+        let types = by_id("2026-10-backfill-stable-key-types");
+        // A label expression, not `MATCH (n) WHERE n:Struct OR ...` (an
+        // AllNodesScan per batch — finding 6 of the review).
+        assert!(types.batch.contains("(n:Struct|Trait|Enum)"));
+        assert!(!types.batch.contains("MATCH (n)\n"));
+        assert!(types.batch.contains("n.name IS NOT NULL"));
+        assert!(types.batch.contains("is_external"));
+
+        let impls = by_id("2026-10-backfill-stable-key-impls");
+        assert!(impls.batch.contains("(n:Impl)"));
+        assert!(impls.batch.contains("n.for_type IS NOT NULL"));
+        assert!(impls.batch.contains("trait_name"));
+
+        let imports = by_id("2026-10-backfill-stable-key-imports");
+        assert!(imports.batch.contains("(n:Import)"));
+        assert!(imports.batch.contains("n.path IS NOT NULL"));
+        // The line LEFT the import identity (finding 9): 38 555 of 289 491
+        // import nodes existed only because a line moved.
+        assert!(!imports.batch.contains("n.line"));
+        assert!(imports
+            .compute
+            .as_ref()
+            .unwrap()
+            .write
+            .contains("n.occurrence = 0"));
+    }
+
+    /// `File.uid` n'a de valeur que si la migration qui le remplit lit la même
+    /// racine que l'écriture : sinon les fichiers d'un projet monté par un lien
+    /// garderaient leur chemin absolu dans l'identité.
+    #[test]
+    fn test_file_uid_backfills_read_the_canonical_root() {
+        let migrations = Neo4jClient::data_migrations();
+        let by_id = |id: &str| -> String {
+            migrations
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("{id} is registered"))
+                .batch
+                .clone()
+        };
+
+        let projects = by_id("2026-10-backfill-file-uid");
+        assert!(projects.contains("p.canonical_path"));
+        // Les deux racines retirent le préfixe — la forme déclarée NORMALISÉE
+        // (`declared_path`), jamais `root_path` brut — et l'uid est calculé en
+        // Rust par `PathPolicy::uid`, la fonction des chemins d'écriture.
+        assert!(
+            projects.contains("coalesce(p.declared_path, p.root_path, '') AS declared"),
+            "the normalized declared root is read, the raw root_path only as a fallback"
+        );
+        assert!(
+            !projects.contains("substring("),
+            "no Cypher re-implementation of the grammar"
+        );
+        assert!(
+            projects.contains("n.uid IS NULL AND n.uid_conflict IS NULL"),
+            "idempotent, and a conflicting node leaves the selection"
+        );
+        let compute = migrations
+            .iter()
+            .find(|m| m.id == "2026-10-backfill-file-uid")
+            .and_then(|m| m.compute.as_ref())
+            .expect("the uid is computed in Rust");
+        assert!(compute
+            .write
+            .contains("OPTIONAL MATCH (o:File {uid: item.uid}) WHERE o <> n"));
+        assert!(
+            compute
+                .write
+                .contains("n.uid_conflict = CASE WHEN conflict THEN uid"),
+            "a uid another file already holds is recorded as a conflict, never written twice"
+        );
+        assert!(
+            compute
+                .write
+                .contains("any(r IN rows[0..i] WHERE r.uid = rows[i].uid)"),
+            "two duplicates in one batch: the first wins, the other is a conflict"
+        );
+
+        let orphans = by_id("2026-10-backfill-file-uid-orphans");
+        assert!(
+            orphans.contains("'-:'"),
+            "an ownerless file is owned by `-`, like file_uid(None, path)"
+        );
+        assert!(orphans.contains("f.uid IS NULL"));
     }
 
     /// The worktree purge deletes COPIES of the project's code, never the code
@@ -619,11 +1321,22 @@ mod tests {
         for m in Neo4jClient::data_migrations() {
             assert!(m.batch.contains("$scope"), "{} must honour $scope", m.id);
             assert!(m.batch.contains("$batch"), "{} must be bounded", m.id);
-            assert!(
-                m.batch.contains("AS processed"),
-                "{} must report progress",
-                m.id
-            );
+            // A plain migration reports progress itself; a computed one through
+            // its write, which must address the selected nodes and nothing else.
+            match &m.compute {
+                None => assert!(
+                    m.batch.contains("AS processed"),
+                    "{} must report progress",
+                    m.id
+                ),
+                Some(c) => {
+                    assert!(m.batch.contains("elementId(n) AS eid"), "{}", m.id);
+                    assert!(m.batch.contains("$after"), "{} must take the cursor", m.id);
+                    assert!(c.write.contains("UNWIND $items AS item"), "{}", m.id);
+                    assert!(c.write.contains("elementId(n) = item.eid"), "{}", m.id);
+                    assert!(c.write.contains("AS processed"), "{}", m.id);
+                }
+            }
         }
     }
 

@@ -29,11 +29,20 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use super::context::ContextBuilder;
-/// Normalize a file path to an absolute canonical form.
+/// Normalize a file path to an absolute, lexically clean form.
 /// - Resolves `~` to home directory
 /// - Resolves `.` and `..`
 /// - Makes relative paths absolute using current_dir
-/// - Returns the path as a String
+/// - **Never resolves symlinks.** The stored path is the one the user declared
+///   (`Project.root_path`), and this function is the funnel every written path
+///   goes through — directly for `File.path`, through the parser for every
+///   symbol's `file_path`, and again in the import resolvers. Resolving links
+///   here is what indexed the backend under `~/.openclaw/…` while its root was
+///   declared as `~/projects/…/backend` (T7): a declared form applied upstream
+///   was undone by the next call downstream. Not resolving is the only place
+///   where the rule cannot be bypassed by a future call site.
+///   The real-path perimeter is still enforced where it belongs:
+///   `scan_files` (`file_uid::realpath_within_root`).
 pub(crate) fn normalize_path(path: &str) -> String {
     let expanded = if let Some(rest) = path.strip_prefix('~') {
         if let Some(home) = dirs::home_dir() {
@@ -48,39 +57,28 @@ pub(crate) fn normalize_path(path: &str) -> String {
     };
 
     let p = std::path::Path::new(&expanded);
-    if p.is_absolute() {
-        // Try to canonicalize (resolves symlinks and ..)
-        match p.canonicalize() {
-            Ok(canonical) => canonical.to_string_lossy().to_string(),
-            Err(_) => {
-                // File might not exist yet — do manual cleanup of . and ..
-                let mut components = Vec::new();
-                for component in p.components() {
-                    match component {
-                        std::path::Component::ParentDir => {
-                            components.pop();
-                        }
-                        std::path::Component::CurDir => {}
-                        other => components.push(other),
-                    }
-                }
-                let cleaned: std::path::PathBuf = components.iter().collect();
-                cleaned.to_string_lossy().to_string()
-            }
-        }
+    let abs: std::path::PathBuf = if p.is_absolute() {
+        p.to_path_buf()
     } else {
-        // Relative path — prepend current_dir
         match std::env::current_dir() {
-            Ok(cwd) => {
-                let abs = cwd.join(p);
-                match abs.canonicalize() {
-                    Ok(canonical) => canonical.to_string_lossy().to_string(),
-                    Err(_) => abs.to_string_lossy().to_string(),
-                }
+            Ok(cwd) => cwd.join(p),
+            Err(_) => return expanded,
+        }
+    };
+
+    // Lexical cleanup of `.` and `..` — no filesystem access, no link resolved.
+    let mut components = Vec::new();
+    for component in abs.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                components.pop();
             }
-            Err(_) => expanded,
+            std::path::Component::CurDir => {}
+            other => components.push(other),
         }
     }
+    let cleaned: std::path::PathBuf = components.iter().collect();
+    cleaned.to_string_lossy().to_string()
 }
 
 /// Resolve a relative path (like `./foo` or `../bar`) against a base directory.
@@ -166,6 +164,10 @@ pub struct Orchestrator {
     /// LRU cache for parsed AST results, avoiding re-parsing unchanged files
     /// across consecutive syncs.
     ast_cache: tokio::sync::Mutex<crate::parser::ast_cache::AstCache>,
+    /// The stored form of each project's paths, one graph round trip per
+    /// project and TTL (see `file_uid::PathPolicyCache`), invalidated when a
+    /// project is updated.
+    path_policies: crate::neo4j::file_uid::PathPolicyCache,
 }
 
 /// Create an embedding provider from resolved [`Config`] fields.
@@ -378,6 +380,7 @@ impl Orchestrator {
             event_emitter: None,
             embedding_provider: embedding_provider.clone(),
             ast_cache: tokio::sync::Mutex::new(crate::parser::ast_cache::AstCache::new()),
+            path_policies: crate::neo4j::file_uid::PathPolicyCache::new(),
         })
     }
 
@@ -480,6 +483,7 @@ impl Orchestrator {
             event_emitter: Some(emitter),
             embedding_provider: embedding_provider.clone(),
             ast_cache: tokio::sync::Mutex::new(crate::parser::ast_cache::AstCache::new()),
+            path_policies: crate::neo4j::file_uid::PathPolicyCache::new(),
         })
     }
 
@@ -584,6 +588,7 @@ impl Orchestrator {
             event_emitter: Some(emitter),
             embedding_provider: embedding_provider.clone(),
             ast_cache: tokio::sync::Mutex::new(crate::parser::ast_cache::AstCache::new()),
+            path_policies: crate::neo4j::file_uid::PathPolicyCache::new(),
         })
     }
 
@@ -627,6 +632,14 @@ impl Orchestrator {
     /// Get the graph store as Arc (for sharing with ChatManager etc.)
     pub fn neo4j_arc(&self) -> Arc<dyn crate::neo4j::GraphStore> {
         self.state.neo4j.clone()
+    }
+
+    /// The stored form of a project's paths, from the per-project cache.
+    pub async fn path_policy(
+        &self,
+        project_id: Uuid,
+    ) -> Result<crate::neo4j::file_uid::PathPolicy> {
+        self.path_policies.get(&*self.state.neo4j, project_id).await
     }
 
     /// The resolved runtime configuration.
@@ -1746,21 +1759,33 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let sync_started = std::time::Instant::now();
         // Read before the sync writes anything: once the caller has bumped
         // `last_synced`, the answer is "not first" for every subsequent sync.
-        let is_first_sync = match project_id {
-            Some(pid) => self
-                .state
-                .neo4j
-                .get_project(pid)
-                .await
-                .ok()
-                .flatten()
-                .map(|project| project.last_synced.is_none()),
+        let project = match project_id {
+            Some(pid) => self.state.neo4j.get_project(pid).await.ok().flatten(),
             None => None,
+        };
+        let is_first_sync = project.as_ref().map(|p| p.last_synced.is_none());
+        // The stored form of this project's paths — canonical until the project
+        // is marked by `migrate file-paths --apply`, declared after — resolved
+        // ONCE for the run. A sync that cannot read it does not guess: writing
+        // in the wrong vocabulary creates a twin for every symbol it touches.
+        let policy = match project_id {
+            Some(pid) => self.path_policies.get(&*self.state.neo4j, pid).await?,
+            None => crate::neo4j::file_uid::PathPolicy::none(),
         };
 
         // ── Phase 1: Scan ──────────────────────────────────────────
         ingestion.enter_phase(IngestionPhase::Scanning, IngestionCounters::default());
-        let entries = scan_files(dir_path);
+        // `dir_path` may be the declared root or the canonical one (the watcher
+        // resolves the roots it watches): every path is brought to the stored
+        // form here, before the parser copies it into each symbol. A rescan
+        // must never recreate a vocabulary the project does not use (T7).
+        let entries: Vec<FileEntry> = scan_files(dir_path)
+            .into_iter()
+            .map(|mut e| {
+                e.path = policy.stored(&e.path);
+                e
+            })
+            .collect();
         let scanned_total = entries.len();
 
         // Track all scanned paths for stale-file cleanup
@@ -2005,8 +2030,21 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .await
             .context("Failed to read file")?;
 
-        // Normalize path to absolute form for consistent Neo4j storage
+        // Normalize path to absolute form for consistent Neo4j storage, then
+        // bring it to the project's STORED form: the watcher hands over real
+        // paths (it canonicalizes the roots it watches), and a file written in
+        // the other vocabulary would be a second node for every symbol it
+        // contains.
         let path_str = normalize_path(&path.to_string_lossy());
+        let path_str = match project_id {
+            Some(pid) => self
+                .path_policies
+                .get(&*self.state.neo4j, pid)
+                .await?
+                .stored(&path_str),
+            // No project: the canonical form, the invariant these syncs always had.
+            None => crate::neo4j::file_uid::PathPolicy::none().stored(&path_str),
+        };
         if !force {
             if let Some(existing) = self.state.neo4j.get_file(&path_str).await? {
                 use sha2::{Digest, Sha256};
@@ -4627,6 +4665,8 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         self.neo4j()
             .update_project(id, name.clone(), description, root_path.clone(), profile)
             .await?;
+        // The roots may have changed: the cached stored form must not outlive them.
+        self.path_policies.invalidate(id).await;
         let mut payload = serde_json::Map::new();
         if let Some(ref n) = name {
             payload.insert("name".into(), serde_json::json!(n));
@@ -5533,10 +5573,25 @@ pub fn scan_files(root: &Path) -> Vec<FileEntry> {
 
     let start = std::time::Instant::now();
     let mut entries = Vec::new();
+    // The real root is resolved ONCE, and asked only about the LINKS the walk
+    // meets: a plain entry under a directory already inside the root cannot
+    // leave it, so 33 000 files cost 33 000 `realpath` only if each is a link.
+    // A link that points outside the repository is pruned with its subtree —
+    // the name-based list below cannot see it, and `follow_links(true)` would
+    // happily walk through it. Measured rule, not a list of names.
+    let real_root = crate::neo4j::file_uid::RealRoot::new(root);
 
     for entry in WalkDir::new(root)
         .follow_links(true)
         .into_iter()
+        .filter_entry(|e| {
+            if !e.path_is_symlink() || real_root.contains(e.path()) {
+                true
+            } else {
+                tracing::debug!(path = %e.path().display(), "scan_files: link outside the project's real root");
+                false
+            }
+        })
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
     {
@@ -6982,6 +7037,7 @@ mod tests {
             line_start: 1,
             line_end: 10,
             docstring: None,
+            owner: None,
         }
     }
 
@@ -7430,6 +7486,7 @@ mod tests {
                     line_start: 1,
                     line_end: 10,
                     docstring: None,
+                    owner: None,
                 },
                 FunctionNode {
                     name: "bar".to_string(),
@@ -7444,6 +7501,7 @@ mod tests {
                     line_start: 20,
                     line_end: 30,
                     docstring: None,
+                    owner: None,
                 },
             ],
             structs: vec![StructNode {
@@ -7492,6 +7550,7 @@ mod tests {
                 items: vec!["Display".to_string()],
                 file_path: file_path.clone(),
                 line: 1,
+                occurrence: 0,
             }],
             function_calls: vec![FunctionCall {
                 caller_id: format!("{}:foo:1", file_path),
@@ -7584,6 +7643,7 @@ mod tests {
                 line_start: 10,
                 line_end: 50,
                 docstring: None,
+                owner: None,
             }],
             structs: vec![StructNode {
                 name: "PlanRequest".to_string(),
@@ -7631,6 +7691,7 @@ mod tests {
             line_start: 100,
             line_end: 200,
             docstring: Some("Generate implementation phases from code analysis".to_string()),
+            owner: None,
         };
 
         let text = Orchestrator::build_function_embedding_text(&func);
@@ -7657,6 +7718,7 @@ mod tests {
             line_start: 1,
             line_end: 3,
             docstring: None,
+            owner: None,
         };
 
         let text = Orchestrator::build_function_embedding_text(&func);
@@ -8850,6 +8912,7 @@ mod tests {
                     line_start: (i as u32 + 1) * 10,
                     line_end: (i as u32 + 1) * 10 + 5,
                     docstring: None,
+                    owner: None,
                 })
                 .collect(),
             structs: vec![],
@@ -9069,6 +9132,7 @@ mod tests {
                 line_start: 1,
                 line_end: 10,
                 docstring: None,
+                owner: None,
             }],
             structs: vec![StructNode {
                 name: "MyStruct".to_string(),
@@ -9233,6 +9297,241 @@ mod tests {
         assert!(
             std::path::Path::new(&entries[0].path).is_absolute(),
             "scan_files should return absolute paths"
+        );
+    }
+
+    /// T7, sous-tâche 4 — « un rescan ne recrée aucun chemin openclaw ». Le
+    /// dépôt réel est atteint par un lien (la racine DÉCLARÉE) ; le chemin
+    /// stocké doit être la forme déclarée, que le scan parte du lien ou du
+    /// dossier réel (le watcher résout les racines qu'il surveille), et
+    /// `file_uid` doit être identique par les deux chemins.
+    #[cfg(unix)]
+    #[test]
+    fn the_stored_path_is_the_declared_form_and_the_uid_does_not_see_the_link() {
+        use crate::neo4j::file_uid::{canonical_root, file_uid, relative_to_root, PathPolicy};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-repo");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/main.rs"), "fn main() {}").unwrap();
+        let link = tmp.path().join("declared-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let declared = link.to_string_lossy().to_string();
+        let canonical = canonical_root(Some(&declared));
+        assert_ne!(canonical, declared, "the fixture must go through a link");
+
+        // Scanning FROM the link: the lexical normalization keeps the declared form.
+        let via_link = scan_files(&link);
+        assert_eq!(via_link.len(), 1);
+        let stored_from_link = PathPolicy::new(&declared, "", true).stored(&via_link[0].path);
+        assert_eq!(stored_from_link, format!("{declared}/src/main.rs"));
+        assert!(
+            !stored_from_link.starts_with(&canonical),
+            "the real path must not leak into the stored form"
+        );
+
+        // Scanning FROM the real directory (what the watcher hands over): the
+        // declared mapping brings it back to the same stored form.
+        let via_real = scan_files(&real);
+        assert_eq!(via_real.len(), 1);
+        let stored_from_real = PathPolicy::new(&declared, "", true).stored(&via_real[0].path);
+        assert_eq!(stored_from_real, stored_from_link);
+
+        // And the identity is the same whichever path was walked.
+        let project = Uuid::parse_str("00333b5f-2d0a-4467-9c98-155e55d2b7e5").unwrap();
+        let rel_declared = relative_to_root(&declared, &stored_from_link).unwrap();
+        let rel_real = relative_to_root(&real.to_string_lossy(), &via_real[0].path).unwrap();
+        assert_eq!(
+            file_uid(Some(project), &rel_declared),
+            file_uid(Some(project), &rel_real)
+        );
+    }
+
+    /// `normalize_path` est l'entonnoir de tout chemin écrit : s'il résolvait
+    /// les liens, la forme déclarée appliquée en amont serait défaite par le
+    /// premier appel en aval (il y en a huit dans le pipeline).
+    #[cfg(unix)]
+    #[test]
+    fn normalize_path_never_resolves_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let input = format!("{}/./src/../src/a.rs", link.display());
+        assert_eq!(
+            normalize_path(&input),
+            format!("{}/src/a.rs", link.display()),
+            "dots are cleaned, the link is kept"
+        );
+    }
+
+    /// Le verrou : un projet NON marqué garde son vocabulaire (canonique) même
+    /// quand le sync part de la racine déclarée ; marqué, il écrit la forme
+    /// déclarée. Sans ce verrou, un sync entre le déploiement et
+    /// `migrate file-paths --apply` créait un jumeau sous la racine déclarée
+    /// pour chaque symbole touché, puis la passe des fichiers périmés
+    /// supprimait les originaux avec leurs 28 833 arêtes de notes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unmarked_project_keeps_its_vocabulary_until_migrated() {
+        use crate::neo4j::file_uid::PathPolicy;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-repo");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/main.rs"), "fn main() {}").unwrap();
+        let link = tmp.path().join("declared-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let declared = link.to_string_lossy().to_string();
+        let canonical = PathPolicy::new(&declared, "", false).canonical_root;
+        assert_ne!(canonical, declared, "the fixture must go through a link");
+
+        let (state, neo4j, _meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+        let mut project = crate::test_helpers::test_project_named("linked");
+        project.root_path = declared.clone();
+        let pid = project.id;
+        // Inserted directly: an EXISTING project, not marked (create_project marks).
+        neo4j.projects.write().await.insert(pid, project);
+
+        orch.sync_directory_for_project_with_options(&link, Some(pid), Some("linked"), false)
+            .await
+            .unwrap();
+        let paths: Vec<String> = neo4j.files.read().await.keys().cloned().collect();
+        assert!(!paths.is_empty(), "the sync stored the file");
+        assert!(
+            paths
+                .iter()
+                .all(|p| p.starts_with(&format!("{canonical}/"))),
+            "unmarked: the canonical vocabulary, got {paths:?}"
+        );
+
+        // Marked (what `migrate file-paths --apply` does): the declared form.
+        // `--apply` runs in another process: the server sees the marker when its
+        // cached policy expires (PATH_POLICY_TTL); here the cache is dropped.
+        neo4j.paths_declared.write().await.insert(pid, true);
+        orch.path_policies.invalidate(pid).await;
+        orch.sync_directory_for_project_with_options(&link, Some(pid), Some("linked"), true)
+            .await
+            .unwrap();
+        let paths: Vec<String> = neo4j.files.read().await.keys().cloned().collect();
+        assert!(
+            paths.iter().any(|p| p.starts_with(&format!("{declared}/"))),
+            "marked: the declared vocabulary, got {paths:?}"
+        );
+    }
+
+    /// `Orchestrator::path_policy` reads the project's vocabulary through the
+    /// cache: the declared form once marked, kept as given for an unknown project.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_orchestrator_exposes_the_cached_path_policy() {
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-repo");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        let link = tmp.path().join("declared-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let declared = link.to_string_lossy().to_string();
+
+        let (state, neo4j, _meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+        let mut project = crate::test_helpers::test_project_named("policy");
+        project.root_path = declared.clone();
+        let pid = project.id;
+        neo4j.projects.write().await.insert(pid, project);
+        neo4j.paths_declared.write().await.insert(pid, true);
+
+        let policy = orch.path_policy(pid).await.unwrap();
+        assert!(policy.declared, "the marker is read");
+        let real_file = format!("{}/src/a.rs", real.canonicalize().unwrap().display());
+        assert_eq!(policy.stored(&real_file), format!("{declared}/src/a.rs"));
+
+        let unknown = orch.path_policy(Uuid::new_v4()).await.unwrap();
+        assert!(!unknown.declared);
+        assert_eq!(unknown.stored("/x/y.rs"), "/x/y.rs", "kept as given");
+    }
+
+    /// A single-file sync stores the file in the project's form when it has a
+    /// project, and in the canonical form when it has none.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_single_file_sync_follows_the_project_vocabulary() {
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-repo");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/a.rs"), "fn a() {}").unwrap();
+        std::fs::write(real.join("src/b.rs"), "fn b() {}").unwrap();
+        let link = tmp.path().join("declared-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let declared = link.to_string_lossy().to_string();
+        let canonical = real.canonicalize().unwrap().to_string_lossy().to_string();
+
+        let (state, neo4j, _meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+        let mut project = crate::test_helpers::test_project_named("single");
+        project.root_path = declared.clone();
+        let pid = project.id;
+        neo4j.projects.write().await.insert(pid, project);
+        neo4j.paths_declared.write().await.insert(pid, true);
+
+        // With the project (marked): the declared form.
+        orch.sync_file_for_project(&link.join("src/a.rs"), Some(pid), Some("single"))
+            .await
+            .unwrap();
+        // Without a project: the canonical form, whatever path was handed over.
+        orch.sync_file(&link.join("src/b.rs")).await.unwrap();
+
+        let paths: Vec<String> = neo4j.files.read().await.keys().cloned().collect();
+        assert!(
+            paths.contains(&format!("{declared}/src/a.rs")),
+            "project file in the declared form: {paths:?}"
+        );
+        assert!(
+            paths.contains(&format!("{canonical}/src/b.rs")),
+            "project-less file in the canonical form: {paths:?}"
+        );
+        assert_eq!(paths.len(), 2, "one node per file: {paths:?}");
+    }
+
+    /// A relative path is anchored on the working directory, then cleaned.
+    #[test]
+    fn normalize_path_anchors_a_relative_path_on_the_working_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            normalize_path("src/../src/a.rs"),
+            cwd.join("src/a.rs").to_string_lossy().to_string()
+        );
+    }
+
+    /// The scan prunes a link that leaves the project's real root — with its
+    /// subtree — and keeps a link that stays inside it.
+    #[cfg(unix)]
+    #[test]
+    fn scan_files_prunes_a_link_that_leaves_the_real_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.rs"), "fn secret() {}").unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/in.rs"), "fn inside() {}").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        std::os::unix::fs::symlink(root.join("src"), root.join("alias")).unwrap();
+
+        let names: Vec<String> = scan_files(&root).iter().map(|e| e.path.clone()).collect();
+        assert!(
+            !names.iter().any(|p| p.contains("secret.rs")),
+            "the link to the outside is pruned: {names:?}"
+        );
+        assert!(
+            names.iter().any(|p| p.ends_with("alias/in.rs")),
+            "a link inside the root is walked: {names:?}"
         );
     }
 
@@ -9667,6 +9966,7 @@ mod tests {
                     is_unsafe: false,
                     complexity: 1,
                     docstring: None,
+                    owner: None,
                 }],
                 structs: vec![],
                 traits: vec![],
@@ -9693,6 +9993,7 @@ mod tests {
                     is_unsafe: false,
                     complexity: 1,
                     docstring: None,
+                    owner: None,
                 }],
                 structs: vec![],
                 traits: vec![],
@@ -10164,6 +10465,7 @@ mod tests {
                 line_start: 10,
                 line_end: 30,
                 docstring: Some("Handle request".to_string()),
+                owner: None,
             }],
             structs: vec![StructNode {
                 name: "Config".to_string(),
@@ -10185,6 +10487,7 @@ mod tests {
                 items: vec!["Deserialize".to_string()],
                 file_path: file_path.clone(),
                 line: 1,
+                occurrence: 0,
             }],
             function_calls: vec![],
             symbols: vec!["handler".to_string(), "Config".to_string()],
@@ -10249,6 +10552,7 @@ mod tests {
                 line_start: 1,
                 line_end: 5,
                 docstring: None,
+                owner: None,
             }],
             structs: vec![],
             traits: vec![],
@@ -10328,6 +10632,7 @@ mod tests {
                 line_start: 1,
                 line_end: 5,
                 docstring: None,
+                owner: None,
             }],
             structs: vec![],
             traits: vec![],
@@ -10371,6 +10676,7 @@ mod tests {
                 line_start: 1,
                 line_end: 5,
                 docstring: None,
+                owner: None,
             }],
             structs: vec![],
             traits: vec![],
@@ -10563,6 +10869,7 @@ mod tests {
                     line_start: 1,
                     line_end: 5,
                     docstring: None,
+                    owner: None,
                 }],
                 structs: vec![],
                 traits: vec![],
@@ -10610,6 +10917,7 @@ mod tests {
                     line_start: 1,
                     line_end: 5,
                     docstring: None,
+                    owner: None,
                 },
                 FunctionNode {
                     name: "new_func".to_string(),
@@ -10624,6 +10932,7 @@ mod tests {
                     line_start: 10,
                     line_end: 15,
                     docstring: None,
+                    owner: None,
                 },
             ],
             structs: vec![],
@@ -10687,6 +10996,7 @@ mod tests {
                 line_start: 1,
                 line_end: 10,
                 docstring: None,
+                owner: None,
             }],
             structs: vec![],
             traits: vec![],
@@ -10698,6 +11008,7 @@ mod tests {
                 items: vec![],
                 file_path: importer.clone(),
                 line: 1,
+                occurrence: 0,
             }],
             function_calls: vec![],
             symbols: vec!["main".to_string()],
@@ -10720,6 +11031,7 @@ mod tests {
                 line_start: 1,
                 line_end: 5,
                 docstring: None,
+                owner: None,
             }],
             structs: vec![],
             traits: vec![],
@@ -10786,6 +11098,7 @@ mod tests {
                     line_start: 1,
                     line_end: 5,
                     docstring: None,
+                    owner: None,
                 }],
                 structs: vec![],
                 traits: vec![],
@@ -10877,6 +11190,7 @@ mod tests {
                     line_start: func_idx * 10 + 1,
                     line_end: func_idx * 10 + 9,
                     docstring: None,
+                    owner: None,
                 })
                 .collect();
 
@@ -11035,6 +11349,7 @@ mod tests {
                     line_start: func_idx * 10 + 1,
                     line_end: func_idx * 10 + 9,
                     docstring: None,
+                    owner: None,
                 })
                 .collect();
 

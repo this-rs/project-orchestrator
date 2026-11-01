@@ -251,6 +251,25 @@ Claude Code CLI and with several instances allowed, the opening is refused (`409
 The level that decided is stored as `routed_by` on the session and the execution. The model policy ships `off`; `shadow` records what it
 would have chosen without applying it; `enforce` applies it.
 
+### The context window: declared, or unknown
+
+A candidate enters the router's pool with what is **known** about it, and three things are never
+guessed: its tools, its window, its price. `/v1/models` publishes a window only when the endpoint
+names it (`context_length`, `max_model_len`, `context_window`, `max_context_length`,
+`meta.n_ctx_train`); NVIDIA NIM answers `id`, `object`, `created`, `owned_by` and nothing else.
+
+Without a window a candidate is rejected **before any scoring** (`context_too_small`, `have: null`):
+it never competes, whatever its price. And the sessions it opens carry
+`degraded_features: [compaction]`, because nothing can decide when to compact — the same absence,
+paid twice.
+
+So an instance may DECLARE that window (`context_window`, in tokens, on create/update; the provider
+form and the `provider` MCP tool both carry it). It is a **floor the operator states**, reported
+back with the source `configured` so it is never mistaken for a measured number. `null` clears it.
+Nothing declared means unknown — exactly the behaviour before the field existed — and unknown is
+refused rather than filled in. The value itself is refused below the router's floor (`8000`, the
+smallest context any turn is assumed to need) and above `100000000`.
+
 ## Cost
 
 Two counters: *marginal* (reported or priced: real spend, the only one that can stop a run) and

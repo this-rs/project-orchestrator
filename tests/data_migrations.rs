@@ -90,6 +90,75 @@ async fn status_of(raw: &Graph, skill_id: &str) -> Option<String> {
         .map(|row| row.get::<String>("st").unwrap())
 }
 
+/// The ids of every non-File node of a project, sorted — the shadow key must
+/// leave them untouched.
+async fn ids_in_scope(raw: &Graph, project: &str) -> Vec<String> {
+    let mut r = raw
+        .execute(
+            query(
+                "MATCH (n) WHERE NOT n:File AND (n.project_id = $p
+                       OR EXISTS { (n)<-[:CONTAINS|HAS_IMPORT]-(:File {project_id: $p}) })
+                 RETURN collect(n.id) AS ids",
+            )
+            .param("p", project),
+        )
+        .await
+        .unwrap();
+    let mut ids: Vec<String> = r.next().await.unwrap().unwrap().get("ids").unwrap();
+    ids.sort();
+    ids
+}
+
+/// `(stable_key, owner_type, owner_trait)` of the node with this legacy id.
+async fn key_of(raw: &Graph, id: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let mut r = raw
+        .execute(
+            query(
+                "MATCH (n {id: $id}) RETURN n.stable_key AS k, n.owner_type AS ot,
+                        n.owner_trait AS otr",
+            )
+            .param("id", id),
+        )
+        .await
+        .unwrap();
+    let row = r.next().await.unwrap().unwrap();
+    (
+        row.get::<Option<String>>("k").unwrap(),
+        row.get::<Option<String>>("ot").unwrap(),
+        row.get::<Option<String>>("otr").unwrap(),
+    )
+}
+
+/// A function as the sync writes it (the write path knows the owner).
+async fn write_function(
+    client: &Neo4jClient,
+    file_path: &str,
+    name: &str,
+    line: u32,
+    params: Vec<project_orchestrator::neo4j::models::Parameter>,
+    owner: Option<project_orchestrator::neo4j::models::SymbolOwner>,
+) {
+    use project_orchestrator::neo4j::models::{FunctionNode, Visibility};
+    client
+        .upsert_function(&FunctionNode {
+            name: name.into(),
+            visibility: Visibility::Public,
+            params,
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: file_path.into(),
+            line_start: line,
+            line_end: line + 2,
+            docstring: None,
+            owner,
+        })
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn test_data_migrations_repair_an_upgraded_install() {
     let Some(Env { client, raw }) = env().await else {
@@ -791,6 +860,556 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         let times = store.get_deep_maintenance_times().await.unwrap();
         let (_, at) = times.iter().find(|(id, _)| *id == d).expect("persisted");
         assert!((chrono::Utc::now() - *at).num_seconds().abs() < 60);
+    }
+
+    // ------------------------------------------------------------------
+    // 5b. The stable identity of code symbols (T1, `symbol_key.rs`): the
+    //     four backfills key EVERY legacy node of the six labels, with the
+    //     grammar the write paths use — same owner, same key, no id touched.
+    // ------------------------------------------------------------------
+    {
+        use project_orchestrator::neo4j::models::{
+            ImplNode, ImportNode, Parameter, StructNode, SymbolOwner, Visibility,
+        };
+        use project_orchestrator::neo4j::symbol_key::{
+            stable_external_trait_key, stable_impl_key, stable_import_key, stable_symbol_key,
+            stable_type_key,
+        };
+
+        let k = Uuid::new_v4();
+        let ks = k.to_string();
+        let rs = format!("{ks}/src/a.rs");
+        let py = format!("{ks}/src/k.py");
+        let fmt_params =
+            r#"[{"name":"self","type_name":"&self"},{"name":"f","type_name":"&mut Formatter"}]"#;
+        // Legacy nodes, as the server wrote them before this version: an id
+        // with the line, `params` as JSON, `''` for "no trait", no stable_key —
+        // and NO project_id on Impl and Import (0 of 59 994 and 0 of 289 491
+        // carry one on 31/10/2026): the scoped run must reach them through
+        // their File.
+        raw.run(
+            query(
+                "CREATE (f:File {path: $rs, project_id: $p, language: 'rust'})
+                 CREATE (g:File {path: $py, project_id: $p, language: 'python'})
+                 CREATE (f)-[:CONTAINS]->(:Function {id: $rs + ':new:1', name: 'new', file_path: $rs,
+                         line_start: 1, line_end: 3, params: '[]', project_id: $p})
+                 CREATE (f)-[:CONTAINS]->(:Struct {id: $rs + ':A', name: 'A', file_path: $rs,
+                         line_start: 5, line_end: 6, project_id: $p})
+                 CREATE (f)-[:CONTAINS]->(:Trait {id: $rs + ':T', name: 'T', file_path: $rs,
+                         line_start: 7, line_end: 8, project_id: $p})
+                 CREATE (f)-[:CONTAINS]->(:Enum {id: $rs + ':E', name: 'E', file_path: $rs,
+                         line_start: 9, line_end: 9, project_id: $p})
+                 CREATE (:Trait {id: 'external:trait:std::fmt::Display', name: 'Display',
+                         full_path: 'std::fmt::Display', is_external: true, file_path: '',
+                         line_start: 0, line_end: 0, project_id: $p})
+                 CREATE (f)-[:CONTAINS]->(:Impl {id: $rs + ':impl:A:self', for_type: 'A', trait_name: '',
+                         file_path: $rs, line_start: 10, line_end: 20})
+                 CREATE (f)-[:CONTAINS]->(:Function {id: $rs + ':new:11', name: 'new', file_path: $rs,
+                         line_start: 11, line_end: 13, params: '[]', project_id: $p})
+                 CREATE (f)-[:CONTAINS]->(:Impl {id: $rs + ':impl:B:self', for_type: 'B', trait_name: null,
+                         file_path: $rs, line_start: 30, line_end: 40})
+                 CREATE (f)-[:CONTAINS]->(:Function {id: $rs + ':new:31', name: 'new', file_path: $rs,
+                         line_start: 31, line_end: 33, params: '[]', project_id: $p})
+                 CREATE (f)-[:CONTAINS]->(:Impl {id: $rs + ':impl:A:Display', for_type: 'A', trait_name: 'Display',
+                         file_path: $rs, line_start: 50, line_end: 60})
+                 CREATE (f)-[:CONTAINS]->(:Function {id: $rs + ':fmt:51', name: 'fmt', file_path: $rs,
+                         line_start: 51, line_end: 55, params: $fmt, project_id: $p})
+                 CREATE (f)-[:CONTAINS]->(:Impl {id: $rs + ':impl:A:Debug', for_type: 'A', trait_name: 'Debug',
+                         file_path: $rs, line_start: 70, line_end: 80})
+                 CREATE (f)-[:CONTAINS]->(:Function {id: $rs + ':fmt:71', name: 'fmt', file_path: $rs,
+                         line_start: 71, line_end: 75, params: $fmt, project_id: $p})
+                 CREATE (f)-[:CONTAINS]->(:Impl {id: $rs + ':impl:C:  ', for_type: 'C', trait_name: '  ',
+                         file_path: $rs, line_start: 82, line_end: 84})
+                 CREATE (f)-[:CONTAINS]->(:Function {id: $rs + ':parse:90', name: 'parse', file_path: $rs,
+                         line_start: 90, line_end: 92, params: '[{\"name\":\"x\",\"type_name\":\"i32\"}]', project_id: $p})
+                 CREATE (f)-[:CONTAINS]->(:Function {id: $rs + ':parse:95', name: 'parse', file_path: $rs,
+                         line_start: 95, line_end: 97, params: '[{\"name\":\"x\",\"type_name\":\"bool\"}]', project_id: $p})
+                 CREATE (f)-[:CONTAINS]->(:Function {id: $rs + ':nameless:100', file_path: $rs,
+                         line_start: 100, line_end: 101, params: '[]', project_id: $p})
+                 CREATE (f)-[:HAS_IMPORT]->(:Import {id: $rs + ':3:std::fmt', path: 'std::fmt', file_path: $rs,
+                         line: 3})
+                 CREATE (f)-[:HAS_IMPORT]->(:Import {id: $rs + ':99:std::fmt', path: 'std::fmt', file_path: $rs,
+                         line: 99})
+                 CREATE (f)-[:HAS_IMPORT]->(:Import {id: $rs + ':4:std::io', path: 'std::io', file_path: $rs,
+                         line: 4})
+                 CREATE (g)-[:CONTAINS]->(:Struct {id: $py + ':Klass', name: 'Klass', file_path: $py,
+                         line_start: 1, line_end: 20, project_id: $p})
+                 CREATE (g)-[:CONTAINS]->(:Function {id: $py + ':__init__:2', name: '__init__', file_path: $py,
+                         line_start: 2, line_end: 4, params: '[{\"name\":\"self\",\"type_name\":null}]', project_id: $p})",
+            )
+            .param("p", ks.clone())
+            .param("rs", rs.clone())
+            .param("py", py.clone())
+            .param("fmt", fmt_params),
+        )
+        .await
+        .unwrap();
+
+        let before = ids_in_scope(&raw, &ks).await;
+
+        for (id, expected) in [
+            // 8 selected: `__init__` keyed, the 7 others DEFERRED (review 2,
+            // point 2): `new` x3, `fmt` x2 and `parse` x2 each share a name with
+            // another Function of the file at another line.
+            ("2026-10-backfill-stable-key", 8),
+            ("2026-10-backfill-stable-key-types", 5),
+            ("2026-10-backfill-stable-key-impls", 5),
+            ("2026-10-backfill-stable-key-imports", 3),
+        ] {
+            let out = client.run_data_migration_scoped(id, k).await.unwrap();
+            assert!(out.completed, "{out:?}");
+            assert_eq!(out.processed, expected, "{id}: {out:?}");
+            // Idempotent AND convergent: a second run finds nothing — including
+            // for the function without a name, which the grammar cannot key and
+            // the SELECT therefore never returns (finding 3 of the review).
+            let again = client.run_data_migration_scoped(id, k).await.unwrap();
+            assert!(again.completed && again.processed == 0, "{id}: {again:?}");
+        }
+
+        // Every node the grammar can key carries a key; the nameless one is
+        // excluded and the 7 homonyms are deferred — none stalled the migration.
+        assert_eq!(
+            count(
+                &raw,
+                "MATCH (n) WHERE NOT n:File AND n.stable_key IS NULL AND (n.project_id = $p
+                       OR EXISTS { (n)<-[:CONTAINS|HAS_IMPORT]-(:File {project_id: $p}) })
+                 RETURN count(n) AS c",
+                &ks
+            )
+            .await,
+            8
+        );
+        assert_eq!(
+            key_of(&raw, &format!("{rs}:nameless:100")).await.0,
+            None,
+            "a node the grammar cannot key is left alone, not keyed with NULL"
+        );
+        assert_eq!(
+            count(
+                &raw,
+                "MATCH (n:Function) WHERE n.key_deferred = true AND n.file_path = $p + '/src/a.rs'
+                 RETURN count(n) AS c",
+                &ks
+            )
+            .await,
+            7,
+            "the homonyms are flagged, not guessed"
+        );
+        // A class method with no homonym is keyed by the backfill, owner included.
+        assert_eq!(
+            key_of(&raw, &format!("{py}:__init__:2")).await.0.as_deref(),
+            Some(format!("{py}::Klass::__init__(?)").as_str())
+        );
+
+        // Finding 1 (review 1): the owner qualifies the method — proven through
+        // the write path, which knows the owner (the backfill refused to guess
+        // it for these homonyms). `impl A { fn new }`, `impl B { fn new }` and
+        // the free `new` are three symbols; `fmt` of Display is not `fmt` of
+        // Debug; overloads keep distinct keys.
+        let fmt_params = || {
+            vec![
+                Parameter {
+                    name: "self".into(),
+                    type_name: Some("&self".into()),
+                },
+                Parameter {
+                    name: "f".into(),
+                    type_name: Some("&mut Formatter".into()),
+                },
+            ]
+        };
+        let a_owner = SymbolOwner::new("A", None::<&str>);
+        write_function(&client, &rs, "new", 1, vec![], None).await;
+        write_function(&client, &rs, "new", 11, vec![], Some(a_owner.clone())).await;
+        write_function(
+            &client,
+            &rs,
+            "new",
+            31,
+            vec![],
+            Some(SymbolOwner::new("B", None::<&str>)),
+        )
+        .await;
+        write_function(
+            &client,
+            &rs,
+            "fmt",
+            51,
+            fmt_params(),
+            Some(SymbolOwner::new("A", Some("Display"))),
+        )
+        .await;
+        write_function(
+            &client,
+            &rs,
+            "fmt",
+            71,
+            fmt_params(),
+            Some(SymbolOwner::new("A", Some("Debug"))),
+        )
+        .await;
+        write_function(
+            &client,
+            &rs,
+            "parse",
+            90,
+            vec![Parameter {
+                name: "x".into(),
+                type_name: Some("i32".into()),
+            }],
+            None,
+        )
+        .await;
+        write_function(
+            &client,
+            &rs,
+            "parse",
+            95,
+            vec![Parameter {
+                name: "x".into(),
+                type_name: Some("bool".into()),
+            }],
+            None,
+        )
+        .await;
+
+        let free = key_of(&raw, &format!("{rs}:new:1")).await;
+        let a_new = key_of(&raw, &format!("{rs}:new:11")).await;
+        let b_new = key_of(&raw, &format!("{rs}:new:31")).await;
+        assert_eq!(free, (Some(format!("{rs}::new")), None, None));
+        assert_eq!(
+            a_new,
+            (Some(format!("{rs}::A::new")), Some("A".into()), None)
+        );
+        assert_eq!(
+            b_new,
+            (Some(format!("{rs}::B::new")), Some("B".into()), None)
+        );
+        assert_eq!(
+            a_new.0.as_deref(),
+            Some(stable_symbol_key(&rs, Some(&a_owner), "new", &[]).as_str()),
+            "the write path and symbol_key.rs disagree"
+        );
+        let display = key_of(&raw, &format!("{rs}:fmt:51")).await;
+        let debug = key_of(&raw, &format!("{rs}:fmt:71")).await;
+        assert_eq!(
+            display.0.as_deref(),
+            Some(format!("{rs}::<A as Display>::fmt(&self,&mut Formatter)").as_str())
+        );
+        assert_eq!(
+            debug.0.as_deref(),
+            Some(format!("{rs}::<A as Debug>::fmt(&self,&mut Formatter)").as_str())
+        );
+        assert_eq!(display.2.as_deref(), Some("Display"));
+        assert_ne!(
+            key_of(&raw, &format!("{rs}:parse:90")).await.0,
+            key_of(&raw, &format!("{rs}:parse:95")).await.0
+        );
+        // The write path cleared the flag on every node it rewrote.
+        assert_eq!(
+            count(
+                &raw,
+                "MATCH (n:Function) WHERE n.key_deferred = true AND n.file_path = $p + '/src/a.rs'
+                 RETURN count(n) AS c",
+                &ks
+            )
+            .await,
+            0
+        );
+
+        // Types: the three declarations and the external placeholder.
+        for (id, expected) in [
+            (format!("{rs}:A"), stable_type_key(&rs, "A")),
+            (format!("{rs}:T"), stable_type_key(&rs, "T")),
+            (format!("{rs}:E"), stable_type_key(&rs, "E")),
+            (format!("{py}:Klass"), stable_type_key(&py, "Klass")),
+            (
+                "external:trait:std::fmt::Display".to_string(),
+                stable_external_trait_key("std::fmt::Display"),
+            ),
+        ] {
+            assert_eq!(
+                key_of(&raw, &id).await.0.as_deref(),
+                Some(expected.as_str()),
+                "{id}"
+            );
+        }
+        // Finding 2: the unit `upsert_struct` writes the key too (it did not).
+        client
+            .upsert_struct(&StructNode {
+                name: "A".into(),
+                visibility: Visibility::Public,
+                generics: vec![],
+                file_path: rs.clone(),
+                line_start: 5,
+                line_end: 6,
+                docstring: None,
+                parent_class: None,
+                interfaces: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            key_of(&raw, &format!("{rs}:A")).await.0,
+            Some(stable_type_key(&rs, "A"))
+        );
+
+        // Impls: `''`, NULL and `'  '` are all "no trait" — the Cypher of the
+        // previous version tested `= ''` only (finding 5).
+        for (id, expected) in [
+            (format!("{rs}:impl:A:self"), stable_impl_key(&rs, "A", None)),
+            (format!("{rs}:impl:B:self"), stable_impl_key(&rs, "B", None)),
+            (format!("{rs}:impl:C:  "), stable_impl_key(&rs, "C", None)),
+            (
+                format!("{rs}:impl:A:Display"),
+                stable_impl_key(&rs, "A", Some("Display")),
+            ),
+        ] {
+            assert_eq!(
+                key_of(&raw, &id).await.0.as_deref(),
+                Some(expected.as_str()),
+                "{id}"
+            );
+        }
+        assert_eq!(
+            key_of(&raw, &format!("{rs}:impl:C:  ")).await.0,
+            Some(format!("{rs}::impl C"))
+        );
+        // Finding 2 again: the unit `upsert_impl` writes the key, and (finding 4)
+        // the project_id — Impl and Import nodes had none (0 of 59 994 and 0 of
+        // 289 491 on 31/10/2026), so `$scope` could not reach them.
+        client
+            .upsert_impl(&ImplNode {
+                for_type: "A".into(),
+                trait_name: None,
+                generics: vec![],
+                where_clause: None,
+                file_path: rs.clone(),
+                line_start: 10,
+                line_end: 20,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            key_of(&raw, &format!("{rs}:impl:A:self")).await.0,
+            Some(stable_impl_key(&rs, "A", None))
+        );
+
+        // Imports (finding 9): the line left the key. The two legacy versions
+        // of `use std::fmt` share one key — T2 folds them — and `std::io` is
+        // another import.
+        let fmt_key = stable_import_key(&rs, "std::fmt", 0);
+        assert_eq!(fmt_key, format!("{rs}::import:std::fmt"));
+        assert_eq!(
+            key_of(&raw, &format!("{rs}:3:std::fmt")).await.0.as_deref(),
+            Some(fmt_key.as_str())
+        );
+        assert_eq!(
+            key_of(&raw, &format!("{rs}:99:std::fmt"))
+                .await
+                .0
+                .as_deref(),
+            Some(fmt_key.as_str())
+        );
+        assert_eq!(
+            key_of(&raw, &format!("{rs}:4:std::io")).await.0,
+            Some(stable_import_key(&rs, "std::io", 0))
+        );
+        client
+            .upsert_import(&ImportNode {
+                path: "std::fmt".into(),
+                alias: None,
+                items: vec![],
+                file_path: rs.clone(),
+                line: 3,
+                occurrence: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            key_of(&raw, &format!("{rs}:3:std::fmt")).await.0.as_deref(),
+            Some(fmt_key.as_str())
+        );
+        // A genuine duplicate in the current file is ranked, not merged.
+        assert_eq!(
+            stable_import_key(&rs, "std::fmt", 1),
+            format!("{rs}::import:std::fmt#2")
+        );
+
+        // Finding 4: every write path denormalises project_id from the File —
+        // the three nodes the unit paths rewrote above now carry it (the legacy
+        // Impl/Import the backfill keyed still do not: keying is not re-homing).
+        assert_eq!(
+            count(
+                &raw,
+                "MATCH (n) WHERE n.id IN [$p + '/src/a.rs:new:11', $p + '/src/a.rs:impl:A:self',
+                                         $p + '/src/a.rs:3:std::fmt']
+                   AND n.project_id = $p
+                 RETURN count(n) AS c",
+                &ks
+            )
+            .await,
+            3
+        );
+        assert_eq!(
+            count(
+                &raw,
+                "MATCH (:File {project_id: $p})-[:CONTAINS|HAS_IMPORT]->(n:Impl|Import)
+                 WHERE n.project_id IS NULL RETURN count(n) AS c",
+                &ks
+            )
+            .await,
+            6,
+            "the legacy Impl/Import not rewritten by a write path keep no project_id"
+        );
+
+        // No id was modified, none appeared: the key is a shadow property.
+        assert_eq!(ids_in_scope(&raw, &ks).await, before);
+
+        // Finding 7: the key is indexed on the six labels (created by the
+        // client's schema init, which ran when `client` was built).
+        let mut r = raw
+            .execute(query(
+                "SHOW INDEXES YIELD name, properties
+                 WHERE 'stable_key' IN properties
+                 RETURN collect(name) AS names",
+            ))
+            .await
+            .unwrap();
+        let mut names: Vec<String> = r.next().await.unwrap().unwrap().get("names").unwrap();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "enum_stable_key",
+                "function_stable_key",
+                "impl_stable_key",
+                "import_stable_key",
+                "struct_stable_key",
+                "trait_stable_key",
+            ]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 5c. Review 2 of 31/10/2026, points 2 and 4: the backfill must not GUESS
+    //     the owner of a node it cannot place.
+    // ------------------------------------------------------------------
+    {
+        use project_orchestrator::neo4j::models::{FunctionNode, SymbolOwner, Visibility};
+
+        let k = Uuid::new_v4();
+        let ks = k.to_string();
+        let rs = format!("{ks}/src/stale.rs");
+        let br = format!("{ks}/src/broken.rs");
+        // Point 2 — the graph is at v2: `impl B` now spans 10-60 and `impl A`
+        // moved to 100-150; the sync wrote `new:120` (current) and never
+        // deleted `new:20` (v1, when `impl A` spanned 10-50). By line
+        // inclusion `new:20` is "inside impl B" — a guess that would make T2
+        // fold the old A::new into B::new. Measured on 31/10/2026: 34 814
+        // (file, name, params) groups hold several line versions — 192 673
+        // Function nodes (38 %) are in this situation.
+        //
+        // Point 4 — a block of the same file without lines (`impl Z`) could own
+        // `fn z`; the backfill cannot know, and must not write an unqualified
+        // key in silence.
+        raw.run(
+            query(
+                "CREATE (f:File {path: $rs, project_id: $p, language: 'rust'})
+                 CREATE (g:File {path: $br, project_id: $p, language: 'rust'})
+                 CREATE (f)-[:CONTAINS]->(:Impl {id: $rs + ':impl:B:self', for_type: 'B', trait_name: '',
+                         file_path: $rs, line_start: 10, line_end: 60})
+                 CREATE (f)-[:CONTAINS]->(:Impl {id: $rs + ':impl:A:self', for_type: 'A', trait_name: '',
+                         file_path: $rs, line_start: 100, line_end: 150})
+                 CREATE (f)-[:CONTAINS]->(:Function {id: $rs + ':new:20', name: 'new', file_path: $rs,
+                         line_start: 20, line_end: 30, params: '[]', project_id: $p})
+                 CREATE (f)-[:CONTAINS]->(:Function {id: $rs + ':new:120', name: 'new', file_path: $rs,
+                         line_start: 120, line_end: 130, params: '[]', project_id: $p})
+                 CREATE (f)-[:CONTAINS]->(:Function {id: $rs + ':only:200', name: 'only', file_path: $rs,
+                         line_start: 200, line_end: 201, params: '[]', project_id: $p})
+                 CREATE (g)-[:CONTAINS]->(:Impl {id: $br + ':impl:Z:self', for_type: 'Z', trait_name: '',
+                         file_path: $br})
+                 CREATE (g)-[:CONTAINS]->(:Function {id: $br + ':z:5', name: 'z', file_path: $br,
+                         line_start: 5, line_end: 6, params: '[]', project_id: $p})",
+            )
+            .param("p", ks.clone())
+            .param("rs", rs.clone())
+            .param("br", br.clone()),
+        )
+        .await
+        .unwrap();
+
+        let out = client
+            .run_data_migration_scoped("2026-10-backfill-stable-key", k)
+            .await
+            .unwrap();
+        assert!(out.completed, "{out:?}");
+        // The free function with one version is keyed; the two versions of
+        // `new` and `z` are NOT: no key, a flag, and the migration converges.
+        assert_eq!(
+            key_of(&raw, &format!("{rs}:only:200")).await.0,
+            Some(format!("{rs}::only"))
+        );
+        for id in [
+            format!("{rs}:new:20"),
+            format!("{rs}:new:120"),
+            format!("{br}:z:5"),
+        ] {
+            let (key, owner, _) = key_of(&raw, &id).await;
+            assert_eq!(key, None, "{id}: a guessed owner was written ({owner:?})");
+            assert_eq!(
+                count(
+                    &raw,
+                    "MATCH (n {id: $p}) WHERE n.key_deferred = true RETURN count(n) AS c",
+                    &id
+                )
+                .await,
+                1,
+                "{id} must be flagged key_deferred"
+            );
+        }
+        let again = client
+            .run_data_migration_scoped("2026-10-backfill-stable-key", k)
+            .await
+            .unwrap();
+        assert!(again.completed && again.processed == 0, "{again:?}");
+
+        // The next sync writes the CURRENT version with its true owner: keyed,
+        // flag cleared. The stale `new:20` stays flagged and keyless — T2
+        // deletes it without folding it into anything.
+        client
+            .upsert_function(&FunctionNode {
+                name: "new".into(),
+                visibility: Visibility::Public,
+                params: vec![],
+                return_type: None,
+                generics: vec![],
+                is_async: false,
+                is_unsafe: false,
+                complexity: 1,
+                file_path: rs.clone(),
+                line_start: 120,
+                line_end: 130,
+                docstring: None,
+                owner: Some(SymbolOwner::new("A", None::<&str>)),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            key_of(&raw, &format!("{rs}:new:120")).await.0,
+            Some(format!("{rs}::A::new"))
+        );
+        assert_eq!(
+            count(
+                &raw,
+                "MATCH (n {id: $p}) WHERE n.key_deferred IS NULL RETURN count(n) AS c",
+                &format!("{rs}:new:120")
+            )
+            .await,
+            1,
+            "the write path clears the flag"
+        );
+        assert_eq!(key_of(&raw, &format!("{rs}:new:20")).await.0, None);
     }
 
     // ------------------------------------------------------------------

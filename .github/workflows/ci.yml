@@ -55,11 +55,125 @@ env:
   CACHE_SAVE: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
 
 jobs:
+
+  # ==========================================================================
+  # Resolve runner - can each heavy job take a self-hosted runner RIGHT NOW?
+  # ==========================================================================
+  # The three heavy jobs (Build, Unit Tests, Code Coverage) pin to a self-hosted
+  # runner by the repository variable CI_SELF_HOSTED_LABEL (<label>-build,
+  # -unit, -cov). GitHub does NOT fall back when that machine is offline or when
+  # its single instance is busy: the job then queues forever, and nothing in the
+  # UI says so beyond a grey "queued".
+  #
+  # MEASURED FAILURE, 01/11/2026. Four runs sat `queued` for an hour doing
+  # nothing while TWO of the three ffs-n2 runners were IDLE: every one of them
+  # was waiting for the same bucket, `ffs-unit`, which has a single instance.
+  # The previous probe answered a different question - "is ANY runner whose
+  # label starts with `ffs-` online?" - and six such labels were online, so it
+  # said `self_hosted=true` and the queue never drained. It also required
+  # RUNNERS_READ_TOKEN, a secret that has never existed, so it answered
+  # `self_hosted=true` unconditionally and silently: the fallback could not fire.
+  #
+  # The decision is now per BUCKET (`build`, `unit`, `cov`), so a saturated
+  # bucket no longer drags the two healthy ones to ubuntu-latest, and it uses a
+  # GITHUB_TOKEN: `/actions/runners` needs admin, but `/actions/runs/{id}/jobs`
+  # only needs `actions: read`, and every job carries its `labels`, its
+  # `status`, the `runner_name` that executed it and its `created_at` - which is
+  # everything the decision needs. No PAT, no secret to forget.
+  #
+  # A bucket falls back to ubuntu-latest when ANY of these holds:
+  #   * no job has ever run on such a runner (an empty or renamed fleet);
+  #   * a job of this bucket has been waiting longer than QUEUE_LIMIT seconds -
+  #     the bucket is not draining, whether the instance is offline or stuck;
+  #   * every known instance is busy AND at least one job is already waiting.
+  # Otherwise the job stays on self-hosted, where the warm target/ makes it ~3x
+  # faster. If the API cannot be read at all, the job falls back to ubuntu-latest
+  # and says so: a slow run beats a silent hour of nothing.
+  resolve-runner:
+    name: Resolve runner
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      unit: ${{ steps.check.outputs.unit }}
+      cov: ${{ steps.check.outputs.cov }}
+    steps:
+      - name: Can each bucket take a job right now?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ${{ vars.CI_SELF_HOSTED_LABEL }}
+          # 10 minutes: longer than a cold unit run takes to start, short enough
+          # that nobody waits an hour in front of a grey "queued".
+          QUEUE_LIMIT: "600"
+        run: |
+          label="$LABEL"
+          limit="$QUEUE_LIMIT"
+          now=$(date -u +%s)
+
+          # No label -> every heavy job already routes to ubuntu-latest.
+          jobs=""
+          if [ -n "$label" ]; then
+            runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?per_page=20" \
+              --jq '.workflow_runs[].id') || jobs=""
+            if [ -n "$runs" ]; then
+              jobs=$(for r in $runs; do
+                gh api "repos/$GITHUB_REPOSITORY/actions/runs/$r/jobs?per_page=100" \
+                  --jq '[.jobs[] | {l: .labels, s: .status, r: (.runner_name // ""), c: .created_at}]'
+              done | jq -s 'add // []') || jobs=""
+            fi
+          fi
+
+          for bucket in build unit cov; do
+            if [ -z "$label" ]; then
+              echo "$bucket=false" >> "$GITHUB_OUTPUT"
+              continue
+            fi
+            if [ -z "$jobs" ]; then
+              echo "::warning::cannot read this repository's jobs; ${label}-${bucket} falls back to ubuntu-latest"
+              echo "$bucket=false" >> "$GITHUB_OUTPUT"
+              continue
+            fi
+            sel=$(jq --arg L "${label}-${bucket}" '[.[] | select(.l | index($L))]' <<<"$jobs")
+            instances=$(jq '[.[] | select(.r != "") | .r] | unique | length' <<<"$sel")
+            busy=$(jq '[.[] | select(.s == "in_progress") | .r] | unique | length' <<<"$sel")
+            queued=$(jq '[.[] | select(.s == "queued")] | length' <<<"$sel")
+            oldest=$(jq -r '[.[] | select(.s == "queued") | .c] | min // empty' <<<"$sel")
+            waited=0
+            if [ -n "$oldest" ]; then
+              # jq does the arithmetic: Apple's `date` has no `-d`.
+              waited=$(jq -n --arg o "$oldest" --argjson n "$now" '$n - ($o|fromdateiso8601)')
+            fi
+
+            verdict=true
+            why="free capacity (${busy}/${instances} busy, ${queued} waiting)"
+            if [ "$instances" -eq 0 ]; then
+              verdict=false
+              why="no runner has ever served this bucket"
+            elif [ "$waited" -gt "$limit" ]; then
+              verdict=false
+              why="this bucket is not draining: a job has been waiting ${waited}s (limit ${limit}s)"
+            elif [ "$busy" -ge "$instances" ] && [ "$queued" -ge 1 ]; then
+              verdict=false
+              why="saturated: ${busy}/${instances} busy, ${queued} waiting"
+            fi
+            # The numbers are printed either way: a fallback nobody can explain
+            # is how the old probe stayed broken for months.
+            if [ "$verdict" = "true" ]; then
+              echo "::notice::${label}-${bucket}: self-hosted - ${why}"
+            else
+              echo "::warning::${label}-${bucket}: ubuntu-latest - ${why}"
+            fi
+            echo "$bucket=$verdict" >> "$GITHUB_OUTPUT"
+          done
   # ==========================================================================
   # Build - Compile once, share artifacts and cache
   # ==========================================================================
   build:
     name: Build
+    needs: [resolve-runner]
     # FULL tier only: a READY (non-draft) PR into main, pushes to main, nightly and manual runs.
     # A DRAFT PR into main (an integration branch accumulating its lot) runs the fast tier only;
     # "Ready for review" starts the full tier once.
@@ -72,7 +186,7 @@ jobs:
     # workspace crates by their absolute path, and each instance has its own work dir, so a
     # job that moved to another instance recompiled the whole workspace (Build: 4 min 53 s
     # on an empty commit, 19/10/2026).
-    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-build', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
+    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && needs.resolve-runner.outputs.build == 'true' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-build', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -336,6 +450,7 @@ jobs:
   # ==========================================================================
   unit-tests:
     name: Unit Tests
+    needs: [resolve-runner]
     # On the self-hosted runner (ffs-n2, label in the repository variable CI_SELF_HOSTED_LABEL)
     # when that variable is set, for pushes and for PRs from THIS repository only: the repository
     # is public, a fork's code never runs on that machine. Nightly and `fresh` runs stay on a
@@ -344,7 +459,7 @@ jobs:
     # workspace crates by their absolute path, and each instance has its own work dir, so a
     # job that moved to another instance recompiled the whole workspace (Build: 4 min 53 s
     # on an empty commit, 19/10/2026).
-    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-unit', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
+    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && needs.resolve-runner.outputs.unit == 'true' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-unit', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
     # A hung test used to hold a job for 1-2 hours; nextest kills it after 5 min (see
     # .config/nextest.toml), this is the backstop.
     timeout-minutes: 40
@@ -514,8 +629,8 @@ jobs:
           HARNESS_NEO4J_REQUIRED=1 cargo test --test integration_tests --test data_migrations \
             --test workspace_tests --test neo4j_store_tests --test harness_neo4j \
             --test neo4j_note_consent --test neo4j_decision_project --test neural_routing_indexes \
-            --test neo4j_synapse_shadow --test store_conformance \
-            --test neural_routing_sampler
+            --test neo4j_synapse_shadow --test store_conformance --test code_graph_stable_key \
+            --test file_paths --test neural_routing_sampler
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
@@ -633,6 +748,7 @@ jobs:
   # ==========================================================================
   coverage:
     name: Code Coverage
+    needs: [resolve-runner]
     # FULL tier only: a READY (non-draft) PR into main, pushes to main, nightly and manual runs.
     # A DRAFT PR into main (an integration branch accumulating its lot) runs the fast tier only;
     # "Ready for review" starts the full tier once.
@@ -645,7 +761,7 @@ jobs:
     # workspace crates by their absolute path, and each instance has its own work dir, so a
     # job that moved to another instance recompiled the whole workspace (Build: 4 min 53 s
     # on an empty commit, 19/10/2026).
-    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-cov', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
+    runs-on: ${{ (vars.CI_SELF_HOSTED_LABEL != '' && needs.resolve-runner.outputs.cov == 'true' && github.event_name != 'schedule' && !inputs.fresh && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && format('{0}-cov', vars.CI_SELF_HOSTED_LABEL) || 'ubuntu-latest' }}
     # Backstop: a hung test used to keep this job alive for 1-2 hours.
     timeout-minutes: 50
     permissions:
@@ -797,6 +913,8 @@ jobs:
             --test harness_neo4j \
             --test neo4j_decision_project \
             --test self_graph \
+            --test code_graph_stable_key \
+            --test file_paths \
             --test neural_routing_sampler \
             --test store_conformance
 
@@ -847,6 +965,32 @@ jobs:
             src/neo4j/traits.rs \
             src/neo4j/client.rs \
             src/neo4j/chat.rs
+
+      # Codecov's `patch` status is ADVISORY here (`require_ci_to_pass: false`,
+      # `fail_ci_if_error: false`) and it reports ONE percentage, never the lines
+      # behind it. This applies the SAME bar before the upload — the target read
+      # from `codecov.yml` (95 %, threshold 0 %) — and NAMES every uncovered line
+      # of the diff, so a red patch status stops being an unexplained number.
+      # Calibration: on PR #1048 the gate measured 29/32 instrumented lines, i.e.
+      # 90.62 %, the exact figure codecov printed for that commit.
+      - name: Patch coverage of this PR's diff (the bar codecov applies)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          # The gate diffs the PR against its base, which needs the merge base: a
+          # depth-1 checkout has no history at all (`--unshallow` on a complete
+          # clone is an error, hence the test).
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+            git fetch --no-tags --unshallow origin "+refs/heads/${BASE}:refs/remotes/origin/${BASE}"
+          else
+            git fetch --no-tags origin "+refs/heads/${BASE}:refs/remotes/origin/${BASE}"
+          fi
+          rustc --test scripts/patch_coverage.rs -o "$RUNNER_TEMP/patch_coverage_test"
+          "$RUNNER_TEMP/patch_coverage_test"
+          rustc -O scripts/patch_coverage.rs -o "$RUNNER_TEMP/patch_coverage"
+          "$RUNNER_TEMP/patch_coverage" lcov.info \
+            --base "origin/${BASE}" --min 95 --repo .
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7

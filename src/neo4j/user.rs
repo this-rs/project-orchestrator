@@ -326,6 +326,83 @@ impl Neo4jClient {
         }
     }
 
+    /// Consume a refresh token: validate it, revoke it (rotation is single-use)
+    /// and return its user — all in ONE round trip.
+    ///
+    /// This is the hot path of `POST /auth/refresh`. It used to be three separate
+    /// round trips (validate, revoke, load the user), and each one has to acquire
+    /// a Neo4j connection from the pool: when the pool was saturated by the
+    /// workspace fan-out, the request paid that wait three times over (measured
+    /// 2026-10-31: 57 s on `/auth/refresh` while Neo4j itself answered in 5 ms).
+    ///
+    /// Doing it in one statement also closes the rotation race: two concurrent
+    /// refreshes with the same cookie can no longer both read `revoked = false`
+    /// before either of them revokes it. The loser sees `was_revoked = true` and
+    /// gets `None`.
+    ///
+    /// The returned node carries the state observed **before** the revoke, so the
+    /// caller can distinguish "unknown, expired or already used" (`None`) from
+    /// "valid, and now single-use" (`Some`). The second element is the user row
+    /// when it exists in the graph — root accounts live in the config only, so it
+    /// is legitimately `None` and the caller falls back to `auth_config`.
+    pub async fn consume_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<
+        Option<(
+            crate::neo4j::models::RefreshTokenNode,
+            Option<crate::neo4j::models::UserNode>,
+        )>,
+    > {
+        let q = query(
+            "MATCH (rt:RefreshToken {token_hash: $token_hash})
+             WITH rt, rt.revoked AS was_revoked
+             SET rt.revoked = true
+             WITH rt, was_revoked
+             OPTIONAL MATCH (u:User {id: rt.user_id})
+             RETURN rt, was_revoked, u",
+        )
+        .param("token_hash", token_hash.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let Some(row) = result.next().await? else {
+            return Ok(None);
+        };
+
+        let node: neo4rs::Node = row.get("rt")?;
+        let was_revoked: bool = row.get("was_revoked").unwrap_or(false);
+        let token = crate::neo4j::models::RefreshTokenNode {
+            token_hash: node.get("token_hash")?,
+            user_id: node.get::<String>("user_id")?.parse()?,
+            expires_at: node
+                .get::<String>("expires_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            created_at: node
+                .get::<String>("created_at")?
+                .parse()
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            // The observed state, not the one we just wrote.
+            revoked: was_revoked,
+        };
+
+        // Already used, or expired: not a valid rotation. Either way the row is
+        // now revoked, which is the right outcome for both cases.
+        if was_revoked || token.expires_at < chrono::Utc::now() {
+            return Ok(None);
+        }
+
+        // A null `u` (root account, or a user deleted since the login) is not an
+        // error: `node_to_user` on a null would fail, so ask for the node and
+        // treat "not a node" as "no user row".
+        let user = row
+            .get::<neo4rs::Node>("u")
+            .ok()
+            .and_then(|node| self.node_to_user(&node).ok());
+
+        Ok(Some((token, user)))
+    }
+
     /// Revoke a single refresh token by its hash.
     pub async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool> {
         let q = query(

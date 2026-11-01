@@ -275,6 +275,9 @@ impl CodeParser {
             }
         }
 
+        assign_owners(&mut parsed);
+        assign_import_occurrences(&mut parsed);
+
         Ok((parsed, tree))
     }
 
@@ -386,6 +389,334 @@ pub struct FunctionCall {
     pub reason: String,
 }
 
+/// Give every method its owner, for every language at once.
+///
+/// A method pushed by a language extractor carries a bare name; the blocks
+/// that own it — an `impl` (Rust, Swift/Dart extension) or a class (modelled
+/// as a `StructNode`), and the classes THAT one is nested in — are the ones
+/// whose lines enclose the method's, chained outer to inner (`Foo::Config`),
+/// by the ONE rule of `symbol_key::enclosing_owner`, which the
+/// backfill of legacy nodes applies to the `Impl`/`Struct` nodes of the graph.
+/// An owner an extractor set itself (Rust's `extract_impl`, which knows the
+/// trait) is kept.
+pub fn assign_owners(parsed: &mut ParsedFile) {
+    let candidates: Vec<(u32, u32, SymbolOwner)> = parsed
+        .impl_blocks
+        .iter()
+        .map(|i| {
+            (
+                i.line_start,
+                i.line_end,
+                SymbolOwner::new(i.for_type.clone(), i.trait_name.clone()),
+            )
+        })
+        .chain(parsed.structs.iter().map(|s| {
+            (
+                s.line_start,
+                s.line_end,
+                SymbolOwner::new(s.name.clone(), None::<String>),
+            )
+        }))
+        .collect();
+    for func in parsed.functions.iter_mut().filter(|f| f.owner.is_none()) {
+        func.owner = crate::neo4j::symbol_key::enclosing_owner(
+            func.line_start,
+            func.line_end,
+            candidates.iter().cloned(),
+        );
+    }
+}
+
+/// Rank the imports of one path within the file, in source order: the first
+/// is `0`, a genuine duplicate (`use std::fmt;` at the top and again in
+/// `mod tests`) is `1`, ... The rank replaces the line in the import's stable
+/// identity (`symbol_key::stable_import_key`).
+pub fn assign_import_occurrences(parsed: &mut ParsedFile) {
+    let mut seen: HashMap<&str, u32> = HashMap::new();
+    let mut imports = std::mem::take(&mut parsed.imports);
+    imports.sort_by_key(|i| i.line);
+    // Two extractors seeing the same `import` line (dart.rs: regex + tree-sitter)
+    // is one import, not a duplicate to rank.
+    imports.dedup_by(|b, a| a.line == b.line && a.path == b.path);
+    for import in imports.iter_mut() {
+        let n = seen.entry(import.path.as_str()).or_insert(0);
+        import.occurrence = *n;
+        *n += 1;
+    }
+    parsed.imports = imports;
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    fn func(name: &str, start: u32, end: u32) -> FunctionNode {
+        FunctionNode {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/a.rs".to_string(),
+            line_start: start,
+            line_end: end,
+            docstring: None,
+            owner: None,
+        }
+    }
+
+    fn parsed() -> ParsedFile {
+        ParsedFile {
+            path: "src/a.rs".to_string(),
+            language: "rust".to_string(),
+            hash: String::new(),
+            functions: vec![],
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            imports: vec![],
+            impl_blocks: vec![],
+            function_calls: vec![],
+            symbols: vec![],
+        }
+    }
+
+    // The review's defect: two `new` in two impls of one file shared a key.
+    // The owner is deduced from the enclosing block, the same way for every
+    // language and for the backfill of legacy nodes.
+    #[test]
+    fn methods_take_the_innermost_enclosing_block_as_owner() {
+        let mut p = parsed();
+        p.impl_blocks.push(ImplNode {
+            for_type: "A".into(),
+            trait_name: None,
+            generics: vec![],
+            where_clause: None,
+            file_path: "src/a.rs".into(),
+            line_start: 10,
+            line_end: 20,
+        });
+        p.impl_blocks.push(ImplNode {
+            for_type: "A".into(),
+            trait_name: Some("Display".into()),
+            generics: vec![],
+            where_clause: None,
+            file_path: "src/a.rs".into(),
+            line_start: 30,
+            line_end: 40,
+        });
+        p.structs.push(StructNode {
+            name: "Klass".into(),
+            visibility: Visibility::Public,
+            generics: vec![],
+            file_path: "src/a.py".into(),
+            line_start: 50,
+            line_end: 70,
+            docstring: None,
+            parent_class: None,
+            interfaces: vec![],
+        });
+        p.functions.push(func("new", 11, 15));
+        p.functions.push(func("fmt", 31, 35));
+        p.functions.push(func("__init__", 51, 55));
+        p.functions.push(func("free", 80, 85));
+        // An extractor that already knows the owner is not second-guessed.
+        let mut known = func("known", 12, 13);
+        known.owner = Some(SymbolOwner::new("Given", None::<&str>));
+        p.functions.push(known);
+
+        assign_owners(&mut p);
+
+        let owner = |n: &str| {
+            p.functions
+                .iter()
+                .find(|f| f.name == n)
+                .unwrap()
+                .owner
+                .clone()
+        };
+        assert_eq!(owner("new"), Some(SymbolOwner::new("A", None::<&str>)));
+        assert_eq!(owner("fmt"), Some(SymbolOwner::new("A", Some("Display"))));
+        assert_eq!(
+            owner("__init__"),
+            Some(SymbolOwner::new("Klass", None::<&str>))
+        );
+        assert_eq!(owner("free"), None);
+        assert_eq!(
+            owner("known"),
+            Some(SymbolOwner::new("Given", None::<&str>))
+        );
+    }
+
+    // Review 2, point 1: a Go method's receiver IS its owner. Two `String()`
+    // on two types of one file are two methods; the type is a `StructNode`
+    // spanning its own declaration only, so line inclusion never finds it.
+    #[test]
+    fn a_go_method_takes_its_receiver_as_owner() {
+        use std::path::PathBuf;
+        let src = "package m\n\ntype A struct{}\ntype B struct{}\n\nfunc (a A) String() string { return \"a\" }\nfunc (b *B) String() string { return \"b\" }\nfunc (g Gen[T]) Name() string { return \"g\" }\nfunc Free() {}\n";
+        let parsed = CodeParser::new()
+            .unwrap()
+            .parse_file(&PathBuf::from("m.go"), src)
+            .unwrap();
+        let owner = |n: &str, line: u32| {
+            parsed
+                .functions
+                .iter()
+                .find(|f| f.name == n && f.line_start == line)
+                .unwrap_or_else(|| panic!("{n} at {line}"))
+                .owner
+                .clone()
+        };
+        assert_eq!(
+            owner("String", 6),
+            Some(SymbolOwner::new("A", None::<&str>))
+        );
+        // `*B` is the receiver of B's method, not of a type called `*B`.
+        assert_eq!(
+            owner("String", 7),
+            Some(SymbolOwner::new("B", None::<&str>))
+        );
+        // Generic receiver `Gen[T]`: the type is `Gen`.
+        assert_eq!(
+            owner("Name", 8),
+            Some(SymbolOwner::new("Gen", None::<&str>))
+        );
+        assert_eq!(owner("Free", 9), None);
+    }
+
+    // Review 2, point 3: dart.rs extracts imports by regex AND by tree-sitter
+    // (`library_import`), so one `import` line yielded two ImportNodes — the
+    // same id written twice, the survivor ranked `#2`, the bare key never
+    // written. One (line, path) is one import.
+    #[test]
+    fn one_import_line_is_one_import_even_when_two_extractors_see_it() {
+        use std::path::PathBuf;
+        // Seven shapes of import/export, a `library` header and a comment,
+        // so that whichever shape the grammar manages to parse is covered.
+        let src = "library app;\n// comment\nimport 'package:flutter/material.dart';\nimport 'dart:async' as async;\nimport 'package:a/b.dart' show X, Y;\nimport 'package:a/c.dart' hide Z;\nimport 'package:a/d.dart' deferred as d;\nexport 'src/e.dart';\nimport \"package:a/f.dart\";\n\nvoid main() {}\n";
+        let parsed = CodeParser::new()
+            .unwrap()
+            .parse_file(&PathBuf::from("a.dart"), src)
+            .unwrap();
+        let seen: Vec<(u32, String, u32)> = parsed
+            .imports
+            .iter()
+            .map(|i| (i.line, i.path.clone(), i.occurrence))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (3, "package:flutter/material.dart".to_string(), 0),
+                (4, "dart:async".to_string(), 0),
+                (5, "package:a/b.dart".to_string(), 0),
+                (6, "package:a/c.dart".to_string(), 0),
+                (7, "package:a/d.dart".to_string(), 0),
+                (8, "src/e.dart".to_string(), 0),
+                (9, "package:a/f.dart".to_string(), 0),
+            ],
+            "{seen:?}"
+        );
+    }
+
+    // Review 2, point 5: nested classes. `class Foo { class Config { load } }`
+    // and `class Bar { class Config { load } }` in one file: the innermost
+    // block alone (`Config::load`) merges them; the owner is the CHAIN.
+    #[test]
+    fn nested_classes_chain_their_owners() {
+        let mut p = parsed();
+        let class = |name: &str, start: u32, end: u32| StructNode {
+            name: name.into(),
+            visibility: Visibility::Public,
+            generics: vec![],
+            file_path: "src/a.py".into(),
+            line_start: start,
+            line_end: end,
+            docstring: None,
+            parent_class: None,
+            interfaces: vec![],
+        };
+        p.structs.push(class("Foo", 1, 50));
+        p.structs.push(class("Config", 2, 10));
+        p.structs.push(class("Bar", 60, 100));
+        p.structs.push(class("Config", 61, 70));
+        p.functions.push(func("load", 3, 5));
+        p.functions.push(func("load", 62, 65));
+        assign_owners(&mut p);
+        let keys: Vec<String> = p
+            .functions
+            .iter()
+            .map(|f| {
+                crate::neo4j::symbol_key::stable_symbol_key(
+                    &f.file_path,
+                    f.owner.as_ref(),
+                    &f.name,
+                    &f.params,
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["src/a.rs::Foo::Config::load", "src/a.rs::Bar::Config::load"]
+        );
+    }
+
+    // Review 2, point 3: two extractors (regex + tree-sitter in dart.rs) may
+    // both push the SAME (line, path). It is one import, written once under
+    // one id — ranking the copy `#2` would leave the bare key never written.
+    #[test]
+    fn an_exact_double_push_is_one_import() {
+        let mut p = parsed();
+        let imp = |path: &str, line: u32| ImportNode {
+            path: path.into(),
+            alias: None,
+            items: vec![],
+            file_path: "src/a.dart".into(),
+            line,
+            occurrence: 0,
+        };
+        p.imports.push(imp("package:a/b.dart", 1));
+        p.imports.push(imp("package:a/b.dart", 1));
+        p.imports.push(imp("package:a/b.dart", 7));
+        assign_import_occurrences(&mut p);
+        let occ: Vec<(u32, u32)> = p.imports.iter().map(|i| (i.line, i.occurrence)).collect();
+        assert_eq!(occ, vec![(1, 0), (7, 1)]);
+    }
+
+    #[test]
+    fn duplicate_imports_are_ranked_in_source_order() {
+        let mut p = parsed();
+        let imp = |path: &str, line: u32| ImportNode {
+            path: path.into(),
+            alias: None,
+            items: vec![],
+            file_path: "src/a.rs".into(),
+            line,
+            occurrence: 0,
+        };
+        p.imports.push(imp("std::fmt", 90));
+        p.imports.push(imp("std::fmt", 3));
+        p.imports.push(imp("std::io", 4));
+        assign_import_occurrences(&mut p);
+        let occ: Vec<(String, u32, u32)> = p
+            .imports
+            .iter()
+            .map(|i| (i.path.clone(), i.line, i.occurrence))
+            .collect();
+        assert_eq!(
+            occ,
+            vec![
+                ("std::fmt".to_string(), 3, 0),
+                ("std::io".to_string(), 4, 0),
+                ("std::fmt".to_string(), 90, 1),
+            ]
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +807,44 @@ mod tests {
             assert_eq!(&parsed.language, lang, "language mismatch for {fname}");
             assert!(!parsed.hash.is_empty(), "empty hash for {fname}");
             assert_eq!(parsed.path, *fname);
+
+            // A grammar that loads but parses nothing (the failure mode of a
+            // tree-sitter runtime bump: the ABI stays inside the accepted
+            // range, the grammar silently stops matching) still yields a hash.
+            // Require a real symbol out of a snippet that defines one.
+            let symbols = parsed.functions.len() + parsed.structs.len() + parsed.enums.len();
+            assert!(symbols > 0, "no symbol extracted from {fname}");
+
+            // And the tree must be free of ERROR nodes, per language. This is
+            // the assertion a runtime bump has to earn: 0.26 → 0.27 keeps ABI
+            // 13-15 compatible, but nothing else guarantees the grammars still
+            // agree with the runtime they are driven by.
+            let extension = std::path::Path::new(fname)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default();
+            let language = SupportedLanguage::from_extension(extension)
+                .unwrap_or_else(|| panic!("unknown extension for {fname}"));
+            let mut raw = tree_sitter::Parser::new();
+            raw.set_language(&language.tree_sitter_language())
+                .unwrap_or_else(|e| panic!("set_language failed for {fname}: {e}"));
+            let tree = raw
+                .parse(src, None)
+                .unwrap_or_else(|| panic!("no tree for {fname}"));
+            // A JSX/TSX case is exempt: `from_extension` maps tsx/jsx to the
+            // plain TypeScript grammar, which has no JSX production, so the
+            // tree carries an ERROR node. That predates this bump — measured
+            // identical under tree-sitter 0.26.13 and 0.27.1 — and fixing it
+            // means adding the TSX grammar (LANGUAGE_TSX), not bumping the
+            // runtime. Keep the exemption narrow so a real regression still
+            // fails here.
+            let jsx_gap = fname.ends_with(".tsx") || fname.ends_with(".jsx");
+            let bad = !jsx_gap && tree.root_node().has_error();
+            assert!(
+                !bad,
+                "parse error in {fname}: {}",
+                tree.root_node().to_sexp()
+            );
         }
     }
 

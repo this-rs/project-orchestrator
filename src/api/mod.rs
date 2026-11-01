@@ -2,6 +2,7 @@
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
+pub mod activity_handlers;
 pub mod attention;
 pub mod attention_aggregate;
 pub mod auth_handlers;
@@ -56,6 +57,9 @@ pub mod trigger_handlers;
 pub mod update_handlers;
 pub mod vault_handlers;
 pub mod workspace_handlers;
+pub mod ws_activity_handler;
+#[cfg(test)]
+mod ws_activity_tests;
 pub mod ws_auth;
 pub mod ws_chat_handler;
 pub mod ws_handlers;

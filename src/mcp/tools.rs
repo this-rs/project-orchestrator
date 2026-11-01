@@ -680,6 +680,7 @@ fn provider_tool() -> ToolDefinition {
                 "label": {"type": "string", "description": "Display label (create/update). A claude_code_remote instance takes its id from it"},
                 "base_url": {"type": "string", "description": "Endpoint base URL (create/update), https outside loopback. Not used by codex, acp and claude_code_remote"},
                 "default_model": {"type": "string", "description": "Default model (create/update)"},
+                "context_window": {"type": "integer", "description": "Declared context window in tokens (create/update): a FLOOR for every model of this instance. Absent or null = unknown. Without it, an endpoint that publishes no window is rejected by the router (reason context_too_small) and the sessions it opens lose automatic compaction"},
                 "cost_source": {"type": "string", "description": "Where the cost comes from (create/update): reported, priced, free, subscription, unknown"},
                 "credential_ref": {"type": "string", "description": "Credential REFERENCE (create/update): `vault:<name>`, `env:<VAR>` or `none`. Never a value"},
                 "host": {"type": "string", "description": "claude_code_remote: host name or address (create/update)"},

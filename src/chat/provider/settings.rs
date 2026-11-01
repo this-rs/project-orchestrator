@@ -76,6 +76,16 @@ fn invalid(why: &str) -> SettingsError {
     SettingsError::Invalid(why.to_string())
 }
 
+/// `context_window` in a patch: absent = left untouched, `null` = cleared, a
+/// number = declared. Serde alone maps BOTH the absent field and `null` to
+/// `None`, which would make a wrong declaration impossible to remove.
+fn deserialize_declared_window<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<u64>::deserialize(deserializer).map(Some)
+}
+
 /// Where a credential lives. The value is never held here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialSource {
@@ -173,6 +183,10 @@ pub struct InstanceDraft {
     /// Default model.
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Declared context window, in tokens: a FLOOR the operator states for this
+    /// instance and the models it serves. Absent = nothing is declared.
+    #[serde(default)]
+    pub context_window: Option<u64>,
     /// Where the cost comes from.
     #[serde(default)]
     pub cost_source: Option<String>,
@@ -223,6 +237,10 @@ pub struct InstancePatch {
     /// Default model.
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Declared context window. Absent = leave the stored value untouched;
+    /// `null` = clear it (back to unknown); a number = declare it.
+    #[serde(default, deserialize_with = "deserialize_declared_window")]
+    pub context_window: Option<Option<u64>>,
     /// Cost source.
     #[serde(default)]
     pub cost_source: Option<String>,
@@ -276,6 +294,14 @@ pub struct InstanceRecord {
     /// Default model.
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Declared context window, in tokens: a FLOOR the operator states for this
+    /// instance and the models it serves. Never guessed, never derived from a
+    /// model name. `None` = unknown, which is the whole previous behaviour: an
+    /// endpoint that publishes no window keeps being rejected by the router
+    /// (`context_too_small`) and its sessions keep running without automatic
+    /// compaction.
+    #[serde(default)]
+    pub context_window: Option<u64>,
     /// Cost source.
     pub cost_source: String,
     /// Credential reference.
@@ -1198,6 +1224,49 @@ pub fn process_origin(kind: &str, preset: Option<&str>) -> String {
     }
 }
 
+// ============================================================================
+// Declared context window
+// ============================================================================
+//
+// An OpenAI-compatible endpoint does not always publish the window of its
+// models: `/v1/models` at NVIDIA NIM answers `id`, `object`, `created`,
+// `owned_by` and nothing else. The router needs that window to compare it with
+// the tokens a turn will ask for, and the native harness needs it to compact.
+// Without it a model is rejected BEFORE any scoring (`context_too_small`) and
+// every session it opens runs without automatic compaction: the same absence,
+// paid twice.
+//
+// An operator may therefore DECLARE a floor for an instance. It is a
+// declaration, never a guess: absent means unknown, and unknown keeps exactly
+// the behaviour that existed before this field, instead of inventing a number.
+
+/// Smallest declaration accepted: the floor the router applies to every chat
+/// turn (`MIN_CONTEXT_TOKENS` in `cognitive::signature`). A smaller declaration
+/// would make every turn ineligible — the silent exclusion this field exists to
+/// remove — so it is refused with a message that says why.
+pub const MIN_DECLARED_CONTEXT_WINDOW: u64 = super::cognitive::signature::MIN_CONTEXT_TOKENS;
+
+/// Largest declaration accepted: a bound keeps a typo (`131072000`) out of the
+/// stored document.
+pub const MAX_DECLARED_CONTEXT_WINDOW: u64 = 100_000_000;
+
+/// Validates a declared context window.
+pub fn validate_context_window(window: u64) -> Result<(), SettingsError> {
+    if window < MIN_DECLARED_CONTEXT_WINDOW {
+        return Err(invalid(&format!(
+            "context_window: at least {MIN_DECLARED_CONTEXT_WINDOW} tokens — the router never \
+             sends a turn to a model whose window is smaller, so a lower value would be a silent \
+             exclusion"
+        )));
+    }
+    if window > MAX_DECLARED_CONTEXT_WINDOW {
+        return Err(invalid(&format!(
+            "context_window: at most {MAX_DECLARED_CONTEXT_WINDOW} tokens"
+        )));
+    }
+    Ok(())
+}
+
 /// Validates a draft into a record (syntax only; the DNS check is async and
 /// done by the caller through `validate_endpoint`).
 pub fn record_from_draft(
@@ -1353,6 +1422,11 @@ pub fn record_from_draft(
     // RL1: the limits are optional, but when they are given they are checked
     // here — an instance never stores a limit it would refuse to apply.
     validate_rate_limits(&draft.rate_limit, env_allow)?;
+    // Same rule for the declared window: an instance never stores a number the
+    // router would refuse to use.
+    if let Some(window) = draft.context_window {
+        validate_context_window(window)?;
+    }
     Ok(InstanceRecord {
         label: draft
             .label
@@ -1365,6 +1439,7 @@ pub fn record_from_draft(
         base_url,
         origin,
         default_model: draft.default_model.clone().filter(|m| !m.trim().is_empty()),
+        context_window: draft.context_window,
         cost_source,
         credential_ref,
         host: remote.then(|| draft.host.clone()).flatten(),
@@ -1503,6 +1578,16 @@ pub fn apply_patch(
     }
     if patch.default_model.is_some() {
         next.default_model = patch.default_model.clone().filter(|m| !m.trim().is_empty());
+    }
+    // The declared window: `None` leaves the stored value untouched, `null`
+    // clears it (back to unknown), a number declares it. It changes what the
+    // router may choose and how a session compacts; it sends project content
+    // nowhere, so it touches no consent.
+    if let Some(window) = patch.context_window {
+        if let Some(value) = window {
+            validate_context_window(value)?;
+        }
+        next.context_window = window;
     }
     if let Some(cost) = patch.cost_source.as_ref() {
         if !COST_SOURCES.contains(&cost.as_str()) {
@@ -1865,6 +1950,97 @@ mod tests {
         let r = record_from_draft(&draft(), &EndpointPolicy::default(), &[]).unwrap();
         assert_eq!(r.origin, "https://api.deepseek.com");
         assert_eq!(r.credential_ref, "vault:deepseek");
+    }
+
+    #[test]
+    fn a_declared_window_is_stored_and_reads_back() {
+        let mut d = draft();
+        d.context_window = Some(131_072);
+        let r = record_from_draft(&d, &EndpointPolicy::default(), &[]).unwrap();
+        assert_eq!(r.context_window, Some(131_072));
+        // And it survives the trip through the settings document.
+        let back: InstanceRecord =
+            serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
+        assert_eq!(back.context_window, Some(131_072));
+    }
+
+    #[test]
+    fn a_record_stored_before_the_window_existed_reads_back_unknown() {
+        // No migration: every document written before the field carries none, and
+        // unknown is not a number.
+        let json = serde_json::json!({
+            "id": "nim",
+            "kind": "openai_compatible",
+            "label": "NVIDIA NIM",
+            "base_url": "https://integrate.api.nvidia.com/v1",
+            "origin": "https://integrate.api.nvidia.com",
+            "cost_source": "priced",
+            "credential_ref": "vault:nim-1"
+        });
+        let r: InstanceRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(r.context_window, None);
+    }
+
+    #[test]
+    fn a_window_below_the_router_floor_is_refused_with_its_reason() {
+        // Below the router's floor every chat turn is ineligible: storing such a
+        // number would be the silent exclusion this field exists to remove.
+        let mut d = draft();
+        d.context_window = Some(4_096);
+        let err = record_from_draft(&d, &EndpointPolicy::default(), &[]).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("context_window"), "{text}");
+        assert!(text.contains("8000"), "the floor is named: {text}");
+    }
+
+    #[test]
+    fn an_absurd_window_is_refused_at_the_upper_bound() {
+        // A typo (`131072000`) would otherwise enter the routing pool as a window
+        // no endpoint has.
+        let mut d = draft();
+        d.context_window = Some(MAX_DECLARED_CONTEXT_WINDOW + 1);
+        let err = record_from_draft(&d, &EndpointPolicy::default(), &[]).unwrap_err();
+        assert!(err.to_string().contains("context_window"), "{err}");
+    }
+
+    #[test]
+    fn a_patch_declares_clears_or_leaves_the_window_alone() {
+        let policy = EndpointPolicy::default();
+        let old = record_from_draft(&draft(), &policy, &[]).unwrap();
+        let patch =
+            |body: serde_json::Value| -> InstancePatch { serde_json::from_value(body).unwrap() };
+        let with = apply_patch(
+            &old,
+            &patch(serde_json::json!({"context_window": 65_536})),
+            &policy,
+            &[],
+        )
+        .unwrap()
+        .0;
+        assert_eq!(with.context_window, Some(65_536));
+        // `null` clears it: a wrong number has to be removable.
+        let cleared = apply_patch(
+            &with,
+            &patch(serde_json::json!({"context_window": null})),
+            &policy,
+            &[],
+        )
+        .unwrap()
+        .0;
+        assert_eq!(cleared.context_window, None);
+        // Absent leaves the stored value untouched.
+        let kept = apply_patch(
+            &with,
+            &patch(serde_json::json!({"label": "DeepSeek"})),
+            &policy,
+            &[],
+        )
+        .unwrap()
+        .0;
+        assert_eq!(kept.context_window, Some(65_536));
+        // A declaration the router would refuse is refused here too.
+        let too_small = patch(serde_json::json!({"context_window": 10}));
+        assert!(apply_patch(&old, &too_small, &policy, &[]).is_err());
     }
 
     #[test]

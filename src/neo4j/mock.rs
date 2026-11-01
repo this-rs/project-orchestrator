@@ -245,6 +245,9 @@ pub struct MockGraphStore {
     pub plan_constraints: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub project_plans: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub project_files: RwLock<HashMap<Uuid, Vec<String>>>,
+    /// `Project.paths_declared` — the marker `migrate file-paths --apply` sets
+    /// (and `create_project` sets for a new project). Absent: canonical form.
+    pub paths_declared: RwLock<HashMap<Uuid, bool>>,
     pub file_symbols: RwLock<HashMap<String, Vec<String>>>,
     pub task_files: RwLock<HashMap<Uuid, Vec<String>>>,
     pub task_commits: RwLock<HashMap<Uuid, Vec<String>>>,
@@ -501,6 +504,7 @@ impl MockGraphStore {
             plan_constraints: RwLock::new(HashMap::new()),
             project_plans: RwLock::new(HashMap::new()),
             project_files: RwLock::new(HashMap::new()),
+            paths_declared: RwLock::new(HashMap::new()),
             file_symbols: RwLock::new(HashMap::new()),
             task_files: RwLock::new(HashMap::new()),
             task_commits: RwLock::new(HashMap::new()),
@@ -1405,6 +1409,7 @@ mod tests {
             line_start,
             line_end: line_start + 10,
             docstring: None,
+            owner: None,
         }
     }
 
@@ -3983,6 +3988,7 @@ mod tests {
             items: vec!["Item1".to_string()],
             file_path: file_path.to_string(),
             line,
+            occurrence: 0,
         }
     }
 
@@ -4412,6 +4418,7 @@ mod tests {
             line_start: 1,
             line_end: 10,
             docstring: None,
+            owner: None,
         };
         store.upsert_function(&caller).await.unwrap();
 
@@ -4428,6 +4435,7 @@ mod tests {
             line_start: 12,
             line_end: 20,
             docstring: None,
+            owner: None,
         };
         store.upsert_function(&real_callee).await.unwrap();
 
@@ -4444,6 +4452,7 @@ mod tests {
             line_start: 22,
             line_end: 24,
             docstring: None,
+            owner: None,
         };
         store.upsert_function(&builtin_callee).await.unwrap();
 
@@ -6216,12 +6225,32 @@ impl ProjectStore for MockGraphStore {
             .write()
             .await
             .insert(project.id, project.clone());
+        // Mirrors Neo4j: a NEW project is born in the declared vocabulary.
+        self.paths_declared.write().await.insert(project.id, true);
         Ok(())
     }
 
     async fn get_project(&self, id: Uuid) -> Result<Option<ProjectNode>> {
         self.count_read();
         Ok(self.projects.read().await.get(&id).cloned())
+    }
+
+    async fn path_policy(&self, id: Uuid) -> Result<crate::neo4j::file_uid::PathPolicy> {
+        use crate::neo4j::file_uid::PathPolicy;
+        self.count_read();
+        self.log_read("path_policy")?;
+        let projects = self.projects.read().await;
+        let Some(project) = projects.get(&id) else {
+            return Ok(PathPolicy::none());
+        };
+        let declared = self
+            .paths_declared
+            .read()
+            .await
+            .get(&id)
+            .copied()
+            .unwrap_or(false);
+        Ok(PathPolicy::new(&project.root_path, "", declared))
     }
 
     async fn get_project_by_slug(&self, slug: &str) -> Result<Option<ProjectNode>> {
@@ -15966,6 +15995,13 @@ impl ChatStore for MockGraphStore {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<ChatEventRecord>> {
+        if self
+            .fail_reads
+            .lock()
+            .is_ok_and(|f| f.contains("get_chat_events_paginated"))
+        {
+            anyhow::bail!("injected failure of get_chat_events_paginated");
+        }
         let store = self.chat_events.read().await;
         let events = store
             .get(&session_id)
@@ -15983,6 +16019,13 @@ impl ChatStore for MockGraphStore {
     }
 
     async fn count_chat_events(&self, session_id: Uuid) -> Result<i64> {
+        if self
+            .fail_reads
+            .lock()
+            .is_ok_and(|f| f.contains("count_chat_events"))
+        {
+            anyhow::bail!("injected failure of count_chat_events");
+        }
         let store = self.chat_events.read().await;
         let count = store.get(&session_id).map(|v| v.len() as i64).unwrap_or(0);
         Ok(count)
@@ -16276,6 +16319,34 @@ impl AuthStore for MockGraphStore {
             }
             None => Ok(false),
         }
+    }
+
+    async fn consume_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<
+        Option<(
+            crate::neo4j::models::RefreshTokenNode,
+            Option<crate::neo4j::models::UserNode>,
+        )>,
+    > {
+        // Same contract as the real store: one shot, the token ends up revoked
+        // whatever happens, and only a token valid BEFORE the call is returned.
+        let consumed = {
+            let mut tokens = self.refresh_tokens.write().await;
+            let Some(token) = tokens.get_mut(token_hash) else {
+                return Ok(None);
+            };
+            let was_valid = !token.revoked && token.expires_at > chrono::Utc::now();
+            token.revoked = true;
+            if !was_valid {
+                return Ok(None);
+            }
+            token.clone()
+        };
+
+        let user = self.users.read().await.get(&consumed.user_id).cloned();
+        Ok(Some((consumed, user)))
     }
 
     async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64> {

@@ -52,6 +52,40 @@
 %%   live_session_snapshot compte en plus les tâches de fond, SessionActivity est né, et
 %%   `GET /api/chat/live-activity` (api/chat_handlers.rs, hors de ce diagramme) l'expose.
 %% ---
+%% CORRIGE LE 2026-11-01 (issue #1056, fix/chat-opening-bounded) : l'OUVERTURE d'une session
+%%   n'est plus dans la réponse d'un appelant AGENT. `api/chat_handlers.rs::create_session` :
+%%   un appelant `SpawnCaller::Agent` (une session qui passe par son serveur MCP, donc
+%%   `chat(action:"send_message")`) reçoit `ChatManager::create_session_detached` — l'id est
+%%   tiré (Uuid v4) et rendu TOUT DE SUITE, sans un seul await (signature non `async` : le
+%%   type est la preuve), avec `stream_url`, `execution_place` et `access` que la requête seule
+%%   décide ; `create_session_relayed_at(request, relay, id)` (ex-`create_session_relayed`, qui
+%%   tirait son propre id) continue dans une tâche : lectures de graphe (propriétaire, projet,
+%%   `provider_choice`), persistance du ChatSessionNode, puis open_agent_session ou le CLI. Un
+%%   refus n'est donc plus un 4xx pour un agent : il devient un `ChatEvent::Error`
+%%   (code `session_open_failed`) écrit dans la conversation appelante (emit_session_event).
+%%   Les refus que le handler tranche AVANT l'ouverture — enveloppe, plafond d'enfants vivants,
+%%   `refuse_if_mirror`, `check_provider_binding` — restent synchrones ; le ticket d'ouverture
+%%   (`OpeningTicket`, P18-suite point 6) est DÉPLACÉ dans la tâche, sinon un parent qui ouvre
+%%   plusieurs enfants d'un coup passerait son propre plafond. Un appelant PERSONNE ne change
+%%   pas : il garde la réponse complète et le refus inline.
+%%   Mesure qui l'impose : 107 s avant la persistance du nœud (donc dans les lectures de
+%%   graphe, pas dans le spawn du CLI, qui vient après `created_at`), contre un budget client
+%%   MCP de 120 s (`mcp/http_client.rs`), et 120 s/300 s de bornes d'appel d'outil côté
+%%   clients — le parent restait `streaming` 26 min, ni résultat ni erreur.
+%%   AJOUTE le chien de garde LOST-TOOL-RESULT (`start_lost_tool_result_watchdog`, démarré par
+%%   lib.rs à côté du dead-CLI) : toutes les 60 s, une session qui est `streaming`, ne tient
+%%   aucune tâche de fond et n'attend aucune permission, et dont le DERNIER événement persisté
+%%   est un `tool_use` sans rien après lui, plus vieux que 10 min (outil `mcp__*`, dont les
+%%   hops sont bornés) ou 1 h (outil de commande, sans borne propre), reçoit d'abord un
+%%   `ChatEvent::Error` (code `tool_result_lost`) puis un `interrupt` ordinaire — jamais une
+%%   fermeture : le travail est là et le message suivant reprend.
+%%   test : test_a_detached_opening_answers_its_id_and_the_opening_still_happens,
+%%   test_a_refused_detached_opening_is_reported_in_the_calling_conversation,
+%%   test_the_lost_tool_result_rule_reads_an_unanswered_call_and_never_a_finished_turn,
+%%   test_the_lost_tool_result_watchdog_ends_nothing_when_nothing_is_streaming
+%%   🟠 le chien de garde n'est pas exercé de bout en bout sur une vraie session bloquée (il
+%%   faudrait un CLI muet) : la règle et le tick à vide sont testés, pas l'interrupt réel.
+%% ---
 %% NON ETABLI :
 %%   le chemin NATS (sessions sur une autre instance : try_remote_send, request_send_message)
 %%   n'est relu qu'en surface : ses tests tournent sans NATS réel

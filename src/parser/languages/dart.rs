@@ -46,8 +46,9 @@ fn extract_toplevel(
     let mut i = 0;
 
     while i < child_count {
-        // tree-sitter 0.26 changed Node::child() to take u32 (was usize).
-        let child = root.child(i as u32).unwrap();
+        // tree-sitter 0.27: both child_count() and child() speak u32, so the
+        // index needs no cast (0.26 had child_count() -> usize and required one).
+        let child = root.child(i).unwrap();
 
         match child.kind() {
             "class_declaration" => {
@@ -98,8 +99,7 @@ fn extract_toplevel(
             "function_signature" => {
                 // Look ahead for function_body
                 let body_node = if i + 1 < child_count {
-                    root.child((i + 1) as u32)
-                        .filter(|n| n.kind() == "function_body")
+                    root.child(i + 1).filter(|n| n.kind() == "function_body")
                 } else {
                     None
                 };
@@ -193,6 +193,7 @@ fn extract_function_from_signature(
         line_start: sig.start_position().row as u32 + 1,
         line_end,
         docstring,
+        owner: None,
     })
 }
 
@@ -252,6 +253,7 @@ fn extract_function_from_member(
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
+        owner: None,
     })
 }
 
@@ -456,6 +458,7 @@ fn extract_imports_regex(source: &str, file_path: &str, parsed: &mut ParsedFile)
                 items: vec![],
                 file_path: file_path.to_string(),
                 line: line_num as u32 + 1,
+                occurrence: 0,
             });
         }
     }
@@ -493,6 +496,7 @@ fn extract_import(node: &tree_sitter::Node, source: &str, file_path: &str) -> Op
         items,
         file_path: file_path.to_string(),
         line: node.start_position().row as u32 + 1,
+        occurrence: 0,
     })
 }
 

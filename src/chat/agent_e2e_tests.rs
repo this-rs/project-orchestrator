@@ -4280,6 +4280,207 @@ mod provider_switch {
         assert_eq!(note["from_provider"], "local");
     }
 
+    /// A move made while the answer is still streaming keeps what was produced: the text lives
+    /// only in the session's buffer until its turn ends, and the target must read it in the relay.
+    #[tokio::test]
+    async fn a_switch_during_a_streamed_answer_keeps_the_text_already_produced() {
+        let w = world().await;
+        let old = first_turn(&w).await;
+        // A turn still streaming: its text is in the buffer, not yet stored as the answer.
+        let handle = w
+            .manager
+            .agent_runtime
+            .get(&old)
+            .await
+            .expect("a live agent session");
+        handle
+            .streaming_text
+            .lock()
+            .await
+            .push_str("the half answer");
+        handle
+            .is_streaming
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let moved = w
+            .manager
+            .switch_session_provider(&old, "local2", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+
+        // The target answers the moved turn: wait for that answer, as the sibling test does.
+        stored_until(&w, &moved.session_id, |events| {
+            events
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains("the answer"))
+        })
+        .await;
+        let chats = w.fake.chat_requests();
+        let turn = chats
+            .iter()
+            .find(|r| r["body"].to_string().contains("second question"))
+            .expect("the relayed turn");
+        assert!(
+            turn["body"].to_string().contains("the half answer"),
+            "the target must read the answer the user was reading: {}",
+            turn["body"]
+        );
+        let stored = w
+            .graph
+            .get_chat_events(Uuid::parse_str(&moved.session_id).unwrap(), 0, 5_000)
+            .await
+            .unwrap();
+        assert!(
+            stored
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains("the half answer")),
+            "the thread keeps the cut answer too"
+        );
+    }
+
+    /// A turn still streaming while the switch waits for it: its text keeps growing in the
+    /// buffer, then the turn ends with one more word. The answer kept is the whole text.
+    #[tokio::test]
+    async fn a_switch_keeps_the_answer_that_streams_until_the_turn_ends() {
+        let w = world().await;
+        let old = first_turn(&w).await;
+        let handle = w
+            .manager
+            .agent_runtime
+            .get(&old)
+            .await
+            .expect("a live agent session");
+        handle.streaming_text.lock().await.push_str("half answer");
+        handle
+            .is_streaming
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let writer = handle.clone();
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                writer.streaming_text.lock().await.push('+');
+            }
+            writer.streaming_text.lock().await.push_str(" and more");
+            writer
+                .is_streaming
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let moved = w
+            .manager
+            .switch_session_provider(&old, "local2", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+
+        let stored = stored_until(&w, &moved.session_id, |events| {
+            events
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains("the answer"))
+        })
+        .await;
+        let cut = stored
+            .iter()
+            .find(|e| e.event_type == "assistant_text" && e.data.contains("half answer"))
+            .expect("the cut answer is stored");
+        assert!(
+            cut.data.contains("and more"),
+            "the text up to the end of the turn is kept: {}",
+            cut.data
+        );
+    }
+
+    /// The turn ends by clearing its buffer, as the agent engine does. What the switch saw while
+    /// the text grew is kept, even though the buffer is empty by the time the switch looks again.
+    #[tokio::test]
+    async fn a_switch_keeps_the_longest_text_seen_when_the_turn_clears_its_buffer() {
+        let w = world().await;
+        let old = first_turn(&w).await;
+        let handle = w
+            .manager
+            .agent_runtime
+            .get(&old)
+            .await
+            .expect("a live agent session");
+        handle.streaming_text.lock().await.push_str("half answer");
+        handle
+            .is_streaming
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let writer = handle.clone();
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                writer.streaming_text.lock().await.push('+');
+            }
+            writer.streaming_text.lock().await.clear();
+            writer
+                .is_streaming
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let moved = w
+            .manager
+            .switch_session_provider(&old, "local2", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+
+        let stored = stored_until(&w, &moved.session_id, |events| {
+            events
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains("the answer"))
+        })
+        .await;
+        let cut = stored
+            .iter()
+            .find(|e| e.event_type == "assistant_text" && e.data.contains("half answer"))
+            .expect("the cut answer is stored");
+        assert!(
+            cut.data.contains("++"),
+            "the longest text seen while streaming is kept, not the one before it: {}",
+            cut.data
+        );
+    }
+
+    /// A turn streaming nothing but whitespace has no answer to keep: no blank answer is stored.
+    /// Its flag never clears, so the switch waits out its bound before it moves on.
+    #[tokio::test]
+    async fn a_switch_while_streaming_only_whitespace_stores_no_blank_answer() {
+        let w = world().await;
+        let old = first_turn(&w).await;
+        let handle = w
+            .manager
+            .agent_runtime
+            .get(&old)
+            .await
+            .expect("a live agent session");
+        handle.streaming_text.lock().await.push_str("  \n ");
+        handle
+            .is_streaming
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let moved = w
+            .manager
+            .switch_session_provider(&old, "local2", None, "second question", None)
+            .await
+            .unwrap_or_else(|e| panic!("switch failed: {e:#}"));
+
+        let stored = stored_until(&w, &moved.session_id, |events| {
+            events
+                .iter()
+                .any(|e| e.event_type == "assistant_text" && e.data.contains("the answer"))
+        })
+        .await;
+        let answers: Vec<String> = stored
+            .iter()
+            .filter(|e| e.event_type == "assistant_text")
+            .map(|e| e.data.clone())
+            .collect();
+        assert_eq!(
+            answers.len(),
+            2,
+            "the first answer and the moved one, and no blank answer: {answers:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_refused_switch_leaves_the_old_session_untouched() {
         let w = world().await;

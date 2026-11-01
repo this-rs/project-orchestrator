@@ -689,7 +689,9 @@ pub async fn get_me(
 ///
 /// Reads the `refresh_token` cookie (HttpOnly, set by login/register),
 /// validates it against the database (not expired, not revoked), then:
-/// 1. Revokes the old refresh token (rotation — single use)
+/// 1. Revokes the old refresh token (rotation — single use). Validation, revoke
+///    and the user lookup happen in a single statement, so a saturated Neo4j
+///    pool costs one connection wait instead of three.
 /// 2. Creates a new refresh token and emits a new Set-Cookie
 /// 3. Returns a fresh access JWT in the body
 ///
@@ -713,28 +715,22 @@ pub async fn refresh_token(
     let raw_token = refresh::extract_refresh_token_from_cookie(cookie_header)
         .ok_or_else(|| AppError::Unauthorized("No refresh_token in cookie".to_string()))?;
 
-    // 2. Validate refresh token in DB (checks expiry + revoked)
+    // 2. Validate, revoke (rotation is single-use) and load the user in ONE
+    //    round trip.
+    //
+    //    This used to be three: validate, revoke, then `get_user_by_id`. Every one
+    //    of them has to acquire a Neo4j connection from the pool, so under pool
+    //    pressure the endpoint paid the wait three times over (measured
+    //    2026-10-31: 57 s on this endpoint while Neo4j itself answered in 5 ms).
+    //    Merging them also closes the rotation race: two concurrent refreshes
+    //    with the same cookie can no longer both see the token as still valid.
     let token_hash = refresh::hash_token(&raw_token);
-    let token_node = state
+    let (token_node, user) = state
         .orchestrator
         .neo4j()
-        .validate_refresh_token(&token_hash)
+        .consume_refresh_token(&token_hash)
         .await?
         .ok_or_else(|| AppError::Unauthorized("Invalid or expired refresh token".to_string()))?;
-
-    // 3. Revoke old refresh token (rotation — each token is single-use)
-    state
-        .orchestrator
-        .neo4j()
-        .revoke_refresh_token(&token_hash)
-        .await?;
-
-    // 4. Look up user info for JWT claims
-    let user = state
-        .orchestrator
-        .neo4j()
-        .get_user_by_id(token_node.user_id)
-        .await?;
 
     // For root accounts (not in Neo4j), fall back to auth config
     let (user_id, email, name) = match user {

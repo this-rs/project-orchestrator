@@ -1953,6 +1953,7 @@ mod tests {
                     return_type: None,
                     generics: vec![],
                     docstring: None,
+                    owner: None,
                 })
                 .await
                 .unwrap();
@@ -2881,6 +2882,7 @@ mod tests {
                     return_type: None,
                     generics: vec![],
                     docstring: None,
+                    owner: None,
                 })
                 .await
                 .unwrap();
@@ -3411,6 +3413,7 @@ mod tests {
                 return_type: None,
                 generics: vec![],
                 docstring: None,
+                owner: None,
             })
             .await
             .unwrap();

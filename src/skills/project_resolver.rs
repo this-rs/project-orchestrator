@@ -105,14 +105,7 @@ pub(crate) fn find_longest_prefix_match(
 /// `path` with `~` expanded, relative paths joined onto `base` (when given),
 /// plus its canonical form when it exists on disk and differs.
 pub(crate) fn path_forms(path: &str, base: Option<&str>) -> Vec<String> {
-    let expanded = crate::expand_tilde(path);
-    let absolute = match base {
-        Some(base) if !expanded.starts_with('/') && !expanded.is_empty() => {
-            let base = crate::expand_tilde(base);
-            format!("{}/{}", base.trim_end_matches('/'), expanded)
-        }
-        _ => expanded,
-    };
+    let absolute = absolute_form(path, base);
     let mut forms = vec![absolute.clone()];
     if let Ok(canonical) = std::fs::canonicalize(&absolute) {
         let canonical = canonical.display().to_string();
@@ -123,14 +116,30 @@ pub(crate) fn path_forms(path: &str, base: Option<&str>) -> Vec<String> {
     forms
 }
 
-/// The form of `path` stored in the graph: `File.path` is canonical (sync
-/// canonicalizes), so persona KNOWS lookups must use the canonical form.
-/// Relative paths are joined onto `base`; falls back to the absolute form
-/// when the file does not exist.
-pub fn graph_file_path(path: &str, base: Option<&str>) -> String {
-    path_forms(path, base)
-        .pop()
-        .unwrap_or_else(|| path.to_string())
+/// `path` with `~` expanded and, when relative, joined onto `base`.
+fn absolute_form(path: &str, base: Option<&str>) -> String {
+    let expanded = crate::expand_tilde(path);
+    match base {
+        Some(base) if !expanded.starts_with('/') && !expanded.is_empty() => {
+            let base = crate::expand_tilde(base);
+            format!("{}/{}", base.trim_end_matches('/'), expanded)
+        }
+        _ => expanded,
+    }
+}
+
+/// The form of `path` stored in the graph for the project `policy` describes
+/// (`File.path` is canonical until the project is migrated, declared after —
+/// see `file_uid::PathPolicy`), so persona KNOWS lookups find the node.
+/// Relative paths are joined onto `base`. A canonical form is NOT assumed
+/// here: that is what made every lookup miss on a project declared through a
+/// link once its nodes were renamed.
+pub fn graph_file_path(
+    path: &str,
+    base: Option<&str>,
+    policy: &crate::neo4j::file_uid::PathPolicy,
+) -> String {
+    policy.stored(&absolute_form(path, base))
 }
 
 /// Longest-prefix match over every form of `path` (see [`path_forms`]).
@@ -642,19 +651,40 @@ mod tests {
         );
     }
 
+    /// La forme du graphe est celle du PROJET, pas « la canonique » : un projet
+    /// non migré stocke la canonique, un projet migré la déclarée. Supposer la
+    /// canonique faisait rater toutes les recherches KNOWS d'un projet lié
+    /// après son renommage.
     #[test]
-    fn test_graph_file_path_is_canonical() {
+    fn test_graph_file_path_follows_the_project_vocabulary() {
+        use crate::neo4j::file_uid::PathPolicy;
         let (_tmp, link, real) = symlinked_project();
+
+        let unmarked = PathPolicy::new(&link, "", false);
         assert_eq!(
-            graph_file_path(&format!("{link}/src/main.rs"), None),
+            graph_file_path(&format!("{link}/src/main.rs"), None, &unmarked),
             format!("{real}/src/main.rs")
         );
         assert_eq!(
-            graph_file_path("src/main.rs", Some(&link)),
+            graph_file_path("src/main.rs", Some(&link), &unmarked),
             format!("{real}/src/main.rs")
         );
-        // Missing files keep their absolute form.
-        assert_eq!(graph_file_path("/nope/x.rs", None), "/nope/x.rs");
+
+        let marked = PathPolicy::new(&link, "", true);
+        assert_eq!(
+            graph_file_path(&format!("{real}/src/main.rs"), None, &marked),
+            format!("{link}/src/main.rs")
+        );
+        assert_eq!(
+            graph_file_path("src/main.rs", Some(&link), &marked),
+            format!("{link}/src/main.rs")
+        );
+
+        // No project: the absolute form, as given.
+        assert_eq!(
+            graph_file_path("/nope/x.rs", None, &PathPolicy::none()),
+            "/nope/x.rs"
+        );
     }
 
     #[test]
