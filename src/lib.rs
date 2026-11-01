@@ -1912,6 +1912,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         }
         cm.start_cleanup_task();
         cm.start_dead_cli_watchdog();
+        // A turn waiting on a tool result that will never come (issue #1056): nothing else
+        // ends it — the stop watchdog needs a stop, the dead-CLI one needs a dead process.
+        cm.start_lost_tool_result_watchdog();
         tracing::info!("Chat manager initialized");
         boot.done("chat");
         Some(cm)

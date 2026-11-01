@@ -207,6 +207,26 @@ pub async fn create_session(
     }
 
     // ── Create path (no session_id) ────────────────────────────────────────
+    // An AGENT caller (a chat session calling through its MCP server) gets the id at once
+    // and the opening goes on in the background (issue #1056). Why not for a person: their
+    // client shows the refusal inline (`no_cwd`, a provider that refuses, the session limit)
+    // and needs the place and the access in the same answer. An agent has no such screen and
+    // can be told later, in its own conversation; what it cannot afford is a call that never
+    // returns — measured at 107 s before the session was even persisted, against a 120 s
+    // client budget, with the parent left `streaming` for half an hour.
+    if let envelope::SpawnCaller::Agent {
+        session_id: caller_session,
+        ..
+    } = &caller
+    {
+        let response =
+            chat_manager.create_session_detached(request, Some(caller_session.clone()), opening);
+        // No entity extraction here, unlike the synchronous path below: it writes DISCUSSED
+        // relations FROM the session, and a refused opening now leaves no session to hang
+        // them on.
+        return Ok(Json(response));
+    }
+
     let response = chat_manager
         .create_session(&request)
         .await
