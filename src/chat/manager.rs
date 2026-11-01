@@ -54,6 +54,9 @@ const BROADCAST_BUFFER: usize = 256;
 /// How long a resumed CLI must stay up after its handshake before the resume is
 /// trusted (an unknown `--resume` target makes it exit within a second).
 const RESUME_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
+/// How long a provider switch waits for a streaming turn to stop before it reads what the turn
+/// had produced (`settle_cut_turn`). A cut turn ends in milliseconds; this only bounds a stuck one.
+const CUT_TURN_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How long an interrupted turn of the Claude CLI waits for the CLI's own `result` of
 /// that turn before it ends (see `stream_response`): a CLI answers an interrupt at
@@ -12168,6 +12171,16 @@ impl ChatManager {
         // the explicit one, else the target's own default (never the old provider's model name).
         let target_model = self.resolve_target_model(provider, model).await?;
 
+        // Pre-flight: the consent/gate/journal check runs BEFORE anything is stopped or closed,
+        // so a refused move never cuts a running turn nor tears the old process down (the old
+        // session stays exactly as it was: process live, resume token intact).
+        self.authorize_provider_switch(&node, provider, &target_model, claims.as_ref())
+            .await?;
+
+        // A turn still streaming is cut by the move: keep the answer it had produced before the
+        // conversation so far is read from what was stored.
+        self.settle_cut_turn(session_id).await;
+
         // The conversation so far, from what was stored.
         let records = self.graph.get_chat_events(previous, 0, 5_000).await?;
         let events: Vec<ChatEvent> = records
@@ -12234,12 +12247,6 @@ impl ChatManager {
         } else {
             None
         };
-
-        // Pre-flight: the consent/gate/journal check runs BEFORE the old process is closed,
-        // so a refused move never tears it down (the old session stays exactly as it was:
-        // process live, resume token intact).
-        self.authorize_provider_switch(&node, provider, &target_model, claims.as_ref())
-            .await?;
 
         // Re-target the SAME id in place: the node is updated, the old provider process is
         // closed quietly (`close_session_for_switch`, which emits no `session_closed` and,
@@ -12310,6 +12317,47 @@ impl ChatManager {
             omitted_entries: rendered.omitted,
             conversation_id: relayed.conversation_id.clone(),
         })
+    }
+
+    /// Stops the turn a provider switch is about to cut, and keeps the answer it had produced.
+    ///
+    /// On the agent engine a turn stores its answer only at its end, while the text streamed so
+    /// far lives in the session's buffer, which is cleared when the turn ends. Without this, a
+    /// conversation moved while the answer was streaming lost that answer: the target read the
+    /// question with no reply, and the thread showed nothing for it. The longest text the buffer
+    /// held is stored as the assistant's answer, before the relay is read. A session that is not
+    /// streaming is left as it is. Bounded: the wait never holds the switch longer than
+    /// `CUT_TURN_SETTLE`.
+    async fn settle_cut_turn(&self, session_id: &str) {
+        let Some(handle) = self.agent_runtime.get(session_id).await else {
+            return;
+        };
+        if !handle.is_streaming.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut partial = handle.streaming_text.lock().await.clone();
+        let _ = self.interrupt(session_id).await;
+        let deadline = tokio::time::Instant::now() + CUT_TURN_SETTLE;
+        while handle.is_streaming.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+            let text = handle.streaming_text.lock().await.clone();
+            if text.len() > partial.len() {
+                partial = text;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let text = handle.streaming_text.lock().await.clone();
+        if text.len() > partial.len() {
+            partial = text;
+        }
+        if partial.trim().is_empty() {
+            return;
+        }
+        handle
+            .emit(ChatEvent::AssistantText {
+                content: partial,
+                parent_tool_use_id: None,
+            })
+            .await;
     }
 
     /// Persists and broadcasts `event` on the thread of a session this instance may or
