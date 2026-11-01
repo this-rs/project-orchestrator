@@ -468,6 +468,7 @@ mod tests {
                 line_start: (i * 10) as u32,
                 line_end: (i * 10 + 9) as u32,
                 docstring: None,
+                owner: None,
             };
             store.upsert_function(&func).await.unwrap();
         }
@@ -854,6 +855,7 @@ mod tests {
             line_start: 10,
             line_end: 20,
             docstring: None,
+            owner: None,
         };
         let func_b = FunctionNode {
             name: "route_request".to_string(),
@@ -868,6 +870,7 @@ mod tests {
             line_start: 5,
             line_end: 15,
             docstring: None,
+            owner: None,
         };
 
         store.upsert_function(&func_a).await.unwrap();

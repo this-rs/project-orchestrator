@@ -19,6 +19,10 @@ mod environment;
 mod event_trigger;
 mod execution_place;
 mod feature_graph;
+/// Identité de fichier indépendante du point de montage (T7) : `file_uid`
+/// (identité), `declared_path` (écriture sous la racine déclarée) et
+/// `realpath_within_root` (périmètre du scan).
+pub mod file_uid;
 pub mod graph_sampler;
 pub mod graph_schema;
 mod impl_graph_store;
@@ -29,6 +33,7 @@ mod milestone;
 pub mod models;
 mod neighborhood;
 mod note;
+pub mod path_migration;
 mod persona;
 pub mod plan;
 mod plan_run;
@@ -43,6 +48,7 @@ pub mod segment;
 mod sharing;
 mod skill;
 mod step;
+pub mod symbol_key;
 mod synapse_shadow;
 mod task;
 mod topology;

@@ -164,6 +164,11 @@ pub trait ProjectStore: Send + Sync {
     /// Get a project by ID
     async fn get_project(&self, id: Uuid) -> Result<Option<ProjectNode>>;
 
+    /// The stored form of this project's file paths (see `file_uid::PathPolicy`):
+    /// canonical until `migrate file-paths --apply` marks the project, declared
+    /// after. Every site that writes or reads a `File.path` goes through it.
+    async fn path_policy(&self, id: Uuid) -> Result<crate::neo4j::file_uid::PathPolicy>;
+
     /// Get a project by slug
     async fn get_project_by_slug(&self, slug: &str) -> Result<Option<ProjectNode>>;
 
@@ -2495,6 +2500,13 @@ pub trait AnalyticsStore: Send + Sync {
     /// `neo4j::data_migrations`). Backends without migrations do nothing.
     async fn run_data_migrations(&self) -> Vec<crate::neo4j::data_migrations::MigrationOutcome> {
         Vec::new()
+    }
+
+    /// Fill `Project.canonical_path` where it is missing (see the Neo4j
+    /// implementation): the `File.uid` backfill reads it, and it cannot be
+    /// computed in Cypher. Returns `(scanned, updated)`.
+    async fn ensure_project_canonical_paths(&self) -> Result<(usize, usize)> {
+        Ok((0, 0))
     }
 
     /// Decay and prune the synapses of one project's notes (see the Neo4j

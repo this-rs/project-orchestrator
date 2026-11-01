@@ -1338,6 +1338,18 @@ pub const BOOT_PHASES: &[(&str, &str)] = &[
     ("listening", "Accepting connections"),
 ];
 
+/// Say what the boot-time repair of `Project.canonical_path` did. It never fails the
+/// boot: the `File.uid` backfill that follows reports its own precondition.
+fn report_canonical_path_repair(result: Result<(usize, usize)>) {
+    match result {
+        Ok((scanned, updated)) if updated > 0 => {
+            tracing::info!(scanned, updated, "Project roots: canonical path filled")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "Project roots: canonical path repair failed"),
+    }
+}
+
 pub async fn start_server(mut config: Config) -> Result<()> {
     use std::net::SocketAddr;
 
@@ -2239,6 +2251,10 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         // the same skills the migrations archive and purge.
         boot.start("migrations");
         tokio::spawn(async move {
+            // La racine canonique se calcule en Rust (aucun `realpath` en
+            // Cypher) : elle doit exister AVANT le backfill de `File.uid`, qui
+            // en dérive le chemin relatif — donc l'identité des fichiers.
+            report_canonical_path_repair(graph.ensure_project_canonical_paths().await);
             let outcomes = graph.run_data_migrations().await;
             for o in outcomes.iter().filter(|o| !o.skipped) {
                 tracing::info!(
@@ -3682,5 +3698,60 @@ chat:
         chat.obscura_path = None;
         apply_obscura(&mut chat, Some("./dsh-obscura-nav"), None, || None);
         assert_eq!(chat.obscura_path, None, "a relative path is not configured");
+    }
+}
+
+#[cfg(test)]
+mod canonical_path_repair_report_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What the boot says for one repair outcome, captured from `tracing`.
+    fn logged(result: Result<(usize, usize)>) -> String {
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || report_canonical_path_repair(result));
+        let bytes = sink.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn a_repair_that_wrote_something_is_reported() {
+        let out = logged(Ok((5, 2)));
+        assert!(out.contains("canonical path filled"), "{out}");
+        assert!(
+            out.contains("scanned=5") && out.contains("updated=2"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_repair_with_nothing_to_write_is_silent() {
+        assert_eq!(logged(Ok((5, 0))), "");
+    }
+
+    #[test]
+    fn a_failed_repair_is_a_warning_and_not_an_error() {
+        let out = logged(Err(anyhow::anyhow!("neo4j is away")));
+        assert!(out.contains("WARN"), "{out}");
+        assert!(out.contains("canonical path repair failed"), "{out}");
+        assert!(out.contains("neo4j is away"), "{out}");
     }
 }

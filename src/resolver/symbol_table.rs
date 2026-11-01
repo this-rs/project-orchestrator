@@ -256,6 +256,7 @@ mod tests {
                     line_start: *line,
                     line_end: line + 5,
                     docstring: None,
+                    owner: None,
                 })
                 .collect(),
             structs: structs
