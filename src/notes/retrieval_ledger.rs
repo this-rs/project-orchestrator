@@ -547,6 +547,10 @@ fn apply_or_overflow(entry: Entry, capacity: usize) -> bool {
 /// `dropped` : les événements concernés seront alors réglés par le tour courant,
 /// et le compteur dit que la mesure a été incomplète.
 pub fn begin_turn(session: Uuid) {
+    #[cfg(test)]
+    let Some(_isolation) = isolation_gate() else {
+        return;
+    };
     let capacity = CAPACITY.load(Ordering::Relaxed);
     if capacity == 0 {
         return;
@@ -566,10 +570,50 @@ pub fn journal_capacity() -> usize {
 /// Sérialise les tests qui touchent le registre : il est global, et deux tests
 /// concurrents se voleraient leurs événements. Résistant à l'empoisonnement, pour
 /// qu'un test qui panique ne fasse pas tomber les suivants.
+///
+/// La garde fait aussi taire les écrivains étrangers : le registre est écrit par
+/// le chemin de PRODUCTION (`NoteManager`, activation de skills, injection du chat),
+/// que des centaines de tests exécutent sans connaître cette garde. Tant qu'elle est
+/// tenue, une écriture d'un AUTRE thread est ignorée ([`isolation_gate`]), et la
+/// prise de la garde attend les écritures déjà en cours : un test du registre voit
+/// donc exactement ce qu'il a écrit. Mesuré : 15 échecs sur 30 sous charge sans
+/// cela, sur six assertions différentes (`kept`, `calls`, `dropped`, `evicted`…).
 #[cfg(test)]
-pub(crate) fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn serial_guard() -> SerialGuard {
     static SERIAL: Mutex<()> = Mutex::new(());
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // `write()` attend les écritures étrangères en vol (elles tiennent un `read()`).
+    *ISOLATION.write().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current().id());
+    SerialGuard { _serial: serial }
+}
+
+/// Le thread qui tient la garde, le temps qu'il la tient.
+#[cfg(test)]
+static ISOLATION: std::sync::RwLock<Option<std::thread::ThreadId>> = std::sync::RwLock::new(None);
+
+/// La garde des tests du registre : lève l'isolation, puis libère le verrou.
+#[cfg(test)]
+pub(crate) struct SerialGuard {
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for SerialGuard {
+    fn drop(&mut self) {
+        // Avant la libération du verrou (les champs tombent après `drop`).
+        *ISOLATION.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// `None` si un AUTRE thread tient la garde : l'écriture est ignorée. Sinon un
+/// `read()` à garder pour toute l'écriture, ce qui fait attendre `serial_guard`.
+#[cfg(test)]
+fn isolation_gate() -> Option<std::sync::RwLockReadGuard<'static, Option<std::thread::ThreadId>>> {
+    let gate = ISOLATION.read().unwrap_or_else(|e| e.into_inner());
+    match *gate {
+        Some(owner) if owner != std::thread::current().id() => None,
+        _ => Some(gate),
+    }
 }
 
 /// Fixe la capacité du journal (diagnostic, tests, ou bornage mémoire).
@@ -610,6 +654,8 @@ pub fn record_for_session(
     latency_ms: u64,
     session_id: Option<Uuid>,
 ) -> Option<u64> {
+    #[cfg(test)]
+    let _isolation = isolation_gate()?;
     LEDGER.calls.fetch_add(1, Ordering::Relaxed);
     // Un échec et un résultat vide sont deux choses différentes : une lecture qui
     // a échoué n'a rien répondu, elle n'a pas répondu « rien ».
@@ -702,6 +748,10 @@ pub struct Settled {
 /// Attend le verrou (pas le chemin chaud d'une recherche). Une session sans
 /// événement en attente ne fait rien : `Settled::default()`.
 pub fn settle_turn(session_id: Uuid, used: &[String]) -> Settled {
+    #[cfg(test)]
+    let Some(_isolation) = isolation_gate() else {
+        return Settled::default();
+    };
     let mut journal = lock_journal();
     let Some(ids) = journal.pending.remove(&session_id) else {
         return Settled::default();
@@ -739,6 +789,10 @@ pub fn settle_turn(session_id: Uuid, used: &[String]) -> Settled {
 /// Retourne `false` si l'événement n'est plus dans le journal (évincé par la
 /// capacité) : l'appelant n'a rien à en faire, et le manque est compté.
 pub fn outcome(event_id: u64, usage: Usage) -> bool {
+    #[cfg(test)]
+    let Some(_isolation) = isolation_gate() else {
+        return false;
+    };
     count_usage(&usage);
 
     // Même règle que `recent` : ce n'est pas le chemin chaud d'une recherche, et
@@ -1867,6 +1921,11 @@ mod tests {
     /// restent vrais pour `recent` et pour l'éviction.
     #[test]
     fn le_journal_reste_ordonne_par_identifiant() {
+        // Le journal est local, mais `push` évince en incrémentant les compteurs
+        // GLOBAUX (`LEDGER.evicted`) : sans la garde, ce test ajoutait deux
+        // évictions à celles qu'un autre test comptait au même moment.
+        let _g = serial_guard();
+        reset();
         let (_tx, rx) = std::sync::mpsc::sync_channel(4);
         let mut journal = Journal {
             events: VecDeque::new(),
