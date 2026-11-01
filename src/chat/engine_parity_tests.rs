@@ -700,14 +700,27 @@ fn bilan(m: &Measures) -> Bilan {
 /// (`engine label -> (greens, total)`), never from the measures: a render that started
 /// counting declared cells as green is then caught instead of being trusted.
 fn published_greens(table: &str) -> Vec<(String, usize, usize)> {
-    let line = table
+    // The document opens with a LEGEND that also starts with `` `ok` : `` — the first
+    // line of a real matrix is "`ok` : mesuré et conforme. …", not the totals. Taking
+    // the first match read the legend and published nothing, which the parity run
+    // caught on its first CI: every engine answered « aucune ligne de totaux publiée ».
+    // So: every candidate line is parsed, the one that yields the most engines wins, and
+    // a line that does not parse entirely is not a candidate at all.
+    table
         .lines()
-        .find(|l| l.starts_with("`ok` : "))
-        .unwrap_or_default();
+        .filter(|l| l.starts_with("`ok` : "))
+        .filter_map(totals_of)
+        .max_by_key(|totals| totals.len())
+        .unwrap_or_default()
+}
+
+/// `Claude Code 36/41, Codex 1/41.` → the three fields, or `None` if any of them is
+/// not `label N/M` (the legend line is exactly that case).
+fn totals_of(line: &str) -> Option<Vec<(String, usize, usize)>> {
     line.trim_start_matches("`ok` : ")
         .trim_end_matches('.')
         .split(", ")
-        .filter_map(|part| {
+        .map(|part| {
             let (label, counts) = part.rsplit_once(' ')?;
             let (green, total) = counts.split_once('/')?;
             Some((label.to_string(), green.parse().ok()?, total.parse().ok()?))
@@ -6033,6 +6046,21 @@ fn the_gate_fails_when_a_green_was_never_measured() {
         problems[0].contains("1 verts publiés pour 0 attestés"),
         "{}",
         problems[0]
+    );
+}
+
+#[test]
+fn published_greens_ignores_the_legend_the_document_opens_with() {
+    // The real document starts with a legend whose line ALSO starts with `` `ok` : ``.
+    // Reading it as the totals published nothing, and the parity run went red on CI.
+    let table = "`ok` : mesuré et conforme. `gap (cause, tâche)` : mesuré absent.\n\
+                 \n| a | b |\n\n`ok` : Claude Code 36/41, Codex 1/41.\n";
+    assert_eq!(
+        published_greens(table),
+        vec![
+            ("Claude Code".to_string(), 36, 41),
+            ("Codex".to_string(), 1, 41)
+        ]
     );
 }
 
