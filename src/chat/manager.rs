@@ -75,6 +75,29 @@ pub(crate) const ROUTING_CATALOG_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often the watchdog looks for a legacy session whose CLI process is gone (ZOMBIE-CLI).
 const DEAD_CLI_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How often the watchdog looks for a turn waiting on a tool result that will never come
+/// (LOST-TOOL-RESULT, issue #1056). A turn's clock is minutes, not seconds.
+const LOST_TOOL_RESULT_WATCH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A turn whose last persisted event is a `tool_use` of one of PO's OWN MCP tools, older
+/// than this, is dead: those hops are bounded (120 s for the REST proxy in `mcp::http_client`,
+/// 300 s for the native MCP client), so a result eight times past the larger bound is not
+/// late — it is lost. Nothing kills a turn faster than a lost result can hurt it: the turn
+/// is abandoned, its queued messages wait for the next one.
+const LOST_TOOL_RESULT_GRACE_MCP: Duration = Duration::from_secs(600);
+
+/// Same, for a tool that runs something (`Bash`, a script, a build): those have no bound of
+/// their own, so they are given a much longer silence before the turn is called dead. A
+/// command still running after an hour has outlived every budget this harness gives a turn.
+const LOST_TOOL_RESULT_GRACE_COMMAND: Duration = Duration::from_secs(3600);
+
+/// Whether a tool name belongs to one of PO's own MCP servers (`mcp__<server>__<tool>`) —
+/// i.e. hops this server serves, and whose budgets it therefore knows. The native tools
+/// (`Bash`, `Read`, ...) do not travel through it and keep the command grace.
+fn is_own_mcp_tool(tool: &str) -> bool {
+    tool.starts_with("mcp__")
+}
+
 /// How long the detached write of the episode a closed session leaves may take
 /// (`record_close_episode`: a few graph round trips). Past it, it is given up and logged.
 const CLOSE_EPISODE_BUDGET: Duration = Duration::from_secs(10);
@@ -7415,6 +7438,19 @@ impl ChatManager {
         request: &ChatRequest,
         relay: Option<&super::relay::RelayedFrom>,
     ) -> Result<CreateSessionResponse> {
+        self.create_session_relayed_at(request, relay, Uuid::new_v4())
+            .await
+    }
+
+    /// [`Self::create_session_relayed`] under an id the caller has ALREADY answered with
+    /// ([`Self::create_session_detached`]): everything the opening persists has to carry
+    /// that id, since the caller's client is already streaming `/ws/chat/<id>`.
+    async fn create_session_relayed_at(
+        &self,
+        request: &ChatRequest,
+        relay: Option<&super::relay::RelayedFrom>,
+        session_id: Uuid,
+    ) -> Result<CreateSessionResponse> {
         // The menu's ticks, read once: one model ticked is strict, an empty pool is none.
         let settled = request.settled_routing();
         let request = settled.as_ref().unwrap_or(request);
@@ -7432,7 +7468,6 @@ impl ChatManager {
             }
         });
         let request = delegated.as_ref().unwrap_or(request);
-        let session_id = Uuid::new_v4();
         if !request.cwd.trim().is_empty() {
             return self
                 .create_session_in_place(request, relay, session_id)
@@ -7466,6 +7501,158 @@ impl ChatManager {
             );
         }
         Ok(response)
+    }
+
+    /// Opens a session WITHOUT waiting for it (issue #1056): the caller gets the id now,
+    /// and the opening — graph reads (owner, project, provider), CLI spawn, first message —
+    /// goes on in a task of its own.
+    ///
+    /// WHY. `POST /api/chat/sessions` used to answer only once the WHOLE opening was over.
+    /// Measured on 2026-11-01 (issue #1056): ~107 s went by before the session was even
+    /// persisted — on a loaded machine, in the graph reads that precede it — while the MCP
+    /// caller's HTTP budget is 120 s (`mcp::http_client`). A parent asking for a child
+    /// through `chat(action: "send_message")` could then stay `streaming` for tens of
+    /// minutes with neither a result nor an error.
+    ///
+    /// WHAT THE CALLER KEEPS. The id (a session's stream is `/ws/chat/<id>`, and it is
+    /// known before anything is resolved), the place and the access, which the request
+    /// alone decides. What it no longer gets is the REFUSAL as an HTTP error: a refused
+    /// opening is reported as an `error` event in `notice_to` (the conversation that asked),
+    /// since no response is left to carry it. That is the trade issue #1056 asks for — a
+    /// bounded call, and the failure said where the conversation will read it.
+    ///
+    /// `opening` is the caller's in-flight ticket (P18-suite, point 6): it moves INTO the
+    /// task, so the live-children cap counts this opening until it is over. Without it, a
+    /// parent firing several detached openings would walk past its own cap.
+    pub fn create_session_detached(
+        self: &Arc<Self>,
+        request: ChatRequest,
+        notice_to: Option<String>,
+        opening: Option<super::envelope::OpeningTicket>,
+    ) -> CreateSessionResponse {
+        let session_id = Uuid::new_v4();
+        // What the request alone decides, answered now. The opening may narrow the access
+        // further; it can never widen what is said here, and a session says its `access`
+        // again on every read once it exists.
+        let execution_place = if request.cwd.trim().is_empty()
+            || super::neutral_place::is_neutral_path(&request.cwd)
+        {
+            super::neutral_place::ExecutionPlace::Neutral
+        } else {
+            super::neutral_place::ExecutionPlace::Project
+        };
+        let access = super::provider::policy::SessionAccess::for_open(
+            request.access,
+            matches!(
+                execution_place,
+                super::neutral_place::ExecutionPlace::Neutral
+            ),
+        );
+        let manager = Arc::clone(self);
+        let spawned = request;
+        let id = session_id.to_string();
+        let id_in_task = id.clone();
+        tokio::spawn(async move {
+            // Held for the whole opening, dropped with this task.
+            let _opening = opening;
+            if let Err(e) = manager
+                .create_session_relayed_at(&spawned, None, session_id)
+                .await
+            {
+                warn!(
+                    session_id = %id_in_task,
+                    error = %e,
+                    "a detached opening failed: the caller was already told the id"
+                );
+                manager
+                    .emit_session_event(
+                        notice_to.as_deref(),
+                        ChatEvent::Error {
+                            message: format!(
+                                "Opening session {id_in_task} failed: {e}. Nothing is running \
+                                 under that id; the conversation is free."
+                            ),
+                            parent_tool_use_id: None,
+                            code: Some("session_open_failed".to_string()),
+                            reason: None,
+                            index: None,
+                            request_id: None,
+                        },
+                    )
+                    .await;
+            }
+        });
+        CreateSessionResponse {
+            session_id: id,
+            stream_url: format!("/ws/chat/{session_id}"),
+            execution_place,
+            access,
+            notices: vec![
+                "this session is opening in the background: the id answers now and the \
+                 conversation fills as the provider opens. A refused opening is reported as an \
+                 error in the conversation that asked for it."
+                    .to_string(),
+            ],
+        }
+    }
+
+    /// Persists AND broadcasts one event for a session of EITHER engine: the agent engine
+    /// through its handle (which owns the sequence and the broadcast), the Claude Code
+    /// engine through its live `ActiveSession`, and — for a session nobody holds any more —
+    /// into the graph alone.
+    ///
+    /// Best effort by construction: a notice that fails to persist is logged and never fails
+    /// the caller. `None` (no conversation to tell) is a no-op, not a mistake.
+    pub(crate) async fn emit_session_event(&self, session_id: Option<&str>, event: ChatEvent) {
+        let Some(session_id) = session_id.filter(|s| !s.trim().is_empty()) else {
+            return;
+        };
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            handle.emit(event).await;
+            return;
+        }
+        let (tx, seq) = {
+            let sessions = self.active_sessions.read().await;
+            match sessions.get(session_id) {
+                Some(s) => (
+                    Some(s.events_tx.clone()),
+                    Some(s.next_seq.fetch_add(1, Ordering::SeqCst)),
+                ),
+                None => (None, None),
+            }
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(event.clone());
+        }
+        let Ok(uuid) = Uuid::parse_str(session_id) else {
+            warn!(
+                session_id,
+                "a session notice names no session id: not persisted"
+            );
+            return;
+        };
+        // A session nobody holds: its stored sequence is the only authority there is.
+        let seq = match seq {
+            Some(seq) => seq,
+            None => match self.graph.get_latest_chat_event_seq(uuid).await {
+                Ok(seq) => seq + 1,
+                Err(e) => {
+                    warn!(session_id, error = %e, "cannot read the last sequence: notice not persisted");
+                    return;
+                }
+            },
+        };
+        let record = ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: uuid,
+            seq,
+            event_type: event.event_type().to_string(),
+            data: serde_json::to_string(&event).unwrap_or_default(),
+            created_at: chrono::Utc::now(),
+        };
+        if let Err(e) = self.graph.store_chat_events(uuid, vec![record]).await {
+            warn!(session_id, error = %e, "failed to persist a session notice (non-fatal)");
+        }
     }
 
     /// [`Self::create_session_relayed`] once `request.cwd` is settled (a project's, or
@@ -18903,6 +19090,134 @@ impl ChatManager {
         });
     }
 
+    /// Arms the LOST-TOOL-RESULT watchdog (issue #1056).
+    ///
+    /// What it repairs: a session left `streaming` because the answer to one of its tool
+    /// calls never came back. Measured on 2026-11-01 — a parent asked for a child through
+    /// `chat(action: "send_message")`, the child was created and finished, and the parent
+    /// stayed `streaming` for 26+ minutes, no result and no error, until a human
+    /// interrupted it. No existing watchdog covers that case: the interrupt watchdog needs a
+    /// stop to have been asked, and the dead-CLI one needs a dead process.
+    ///
+    /// It only ever FIRES AN INTERRUPT — the ordinary, engine-agnostic way to end a turn —
+    /// after saying why in the conversation. It never closes a session: the work is still
+    /// there, and the next message resumes it.
+    pub fn start_lost_tool_result_watchdog(self: &Arc<Self>) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(LOST_TOOL_RESULT_WATCH_INTERVAL);
+            loop {
+                ticker.tick().await;
+                manager.abandon_turns_whose_tool_result_never_came().await;
+            }
+        });
+    }
+
+    /// One tick of the LOST-TOOL-RESULT watchdog: ends the turns whose last persisted event
+    /// is a tool call that got no result long ago, and returns the sessions it ended.
+    ///
+    /// The three cheap filters come first, in memory (`session_activity_map`): a turn is a
+    /// candidate only if it is streaming, holds no background subprocess (a monitor or a
+    /// `run_in_background` shell legitimately says nothing for minutes) and waits on no
+    /// permission. Only then is the graph asked what the LAST event was — two indexed reads,
+    /// for the few sessions that pass. A store that cannot answer means "not judged", never
+    /// "guess": a wrong interrupt costs a turn.
+    pub(crate) async fn abandon_turns_whose_tool_result_never_came(&self) -> Vec<String> {
+        let now = chrono::Utc::now();
+        let mut abandoned = Vec::new();
+        for (id, activity) in self.session_activity_map().await {
+            if !activity.streaming
+                || activity.background_tasks() > 0
+                || activity.pending_permissions > 0
+            {
+                continue;
+            }
+            let Some((tool, at)) = self.last_event_unanswered_tool_use(id).await else {
+                continue;
+            };
+            let silent_for = now.signed_duration_since(at).to_std().unwrap_or_default();
+            let grace = if is_own_mcp_tool(&tool) {
+                LOST_TOOL_RESULT_GRACE_MCP
+            } else {
+                LOST_TOOL_RESULT_GRACE_COMMAND
+            };
+            if silent_for < grace {
+                continue;
+            }
+            warn!(
+                session_id = %id,
+                tool = %tool,
+                silent_secs = silent_for.as_secs(),
+                grace_secs = grace.as_secs(),
+                "a tool result is lost: the turn waited past every budget of that call, ending it"
+            );
+            self.emit_session_event(
+                Some(&id.to_string()),
+                ChatEvent::Error {
+                    message: format!(
+                        "The call to `{tool}` never came back: this turn waited {} min for its \
+                         result, which is past every budget that call has, so the turn was ended. \
+                         The session is free again and your next message continues the \
+                         conversation. Only this turn's answer was lost.",
+                        silent_for.as_secs() / 60
+                    ),
+                    parent_tool_use_id: None,
+                    code: Some("tool_result_lost".to_string()),
+                    reason: None,
+                    index: None,
+                    request_id: None,
+                },
+            )
+            .await;
+            if let Err(e) = self.interrupt(&id.to_string()).await {
+                warn!(session_id = %id, error = %e, "ending a turn stuck on a lost tool result failed");
+                continue;
+            }
+            abandoned.push(id.to_string());
+        }
+        abandoned
+    }
+
+    /// The last persisted event of `session_id` when it is a `tool_use`, i.e. when nothing —
+    /// no result, no answer — has been written since that call. `None` for a session with no
+    /// event yet, and for any other last event: a finished turn, a message, a question.
+    async fn last_event_unanswered_tool_use(
+        &self,
+        session_id: Uuid,
+    ) -> Option<(String, chrono::DateTime<chrono::Utc>)> {
+        let count = match self.graph.count_chat_events(session_id).await {
+            Ok(count) => count,
+            Err(e) => {
+                debug!(session_id = %session_id, error = %e, "cannot count its events: session not judged");
+                return None;
+            }
+        };
+        if count == 0 {
+            return None;
+        }
+        let last = match self
+            .graph
+            .get_chat_events_paginated(session_id, count - 1, 1)
+            .await
+        {
+            Ok(mut events) => events.pop()?,
+            Err(e) => {
+                debug!(session_id = %session_id, error = %e, "cannot read its last event: session not judged");
+                return None;
+            }
+        };
+        if last.event_type != "tool_use" {
+            return None;
+        }
+        let data: serde_json::Value = serde_json::from_str(&last.data).ok()?;
+        let tool = data
+            .get("tool")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        Some((tool, last.created_at))
+    }
+
     /// Stores the episode a closed session leaves (`episodes::collector::collect_session_episode`).
     ///
     /// Called on an ANNOUNCED close only — never on an in-place switch, whose thread goes on.
@@ -24851,6 +25166,387 @@ mod tests {
             ChatManager::new_without_memory(dyn_graph, state.meili, test_config()),
             graph,
         )
+    }
+
+    /// Waits, bounded, for `check` to answer true — the detached task runs on its own.
+    /// Returns whether it did; a passing test leaves no line of it unrun.
+    async fn wait_until(mut check: impl FnMut() -> bool) -> bool {
+        let mut seen = false;
+        for _ in 0..500 {
+            if check() {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        seen
+    }
+
+    /// A persisted `tool_use` of `tool`, `minutes` minutes old (issue #1056, correctif B).
+    fn tool_use_event(
+        session_id: Uuid,
+        seq: i64,
+        tool: &str,
+        minutes: i64,
+    ) -> crate::neo4j::models::ChatEventRecord {
+        crate::neo4j::models::ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id,
+            seq,
+            event_type: "tool_use".to_string(),
+            data: serde_json::json!({"type": "tool_use", "tool": tool}).to_string(),
+            created_at: chrono::Utc::now() - chrono::Duration::minutes(minutes),
+        }
+    }
+
+    fn an_error_event() -> ChatEvent {
+        ChatEvent::Error {
+            message: "notice".to_string(),
+            parent_tool_use_id: None,
+            code: Some("session_open_failed".to_string()),
+            reason: None,
+            index: None,
+            request_id: None,
+        }
+    }
+
+    // issue #1056, correctif A. The call an agent makes has to be BOUNDED: the id answers
+    // before the opening has read anything, so no HTTP budget can be busted by a slow graph
+    // (measured: 107 s before the session was even persisted, against a 120 s client budget).
+    //
+    // The proof that nothing is waited for is the SIGNATURE: `create_session_detached` is not
+    // `async`, so it cannot await the opening. What is left to check is the answer's shape,
+    // and that the opening really does happen afterwards.
+    #[tokio::test]
+    async fn test_a_detached_opening_answers_its_id_and_the_opening_still_happens() {
+        let (manager, graph) = manager_with_mock();
+        let manager = Arc::new(manager);
+        let response =
+            manager
+                .clone()
+                .create_session_detached(agent_request("open a child"), None, None);
+
+        let id = Uuid::parse_str(&response.session_id).expect("a uuid, answered now");
+        assert_eq!(response.stream_url, format!("/ws/chat/{id}"));
+        assert_eq!(
+            response.execution_place,
+            crate::chat::neutral_place::ExecutionPlace::Project,
+            "the request's cwd alone decides the place, and it is answered now"
+        );
+        assert!(
+            !response.notices.is_empty(),
+            "the caller is told the opening is still going on"
+        );
+        // THE regression assertion: the answer came BEFORE the opening persisted anything.
+        // Nothing was awaited between the call and this line, so a caller that had waited for
+        // the opening (the behaviour issue #1056 reports) would already find the session here
+        // — the synchronous `create_session` persists before it returns.
+        assert!(
+            graph
+                .chat_sessions
+                .try_read()
+                .map(|s| !s.contains_key(&id))
+                .unwrap_or(true),
+            "the id is answered before the opening has persisted anything"
+        );
+
+        // The opening is not skipped: the session is persisted by the detached task.
+        assert!(
+            wait_until(|| {
+                graph
+                    .chat_sessions
+                    .try_read()
+                    .map(|s| s.contains_key(&id))
+                    .unwrap_or(false)
+            })
+            .await,
+            "the detached task persisted the session under the promised id"
+        );
+    }
+
+    // issue #1056, correctif A, second half: a refused opening can no longer be an HTTP
+    // error (the response left long before), so it is reported where the conversation will
+    // read it — as an `error` event in the session that asked.
+    #[tokio::test]
+    async fn test_a_refused_detached_opening_is_reported_in_the_calling_conversation() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let dyn_graph: Arc<dyn GraphStore> = graph.clone();
+        let mut config = test_config();
+        // No room at all: the opening is refused before anything is persisted, which is
+        // exactly the refusal the caller can no longer receive as an HTTP error.
+        config.max_sessions = 0;
+        let manager = Arc::new(ChatManager::new_without_memory(
+            dyn_graph,
+            mock_app_state().meili,
+            config,
+        ));
+        let parent = crate::test_helpers::test_chat_session(None);
+        graph.create_chat_session(&parent).await.unwrap();
+
+        let response = manager.clone().create_session_detached(
+            agent_request("open a child"),
+            Some(parent.id.to_string()),
+            None,
+        );
+        assert!(Uuid::parse_str(&response.session_id).is_ok());
+
+        assert!(
+            wait_until(|| {
+                graph
+                    .chat_events
+                    .try_read()
+                    .map(|events| {
+                        events.get(&parent.id).is_some_and(|list| {
+                            list.iter().any(|e| {
+                                e.event_type == "error" && e.data.contains("session_open_failed")
+                            })
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .await,
+            "the refusal is an event in the conversation that asked"
+        );
+    }
+
+    // issue #1056, correctif B. The rule reads the LAST persisted event: a call with nothing
+    // written after it is unanswered; anything written after it means the turn moved on.
+    #[tokio::test]
+    async fn test_the_lost_tool_result_rule_reads_an_unanswered_call_and_never_a_finished_turn() {
+        let (manager, graph) = manager_with_mock();
+        let session = crate::test_helpers::test_chat_session(None);
+        graph.create_chat_session(&session).await.unwrap();
+        let sid = session.id;
+        let event =
+            |seq: i64, kind: &str, data: serde_json::Value| crate::neo4j::models::ChatEventRecord {
+                id: Uuid::new_v4(),
+                session_id: sid,
+                seq,
+                event_type: kind.to_string(),
+                data: data.to_string(),
+                created_at: chrono::Utc::now(),
+            };
+
+        // Nothing written yet: no judgement to make.
+        assert!(manager.last_event_unanswered_tool_use(sid).await.is_none());
+
+        graph
+            .store_chat_events(
+                sid,
+                vec![event(
+                    1,
+                    "tool_use",
+                    serde_json::json!({
+                        "type": "tool_use",
+                        "tool": "mcp__project-orchestrator__chat",
+                    }),
+                )],
+            )
+            .await
+            .unwrap();
+        let (tool, _) = manager
+            .last_event_unanswered_tool_use(sid)
+            .await
+            .expect("a call nobody answered");
+        assert_eq!(tool, "mcp__project-orchestrator__chat");
+        assert!(
+            is_own_mcp_tool(&tool),
+            "PO's own hop: the short grace applies"
+        );
+
+        // The result arrives: the turn is not waiting any more.
+        graph
+            .store_chat_events(
+                sid,
+                vec![event(
+                    2,
+                    "tool_result",
+                    serde_json::json!({"type": "tool_result", "tool_use_id": "call_1"}),
+                )],
+            )
+            .await
+            .unwrap();
+        assert!(
+            manager.last_event_unanswered_tool_use(sid).await.is_none(),
+            "an answered call is not a lost result"
+        );
+
+        // A turn that ended says nothing about a lost result either.
+        graph
+            .store_chat_events(
+                sid,
+                vec![event(
+                    3,
+                    "assistant_text",
+                    serde_json::json!({"type": "assistant_text", "content": "done"}),
+                )],
+            )
+            .await
+            .unwrap();
+        assert!(manager.last_event_unanswered_tool_use(sid).await.is_none());
+    }
+
+    /// The watchdog's tick is a no-op when no session is streaming: an idle server never
+    /// interrupts anything.
+    #[tokio::test]
+    async fn test_the_lost_tool_result_watchdog_ends_nothing_when_nothing_is_streaming() {
+        let (manager, _graph) = manager_with_mock();
+        assert!(manager
+            .abandon_turns_whose_tool_result_never_came()
+            .await
+            .is_empty());
+    }
+
+    // issue #1056, correctif B, de bout en bout : une session VIVANTE dont le dernier
+    // événement persisté est un appel MCP sans résultat, vieux de 11 min, est interrompue —
+    // et la raison est écrite dans la conversation. La session n'est pas fermée.
+    #[tokio::test]
+    async fn test_the_watchdog_ends_a_turn_whose_mcp_tool_result_is_lost() {
+        let (manager, graph) = manager_with_mock();
+        let manager = Arc::new(manager);
+        let session = crate::test_helpers::test_chat_session(None);
+        graph.create_chat_session(&session).await.unwrap();
+        let sid = session.id;
+        graph
+            .store_chat_events(
+                sid,
+                vec![tool_use_event(
+                    sid,
+                    1,
+                    "mcp__project-orchestrator__chat",
+                    11,
+                )],
+            )
+            .await
+            .unwrap();
+        let (dummy, _pending) = create_dummy_session(true, "", Vec::new());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(sid.to_string(), dummy);
+
+        let ended = manager.abandon_turns_whose_tool_result_never_came().await;
+
+        assert_eq!(ended, vec![sid.to_string()], "the stuck turn is ended");
+        let events = graph.chat_events.read().await;
+        let notice = events
+            .get(&sid)
+            .expect("its events")
+            .iter()
+            .find(|e| e.data.contains("tool_result_lost"))
+            .expect("the reason is written in the conversation");
+        assert_eq!(notice.event_type, "error");
+        assert!(
+            graph.get_chat_session(sid).await.unwrap().is_some(),
+            "the session is NOT closed: its next message continues it"
+        );
+    }
+
+    // issue #1056, correctif B : un relevé qui échoue ne juge pas la session. Lire le compte,
+    // puis le dernier événement, peut échouer : la session est laissée tranquille, jamais
+    // interrompue sur une lecture qu'on n'a pas pu faire.
+    #[tokio::test]
+    async fn test_the_lost_tool_result_rule_does_not_judge_a_session_it_cannot_read() {
+        let (manager, graph) = manager_with_mock();
+        let sid = Uuid::new_v4();
+        graph
+            .store_chat_events(
+                sid,
+                vec![tool_use_event(
+                    sid,
+                    1,
+                    "mcp__project-orchestrator__chat",
+                    11,
+                )],
+            )
+            .await
+            .unwrap();
+
+        graph.fail_reads.lock().unwrap().insert("count_chat_events");
+        assert!(manager.last_event_unanswered_tool_use(sid).await.is_none());
+
+        graph.fail_reads.lock().unwrap().clear();
+        graph
+            .fail_reads
+            .lock()
+            .unwrap()
+            .insert("get_chat_events_paginated");
+        assert!(manager.last_event_unanswered_tool_use(sid).await.is_none());
+    }
+
+    // issue #1056, correctif B : les deux cas qui NE doivent PAS déclencher. Un appel MCP de
+    // 2 minutes est simplement lent ; une commande de 11 minutes est dans son droit (elle
+    // n'a pas la borne courte des hops de PO).
+    #[tokio::test]
+    async fn test_the_watchdog_leaves_a_recent_call_and_a_command_alone() {
+        let (manager, graph) = manager_with_mock();
+        let manager = Arc::new(manager);
+        let recent = crate::test_helpers::test_chat_session(None);
+        let command = crate::test_helpers::test_chat_session(None);
+        for (node, tool, minutes) in [
+            (&recent, "mcp__project-orchestrator__chat", 2),
+            (&command, "Bash", 11),
+        ] {
+            graph.create_chat_session(node).await.unwrap();
+            graph
+                .store_chat_events(node.id, vec![tool_use_event(node.id, 1, tool, minutes)])
+                .await
+                .unwrap();
+            let (dummy, _pending) = create_dummy_session(true, "", Vec::new());
+            manager
+                .active_sessions
+                .write()
+                .await
+                .insert(node.id.to_string(), dummy);
+        }
+
+        assert!(
+            manager
+                .abandon_turns_whose_tool_result_never_came()
+                .await
+                .is_empty(),
+            "neither a slow call nor a long command is a lost result"
+        );
+    }
+
+    /// A notice with nowhere to go is dropped: never a panic, never another session.
+    #[tokio::test]
+    async fn test_a_session_notice_without_a_usable_session_is_dropped() {
+        let (manager, graph) = manager_with_mock();
+        manager.emit_session_event(None, an_error_event()).await;
+        manager
+            .emit_session_event(Some("   "), an_error_event())
+            .await;
+        manager
+            .emit_session_event(Some("not-a-uuid"), an_error_event())
+            .await;
+        assert!(
+            graph.chat_events.read().await.is_empty(),
+            "nothing was written for a session nobody named"
+        );
+    }
+
+    /// No `cwd`: the request alone already says the session is neutral, and that is answered
+    /// before the host has made the directory.
+    #[tokio::test]
+    async fn test_a_detached_opening_without_a_cwd_answers_the_neutral_place() {
+        let (manager, _graph) = manager_with_mock();
+        let manager = Arc::new(manager);
+        let mut request = agent_request("open a child");
+        request.cwd = String::new();
+
+        let response = manager.clone().create_session_detached(request, None, None);
+
+        assert_eq!(
+            response.execution_place,
+            crate::chat::neutral_place::ExecutionPlace::Neutral
+        );
+        assert!(
+            !response.access.is_normal(),
+            "a neutral place with no access asked for opens read_only (ChatRequest::access), \
+             and the caller learns it in the same answer"
+        );
     }
 
     #[tokio::test]
