@@ -556,6 +556,7 @@ The chat system is configured via environment variables:
 | `CHAT_SESSION_TIMEOUT_SECS` | Idle timeout before subprocess is freed | `1800` (30 min) |
 | `CHAT_MAX_TURNS` | Maximum agentic turns (tool calls) per message | `50` |
 | `CHAT_AUTO_CONTINUE` | Operator kill switch of auto-continue: `false` or `0` stops interactive sessions from continuing a turn that stopped on its `max_turns` limit (runner sessions always continue). Any other value, or unset: on, capped at 5 continuations in a row | on |
+| `RESUME_ON_START` | Operator switch of what a restart relaunches: `false` or `0` relaunches nothing at boot — neither the chat turns the restart cut nor the plan runs it interrupted — and starts neither the schedule nor the event trigger. Meant for a copy of a production database (see [Operations](operations.md#starting-a-copy-of-a-production-database)). Any other value, or unset: on | on |
 | `PROMPT_BUILDER_MODEL` | Model for oneshot prompt builder (context refinement) | `claude-opus-4-6` |
 | `MCP_SERVER_PATH` | Path to the MCP server binary | Auto-detected |
 

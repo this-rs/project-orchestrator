@@ -568,6 +568,17 @@ pub(crate) fn auto_continue_from_env(value: Option<&str>) -> bool {
     )
 }
 
+/// `RESUME_ON_START`: at boot, the server relaunches the agent work the restart cut
+/// (chat turns, plan runs). On unless the operator turns it off (`false` or `0`, any
+/// case) — a copy of a production database started for a test must not wake agents.
+/// Unset or any other value: on.
+pub fn resume_on_start_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("false" | "0")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,6 +627,17 @@ mod tests {
         assert!(!auto_continue_from_env(Some("false")));
         assert!(!auto_continue_from_env(Some(" FALSE ")));
         assert!(!auto_continue_from_env(Some("0")));
+    }
+
+    /// Resume on start is on by default; `RESUME_ON_START=false|0` keeps the cut work asleep.
+    #[test]
+    fn resume_on_start_is_on_unless_the_operator_turns_it_off() {
+        assert!(resume_on_start_from_env(None));
+        assert!(resume_on_start_from_env(Some("true")));
+        assert!(resume_on_start_from_env(Some("")));
+        assert!(!resume_on_start_from_env(Some("false")));
+        assert!(!resume_on_start_from_env(Some(" FALSE ")));
+        assert!(!resume_on_start_from_env(Some("0")));
     }
 
     /// M2: the agent engine is the default; legacy stays selectable; a value set but not

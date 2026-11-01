@@ -2027,6 +2027,15 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         });
     }
 
+    // `RESUME_ON_START=false`: the restart relaunches nothing — neither the cut chat turns
+    // nor the interrupted plan runs. Read once, for both recoveries below.
+    let resume_on_start = crate::chat::config::resume_on_start_from_env(
+        std::env::var("RESUME_ON_START").ok().as_deref(),
+    );
+    if !resume_on_start {
+        tracing::warn!("RESUME_ON_START=false: no session or plan run is relaunched at boot");
+    }
+
     // Plan runner: resume what can be resumed, then reconcile. Reconciliation closes
     // every `running` PlanRun / AgentExecution this process does not drive (boot, then
     // every RECONCILE_INTERVAL), so a "running" state is always a real one.
@@ -2070,7 +2079,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
 
             let mut resumed = 0usize;
             let mut recovery_failure: Option<String> = None;
-            if let Some(runner) = runner {
+            if let Some(runner) = runner.filter(|_| resume_on_start) {
                 match runner.recover_interrupted_runs().await {
                     Ok(0) => {} // no runs to recover, stay silent
                     Ok(count) => {
@@ -2111,7 +2120,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Agent turns cut by the restart: judged now (fast), resumed in the background, once the
     // vault lets the providers read their keys. The startup never waits for a person.
     boot.start("chat_turns");
-    match chat_manager.as_ref() {
+    match chat_manager.as_ref().filter(|_| resume_on_start) {
+        None if !resume_on_start => boot.skip("chat_turns", "RESUME_ON_START=false"),
         None => boot.skip("chat_turns", "no chat manager"),
         Some(cm) => match cm.scan_interrupted_turns().await {
             Err(e) => boot.fail("chat_turns", e),
@@ -2174,7 +2184,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             None, // default 60s
         );
         let mut trigger_failure: Option<String> = None;
-        if let Err(e) = schedule_provider.setup().await {
+        if !resume_on_start {
+            tracing::warn!("ScheduleProvider not started: RESUME_ON_START=false");
+        } else if let Err(e) = schedule_provider.setup().await {
             tracing::warn!("ScheduleProvider setup failed (non-fatal): {}", e);
             trigger_failure = Some(format!("schedule: {e}"));
         } else {
@@ -2187,7 +2199,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         let event_rx = event_bus.subscribe();
         let event_provider =
             runner::providers::event::EventProvider::new(graph.clone(), dispatcher, event_rx);
-        if let Err(e) = event_provider.setup().await {
+        if !resume_on_start {
+            tracing::warn!("EventProvider not started: RESUME_ON_START=false");
+        } else if let Err(e) = event_provider.setup().await {
             tracing::warn!("EventProvider setup failed (non-fatal): {}", e);
             trigger_failure = Some(format!("event: {e}"));
         } else {

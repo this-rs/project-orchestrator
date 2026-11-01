@@ -105,3 +105,42 @@ system temp directory: two simulated trees (identical and divergent) for
 `in-service`, a deliberately stale pin versus the head pin for `pins`. Only
 `run()` touches the real disk and network. CI (lint job) formats, lints and
 tests the crate, then runs `in-service` HEAD-against-HEAD as a smoke test.
+
+## Starting a copy of a production database
+
+Before an upgrade that carries data migrations (`neo4j/data_migrations.rs`,
+for instance `2026-10-backfill-stable-key` and `2026-10-backfill-file-uid`),
+run the new binary on a **restored copy** of the production database, not on
+production. Each point below was met in practice.
+
+1. **Back up consistently.** Neo4j Community cannot dump a running database:
+   stop it, run `neo4j-admin database dump neo4j --to-path=<dir>`, start it
+   again. Meilisearch: `POST /dumps`.
+2. **Restore into separate containers**, on other ports and new volumes,
+   never into the production ones. Give the throwaway Meilisearch a master
+   key: a keyless instance rejects the empty key of the config and the
+   server stops at boot with `invalid_api_key`.
+3. **Pass an explicit `--config`** that points at the copy. Auto-detection
+   finds the production `config.yaml`.
+4. **Isolate `HOME`.** The server also writes under `~/.claude*`, the vault
+   files and `~/.project-orchestrator`, and the `claude` CLI looks its
+   transcripts up there.
+5. **Set `RESUME_ON_START=false`.** The copy still holds the sessions that
+   were live when it was taken. Without the switch the server launches the
+   `claude` CLI in the real working directory to resume them, relaunches the
+   interrupted plan runs, and starts the schedule and event triggers. With
+   it, none of that happens; the boot log says so (`RESUME_ON_START=false:
+   no session or plan run is relaunched at boot`).
+6. **Mind the listener.** With no `auth` section the server answers every
+   request anonymously on `0.0.0.0` and logs `AUTH DISABLED` at boot. Stop it
+   as soon as the check is done, or configure `auth`.
+7. **A run is not read-only.** `RESUME_ON_START=false` keeps the agents
+   asleep, not the maintenance: the file watcher resyncs the projects whose
+   path exists on the machine, and the heartbeat prunes weak synapses
+   (`DecaySynapses`). Reload the copy from the dump to start over.
+
+Data migrations are resumable. Each one commits in batches and is recorded by
+a `(:DataMigration {id})` marker once complete; a restart after a cut skips
+the nodes already written and a restart after completion replays nothing. To
+check a run, compare the marker count with the number of migrations the
+binary declares, and count the nodes still without their new property.
