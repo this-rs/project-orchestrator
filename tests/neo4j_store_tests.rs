@@ -1879,3 +1879,103 @@ async fn test_a_deleted_parent_has_no_children_left_by_the_spawned_by_fallback()
 
     store.delete_chat_session(child.id).await.unwrap();
 }
+
+// ===========================================================================
+// src/neo4j/user.rs — rotation of refresh tokens
+// ===========================================================================
+
+/// `/auth/refresh` calls exactly this, once per rotation.
+///
+/// Three properties are asserted, in the order the handler depends on them:
+/// a fresh token is consumed and reports its owner; the same cookie replayed
+/// is refused (single use, no window where two concurrent refreshes both win);
+/// and an expired token is refused even though consuming it still revokes it.
+#[tokio::test]
+async fn refresh_token_rotation_is_single_use_and_carries_its_user() {
+    let client = store_or_skip!();
+    let store: &dyn GraphStore = &client;
+
+    let user = a_password_user();
+    store.upsert_user(&user).await.unwrap();
+    let hash = format!("{:064x}", Uuid::new_v4().as_u128());
+
+    store
+        .create_refresh_token(
+            user.id,
+            &hash,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap();
+
+    // --- happy path: consumed, and the user comes back with the token ---
+    let (consumed, owner) = store
+        .consume_refresh_token(&hash)
+        .await
+        .unwrap()
+        .expect("a freshly issued token must be consumable");
+    assert_eq!(consumed.user_id, user.id);
+    assert!(
+        !consumed.revoked,
+        "the returned node carries the state observed BEFORE the revoke, not the one just written"
+    );
+    assert_eq!(
+        owner.expect("the user row exists in the graph").id,
+        user.id,
+        "the same round trip must hand back the user the JWT claims are built from"
+    );
+
+    // --- replay of the same cookie: refused, and the node reads as revoked ---
+    assert!(
+        store.consume_refresh_token(&hash).await.unwrap().is_none(),
+        "rotation is single use"
+    );
+    assert!(store.validate_refresh_token(&hash).await.unwrap().is_none());
+
+    // --- expired token: refused, and consuming it still revokes it ---
+    let expired = format!("{:064x}", Uuid::new_v4().as_u128());
+    store
+        .create_refresh_token(
+            user.id,
+            &expired,
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .consume_refresh_token(&expired)
+            .await
+            .unwrap()
+            .is_none(),
+        "an expired token must not rotate"
+    );
+
+    // --- a token whose user row is gone still rotates: the caller falls back
+    // to the root account, so `owner` is legitimately `None` ---
+    let orphan = format!("{:064x}", Uuid::new_v4().as_u128());
+    store
+        .create_refresh_token(
+            Uuid::new_v4(),
+            &orphan,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap();
+    let (_, no_owner) = store
+        .consume_refresh_token(&orphan)
+        .await
+        .unwrap()
+        .expect("rotates without a user row");
+    assert!(
+        no_owner.is_none(),
+        "no user row -> None, the handler falls back to the root account"
+    );
+
+    // --- unknown hash: None, not an error, not a created node ---
+    assert!(store
+        .consume_refresh_token(&format!("{:064x}", Uuid::new_v4().as_u128()))
+        .await
+        .unwrap()
+        .is_none());
+}

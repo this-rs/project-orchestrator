@@ -2155,7 +2155,8 @@ mod tests {
     use crate::neo4j::traits::*;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{
-        mock_app_state, test_bearer_token, test_plan, test_task_titled, test_workspace,
+        mock_app_state, test_bearer_token, test_plan, test_project, test_task_titled,
+        test_workspace,
     };
     use axum::body::Body;
     use axum::http::{Request, StatusCode as HttpStatus};
@@ -2173,7 +2174,15 @@ mod tests {
 
     /// Build a test router with mock backends
     async fn test_app() -> axum::Router {
-        let app_state = mock_app_state();
+        test_app_with(mock_app_state()).await
+    }
+
+    /// Same router, on an already seeded mock store.
+    ///
+    /// Tests that need data to exist *before* the router is built (a workspace
+    /// with projects, a milestone with tasks…) come through here instead of
+    /// duplicating the `ServerState` boilerplate.
+    async fn test_app_with(app_state: crate::AppState) -> axum::Router {
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -3593,5 +3602,76 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
         assert_eq!(body_json(resp).await["title"], "renamed");
+    }
+    /// The overview page mounts this summary on every load, and computing it runs
+    /// the whole workspace fan-out (14 queries per project). That recomputation is
+    /// exactly what starved the Neo4j pool and made `/auth/refresh` wait 57 s, so
+    /// the second call inside the TTL must be answered from the cache: a project
+    /// added between the two calls does not appear, which is what proves the
+    /// fan-out did NOT run again.
+    #[tokio::test]
+    async fn workspace_intelligence_summary_is_cached_within_the_ttl() {
+        let app_state = mock_app_state();
+
+        // A slug of its own: the cache is a process-wide static keyed by slug,
+        // and tests run in parallel.
+        let mut ws = test_workspace();
+        ws.slug = format!("intel-cache-{}", Uuid::new_v4());
+        app_state.neo4j.create_workspace(&ws).await.unwrap();
+
+        let first_project = test_project();
+        app_state
+            .neo4j
+            .create_project(&first_project)
+            .await
+            .unwrap();
+        app_state
+            .neo4j
+            .add_project_to_workspace(ws.id, first_project.id)
+            .await
+            .unwrap();
+
+        let (app, first_body) = {
+            let app = test_app_with(app_state.clone()).await;
+            let uri = format!("/api/workspaces/{}/intelligence/summary", ws.slug);
+            let resp = app.clone().oneshot(auth_get(&uri)).await.unwrap();
+            assert_eq!(resp.status(), HttpStatus::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json["per_project"].as_array().map(|a| a.len()),
+                Some(1),
+                "the summary must report the one project of the workspace"
+            );
+            (app, json)
+        };
+
+        // A project joined the workspace after the summary was computed.
+        let second_project = test_project();
+        app_state
+            .neo4j
+            .create_project(&second_project)
+            .await
+            .unwrap();
+        app_state
+            .neo4j
+            .add_project_to_workspace(ws.id, second_project.id)
+            .await
+            .unwrap();
+
+        let uri = format!("/api/workspaces/{}/intelligence/summary", ws.slug);
+        let resp = app.oneshot(auth_get(&uri)).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let second_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            second_body, first_body,
+            "within the TTL the summary comes from the cache: the fan-out did not run again"
+        );
     }
 }
