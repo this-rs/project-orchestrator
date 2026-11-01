@@ -38,6 +38,7 @@ use super::trigger_handlers;
 use super::update_handlers;
 use super::vault_handlers;
 use super::workspace_handlers;
+use super::ws_activity_handler;
 use super::ws_chat_handler;
 use super::ws_handlers;
 use super::ws_run_handler;
@@ -366,6 +367,7 @@ fn public_routes() -> Router<OrchestratorState> {
         // WebSocket (public — auth via cookie or ticket fallback)
         // ================================================================
         .route("/ws/events", get(ws_handlers::ws_events))
+        .route("/ws/activity", get(ws_activity_handler::ws_activity))
         .route("/ws/chat/{session_id}", get(ws_chat_handler::ws_chat))
         .route("/ws/run/{run_id}", get(ws_run_handler::ws_run))
         // NOTE: `/hooks/wake` and `/internal/events` are NOT public. They mutate
@@ -875,6 +877,12 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/attention",
             get(super::attention_aggregate::get_attention),
+        )
+        // Live Activity Hub: what every run of the scope is doing, in one
+        // request, plus the sequence number the live feed resumes from.
+        .route(
+            "/api/activity/snapshot",
+            get(super::activity_handlers::get_activity_snapshot),
         )
         // Every agent whose CLI is running right now, whatever started it.
         .route(
