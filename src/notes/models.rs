@@ -664,6 +664,43 @@ impl AssertionResult {
 // Main Note Struct
 // ============================================================================
 
+/// Provenance of a revision: the previous version of a note was replaced by this one.
+///
+/// A note outside its validity window (or superseded) cannot be used as is; it is
+/// REVISED — a new version carrying this record — not refused. `evidence` is
+/// mandatory and non-blank: a revision with no stated proof is a rewrite.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoteRevision {
+    /// Who revised.
+    pub revised_by: String,
+    /// When.
+    pub revised_at: DateTime<Utc>,
+    /// On what proof (a commit sha, a test, a command output, a link).
+    pub evidence: String,
+    /// The version that was replaced.
+    pub revises: Uuid,
+}
+
+/// What a plain `CreateNoteRequest` does not carry: a validity window and the
+/// provenance of a revision. `Default` = a note like any other.
+#[derive(Debug, Clone, Default)]
+pub struct NoteExtras {
+    pub valid_from: Option<DateTime<Utc>>,
+    pub valid_until: Option<DateTime<Utc>>,
+    pub revision: Option<NoteRevision>,
+}
+
+/// Where a note stands against its validity window at a given instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Validity {
+    /// Inside the window (or no window).
+    Current,
+    /// The window has not opened yet.
+    NotYetValid(DateTime<Utc>),
+    /// The window has closed.
+    Expired(DateTime<Utc>),
+}
+
 /// A Knowledge Note capturing contextual information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Note {
@@ -761,6 +798,18 @@ pub struct Note {
     /// Last assertion result (for assertion notes)
     pub last_assertion_result: Option<AssertionResult>,
 
+    // Validity window (PR5: preserve without forcing)
+    /// The note is knowledge only FROM this instant (None = since always).
+    #[serde(default)]
+    pub valid_from: Option<DateTime<Utc>>,
+    /// The note is knowledge only UNTIL this instant (None = no end).
+    #[serde(default)]
+    pub valid_until: Option<DateTime<Utc>>,
+    /// Who revised the previous version into this one, when, and on what evidence.
+    /// Set only by a revision; a plain `supersede` leaves it empty.
+    #[serde(default)]
+    pub revision: Option<NoteRevision>,
+
     // Privacy / Sharing consent (RFC Privacy §2.4)
     /// Sharing consent for P2P knowledge exchange.
     /// Controls whether this note can be shared via the distillation pipeline.
@@ -769,6 +818,24 @@ pub struct Note {
 }
 
 impl Note {
+    /// Where this note stands against its validity window at `now`.
+    ///
+    /// A bound is inclusive at its start and exclusive at its end: a note valid
+    /// `[from, until)`. No window at all is always `Current`.
+    pub fn validity_at(&self, now: DateTime<Utc>) -> Validity {
+        if let Some(from) = self.valid_from {
+            if now < from {
+                return Validity::NotYetValid(from);
+            }
+        }
+        if let Some(until) = self.valid_until {
+            if now >= until {
+                return Validity::Expired(until);
+            }
+        }
+        Validity::Current
+    }
+
     /// The label the knowledge graph shows for a note: its content, cut at 40 characters.
     ///
     /// ONE formula, used by the graph endpoint AND by the live `node_created` event.
@@ -828,6 +895,9 @@ impl Note {
             changes: vec![NoteChange::new(ChangeType::Created, created_by)],
             assertion_rule: None,
             last_assertion_result: None,
+            valid_from: None,
+            valid_until: None,
+            revision: None,
             sharing_consent: crate::episodes::distill_models::SharingConsent::NotSet,
         }
     }
@@ -899,6 +969,9 @@ impl Note {
             changes: vec![NoteChange::new(ChangeType::Created, created_by)],
             assertion_rule: None,
             last_assertion_result: None,
+            valid_from: None,
+            valid_until: None,
+            revision: None,
             sharing_consent: crate::episodes::distill_models::SharingConsent::NotSet,
         }
     }

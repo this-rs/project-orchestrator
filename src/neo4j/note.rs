@@ -186,6 +186,9 @@ impl Neo4jClient {
                 scar_intensity: $scar_intensity,
                 memory_horizon: $memory_horizon,
                 activation_count: $activation_count,
+                valid_from: CASE WHEN $valid_from = '' THEN null ELSE datetime($valid_from) END,
+                valid_until: CASE WHEN $valid_until = '' THEN null ELSE datetime($valid_until) END,
+                revision_json: $revision_json,
                 sharing_consent: $sharing_consent
             })
             "#,
@@ -228,6 +231,21 @@ impl Neo4jClient {
         .param("scar_intensity", note.scar_intensity)
         .param("memory_horizon", note.memory_horizon.to_string())
         .param("activation_count", note.activation_count)
+        .param(
+            "valid_from",
+            note.valid_from.map(|d| d.to_rfc3339()).unwrap_or_default(),
+        )
+        .param(
+            "valid_until",
+            note.valid_until.map(|d| d.to_rfc3339()).unwrap_or_default(),
+        )
+        .param(
+            "revision_json",
+            note.revision
+                .as_ref()
+                .map(|r| serde_json::to_string(r).unwrap_or_default())
+                .unwrap_or_default(),
+        )
         .param("sharing_consent", note.sharing_consent.as_db_str());
 
         self.graph.run(q).await?;
@@ -3888,6 +3906,19 @@ impl Neo4jClient {
                 .get::<String>("superseded_by")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            valid_from: node
+                .get::<String>("valid_from")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            valid_until: node
+                .get::<String>("valid_until")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            revision: node
+                .get::<String>("revision_json")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| serde_json::from_str(&s).ok()),
             changes,
             assertion_rule,
             last_assertion_result: None, // Loaded separately if needed
