@@ -63,6 +63,7 @@ pub mod provider;
 mod refs_wiring_tests;
 pub mod relay;
 pub(crate) mod resume_guard;
+pub mod retrieval_trigger;
 pub mod routing;
 #[cfg(test)]
 mod routing_modes_e2e_tests;
