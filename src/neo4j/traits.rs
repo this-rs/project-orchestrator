@@ -3669,6 +3669,23 @@ pub trait AuthStore: Send + Sync {
     /// Revoke a single refresh token by its hash.
     async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool>;
 
+    /// Validate AND revoke a refresh token in a single round trip, returning the
+    /// token and its user row (when it exists in the graph).
+    ///
+    /// This is the rotation path of `POST /auth/refresh`: one pool checkout
+    /// instead of three, and no window where two concurrent refreshes both see
+    /// the token as still valid. `None` covers unknown, expired and already-used
+    /// tokens alike.
+    async fn consume_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<
+        Option<(
+            crate::neo4j::models::RefreshTokenNode,
+            Option<crate::neo4j::models::UserNode>,
+        )>,
+    >;
+
     /// Revoke all refresh tokens for a given user (e.g. on password change).
     async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64>;
 

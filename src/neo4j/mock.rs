@@ -16213,6 +16213,34 @@ impl AuthStore for MockGraphStore {
         }
     }
 
+    async fn consume_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<
+        Option<(
+            crate::neo4j::models::RefreshTokenNode,
+            Option<crate::neo4j::models::UserNode>,
+        )>,
+    > {
+        // Same contract as the real store: one shot, the token ends up revoked
+        // whatever happens, and only a token valid BEFORE the call is returned.
+        let consumed = {
+            let mut tokens = self.refresh_tokens.write().await;
+            let Some(token) = tokens.get_mut(token_hash) else {
+                return Ok(None);
+            };
+            let was_valid = !token.revoked && token.expires_at > chrono::Utc::now();
+            token.revoked = true;
+            if !was_valid {
+                return Ok(None);
+            }
+            token.clone()
+        };
+
+        let user = self.users.read().await.get(&consumed.user_id).cloned();
+        Ok(Some((consumed, user)))
+    }
+
     async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64> {
         let mut tokens = self.refresh_tokens.write().await;
         let mut count = 0u64;
