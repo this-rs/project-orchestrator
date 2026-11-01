@@ -807,6 +807,47 @@ mod tests {
             assert_eq!(&parsed.language, lang, "language mismatch for {fname}");
             assert!(!parsed.hash.is_empty(), "empty hash for {fname}");
             assert_eq!(parsed.path, *fname);
+
+            // A grammar that loads but parses nothing (the failure mode of a
+            // tree-sitter runtime bump: the ABI stays inside the accepted
+            // range, the grammar silently stops matching) still yields a hash.
+            // Require a real symbol out of a snippet that defines one.
+            assert!(
+                !parsed.functions.is_empty()
+                    || !parsed.structs.is_empty()
+                    || !parsed.enums.is_empty(),
+                "no symbol extracted from {fname} — the grammar parsed nothing"
+            );
+
+            // And the tree must be free of ERROR nodes, per language. This is
+            // the assertion a runtime bump has to earn: 0.26 → 0.27 keeps ABI
+            // 13-15 compatible, but nothing else guarantees the grammars still
+            // agree with the runtime they are driven by.
+            let extension = std::path::Path::new(fname)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default();
+            let language = SupportedLanguage::from_extension(extension)
+                .unwrap_or_else(|| panic!("unknown extension for {fname}"));
+            let mut raw = tree_sitter::Parser::new();
+            raw.set_language(&language.tree_sitter_language())
+                .unwrap_or_else(|e| panic!("set_language failed for {fname}: {e}"));
+            let tree = raw
+                .parse(src, None)
+                .unwrap_or_else(|| panic!("no tree for {fname}"));
+            // A JSX/TSX case is exempt: `from_extension` maps tsx/jsx to the
+            // plain TypeScript grammar, which has no JSX production, so the
+            // tree carries an ERROR node. That predates this bump — measured
+            // identical under tree-sitter 0.26.13 and 0.27.1 — and fixing it
+            // means adding the TSX grammar (LANGUAGE_TSX), not bumping the
+            // runtime. Keep the exemption narrow so a real regression still
+            // fails here.
+            let jsx_gap = fname.ends_with(".tsx") || fname.ends_with(".jsx");
+            assert!(
+                jsx_gap || !tree.root_node().has_error(),
+                "parse error in {fname}: {}",
+                tree.root_node().to_sexp()
+            );
         }
     }
 
