@@ -353,6 +353,7 @@ async fn keep_current_notes(
     reader: Option<Uuid>,
     notes: Vec<ScoredNote>,
     restricted: bool,
+    session: Option<Uuid>,
 ) -> Vec<ScoredNote> {
     let lookups = notes.iter().map(|n| async move {
         match Uuid::parse_str(&n.id) {
@@ -380,6 +381,7 @@ async fn keep_current_notes(
         .into_iter()
         .filter_map(|(mut scored, note)| {
             if !crate::notes::is_current_knowledge(&note) {
+                ledger_contradiction(&note, &scored.source, session);
                 if scored.source != "uuid_reference" {
                     return None;
                 }
@@ -591,6 +593,7 @@ impl KnowledgeInjectionStage {
         project: Option<&str>,
         max_content_chars: usize,
         excluded: &std::collections::HashSet<String>,
+        session: Option<Uuid>,
     ) -> std::collections::HashSet<String> {
         let mut injected = std::collections::HashSet::new();
         let graph = self.graph.clone();
@@ -676,7 +679,7 @@ impl KnowledgeInjectionStage {
             }
             // The currency, consent and policy checks read the graph too: under the
             // same budget as the lookups, so a slow graph costs the pins, never the turn.
-            keep_current_notes(graph.as_ref(), reader, candidates, restricted).await
+            keep_current_notes(graph.as_ref(), reader, candidates, restricted, session).await
         };
         let kept = match timeout(PINNED_NOTES_BUDGET, read).await {
             Ok(kept) => kept,
@@ -1425,7 +1428,7 @@ impl KnowledgeInjectionStage {
         // check against Neo4j (see keep_current_notes).
         let notes: Vec<ScoredNote> = note_map.into_values().collect();
         let mut notes =
-            keep_current_notes(self.graph.as_ref(), _project_id, notes, restricted).await;
+            keep_current_notes(self.graph.as_ref(), _project_id, notes, restricted, session).await;
         notes.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -1689,6 +1692,34 @@ fn ledger_injection(
     );
 }
 
+/// Une pièce récupérée qui n~st PLUS la connaissance courante (supersédée,
+/// archivée, hors de sa fenêtre de validité, ou écrite par l'évolution des
+/// skills) contredit le noyau actif : le registre la consigne sous
+/// [`retrieval_ledger::Trigger::Contradiction`], la note elle-même en témoin.
+///
+/// C~st le troisième signal du déclencheur (PR3). Son témoin n~xistait pas
+/// avant PR5 (`superseded_by`, fenêtres de validité) : le déclarer sans témoin
+/// aurait été un vert « déclaré », exactement ce que la porte dzttestation
+/// (PR2) refuse. La source est le canal qui a rendu la pièce ; `query` est
+/// l'identifiant de la note — la contradiction ne porte pas sur une requête,
+/// elle porte sur une pièce.
+fn ledger_contradiction(note: &crate::notes::Note, source: &str, session: Option<Uuid>) {
+    let source = match source {
+        "bm25_search" => retrieval_ledger::Source::Bm25,
+        "dense_search" => retrieval_ledger::Source::Semantic,
+        _ => retrieval_ledger::Source::Other,
+    };
+    retrieval_ledger::record_for_session(
+        source,
+        retrieval_ledger::Trigger::Contradiction,
+        &note.id.to_string(),
+        vec![RetrievedItem::new(note.id.to_string(), "note", None)],
+        true,
+        0,
+        session,
+    );
+}
+
 /// Wrap a group of rendered entries (note or decision text from the graph) in
 /// an untrusted-data container. The character budget counts the entries only,
 /// not the few dozen characters of the container tags.
@@ -1773,6 +1804,7 @@ impl ParallelEnrichmentStage for KnowledgeInjectionStage {
                 requested_slug.as_deref(),
                 self.config.max_content_chars,
                 &input.excluded_note_ids,
+                Some(input.session_id),
             )
             .await;
 
@@ -2056,6 +2088,7 @@ mod tests {
                 scored(replaced.id, "uuid_reference"),
             ],
             false,
+            None,
         )
         .await;
         let ids: Vec<&str> = kept.iter().map(|n| n.id.as_str()).collect();
@@ -2073,6 +2106,62 @@ mod tests {
         // Equal relevance: the fresher instruction ranks above the old one.
         let score = |id: Uuid| kept.iter().find(|n| n.id == id.to_string()).unwrap().score;
         assert!(score(fresh.id) > score(old.id));
+    }
+
+    /// Une pièce récupérée qui n~st plus la connaissance courante (ici :
+    /// supersédée) contredit le noyau actif. Le registre la consigne sous
+    /// `Contradiction`, la note en témoin — pas fondue dans `Injection`, sinon
+    /// le troisième signal du déclencheur (PR3) resterait à zéro pour toujours.
+    #[tokio::test]
+    async fn une_piece_perimee_est_consignee_comme_contradiction() {
+        use crate::notes::{Note, NoteStatus, NoteType};
+        let _serial = retrieval_ledger::serial_guard();
+        let saved_capacity = retrieval_ledger::journal_capacity();
+        retrieval_ledger::set_journal_capacity(4096);
+
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let project = Some(Uuid::new_v4());
+        let mut fresh = Note::new(project, NoteType::Gotcha, "fresh".into(), "t".into());
+        fresh.status = NoteStatus::Active;
+        let mut stale = Note::new(project, NoteType::Gotcha, "stale".into(), "t".into());
+        stale.status = NoteStatus::Archived;
+        stale.superseded_by = Some(fresh.id);
+        for n in [&fresh, &stale] {
+            store.create_note(n).await.unwrap();
+        }
+
+        let session = Uuid::new_v4();
+        let kept = keep_current_notes(
+            &store,
+            project,
+            vec![scored(stale.id, "bm25_search")],
+            false,
+            Some(session),
+        )
+        .await;
+        assert!(
+            kept.is_empty(),
+            "une note supersédée trouvée par recherche n~st pas injectée telle quelle"
+        );
+
+        let events = retrieval_ledger::recent_for_session(session, 100);
+        let contradiction = events
+            .iter()
+            .find(|e| e.trigger == retrieval_ledger::Trigger::Contradiction)
+            .expect("une pièce périmée est une contradiction");
+        assert_eq!(
+            contradiction
+                .results
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![stale.id.to_string().as_str()],
+            "la note est le témoin de la contradiction"
+        );
+        assert!(contradiction.ok, "l'index a répondu");
+        assert_eq!(contradiction.source, retrieval_ledger::Source::Bm25);
+
+        retrieval_ledger::set_journal_capacity(saved_capacity);
     }
 
     #[tokio::test]
@@ -2094,7 +2183,7 @@ mod tests {
         };
 
         // A restricted provider (Claude Code): only the untagged note goes through.
-        let restricted = keep_current_notes(&store, project, candidates(), true).await;
+        let restricted = keep_current_notes(&store, project, candidates(), true, None).await;
         let ids: Vec<&str> = restricted.iter().map(|n| n.id.as_str()).collect();
         assert!(ids.contains(&plain.id.to_string().as_str()));
         assert!(
@@ -2103,7 +2192,7 @@ mod tests {
         );
 
         // A permissive provider keeps both: the material is legitimate, only the endpoint refuses it.
-        let permissive = keep_current_notes(&store, project, candidates(), false).await;
+        let permissive = keep_current_notes(&store, project, candidates(), false, None).await;
         assert_eq!(
             permissive.len(),
             2,
@@ -4095,6 +4184,7 @@ mod tests {
                 scored(future.id, "uuid_reference"),
             ],
             false,
+            None,
         )
         .await;
         let content = |id: Uuid| {
