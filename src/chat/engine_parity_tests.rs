@@ -650,6 +650,118 @@ fn cell(engine: Engine, function: &str, m: &Measures) -> String {
     }
 }
 
+// ============================================================================
+// Attestation: what the document publishes as green, and what the run attests
+// ============================================================================
+
+/// How the cells of one engine split once the scenario ran.
+///
+/// `attested` is the ONLY number this matrix may publish as green: the scenario ran the
+/// function on that engine and saw it conform. `declared` is a gap of `EXPECTED` that the
+/// scenario did NOT exercise on this engine — it reads like an accepted exception, and
+/// counting it as a green is exactly the drift this type exists to catch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Bilan {
+    attested: usize,
+    declared: usize,
+    measured_gap: usize,
+    not_measured: usize,
+    missing: usize,
+}
+
+impl Bilan {
+    fn total(self) -> usize {
+        self.attested + self.declared + self.measured_gap + self.not_measured + self.missing
+    }
+
+    /// Everything that is not a measured gap: what a « not red » tally would publish. It is
+    /// NOT the number of greens, and the difference between the two is the whole point.
+    #[cfg(test)]
+    fn not_red(self) -> usize {
+        self.attested + self.declared + self.not_measured
+    }
+}
+
+fn bilan(m: &Measures) -> Bilan {
+    let mut b = Bilan::default();
+    for (function, _) in FUNCTIONS {
+        match m.get(function).map(|(v, _)| v) {
+            Some(Verdict::Ok) => b.attested += 1,
+            Some(Verdict::Declared(_)) => b.declared += 1,
+            Some(Verdict::Gap(_)) => b.measured_gap += 1,
+            Some(Verdict::NotMeasured) => b.not_measured += 1,
+            None => b.missing += 1,
+        }
+    }
+    b
+}
+
+/// The numbers the generated document publishes as green, read back FROM THE TEXT
+/// (`engine label -> (greens, total)`), never from the measures: a render that started
+/// counting declared cells as green is then caught instead of being trusted.
+fn published_greens(table: &str) -> Vec<(String, usize, usize)> {
+    let line = table
+        .lines()
+        .find(|l| l.starts_with("`ok` : "))
+        .unwrap_or_default();
+    line.trim_start_matches("`ok` : ")
+        .trim_end_matches('.')
+        .split(", ")
+        .filter_map(|part| {
+            let (label, counts) = part.rsplit_once(' ')?;
+            let (green, total) = counts.split_once('/')?;
+            Some((label.to_string(), green.parse().ok()?, total.parse().ok()?))
+        })
+        .collect()
+}
+
+/// The gate: fails when the document publishes more green cells than the run attests, and
+/// when a column's five counts do not split the matrix.
+fn attestation_gate(published: &[(String, usize, usize)], run: &Run<'_>) -> Vec<String> {
+    let mut problems = Vec::new();
+    for &(engine, m) in run {
+        let b = bilan(m);
+        let Some((_, green, total)) = published.iter().find(|(l, _, _)| l == engine.label()) else {
+            problems.push(format!(
+                "{} : aucune ligne de totaux publiée pour ce moteur",
+                engine.label()
+            ));
+            continue;
+        };
+        if *total != FUNCTIONS.len() {
+            problems.push(format!(
+                "{} : la ligne publiée annonce {total} fonctions, la matrice en a {}",
+                engine.label(),
+                FUNCTIONS.len()
+            ));
+        }
+        match green.cmp(&b.attested) {
+            std::cmp::Ordering::Greater => problems.push(format!(
+                "{} : {green} verts publiés pour {} attestés — {} cellule(s) déclarée(s) comptée(s) \
+                 comme verte(s). Un écart déclaré n'est pas un vert : le scénario ne l'a pas joué.",
+                engine.label(),
+                b.attested,
+                green - b.attested
+            )),
+            std::cmp::Ordering::Less => problems.push(format!(
+                "{} : {green} verts publiés pour {} attestés — {} vert(s) mesuré(s) n'est pas publié",
+                engine.label(),
+                b.attested,
+                b.attested - green
+            )),
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    problems
+}
+
+/// What the attestation table means, printed above it.
+const BILAN_INTRO: &str = "Un **vert attesté** est une cellule que ce scénario a jouée sur ce moteur et a vue \
+conforme (`ok`). Un **écart déclaré** est un écart connu, inscrit dans `EXPECTED`, que le scénario n'a PAS \
+joué sur ce moteur : il n'est pas un vert et n'est jamais compté comme tel. La ligne de totaux ci-dessus ne \
+publie que des attestés. `total` est la somme des cinq colonnes et vaut le nombre de fonctions de la \
+matrice.\n\n";
+
 const MATRIX_PATH: &str = "docs/parity/engines.md";
 const UPDATE_ENV: &str = "UPDATE_PARITY_MATRIX";
 const UPDATE_COMMAND: &str =
@@ -708,6 +820,25 @@ fn render(run: &Run<'_>) -> String {
         .map(|&(engine, m)| format!("{} {}/{}", engine.label(), ok(m), FUNCTIONS.len()))
         .collect();
     out.push_str(&format!("\n`ok` : {}.\n", totals.join(", ")));
+    out.push_str("\n## Bilan d'attestation\n\n");
+    out.push_str(BILAN_INTRO);
+    out.push_str(
+        "| Moteur | attestés | écarts déclarés | écarts mesurés | non mesurés | manquants | total |\n\
+         |---|---|---|---|---|---|---|\n",
+    );
+    for &(engine, m) in run {
+        let b = bilan(m);
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            engine.label(),
+            b.attested,
+            b.declared,
+            b.measured_gap,
+            b.not_measured,
+            b.missing,
+            b.total()
+        ));
+    }
     out.push_str("\n## Écarts déclarés\n\n");
     out.push_str("| Moteur | Fonction | Cause | Tâche | Ce qui manque |\n|---|---|---|---|---|\n");
     for (engine, function, x) in declared_in_table_order() {
@@ -853,7 +984,8 @@ fn gate(run: &Run<'_>) {
         }
     }
     let table = render(run);
-    let problems = audit(run, &expected);
+    let mut problems = audit(run, &expected);
+    problems.extend(attestation_gate(&published_greens(&table), run));
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(MATRIX_PATH);
     if std::env::var(UPDATE_ENV).as_deref() == Ok("1") {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -5813,4 +5945,171 @@ fn a_turn_that_never_reached_the_messages_api_is_a_gap() {
         .expect("nothing to read headers from is not the same as a blind fake");
     assert!(!ok);
     assert!(seen.contains("aucune requête"), "{seen}");
+}
+
+// ============================================================================
+// The attestation gate: a declared cell is never a green
+// ============================================================================
+
+/// Codex as the scenario leaves it: one function really measured, the rest declared.
+fn codex_with_one_attested() -> Measures {
+    let mut m = declared_only(Engine::Codex);
+    let unset = FUNCTIONS
+        .iter()
+        .map(|(f, _)| *f)
+        .find(|f| m.get(f).is_none())
+        .expect("Codex has at least one function EXPECTED does not declare");
+    m.set(unset, Verdict::Ok, "synthetic");
+    m
+}
+
+#[test]
+fn a_declared_cell_is_not_a_green() {
+    let m = codex_with_one_attested();
+    let b = bilan(&m);
+    assert_eq!(b.attested, 1, "one function was really measured");
+    assert_eq!(b.declared, 12, "twelve declared gaps (ISO4)");
+    assert_eq!(b.not_measured, 28);
+    assert_eq!(b.missing, 0);
+    assert_eq!(
+        b.total(),
+        FUNCTIONS.len(),
+        "the five counts split the matrix"
+    );
+    assert_ne!(
+        b.not_red(),
+        b.attested,
+        "a declared cell is not red, and is still not green: {} cells read as « not red » \
+         against {} attested",
+        b.not_red(),
+        b.attested
+    );
+}
+
+#[test]
+fn the_gate_fails_when_a_declared_cell_is_published_as_green() {
+    let m = codex_with_one_attested();
+    let run = [(Engine::Codex, &m)];
+    // What a « everything that is not red » tally would publish: 1 attested + 12 declared.
+    let inflated = vec![("Codex".to_string(), 13usize, FUNCTIONS.len())];
+    let problems = attestation_gate(&inflated, &run);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("13 verts publiés pour 1 attestés"),
+        "{}",
+        problems[0]
+    );
+    assert!(
+        problems[0].contains("12 cellule(s) déclarée(s)"),
+        "{}",
+        problems[0]
+    );
+}
+
+#[test]
+fn the_gate_accepts_the_number_the_run_attests() {
+    let m = codex_with_one_attested();
+    let run = [(Engine::Codex, &m)];
+    let honest = vec![("Codex".to_string(), 1usize, FUNCTIONS.len())];
+    assert!(attestation_gate(&honest, &run).is_empty());
+}
+
+#[test]
+fn the_gate_fails_when_a_green_was_never_measured() {
+    // A column that lost the cell it published as green: the document still says 1,
+    // nothing in the run attests it.
+    let mut m = as_declared(Engine::Codex);
+    let measured = FUNCTIONS
+        .iter()
+        .map(|(f, _)| *f)
+        .find(|f| matches!(m.get(f), Some((Verdict::Ok, _))))
+        .expect("Codex has one function EXPECTED does not declare");
+    m.rows.retain(|(f, _, _)| *f != measured);
+    let run = [(Engine::Codex, &m)];
+    let published = vec![("Codex".to_string(), 1usize, FUNCTIONS.len())];
+    let problems = attestation_gate(&published, &run);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("1 verts publiés pour 0 attestés"),
+        "{}",
+        problems[0]
+    );
+}
+
+#[test]
+fn published_greens_reads_the_numbers_back_from_the_document() {
+    let table = "| a | b |\n\n`ok` : Claude Code 36/41, Codex 1/41.\n";
+    assert_eq!(
+        published_greens(table),
+        vec![
+            ("Claude Code".to_string(), 36, 41),
+            ("Codex".to_string(), 1, 41)
+        ]
+    );
+}
+
+/// The committed matrix publishes its own attestation counts, and they split every column.
+/// This is what proves the section was not hand-written to look right.
+#[test]
+fn the_committed_matrix_publishes_its_attestation_counts() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(MATRIX_PATH);
+    let doc = std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(!doc.is_empty(), "{MATRIX_PATH} is missing");
+
+    let header = doc
+        .lines()
+        .find(|l| l.starts_with("| Fonction |"))
+        .expect("the matrix has a header row");
+    let labels: Vec<String> = header
+        .split('|')
+        .skip(3)
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+
+    let mut counted: std::collections::BTreeMap<String, [usize; 5]> = Default::default();
+    for line in doc.lines().filter(|l| l.starts_with("| `")) {
+        let cells: Vec<&str> = line.split('|').skip(3).collect();
+        for (i, label) in labels.iter().enumerate() {
+            let cell = cells.get(i).copied().unwrap_or("").trim();
+            let e = counted.entry(label.clone()).or_default();
+            match cell {
+                "ok" => e[0] += 1,
+                c if c.starts_with("declared") => e[1] += 1,
+                c if c.starts_with("gap") => e[2] += 1,
+                "not_measured" => e[3] += 1,
+                "?" => e[4] += 1,
+                other => panic!("{label}: unknown cell {other:?}"),
+            }
+        }
+    }
+    assert_eq!(counted.len(), labels.len(), "every column was counted");
+
+    let start = doc
+        .find("## Bilan d'attestation")
+        .expect("the matrix has an attestation section");
+    let section = &doc[start..];
+    let end = section[2..]
+        .find("\n## ")
+        .map(|i| i + 2)
+        .unwrap_or(section.len());
+    let section = &section[..end];
+
+    for (label, c) in counted {
+        let row = section
+            .lines()
+            .find(|l| l.starts_with(&format!("| {label} |")))
+            .unwrap_or_else(|| panic!("{label} has no attestation row"));
+        let want = format!(
+            "| {label} | {} | {} | {} | {} | {} | {} |",
+            c[0],
+            c[1],
+            c[2],
+            c[3],
+            c[4],
+            c.iter().sum::<usize>()
+        );
+        assert_eq!(row.trim(), want, "{MATRIX_PATH}, row « {label} »");
+        assert_eq!(c.iter().sum::<usize>(), FUNCTIONS.len(), "{label}");
+    }
 }
