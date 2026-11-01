@@ -3802,6 +3802,18 @@ impl AuthStore for Neo4jClient {
         self.revoke_refresh_token(token_hash).await
     }
 
+    async fn consume_refresh_token(
+        &self,
+        token_hash: &str,
+    ) -> anyhow::Result<
+        Option<(
+            crate::neo4j::models::RefreshTokenNode,
+            Option<crate::neo4j::models::UserNode>,
+        )>,
+    > {
+        self.consume_refresh_token(token_hash).await
+    }
+
     async fn revoke_all_user_tokens(&self, user_id: Uuid) -> anyhow::Result<u64> {
         self.revoke_all_user_tokens(user_id).await
     }
