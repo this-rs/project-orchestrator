@@ -1814,12 +1814,9 @@ impl AgentSessionHandle {
                 continue;
             }
             let since = *stopped_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= self.stop_grace() {
-                tracing::warn!(
-                    session_id = %self.session_id,
-                    grace_ms = self.stop_grace().as_millis() as u64,
-                    "Stop ignored by the provider: the turn is abandoned, the session is closed and resumed by the next message"
-                );
+            let grace = self.stop_grace();
+            if since.elapsed() >= grace {
+                tracing::warn!(session_id = %self.session_id, grace_ms = grace.as_millis() as u64, "Stop ignored by the provider: the turn is abandoned, the session is closed and resumed by the next message");
                 *abandoned = true;
                 return Some(interrupted_done());
             }
@@ -3268,6 +3265,8 @@ pub(crate) mod fake {
         pub fail_set_model: StdMutex<Option<ProviderError>>,
         pub modes: StdMutex<Vec<PolicyMode>>,
         pub closed: AtomicBool,
+        /// When set, `close` fails (and does not mark the provider closed).
+        pub fail_close: AtomicBool,
         pub turns_started: StdMutex<Vec<String>>,
         pub turn_tx: StdMutex<Option<UnboundedSender<AgentEvent>>>,
         pub oob_tx: StdMutex<Option<UnboundedSender<AgentEvent>>>,
@@ -3451,6 +3450,9 @@ pub(crate) mod fake {
             self.oob.lock().unwrap().take()
         }
         async fn close(&self) -> Result<(), ProviderError> {
+            if self.state.fail_close.load(Ordering::SeqCst) {
+                return Err(ProviderError::unsupported("close"));
+            }
             self.state.closed.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -6514,6 +6516,16 @@ mod answered_tests {
         assert_eq!(host.seen(), [true]);
     }
 
+    /// Polls `ready` until it holds, within five seconds: the loop body is the same for every
+    /// wait of these tests, so it is exercised by any wait that is not already over.
+    async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// The stuck Stop (observed on Claude Code chats): the CLI never answers the
     /// interrupt, so the turn never ends. A message sent meanwhile is queued and the
     /// Stop is written, but nothing may leave that message waiting for ever.
@@ -6526,24 +6538,51 @@ mod answered_tests {
             .ignore_interrupts
             .store(true, Ordering::SeqCst);
         handle.send_message("first").await.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while provider.state.turns_started.lock().unwrap().is_empty() {
-            assert!(Instant::now() < deadline, "the first turn never started");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_for("the first turn never started", || {
+            !provider.state.turns_started.lock().unwrap().is_empty()
+        })
+        .await;
         handle.send_message("second").await.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while provider.state.turns_started.lock().unwrap().len() < 2 {
-            assert!(
-                Instant::now() < deadline,
-                "the message sent during a turn never went out: the stop was ignored and nothing ended the turn"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_for(
+            "the message sent during a turn never went out: the stop was ignored and nothing ended the turn",
+            || provider.state.turns_started.lock().unwrap().len() >= 2,
+        )
+        .await;
         assert_eq!(
             provider.state.turns_started.lock().unwrap()[1],
             "second",
             "the queued message is the one that goes out"
+        );
+        assert!(
+            provider.state.closed.load(Ordering::SeqCst),
+            "the provider of the abandoned turn is closed"
+        );
+    }
+
+    /// A provider that cannot be closed after an abandoned turn does not keep the next
+    /// message from going out: the failure is logged and the turn is abandoned all the same.
+    #[tokio::test]
+    async fn an_abandoned_turn_whose_provider_cannot_be_closed_still_frees_the_queue() {
+        let (provider, handle, _host) = session(0).await;
+        handle.configure_stop_grace(Duration::from_millis(100));
+        provider
+            .state
+            .ignore_interrupts
+            .store(true, Ordering::SeqCst);
+        provider.state.fail_close.store(true, Ordering::SeqCst);
+        handle.send_message("first").await.unwrap();
+        wait_for("the first turn never started", || {
+            !provider.state.turns_started.lock().unwrap().is_empty()
+        })
+        .await;
+        handle.send_message("second").await.unwrap();
+        wait_for("the message never went out", || {
+            provider.state.turns_started.lock().unwrap().len() >= 2
+        })
+        .await;
+        assert!(
+            !provider.state.closed.load(Ordering::SeqCst),
+            "the close failed, so the provider is not marked closed"
         );
     }
 
