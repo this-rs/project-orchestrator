@@ -5769,9 +5769,9 @@ dependencies = [
 
 [[package]]
 name = "orion"
-version = "0.17.16"
+version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be0ab36a035b13899701dd991f918616c31694c9219908807ee56d6562c60568"
+checksum = "ce166f9a98c32a49ccf0684ea3be1a99cdebc0694d96e487ee5df844591a3403"
 dependencies = [
  "cmov",
  "fiat-crypto 0.3.0",
@@ -5891,9 +5891,9 @@ dependencies = [
 
 [[package]]
 name = "pasetors"
-version = "0.7.8"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e838401fb2873bad417e6a03179014c748746f67311cb7317ab14fc0881fa9f0"
+checksum = "8ec9d69d491936c29fa2684dcb50d4c7503a405f4e972066e344ff2a4f639195"
 dependencies = [
  "ct-codecs",
  "ed25519-compact",
