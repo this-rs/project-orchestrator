@@ -60,6 +60,19 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 
 `ok` : Claude Code 36/41, Claude Code (moteur agent) 36/41, natif 40/41, Codex 1/41, opencode 0/41, ACP 1/41.
 
+## Bilan d'attestation
+
+Un **vert attesté** est une cellule que ce scénario a jouée sur ce moteur et a vue conforme (`ok`). Un **écart déclaré** est un écart connu, inscrit dans `EXPECTED`, que le scénario n'a PAS joué sur ce moteur : il n'est pas un vert et n'est jamais compté comme tel. La ligne de totaux ci-dessus ne publie que des attestés. `total` est la somme des cinq colonnes et vaut le nombre de fonctions de la matrice.
+
+| Moteur | attestés | écarts déclarés | écarts mesurés | non mesurés | manquants | total |
+|---|---|---|---|---|---|---|
+| Claude Code | 36 | 0 | 0 | 5 | 0 | 41 |
+| Claude Code (moteur agent) | 36 | 0 | 0 | 5 | 0 | 41 |
+| natif | 40 | 0 | 0 | 1 | 0 | 41 |
+| Codex | 1 | 12 | 0 | 28 | 0 | 41 |
+| opencode | 0 | 0 | 0 | 41 | 0 | 41 |
+| ACP | 1 | 10 | 0 | 30 | 0 | 41 |
+
 ## Écarts déclarés
 
 | Moteur | Fonction | Cause | Tâche | Ce qui manque |
