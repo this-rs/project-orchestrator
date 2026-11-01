@@ -515,7 +515,7 @@ jobs:
             --test workspace_tests --test neo4j_store_tests --test harness_neo4j \
             --test neo4j_note_consent --test neo4j_decision_project --test neural_routing_indexes \
             --test neo4j_synapse_shadow --test store_conformance --test code_graph_stable_key \
-            --test neural_routing_sampler
+            --test file_paths --test neural_routing_sampler
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
@@ -798,6 +798,7 @@ jobs:
             --test neo4j_decision_project \
             --test self_graph \
             --test code_graph_stable_key \
+            --test file_paths \
             --test neural_routing_sampler \
             --test store_conformance
 
