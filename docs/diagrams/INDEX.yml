@@ -68,6 +68,9 @@ diagrams:
       # notes::manager (entree po-knowledge-notes encore `planned`, donc sans
       # propriete). Il rejoint po-chat-manager, comme notes/coactivation.rs.
       - "backend:src/notes/retrieval_ledger.rs"
+      # Meme arbitrage pour la politique (PR6) : elle LIT le registre et ne regle
+      # rien ; elle appartient au meme dessin que ce qu'elle lit.
+      - "backend:src/notes/retrieval_policy.rs"
   - name: po-spawn-envelope
     owner: theotime
     status: verified
