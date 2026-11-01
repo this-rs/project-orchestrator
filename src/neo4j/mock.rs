@@ -15930,6 +15930,13 @@ impl ChatStore for MockGraphStore {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<ChatEventRecord>> {
+        if self
+            .fail_reads
+            .lock()
+            .is_ok_and(|f| f.contains("get_chat_events_paginated"))
+        {
+            anyhow::bail!("injected failure of get_chat_events_paginated");
+        }
         let store = self.chat_events.read().await;
         let events = store
             .get(&session_id)
@@ -15947,6 +15954,13 @@ impl ChatStore for MockGraphStore {
     }
 
     async fn count_chat_events(&self, session_id: Uuid) -> Result<i64> {
+        if self
+            .fail_reads
+            .lock()
+            .is_ok_and(|f| f.contains("count_chat_events"))
+        {
+            anyhow::bail!("injected failure of count_chat_events");
+        }
         let store = self.chat_events.read().await;
         let count = store.get(&session_id).map(|v| v.len() as i64).unwrap_or(0);
         Ok(count)

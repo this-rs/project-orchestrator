@@ -25169,14 +25169,45 @@ mod tests {
     }
 
     /// Waits, bounded, for `check` to answer true — the detached task runs on its own.
+    /// Returns whether it did; a passing test leaves no line of it unrun.
     async fn wait_until(mut check: impl FnMut() -> bool) -> bool {
+        let mut seen = false;
         for _ in 0..500 {
             if check() {
-                return true;
+                seen = true;
+                break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        false
+        seen
+    }
+
+    /// A persisted `tool_use` of `tool`, `minutes` minutes old (issue #1056, correctif B).
+    fn tool_use_event(
+        session_id: Uuid,
+        seq: i64,
+        tool: &str,
+        minutes: i64,
+    ) -> crate::neo4j::models::ChatEventRecord {
+        crate::neo4j::models::ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id,
+            seq,
+            event_type: "tool_use".to_string(),
+            data: serde_json::json!({"type": "tool_use", "tool": tool}).to_string(),
+            created_at: chrono::Utc::now() - chrono::Duration::minutes(minutes),
+        }
+    }
+
+    fn an_error_event() -> ChatEvent {
+        ChatEvent::Error {
+            message: "notice".to_string(),
+            parent_tool_use_id: None,
+            code: Some("session_open_failed".to_string()),
+            reason: None,
+            index: None,
+            request_id: None,
+        }
     }
 
     // issue #1056, correctif A. The call an agent makes has to be BOUNDED: the id answers
@@ -25364,6 +25395,158 @@ mod tests {
             .abandon_turns_whose_tool_result_never_came()
             .await
             .is_empty());
+    }
+
+    // issue #1056, correctif B, de bout en bout : une session VIVANTE dont le dernier
+    // événement persisté est un appel MCP sans résultat, vieux de 11 min, est interrompue —
+    // et la raison est écrite dans la conversation. La session n'est pas fermée.
+    #[tokio::test]
+    async fn test_the_watchdog_ends_a_turn_whose_mcp_tool_result_is_lost() {
+        let (manager, graph) = manager_with_mock();
+        let manager = Arc::new(manager);
+        let session = crate::test_helpers::test_chat_session(None);
+        graph.create_chat_session(&session).await.unwrap();
+        let sid = session.id;
+        graph
+            .store_chat_events(
+                sid,
+                vec![tool_use_event(
+                    sid,
+                    1,
+                    "mcp__project-orchestrator__chat",
+                    11,
+                )],
+            )
+            .await
+            .unwrap();
+        let (dummy, _pending) = create_dummy_session(true, "", Vec::new());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(sid.to_string(), dummy);
+
+        let ended = manager.abandon_turns_whose_tool_result_never_came().await;
+
+        assert_eq!(ended, vec![sid.to_string()], "the stuck turn is ended");
+        let events = graph.chat_events.read().await;
+        let notice = events
+            .get(&sid)
+            .expect("its events")
+            .iter()
+            .find(|e| e.data.contains("tool_result_lost"))
+            .expect("the reason is written in the conversation");
+        assert_eq!(notice.event_type, "error");
+        assert!(
+            graph.get_chat_session(sid).await.unwrap().is_some(),
+            "the session is NOT closed: its next message continues it"
+        );
+    }
+
+    // issue #1056, correctif B : un relevé qui échoue ne juge pas la session. Lire le compte,
+    // puis le dernier événement, peut échouer : la session est laissée tranquille, jamais
+    // interrompue sur une lecture qu'on n'a pas pu faire.
+    #[tokio::test]
+    async fn test_the_lost_tool_result_rule_does_not_judge_a_session_it_cannot_read() {
+        let (manager, graph) = manager_with_mock();
+        let sid = Uuid::new_v4();
+        graph
+            .store_chat_events(
+                sid,
+                vec![tool_use_event(
+                    sid,
+                    1,
+                    "mcp__project-orchestrator__chat",
+                    11,
+                )],
+            )
+            .await
+            .unwrap();
+
+        graph.fail_reads.lock().unwrap().insert("count_chat_events");
+        assert!(manager.last_event_unanswered_tool_use(sid).await.is_none());
+
+        graph.fail_reads.lock().unwrap().clear();
+        graph
+            .fail_reads
+            .lock()
+            .unwrap()
+            .insert("get_chat_events_paginated");
+        assert!(manager.last_event_unanswered_tool_use(sid).await.is_none());
+    }
+
+    // issue #1056, correctif B : les deux cas qui NE doivent PAS déclencher. Un appel MCP de
+    // 2 minutes est simplement lent ; une commande de 11 minutes est dans son droit (elle
+    // n'a pas la borne courte des hops de PO).
+    #[tokio::test]
+    async fn test_the_watchdog_leaves_a_recent_call_and_a_command_alone() {
+        let (manager, graph) = manager_with_mock();
+        let manager = Arc::new(manager);
+        let recent = crate::test_helpers::test_chat_session(None);
+        let command = crate::test_helpers::test_chat_session(None);
+        for (node, tool, minutes) in [
+            (&recent, "mcp__project-orchestrator__chat", 2),
+            (&command, "Bash", 11),
+        ] {
+            graph.create_chat_session(node).await.unwrap();
+            graph
+                .store_chat_events(node.id, vec![tool_use_event(node.id, 1, tool, minutes)])
+                .await
+                .unwrap();
+            let (dummy, _pending) = create_dummy_session(true, "", Vec::new());
+            manager
+                .active_sessions
+                .write()
+                .await
+                .insert(node.id.to_string(), dummy);
+        }
+
+        assert!(
+            manager
+                .abandon_turns_whose_tool_result_never_came()
+                .await
+                .is_empty(),
+            "neither a slow call nor a long command is a lost result"
+        );
+    }
+
+    /// A notice with nowhere to go is dropped: never a panic, never another session.
+    #[tokio::test]
+    async fn test_a_session_notice_without_a_usable_session_is_dropped() {
+        let (manager, graph) = manager_with_mock();
+        manager.emit_session_event(None, an_error_event()).await;
+        manager
+            .emit_session_event(Some("   "), an_error_event())
+            .await;
+        manager
+            .emit_session_event(Some("not-a-uuid"), an_error_event())
+            .await;
+        assert!(
+            graph.chat_events.read().await.is_empty(),
+            "nothing was written for a session nobody named"
+        );
+    }
+
+    /// No `cwd`: the request alone already says the session is neutral, and that is answered
+    /// before the host has made the directory.
+    #[tokio::test]
+    async fn test_a_detached_opening_without_a_cwd_answers_the_neutral_place() {
+        let (manager, _graph) = manager_with_mock();
+        let manager = Arc::new(manager);
+        let mut request = agent_request("open a child");
+        request.cwd = String::new();
+
+        let response = manager.clone().create_session_detached(request, None, None);
+
+        assert_eq!(
+            response.execution_place,
+            crate::chat::neutral_place::ExecutionPlace::Neutral
+        );
+        assert!(
+            !response.access.is_normal(),
+            "a neutral place with no access asked for opens read_only (ChatRequest::access), \
+             and the caller learns it in the same answer"
+        );
     }
 
     #[tokio::test]
