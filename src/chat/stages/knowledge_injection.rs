@@ -381,7 +381,7 @@ async fn keep_current_notes(
         .into_iter()
         .filter_map(|(mut scored, note)| {
             if !crate::notes::is_current_knowledge(&note) {
-                ledger_contradiction(&note, &scored.source, session);
+                ledger_contradiction(&note, scored.source, session);
                 if scored.source != "uuid_reference" {
                     return None;
                 }
@@ -585,6 +585,7 @@ impl KnowledgeInjectionStage {
     /// most [`MAX_PINNED_NOTES`], minus the notes the message already references
     /// (`excluded`). Read under [`PINNED_NOTES_BUDGET`]. Returns the ids injected, so
     /// the ranked retrieval does not inject them a second time.
+    #[allow(clippy::too_many_arguments)]
     async fn inject_pinned(
         &self,
         output: &mut StageOutput,
