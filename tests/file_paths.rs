@@ -658,6 +658,21 @@ async fn paths_of_files(raw: &Graph, pid: Uuid) -> Vec<String> {
     .await
 }
 
+/// Compare two path lists without depending on their order.
+///
+/// The paths come from Neo4j, which promises no order without an explicit
+/// `ORDER BY`. The CI proved it: the same three assertions passed locally and
+/// failed there with identical paths in a different order. These tests assert
+/// WHICH paths survived a migration, never in which order, so both sides are
+/// sorted before comparing.
+#[track_caller]
+fn assert_same_paths(got: Vec<String>, want: Vec<String>, why: &str) {
+    let (mut got, mut want) = (got, want);
+    got.sort();
+    want.sort();
+    assert_eq!(got, want, "{why}");
+}
+
 async fn marker(raw: &Graph, pid: Uuid) -> Option<String> {
     opt_string(
         raw,
@@ -696,13 +711,13 @@ async fn the_dry_run_writes_nothing_and_exits_zero() {
             .unwrap();
         assert_eq!(code, 0, "purge_wl={purge}");
     }
-    assert_eq!(
+    assert_same_paths(
         paths_of_files(&env.raw, pid).await,
         vec![
             format!("{real}/.wl/br/src/a.rs"),
-            format!("{real}/src/a.rs")
+            format!("{real}/src/a.rs"),
         ],
-        "the dry-run renamed nothing and purged nothing"
+        "the dry-run renamed nothing and purged nothing",
     );
     assert_eq!(marker(&env.raw, pid).await, None, "no marker either");
     cleanup(&env.raw, pid).await;
@@ -730,9 +745,10 @@ async fn a_root_that_is_not_a_link_has_nothing_to_rename() {
         .unwrap();
     assert_eq!(code, 0);
     assert_eq!(marker(&env.raw, pid).await, None, "apply did not run");
-    assert_eq!(
+    assert_same_paths(
         paths_of_files(&env.raw, pid).await,
-        vec![format!("{real}/src/a.rs")]
+        vec![format!("{real}/src/a.rs")],
+        "a dry run writes nothing",
     );
     cleanup(&env.raw, pid).await;
 }
@@ -783,13 +799,13 @@ async fn apply_renames_marks_and_keeps_the_wl_copies_without_purge() {
             .unwrap(),
         0
     );
-    assert_eq!(
+    assert_same_paths(
         paths_of_files(&env.raw, pid).await,
         vec![
             format!("{real}/.wl/br/src/a.rs"),
-            format!("{link}/src/a.rs")
+            format!("{link}/src/a.rs"),
         ],
-        "the file moved to the declared root, the .wl copy was left alone"
+        "the file moved to the declared root, the .wl copy was left alone",
     );
     assert_eq!(marker(&env.raw, pid).await.as_deref(), Some("true"));
     // The plan now reads the marker.
@@ -839,10 +855,10 @@ async fn purge_rehomes_the_knowledge_of_a_wl_copy_then_deletes_it() {
         .await
         .unwrap();
     assert_eq!(code, 0, "the purge gate opens: the twin exists");
-    assert_eq!(
+    assert_same_paths(
         paths_of_files(&env.raw, pid).await,
         vec![format!("{link}/src/a.rs")],
-        "the .wl copy is gone, the real file is under the declared root"
+        "the .wl copy is gone, the real file is under the declared root",
     );
     assert_eq!(
         strings(
@@ -892,13 +908,13 @@ async fn the_purge_gate_refuses_when_a_note_would_lose_its_last_anchor() {
         .await
         .unwrap();
     assert_eq!(code, 2, "refused");
-    assert_eq!(
+    assert_same_paths(
         paths_of_files(&env.raw, pid).await,
         vec![
             format!("{real}/.wl/br/src/lonely.rs"),
-            format!("{link}/src/a.rs")
+            format!("{link}/src/a.rs"),
         ],
-        "renamed, but nothing was purged"
+        "renamed, but nothing was purged",
     );
     assert_eq!(
         count(
@@ -1191,13 +1207,13 @@ async fn the_cli_dispatches_the_migration_and_forwards_its_exit_code() {
         String::from_utf8_lossy(&out.stdout)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("Purge .wl REFUSÉE"));
-    assert_eq!(
+    assert_same_paths(
         paths_of_files(&env.raw, pid).await,
         vec![
             format!("{real}/.wl/br/src/lonely.rs"),
-            format!("{link}/src/a.rs")
+            format!("{link}/src/a.rs"),
         ],
-        "renamed, nothing purged"
+        "renamed, nothing purged",
     );
 
     // Unknown project: an error, a non-zero exit.
