@@ -33377,9 +33377,13 @@ mod tests {
             flag.load(Ordering::SeqCst),
             "flag should be true after interrupt"
         );
+        // A wall-clock budget on a shared runner measures the MACHINE, not the code:
+        // this one was measured at 3.12 ms on a loaded CI runner for an interrupt that
+        // only sets an AtomicBool. A regression does not make it "a bit slow": waiting on
+        // the client Mutex or on an I/O would not return at all inside the test.
         assert!(
-            elapsed < Duration::from_millis(1),
-            "interrupt() took {:?}, expected < 1ms (atomic flag only)",
+            elapsed < Duration::from_millis(100),
+            "interrupt() took {:?}, expected under 100 ms",
             elapsed
         );
     }
@@ -33414,9 +33418,13 @@ mod tests {
             flag.load(Ordering::SeqCst),
             "flag should be set even while Mutex is held"
         );
+        // A wall-clock budget on a shared runner measures the MACHINE, not the code:
+        // this one was measured at 3.12 ms on a loaded CI runner for an interrupt that
+        // only sets an AtomicBool. A regression does not make it "a bit slow": waiting on
+        // the client Mutex or on an I/O would not return at all inside the test.
         assert!(
-            elapsed < Duration::from_millis(1),
-            "interrupt() took {:?} even though client Mutex is held — should be < 1ms",
+            elapsed < Duration::from_millis(100),
+            "interrupt() took {:?} even though the client Mutex is held",
             elapsed
         );
     }
@@ -33492,9 +33500,13 @@ mod tests {
             );
         }
 
+        // A wall-clock budget on a shared runner measures the MACHINE, not the code:
+        // this one was measured at 3.12 ms on a loaded CI runner for an interrupt that
+        // only sets an AtomicBool. A regression does not make it "a bit slow": waiting on
+        // the client Mutex or on an I/O would not return at all inside the test.
         assert!(
-            avg < Duration::from_millis(1),
-            "Average interrupt latency {:?} exceeds 1ms (total {:?} for {iterations})",
+            avg < Duration::from_millis(100),
+            "Average interrupt latency {:?} exceeds 100 ms (total {:?} for {iterations})",
             avg,
             total
         );
