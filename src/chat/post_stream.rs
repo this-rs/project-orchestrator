@@ -2627,4 +2627,57 @@ mod retrieval_settlement_tests {
         assert_eq!(usage.used_ids, vec![cited.to_string()]);
         assert!(usage.validation.is_none() && usage.benefit.is_none());
     }
+
+    /// Une fin de tour appelée pour une session SANS récupération en attente :
+    /// rien n'est réglé, et la fin de tour continue (ici sans mémoire, retour
+    /// anticipé). Avec le journal en debug, comme en production verbeuse.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn une_fin_de_tour_sans_recuperation_ne_regle_rien() {
+        let _serial = retrieval_ledger::serial_guard();
+        let saved_capacity = retrieval_ledger::journal_capacity();
+        retrieval_ledger::set_journal_capacity(4096);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let session = Uuid::new_v4();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let feedback = || TurnFeedback {
+            graph: &graph,
+            search: &search,
+            event_emitter: &None,
+            session_id: "s",
+            session_uuid: Some(session),
+            project_id: None,
+            rfc_accumulator: None,
+        };
+        record_turn_feedback(feedback(), "Aucune citation.", &None, &None).await;
+        assert!(
+            retrieval_ledger::recent_for_session(session, 10).is_empty(),
+            "aucun événement inventé"
+        );
+
+        // Et avec un événement en attente, sous le même abonné debug.
+        retrieval_ledger::record_for_session(
+            Source::Bm25,
+            Trigger::Injection,
+            "q",
+            vec![RetrievedItem::new("not-cited", "note", Some(0.1))],
+            true,
+            1,
+            Some(session),
+        )
+        .expect("le journal accepte l'événement");
+        record_turn_feedback(feedback(), "Aucune citation.", &None, &None).await;
+        let event = retrieval_ledger::recent_for_session(session, 10)
+            .pop()
+            .expect("l'événement de la session");
+        retrieval_ledger::set_journal_capacity(saved_capacity);
+        assert!(event.usage.is_some(), "réglé à la fin du tour");
+    }
 }

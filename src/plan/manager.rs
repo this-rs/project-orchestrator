@@ -1750,6 +1750,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reindex_decisions_indexes_task_decisions() {
+        let state = mock_app_state();
+        let pm = PlanManager::new(state.neo4j.clone(), state.meili.clone());
+        let task = test_task();
+        let decision = test_decision("Reindex me", "because");
+        state
+            .neo4j
+            .create_task(Uuid::new_v4(), &task)
+            .await
+            .unwrap();
+        state
+            .neo4j
+            .create_decision(task.id, &decision)
+            .await
+            .unwrap();
+
+        let (total, indexed) = pm.reindex_decisions().await.unwrap();
+        assert_eq!((total, indexed), (1, 1));
+        let hits = state.meili.search_decisions("Reindex", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].task_id.as_deref(),
+            Some(task.id.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backfill_skips_global_and_unparsable_task_ids() {
+        let state = mock_app_state();
+        let pm = PlanManager::new(state.neo4j.clone(), state.meili.clone());
+        let mk =
+            |desc: &str, task_id: Option<&str>| crate::meilisearch::indexes::DecisionDocument {
+                id: Uuid::new_v4().to_string(),
+                description: desc.to_string(),
+                rationale: "r".to_string(),
+                task_id: task_id.map(str::to_string),
+                agent: "a".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                tags: vec![],
+                project_id: None,
+                project_slug: None,
+            };
+        // Décision globale (sans tâche) : rien à rattraper, pas une erreur.
+        state
+            .meili
+            .index_decision(&mk("Global one", None))
+            .await
+            .unwrap();
+        // task_id illisible : ignorée avec un avertissement.
+        state
+            .meili
+            .index_decision(&mk("Broken one", Some("not-a-uuid")))
+            .await
+            .unwrap();
+
+        let (total, updated) = pm.backfill_decision_project_slugs().await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(updated, 0);
+    }
+
+    #[tokio::test]
     async fn test_backfill_decision_project_slugs() {
         let state = mock_app_state();
         let pm = PlanManager::new(state.neo4j.clone(), state.meili.clone());

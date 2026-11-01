@@ -2575,6 +2575,84 @@ mod tests {
         assert_eq!(mine[0].trigger, retrieval_ledger::Trigger::TaskBoundary);
     }
 
+    // -- Retrieval failure paths: a source in error is a FAILED retrieval ------
+
+    /// An embedding provider whose call always fails (the semantic channel must
+    /// report "failed", never "empty").
+    struct FailingEmbeddingProvider;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for FailingEmbeddingProvider {
+        async fn embed_text(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            anyhow::bail!("embedder down")
+        }
+
+        async fn embed_batch(&self, _texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            anyhow::bail!("embedder down")
+        }
+
+        fn dimensions(&self) -> usize {
+            768
+        }
+
+        fn model_name(&self) -> &str {
+            "failing-test"
+        }
+    }
+
+    /// A Meilisearch failure surfaces as an error from `search_notes`; the
+    /// retrieval ledger records it as a FAILED BM25 retrieval.
+    #[tokio::test]
+    async fn a_bm25_search_failure_surfaces_the_error() {
+        let (state, _graph, meili) = mock_app_state_with_stores();
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        meili
+            .fail_note_search
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let err = mgr
+            .search_notes("bm25-will-fail", &NoteFilters::default())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("injected"), "{err}");
+    }
+
+    /// An embedding failure fails the semantic search: the error is returned
+    /// (and the ledger counts a failed semantic retrieval, not an empty one).
+    #[tokio::test]
+    async fn an_embedding_failure_fails_the_semantic_search() {
+        let state = mock_app_state_with_stores().0;
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone())
+            .with_embedding_provider(Arc::new(FailingEmbeddingProvider));
+
+        let err = mgr
+            .semantic_search_notes("needle", None, None, None, None, None)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("embed"), "{err}");
+    }
+
+    /// A vector search failure surfaces the raw graph error to the caller
+    /// (after the ledger records a failed semantic retrieval).
+    #[tokio::test]
+    async fn a_vector_search_failure_surfaces_the_error() {
+        let (state, graph, _meili) = mock_app_state_with_stores();
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone())
+            .with_embedding_provider(Arc::new(crate::embeddings::MockEmbeddingProvider::new(768)));
+        graph
+            .fail_vector_search
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let err = mgr
+            .semantic_search_notes("needle", None, None, None, None, None)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("injected"), "{err}");
+    }
+
     // -- Hybrid ranking: dense ∪ lexical, fused by RRF ----------------------
 
     #[test]
@@ -3044,6 +3122,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(inverted.to_string().contains("valid_until"), "{inverted}");
+    }
+
+    #[tokio::test]
+    async fn a_revision_with_an_equal_validity_window_is_refused() {
+        let (mgr, pid) = create_note_manager().await;
+        let old = mgr
+            .create_note(make_create_request(pid, "y"), "agent-1")
+            .await
+            .unwrap();
+
+        // `valid_until == valid_from` is refused too: the window is closed as
+        // soon as it is not strictly positive.
+        let now = chrono::Utc::now();
+        let err = mgr
+            .revise_note(
+                old.id,
+                make_create_request(pid, "z"),
+                "agent-2",
+                "proof",
+                Some(now),
+                Some(now),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("valid_until"), "{err}");
     }
 
     #[tokio::test]

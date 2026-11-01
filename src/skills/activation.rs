@@ -1969,6 +1969,15 @@ mod tests {
     use crate::skills::models::{SkillNode, SkillStatus, SkillTrigger};
     use chrono::Utc;
 
+    /// Une activation en échec est consignée comme telle, sans item.
+    #[test]
+    fn record_activation_logs_failed_activation() {
+        let out: anyhow::Result<Option<HookActivationOutcome>> = Err(anyhow::anyhow!("boom"));
+        record_activation(&out, "Bash", std::time::Instant::now());
+        // Aucun skill ne correspond : réponse valide, tracée aussi.
+        record_activation(&Ok(None), "Bash", std::time::Instant::now());
+    }
+
     fn make_test_note(
         id: Uuid,
         content: &str,

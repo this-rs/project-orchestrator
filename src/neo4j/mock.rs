@@ -198,6 +198,8 @@ pub struct MockGraphStore {
     pub fail_external_event_writes: std::sync::atomic::AtomicBool,
     /// Makes `plan_third_party_written_at` fail (a graph error).
     pub fail_mark_read: std::sync::atomic::AtomicBool,
+    /// Makes `vector_search_notes` fail (an index error surfaces to the caller).
+    pub fail_vector_search: std::sync::atomic::AtomicBool,
     /// Stall injection: `search_decisions_by_vector` sleeps this long before
     /// answering — a dense decision search slower than the turn's budget.
     pub slow_decision_vector_search: std::sync::Mutex<Option<std::time::Duration>>,
@@ -482,6 +484,7 @@ impl MockGraphStore {
             trigger_reservations: RwLock::new(HashMap::new()),
             plan_third_party_writes: RwLock::new(HashMap::new()),
             fail_mark_read: std::sync::atomic::AtomicBool::new(false),
+            fail_vector_search: std::sync::atomic::AtomicBool::new(false),
             slow_decision_vector_search: std::sync::Mutex::new(None),
             fail_harness_writes: std::sync::atomic::AtomicBool::new(false),
             fail_session_episode_writes: std::sync::atomic::AtomicBool::new(false),
@@ -10285,6 +10288,7 @@ impl DecisionStore for MockGraphStore {
         decision: &DecisionNode,
         project_id: Option<Uuid>,
     ) -> Result<()> {
+        self.log_read("create_decision_global")?;
         if let Some(pid) = project_id {
             if !self.projects.read().await.contains_key(&pid) {
                 anyhow::bail!(
@@ -12472,6 +12476,12 @@ impl NoteStore for MockGraphStore {
         workspace_slug: Option<&str>,
         min_similarity: Option<f64>,
     ) -> Result<Vec<(Note, f64)>> {
+        if self
+            .fail_vector_search
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected vector search failure (test)");
+        }
         let notes = self.notes.read().await;
         let embeddings = self.note_embeddings.read().await;
 
@@ -16878,6 +16888,7 @@ impl PersonaStore for MockGraphStore {
         decision_id: Uuid,
         weight: f64,
     ) -> Result<()> {
+        self.log_read("auto_link_decision_to_persona")?;
         self.persona_decisions
             .write()
             .await
@@ -17829,7 +17840,8 @@ impl ProtocolRunStore for MockGraphStore {
         _entity_id: Uuid,
         _run_id: Uuid,
     ) -> anyhow::Result<bool> {
-        // Mock: always succeed
+        // Succeeds, unless the test asked this write to fail (`fail_reads`).
+        self.log_read("create_produced_during")?;
         Ok(true)
     }
     async fn get_run_outcomes(
@@ -19706,5 +19718,48 @@ impl TriggerStore for MockGraphStore {
             .collect();
         result.sort_by_key(|h| h.priority);
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod decision_coverage_tests {
+    use super::*;
+    use crate::test_helpers::{test_decision, test_project};
+
+    /// Supprimer une décision globale la retire aussi de l'index par projet.
+    #[tokio::test]
+    async fn delete_decision_removes_it_from_project_index() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        store.create_project(&project).await.unwrap();
+        let decision = test_decision("d", "r");
+        store
+            .create_decision_global(&decision, Some(project.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.project_decisions.read().await[&project.id],
+            vec![decision.id]
+        );
+        store.delete_decision(decision.id).await.unwrap();
+        assert!(store.project_decisions.read().await[&project.id].is_empty());
+    }
+
+    /// Un verrou empoisonné ne casse pas la recherche vectorielle de décisions.
+    #[tokio::test]
+    async fn search_decisions_by_vector_survives_poisoned_delay_lock() {
+        let store = std::sync::Arc::new(MockGraphStore::new());
+        let s2 = store.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = s2.slow_decision_vector_search.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(store.slow_decision_vector_search.is_poisoned());
+        let out = store
+            .search_decisions_by_vector(&[0.0], 1, None)
+            .await
+            .unwrap();
+        assert!(out.is_empty());
     }
 }

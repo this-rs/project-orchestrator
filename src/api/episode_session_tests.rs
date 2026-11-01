@@ -297,3 +297,22 @@ async fn the_close_still_writes_the_agent_node_the_snapshot_does_not() {
         .unwrap();
     assert_eq!(fx.graph.agents.lock().unwrap().len(), 1);
 }
+
+/// The run path keeps its `Episode created` event: a run that exists yields an
+/// episode and announces it to the cockpit (pre-existing behaviour).
+#[tokio::test]
+async fn a_run_episode_is_announced_when_the_run_exists() {
+    let fx = fixture().await;
+    let mut events = fx.bus.subscribe();
+    let run = crate::protocol::ProtocolRun::new(Uuid::new_v4(), Uuid::new_v4(), "Start");
+    fx.graph.create_protocol_run(&run).await.unwrap();
+
+    let (status, body) = call(&fx, json!({"run_id": run.id, "project_id": fx.project_id})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body["episode"].is_null(), "{body}");
+
+    let event = events
+        .try_recv()
+        .expect("a created event for the run episode");
+    assert_eq!(event.entity_id, run.id.to_string());
+}

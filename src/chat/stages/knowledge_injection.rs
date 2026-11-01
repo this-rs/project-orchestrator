@@ -4067,6 +4067,187 @@ mod tests {
         );
         retrieval_ledger::set_journal_capacity(saved_capacity);
     }
+
+    // ── Fenêtre de validité d'une note référencée par son id ────────────
+
+    /// Une note encore active mais sortie de sa fenêtre (expirée, ou pas encore
+    /// ouverte) et référencée par son id est gardée, étiquetée « à réviser » —
+    /// jamais « ne s'applique plus ».
+    #[tokio::test]
+    async fn une_note_referencee_hors_de_sa_fenetre_est_etiquetee_a_reviser() {
+        use crate::notes::{Note, NoteType};
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let project = Some(Uuid::new_v4());
+        let now = chrono::Utc::now();
+        let mut expired = Note::new(project, NoteType::Gotcha, "instruction".into(), "t".into());
+        expired.valid_until = Some(now - chrono::Duration::days(3));
+        let mut future = Note::new(project, NoteType::Gotcha, "instruction".into(), "t".into());
+        future.valid_from = Some(now + chrono::Duration::days(3));
+        for n in [&expired, &future] {
+            store.create_note(n).await.unwrap();
+        }
+
+        let kept = keep_current_notes(
+            &store,
+            project,
+            vec![
+                scored(expired.id, "uuid_reference"),
+                scored(future.id, "uuid_reference"),
+            ],
+            false,
+        )
+        .await;
+        let content = |id: Uuid| {
+            kept.iter()
+                .find(|n| n.id == id.to_string())
+                .map(|n| n.content.clone())
+                .expect("une note référencée est gardée")
+        };
+        let e = content(expired.id);
+        assert!(
+            e.starts_with("[OUTSIDE ITS VALIDITY WINDOW — expired "),
+            "{e}"
+        );
+        assert!(e.ends_with("] instruction"), "{e}");
+        let f = content(future.id);
+        assert!(f.starts_with("[NOT VALID YET — starts "), "{f}");
+        assert!(f.ends_with("] instruction"), "{f}");
+    }
+
+    // ── Registre : les canaux qui échouent écrivent une ligne « échec » ──
+
+    /// Un plongeur dont l'appel échoue.
+    struct FailingProvider;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for FailingProvider {
+        async fn embed_text(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            anyhow::bail!("embedder down")
+        }
+
+        async fn embed_batch(&self, _texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            anyhow::bail!("embedder down")
+        }
+
+        fn dimensions(&self) -> usize {
+            CONCEPT_COUNT
+        }
+
+        fn model_name(&self) -> &str {
+            "failing-test"
+        }
+    }
+
+    /// Un plongeur qui ne répond jamais : seul le délai du tour l'arrête.
+    struct StuckProvider;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for StuckProvider {
+        async fn embed_text(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            std::future::pending().await
+        }
+
+        async fn embed_batch(&self, _texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            std::future::pending().await
+        }
+
+        fn dimensions(&self) -> usize {
+            CONCEPT_COUNT
+        }
+
+        fn model_name(&self) -> &str {
+            "stuck-test"
+        }
+    }
+
+    /// La récupération du tour, rattachée à `session` (comme `execute`).
+    async fn retrieve_for(
+        stage: &KnowledgeInjectionStage,
+        corpus: &Corpus,
+        message: &str,
+        session: Uuid,
+    ) -> Vec<ScoredNote> {
+        let entities = entity_extractor::extract_entities(message);
+        let (notes, _, _, _) = stage
+            .query_knowledge_with_config(
+                message,
+                Some(PROJECT_SLUG),
+                Some(corpus.project),
+                &entities,
+                &[],
+                &stage.config,
+                false,
+                Some(session),
+            )
+            .await;
+        notes
+    }
+
+    /// Un plongeur qui échoue : le canal dense écrit une ligne « échec » (pas
+    /// « vide »), et BM25 répond seul.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn un_plongeur_en_echec_ecrit_une_ligne_dense_en_echec() {
+        let _serial = retrieval_ledger::serial_guard();
+        let saved_capacity = retrieval_ledger::journal_capacity();
+        retrieval_ledger::set_journal_capacity(4096);
+
+        let corpus = corpus(&["gather_resolver_symbols walks the call graph"]).await;
+        let stage = hybrid_stage(&corpus, Some(Arc::new(FailingProvider)));
+        let session = Uuid::new_v4();
+        let notes = retrieve_for(&stage, &corpus, "gather_resolver_symbols", session).await;
+        let mine = retrieval_ledger::recent_for_session(session, 100);
+        retrieval_ledger::set_journal_capacity(saved_capacity);
+
+        assert_eq!(notes.len(), 1, "BM25 répond seul : {notes:?}");
+        let semantic: Vec<_> = mine
+            .iter()
+            .filter(|e| e.source == retrieval_ledger::Source::Semantic)
+            .collect();
+        assert_eq!(semantic.len(), 1, "{mine:?}");
+        assert!(!semantic[0].ok, "un plongeon raté est un échec");
+        assert_eq!(semantic[0].query, "gather_resolver_symbols");
+        assert_eq!(mine.len(), 2, "BM25 + dense : {mine:?}");
+    }
+
+    /// Le plongeur ne répond pas dans le budget, et l'index BM25 non plus : chaque
+    /// canal interrompu par le délai écrit sa ligne « échec », avec le budget pour
+    /// latence.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn un_delai_ecrit_une_ligne_echec_par_canal_interrompu() {
+        let _serial = retrieval_ledger::serial_guard();
+        let saved_capacity = retrieval_ledger::journal_capacity();
+        retrieval_ledger::set_journal_capacity(4096);
+
+        let corpus = corpus(&["gather_resolver_symbols walks the call graph"]).await;
+        let mut stage = hybrid_stage(&corpus, Some(Arc::new(StuckProvider)));
+        stage.config.query_timeout_ms = 30;
+        let session = Uuid::new_v4();
+        let notes = {
+            // L'index BM25 est verrouillé en écriture pendant tout le tour : la
+            // recherche de notes ne peut pas répondre avant le délai.
+            let _held = corpus.search.note_documents.write().await;
+            retrieve_for(&stage, &corpus, "gather_resolver_symbols", session).await
+        };
+        let mine = retrieval_ledger::recent_for_session(session, 100);
+        retrieval_ledger::set_journal_capacity(saved_capacity);
+
+        assert!(notes.is_empty(), "aucun canal n'a répondu : {notes:?}");
+        assert_eq!(mine.len(), 2, "une ligne par canal : {mine:?}");
+        for source in [
+            retrieval_ledger::Source::Bm25,
+            retrieval_ledger::Source::Semantic,
+        ] {
+            let e = mine
+                .iter()
+                .find(|e| e.source == source)
+                .unwrap_or_else(|| panic!("ligne {source:?} : {mine:?}"));
+            assert!(!e.ok, "{source:?} interrompu = échec");
+            assert_eq!(e.latency_ms, 30, "le budget du tour");
+            assert_eq!(e.query, "gather_resolver_symbols");
+        }
+    }
 }
 
 /// The pins as people set them (`/api/knowledge/pinned-notes`), and what keeps a pin
