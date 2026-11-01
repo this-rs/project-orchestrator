@@ -14,11 +14,12 @@
 //!   work, which is exactly where the graph knows something the turn does not;
 //! - **declared uncertainty** — the message says it does not know, or has no source.
 //!
-//! Not implemented, deliberately: the **contradiction with the core** signal. It needs
-//! retrieved material to compare against an active rule, i.e. it happens AFTER a first
-//! retrieval, and it has no witness before PR5 (validity windows + `supersedes`) exists.
-//! Declaring it without a witness would be exactly the `declared` green that PR2 of this
-//! plan turns red.
+//! - **contradiction with the core** — a retrieved piece that is no longer current
+//!   knowledge (superseded, archived, out of its validity window). It is not a
+//!   message-based signal, so it is NOT detected here: the injection stage
+//!   (`knowledge_injection`) records it to the ledger under
+//!   [`Trigger::Contradiction`] with the stale note as its witness — a witness
+//!   that only PR5 (validity windows + `supersedes`) could provide.
 //!
 //! The flag is **off** by default: `RETRIEVAL_TRIGGER=1` turns it on. Off, the manager
 //! builds the turn exactly as before.
