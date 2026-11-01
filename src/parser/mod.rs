@@ -812,12 +812,8 @@ mod tests {
             // tree-sitter runtime bump: the ABI stays inside the accepted
             // range, the grammar silently stops matching) still yields a hash.
             // Require a real symbol out of a snippet that defines one.
-            assert!(
-                !parsed.functions.is_empty()
-                    || !parsed.structs.is_empty()
-                    || !parsed.enums.is_empty(),
-                "no symbol extracted from {fname} — the grammar parsed nothing"
-            );
+            let symbols = parsed.functions.len() + parsed.structs.len() + parsed.enums.len();
+            assert!(symbols > 0, "no symbol extracted from {fname}");
 
             // And the tree must be free of ERROR nodes, per language. This is
             // the assertion a runtime bump has to earn: 0.26 → 0.27 keeps ABI
@@ -843,8 +839,9 @@ mod tests {
             // runtime. Keep the exemption narrow so a real regression still
             // fails here.
             let jsx_gap = fname.ends_with(".tsx") || fname.ends_with(".jsx");
+            let bad = !jsx_gap && tree.root_node().has_error();
             assert!(
-                jsx_gap || !tree.root_node().has_error(),
+                !bad,
                 "parse error in {fname}: {}",
                 tree.root_node().to_sexp()
             );
