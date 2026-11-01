@@ -52,6 +52,8 @@ pub mod update_handlers;
 pub mod vault_handlers;
 pub mod workspace_handlers;
 pub mod ws_activity_handler;
+#[cfg(test)]
+mod ws_activity_tests;
 pub mod ws_auth;
 pub mod ws_chat_handler;
 pub mod ws_handlers;

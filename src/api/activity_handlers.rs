@@ -506,4 +506,397 @@ mod tests {
         assert_eq!(clamp(Some(0)), 1);
         assert_eq!(clamp(Some(10_000)), MAX_LIMIT);
     }
+
+    use crate::neo4j::traits::*;
+    use std::sync::Arc;
+
+    /// What the snapshot handler reads: a graph, a chat manager over it, and the
+    /// no-auth server state both are served by.
+    async fn rig() -> (
+        OrchestratorState,
+        Arc<crate::neo4j::mock::MockGraphStore>,
+        Arc<crate::chat::manager::ChatManager>,
+    ) {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let app_state = crate::test_helpers::mock_app_state_with_graph(graph.clone());
+        let manager = Arc::new(crate::chat::manager::ChatManager::new_without_memory(
+            graph.clone(),
+            app_state.meili.clone(),
+            crate::chat::manager::test_support::chat_config(),
+        ));
+        let state =
+            crate::test_helpers::server_state_with_chat(manager.clone(), graph.clone()).await;
+        (state, graph, manager)
+    }
+
+    async fn snapshot(
+        state: &OrchestratorState,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<ActivitySnapshot, AppError> {
+        let query = ActivitySnapshotQuery {
+            project_id,
+            workspace_slug: workspace_slug.map(str::to_string),
+            limit,
+        };
+        get_activity_snapshot(State(state.clone()), Query(query))
+            .await
+            .map(|Json(snapshot)| snapshot)
+    }
+
+    /// A running plan run, owned by `project_id`, with one active agent.
+    fn running_run(
+        plan_id: Uuid,
+        project_id: Option<Uuid>,
+        title: &str,
+    ) -> crate::runner::RunnerState {
+        use crate::runner::{ActiveAgent, RunnerState, TaskRunStatus, TriggerSource};
+        let mut run = RunnerState::new(Uuid::new_v4(), plan_id, 3, TriggerSource::Manual);
+        run.project_id = project_id;
+        run.git_branch = "feat/x".to_string();
+        run.cwd = Some("/work/x".to_string());
+        run.completed_tasks = vec![Uuid::new_v4()];
+        run.failed_tasks = vec![Uuid::new_v4()];
+        run.started_at = Utc::now() - chrono::Duration::seconds(90);
+        run.active_agents = vec![ActiveAgent {
+            task_id: Uuid::new_v4(),
+            task_title: title.to_string(),
+            session_id: Some(Uuid::new_v4()),
+            started_at: Utc::now() - chrono::Duration::seconds(30),
+            cost_usd: 0.5,
+            status: TaskRunStatus::Running,
+        }];
+        run
+    }
+
+    fn visit(state_id: Uuid, name: &str) -> crate::protocol::StateVisit {
+        crate::protocol::StateVisit {
+            state_id,
+            state_name: name.to_string(),
+            entered_at: Utc::now(),
+            exited_at: None,
+            duration_ms: None,
+            trigger: None,
+            progress_snapshot: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_project_is_a_not_found_not_an_empty_snapshot() {
+        let (state, _graph, _manager) = rig().await;
+        let refused = snapshot(&state, Some(Uuid::new_v4()), None, None)
+            .await
+            .expect_err("an unknown project is refused");
+        assert!(matches!(refused, AppError::NotFound(_)), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_workspace_is_a_not_found() {
+        let (state, _graph, _manager) = rig().await;
+        let refused = snapshot(&state, None, Some("no-such-workspace"), None)
+            .await
+            .expect_err("an unknown workspace is refused");
+        match refused {
+            AppError::NotFound(message) => assert!(message.contains("no-such-workspace")),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_runs_are_scoped_by_project_and_by_workspace_membership() {
+        let (state, graph, _manager) = rig().await;
+        let alpha = crate::test_helpers::test_project_named("alpha");
+        let beta = crate::test_helpers::test_project_named("beta");
+        let gamma = crate::test_helpers::test_project_named("gamma");
+        for project in [&alpha, &beta, &gamma] {
+            graph.create_project(project).await.unwrap();
+        }
+        let workspace = crate::test_helpers::test_workspace();
+        graph.create_workspace(&workspace).await.unwrap();
+        graph
+            .add_project_to_workspace(workspace.id, alpha.id)
+            .await
+            .unwrap();
+        graph
+            .add_project_to_workspace(workspace.id, beta.id)
+            .await
+            .unwrap();
+
+        let plan = crate::test_helpers::test_plan_for_project(alpha.id);
+        graph.create_plan(&plan).await.unwrap();
+        let in_alpha = running_run(plan.id, Some(alpha.id), "Build alpha");
+        let in_beta = running_run(Uuid::new_v4(), Some(beta.id), "Build beta");
+        let in_gamma = running_run(plan.id, Some(gamma.id), "Build gamma");
+        let unowned = running_run(plan.id, None, "Orphan");
+        for run in [&in_alpha, &in_beta, &in_gamma, &unowned] {
+            graph.create_plan_run(run).await.unwrap();
+        }
+
+        // Unscoped: every running run, the plan title resolved where the plan exists.
+        let all = snapshot(&state, None, None, None).await.ok().unwrap();
+        assert_eq!(all.counts.plan_runs, 4);
+        let alpha_entry = all
+            .plan_runs
+            .iter()
+            .find(|r| r.run_id == in_alpha.run_id)
+            .expect("alpha run listed");
+        assert_eq!(alpha_entry.plan_title.as_deref(), Some(plan.title.as_str()));
+        assert_eq!(alpha_entry.status, "running");
+        assert_eq!(alpha_entry.completed_tasks, 1);
+        assert_eq!(alpha_entry.failed_tasks, 1);
+        assert_eq!(alpha_entry.total_tasks, 3);
+        assert_eq!(alpha_entry.git_branch, "feat/x");
+        assert_eq!(alpha_entry.cwd.as_deref(), Some("/work/x"));
+        assert!(
+            alpha_entry.elapsed_secs >= 90,
+            "{}",
+            alpha_entry.elapsed_secs
+        );
+        assert_eq!(alpha_entry.active_tasks.len(), 1);
+        assert_eq!(alpha_entry.active_tasks[0].title, "Build alpha");
+        assert_eq!(alpha_entry.active_tasks[0].status, "running");
+        assert!(alpha_entry.active_tasks[0].elapsed_secs >= 30);
+        let beta_entry = all
+            .plan_runs
+            .iter()
+            .find(|r| r.run_id == in_beta.run_id)
+            .expect("beta run listed");
+        assert_eq!(
+            beta_entry.plan_title, None,
+            "the plan of beta does not exist"
+        );
+
+        // A project: only its own runs, the unowned one never leaks in.
+        let only_alpha = snapshot(&state, Some(alpha.id), None, None)
+            .await
+            .ok()
+            .unwrap();
+        let ids: Vec<Uuid> = only_alpha.plan_runs.iter().map(|r| r.run_id).collect();
+        assert_eq!(ids, vec![in_alpha.run_id]);
+        assert_eq!(only_alpha.project_id, Some(alpha.id));
+
+        // A workspace: the runs of its member projects, not gamma's and not the orphan.
+        let in_ws = snapshot(&state, None, Some(&workspace.slug), None)
+            .await
+            .ok()
+            .unwrap();
+        let mut ws_ids: Vec<Uuid> = in_ws.plan_runs.iter().map(|r| r.run_id).collect();
+        ws_ids.sort();
+        let mut expected = vec![in_alpha.run_id, in_beta.run_id];
+        expected.sort();
+        assert_eq!(ws_ids, expected);
+        assert_eq!(
+            in_ws.workspace_slug.as_deref(),
+            Some(workspace.slug.as_str())
+        );
+
+        // The per-family limit caps the list and is reflected in the counts.
+        let capped = snapshot(&state, None, None, Some(1)).await.ok().unwrap();
+        assert_eq!(capped.plan_runs.len(), 1);
+        assert_eq!(capped.counts.plan_runs, 1);
+        // A zero limit is clamped to one, never an empty page that hides everything.
+        let clamped = snapshot(&state, None, None, Some(0)).await.ok().unwrap();
+        assert_eq!(clamped.plan_runs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn protocol_runs_name_their_protocol_and_current_state() {
+        let (state, graph, _manager) = rig().await;
+        let project = crate::test_helpers::test_project_named("ops");
+        graph.create_project(&project).await.unwrap();
+        let start = Uuid::new_v4();
+        let protocol = crate::protocol::Protocol::new(Some(project.id), "deploy", start);
+        graph.upsert_protocol(&protocol).await.unwrap();
+
+        // The current state is named by its visit: the name is denormalized there.
+        let mut named = crate::protocol::ProtocolRun::new(protocol.id, start, "start");
+        named.states_visited = vec![visit(start, "start")];
+        // The current state has no visit (never recorded): no name, not a failure.
+        // A child run of the same protocol: the store refuses two *root* runs
+        // running on one protocol, and a second run of it exercises the cache.
+        let mut unnamed = crate::protocol::ProtocolRun::new(protocol.id, Uuid::new_v4(), "ghost");
+        unnamed.states_visited = vec![visit(start, "start")];
+        unnamed.parent_run_id = Some(named.id);
+        // The protocol itself is gone: the run still shows, without a name.
+        let orphan = crate::protocol::ProtocolRun::new(Uuid::new_v4(), start, "start");
+        for run in [&named, &unnamed, &orphan] {
+            graph.create_protocol_run(run).await.unwrap();
+        }
+
+        let all = snapshot(&state, None, None, None).await.ok().unwrap();
+        assert_eq!(all.counts.protocol_runs, 3);
+        let by_id = |id: Uuid| {
+            all.protocol_runs
+                .iter()
+                .find(|r| r.run_id == id)
+                .expect("run listed")
+        };
+        let named_entry = by_id(named.id);
+        assert_eq!(named_entry.protocol_name.as_deref(), Some("deploy"));
+        assert_eq!(named_entry.current_state_name.as_deref(), Some("start"));
+        assert_eq!(named_entry.states_visited, 1);
+        assert_eq!(named_entry.status, "running");
+        let unnamed_entry = by_id(unnamed.id);
+        assert_eq!(unnamed_entry.protocol_name.as_deref(), Some("deploy"));
+        assert_eq!(unnamed_entry.current_state_name, None);
+        assert_eq!(by_id(orphan.id).protocol_name, None);
+
+        // A project scope keeps the runs whose protocol belongs to it.
+        let scoped = snapshot(&state, Some(project.id), None, None)
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(scoped.counts.protocol_runs, 2);
+        assert!(scoped.protocol_runs.iter().all(|r| r.run_id != orphan.id));
+    }
+
+    #[tokio::test]
+    async fn conversations_are_scoped_like_plan_runs_and_limited() {
+        let (state, graph, manager) = rig().await;
+        let alpha = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&alpha).await.unwrap();
+        let workspace = crate::test_helpers::test_workspace();
+        graph.create_workspace(&workspace).await.unwrap();
+        graph
+            .add_project_to_workspace(workspace.id, alpha.id)
+            .await
+            .unwrap();
+
+        // In the project.
+        let mut in_project = crate::test_helpers::test_chat_session(Some(&alpha.slug));
+        in_project.title = Some("Chat in alpha".to_string());
+        // Elsewhere.
+        let elsewhere = crate::test_helpers::test_chat_session(Some("elsewhere"));
+        // Names its workspace directly, its project is elsewhere: in.
+        let mut named_workspace = crate::test_helpers::test_chat_session(Some("elsewhere"));
+        named_workspace.workspace_slug = Some(workspace.slug.clone());
+        // Names another workspace, but its project is in this one: in by project.
+        let mut other_workspace = crate::test_helpers::test_chat_session(Some(&alpha.slug));
+        other_workspace.workspace_slug = Some("another".to_string());
+        // Names another workspace and its project is not ours: out.
+        let mut foreign = crate::test_helpers::test_chat_session(Some("elsewhere"));
+        foreign.workspace_slug = Some("another".to_string());
+        // Names another workspace and no project at all: out, nothing to fall back on.
+        let mut projectless = crate::test_helpers::test_chat_session(None);
+        projectless.workspace_slug = Some("another".to_string());
+        let nodes = [
+            &in_project,
+            &elsewhere,
+            &named_workspace,
+            &other_workspace,
+            &foreign,
+            &projectless,
+        ];
+        for node in nodes {
+            graph.create_chat_session(node).await.unwrap();
+        }
+        // Live but unknown to the graph (just opened): shown when unscoped only.
+        let unknown_id = Uuid::new_v4();
+
+        let mut handles = Vec::new();
+        for node in nodes {
+            handles.push(
+                crate::chat::manager::test_support::insert_mock_cli_session(
+                    &manager,
+                    &node.id.to_string(),
+                )
+                .await,
+            );
+        }
+        handles.push(
+            crate::chat::manager::test_support::insert_mock_cli_session(
+                &manager,
+                &unknown_id.to_string(),
+            )
+            .await,
+        );
+
+        let all = snapshot(&state, None, None, None).await.ok().unwrap();
+        assert_eq!(all.counts.chat_sessions, 7);
+        let unknown_entry = all
+            .chat_sessions
+            .iter()
+            .find(|s| s.session_id == unknown_id)
+            .expect("the unknown live session is still shown");
+        assert_eq!(unknown_entry.title, None);
+        assert_eq!(unknown_entry.model, "");
+        assert!(unknown_entry.activity.live);
+        let alpha_entry = all
+            .chat_sessions
+            .iter()
+            .find(|s| s.session_id == in_project.id)
+            .expect("alpha chat listed");
+        assert_eq!(alpha_entry.title.as_deref(), Some("Chat in alpha"));
+        assert_eq!(
+            alpha_entry.project_slug.as_deref(),
+            Some(alpha.slug.as_str())
+        );
+
+        // A project: its conversations only; the unknown live one is not theirs.
+        let by_project = snapshot(&state, Some(alpha.id), None, None)
+            .await
+            .ok()
+            .unwrap();
+        let project_ids: Vec<Uuid> = by_project
+            .chat_sessions
+            .iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert!(project_ids.contains(&in_project.id));
+        assert!(project_ids.contains(&other_workspace.id));
+        assert!(!project_ids.contains(&unknown_id));
+        assert!(!project_ids.contains(&elsewhere.id));
+
+        // A workspace: by its slug, or by the project it belongs to; the foreign one stays out.
+        let by_workspace = snapshot(&state, None, Some(&workspace.slug), None)
+            .await
+            .ok()
+            .unwrap();
+        let ws_ids: Vec<Uuid> = by_workspace
+            .chat_sessions
+            .iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert!(ws_ids.contains(&in_project.id));
+        assert!(ws_ids.contains(&named_workspace.id));
+        assert!(ws_ids.contains(&other_workspace.id));
+        assert!(!ws_ids.contains(&elsewhere.id));
+        assert!(!ws_ids.contains(&foreign.id));
+        assert!(!ws_ids.contains(&projectless.id));
+        assert!(!ws_ids.contains(&unknown_id));
+
+        // The limit applies to conversations too.
+        let capped = snapshot(&state, None, None, Some(2)).await.ok().unwrap();
+        assert_eq!(capped.chat_sessions.len(), 2);
+        drop(handles);
+    }
+
+    #[test]
+    fn wire_name_is_the_snake_case_name_and_never_a_panic() {
+        assert_eq!(wire_name(&crate::runner::TaskRunStatus::Running), "running");
+        assert_eq!(
+            wire_name(&7u32),
+            "7",
+            "a non-string value keeps its JSON form"
+        );
+        assert_eq!(wire_name(&Unserializable), "unknown");
+    }
+
+    #[test]
+    fn elapsed_is_never_negative() {
+        let future = Utc::now() + chrono::Duration::seconds(120);
+        assert_eq!(elapsed_secs(future), 0);
+        let past = Utc::now() - chrono::Duration::seconds(5);
+        assert!(elapsed_secs(past) >= 5);
+    }
+
+    /// A value whose serialization fails: `wire_name` must degrade, not panic.
+    struct Unserializable;
+
+    impl Serialize for Unserializable {
+        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("refused on purpose"))
+        }
+    }
 }
