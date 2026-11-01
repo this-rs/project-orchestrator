@@ -6,6 +6,7 @@
 use crate::neo4j::traits::*;
 
 use super::models::*;
+use super::retrieval_ledger;
 use crate::embeddings::EmbeddingProvider;
 use crate::events::graph::{GraphEvent, GraphEventType, GraphLayer};
 use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter};
@@ -392,6 +393,19 @@ impl NoteManager {
 
     /// Create a new note
     pub async fn create_note(&self, input: CreateNoteRequest, created_by: &str) -> Result<Note> {
+        self.create_note_with(input, created_by, NoteExtras::default())
+            .await
+    }
+
+    /// [`Self::create_note`] with the validity window and revision provenance a
+    /// plain creation never carries. Kept apart so that the 17 sites building a
+    /// `CreateNoteRequest` do not all change for a feature most notes do not use.
+    pub async fn create_note_with(
+        &self,
+        input: CreateNoteRequest,
+        created_by: &str,
+        extras: NoteExtras,
+    ) -> Result<Note> {
         // RFC auto-template: use structured template if content is empty
         let content = if input.note_type == NoteType::Rfc && input.content.trim().is_empty() {
             Self::RFC_TEMPLATE.to_string()
@@ -420,6 +434,9 @@ impl NoteManager {
         if let Some(consent) = input.sharing_consent {
             note.sharing_consent = consent;
         }
+        note.valid_from = extras.valid_from;
+        note.valid_until = extras.valid_until;
+        note.revision = extras.revision;
 
         // Apply project-level default_note_energy if set (homeostasis throttle).
         // When note_density is high, homeostasis sets a lower initial energy
@@ -943,6 +960,70 @@ impl NoteManager {
         Ok(new_note)
     }
 
+    /// Revise a note: the new version replaces `old_note_id` and carries WHO revised,
+    /// WHEN and on WHAT EVIDENCE.
+    ///
+    /// This is how a note outside its validity window (or already superseded) comes
+    /// back into use: not refused, revised. A revision with no evidence is refused —
+    /// it would be a silent rewrite, the very thing the window exists to prevent.
+    /// The new version opens a fresh window (`valid_from` / `valid_until` as given;
+    /// both `None` = unbounded).
+    pub async fn revise_note(
+        &self,
+        old_note_id: Uuid,
+        new_note_input: CreateNoteRequest,
+        revised_by: &str,
+        evidence: &str,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Note> {
+        let evidence = evidence.trim();
+        if evidence.is_empty() {
+            anyhow::bail!(
+                "a revision needs its evidence (a commit, a test, an output): none was given"
+            );
+        }
+        if let (Some(from), Some(until)) = (valid_from, valid_until) {
+            if until <= from {
+                anyhow::bail!("valid_until must be after valid_from");
+            }
+        }
+        if self.neo4j.get_note(old_note_id).await?.is_none() {
+            anyhow::bail!("note {old_note_id} not found: nothing to revise");
+        }
+        let extras = NoteExtras {
+            valid_from,
+            valid_until,
+            revision: Some(NoteRevision {
+                revised_by: revised_by.to_string(),
+                revised_at: chrono::Utc::now(),
+                evidence: evidence.to_string(),
+                revises: old_note_id,
+            }),
+        };
+        let mut new_note = self
+            .create_note_with(new_note_input, revised_by, extras)
+            .await?;
+        new_note.supersedes = Some(old_note_id);
+        self.neo4j.supersede_note(old_note_id, new_note.id).await?;
+        self.meilisearch
+            .update_note_status(&old_note_id.to_string(), "archived")
+            .await?;
+        self.emit(
+            CrudEvent::new(
+                EventEntityType::Note,
+                CrudAction::Updated,
+                old_note_id.to_string(),
+            )
+            .with_payload(serde_json::json!({
+                "status": "archived",
+                "superseded_by": new_note.id.to_string(),
+                "revised_by": revised_by,
+            })),
+        );
+        Ok(new_note)
+    }
+
     /// Get notes that need review
     pub async fn get_notes_needing_review(
         &self,
@@ -976,6 +1057,44 @@ impl NoteManager {
 
     /// Search notes using semantic search
     pub async fn search_notes(
+        &self,
+        query: &str,
+        filters: &NoteFilters,
+    ) -> Result<Vec<NoteSearchHit>> {
+        self.search_notes_with_trigger(query, filters, retrieval_ledger::Trigger::Explicit)
+            .await
+    }
+
+    /// [`Self::search_notes`] (BM25, Meilisearch), avec le motif déclaré par
+    /// l'appelant. C'est le seul point d'entrée BM25 : il enregistre une ligne de
+    /// registre par appel, réussite comme échec.
+    pub async fn search_notes_with_trigger(
+        &self,
+        query: &str,
+        filters: &NoteFilters,
+        trigger: retrieval_ledger::Trigger,
+    ) -> Result<Vec<NoteSearchHit>> {
+        let started = std::time::Instant::now();
+        let out = self.search_notes_inner(query, filters).await;
+        let (items, ok) = match &out {
+            Ok(hits) => (note_items(hits), true),
+            Err(_) => (Vec::new(), false),
+        };
+        retrieval_ledger::record(
+            retrieval_ledger::Source::Bm25,
+            trigger,
+            query,
+            items,
+            ok,
+            started.elapsed().as_millis() as u64,
+        );
+        out
+    }
+
+    /// Le corps de la recherche BM25, sans registre : appelé par l'enveloppe
+    /// instrumentée et par le canal lexical de la recherche fusionnée, qui ne doit
+    /// pas compter une seconde récupération.
+    async fn search_notes_inner(
         &self,
         query: &str,
         filters: &NoteFilters,
@@ -1040,6 +1159,9 @@ impl NoteManager {
     /// * `project_id` - Optional filter by project UUID
     /// * `workspace_slug` - Optional filter by workspace (includes all projects in workspace + global notes)
     /// * `limit` - Maximum number of results (default 20)
+    ///
+    /// Entrée instrumentée : comportement identique, plus une ligne de registre.
+    /// Le registre ne peut pas faire échouer l'appel (voir retrieval_ledger::record).
     pub async fn semantic_search_notes(
         &self,
         query: &str,
@@ -1049,7 +1171,34 @@ impl NoteManager {
         min_similarity: Option<f64>,
         profile: Option<&str>,
     ) -> Result<Vec<NoteSearchHit>> {
+        self.semantic_search_notes_with_trigger(
+            query,
+            project_id,
+            workspace_slug,
+            limit,
+            min_similarity,
+            profile,
+            retrieval_ledger::Trigger::Explicit,
+        )
+        .await
+    }
+
+    /// [`Self::semantic_search_notes`], avec le motif de déclenchement déclaré par
+    /// l'appelant (champ (1) du registre). Le motif par défaut est « explicite » :
+    /// une récupération que personne n'a déclenchée ne doit pas se dire telle.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn semantic_search_notes_with_trigger(
+        &self,
+        query: &str,
+        project_id: Option<Uuid>,
+        workspace_slug: Option<&str>,
+        limit: Option<usize>,
+        min_similarity: Option<f64>,
+        profile: Option<&str>,
+        trigger: retrieval_ledger::Trigger,
+    ) -> Result<Vec<NoteSearchHit>> {
         let limit = limit.unwrap_or(20);
+        let started = std::time::Instant::now();
 
         if let Some(profile_name) = profile {
             tracing::debug!(
@@ -1070,19 +1219,36 @@ impl NoteManager {
                     limit: Some(limit as i64),
                     ..Default::default()
                 };
-                return self.search_notes(query, &filters).await;
+                // The fallback is a BM25 retrieval and is recorded as such, with
+                // the caller's motif: recording it twice, once as semantic, would
+                // invent an index call that never happened.
+                return self
+                    .search_notes_with_trigger(query, &filters, trigger)
+                    .await;
             }
         };
 
         // Embed the query text
-        let query_embedding = provider
-            .embed_text(query)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to embed search query: {}", e))?;
+        let query_embedding = match provider.embed_text(query).await {
+            Ok(embedding) => embedding,
+            Err(e) => {
+                // An embedding that fails is a retrieval that returned nothing:
+                // the registry must say "failed", not "empty".
+                retrieval_ledger::record(
+                    retrieval_ledger::Source::Semantic,
+                    trigger,
+                    query,
+                    Vec::new(),
+                    false,
+                    started.elapsed().as_millis() as u64,
+                );
+                return Err(anyhow::anyhow!("Failed to embed search query: {}", e));
+            }
+        };
 
         // Channel 1 — dense cosine over the note embeddings, scoped by
         // project_id / workspace_slug in the Cypher and floored by min_similarity.
-        let dense = self
+        let dense = match self
             .neo4j
             .vector_search_notes(
                 &query_embedding,
@@ -1091,15 +1257,34 @@ impl NoteManager {
                 workspace_slug,
                 min_similarity,
             )
-            .await?;
+            .await
+        {
+            Ok(hits) => hits,
+            Err(e) => {
+                retrieval_ledger::record(
+                    retrieval_ledger::Source::Semantic,
+                    trigger,
+                    query,
+                    Vec::new(),
+                    false,
+                    started.elapsed().as_millis() as u64,
+                );
+                return Err(e);
+            }
+        };
 
         // Channel 2 — lexical BM25. It is fetched unscoped, then confined to the
         // *same* scope as the dense channel: fusing an unscoped lexical list
         // would reintroduce the cross-project leak that project_id closes.
         // A Meilisearch hiccup must not sink the dense answer, hence
         // `unwrap_or_default` (degrade to dense-only).
+        //
+        // `search_notes_inner`, et non `search_notes` : le canal lexical est un
+        // moyen interne de CETTE récupération, pas une seconde récupération. Le
+        // compter comme telle doublerait le nombre d'appels et rendrait le coût
+        // par résultat non vide ininterprétable.
         let lexical: Vec<NoteSearchHit> = self
-            .search_notes(
+            .search_notes_inner(
                 query,
                 &NoteFilters {
                     limit: Some(limit as i64),
@@ -1112,7 +1297,16 @@ impl NoteManager {
             .filter(|hit| note_in_scope(hit.note.project_id, project_id, workspace_slug.is_some()))
             .collect();
 
-        Ok(fuse_dense_and_lexical(dense, lexical, limit))
+        let fused = fuse_dense_and_lexical(dense, lexical, limit);
+        retrieval_ledger::record(
+            retrieval_ledger::Source::Semantic,
+            trigger,
+            query,
+            note_items(&fused),
+            true,
+            started.elapsed().as_millis() as u64,
+        );
+        Ok(fused)
     }
 
     // ========================================================================
@@ -2194,6 +2388,16 @@ fn note_in_scope(
     }
 }
 
+/// Les identifiants et scores rendus, tels que le registre les conserve
+/// (champ (3) : un compteur ne dit pas *quoi* a été rendu).
+fn note_items(hits: &[NoteSearchHit]) -> Vec<retrieval_ledger::RetrievedItem> {
+    hits.iter()
+        .map(|hit| {
+            retrieval_ledger::RetrievedItem::new(hit.note.id.to_string(), "note", Some(hit.score))
+        })
+        .collect()
+}
+
 /// Fuse the dense and lexical channels of a note search by Reciprocal Rank
 /// Fusion, then map ids back to notes and re-apply the scar penalty.
 ///
@@ -2271,6 +2475,183 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
     use crate::test_helpers::*;
+
+    // -- Registre de récupération : le branchement, pas seulement le compteur --
+
+    /// Une recherche BM25 écrit une ligne de registre. La requête est unique par
+    /// test : les compteurs sont globaux, et une assertion par delta serait
+    /// brouillée par les tests voisins.
+    // Le garde sérialise un registre GLOBAL à travers l'appel observé : le
+    // tenir pendant l'await est le but, pas un oubli.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn une_recherche_bm25_ecrit_dans_le_registre() {
+        // Le registre est global : ce test le sérialise avec les autres et
+        // agrandit le journal pour qu'aucun événement voisin ne l'évince.
+        let _serial = retrieval_ledger::serial_guard();
+        let saved_capacity = retrieval_ledger::journal_capacity();
+        retrieval_ledger::set_journal_capacity(4096);
+
+        let state = mock_app_state_with_stores().0;
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        let query = format!("bruit-bm25-{}", Uuid::new_v4());
+
+        let _ = mgr.search_notes(&query, &NoteFilters::default()).await;
+
+        let mine: Vec<_> = retrieval_ledger::recent(256)
+            .into_iter()
+            .filter(|e| e.query == query)
+            .collect();
+        retrieval_ledger::set_journal_capacity(saved_capacity);
+
+        assert_eq!(mine.len(), 1, "une récupération, un événement");
+        assert_eq!(mine[0].source, retrieval_ledger::Source::Bm25);
+        assert_eq!(mine[0].trigger, retrieval_ledger::Trigger::Explicit);
+    }
+
+    /// Sans fournisseur d'embedding, la recherche « sémantique » est servie par
+    /// BM25. Le registre doit le dire : une récupération comptée deux fois, dont
+    /// une fois sous un nom qui n'a pas eu lieu, fausse tout l'agrégat.
+    // Le garde sérialise un registre GLOBAL à travers l'appel observé : le
+    // tenir pendant l'await est le but, pas un oubli.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn le_repli_bm25_ne_se_degulse_pas_en_semantique() {
+        let _serial = retrieval_ledger::serial_guard();
+        let saved_capacity = retrieval_ledger::journal_capacity();
+        retrieval_ledger::set_journal_capacity(4096);
+
+        let state = mock_app_state_with_stores().0;
+        // `NoteManager::new` n'installe aucun fournisseur d'embedding.
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        let query = format!("repli-{}", Uuid::new_v4());
+
+        let _ = mgr
+            .semantic_search_notes(&query, None, None, None, None, None)
+            .await;
+
+        let mine: Vec<_> = retrieval_ledger::recent(256)
+            .into_iter()
+            .filter(|e| e.query == query)
+            .collect();
+        retrieval_ledger::set_journal_capacity(saved_capacity);
+        assert_eq!(mine.len(), 1, "une seule récupération, un seul événement");
+        assert_eq!(
+            mine[0].source,
+            retrieval_ledger::Source::Bm25,
+            "le repli est une récupération BM25, pas une récupération sémantique"
+        );
+    }
+
+    /// Le motif déclaré par l'appelant est celui qui est enregistré : c'est la
+    /// prise que le déclencheur (PR3) branchera.
+    // Le garde sérialise un registre GLOBAL à travers l'appel observé : le
+    // tenir pendant l'await est le but, pas un oubli.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn le_motif_declare_est_celui_qui_est_enregistre() {
+        let _serial = retrieval_ledger::serial_guard();
+        let saved_capacity = retrieval_ledger::journal_capacity();
+        retrieval_ledger::set_journal_capacity(4096);
+
+        let state = mock_app_state_with_stores().0;
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        let query = format!("frontiere-{}", Uuid::new_v4());
+
+        let _ = mgr
+            .search_notes_with_trigger(
+                &query,
+                &NoteFilters::default(),
+                retrieval_ledger::Trigger::TaskBoundary,
+            )
+            .await;
+
+        let mine: Vec<_> = retrieval_ledger::recent(256)
+            .into_iter()
+            .filter(|e| e.query == query)
+            .collect();
+        retrieval_ledger::set_journal_capacity(saved_capacity);
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].trigger, retrieval_ledger::Trigger::TaskBoundary);
+    }
+
+    // -- Retrieval failure paths: a source in error is a FAILED retrieval ------
+
+    /// An embedding provider whose call always fails (the semantic channel must
+    /// report "failed", never "empty").
+    struct FailingEmbeddingProvider;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for FailingEmbeddingProvider {
+        async fn embed_text(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            anyhow::bail!("embedder down")
+        }
+
+        async fn embed_batch(&self, _texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            anyhow::bail!("embedder down")
+        }
+
+        fn dimensions(&self) -> usize {
+            768
+        }
+
+        fn model_name(&self) -> &str {
+            "failing-test"
+        }
+    }
+
+    /// A Meilisearch failure surfaces as an error from `search_notes`; the
+    /// retrieval ledger records it as a FAILED BM25 retrieval.
+    #[tokio::test]
+    async fn a_bm25_search_failure_surfaces_the_error() {
+        let (state, _graph, meili) = mock_app_state_with_stores();
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        meili
+            .fail_note_search
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let err = mgr
+            .search_notes("bm25-will-fail", &NoteFilters::default())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("injected"), "{err}");
+    }
+
+    /// An embedding failure fails the semantic search: the error is returned
+    /// (and the ledger counts a failed semantic retrieval, not an empty one).
+    #[tokio::test]
+    async fn an_embedding_failure_fails_the_semantic_search() {
+        let state = mock_app_state_with_stores().0;
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone())
+            .with_embedding_provider(Arc::new(FailingEmbeddingProvider));
+
+        let err = mgr
+            .semantic_search_notes("needle", None, None, None, None, None)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("embed"), "{err}");
+    }
+
+    /// A vector search failure surfaces the raw graph error to the caller
+    /// (after the ledger records a failed semantic retrieval).
+    #[tokio::test]
+    async fn a_vector_search_failure_surfaces_the_error() {
+        let (state, graph, _meili) = mock_app_state_with_stores();
+        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone())
+            .with_embedding_provider(Arc::new(crate::embeddings::MockEmbeddingProvider::new(768)));
+        graph
+            .fail_vector_search
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let err = mgr
+            .semantic_search_notes("needle", None, None, None, None, None)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("injected"), "{err}");
+    }
 
     // -- Hybrid ranking: dense ∪ lexical, fused by RRF ----------------------
 
@@ -2636,6 +3017,137 @@ mod tests {
         let old_after = mgr.get_note(old_note.id).await.unwrap().unwrap();
         assert_eq!(old_after.status, NoteStatus::Obsolete);
         assert_eq!(old_after.superseded_by, Some(new_note.id));
+    }
+
+    #[tokio::test]
+    async fn a_revision_records_who_when_and_on_what_evidence() {
+        let (mgr, pid) = create_note_manager().await;
+        let old = mgr
+            .create_note(make_create_request(pid, "Deploy via script A"), "agent-1")
+            .await
+            .unwrap();
+
+        let until = chrono::Utc::now() + chrono::Duration::days(30);
+        let new = mgr
+            .revise_note(
+                old.id,
+                make_create_request(pid, "Deploy via script B"),
+                "agent-2",
+                "  commit 1a2b3c4: script A removed  ",
+                None,
+                Some(until),
+            )
+            .await
+            .unwrap();
+
+        // The persisted version carries the provenance, not just the returned value.
+        let stored = mgr.get_note(new.id).await.unwrap().unwrap();
+        let rev = stored
+            .revision
+            .clone()
+            .expect("a revision must be recorded");
+        assert_eq!(rev.revised_by, "agent-2");
+        assert_eq!(rev.evidence, "commit 1a2b3c4: script A removed");
+        assert_eq!(rev.revises, old.id);
+        assert_eq!(stored.valid_until, Some(until));
+
+        let old_after = mgr.get_note(old.id).await.unwrap().unwrap();
+        assert_eq!(old_after.superseded_by, Some(new.id));
+        assert!(
+            !crate::notes::is_current_knowledge(&old_after),
+            "the replaced version no longer reaches the agent"
+        );
+        assert!(crate::notes::is_current_knowledge(&stored));
+    }
+
+    #[tokio::test]
+    async fn a_revision_without_evidence_is_refused_and_changes_nothing() {
+        let (mgr, pid) = create_note_manager().await;
+        let old = mgr
+            .create_note(make_create_request(pid, "Keep me"), "agent-1")
+            .await
+            .unwrap();
+
+        for blank in ["", "   ", "\n\t"] {
+            let err = mgr
+                .revise_note(
+                    old.id,
+                    make_create_request(pid, "Silent rewrite"),
+                    "agent-2",
+                    blank,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("evidence"), "{err}");
+        }
+        let after = mgr.get_note(old.id).await.unwrap().unwrap();
+        assert!(
+            after.superseded_by.is_none(),
+            "a refused revision must not supersede the note"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revision_of_an_unknown_note_or_an_inverted_window_is_refused() {
+        let (mgr, pid) = create_note_manager().await;
+        let missing = mgr
+            .revise_note(
+                Uuid::new_v4(),
+                make_create_request(pid, "x"),
+                "agent-2",
+                "proof",
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("not found"), "{missing}");
+
+        let old = mgr
+            .create_note(make_create_request(pid, "y"), "agent-1")
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let inverted = mgr
+            .revise_note(
+                old.id,
+                make_create_request(pid, "z"),
+                "agent-2",
+                "proof",
+                Some(now),
+                Some(now - chrono::Duration::days(1)),
+            )
+            .await
+            .unwrap_err();
+        assert!(inverted.to_string().contains("valid_until"), "{inverted}");
+    }
+
+    #[tokio::test]
+    async fn a_revision_with_an_equal_validity_window_is_refused() {
+        let (mgr, pid) = create_note_manager().await;
+        let old = mgr
+            .create_note(make_create_request(pid, "y"), "agent-1")
+            .await
+            .unwrap();
+
+        // `valid_until == valid_from` is refused too: the window is closed as
+        // soon as it is not strictly positive.
+        let now = chrono::Utc::now();
+        let err = mgr
+            .revise_note(
+                old.id,
+                make_create_request(pid, "z"),
+                "agent-2",
+                "proof",
+                Some(now),
+                Some(now),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("valid_until"), "{err}");
     }
 
     #[tokio::test]

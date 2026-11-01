@@ -75,7 +75,7 @@ Workspace
 - Persona → Skill: `persona(action: "add_skill")` — HAS_SKILL
 - Persona → Protocol: `persona(action: "add_protocol")` — HAS_PROTOCOL
 - Persona → Persona: `persona(action: "add_extends")` — inheritance (child inherits parent's KNOWS)
-- Episode ← ProtocolRun: `episode(action: "collect", run_id)` — PRODUCED_DURING
+- Episode ← ProtocolRun: `episode(action: "collect", run_id, project_id)` — PRODUCED_DURING; Episode ← chat session: `episode(action: "collect", session_id)`
 
 ### Code Graph — Structural Relations
 
@@ -557,9 +557,10 @@ Personas are adaptive knowledge agents scoped to code regions. They accumulate K
 
 ### Episodic Memory
 
-Episodes are cognitive snapshots collected from protocol runs: stimulus (what triggered it), process (what happened), outcome (result + learnings).
+Episodes are cognitive snapshots collected from protocol runs or chat sessions: stimulus (what triggered it), process (what happened), outcome (result + learnings).
 
-- `episode(action: "collect", run_id)` — collect episode from a completed protocol run
+- `episode(action: "collect", run_id, project_id)` — collect episode from a completed protocol run
+- `episode(action: "collect", session_id)` — collect the episode of a chat session as it stands now (`close_reason` is `open` while it runs); a closed session's episode is already saved and listed with `source: "session"`
 - `episode(action: "list", project_id)` — list episodes for a project
 - `episode(action: "get", episode_id)` — get episode details
 - `episode(action: "export", episode_id)` — export for cross-instance portability
@@ -773,7 +774,7 @@ Manage architectural decisions.
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
-| add | `task_id` (req), `description` (req), `rationale`, `alternatives`, `chosen_option` | Record a decision |
+| add | `description` (req), `rationale`, `alternatives`, `chosen_option`, `task_id`, `project_id` | Record a decision. With no `task_id` it belongs to no task; `project_id` then only scopes search |
 | get | `decision_id` (req) | Get decision by UUID |
 | update | `decision_id` (req), `description`, `rationale`, `chosen_option`, `status` (proposed/accepted/deprecated/superseded) | Update decision |
 | delete | `decision_id` (req) | Delete a decision |

@@ -17,6 +17,9 @@ pub struct MockSearchStore {
     pub code_documents: RwLock<Vec<CodeDocument>>,
     pub decision_documents: RwLock<Vec<DecisionDocument>>,
     pub note_documents: RwLock<Vec<NoteDocument>>,
+    /// When set, `search_notes_with_scores` fails (a Meilisearch error surfaces
+    /// as a failed retrieval, not an empty one).
+    pub fail_note_search: std::sync::atomic::AtomicBool,
 }
 
 impl MockSearchStore {
@@ -26,6 +29,7 @@ impl MockSearchStore {
             code_documents: RwLock::new(Vec::new()),
             decision_documents: RwLock::new(Vec::new()),
             note_documents: RwLock::new(Vec::new()),
+            fail_note_search: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -319,7 +323,7 @@ impl SearchStore for MockSearchStore {
 
     async fn delete_decisions_for_task(&self, task_id: &str) -> Result<()> {
         let mut docs = self.decision_documents.write().await;
-        docs.retain(|d| d.task_id != task_id);
+        docs.retain(|d| d.task_id.as_deref() != Some(task_id));
         Ok(())
     }
 
@@ -409,6 +413,12 @@ impl SearchStore for MockSearchStore {
         status: Option<&str>,
         importance: Option<&str>,
     ) -> Result<Vec<SearchHit<NoteDocument>>> {
+        if self
+            .fail_note_search
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected note search failure (test)");
+        }
         let docs = self.note_documents.read().await;
         let mut results: Vec<SearchHit<NoteDocument>> = docs
             .iter()
@@ -512,7 +522,7 @@ mod tests {
             id: id.to_string(),
             description: "Use async/await for all IO operations".to_string(),
             rationale: "Better performance under load".to_string(),
-            task_id: task_id.to_string(),
+            task_id: Some(task_id.to_string()),
             agent: "claude".to_string(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             tags: vec!["architecture".to_string()],

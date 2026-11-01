@@ -1827,28 +1827,37 @@ pub(crate) async fn enrichment_for_turn(
         reasoning_path_tracker: protocol.reasoning_path_tracker,
     };
     let ctx = pipeline.execute(&input).await;
-    if !ctx.has_content() {
-        return (!live_block.is_empty()).then_some(live_block);
+    let mut parts: Vec<String> = Vec::new();
+    if !live_block.is_empty() {
+        // The live block opens the enrichment, like the other stages: never the prefix.
+        parts.push(live_block);
     }
-    debug!(
-        "[enrichment] Prompt enriched: {} sections, {}ms (hints: {:?})",
-        ctx.sections.len(),
-        ctx.total_time_ms,
-        ctx.hints.keys().collect::<Vec<_>>()
-    );
-    // Clean markdown prepended to the user message (replaces the old XML-wrapped
-    // <enrichment_context> format).
-    let md =
-        ctx.to_system_prompt_markdown_capped(super::composer::turn_enrichment_cap(window_tokens));
-    if live_block.is_empty() {
-        return (!md.is_empty()).then_some(md);
+    if ctx.has_content() {
+        debug!(
+            "[enrichment] Prompt enriched: {} sections, {}ms (hints: {:?})",
+            ctx.sections.len(),
+            ctx.total_time_ms,
+            ctx.hints.keys().collect::<Vec<_>>()
+        );
+        // Clean markdown prepended to the user message (replaces the old XML-wrapped
+        // <enrichment_context> format).
+        let md = ctx
+            .to_system_prompt_markdown_capped(super::composer::turn_enrichment_cap(window_tokens));
+        if !md.is_empty() {
+            parts.push(md);
+        }
     }
-    // The live block opens the enrichment, like the other stages: never the prefix.
-    Some(if md.is_empty() {
-        live_block
-    } else {
-        format!("{live_block}\n\n{md}")
-    })
+    // The retrieval trigger (PR3 of plan 42d49a31): an INVITATION to consult the graph,
+    // appended to the user turn — never to the system prompt, whose prefix must stay
+    // byte-identical for the cache. Off by default (`RETRIEVAL_TRIGGER`): off, `parts`
+    // holds exactly what the three branches above held before.
+    if let Some(invite) = super::retrieval_trigger::for_turn(super::retrieval_trigger::Facts {
+        message,
+        first_turn: node.message_count <= 1,
+    }) {
+        parts.push(invite);
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 /// What the manager does around a turn of the agent engine
@@ -20937,6 +20946,113 @@ mod tests {
         fn is_enabled(&self, _config: &crate::chat::enrichment::EnrichmentConfig) -> bool {
             true
         }
+    }
+
+    /// A stage that always contributes one section.
+    struct SectionProbe;
+
+    #[async_trait::async_trait]
+    impl crate::chat::enrichment::ParallelEnrichmentStage for SectionProbe {
+        async fn execute(
+            &self,
+            _input: &crate::chat::enrichment::EnrichmentInput,
+        ) -> anyhow::Result<crate::chat::enrichment::StageOutput> {
+            let mut out = crate::chat::enrichment::StageOutput::new("section-probe");
+            out.add_section(
+                "Probe",
+                "probe content",
+                "section-probe",
+                crate::chat::enrichment::EnrichmentSource::KnowledgeInjection,
+            );
+            Ok(out)
+        }
+        fn name(&self) -> &str {
+            "section-probe"
+        }
+        fn is_enabled(&self, _config: &crate::chat::enrichment::EnrichmentConfig) -> bool {
+            true
+        }
+    }
+
+    /// One turn of a fresh session whose pipeline holds [`SectionProbe`].
+    async fn enrich_one_probed_turn() -> Option<String> {
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let s = neutral_session();
+        mock.create_chat_session(&s).await.unwrap();
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let mut pipeline = crate::chat::enrichment::EnrichmentPipeline::new(Default::default());
+        pipeline.add_parallel_stage(Box::new(SectionProbe));
+        let anchor = anchor_in(AnchorContextMode::Off);
+        enrichment_for_turn(
+            &graph,
+            &pipeline,
+            &s.id.to_string(),
+            "hello",
+            Default::default(),
+            Default::default(),
+            &anchor,
+            None,
+        )
+        .await
+    }
+
+    /// With debug logging on, the enriched turn is reported (sections, time, hints)
+    /// and the prompt still carries the stage's section.
+    #[tokio::test]
+    async fn an_enriched_turn_is_reported_at_debug_level() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let md = enrich_one_probed_turn().await.expect("the probe's section");
+        assert!(md.contains("probe content"), "{md}");
+    }
+
+    /// The child half of [`the_retrieval_trigger_invites_the_first_turn_to_consult_the_graph`]:
+    /// it only checks something when its parent re-runs it with the flag on.
+    #[tokio::test]
+    async fn retrieval_trigger_child_appends_the_invitation() {
+        if std::env::var(crate::chat::retrieval_trigger::FLAG).as_deref() != Ok("1") {
+            return;
+        }
+        let md = enrich_one_probed_turn()
+            .await
+            .expect("section + invitation");
+        assert!(md.contains("probe content"), "{md}");
+        let invite = crate::chat::retrieval_trigger::invitation(
+            crate::notes::retrieval_ledger::Trigger::TaskBoundary,
+        );
+        assert!(
+            md.ends_with(&invite),
+            "the invitation closes the turn: {md}"
+        );
+    }
+
+    /// `RETRIEVAL_TRIGGER=1`: a session's first turn ends with the invitation to
+    /// consult the graph. The flag is read from the process environment, so the
+    /// check runs in a child process of this test binary — setting it here would
+    /// leak into the tests running in parallel.
+    #[test]
+    fn the_retrieval_trigger_invites_the_first_turn_to_consult_the_graph() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "chat::manager::tests::retrieval_trigger_child_appends_the_invitation",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(crate::chat::retrieval_trigger::FLAG, "1")
+            .output()
+            .expect("the child test runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "child failed: {stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains("1 passed"), "the child test ran: {stdout}");
     }
 
     /// Review #679 finding 6: a session belongs to the person who opened it, a delegated

@@ -734,6 +734,22 @@ pub(crate) async fn record_turn_feedback(
     memory_manager: &Option<Arc<Mutex<ConversationMemoryManager>>>,
     context_injector: &Option<Arc<ContextInjector>>,
 ) {
+    // Le registre de récupération (PR1 du plan 42d49a31) : les récupérations
+    // de CE tour sont réglées maintenant que la réponse est connue — « utilisé »
+    // = cité par la réponse. Avant tout retour anticipé : le règlement ne dépend
+    // pas de la mémoire de conversation, et une réponse vide n'a rien cité.
+    if let Some(uuid) = f.session_uuid {
+        let settled =
+            crate::notes::retrieval_ledger::settle_turn(uuid, &cited_note_ids(assistant_text));
+        if settled.events > 0 {
+            debug!(
+                session_id = %uuid,
+                events = settled.events,
+                used = settled.used,
+                "retrieval ledger: turn settled"
+            );
+        }
+    }
     let Some(ref mm) = memory_manager else {
         return;
     };
@@ -786,6 +802,21 @@ pub(crate) async fn record_turn_feedback(
             });
         }
     }
+}
+
+/// Les identifiants de notes que la réponse CITE (`#note:<uuid>`, `#rfc:<uuid>` —
+/// un RFC est une note), lus par le lecteur unique des citations
+/// ([`crate::refs::cite::cited_refs`] : un jeton dans un bloc de code n'est pas
+/// une citation). C'est la définition **mesurée** de « utilisé » du registre de
+/// récupération : une note injectée dans le prompt n'est pas pour autant utilisée.
+pub(crate) fn cited_note_ids(answer: &str) -> Vec<String> {
+    use crate::refs::RefKind;
+    // Filtre par sorte AVANT le plafond par message : vingt plans cités ne
+    // doivent pas cacher la note citée ensuite.
+    crate::refs::cite::cited_refs_where(answer, |k| matches!(k, RefKind::Note | RefKind::Rfc))
+        .into_iter()
+        .map(|r| r.id.to_string())
+        .collect()
 }
 
 // ── Shared by both engines ─────────────────────────────────────────────
@@ -2501,5 +2532,152 @@ mod bounded_step_tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("the write was dropped with the wait");
+    }
+}
+
+/// Le règlement des récupérations à la fin du tour (registre de récupération).
+#[cfg(test)]
+mod retrieval_settlement_tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    use crate::notes::retrieval_ledger::{self, RetrievedItem, Source, Trigger};
+
+    #[test]
+    fn cited_note_ids_lit_les_notes_et_les_rfc_pas_les_autres_entites() {
+        let note = Uuid::new_v4();
+        let rfc = Uuid::new_v4();
+        let plan = Uuid::new_v4();
+        let text = format!("voir #note:{note} et #rfc:{rfc}, pas #plan:{plan}");
+        assert_eq!(
+            cited_note_ids(&text),
+            vec![note.to_string(), rfc.to_string()]
+        );
+        assert!(cited_note_ids("rien de cité").is_empty());
+    }
+
+    /// Revue 31/10 (6) : le plafond de citations par message (toutes sortes)
+    /// ne doit pas faire perdre une note citée après vingt plans.
+    #[test]
+    fn une_note_citee_apres_vingt_plans_est_lue() {
+        let note = Uuid::new_v4();
+        let mut text = (0..crate::refs::cite::MAX_CITED_PER_MESSAGE + 1)
+            .map(|_| format!("#plan:{}", Uuid::new_v4()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        text.push_str(&format!(" et #note:{note}"));
+        assert_eq!(cited_note_ids(&text), vec![note.to_string()]);
+    }
+
+    /// La fin de tour règle les récupérations de la session avec ce que la
+    /// réponse a cité — sans mémoire de conversation (retour anticipé APRÈS le
+    /// règlement), et seulement l'intersection avec ce que l'index a rendu.
+    // Le garde sérialise un registre GLOBAL à travers l'appel observé.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn la_fin_de_tour_regle_les_recuperations_de_la_session() {
+        let _serial = retrieval_ledger::serial_guard();
+        let saved_capacity = retrieval_ledger::journal_capacity();
+        retrieval_ledger::set_journal_capacity(4096);
+
+        let session = Uuid::new_v4();
+        let cited = Uuid::new_v4();
+        let id = retrieval_ledger::record_for_session(
+            Source::Bm25,
+            Trigger::Injection,
+            "q",
+            vec![
+                RetrievedItem::new(cited.to_string(), "note", Some(0.5)),
+                RetrievedItem::new("not-cited", "note", Some(0.1)),
+            ],
+            true,
+            1,
+            Some(session),
+        )
+        .expect("le journal accepte l'événement");
+
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        record_turn_feedback(
+            TurnFeedback {
+                graph: &graph,
+                search: &search,
+                event_emitter: &None,
+                session_id: &session.to_string(),
+                session_uuid: Some(session),
+                project_id: None,
+                rfc_accumulator: None,
+            },
+            &format!(
+                "La réponse s'appuie sur #note:{cited} et sur #note:{}.",
+                Uuid::new_v4()
+            ),
+            &None,
+            &None,
+        )
+        .await;
+
+        let event = retrieval_ledger::recent_for_session(session, 10)
+            .pop()
+            .expect("l'événement de la session");
+        retrieval_ledger::set_journal_capacity(saved_capacity);
+        assert_eq!(event.id, id);
+        let usage = event.usage.expect("réglé à la fin du tour");
+        assert_eq!(usage.used_ids, vec![cited.to_string()]);
+        assert!(usage.validation.is_none() && usage.benefit.is_none());
+    }
+
+    /// Une fin de tour appelée pour une session SANS récupération en attente :
+    /// rien n'est réglé, et la fin de tour continue (ici sans mémoire, retour
+    /// anticipé). Avec le journal en debug, comme en production verbeuse.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn une_fin_de_tour_sans_recuperation_ne_regle_rien() {
+        let _serial = retrieval_ledger::serial_guard();
+        let saved_capacity = retrieval_ledger::journal_capacity();
+        retrieval_ledger::set_journal_capacity(4096);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let session = Uuid::new_v4();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let feedback = || TurnFeedback {
+            graph: &graph,
+            search: &search,
+            event_emitter: &None,
+            session_id: "s",
+            session_uuid: Some(session),
+            project_id: None,
+            rfc_accumulator: None,
+        };
+        record_turn_feedback(feedback(), "Aucune citation.", &None, &None).await;
+        assert!(
+            retrieval_ledger::recent_for_session(session, 10).is_empty(),
+            "aucun événement inventé"
+        );
+
+        // Et avec un événement en attente, sous le même abonné debug.
+        retrieval_ledger::record_for_session(
+            Source::Bm25,
+            Trigger::Injection,
+            "q",
+            vec![RetrievedItem::new("not-cited", "note", Some(0.1))],
+            true,
+            1,
+            Some(session),
+        )
+        .expect("le journal accepte l'événement");
+        record_turn_feedback(feedback(), "Aucune citation.", &None, &None).await;
+        let event = retrieval_ledger::recent_for_session(session, 10)
+            .pop()
+            .expect("l'événement de la session");
+        retrieval_ledger::set_journal_capacity(saved_capacity);
+        assert!(event.usage.is_some(), "réglé à la fin du tour");
     }
 }

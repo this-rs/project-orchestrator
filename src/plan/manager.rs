@@ -347,12 +347,88 @@ impl PlanManager {
         req: CreateDecisionRequest,
         decided_by: &str,
     ) -> Result<DecisionNode> {
-        let decision = DecisionNode {
+        let decision = Self::new_decision(
+            req.description,
+            req.rationale,
+            req.alternatives,
+            req.chosen_option,
+            decided_by,
+        );
+
+        self.neo4j.create_decision(task_id, &decision).await?;
+
+        // Resolve project via Task → Plan → Project chain
+        let project = self
+            .neo4j
+            .get_project_for_task(task_id)
+            .await
+            .ok()
+            .flatten();
+
+        self.record_decision(&decision, Some(task_id), project.as_ref(), decided_by)
+            .await?;
+        Ok(decision)
+    }
+
+    /// Record a decision attached to NO task.
+    ///
+    /// The task-bound path is left exactly as it was: [`Self::add_decision`] keeps
+    /// its integrity check (bug 3693617b — a decision naming a task that does not
+    /// exist is still rejected). This path exists because a choice made outside
+    /// any plan had nowhere to go, and was therefore never recorded at all.
+    ///
+    /// A `project_id` is a scope, not a hint: it must name a project. The decision
+    /// is then attached to it in the graph (`(Project)-[:HAS_DECISION]->(Decision)`),
+    /// so it is read wherever the project's decisions are, and the search document
+    /// and the auto-anchoring are scoped to it. An unknown project is an error
+    /// (`not found`, a 404 at the route) and nothing is recorded; a graph that fails
+    /// to answer is an error too — never a decision silently recorded without the
+    /// scope the caller asked for.
+    pub async fn add_decision_global(
+        &self,
+        req: CreateGlobalDecisionRequest,
+        decided_by: &str,
+    ) -> Result<DecisionNode> {
+        let project = match req.project_id {
+            Some(project_id) => Some(
+                self.neo4j
+                    .get_project(project_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Project {project_id} not found in Neo4j"))?,
+            ),
+            None => None,
+        };
+        let decision = Self::new_decision(
+            req.description,
+            req.rationale,
+            req.alternatives,
+            req.chosen_option,
+            decided_by,
+        );
+
+        self.neo4j
+            .create_decision_global(&decision, project.as_ref().map(|p| p.id))
+            .await?;
+
+        self.record_decision(&decision, None, project.as_ref(), decided_by)
+            .await?;
+        Ok(decision)
+    }
+
+    /// A new, proposed decision as both paths build it.
+    fn new_decision(
+        description: String,
+        rationale: String,
+        alternatives: Option<Vec<String>>,
+        chosen_option: Option<String>,
+        decided_by: &str,
+    ) -> DecisionNode {
+        DecisionNode {
             id: Uuid::new_v4(),
-            description: req.description.clone(),
-            rationale: req.rationale.clone(),
-            alternatives: req.alternatives.unwrap_or_default(),
-            chosen_option: req.chosen_option.clone(),
+            description,
+            rationale,
+            alternatives: alternatives.unwrap_or_default(),
+            chosen_option,
             decided_by: decided_by.to_string(),
             decided_at: chrono::Utc::now(),
             status: DecisionStatus::Proposed,
@@ -360,33 +436,30 @@ impl PlanManager {
             embedding_model: None,
             scar_intensity: 0.0,
             sharing_consent: Default::default(),
-        };
+        }
+    }
 
-        self.neo4j.create_decision(task_id, &decision).await?;
-
-        // Resolve project via Task → Plan → Project chain
-        let project_for_task = self
-            .neo4j
-            .get_project_for_task(task_id)
-            .await
-            .ok()
-            .flatten();
-        let (project_id, project_slug) = match &project_for_task {
-            Some(project) => (Some(project.id.to_string()), Some(project.slug.clone())),
-            None => (None, None),
-        };
-
-        // Index in Meilisearch for search
+    /// What follows the creation of a decision node, on both paths: the search
+    /// document (scoped to `project` when known), the embedding, the CRUD event
+    /// (naming the task and the project it has), and the auto-anchoring to the
+    /// files its text names.
+    async fn record_decision(
+        &self,
+        decision: &DecisionNode,
+        task_id: Option<Uuid>,
+        project: Option<&ProjectNode>,
+        decided_by: &str,
+    ) -> Result<()> {
         let doc = DecisionDocument {
             id: decision.id.to_string(),
             description: decision.description.clone(),
             rationale: decision.rationale.clone(),
-            task_id: task_id.to_string(),
+            task_id: task_id.map(|t| t.to_string()),
             agent: decided_by.to_string(),
             timestamp: decision.decided_at.to_rfc3339(),
             tags: vec![],
-            project_id,
-            project_slug,
+            project_id: project.map(|p| p.id.to_string()),
+            project_slug: project.map(|p| p.slug.clone()),
         };
         self.meili.index_decision(&doc).await?;
 
@@ -394,15 +467,24 @@ impl PlanManager {
         self.embed_decision(decision.id, &decision.description, &decision.rationale)
             .await;
 
-        self.emit(
-            CrudEvent::new(EntityType::Decision, CrudAction::Created, decision.id.to_string())
-                .with_payload(serde_json::json!({"task_id": task_id.to_string(), "description": &decision.description})),
-        );
+        let mut payload = serde_json::json!({"description": &decision.description});
+        if let Some(task_id) = task_id {
+            payload["task_id"] = serde_json::Value::String(task_id.to_string());
+        }
+        let mut event = CrudEvent::new(
+            EntityType::Decision,
+            CrudAction::Created,
+            decision.id.to_string(),
+        )
+        .with_payload(payload);
+        if let Some(project) = project {
+            event = event.with_project_id(project.id.to_string());
+        }
+        self.emit(event);
 
         // Auto-anchor decision to files mentioned in content (fire-and-forget)
-        self.spawn_auto_anchor_decision(&decision, project_for_task.as_ref());
-
-        Ok(decision)
+        self.spawn_auto_anchor_decision(decision, project);
+        Ok(())
     }
 
     /// Automatically create AFFECTS anchors from file paths mentioned in decision content.
@@ -544,7 +626,7 @@ impl PlanManager {
                 id: decision.id.to_string(),
                 description: decision.description.clone(),
                 rationale: decision.rationale.clone(),
-                task_id: task_id.to_string(),
+                task_id: Some(task_id.to_string()),
                 agent: decision.decided_by.clone(),
                 timestamp: decision.decided_at.to_rfc3339(),
                 tags: vec![],
@@ -588,18 +670,22 @@ impl PlanManager {
                 continue;
             }
 
-            // Parse task_id and resolve project
-            let task_id: Uuid = match doc.task_id.parse() {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::warn!(
-                        decision_id = %doc.id,
-                        task_id = %doc.task_id,
-                        error = %e,
-                        "Failed to parse task_id during backfill, skipping"
-                    );
-                    continue;
-                }
+            // Parse task_id and resolve project. A global decision has no task:
+            // there is nothing to backfill, and it is not an error.
+            let task_id: Uuid = match doc.task_id.as_deref() {
+                None => continue,
+                Some(raw) => match raw.parse() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!(
+                            decision_id = %doc.id,
+                            task_id = %raw,
+                            error = %e,
+                            "Failed to parse task_id during backfill, skipping"
+                        );
+                        continue;
+                    }
+                },
             };
 
             match self.neo4j.get_project_for_task(task_id).await {
@@ -622,7 +708,7 @@ impl PlanManager {
                 Ok(None) => {
                     tracing::debug!(
                         decision_id = %doc.id,
-                        task_id = %doc.task_id,
+                        task_id = ?doc.task_id,
                         "No project found for decision's task, skipping"
                     );
                 }
@@ -1664,6 +1750,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reindex_decisions_indexes_task_decisions() {
+        let state = mock_app_state();
+        let pm = PlanManager::new(state.neo4j.clone(), state.meili.clone());
+        let task = test_task();
+        let decision = test_decision("Reindex me", "because");
+        state
+            .neo4j
+            .create_task(Uuid::new_v4(), &task)
+            .await
+            .unwrap();
+        state
+            .neo4j
+            .create_decision(task.id, &decision)
+            .await
+            .unwrap();
+
+        let (total, indexed) = pm.reindex_decisions().await.unwrap();
+        assert_eq!((total, indexed), (1, 1));
+        let hits = state.meili.search_decisions("Reindex", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].task_id.as_deref(),
+            Some(task.id.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backfill_skips_global_and_unparsable_task_ids() {
+        let state = mock_app_state();
+        let pm = PlanManager::new(state.neo4j.clone(), state.meili.clone());
+        let mk =
+            |desc: &str, task_id: Option<&str>| crate::meilisearch::indexes::DecisionDocument {
+                id: Uuid::new_v4().to_string(),
+                description: desc.to_string(),
+                rationale: "r".to_string(),
+                task_id: task_id.map(str::to_string),
+                agent: "a".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                tags: vec![],
+                project_id: None,
+                project_slug: None,
+            };
+        // Décision globale (sans tâche) : rien à rattraper, pas une erreur.
+        state
+            .meili
+            .index_decision(&mk("Global one", None))
+            .await
+            .unwrap();
+        // task_id illisible : ignorée avec un avertissement.
+        state
+            .meili
+            .index_decision(&mk("Broken one", Some("not-a-uuid")))
+            .await
+            .unwrap();
+
+        let (total, updated) = pm.backfill_decision_project_slugs().await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(updated, 0);
+    }
+
+    #[tokio::test]
     async fn test_backfill_decision_project_slugs() {
         let state = mock_app_state();
         let pm = PlanManager::new(state.neo4j.clone(), state.meili.clone());
@@ -1717,7 +1864,7 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             description: "Old decision without project".to_string(),
             rationale: "Some rationale".to_string(),
-            task_id: task.id.to_string(),
+            task_id: Some(task.id.to_string()),
             agent: "old-agent".to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
             tags: vec![],

@@ -604,6 +604,10 @@ const CLOSED_ROUTE_PREFIXES: &[&str] = &[
     "/api/agents",
     "/api/alerts",
     "/api/attention",
+    // the retrieval ledger is process-global: a query is often the user's own
+    // prompt, so a restricted session reading it would read the other sessions'
+    // questions. The aggregate is for the operator, not for the agent.
+    "/api/retrieval-ledger",
     "/api/documents",
     "/api/feedback",
     "/api/graph",
@@ -1454,6 +1458,7 @@ mod tests {
             "/api/progress",
             "/api/reactor",
             "/api/refs/search",
+            "/api/retrieval-ledger",
             "/api/registry",
             "/api/rfcs",
             "/api/setup-status",

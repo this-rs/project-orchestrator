@@ -74,8 +74,15 @@ diagrams:
     file: docs/diagrams/po-chat-manager.mmd
     covers:
       - "backend:src/chat/manager/recovery.rs"
-      - "backend:src/chat/{mod,manager,cost,anchor,anchor_resolver,eval_transverse,agent_e2e_tests,tree,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments,pending_queue,posture,relay,refs_wiring_tests,untrusted,neutral_place,session_record,tool_clock}.rs"
+      - "backend:src/chat/{mod,manager,cost,anchor,anchor_resolver,eval_transverse,agent_e2e_tests,tree,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments,pending_queue,posture,relay,refs_wiring_tests,untrusted,neutral_place,session_record,tool_clock,retrieval_trigger}.rs"
       - "backend:src/notes/coactivation.rs"
+      # Arbitrage (PR registre de recuperation) : le registre est appele par
+      # notes::manager (entree po-knowledge-notes encore `planned`, donc sans
+      # propriete). Il rejoint po-chat-manager, comme notes/coactivation.rs.
+      - "backend:src/notes/retrieval_ledger.rs"
+      # Meme arbitrage pour la politique (PR6) : elle LIT le registre et ne regle
+      # rien ; elle appartient au meme dessin que ce qu'elle lit.
+      - "backend:src/notes/retrieval_policy.rs"
   - name: po-spawn-envelope
     owner: theotime
     status: verified

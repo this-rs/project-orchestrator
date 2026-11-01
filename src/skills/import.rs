@@ -481,6 +481,9 @@ fn portable_note_to_note(
         memory_horizon: MemoryHorizon::Operational, // Imported notes are operational
         supersedes: None,
         superseded_by: None,
+        valid_from: None,
+        valid_until: None,
+        revision: None,
         changes: vec![],
         assertion_rule: None,
         last_assertion_result: None,
@@ -542,6 +545,9 @@ fn decision_to_note(
         memory_horizon: MemoryHorizon::Operational, // Imported decisions are operational
         supersedes: None,
         superseded_by: None,
+        valid_from: None,
+        valid_until: None,
+        revision: None,
         changes: vec![],
         assertion_rule: None,
         last_assertion_result: None,
@@ -630,6 +636,9 @@ fn episode_to_note(
         memory_horizon: MemoryHorizon::Operational,
         supersedes: None,
         superseded_by: None,
+        valid_from: None,
+        valid_until: None,
+        revision: None,
         changes: vec![],
         assertion_rule: None,
         last_assertion_result: None,
@@ -927,6 +936,30 @@ mod tests {
         // The mock might not return all members depending on implementation,
         // but the import should have created 3 notes (2 regular + 1 decision-as-note)
         assert_eq!(result.notes_created + result.decisions_imported, 3);
+    }
+
+    #[tokio::test]
+    async fn test_import_episode_lesson_as_note() {
+        let store = MockGraphStore::new();
+        let project_id = Uuid::new_v4();
+
+        let mut package = make_unsigned_test_package();
+        package.episodes = vec![serde_json::from_value(serde_json::json!({
+            "stimulus": { "request": "Fix the slow query", "trigger": "user_request" },
+            "process": { "had_reasoning_tree": false, "states_visited": ["start", "done"] },
+            "outcome": { "notes_produced": 1, "decisions_made": 0, "commits_made": 2,
+                         "files_modified": 3 },
+            "validation": { "feedback_type": "implicit_positive" },
+            "lesson": { "abstract_pattern": "Batch with UNWIND", "domain_tags": ["neo4j"],
+                        "portability_layer": 3 }
+        }))
+        .unwrap()];
+        sign_package(&mut package, &InstanceIdentity::generate()).unwrap();
+
+        let result = import_skill(&package, project_id, &store, ConflictStrategy::Skip)
+            .await
+            .unwrap();
+        assert_eq!(result.episodes_imported, 1);
     }
 
     #[tokio::test]
@@ -1386,6 +1419,9 @@ mod tests {
             activation_count: 0,
             supersedes: None,
             superseded_by: None,
+            valid_from: None,
+            valid_until: None,
+            revision: None,
             changes: vec![],
             assertion_rule: None,
             last_assertion_result: None,

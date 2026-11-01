@@ -198,6 +198,11 @@ pub struct MockGraphStore {
     pub fail_external_event_writes: std::sync::atomic::AtomicBool,
     /// Makes `plan_third_party_written_at` fail (a graph error).
     pub fail_mark_read: std::sync::atomic::AtomicBool,
+    /// Makes `vector_search_notes` fail (an index error surfaces to the caller).
+    pub fail_vector_search: std::sync::atomic::AtomicBool,
+    /// Stall injection: `search_decisions_by_vector` sleeps this long before
+    /// answering — a dense decision search slower than the turn's budget.
+    pub slow_decision_vector_search: std::sync::Mutex<Option<std::time::Duration>>,
     /// Makes `update_chat_session_harness` fail (the capability snapshot is not stored).
     pub fail_harness_writes: std::sync::atomic::AtomicBool,
     /// Makes `save_session_episode` fail (a session closes even when its episode cannot be
@@ -235,6 +240,9 @@ pub struct MockGraphStore {
     pub plan_tasks: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub task_steps: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub task_decisions: RwLock<HashMap<Uuid, Vec<Uuid>>>,
+    /// `(Project)-[:HAS_DECISION]->(Decision)`: decisions recorded with no task but a
+    /// project (`create_decision_global` with a project).
+    pub project_decisions: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub task_dependencies: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub plan_constraints: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub project_plans: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -343,6 +351,9 @@ pub struct MockGraphStore {
     pub persona_notes: RwLock<HashMap<Uuid, HashMap<Uuid, f64>>>,
     /// persona_id -> Map<decision_id, weight>
     pub persona_decisions: RwLock<HashMap<Uuid, HashMap<Uuid, f64>>>,
+    /// What `find_relevant_personas_for_decision` answers per project (a test sets it;
+    /// empty by default, like a project whose personas know none of the decision's files).
+    pub relevant_personas: RwLock<HashMap<Uuid, Vec<(Uuid, f64)>>>,
     /// persona_id -> Vec<parent_persona_id> (EXTENDS chain)
     pub persona_extends: RwLock<HashMap<Uuid, Vec<Uuid>>>,
 
@@ -473,6 +484,8 @@ impl MockGraphStore {
             trigger_reservations: RwLock::new(HashMap::new()),
             plan_third_party_writes: RwLock::new(HashMap::new()),
             fail_mark_read: std::sync::atomic::AtomicBool::new(false),
+            fail_vector_search: std::sync::atomic::AtomicBool::new(false),
+            slow_decision_vector_search: std::sync::Mutex::new(None),
             fail_harness_writes: std::sync::atomic::AtomicBool::new(false),
             fail_session_episode_writes: std::sync::atomic::AtomicBool::new(false),
             session_episode_save_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -489,6 +502,7 @@ impl MockGraphStore {
             plan_tasks: RwLock::new(HashMap::new()),
             task_steps: RwLock::new(HashMap::new()),
             task_decisions: RwLock::new(HashMap::new()),
+            project_decisions: RwLock::new(HashMap::new()),
             task_dependencies: RwLock::new(HashMap::new()),
             plan_constraints: RwLock::new(HashMap::new()),
             project_plans: RwLock::new(HashMap::new()),
@@ -555,6 +569,7 @@ impl MockGraphStore {
             persona_functions: RwLock::new(HashMap::new()),
             persona_notes: RwLock::new(HashMap::new()),
             persona_decisions: RwLock::new(HashMap::new()),
+            relevant_personas: RwLock::new(HashMap::new()),
             persona_extends: RwLock::new(HashMap::new()),
             user_profiles: RwLock::new(HashMap::new()),
             works_on: RwLock::new(HashMap::new()),
@@ -10268,6 +10283,33 @@ impl DecisionStore for MockGraphStore {
         Ok(())
     }
 
+    async fn create_decision_global(
+        &self,
+        decision: &DecisionNode,
+        project_id: Option<Uuid>,
+    ) -> Result<()> {
+        self.log_read("create_decision_global")?;
+        if let Some(pid) = project_id {
+            if !self.projects.read().await.contains_key(&pid) {
+                anyhow::bail!(
+                    "Failed to create decision: Project {} not found in Neo4j",
+                    pid
+                );
+            }
+            self.project_decisions
+                .write()
+                .await
+                .entry(pid)
+                .or_default()
+                .push(decision.id);
+        }
+        self.decisions
+            .write()
+            .await
+            .insert(decision.id, decision.clone());
+        Ok(())
+    }
+
     async fn get_decision(&self, decision_id: Uuid) -> Result<Option<DecisionNode>> {
         Ok(self.decisions.read().await.get(&decision_id).cloned())
     }
@@ -10286,6 +10328,7 @@ impl DecisionStore for MockGraphStore {
         let task_decisions = self.task_decisions.read().await;
         let plan_tasks = self.plan_tasks.read().await;
         let project_plans = self.project_plans.read().await;
+        let project_decisions = self.project_decisions.read().await;
 
         let mut items: Vec<DecisionListItem> = decisions
             .values()
@@ -10295,16 +10338,25 @@ impl DecisionStore for MockGraphStore {
                     .iter()
                     .find(|(_, ds)| ds.contains(&d.id))
                     .map(|(t, _)| *t);
-                let project_id = task_id.and_then(|t| {
-                    let plan = plan_tasks
-                        .iter()
-                        .find(|(_, ts)| ts.contains(&t))
-                        .map(|(p, _)| *p)?;
-                    project_plans
-                        .iter()
-                        .find(|(_, ps)| ps.contains(&plan))
-                        .map(|(pr, _)| *pr)
-                });
+                // The task's plan's project, else the project the decision is
+                // attached to directly (`coalesce(link.project, direct)` in Cypher).
+                let project_id = task_id
+                    .and_then(|t| {
+                        let plan = plan_tasks
+                            .iter()
+                            .find(|(_, ts)| ts.contains(&t))
+                            .map(|(p, _)| *p)?;
+                        project_plans
+                            .iter()
+                            .find(|(_, ps)| ps.contains(&plan))
+                            .map(|(pr, _)| *pr)
+                    })
+                    .or_else(|| {
+                        project_decisions
+                            .iter()
+                            .find(|(_, ds)| ds.contains(&d.id))
+                            .map(|(p, _)| *p)
+                    });
                 DecisionListItem {
                     decision: d.clone(),
                     task_id,
@@ -10331,13 +10383,18 @@ impl DecisionStore for MockGraphStore {
     }
 
     async fn get_decision_project_ids(&self, decision_ids: &[Uuid]) -> Result<HashMap<Uuid, Uuid>> {
-        // Same chain as the Cypher (Project→Plan→Task→Decision); several
-        // projects → the smallest id, like `min(proj.id)`.
+        // Same paths as the Cypher (Project→Plan→Task→Decision, or the direct
+        // Project→Decision edge); several projects → the smallest id, like `min(proj.id)`.
         let task_decisions = self.task_decisions.read().await;
         let plan_tasks = self.plan_tasks.read().await;
         let project_plans = self.project_plans.read().await;
+        let project_decisions = self.project_decisions.read().await;
         let mut out = HashMap::new();
         for did in decision_ids {
+            let direct = project_decisions
+                .iter()
+                .filter(|(_, ds)| ds.contains(did))
+                .map(|(p, _)| *p);
             let project = task_decisions
                 .iter()
                 .filter(|(_, ds)| ds.contains(did))
@@ -10353,6 +10410,7 @@ impl DecisionStore for MockGraphStore {
                         .filter(move |(_, ps)| ps.contains(&plan))
                         .map(|(pr, _)| *pr)
                 })
+                .chain(direct)
                 .min_by_key(|p| p.to_string());
             if let Some(p) = project {
                 out.insert(*did, p);
@@ -10390,6 +10448,10 @@ impl DecisionStore for MockGraphStore {
         self.decisions.write().await.remove(&decision_id);
         let mut td = self.task_decisions.write().await;
         for ids in td.values_mut() {
+            ids.retain(|id| *id != decision_id);
+        }
+        let mut pd = self.project_decisions.write().await;
+        for ids in pd.values_mut() {
             ids.retain(|id| *id != decision_id);
         }
         Ok(())
@@ -10468,6 +10530,13 @@ impl DecisionStore for MockGraphStore {
         _limit: usize,
         _project_id: Option<&str>,
     ) -> Result<Vec<(DecisionNode, f64)>> {
+        let delay = *self
+            .slow_decision_vector_search
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         // Mock: return empty — vector search requires real Neo4j index
         Ok(vec![])
     }
@@ -12407,6 +12476,12 @@ impl NoteStore for MockGraphStore {
         workspace_slug: Option<&str>,
         min_similarity: Option<f64>,
     ) -> Result<Vec<(Note, f64)>> {
+        if self
+            .fail_vector_search
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected vector search failure (test)");
+        }
         let notes = self.notes.read().await;
         let embeddings = self.note_embeddings.read().await;
 
@@ -16788,9 +16863,16 @@ impl PersonaStore for MockGraphStore {
     async fn find_relevant_personas_for_decision(
         &self,
         _decision_id: Uuid,
-        _project_id: Uuid,
+        project_id: Uuid,
     ) -> Result<Vec<(Uuid, f64)>> {
-        Ok(vec![])
+        self.log_read("find_relevant_personas_for_decision")?;
+        Ok(self
+            .relevant_personas
+            .read()
+            .await
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_default())
     }
     async fn auto_link_note_to_persona(
         &self,
@@ -16802,10 +16884,17 @@ impl PersonaStore for MockGraphStore {
     }
     async fn auto_link_decision_to_persona(
         &self,
-        _persona_id: Uuid,
-        _decision_id: Uuid,
-        _weight: f64,
+        persona_id: Uuid,
+        decision_id: Uuid,
+        weight: f64,
     ) -> Result<()> {
+        self.log_read("auto_link_decision_to_persona")?;
+        self.persona_decisions
+            .write()
+            .await
+            .entry(persona_id)
+            .or_default()
+            .insert(decision_id, weight);
         Ok(())
     }
     async fn auto_link_file_to_persona(
@@ -17751,7 +17840,8 @@ impl ProtocolRunStore for MockGraphStore {
         _entity_id: Uuid,
         _run_id: Uuid,
     ) -> anyhow::Result<bool> {
-        // Mock: always succeed
+        // Succeeds, unless the test asked this write to fail (`fail_reads`).
+        self.log_read("create_produced_during")?;
         Ok(true)
     }
     async fn get_run_outcomes(
@@ -19628,5 +19718,48 @@ impl TriggerStore for MockGraphStore {
             .collect();
         result.sort_by_key(|h| h.priority);
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod decision_coverage_tests {
+    use super::*;
+    use crate::test_helpers::{test_decision, test_project};
+
+    /// Supprimer une décision globale la retire aussi de l'index par projet.
+    #[tokio::test]
+    async fn delete_decision_removes_it_from_project_index() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        store.create_project(&project).await.unwrap();
+        let decision = test_decision("d", "r");
+        store
+            .create_decision_global(&decision, Some(project.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.project_decisions.read().await[&project.id],
+            vec![decision.id]
+        );
+        store.delete_decision(decision.id).await.unwrap();
+        assert!(store.project_decisions.read().await[&project.id].is_empty());
+    }
+
+    /// Un verrou empoisonné ne casse pas la recherche vectorielle de décisions.
+    #[tokio::test]
+    async fn search_decisions_by_vector_survives_poisoned_delay_lock() {
+        let store = std::sync::Arc::new(MockGraphStore::new());
+        let s2 = store.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = s2.slow_decision_vector_search.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(store.slow_decision_vector_search.is_poisoned());
+        let out = store
+            .search_decisions_by_vector(&[0.0], 1, None)
+            .await
+            .unwrap();
+        assert!(out.is_empty());
     }
 }

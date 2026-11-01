@@ -10,9 +10,13 @@ pub mod chat_handlers;
 #[cfg(test)]
 mod chat_times_tests;
 pub mod code_handlers;
+#[cfg(test)]
+mod decision_global_tests;
 pub mod document_handlers;
 pub mod environment_handlers;
 pub mod episode_handlers;
+#[cfg(test)]
+mod episode_session_tests;
 pub mod execution_place_handlers;
 pub mod feedback_handlers;
 pub mod graph_handlers;
@@ -40,6 +44,8 @@ pub mod refs_handlers;
 #[cfg(test)]
 mod refs_ws_tests;
 pub mod registry_handlers;
+#[cfg(test)]
+mod retrieval_ledger_tests;
 pub mod rfc_handlers;
 pub mod routes;
 pub mod routing_handlers;

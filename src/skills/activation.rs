@@ -136,6 +136,59 @@ pub async fn activate_for_hook(
     tool_input: &serde_json::Value,
     config: &HookActivationConfig,
 ) -> anyhow::Result<Option<HookActivationOutcome>> {
+    let started = std::time::Instant::now();
+    let out = activate_for_hook_inner(graph_store, project_id, tool_name, tool_input, config).await;
+    record_activation(&out, tool_name, started);
+    out
+}
+
+/// Enregistre l'activation de skill au registre de récupération (PR1 du plan
+/// 42d49a31). Le motif est `Hook`, catalogué à part des quatre motifs du
+/// formalisme : un déclenchement mécanique sur un appel d'outil n'est pas une
+/// décision de l'agent, et ne doit pas gonfler « explicite ».
+///
+/// La « requête » d'une activation de skill n'est pas une question : c'est le nom
+/// de l'outil qui a déclenché le hook. On enregistre celui-là, pas une chaîne
+/// inventée.
+fn record_activation(
+    out: &anyhow::Result<Option<HookActivationOutcome>>,
+    tool_name: &str,
+    started: std::time::Instant,
+) {
+    use crate::notes::retrieval_ledger::{self, RetrievedItem, Source, Trigger};
+    let (items, ok) = match out {
+        Ok(Some(outcome)) => {
+            let matched = &outcome.response;
+            (
+                vec![RetrievedItem::new(
+                    matched.skill_id.to_string(),
+                    "skill",
+                    Some(matched.confidence),
+                )],
+                true,
+            )
+        }
+        // Aucun skill ne correspond : c'est une réponse, pas un échec.
+        Ok(None) => (Vec::new(), true),
+        Err(_) => (Vec::new(), false),
+    };
+    retrieval_ledger::record(
+        Source::SkillActivate,
+        Trigger::Hook,
+        tool_name,
+        items,
+        ok,
+        started.elapsed().as_millis() as u64,
+    );
+}
+
+async fn activate_for_hook_inner(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    config: &HookActivationConfig,
+) -> anyhow::Result<Option<HookActivationOutcome>> {
     // 1. Extract pattern and file context from tool input
     let pattern = extract_pattern(tool_name, tool_input);
     let file_context = extract_file_context(tool_name, tool_input);
@@ -335,6 +388,29 @@ pub async fn activate_for_hook(
 /// - Cache hit: ~1ms (trigger matching only, no DB for skills)
 /// - Cache miss: ~150ms (same as uncached, plus cache insert ~0.1ms)
 pub async fn activate_for_hook_cached(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    config: &HookActivationConfig,
+    cache: &SkillCache,
+) -> anyhow::Result<Option<HookActivationOutcome>> {
+    let started = std::time::Instant::now();
+    let out = activate_for_hook_cached_inner(
+        graph_store,
+        project_id,
+        tool_name,
+        tool_input,
+        config,
+        cache,
+    )
+    .await;
+    record_activation(&out, tool_name, started);
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn activate_for_hook_cached_inner(
     graph_store: &dyn GraphStore,
     project_id: Uuid,
     tool_name: &str,
@@ -1893,6 +1969,15 @@ mod tests {
     use crate::skills::models::{SkillNode, SkillStatus, SkillTrigger};
     use chrono::Utc;
 
+    /// Une activation en échec est consignée comme telle, sans item.
+    #[test]
+    fn record_activation_logs_failed_activation() {
+        let out: anyhow::Result<Option<HookActivationOutcome>> = Err(anyhow::anyhow!("boom"));
+        record_activation(&out, "Bash", std::time::Instant::now());
+        // Aucun skill ne correspond : réponse valide, tracée aussi.
+        record_activation(&Ok(None), "Bash", std::time::Instant::now());
+    }
+
     fn make_test_note(
         id: Uuid,
         content: &str,
@@ -1923,6 +2008,9 @@ mod tests {
             activation_count: 0,
             supersedes: None,
             superseded_by: None,
+            valid_from: None,
+            valid_until: None,
+            revision: None,
             changes: vec![],
             assertion_rule: None,
             last_assertion_result: None,

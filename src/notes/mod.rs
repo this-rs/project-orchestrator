@@ -13,6 +13,8 @@ pub mod hashing;
 pub mod lifecycle;
 pub mod manager;
 pub mod models;
+pub mod retrieval_ledger;
+pub mod retrieval_policy;
 pub mod witness;
 
 /// Time constant tau (days) of the stored energy decay `exp(-t/tau)` (halves every
@@ -35,9 +37,18 @@ pub const PROJECT_DORMANT_AFTER_DAYS: i64 = 14;
 /// "skill-evolution"`, e.g. "Skill X orphaned and archived") are a log, not
 /// knowledge: never given to the agent either.
 pub fn is_current_knowledge(note: &Note) -> bool {
+    is_current_knowledge_at(note, chrono::Utc::now())
+}
+
+/// [`is_current_knowledge`] at a given instant — the form tests and replays use.
+///
+/// A note outside its validity window is NOT current: it is given to the agent only
+/// after a revision (a new version carrying its provenance), never as it stands.
+pub fn is_current_knowledge_at(note: &Note, now: chrono::DateTime<chrono::Utc>) -> bool {
     matches!(note.status, NoteStatus::Active | NoteStatus::NeedsReview)
         && note.superseded_by.is_none()
         && note.created_by != SKILL_EVOLUTION_AUTHOR
+        && note.validity_at(now) == Validity::Current
 }
 
 /// `created_by` of the audit-trail notes skill evolution writes.
@@ -385,5 +396,77 @@ pub mod provenance {
             let id = Uuid::new_v4();
             assert_eq!(parse_actor(&actor(id)), Some(id));
         }
+    }
+}
+
+#[cfg(test)]
+mod validity_window_tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+
+    fn mk() -> Note {
+        Note::new(None, NoteType::Gotcha, "x".into(), "user".into())
+    }
+
+    #[test]
+    fn a_note_without_a_window_is_unchanged() {
+        // The whole point of PR5 being safe: no window, no new behaviour.
+        let n = mk();
+        assert_eq!(n.validity_at(Utc::now()), Validity::Current);
+        assert!(is_current_knowledge(&n));
+    }
+
+    #[test]
+    fn a_note_past_its_valid_until_is_not_current() {
+        let now = Utc::now();
+        let mut n = mk();
+        n.valid_until = Some(now - Duration::days(1));
+        assert_eq!(
+            n.validity_at(now),
+            Validity::Expired(now - Duration::days(1))
+        );
+        assert!(!is_current_knowledge_at(&n, now));
+    }
+
+    #[test]
+    fn a_note_before_its_valid_from_is_not_current() {
+        let now = Utc::now();
+        let mut n = mk();
+        n.valid_from = Some(now + Duration::days(1));
+        assert!(matches!(n.validity_at(now), Validity::NotYetValid(_)));
+        assert!(!is_current_knowledge_at(&n, now));
+    }
+
+    #[test]
+    fn the_window_is_closed_at_the_start_and_open_at_the_end() {
+        let t0 = Utc::now();
+        let t1 = t0 + Duration::days(10);
+        let mut n = mk();
+        n.valid_from = Some(t0);
+        n.valid_until = Some(t1);
+        assert!(is_current_knowledge_at(&n, t0), "valid_from is inclusive");
+        assert!(is_current_knowledge_at(&n, t1 - Duration::seconds(1)));
+        assert!(!is_current_knowledge_at(&n, t1), "valid_until is exclusive");
+    }
+
+    #[test]
+    fn a_window_does_not_resurrect_a_superseded_note() {
+        let now = Utc::now();
+        let mut n = mk();
+        n.valid_until = Some(now + Duration::days(30));
+        n.superseded_by = Some(uuid::Uuid::new_v4());
+        assert!(!is_current_knowledge_at(&n, now));
+    }
+
+    #[test]
+    fn a_note_serialized_before_the_window_existed_still_reads() {
+        // Stored JSON from before PR5 has none of the three fields.
+        let mut v = serde_json::to_value(mk()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        for k in ["valid_from", "valid_until", "revision"] {
+            o.remove(k);
+        }
+        let n: Note = serde_json::from_value(v).unwrap();
+        assert!(n.valid_from.is_none() && n.valid_until.is_none() && n.revision.is_none());
     }
 }

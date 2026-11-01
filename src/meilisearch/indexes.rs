@@ -41,7 +41,11 @@ pub struct DecisionDocument {
     pub id: String,
     pub description: String,
     pub rationale: String,
-    pub task_id: String,
+    /// The task the decision belongs to, if any. `None` for a decision taken
+    /// outside any plan: an empty string would be a task id that names nothing,
+    /// and would look like a real one to every filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     pub agent: String,
     pub timestamp: String,
     pub tags: Vec<String>,
@@ -133,7 +137,7 @@ mod tests {
             id: "dec-1".to_string(),
             description: "Use async/await".to_string(),
             rationale: "Better performance".to_string(),
-            task_id: "task-1".to_string(),
+            task_id: Some("task-1".to_string()),
             agent: "claude".to_string(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             tags: vec!["architecture".to_string()],
