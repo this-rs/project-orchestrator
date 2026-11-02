@@ -260,9 +260,15 @@ const PINNED_NOTES_BUDGET: Duration = Duration::from_millis(500);
 /// convention of the per-project consents. Keyed by slug like them: a renamed project
 /// leaves its pins behind, and a slug reused by a new project finds the old ones (the
 /// consent gate still applies to each note at every turn).
+/// Le préfixe d'une portée de projet dans les réglages. Nommé, parce que deux endroits en
+/// dépendent (l'écriture et la lecture) et qu'un format implicite s'est déjà désynchronisé :
+/// la règle des épingles passait la portée entière à `get_project_by_slug`, ne résolvait
+/// jamais un projet, et rabaissait toute épingle de projet à l'échelle globale.
+pub const PROJECT_SCOPE_PREFIX: &str = "project:";
+
 pub fn pinned_notes_scope(project_slug: Option<&str>) -> String {
     match project_slug {
-        Some(slug) => format!("project:{slug}"),
+        Some(slug) => format!("{PROJECT_SCOPE_PREFIX}{slug}"),
         None => crate::chat::provider::settings::GLOBAL.to_string(),
     }
 }

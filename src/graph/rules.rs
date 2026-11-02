@@ -321,7 +321,21 @@ pub const BOOT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// un démarrage refusé.
 pub async fn run_at_boot(graph: &dyn GraphStore) -> Option<RulesReport> {
     match tokio::time::timeout(BOOT_BUDGET, run(graph, &[])).await {
-        Ok(Ok(report)) => Some(report),
+        Ok(Ok(report)) => {
+            // Le rapport se dit ici, pas dans `main` : des lignes de journalisation dans la
+            // fonction de démarrage ne sont exécutées par aucun test, donc ne prouvent rien.
+            for rule in &report.rules {
+                tracing::info!(
+                    rule = %rule.name,
+                    considered = rule.considered,
+                    written = rule.written,
+                    released = rule.released,
+                    "{}",
+                    rule.measure
+                );
+            }
+            Some(report)
+        }
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "the knowledge rules could not run at boot");
             None
@@ -614,7 +628,7 @@ async fn run_agent_uses_activated(
 async fn pinned_notes_everywhere(
     graph: &dyn GraphStore,
 ) -> anyhow::Result<(Vec<(Uuid, Option<Uuid>)>, usize, bool)> {
-    use crate::chat::stages::knowledge_injection::PINNED_NOTES_KEY;
+    use crate::chat::stages::knowledge_injection::{PINNED_NOTES_KEY, PROJECT_SCOPE_PREFIX};
 
     let settings = graph.llm_settings_by_key(PINNED_NOTES_KEY).await?;
     let read = settings.len();
@@ -623,11 +637,11 @@ async fn pinned_notes_everywhere(
     let mut ids = Vec::new();
     let mut complete = true;
     for (scope, raw) in settings {
-        // Une portée projet est désignée par son slug ; `global` n'a pas de projet.
-        let project = if scope == "global" {
-            None
-        } else {
-            match graph.get_project_by_slug(&scope).await {
+        // Une portée projet est `project:<slug>` ; tout le reste est global. On retire le
+        // préfixe AVANT de résoudre : passer la portée entière ne résout jamais un projet.
+        let project = match scope.strip_prefix(PROJECT_SCOPE_PREFIX) {
+            None => None,
+            Some(slug) => match graph.get_project_by_slug(slug).await {
                 Ok(Some(p)) => Some(p.id),
                 Ok(None) => None,
                 Err(e) => {
@@ -635,7 +649,7 @@ async fn pinned_notes_everywhere(
                     tracing::warn!(scope = %scope, error = %e, "pin scope unresolved");
                     None
                 }
-            }
+            },
         };
         let parsed: Vec<Uuid> = match serde_json::from_str(&raw) {
             Ok(v) => v,
@@ -876,6 +890,181 @@ mod tests {
                 .unwrap()
                 .notes,
             vec![note.id]
+        );
+    }
+
+    #[test]
+    fn the_scope_names_are_bare_identifiers() {
+        // Le nom part dans le Cypher comme valeur, jamais comme texte inséré — mais il doit
+        // rester une chaîne nue, et les deux échelles doivent être distinctes.
+        assert_eq!(KnowledgeScope::Project.as_str(), "project");
+        assert_eq!(KnowledgeScope::Global.as_str(), "global");
+    }
+
+    /// Deux notes dans la même échelle : c'est ce qui fait vivre le comparateur de rang.
+    /// Avec une seule, le tri n'appelle jamais son comparateur et six lignes restent
+    /// non couvertes — un test qui n'exerce pas ce qu'il croit exercer.
+    #[tokio::test]
+    async fn two_candidates_are_ranked_against_each_other() {
+        let graph = MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&project).await.unwrap();
+        for text in ["first", "second"] {
+            let mut note = a_note(text);
+            note.project_id = Some(project.id);
+            note.status = crate::notes::NoteStatus::Active;
+            note.importance = crate::notes::NoteImportance::Critical;
+            graph.create_note(&note).await.unwrap();
+        }
+
+        let ranked = graph.ranked_foundation(Some(project.id), 6).await.unwrap();
+        assert_eq!(ranked.len(), 2, "{ranked:?}");
+        // Ordre déterministe : le départage se fait sur l'identifiant.
+        assert!(ranked[0].note < ranked[1].note, "{ranked:?}");
+    }
+
+    /// Une échelle qui ne classe plus une note la LIBÈRE : c'est la moitié qui manquait,
+    /// et sa mesure doit le dire.
+    #[tokio::test]
+    async fn a_scale_releases_what_it_no_longer_ranks() {
+        let graph = MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&project).await.unwrap();
+        let mut kept = a_note("kept");
+        kept.project_id = Some(project.id);
+        kept.status = crate::notes::NoteStatus::Active;
+        kept.importance = crate::notes::NoteImportance::Critical;
+        graph.create_note(&kept).await.unwrap();
+        let mut dropped = a_note("dropped");
+        dropped.project_id = Some(project.id);
+        dropped.status = crate::notes::NoteStatus::Active;
+        dropped.importance = crate::notes::NoteImportance::Critical;
+        graph.create_note(&dropped).await.unwrap();
+
+        let first = run(&graph, &[AGENT_KNOWS_PROJECT.name]).await.unwrap();
+        assert_eq!(first.of(AGENT_KNOWS_PROJECT.name).unwrap().written, 2);
+
+        // La note sort du filtre (archivée) : la règle doit la libérer au passage suivant.
+        {
+            let mut notes = graph.notes.write().await;
+            if let Some(n) = notes.get_mut(&dropped.id) {
+                n.status = crate::notes::NoteStatus::Archived;
+            }
+        }
+        let second = run(&graph, &[AGENT_KNOWS_PROJECT.name]).await.unwrap();
+        let outcome = second.of(AGENT_KNOWS_PROJECT.name).unwrap();
+        assert_eq!(outcome.released, 1, "{outcome:?}");
+        assert!(outcome.measure.contains("libérée"), "{}", outcome.measure);
+
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        assert_eq!(
+            graph
+                .agent_knows(self_id, Some(project.id), 10)
+                .await
+                .unwrap()
+                .notes,
+            vec![kept.id]
+        );
+    }
+
+    /// Un second passage atteste au lieu de réécrire : c'est ce que compte `skipped`.
+    #[tokio::test]
+    async fn a_second_pass_attests_instead_of_rewriting() {
+        let graph = MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&project).await.unwrap();
+        let mut note = a_note("kept");
+        note.project_id = Some(project.id);
+        note.status = crate::notes::NoteStatus::Active;
+        note.importance = crate::notes::NoteImportance::Critical;
+        graph.create_note(&note).await.unwrap();
+
+        run(&graph, &[AGENT_KNOWS_PROJECT.name]).await.unwrap();
+        let again = run(&graph, &[AGENT_KNOWS_PROJECT.name]).await.unwrap();
+        let outcome = again.of(AGENT_KNOWS_PROJECT.name).unwrap();
+        assert_eq!(outcome.written, 0);
+        assert_eq!(outcome.skipped, 1, "{outcome:?}");
+    }
+
+    /// Une épingle de portée PROJET garde son projet : l'échelle et le propriétaire sont
+    /// écrits sur l'arête, et l'identifiant est résolu par le slug de la portée.
+    #[tokio::test]
+    async fn a_project_pin_keeps_its_project() {
+        use crate::chat::stages::knowledge_injection::store_pinned_notes;
+
+        let graph = MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&project).await.unwrap();
+        let note = a_note("a project foundation");
+        graph.create_note(&note).await.unwrap();
+
+        store_pinned_notes(&graph, Some("alpha"), &[note.id])
+            .await
+            .unwrap();
+
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        assert_eq!(
+            graph
+                .agent_knows(self_id, Some(project.id), 10)
+                .await
+                .unwrap()
+                .notes,
+            vec![note.id],
+            "the project scale serves it"
+        );
+        assert!(
+            graph
+                .agent_knows(self_id, None, 10)
+                .await
+                .unwrap()
+                .notes
+                .is_empty(),
+            "and it is not global"
+        );
+    }
+
+    /// Une liste d'épingles illisible rend la lecture INCOMPLÈTE : la réconciliation est
+    /// sautée, pas appliquée sur un `keep` partiel.
+    #[tokio::test]
+    async fn an_unreadable_pin_list_blocks_the_release() {
+        use crate::chat::stages::knowledge_injection::store_pinned_notes;
+
+        let graph = MockGraphStore::new();
+        let note = a_note("pinned");
+        graph.create_note(&note).await.unwrap();
+        store_pinned_notes(&graph, None, &[note.id]).await.unwrap();
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        assert_eq!(
+            graph
+                .agent_knows(self_id, None, 10)
+                .await
+                .unwrap()
+                .notes
+                .len(),
+            1
+        );
+
+        // On corrompt la valeur stockée : la lecture devient incomplète.
+        {
+            let mut settings = graph.llm_settings.write().await;
+            for ((_, key), value) in settings.iter_mut() {
+                if key.contains("pinned") {
+                    *value = "{not json".into();
+                }
+            }
+        }
+        let outcome = run(&graph, &[AGENT_KNOWS_CORE.name]).await.unwrap();
+        let outcome = outcome.of(AGENT_KNOWS_CORE.name).unwrap();
+        assert_eq!(outcome.released, 0, "{outcome:?}");
+        assert!(
+            outcome.measure.contains("incomplète"),
+            "{}",
+            outcome.measure
+        );
+        assert_eq!(
+            graph.agent_knows(self_id, None, 10).await.unwrap().notes,
+            vec![note.id],
+            "l'arête survit à une lecture incomplète"
         );
     }
 

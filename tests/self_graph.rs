@@ -642,11 +642,38 @@ async fn the_foundation_query_ranks_a_project_scale_and_a_global_one() {
         .await
         .unwrap();
 
+    // Une SECONDE note ancrée : c'est ce qui fait vivre le comparateur de rang. Avec une
+    // seule, le tri n'appelle jamais son comparateur et les lignes restent non couvertes.
+    let mut second = a_note("api");
+    second.project_id = Some(e.project.id);
+    second.importance = project_orchestrator::notes::NoteImportance::Critical;
+    second.energy = 0.9;
+    e.client.create_note(&second).await.unwrap();
+    let file2 = Uuid::new_v4();
+    e.raw
+        .run(
+            query(
+                "MATCH (n:Note {id: $n}) \
+                 CREATE (f:File {id: $f, path: $p, project_id: $proj}) \
+                 CREATE (n)-[:LINKED_TO]->(f)",
+            )
+            .param("n", second.id.to_string())
+            .param("f", file2.to_string())
+            .param("p", format!("/tmp/{file2}.rs"))
+            .param("proj", e.project.id.to_string()),
+        )
+        .await
+        .unwrap();
+
     let ranked = e
         .client
         .ranked_foundation(Some(e.project.id), 6)
         .await
         .unwrap();
+    assert!(
+        ranked.len() >= 2,
+        "two anchored notes are ranked: {ranked:?}"
+    );
     let hit = ranked
         .iter()
         .find(|c| c.note == note.id)
@@ -666,6 +693,7 @@ async fn the_foundation_query_ranks_a_project_scale_and_a_global_one() {
         .await
         .unwrap();
     e.client.delete_note(note.id).await.unwrap();
+    e.client.delete_note(second.id).await.unwrap();
     cleanup(&e).await;
 }
 
