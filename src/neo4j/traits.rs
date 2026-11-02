@@ -2847,12 +2847,18 @@ pub trait AnalyticsStore: Send + Sync {
     // Embedding projection (UMAP visualization)
     // ========================================================================
 
-    /// Get all note embeddings for a project in a single batch query.
+    /// Get note embeddings for a project in a single batch query, at most `limit` of them.
     /// Returns (note_id, embedding_vec, note_type, importance, energy, tags, content_preview).
     /// Only returns notes that have embeddings. Used for UMAP 2D projection.
+    ///
+    /// `limit` is not optional: the caller copies every vector (`f32` here, `f64` for
+    /// UMAP), so an unbounded read is 60 MB stored and 200 MB+ transients on a project
+    /// of 20 000 notes at 768 dimensions — for a picture. The rows are ordered by note
+    /// id so the same project always yields the same sample.
     async fn get_note_embeddings_for_project(
         &self,
         project_id: Uuid,
+        limit: usize,
     ) -> Result<Vec<NoteEmbeddingPoint>>;
 
     // ========================================================================

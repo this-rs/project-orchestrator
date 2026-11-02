@@ -2990,8 +2990,10 @@ impl AnalyticsStore for Neo4jClient {
     async fn get_note_embeddings_for_project(
         &self,
         project_id: uuid::Uuid,
+        limit: usize,
     ) -> anyhow::Result<Vec<super::models::NoteEmbeddingPoint>> {
-        self.get_note_embeddings_for_project(project_id).await
+        self.get_note_embeddings_for_project(project_id, limit)
+            .await
     }
 
     // ========================================================================

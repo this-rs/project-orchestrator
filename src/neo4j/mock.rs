@@ -14753,6 +14753,7 @@ impl AnalyticsStore for MockGraphStore {
     async fn get_note_embeddings_for_project(
         &self,
         project_id: uuid::Uuid,
+        limit: usize,
     ) -> anyhow::Result<Vec<crate::neo4j::models::NoteEmbeddingPoint>> {
         let notes = self.notes.read().await;
         let embeddings = self.note_embeddings.read().await;
@@ -14760,6 +14761,9 @@ impl AnalyticsStore for MockGraphStore {
         for note in notes.values() {
             if note.project_id != Some(project_id) {
                 continue;
+            }
+            if points.len() >= limit {
+                break;
             }
             if let Some((emb, _model)) = embeddings.get(&note.id) {
                 points.push(crate::neo4j::models::NoteEmbeddingPoint {
