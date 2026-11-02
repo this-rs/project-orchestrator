@@ -65,6 +65,14 @@ pub struct MockAnchorStore {
 /// Shadow state of one directed synapse: `(shadow_weight, last shadow decay)`.
 pub type MockShadowSynapse = (f64, Option<chrono::DateTime<chrono::Utc>>);
 
+/// A `KNOWS` edge in the mock: its scale, the project it belongs to (if any), and the
+/// provenance written on it.
+pub type KnowsEdge = (
+    crate::graph::rules::KnowledgeScope,
+    Option<Uuid>,
+    crate::graph::rules::Provenance,
+);
+
 /// `(project, session, provenance)` of a `SYNAPSE` the mock welded.
 pub type SynapseWeld = (Uuid, Uuid, crate::graph::rules::Provenance);
 
@@ -222,7 +230,7 @@ pub struct MockGraphStore {
     /// `(:Agent)-[:LIVED]->(:SessionEpisode)`, as `(agent, episode)`.
     pub agent_lived: RwLock<std::collections::HashSet<(Uuid, Uuid)>>,
     /// `(:Agent)-[:KNOWS]->(:Note)`, with the provenance written on the edge.
-    pub agent_knows: RwLock<HashMap<(Uuid, Uuid), crate::graph::rules::Provenance>>,
+    pub agent_knows: RwLock<HashMap<(Uuid, Uuid), KnowsEdge>>,
     /// `coactivate_session`: the pairs it welded, and who welded them — `(project,
     /// session, provenance)`.
     pub synapses: RwLock<HashMap<(Uuid, Uuid), SynapseWeld>>,
@@ -13718,6 +13726,8 @@ impl AnalyticsStore for MockGraphStore {
         &self,
         agent_id: Uuid,
         note_id: Uuid,
+        scope: crate::graph::rules::KnowledgeScope,
+        project: Option<Uuid>,
         provenance: &crate::graph::rules::Provenance,
     ) -> Result<bool> {
         // A missing target draws nothing, exactly like the Cypher `MATCH`.
@@ -13726,7 +13736,7 @@ impl AnalyticsStore for MockGraphStore {
         }
         let mut edges = self.agent_knows.write().await;
         let created = !edges.contains_key(&(agent_id, note_id));
-        edges.insert((agent_id, note_id), provenance.clone());
+        edges.insert((agent_id, note_id), (scope, project, provenance.clone()));
         Ok(created)
     }
 
@@ -13776,7 +13786,7 @@ impl AnalyticsStore for MockGraphStore {
         let mut edges = self.agent_knows.write().await;
         let doomed: Vec<(Uuid, Uuid)> = edges
             .iter()
-            .filter(|((a, n), p)| *a == agent_id && p.rule == rule && !keep.contains(n))
+            .filter(|((a, n), (_, _, p))| *a == agent_id && p.rule == rule && !keep.contains(n))
             .map(|(k, _)| *k)
             .collect();
         for k in &doomed {
@@ -13788,20 +13798,72 @@ impl AnalyticsStore for MockGraphStore {
     async fn agent_knows(
         &self,
         agent_id: Uuid,
+        project: Option<Uuid>,
         limit: usize,
     ) -> Result<crate::graph::rules::AgentKnowledge> {
+        use crate::graph::rules::KnowledgeScope;
         let edges = self.agent_knows.read().await;
-        let mut all: Vec<(Uuid, String)> = edges
+        let mut all: Vec<(Uuid, f64, String)> = edges
             .iter()
-            .filter(|((a, _), _)| *a == agent_id)
-            .map(|((_, n), p)| (*n, p.at.clone()))
+            // Deux échelles, comme le Cypher : le global, et le projet demandé.
+            .filter(|((a, _), (scope, owner, _))| {
+                *a == agent_id
+                    && (*scope == KnowledgeScope::Global
+                        || (project.is_some() && *owner == project))
+            })
+            .map(|((_, n), (_, _, p))| (*n, p.score.unwrap_or(0.0), p.at.clone()))
             .collect();
-        // Most recently attested first, then by id so two equal stamps stay deterministic.
-        all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        // Strongest first, then the stamp, then the id: recency is not relevance.
+        all.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| a.0.cmp(&b.0))
+        });
         Ok(crate::graph::rules::AgentKnowledge {
             available: all.len(),
-            notes: all.into_iter().take(limit).map(|(n, _)| n).collect(),
+            notes: all.into_iter().take(limit).map(|(n, _, _)| n).collect(),
         })
+    }
+
+    async fn ranked_foundation(
+        &self,
+        project: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::graph::rules::FoundationCandidate>> {
+        // The mock has no Cypher: it ranks the notes it holds. « Global » means « born
+        // global » here — it cannot measure a multi-project escalation, and pretending
+        // otherwise would make a test believe a rule the real store computes differently.
+        let notes = self.notes.read().await;
+        let mut out: Vec<crate::graph::rules::FoundationCandidate> = notes
+            .values()
+            .filter(|n| {
+                n.status == crate::notes::NoteStatus::Active
+                    && matches!(
+                        n.importance,
+                        crate::notes::NoteImportance::Critical | crate::notes::NoteImportance::High
+                    )
+                    && match project {
+                        Some(p) => n.project_id == Some(p),
+                        None => n.project_id.is_none(),
+                    }
+            })
+            .map(|n| crate::graph::rules::FoundationCandidate {
+                note: n.id,
+                synapses: 0,
+                anchors: 0,
+                energy: 1.0,
+                score: crate::graph::rules::rank_score(0, 0, 1.0),
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.note.cmp(&b.note))
+        });
+        out.truncate(limit);
+        Ok(out)
     }
 
     async fn schema_catalog(&self) -> Result<crate::graph::schema::SchemaCatalog> {

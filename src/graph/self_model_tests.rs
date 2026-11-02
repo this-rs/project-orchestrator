@@ -106,12 +106,14 @@ async fn what_a_subject_knows_is_a_note_never_a_persona_file() {
         .link_agent_knows(
             self_id,
             note.id,
+            crate::graph::rules::KnowledgeScope::Global,
+            None,
             &Provenance::new("agent-knows-core", "1 portée, 1 note")
         )
         .await
         .unwrap());
 
-    let known = graph.agent_knows(self_id, 10).await.unwrap();
+    let known = graph.agent_knows(self_id, None, 10).await.unwrap();
     assert_eq!(known.notes, vec![note.id]);
     assert_eq!(known.available, 1);
     assert_eq!(known.withheld(), 0);
@@ -128,11 +130,28 @@ async fn two_subjects_do_not_share_their_knowledge() {
     let first = Uuid::new_v4();
     let second = Uuid::new_v4();
     let prov = Provenance::new("agent-knows-core", "measured");
-    graph.link_agent_knows(first, note.id, &prov).await.unwrap();
+    graph
+        .link_agent_knows(
+            first,
+            note.id,
+            crate::graph::rules::KnowledgeScope::Global,
+            None,
+            &prov,
+        )
+        .await
+        .unwrap();
 
-    assert_eq!(graph.agent_knows(first, 10).await.unwrap().notes.len(), 1);
+    assert_eq!(
+        graph
+            .agent_knows(first, None, 10)
+            .await
+            .unwrap()
+            .notes
+            .len(),
+        1
+    );
     assert!(graph
-        .agent_knows(second, 10)
+        .agent_knows(second, None, 10)
         .await
         .unwrap()
         .notes
@@ -150,12 +169,18 @@ async fn a_truncated_read_says_what_it_left_out() {
         let note = a_note(&format!("belief {i}"), "api");
         graph.create_note(&note).await.unwrap();
         graph
-            .link_agent_knows(self_id, note.id, &prov)
+            .link_agent_knows(
+                self_id,
+                note.id,
+                crate::graph::rules::KnowledgeScope::Global,
+                None,
+                &prov,
+            )
             .await
             .unwrap();
     }
 
-    let known = graph.agent_knows(self_id, 2).await.unwrap();
+    let known = graph.agent_knows(self_id, None, 2).await.unwrap();
     assert_eq!(known.notes.len(), 2);
     assert_eq!(known.available, 3);
     assert_eq!(
@@ -176,7 +201,13 @@ async fn a_knows_edge_always_carries_its_measure() {
     let prov = Provenance::new("agent-knows-core", "3 portées lues, 1 note épinglée");
 
     graph
-        .link_agent_knows(self_id, note.id, &prov)
+        .link_agent_knows(
+            self_id,
+            note.id,
+            crate::graph::rules::KnowledgeScope::Global,
+            None,
+            &prov,
+        )
         .await
         .unwrap();
 
@@ -187,6 +218,9 @@ async fn a_knows_edge_always_carries_its_measure() {
         .get(&(self_id, note.id))
         .cloned()
         .expect("the edge exists");
+    let (scope, project, stored) = stored;
+    assert_eq!(scope, crate::graph::rules::KnowledgeScope::Global);
+    assert!(project.is_none());
     assert!(stored.is_accountable());
     assert_eq!(stored.rule, "agent-knows-core");
     assert!(stored.measure.contains('3'));
@@ -201,6 +235,8 @@ async fn a_knows_edge_to_a_missing_note_draws_nothing() {
         .link_agent_knows(
             self_id,
             Uuid::new_v4(),
+            crate::graph::rules::KnowledgeScope::Global,
+            None,
             &Provenance::new("agent-knows-core", "measured"),
         )
         .await

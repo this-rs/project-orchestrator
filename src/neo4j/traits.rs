@@ -2979,6 +2979,8 @@ pub trait AnalyticsStore: Send + Sync {
         &self,
         agent_id: Uuid,
         note_id: Uuid,
+        scope: crate::graph::rules::KnowledgeScope,
+        project: Option<Uuid>,
         provenance: &crate::graph::rules::Provenance,
     ) -> Result<bool>;
 
@@ -3028,8 +3030,21 @@ pub trait AnalyticsStore: Send + Sync {
     async fn agent_knows(
         &self,
         agent_id: Uuid,
+        project: Option<Uuid>,
         limit: usize,
     ) -> Result<crate::graph::rules::AgentKnowledge>;
+
+    /// The notes a scope would put in a foundation, ranked, with the measurement that
+    /// ranked them.
+    ///
+    /// `project = Some(p)` : la fondation de CE projet. `None` : l'échelle globale, qui
+    /// n'est pas un fourre-tout — elle contient ce qui est ancré dans des fichiers de
+    /// **plusieurs** projets (l'escalade), plus ce qui est né global.
+    async fn ranked_foundation(
+        &self,
+        project: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::graph::rules::FoundationCandidate>>;
 
     /// The graph described as a catalog: its labels, and for each relationship type the
     /// label pairs it really connects, with measured counts. Measured, never declared.

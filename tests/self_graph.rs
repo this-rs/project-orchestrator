@@ -207,7 +207,7 @@ async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
     // anything. `link_agent_knows` MATCHes both ends — a missing subject is a silent no-op,
     // which is the trap this line documents.
     e.client.ensure_agent(self_id, None).await.unwrap();
-    let before = e.client.agent_knows(self_id, 10).await.unwrap();
+    let before = e.client.agent_knows(self_id, None, 10).await.unwrap();
     assert_eq!(before.available, 0, "a fresh subject knows nothing");
     let prov = rules::Provenance::new("agent-knows-core", "3 portées lues, 3 notes épinglées");
 
@@ -219,14 +219,14 @@ async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
         e.client.create_note(&n).await.unwrap();
         assert!(
             e.client
-                .link_agent_knows(self_id, n.id, &prov)
+                .link_agent_knows(self_id, n.id, rules::KnowledgeScope::Global, None, &prov)
                 .await
                 .unwrap(),
             "first link creates the edge"
         );
         assert!(
             !e.client
-                .link_agent_knows(self_id, n.id, &prov)
+                .link_agent_knows(self_id, n.id, rules::KnowledgeScope::Global, None, &prov)
                 .await
                 .unwrap(),
             "a second link attests, it does not create"
@@ -234,13 +234,13 @@ async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
         ids.push(n.id);
     }
 
-    let known = e.client.agent_knows(self_id, 2).await.unwrap();
+    let known = e.client.agent_knows(self_id, None, 2).await.unwrap();
     assert_eq!(known.notes.len(), 2, "bounded");
     assert_eq!(known.available, 3, "and the total is published");
     assert_eq!(known.withheld(), 1, "« la part lue est dite »");
 
     // And the bound is what limits, not luck: unbounded, all three come back.
-    let all = e.client.agent_knows(self_id, 10).await.unwrap();
+    let all = e.client.agent_knows(self_id, None, 10).await.unwrap();
     assert_eq!(all.notes.len(), 3);
     assert_eq!(all.withheld(), 0);
 
@@ -281,6 +281,8 @@ async fn a_knows_edge_to_a_missing_note_draws_nothing() {
         .link_agent_knows(
             self_id,
             Uuid::new_v4(),
+            rules::KnowledgeScope::Global,
+            None,
             &rules::Provenance::new("agent-knows-core", "measured"),
         )
         .await
@@ -545,6 +547,8 @@ async fn unpinning_releases_the_edge_the_rule_drew_and_spares_a_hand_placed_one(
         .link_agent_knows(
             self_id,
             by_hand.id,
+            rules::KnowledgeScope::Global,
+            None,
             &rules::Provenance::new("a person", "decided by hand"),
         )
         .await
@@ -554,7 +558,7 @@ async fn unpinning_releases_the_edge_the_rule_drew_and_spares_a_hand_placed_one(
     store_pinned_notes(&e.client, None, &[kept.id, dropped.id])
         .await
         .unwrap();
-    let known = e.client.agent_knows(self_id, 10).await.unwrap();
+    let known = e.client.agent_knows(self_id, None, 10).await.unwrap();
     assert_eq!(
         known.available, 3,
         "two pins plus the hand-placed one: {known:?}"
@@ -564,7 +568,7 @@ async fn unpinning_releases_the_edge_the_rule_drew_and_spares_a_hand_placed_one(
     store_pinned_notes(&e.client, None, &[kept.id])
         .await
         .unwrap();
-    let known = e.client.agent_knows(self_id, 10).await.unwrap();
+    let known = e.client.agent_knows(self_id, None, 10).await.unwrap();
     assert_eq!(
         known.available, 2,
         "the dropped pin is released, the hand-placed edge stays: {known:?}"
@@ -605,6 +609,8 @@ async fn the_catalog_says_what_the_graph_really_has() {
         .link_agent_knows(
             agent,
             note.id,
+            rules::KnowledgeScope::Global,
+            None,
             &rules::Provenance::new("agent-knows-core", "measured"),
         )
         .await

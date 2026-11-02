@@ -614,8 +614,23 @@ impl KnowledgeInjectionStage {
             let mut ids = configured;
             // The self, read as a NODE: what it knows is an edge, not a setting. A graph
             // that cannot answer yields no structural note — never another agent's.
+            // La portée de la session décide de l'échelle servie : le socle de CE projet
+            // plus ce qui vaut partout. Sans projet, seule l'échelle globale est servie —
+            // jamais le socle d'un autre projet.
+            let scope_project = match project_owned.as_deref() {
+                Some(slug) => graph
+                    .get_project_by_slug(slug)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|p| p.id),
+                None => None,
+            };
             let structural = match graph.agent_identity_namespace().await {
-                Ok(self_id) => match graph.agent_knows(self_id, MAX_PINNED_NOTES).await {
+                Ok(self_id) => match graph
+                    .agent_knows(self_id, scope_project, MAX_PINNED_NOTES)
+                    .await
+                {
                     Ok(known) => {
                         if known.withheld() > 0 {
                             // « la part lue est dite »: the bound is published, not silent.
