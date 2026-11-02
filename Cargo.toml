@@ -117,7 +117,7 @@ tree-sitter-java = "0.23"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-ruby = "0.23"
-tree-sitter-php = "0.24"
+tree-sitter-php = "0.25"
 tree-sitter-kotlin-ng = "1.1"
 tree-sitter-swift = "0.7"
 tree-sitter-bash = "0.25"
@@ -143,7 +143,7 @@ petgraph = "0.8"
 rustworkx-core = "0.18"
 
 # LRU cache (for resolver)
-lru = "0.18"
+lru = "0.19"
 
 # Utilities
 uuid = { workspace = true }
@@ -205,10 +205,10 @@ tar = "0.4"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # DOCX text extraction (feature `docx`). A .docx is a ZIP of XML parts, so the
-# container is handled by `zip` above and the parsing by quick-xml. 0.39 is
-# already in Cargo.lock as a transitive dependency — pinning the same minor
-# reuses that resolution instead of vendoring a second copy of the crate.
-quick-xml = { version = "0.39", optional = true }
+# container is handled by `zip` above and the parsing by quick-xml, pinned to
+# the same minor as the rest of the lock. Its 0.42 API (names and text as str,
+# no `decode()`) is handled in `documents::extract::{docx, pptx, xml}`.
+quick-xml = { version = "0.42", optional = true }
 
 # XLSX text extraction (feature `xlsx`). Spreadsheets are cell grids with shared
 # strings, typed values and several storage formats, so unlike DOCX/PPTX this is
