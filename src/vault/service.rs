@@ -302,9 +302,9 @@ impl VaultService {
     }
 
     fn issue_proof(&self) -> String {
-        use chacha20poly1305::aead::rand_core::RngCore;
+        use rand::RngExt;
         let mut bytes = [0u8; 32];
-        chacha20poly1305::aead::OsRng.fill_bytes(&mut bytes);
+        rand::rng().fill(&mut bytes);
         let proof = hex::encode(bytes);
         let mut proofs = lock(&self.proofs);
         proofs.push(zeroize::Zeroizing::new(proof.clone()));
