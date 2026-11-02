@@ -8690,6 +8690,136 @@ pub(crate) mod tests {
         }
     }
 
+    /// The whole route: a delegation that OPENS (on the in-process fake provider, no
+    /// binary) is wired to wake its parent, and does so when its turn ends. The parent
+    /// is a session a person drives (no plan run owns it), so `waking_parent` keeps it.
+    #[tokio::test]
+    async fn a_delegation_that_opens_wakes_its_parent_when_its_turn_ends() {
+        use crate::chat::manager::{test_support, ChatManager};
+        use crate::neo4j::GraphStore;
+        use nexus_claude::agent::{AgentEvent, Cost, CostBasis, StopReason};
+
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = crate::test_helpers::test_project();
+        mock.create_project(&project).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(project.id);
+        mock.create_plan(&plan).await.unwrap();
+        let task = crate::test_helpers::test_task();
+        mock.create_task(plan.id, &task).await.unwrap();
+        let parent = crate::test_helpers::test_chat_session(Some(&project.slug));
+        mock.create_chat_session(&parent).await.unwrap();
+        let parent_id = parent.id.to_string();
+
+        let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
+        let dyn_graph: Arc<dyn GraphStore> = mock.clone();
+        let manager = Arc::new(
+            ChatManager::new_without_memory(
+                dyn_graph,
+                crate::test_helpers::mock_app_state().meili,
+                crate::chat::config::ChatConfig {
+                    provider_path: crate::chat::config::ProviderPath::Agent,
+                    ..Default::default()
+                },
+            )
+            .with_provider_source(Arc::new(fake.clone())),
+        );
+        // The parent is live (a child only opens under a live parent) and listened to.
+        test_support::insert_live_session_without_cli(&manager, &parent_id).await;
+        let mut rx = {
+            let sessions = manager.active_sessions.read().await;
+            sessions[&parent_id].events_tx.subscribe()
+        };
+        let state = crate::test_helpers::server_state_with_chat(manager, mock.clone()).await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            crate::chat::envelope::SESSION_ID_HEADER,
+            parent_id.parse().unwrap(),
+        );
+        let req = DelegateTaskRequest {
+            cwd: parent.cwd.clone(),
+            project_slug: None,
+            custom_sections: Vec::new(),
+            parent_session_id: None,
+            provider: None,
+            model: None,
+            task_class: None,
+            execution_place: None,
+        };
+
+        // The child's turn ends once its prompt reached the provider.
+        let pusher = fake.clone();
+        tokio::spawn(async move {
+            while pusher.state.turns_started.lock().unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            // Let `listen_delegation_result` subscribe to the child first.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            pusher.state.push(AgentEvent::Done {
+                stop_reason: StopReason::Completed,
+                subtype: Some("success".into()),
+                is_error: false,
+                result_text: Some("done".into()),
+                usage: Default::default(),
+                cost: Cost {
+                    usd: Some(0.01),
+                    basis: CostBasis::Reported,
+                },
+                duration_ms: 5,
+                duration_api_ms: None,
+                num_turns: 1,
+                model: Some("m".into()),
+                provider_session_id: Some("p-1".into()),
+                structured_output: None,
+                error: None,
+            });
+        });
+
+        let response = delegate_task(
+            State(state),
+            None,
+            headers,
+            Path((plan.id, task.id)),
+            Json(req),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the delegation opens on the fake provider: {e:?}"));
+        let (status, Json(outcome)) = response;
+        assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+        match outcome {
+            DelegateTaskOutcome::Launched(launched) => {
+                assert_eq!(launched.task_id, task.id);
+                assert!(!launched.session_id.is_empty());
+            }
+            DelegateTaskOutcome::ConfirmationRequired(_) => {
+                panic!("no execution place was asked for: nothing to confirm")
+            }
+        }
+
+        // The parent receives the end of the delegation: it names the task.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the end of the delegation never reached the parent"
+            );
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(crate::chat::types::ChatEvent::UserMessage { content }))
+                | Ok(Ok(crate::chat::types::ChatEvent::SystemHint { content }))
+                | Ok(Ok(crate::chat::types::ChatEvent::BackgroundOutput { content, .. }))
+                    if content.contains(&task.id.to_string()) =>
+                {
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(_)) => panic!("the parent's broadcast closed before the notification"),
+                Err(_) => continue,
+            }
+        }
+    }
+
     /// The stored execution, once it is no longer `running` (the drop path
     /// writes from a spawned task).
     async fn closed_execution(
