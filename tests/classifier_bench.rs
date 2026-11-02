@@ -9,6 +9,8 @@
 #[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Instant;
@@ -50,6 +52,23 @@ fn every_classifier_is_scored_against_the_majority_baseline() {
     let scores = evaluation::run_embedded().expect("the embedded fixtures score");
     let elapsed = started.elapsed();
     print_table(&scores, elapsed);
+
+    // The router is not a classifier, so `B_pop` is not a column above: it gets its
+    // own line, in the same bench, because a number nobody prints is not watched.
+    let b_pop = common::metamorphic::b_pop();
+    println!(
+        "\n── routing invariant (not a classifier) ──\n  {}",
+        b_pop.line()
+    );
+    assert_eq!(
+        b_pop.observed_b_pop, 0.0,
+        "B_pop moved on observed arms: {}",
+        b_pop.observed_b_pop
+    );
+    assert!(
+        b_pop.control_moved_seeds > 0,
+        "the B_pop control no longer moves: the invariance above is vacuous"
+    );
 
     let names: BTreeSet<&str> = scores.iter().map(|s| s.classifier.as_str()).collect();
     assert_eq!(
