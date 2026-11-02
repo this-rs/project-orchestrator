@@ -6537,7 +6537,7 @@ dependencies = [
  "petgraph",
  "project-orchestrator",
  "proptest",
- "quick-xml 0.39.4",
+ "quick-xml 0.42.0",
  "rag-umap",
  "rand 0.10.3",
  "rand_core 0.6.4",
