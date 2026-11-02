@@ -307,6 +307,32 @@ impl RulesReport {
     }
 }
 
+/// Le budget du passage au démarrage : un graphe lent coûte la matérialisation du socle,
+/// jamais le démarrage du serveur.
+pub const BOOT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Applique toutes les règles une fois, au démarrage, sous budget.
+///
+/// Extrait de `main` pour être testable : un bloc dans la fonction de démarrage ne
+/// s'exécute dans aucun test, donc il ne prouve rien — il était à 0 % de couverture, et
+/// c'était exact.
+///
+/// `None` signifie « pas de rapport » : budget épuisé ou erreur. Jamais une panique, jamais
+/// un démarrage refusé.
+pub async fn run_at_boot(graph: &dyn GraphStore) -> Option<RulesReport> {
+    match tokio::time::timeout(BOOT_BUDGET, run(graph, &[])).await {
+        Ok(Ok(report)) => Some(report),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "the knowledge rules could not run at boot");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("the knowledge rules timed out at boot");
+            None
+        }
+    }
+}
+
 /// Runs the named rules (all of them when `names` is empty). Deterministic: it reads
 /// counts and settings, never text, and writes nothing but the edges it declares.
 pub async fn run(graph: &dyn GraphStore, names: &[&str]) -> anyhow::Result<RulesReport> {
@@ -787,6 +813,103 @@ mod tests {
                 .notes,
             vec![note.id],
             "l'arête est toujours là"
+        );
+    }
+
+    /// Le corps de la règle PROJET : des candidats classés deviennent des arêtes d'échelle
+    /// projet, et la réconciliation garde exactement ceux-là.
+    #[tokio::test]
+    async fn the_project_scale_writes_what_it_ranked() {
+        let graph = MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&project).await.unwrap();
+        let mut note = a_note("the foundation of alpha");
+        note.project_id = Some(project.id);
+        note.status = crate::notes::NoteStatus::Active;
+        note.importance = crate::notes::NoteImportance::Critical;
+        graph.create_note(&note).await.unwrap();
+
+        let outcome = run(&graph, &[AGENT_KNOWS_PROJECT.name]).await.unwrap();
+        let outcome = outcome.of(AGENT_KNOWS_PROJECT.name).unwrap();
+        assert_eq!(outcome.considered, 1, "{outcome:?}");
+        assert_eq!(outcome.written, 1, "{outcome:?}");
+        assert_eq!(outcome.released, 0);
+
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        let known = graph
+            .agent_knows(self_id, Some(project.id), 10)
+            .await
+            .unwrap();
+        assert_eq!(known.notes, vec![note.id], "the project scale serves it");
+        // …et l'échelle globale ne le sert pas : il appartient à un projet.
+        let global = graph.agent_knows(self_id, None, 10).await.unwrap();
+        assert!(global.notes.is_empty(), "{global:?}");
+    }
+
+    /// Le corps de la règle GLOBALE : une note née globale devient une connaissance qui
+    /// vaut partout, et elle apparaît même sans projet demandé.
+    #[tokio::test]
+    async fn the_global_scale_writes_what_crosses_projects() {
+        let graph = MockGraphStore::new();
+        let mut note = a_note("a lesson that crosses projects");
+        note.project_id = None;
+        note.status = crate::notes::NoteStatus::Active;
+        note.importance = crate::notes::NoteImportance::Critical;
+        graph.create_note(&note).await.unwrap();
+
+        let outcome = run(&graph, &[AGENT_KNOWS_GLOBAL.name]).await.unwrap();
+        let outcome = outcome.of(AGENT_KNOWS_GLOBAL.name).unwrap();
+        assert_eq!(outcome.written, 1, "{outcome:?}");
+
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        assert_eq!(
+            graph.agent_knows(self_id, None, 10).await.unwrap().notes,
+            vec![note.id]
+        );
+        // Une connaissance globale est servie quel que soit le projet demandé : c'est sa
+        // définition même. Ce qui ne se mélange pas, c'est l'inverse — une note de projet
+        // n'apparaît pas dans le socle d'un autre projet (vérifié ci-dessus).
+        assert_eq!(
+            graph
+                .agent_knows(self_id, Some(Uuid::new_v4()), 10)
+                .await
+                .unwrap()
+                .notes,
+            vec![note.id]
+        );
+    }
+
+    /// Le passage au démarrage rend un rapport pour CHAQUE règle — et ne bloque jamais :
+    /// c'est la seule chose que le démarrage demande.
+    #[tokio::test]
+    async fn the_boot_pass_reports_every_rule() {
+        let graph = MockGraphStore::new();
+        let report = run_at_boot(&graph).await.expect("a report");
+        for rule in RULES {
+            assert!(
+                report.of(rule.name).is_some(),
+                "{} is missing from the boot report",
+                rule.name
+            );
+        }
+    }
+
+    /// Le départage du rang : un note sans synapse ni ancre vaut ce que vaut son énergie.
+    #[test]
+    fn the_rank_score_weighs_synapses_double_and_caps_anchors() {
+        assert_eq!(rank_score(0, 0, 0.0), 0.0);
+        assert_eq!(rank_score(1, 0, 0.0), 2.0, "a synapse counts double");
+        assert_eq!(rank_score(0, 10, 0.0), 10.0);
+        assert_eq!(rank_score(0, 50, 0.0), 50.0);
+        assert_eq!(
+            rank_score(0, 5_000, 0.0),
+            50.0,
+            "anchors are capped: « anchored everywhere » is not « truer »"
+        );
+        assert_eq!(
+            rank_score(0, 0, 1.0),
+            10.0,
+            "energy breaks ties, it does not rule"
         );
     }
 

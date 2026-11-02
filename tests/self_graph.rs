@@ -611,6 +611,65 @@ async fn unpinning_releases_the_edge_the_rule_drew_and_spares_a_hand_placed_one(
 }
 
 #[tokio::test]
+async fn the_foundation_query_ranks_a_project_scale_and_a_global_one() {
+    // Les deux variantes du Cypher de classement, exercées directement : la règle peut être
+    // désactivée par un projet illisible, la requête ne doit pas rester non testée pour
+    // autant.
+    let _serial = serial().await;
+    let Some(e) = env("ranked").await else {
+        return;
+    };
+
+    // Une note de projet : active, critique, fraîche, ancrée à un fichier du projet.
+    let mut note = a_note("api");
+    note.project_id = Some(e.project.id);
+    note.importance = project_orchestrator::notes::NoteImportance::Critical;
+    note.energy = 1.0;
+    e.client.create_note(&note).await.unwrap();
+    let file = Uuid::new_v4();
+    e.raw
+        .run(
+            query(
+                "MATCH (n:Note {id: $n}) \
+                 CREATE (f:File {id: $f, path: $p, project_id: $proj}) \
+                 CREATE (n)-[:LINKED_TO]->(f)",
+            )
+            .param("n", note.id.to_string())
+            .param("f", file.to_string())
+            .param("p", format!("/tmp/{file}.rs"))
+            .param("proj", e.project.id.to_string()),
+        )
+        .await
+        .unwrap();
+
+    let ranked = e
+        .client
+        .ranked_foundation(Some(e.project.id), 6)
+        .await
+        .unwrap();
+    let hit = ranked
+        .iter()
+        .find(|c| c.note == note.id)
+        .expect("the project's note is ranked");
+    assert_eq!(hit.anchors, 1, "{hit:?}");
+    assert!(hit.score > 0.0, "{hit:?}");
+
+    // L'échelle globale ne la sert pas : elle n'a pas traversé de frontière.
+    let global = e.client.ranked_foundation(None, 8).await.unwrap();
+    assert!(
+        !global.iter().any(|c| c.note == note.id),
+        "une note d'un seul projet ne s'escalade pas"
+    );
+
+    e.raw
+        .run(query("MATCH (f:File {id: $f}) DETACH DELETE f").param("f", file.to_string()))
+        .await
+        .unwrap();
+    e.client.delete_note(note.id).await.unwrap();
+    cleanup(&e).await;
+}
+
+#[tokio::test]
 async fn the_catalog_says_what_the_graph_really_has() {
     let _serial = serial().await;
     let Some(e) = env("catalog").await else {

@@ -2278,29 +2278,19 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             } else {
                 boot::tracker().done_with("migrations", format!("{applied} migration(s) run"));
             }
-            // Le socle du soi se matérialise une fois, le schéma en place : la règle lit les
-            // épingles et RÉCONCILIE les arêtes `KNOWS`. Bornée et non fatale — un graphe lent
-            // coûte la matérialisation, jamais le démarrage.
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                crate::graph::rules::run(graph.as_ref(), &[]),
-            )
-            .await
-            {
-                Ok(Ok(report)) => {
-                    for rule in &report.rules {
-                        tracing::info!(
-                            rule = %rule.name,
-                            considered = rule.considered,
-                            written = rule.written,
-                            released = rule.released,
-                            "{}",
-                            rule.measure
-                        );
-                    }
+            // Le socle du soi se matérialise une fois, borné et non fatal — le corps est
+            // dans `graph::rules::run_at_boot`, où il est testable.
+            if let Some(report) = crate::graph::rules::run_at_boot(graph.as_ref()).await {
+                for rule in &report.rules {
+                    tracing::info!(
+                        rule = %rule.name,
+                        considered = rule.considered,
+                        written = rule.written,
+                        released = rule.released,
+                        "{}",
+                        rule.measure
+                    );
                 }
-                Ok(Err(e)) => tracing::warn!(error = %e, "the knowledge rules could not run"),
-                Err(_) => tracing::warn!("the knowledge rules timed out at boot"),
             }
 
             let handle = engine.start_owned();
