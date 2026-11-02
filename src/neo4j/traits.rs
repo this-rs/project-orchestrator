@@ -2415,6 +2415,38 @@ pub trait AnalyticsStore: Send + Sync {
         project_id: &str,
     ) -> Result<Vec<crate::graph::models::FileSignalRecord>>;
 
+    /// Read the structural DNA of ONE file.
+    ///
+    /// [`Self::get_project_structural_dna`] materialises every DNA vector of the
+    /// project (one `f64` list per file) to look at a single one — hundreds of MB on a
+    /// large project for one lookup. This is the targeted form; `None` when the file
+    /// has no DNA yet (analytics not run, or file added since).
+    async fn get_file_structural_dna(
+        &self,
+        project_id: &str,
+        path: &str,
+    ) -> Result<Option<Vec<f64>>>;
+
+    /// IMPORTS edges of a project restricted to the given file paths.
+    ///
+    /// The multi-layer graph endpoint used to load EVERY import edge of the project and
+    /// drop the ones outside the requested window in Rust. Pushing the filter into
+    /// Cypher makes the transfer proportional to the window, not to the project.
+    async fn get_import_edges_among(
+        &self,
+        project_id: Uuid,
+        paths: &[String],
+    ) -> Result<Vec<(String, String)>>;
+
+    /// CALLS edges among the given node ids.
+    ///
+    /// Same contract as [`Self::get_import_edges_among`], for the function graph.
+    async fn get_call_edges_among(
+        &self,
+        project_id: Uuid,
+        ids: &[String],
+    ) -> Result<Vec<(String, String)>>;
+
     // ========================================================================
     // SYNAPSE (neural connections bridged to file-level)
     // ========================================================================
@@ -2847,12 +2879,18 @@ pub trait AnalyticsStore: Send + Sync {
     // Embedding projection (UMAP visualization)
     // ========================================================================
 
-    /// Get all note embeddings for a project in a single batch query.
+    /// Get note embeddings for a project in a single batch query, at most `limit` of them.
     /// Returns (note_id, embedding_vec, note_type, importance, energy, tags, content_preview).
     /// Only returns notes that have embeddings. Used for UMAP 2D projection.
+    ///
+    /// `limit` is not optional: the caller copies every vector (`f32` here, `f64` for
+    /// UMAP), so an unbounded read is 60 MB stored and 200 MB+ transients on a project
+    /// of 20 000 notes at 768 dimensions — for a picture. The rows are ordered by note
+    /// id so the same project always yields the same sample.
     async fn get_note_embeddings_for_project(
         &self,
         project_id: Uuid,
+        limit: usize,
     ) -> Result<Vec<NoteEmbeddingPoint>>;
 
     // ========================================================================

@@ -271,6 +271,9 @@ pub struct MockGraphStore {
     /// (and `create_project` sets for a new project). Absent: canonical form.
     pub paths_declared: RwLock<HashMap<Uuid, bool>>,
     pub file_symbols: RwLock<HashMap<String, Vec<String>>>,
+    /// Per-project file signals (`get_project_file_signals`): seeded by tests, read back
+    /// as the Neo4j query would return them.
+    pub file_signals: RwLock<HashMap<Uuid, Vec<crate::graph::models::FileSignalRecord>>>,
     pub task_files: RwLock<HashMap<Uuid, Vec<String>>>,
     pub task_commits: RwLock<HashMap<Uuid, Vec<String>>>,
     pub plan_commits: RwLock<HashMap<Uuid, Vec<String>>>,
@@ -540,6 +543,7 @@ impl MockGraphStore {
             project_files: RwLock::new(HashMap::new()),
             paths_declared: RwLock::new(HashMap::new()),
             file_symbols: RwLock::new(HashMap::new()),
+            file_signals: RwLock::new(HashMap::new()),
             task_files: RwLock::new(HashMap::new()),
             task_commits: RwLock::new(HashMap::new()),
             plan_commits: RwLock::new(HashMap::new()),
@@ -974,6 +978,139 @@ mod tests {
     use crate::neo4j::traits::*;
     use crate::test_helpers::{test_project, test_project_named};
     use chrono::Utc;
+
+    /// The windowed edge read must keep the edges whose BOTH ends are in the window:
+    /// the multi-layer graph endpoint asks for the files it kept and used to receive
+    /// every edge of the project, filtering afterwards in Rust.
+    #[tokio::test]
+    async fn the_windowed_import_read_keeps_only_the_edges_inside_the_window() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+
+        for path in ["a.rs", "b.rs", "c.rs"] {
+            let file = FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "h".to_string(),
+                last_parsed: Utc::now(),
+                project_id: Some(project.id),
+            };
+            store.upsert_file(&file).await.unwrap();
+            store.link_file_to_project(path, project.id).await.unwrap();
+        }
+        store
+            .create_import_relationship("a.rs", "b.rs", "b")
+            .await
+            .unwrap();
+        store
+            .create_import_relationship("b.rs", "c.rs", "c")
+            .await
+            .unwrap();
+
+        let all = store.get_project_import_edges(project.id).await.unwrap();
+        assert_eq!(all.len(), 2, "the whole-project read still sees both edges");
+
+        let window = vec!["a.rs".to_string(), "b.rs".to_string()];
+        let inside = store
+            .get_import_edges_among(project.id, &window)
+            .await
+            .unwrap();
+        assert_eq!(
+            inside,
+            vec![("a.rs".to_string(), "b.rs".to_string())],
+            "b.rs -> c.rs leaves the window, so it must not come back"
+        );
+
+        let nothing = store.get_import_edges_among(project.id, &[]).await.unwrap();
+        assert!(nothing.is_empty(), "an empty window reads nothing");
+    }
+
+    fn a_function(file_path: &str, name: &str) -> FunctionNode {
+        FunctionNode {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            params: Vec::new(),
+            return_type: None,
+            generics: Vec::new(),
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: file_path.to_string(),
+            line_start: 1,
+            line_end: 2,
+            docstring: None,
+            owner: None,
+        }
+    }
+
+    /// The windowed CALLS read keeps only the edges whose two ends are in the window.
+    #[tokio::test]
+    async fn the_windowed_call_read_keeps_only_edges_inside_the_window() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        for path in ["a.rs", "b.rs"] {
+            let file = FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "h".to_string(),
+                last_parsed: Utc::now(),
+                project_id: Some(project.id),
+            };
+            store.upsert_file(&file).await.unwrap();
+            store.link_file_to_project(path, project.id).await.unwrap();
+        }
+        store
+            .upsert_function(&a_function("a.rs", "caller"))
+            .await
+            .unwrap();
+        store
+            .upsert_function(&a_function("b.rs", "callee"))
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("a.rs::caller", "callee", Some(project.id), 1.0, "test")
+            .await
+            .unwrap();
+
+        let all = store.get_project_call_edges(project.id).await.unwrap();
+        assert_eq!(all.len(), 1, "the whole-project read still sees the call");
+
+        // The read reports function ids in the Neo4j shape (`file:name:line`), so the
+        // window is built from what the unfiltered read returned, never from a guess.
+        let (caller_func_id, callee_func_id) = all[0].clone();
+
+        let window = vec![caller_func_id.clone(), callee_func_id.clone()];
+        assert_eq!(
+            store
+                .get_call_edges_among(project.id, &window)
+                .await
+                .unwrap(),
+            vec![(caller_func_id.clone(), callee_func_id)]
+        );
+
+        let narrow = vec![caller_func_id];
+        assert!(
+            store
+                .get_call_edges_among(project.id, &narrow)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an edge whose callee left the window must not come back"
+        );
+    }
+
+    /// The targeted DNA read answers `None` for a file that has no DNA — the mock has
+    /// none by default, which is also the "analytics not run yet" case in production.
+    #[tokio::test]
+    async fn the_targeted_dna_read_is_none_without_analytics() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        assert!(store
+            .get_file_structural_dna(&project.id.to_string(), "src/absent.rs")
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     fn make_event(session_id: Uuid, seq: i64, event_type: &str, data: &str) -> ChatEventRecord {
         ChatEventRecord {
@@ -14297,10 +14434,14 @@ impl AnalyticsStore for MockGraphStore {
 
     async fn get_project_file_signals(
         &self,
-        _project_id: &str,
+        project_id: &str,
     ) -> anyhow::Result<Vec<crate::graph::models::FileSignalRecord>> {
-        // Mock: no file signals in tests by default
-        Ok(vec![])
+        // Mock: none unless a test seeded `file_signals`.
+        let signals = self.file_signals.read().await;
+        Ok(Uuid::parse_str(project_id)
+            .ok()
+            .and_then(|id| signals.get(&id).cloned())
+            .unwrap_or_default())
     }
 
     async fn write_predicted_links(
@@ -14318,6 +14459,47 @@ impl AnalyticsStore for MockGraphStore {
     ) -> anyhow::Result<Vec<(String, Vec<f64>)>> {
         // Mock: no structural DNA in tests by default
         Ok(vec![])
+    }
+
+    async fn get_file_structural_dna(
+        &self,
+        _project_id: &str,
+        _path: &str,
+    ) -> anyhow::Result<Option<Vec<f64>>> {
+        // Mock: no structural DNA in tests by default
+        Ok(None)
+    }
+
+    async fn get_import_edges_among(
+        &self,
+        project_id: Uuid,
+        paths: &[String],
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let wanted: std::collections::HashSet<&str> = paths.iter().map(|p| p.as_str()).collect();
+        Ok(self
+            .get_project_import_edges(project_id)
+            .await?
+            .into_iter()
+            .filter(|(source, target)| {
+                wanted.contains(source.as_str()) && wanted.contains(target.as_str())
+            })
+            .collect())
+    }
+
+    async fn get_call_edges_among(
+        &self,
+        project_id: Uuid,
+        ids: &[String],
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let wanted: std::collections::HashSet<&str> = ids.iter().map(|i| i.as_str()).collect();
+        Ok(self
+            .get_project_call_edges(project_id)
+            .await?
+            .into_iter()
+            .filter(|(source, target)| {
+                wanted.contains(source.as_str()) && wanted.contains(target.as_str())
+            })
+            .collect())
     }
 
     async fn get_project_synapse_edges(
@@ -14854,6 +15036,7 @@ impl AnalyticsStore for MockGraphStore {
     async fn get_note_embeddings_for_project(
         &self,
         project_id: uuid::Uuid,
+        limit: usize,
     ) -> anyhow::Result<Vec<crate::neo4j::models::NoteEmbeddingPoint>> {
         let notes = self.notes.read().await;
         let embeddings = self.note_embeddings.read().await;
@@ -14861,6 +15044,9 @@ impl AnalyticsStore for MockGraphStore {
         for note in notes.values() {
             if note.project_id != Some(project_id) {
                 continue;
+            }
+            if points.len() >= limit {
+                break;
             }
             if let Some((emb, _model)) = embeddings.get(&note.id) {
                 points.push(crate::neo4j::models::NoteEmbeddingPoint {

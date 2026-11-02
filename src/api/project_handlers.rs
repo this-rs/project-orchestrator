@@ -507,7 +507,8 @@ pub async fn get_project_graph(
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
 
     let requested_layers = parse_layers(&params.layers);
-    let limit = params.limit.unwrap_or(5000);
+    // Clamped: `limit` is user input and this endpoint materialises every layer.
+    let limit = params.effective_limit();
 
     let live: Vec<_> = match state.chat_manager.as_ref() {
         Some(cm) => cm.live_session_snapshot().await.live.into_iter().collect(),
@@ -611,6 +612,31 @@ pub struct EmbeddingsProjectionResponse {
     pub dimensions: usize,
     pub projection_dimensions: usize,
     pub method: String,
+    /// Ceiling applied to the number of notes projected. Reported so a client can tell
+    /// a small project from a truncated sample instead of guessing from `points.len()`.
+    pub point_limit: usize,
+}
+
+/// Notes a projection shows, at most.
+///
+/// Every projected note carries a full vector: it is read as `f32` (768 × 4 B), copied
+/// as `f64` for UMAP (768 × 8 B) and rows in the distance matrix. Unbounded, a project
+/// of 20 000 notes meant ~60 MB stored plus a few hundred MB transients for a picture
+/// that a canvas cannot render anyway.
+pub const MAX_PROJECTION_POINTS: usize = 5_000;
+
+/// Log that a projection was capped: a read that came back exactly at the limit may have
+/// dropped notes, so the operator is told rather than shown a silently partial picture.
+fn warn_if_projection_truncated(slug: &str, returned: usize, limit: usize) -> bool {
+    let truncated = returned >= limit;
+    if truncated {
+        tracing::warn!(
+            project = %slug,
+            limit,
+            "embeddings projection truncated: the project has more notes than the cap"
+        );
+    }
+    truncated
 }
 
 /// GET /api/projects/:slug/embeddings/projection?dimensions=2|3
@@ -637,8 +663,12 @@ pub async fn get_embeddings_projection(
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
     let pid = project.id;
 
-    // 2. Get all note embeddings for the project
-    let embedding_points = neo4j.get_note_embeddings_for_project(pid).await?;
+    // 2. Get note embeddings for the project, capped: a projection is a picture, and
+    // every point carries a full vector (see MAX_PROJECTION_POINTS).
+    let embedding_points = neo4j
+        .get_note_embeddings_for_project(pid, MAX_PROJECTION_POINTS)
+        .await?;
+    warn_if_projection_truncated(&slug, embedding_points.len(), MAX_PROJECTION_POINTS);
 
     if embedding_points.is_empty() {
         return Ok(Json(EmbeddingsProjectionResponse {
@@ -648,6 +678,7 @@ pub async fn get_embeddings_projection(
             dimensions: 0,
             projection_dimensions: proj_dims,
             method: "none".to_string(),
+            point_limit: MAX_PROJECTION_POINTS,
         }));
     }
 
@@ -816,6 +847,7 @@ pub async fn get_embeddings_projection(
         } else {
             "umap".to_string()
         },
+        point_limit: MAX_PROJECTION_POINTS,
     }))
 }
 
@@ -1901,6 +1933,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), AxumStatus::NOT_FOUND);
+    }
+
+    /// A read that comes back at the limit is reported as truncated; a smaller one is not.
+    #[test]
+    fn a_read_at_the_limit_is_reported_as_truncated_and_a_smaller_one_is_not() {
+        assert!(warn_if_projection_truncated("p", 5, 5));
+        assert!(warn_if_projection_truncated("p", 6, 5));
+        assert!(!warn_if_projection_truncated("p", 4, 5));
+    }
+
+    #[tokio::test]
+    async fn test_embeddings_projection_refuses_any_dimension_but_2_or_3() {
+        let app_state = mock_app_state();
+        let project = seed_projection_project(&app_state).await;
+
+        let state = state_from_app(app_state).await;
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(authed_get(&format!(
+                "/api/projects/{}/embeddings/projection?dimensions=4",
+                project.slug
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::BAD_REQUEST);
+    }
+
+    /// The cap is part of the contract: a client must be able to tell a small project
+    /// from a truncated sample, and a project under the cap must come back WHOLE.
+    #[tokio::test]
+    async fn test_embeddings_projection_announces_its_cap_and_keeps_small_projects_whole() {
+        let app_state = mock_app_state();
+        let project = seed_projection_project(&app_state).await;
+
+        let state = state_from_app(app_state).await;
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(authed_get(&format!(
+                "/api/projects/{}/embeddings/projection",
+                project.slug
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            json["point_limit"].as_u64().unwrap(),
+            MAX_PROJECTION_POINTS as u64,
+            "the response must say which ceiling was applied"
+        );
+        // 5 notes are far below the ceiling: nothing may be dropped.
+        assert_eq!(json["points"].as_array().unwrap().len(), 5);
+    }
+
+    /// The read itself honours `limit` (the Neo4j query carries `LIMIT $limit`; the mock
+    /// mirrors it), including the degenerate 0, and returns everything when the limit
+    /// is larger than the project.
+    #[tokio::test]
+    async fn test_note_embeddings_read_honours_the_limit() {
+        let app_state = mock_app_state();
+        let project = seed_projection_project(&app_state).await; // 5 notes with embeddings
+
+        let neo4j = &app_state.neo4j;
+        assert_eq!(
+            neo4j
+                .get_note_embeddings_for_project(project.id, 3)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            neo4j
+                .get_note_embeddings_for_project(project.id, 0)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            neo4j
+                .get_note_embeddings_for_project(project.id, MAX_PROJECTION_POINTS)
+                .await
+                .unwrap()
+                .len(),
+            5,
+            "a limit above the project size must not drop anything"
+        );
     }
 }
 

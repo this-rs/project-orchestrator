@@ -30,6 +30,7 @@
 #[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
 
+use neo4rs::query;
 use project_orchestrator::chat::provider::cognitive::segment::{
     Boundary, Dimension, Fingerprint, Observation, Segment, SegmentPolicy, Segmenter,
 };
@@ -1978,4 +1979,243 @@ async fn refresh_token_rotation_is_single_use_and_carries_its_user() {
         .await
         .unwrap()
         .is_none());
+}
+
+// ===========================================================================
+// Windowed reads (memory): ask for a window, not for the project
+// ===========================================================================
+
+/// `get_import_edges_among` and `get_file_structural_dna` exist because the multi-layer
+/// graph endpoint used to load EVERY import edge and EVERY DNA vector of the project and
+/// keep only what fell inside the window it had been asked for. The filter now runs in
+/// Cypher, so what comes back is the window itself.
+#[tokio::test]
+async fn the_windowed_reads_only_return_what_is_inside_the_window() {
+    let client = store_or_skip!();
+    let store = &client as &dyn GraphStore;
+
+    let project = a_project();
+    store.create_project(&project).await.unwrap();
+    let root = project.slug.clone();
+
+    let a = format!("{root}/a.rs");
+    let b = format!("{root}/b.rs");
+    let c = format!("{root}/c.rs");
+    for path in [&a, &b, &c] {
+        let file = FileNode {
+            path: path.clone(),
+            language: "rust".to_string(),
+            hash: "h".to_string(),
+            last_parsed: chrono::Utc::now(),
+            project_id: Some(project.id),
+        };
+        store.upsert_file(&file).await.unwrap();
+        store.link_file_to_project(path, project.id).await.unwrap();
+    }
+    store.create_import_relationship(&a, &b, "b").await.unwrap();
+    store.create_import_relationship(&b, &c, "c").await.unwrap();
+
+    // The whole-project read still sees both edges.
+    let all = store.get_project_import_edges(project.id).await.unwrap();
+    assert_eq!(all.len(), 2, "the unfiltered read is unchanged");
+
+    // The window keeps only the edge whose two ends are inside it.
+    let window = vec![a.clone(), b.clone()];
+    let inside = store
+        .get_import_edges_among(project.id, &window)
+        .await
+        .unwrap();
+    assert_eq!(
+        inside,
+        vec![(a.clone(), b.clone())],
+        "b.rs -> c.rs leaves the window"
+    );
+
+    // An empty window reads nothing at all.
+    assert!(store
+        .get_import_edges_among(project.id, &[])
+        .await
+        .unwrap()
+        .is_empty());
+
+    // DNA: written for one file, read back for that file only.
+    store
+        .batch_update_structural_dna(&[project_orchestrator::graph::models::StructuralDnaUpdate {
+            path: a.clone(),
+            dna: vec![0.1, 0.9],
+        }])
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_file_structural_dna(&project.id.to_string(), &a)
+            .await
+            .unwrap(),
+        Some(vec![0.1, 0.9])
+    );
+    assert!(
+        store
+            .get_file_structural_dna(&project.id.to_string(), &c)
+            .await
+            .unwrap()
+            .is_none(),
+        "a file without DNA answers None, not an empty vector"
+    );
+
+    store
+        .delete_project(project.id, &project.name)
+        .await
+        .unwrap();
+}
+
+// ===========================================================================
+// Projections: the call edges among a window, and the note embeddings read
+// ===========================================================================
+
+/// A raw connection for the Cypher the store does not expose: the fixtures below put
+/// rows in the shape the queries read, including the malformed ones the store must skip.
+async fn raw_graph() -> neo4rs::Graph {
+    let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".into());
+    let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
+    let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "orchestrator123".into());
+    neo4rs::Graph::new(&uri, &user, &password)
+        .await
+        .expect("the raw connection opens once the store one did")
+}
+
+/// `get_call_edges_among` keeps only the calls whose two ends are both in the window.
+#[tokio::test]
+async fn the_call_edges_read_is_restricted_to_the_given_functions() {
+    let client = store_or_skip!();
+    let store = &client as &dyn GraphStore;
+    let raw = raw_graph().await;
+
+    let project = a_project();
+    store.create_project(&project).await.unwrap();
+    let root = project.slug.clone();
+    let a = format!("{root}/a.rs");
+    let b = format!("{root}/b.rs");
+    for path in [&a, &b] {
+        let file = FileNode {
+            path: path.clone(),
+            language: "rust".to_string(),
+            hash: "h".to_string(),
+            last_parsed: chrono::Utc::now(),
+            project_id: Some(project.id),
+        };
+        store.upsert_file(&file).await.unwrap();
+        store.link_file_to_project(path, project.id).await.unwrap();
+    }
+
+    // f1 and f3 live in a.rs, f2 in b.rs; both f1 and f3 call f2.
+    let f1 = format!("{a}:f1:1");
+    let f2 = format!("{b}:f2:1");
+    let f3 = format!("{a}:f3:1");
+    raw.run(
+        query(
+            "MATCH (fa:File {path: $a}), (fb:File {path: $b})
+             CREATE (fa)-[:CONTAINS]->(:Function {id: $f1, name: 'f1'})
+             CREATE (fa)-[:CONTAINS]->(:Function {id: $f3, name: 'f3'})
+             CREATE (fb)-[:CONTAINS]->(:Function {id: $f2, name: 'f2'})",
+        )
+        .param("a", a.clone())
+        .param("b", b.clone())
+        .param("f1", f1.clone())
+        .param("f2", f2.clone())
+        .param("f3", f3.clone()),
+    )
+    .await
+    .unwrap();
+    raw.run(
+        query(
+            "MATCH (x:Function {id: $f1}), (y:Function {id: $f2}), (z:Function {id: $f3})
+             CREATE (x)-[:CALLS]->(y)
+             CREATE (z)-[:CALLS]->(y)",
+        )
+        .param("f1", f1.clone())
+        .param("f2", f2.clone())
+        .param("f3", f3.clone()),
+    )
+    .await
+    .unwrap();
+
+    // Both ends inside the window: f1 -> f2 only. f3 -> f2 leaves it.
+    let among = store
+        .get_call_edges_among(project.id, &[f1.clone(), f2.clone()])
+        .await
+        .unwrap();
+    assert_eq!(among, vec![(f1.clone(), f2.clone())]);
+
+    // An empty window reads nothing.
+    assert!(store
+        .get_call_edges_among(project.id, &[])
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// The embedding projection skips the rows it cannot read, instead of failing the whole
+/// read, and honours its limit.
+#[tokio::test]
+async fn the_embedding_projection_skips_unreadable_rows_and_honours_the_limit() {
+    let client = store_or_skip!();
+    let store = &client as &dyn GraphStore;
+    let raw = raw_graph().await;
+
+    let project = a_project();
+    store.create_project(&project).await.unwrap();
+    let pid = project.id.to_string();
+
+    // Two readable notes. Their ids sort FIRST (`a-`): the read is `ORDER BY n.id LIMIT`, and a
+    // page of one must be a readable row, not the corrupt one it skips (ids are random).
+    for _ in 0..2 {
+        raw.run(
+            query(
+                "CREATE (:Note {id: $id, project_id: $p, status: 'active',
+                               embedding: [0.1, 0.2, 0.3], note_type: 'context',
+                               importance: 'medium', energy: 0.5, tags: [],
+                               content: 'healthy'})",
+            )
+            .param("id", format!("a-{}", Uuid::new_v4()))
+            .param("p", pid.clone()),
+        )
+        .await
+        .unwrap();
+    }
+    // An embedding that is a string, not a list of numbers: the row is skipped.
+    raw.run(
+        query(
+            "CREATE (:Note {id: $id, project_id: $p, status: 'active',
+                           embedding: 'not-a-vector', content: 'corrupt vector'})",
+        )
+        .param("id", format!("z-{}", Uuid::new_v4()))
+        .param("p", pid.clone()),
+    )
+    .await
+    .unwrap();
+    // An id stored as an integer, not a string: the row is skipped too. The integer is
+    // random because `Note.id` is unique: a rerun on the same database must not collide.
+    raw.run(
+        query(
+            "CREATE (:Note {id: $id, project_id: $p, status: 'active',
+                           embedding: [0.1, 0.2, 0.3], content: 'corrupt id'})",
+        )
+        .param("id", (Uuid::new_v4().as_u128() % 1_000_000_000) as i64)
+        .param("p", pid.clone()),
+    )
+    .await
+    .unwrap();
+
+    let points = store
+        .get_note_embeddings_for_project(project.id, 10)
+        .await
+        .unwrap();
+    assert_eq!(points.len(), 2, "only the two readable notes come back");
+    assert!(points.iter().all(|p| p.embedding.len() == 3));
+
+    let capped = store
+        .get_note_embeddings_for_project(project.id, 1)
+        .await
+        .unwrap();
+    assert_eq!(capped.len(), 1, "the limit caps the page");
 }

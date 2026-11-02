@@ -3182,38 +3182,168 @@ pub fn compute_context_cards(
 // GraIL algorithms — Missing Link Prediction (Plan 9)
 // ============================================================================
 
+/// Hard cap on the number of candidate pairs materialised by
+/// [`find_distance_2_3_pairs`] / [`suggest_missing_links`].
+///
+/// The candidate set grows as `Σ node deg(node)²`: ONE hub of degree 3 000 produces
+/// 4.5 M pairs on its own (a project's `mod.rs`, a prelude, a registry), and every
+/// candidate used to be turned into a `LinkPrediction` — two `String`s plus five
+/// `(String, f64)` signals, ~400 B — BEFORE the `top_n` truncation. A request that
+/// returns 20 rows could therefore allocate GBs, which is the same failure family as
+/// the `bridge_synapses` OOM (unbounded accumulation, filter applied afterwards).
+/// Bounded at the source, the whole candidate set is a few tens of MB of `(u32, u32)`.
+pub const MAX_CANDIDATE_PAIRS: usize = 500_000;
+
+/// Neighbours of one node expanded when building candidates, at most.
+///
+/// A node above this degree is a hub: its neighbour pairs carry no prediction signal
+/// (Adamic-Adar exists precisely to penalise them) and cost `deg²` candidates.
+/// The lowest-degree neighbours are kept, so the informative paths survive.
+pub const MAX_NEIGHBOURS_EXPANDED: usize = 64;
+
+/// Distance between two nodes of a candidate pair produced by
+/// [`find_distance_2_3_pairs`]: they share a neighbour and are not directly
+/// connected, so the shortest path is always exactly 2 hops — `1 / 2`.
+///
+/// Used instead of a per-pair BFS in the batch path. The single-pair path
+/// ([`link_plausibility`]) still runs its own BFS, and the two agree on every
+/// candidate (see `batch_scoring_matches_the_single_pair_scorer`).
+const CANDIDATE_PROXIMITY: f64 = 0.5;
+
+/// Undirected, sorted, deduplicated adjacency of the whole graph, built once.
+///
+/// The scoring path used to rebuild the neighbour list of both endpoints on EVERY
+/// candidate pair (`neighbors_directed` ×2 + sort + dedup), which dominated the cost.
+fn undirected_adjacency(
+    g: &petgraph::graph::DiGraph<super::models::CodeNode, super::models::CodeEdge>,
+) -> Vec<Vec<NodeIndex>> {
+    let mut adj: Vec<Vec<NodeIndex>> = vec![Vec::new(); g.node_count()];
+    for idx in g.node_indices() {
+        let mut neighbors: Vec<NodeIndex> = g
+            .neighbors_directed(idx, Direction::Outgoing)
+            .chain(g.neighbors_directed(idx, Direction::Incoming))
+            .collect();
+        neighbors.sort();
+        neighbors.dedup();
+        adj[idx.index()] = neighbors;
+    }
+    adj
+}
+
+/// Bounded top-N accumulator, ordered by DESCENDING score.
+///
+/// Why a type and not a `sort` + `truncate`: the callers stream candidates that can
+/// number in the millions (every file of every project for the structural twins), and
+/// building the full list to keep ten rows is what made the endpoint allocate
+/// gigabytes. `offer` keeps at most `top_n` items alive at any time, so memory is
+/// `O(top_n)` and never `O(candidates)`. Ties keep the item seen first.
+pub struct TopScored<T> {
+    top_n: usize,
+    kept: Vec<(f64, T)>,
+}
+
+impl<T> TopScored<T> {
+    pub fn new(top_n: usize) -> Self {
+        // +1 so a full window can hold the challenger while it is positioned.
+        Self {
+            top_n,
+            kept: Vec::with_capacity(top_n.min(64) + 1),
+        }
+    }
+
+    /// Offer a candidate. Returns `true` when it entered the window.
+    pub fn offer(&mut self, score: f64, item: T) -> bool {
+        if self.top_n == 0 {
+            return false;
+        }
+        if self.kept.len() >= self.top_n
+            && self.kept.last().is_some_and(|(worst, _)| score <= *worst)
+        {
+            return false;
+        }
+        let position = self.kept.partition_point(|(kept, _)| *kept >= score);
+        self.kept.insert(position, (score, item));
+        if self.kept.len() > self.top_n {
+            self.kept.pop();
+        }
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.kept.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.kept.is_empty()
+    }
+
+    /// The kept items, best first.
+    pub fn into_items(self) -> Vec<T> {
+        self.kept.into_iter().map(|(_, item)| item).collect()
+    }
+}
+
 /// Find all pairs of nodes at distance exactly 2 (not directly connected).
 ///
-/// Algorithm: for each node, BFS 1-hop → for each neighbor, BFS 1-hop →
-/// collect pairs (node, hop2) where hop2 is NOT directly connected to node.
-/// Deduplicate by storing (min_index, max_index).
+/// Algorithm: for each node, look at the neighbours of its neighbours, keep the nodes
+/// that are NOT directly connected, deduplicate as `(min_index, max_index)`.
 ///
-/// Complexity: O(V × avg_degree²) — for 10K nodes with avg_degree=5 → ~250K pairs.
+/// Bounded by [`MAX_CANDIDATE_PAIRS`] and [`MAX_NEIGHBOURS_EXPANDED`]: the raw sweep
+/// is `O(V × avg_degree²)` and unbounded around hubs — the same shape of bug as the
+/// `bridge_synapses` OOM. The cap is deterministic (nodes in index order), so the same
+/// graph yields the same candidates.
 pub fn find_distance_2_3_pairs(graph: &CodeGraph) -> Vec<(NodeIndex, NodeIndex)> {
-    let g = &graph.graph;
+    find_distance_2_3_pairs_bounded(graph, MAX_CANDIDATE_PAIRS)
+}
+
+/// [`find_distance_2_3_pairs`] with an explicit ceiling on the pair set.
+pub fn find_distance_2_3_pairs_bounded(
+    graph: &CodeGraph,
+    max_pairs: usize,
+) -> Vec<(NodeIndex, NodeIndex)> {
+    if max_pairs == 0 {
+        return Vec::new();
+    }
+    let adj = undirected_adjacency(&graph.graph);
     let mut pairs: HashSet<(usize, usize)> = HashSet::new();
 
-    for node in g.node_indices() {
-        let neighbors: HashSet<NodeIndex> = undirected_neighbors(g, node).into_iter().collect();
+    'nodes: for (node, neighbors) in adj.iter().enumerate() {
+        if neighbors.is_empty() {
+            continue;
+        }
+        // Expand the informative neighbours first: a hub's pairs are noise, and
+        // they are the ones that explode. Deterministic: (degree, index).
+        let expanded: Vec<NodeIndex> = if neighbors.len() > MAX_NEIGHBOURS_EXPANDED {
+            let mut sorted = neighbors.clone();
+            sorted.sort_by_key(|n| (adj[n.index()].len(), n.index()));
+            sorted.truncate(MAX_NEIGHBOURS_EXPANDED);
+            sorted
+        } else {
+            neighbors.clone()
+        };
 
-        // For each neighbor, look at THEIR neighbors (distance 2 from node)
-        for &neighbor in &neighbors {
-            for hop2 in undirected_neighbors(g, neighbor) {
-                // Skip if hop2 is the source node itself
-                if hop2 == node {
+        for &neighbor in &expanded {
+            for &hop2 in &adj[neighbor.index()] {
+                if hop2.index() == node {
                     continue;
                 }
-                // Skip if hop2 is directly connected to node (distance 1, not 2)
-                if neighbors.contains(&hop2) {
+                // Distance 1, not 2: `neighbors` is sorted by index.
+                if neighbors.binary_search(&hop2).is_ok() {
                     continue;
                 }
-                // Deduplicate: store as (min, max) index pair
-                let pair = if node.index() < hop2.index() {
-                    (node.index(), hop2.index())
+                let pair = if node < hop2.index() {
+                    (node, hop2.index())
                 } else {
-                    (hop2.index(), node.index())
+                    (hop2.index(), node)
                 };
                 pairs.insert(pair);
+                if pairs.len() >= max_pairs {
+                    tracing::warn!(
+                        cap = max_pairs,
+                        "missing-link candidate set hit its cap; the remaining pairs are dropped"
+                    );
+                    break 'nodes;
+                }
             }
         }
     }
@@ -3345,17 +3475,131 @@ pub fn link_plausibility(
     }
 }
 
+/// The five signals of one candidate pair, kept compact (two `u32` + four `f64`).
+///
+/// The candidate list used to hold one `LinkPrediction` per pair — two `String`s and a
+/// `Vec<(String, f64)>` of five named signals — so a few million candidates meant GBs
+/// of transient allocation for a `top_n` of 20. Strings and signal names are only
+/// built for the survivors now.
+struct CandidateSignals {
+    source: u32,
+    target: u32,
+    jaccard: f64,
+    co_change: f64,
+    adamic_adar: f64,
+    dna_similarity: f64,
+}
+
+/// Compute the per-pair signals of the batch path from a prebuilt adjacency.
+///
+/// Mirrors [`link_plausibility`] signal for signal, minus the BFS: every candidate is
+/// at distance 2 by construction ([`CANDIDATE_PROXIMITY`]).
+fn candidate_signals(
+    graph: &CodeGraph,
+    adj: &[Vec<NodeIndex>],
+    co_change: &HashMap<(&str, &str), f64>,
+    dna_map: Option<&HashMap<String, Vec<f64>>>,
+    source: NodeIndex,
+    target: NodeIndex,
+) -> CandidateSignals {
+    let g = &graph.graph;
+    let source_neighbors = &adj[source.index()];
+    let target_neighbors = &adj[target.index()];
+
+    // One merge pass over two sorted slices: common neighbours, their count and the
+    // Adamic-Adar sum. No allocation, no repeated `undirected_neighbors`.
+    let mut common_count = 0usize;
+    let mut adamic_adar = 0.0f64;
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < source_neighbors.len() && j < target_neighbors.len() {
+        match source_neighbors[i]
+            .index()
+            .cmp(&target_neighbors[j].index())
+        {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                common_count += 1;
+                let degree = adj[source_neighbors[i].index()].len();
+                if degree > 1 {
+                    adamic_adar += 1.0 / (degree as f64).ln();
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    // An empty union means both nodes are isolated: 0 / 1 = 0, with no branch to miss.
+    let union_count = source_neighbors.len() + target_neighbors.len() - common_count;
+    let jaccard = common_count as f64 / union_count.max(1) as f64;
+
+    let source_id = &g[source].id;
+    let target_id = &g[target].id;
+    let co_change_weight = co_change
+        .get(&(source_id.as_str(), target_id.as_str()))
+        .or_else(|| co_change.get(&(target_id.as_str(), source_id.as_str())))
+        .copied()
+        .unwrap_or(0.0)
+        .min(1.0);
+
+    let dna_similarity = dna_map
+        .and_then(|dm| {
+            let s_dna = dm.get(source_id)?;
+            let t_dna = dm.get(target_id)?;
+            Some(cosine_similarity(s_dna, t_dna))
+        })
+        .unwrap_or(0.0);
+
+    CandidateSignals {
+        source: source.index() as u32,
+        target: target.index() as u32,
+        jaccard,
+        co_change: co_change_weight,
+        adamic_adar,
+        dna_similarity,
+    }
+}
+
+/// Adamic-Adar of one pair, normalized by the batch maximum.
+///
+/// When the batch maximum is 0 every candidate's raw sum is 0 too (each one is a
+/// non-negative term), so the fallback only ever sees 0 in practice; it is kept so
+/// the value never exceeds 1 whatever the caller passes.
+fn normalize_adamic(raw: f64, max_adamic_adar: f64) -> f64 {
+    if max_adamic_adar > 0.0 {
+        raw / max_adamic_adar
+    } else {
+        raw.min(1.0)
+    }
+}
+
+/// Weighted fusion of the five signals, Adamic-Adar normalized across the batch.
+fn fuse_candidate_signals(signals: &CandidateSignals, max_adamic_adar: f64) -> f64 {
+    let adamic_adar = normalize_adamic(signals.adamic_adar, max_adamic_adar);
+    0.25 * signals.jaccard
+        + 0.30 * signals.co_change
+        + 0.15 * CANDIDATE_PROXIMITY
+        + 0.15 * adamic_adar
+        + 0.15 * signals.dna_similarity
+}
+
 /// Suggest the top-N most plausible missing links in the graph.
 ///
 /// Algorithm:
-/// 1. Find all pairs at distance 2 (not directly connected)
-/// 2. Optionally pre-filter by co-change weight > 0 for efficiency
-/// 3. Score each pair with `link_plausibility` (5 signals)
-/// 4. Filter by `min_plausibility`, sort descending, truncate to `top_n`
+/// 1. Find candidate pairs at distance 2 (bounded, not directly connected)
+/// 2. Score each pair with the 5 signals (Jaccard, co-change, proximity,
+///    Adamic-Adar, DNA), Adamic-Adar normalized across the candidate batch
+/// 3. Filter by `min_plausibility`, sort descending, truncate to `top_n`
+///
+/// # Memory
+/// Bounded by [`MAX_CANDIDATE_PAIRS`] × `size_of::<CandidateSignals>()`; the
+/// `LinkPrediction`s (with their strings) are only built for the `top_n` survivors.
+/// The previous version materialised one full `LinkPrediction` per raw candidate
+/// before truncating — the pair set around a single hub could ask for GBs.
 ///
 /// # Performance
-/// O(V × avg_degree²) for candidate finding + O(candidates × avg_degree) for scoring.
-/// For 10K nodes with avg_degree=5: ~250K candidates → ~1s total.
+/// Candidate finding is `O(V × avg_degree²)`, capped; scoring is one allocation-free
+/// merge pass per pair over the prebuilt adjacency.
 pub fn suggest_missing_links(
     graph: &CodeGraph,
     co_change_data: &HashMap<(String, String), f64>,
@@ -3363,80 +3607,70 @@ pub fn suggest_missing_links(
     top_n: usize,
     min_plausibility: f64,
 ) -> Vec<super::models::LinkPrediction> {
-    let candidates = find_distance_2_3_pairs(graph);
-
-    let mut predictions: Vec<super::models::LinkPrediction> = candidates
-        .into_iter()
-        .map(|(s, t)| link_plausibility(graph, s, t, co_change_data, dna_map))
-        .collect();
-
-    // Normalize Adamic-Adar across the batch: find max and scale to [0, 1]
-    let max_adamic_adar = predictions
-        .iter()
-        .filter_map(|p| {
-            p.signals
-                .iter()
-                .find(|(name, _)| name == "adamic_adar")
-                .map(|(_, v)| *v)
-        })
-        .fold(0.0f64, f64::max);
-
-    if max_adamic_adar > 0.0 {
-        for pred in &mut predictions {
-            // Normalize the raw adamic_adar signal
-            if let Some(aa_signal) = pred
-                .signals
-                .iter_mut()
-                .find(|(name, _)| name == "adamic_adar")
-            {
-                let raw = aa_signal.1;
-                let normalized = raw / max_adamic_adar;
-                aa_signal.1 = normalized;
-
-                // Recompute plausibility with normalized adamic_adar
-                let jaccard = pred
-                    .signals
-                    .iter()
-                    .find(|(n, _)| n == "jaccard")
-                    .map(|(_, v)| *v)
-                    .unwrap_or(0.0);
-                let co_change = pred
-                    .signals
-                    .iter()
-                    .find(|(n, _)| n == "co_change")
-                    .map(|(_, v)| *v)
-                    .unwrap_or(0.0);
-                let proximity = pred
-                    .signals
-                    .iter()
-                    .find(|(n, _)| n == "proximity")
-                    .map(|(_, v)| *v)
-                    .unwrap_or(0.0);
-                let dna_sim = pred
-                    .signals
-                    .iter()
-                    .find(|(n, _)| n == "dna_similarity")
-                    .map(|(_, v)| *v)
-                    .unwrap_or(0.0);
-
-                pred.plausibility = 0.25 * jaccard
-                    + 0.30 * co_change
-                    + 0.15 * proximity
-                    + 0.15 * normalized
-                    + 0.15 * dna_sim;
-            }
-        }
+    if top_n == 0 {
+        return Vec::new();
+    }
+    let candidates = find_distance_2_3_pairs_bounded(graph, MAX_CANDIDATE_PAIRS);
+    if candidates.is_empty() {
+        return Vec::new();
     }
 
-    predictions.retain(|p| p.plausibility >= min_plausibility);
+    let adj = undirected_adjacency(&graph.graph);
+    // Borrowed view of the co-change weights: the owned `(String, String)` keys would
+    // force two `String` clones for every candidate lookup.
+    let co_change: HashMap<(&str, &str), f64> = co_change_data
+        .iter()
+        .map(|((a, b), w)| ((a.as_str(), b.as_str()), *w))
+        .collect();
 
-    predictions.sort_by(|a, b| {
-        b.plausibility
-            .partial_cmp(&a.plausibility)
-            .unwrap_or(std::cmp::Ordering::Equal)
+    // Pass 1 — raw signals and the batch max Adamic-Adar (the normalization anchor).
+    let mut raw: Vec<CandidateSignals> = Vec::with_capacity(candidates.len());
+    let mut max_adamic_adar = 0.0f64;
+    for (source, target) in candidates {
+        let signals = candidate_signals(graph, &adj, &co_change, dna_map, source, target);
+        max_adamic_adar = max_adamic_adar.max(signals.adamic_adar);
+        raw.push(signals);
+    }
+
+    // Pass 2 — score, filter, keep the best `top_n` (stable order, bounded memory).
+    let mut scored: Vec<(f64, usize)> = raw
+        .iter()
+        .enumerate()
+        .filter_map(|(index, signals)| {
+            let plausibility = fuse_candidate_signals(signals, max_adamic_adar);
+            (plausibility >= min_plausibility).then_some((plausibility, index))
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| raw[a.1].source.cmp(&raw[b.1].source))
+            .then_with(|| raw[a.1].target.cmp(&raw[b.1].target))
     });
-    predictions.truncate(top_n);
-    predictions
+    scored.truncate(top_n);
+
+    let g = &graph.graph;
+    scored
+        .into_iter()
+        .map(|(plausibility, index)| {
+            let signals = &raw[index];
+            let source = NodeIndex::new(signals.source as usize);
+            let target = NodeIndex::new(signals.target as usize);
+            let adamic_adar = normalize_adamic(signals.adamic_adar, max_adamic_adar);
+            super::models::LinkPrediction {
+                source: g[source].id.clone(),
+                target: g[target].id.clone(),
+                plausibility,
+                signals: vec![
+                    ("jaccard".to_string(), signals.jaccard),
+                    ("co_change".to_string(), signals.co_change),
+                    ("proximity".to_string(), CANDIDATE_PROXIMITY),
+                    ("adamic_adar".to_string(), adamic_adar),
+                    ("dna_similarity".to_string(), signals.dna_similarity),
+                ],
+                suggested_relation: infer_relation_type(graph, source, target),
+            }
+        })
+        .collect()
 }
 
 /// Extract co-change weights from CoChanged edges in the graph.
@@ -6266,6 +6500,160 @@ mod tests {
         );
     }
 
+    /// The candidate set is bounded: a star of `leaves` leaves asks for
+    /// `C(leaves, 2)` distance-2 pairs, which is quadratic by nature. With a cap the
+    /// sweep must stop at the cap instead of materialising the whole product — this is
+    /// the guard that was missing (a hub of degree 3 000 used to build 4.5 M pairs).
+    #[test]
+    fn the_candidate_set_stops_at_its_cap() {
+        let g = make_star_graph(300); // C(300, 2) = 44 850 pairs
+        let all = find_distance_2_3_pairs(&g);
+        assert_eq!(all.len(), 44_850, "small graphs are unaffected by the cap");
+
+        let capped = find_distance_2_3_pairs_bounded(&g, 100);
+        assert_eq!(capped.len(), 100, "the cap is honoured exactly");
+
+        assert!(
+            find_distance_2_3_pairs_bounded(&g, 0).is_empty(),
+            "a zero cap yields no candidate rather than an unbounded sweep"
+        );
+    }
+
+    /// `TopScored` is the bounded replacement for "collect everything, sort, truncate":
+    /// it must keep exactly the best `top_n`, best first, and never more than `top_n`
+    /// alive — the twins endpoint streams every file of every project through it.
+    #[test]
+    fn top_scored_keeps_the_best_n_and_drops_the_rest() {
+        let mut top: TopScored<&str> = TopScored::new(2);
+        assert!(top.offer(0.4, "quatre"));
+        assert!(top.offer(0.9, "neuf"));
+        assert_eq!(top.len(), 2);
+        assert!(top.offer(0.7, "sept"), "0.7 beats the worst kept (0.4)");
+        assert!(!top.offer(0.1, "un"), "0.1 cannot enter a full window");
+        assert_eq!(top.into_items(), vec!["neuf", "sept"]);
+    }
+
+    #[test]
+    fn top_scored_with_a_zero_window_keeps_nothing() {
+        let mut top: TopScored<&str> = TopScored::new(0);
+        assert!(!top.offer(1.0, "x"));
+        assert!(top.is_empty());
+        assert!(top.into_items().is_empty());
+    }
+
+    #[test]
+    fn top_scored_keeps_everything_when_there_are_fewer_candidates_than_the_window() {
+        let mut top: TopScored<u32> = TopScored::new(10);
+        top.offer(0.2, 1);
+        top.offer(0.8, 2);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top.into_items(), vec![2, 1]);
+    }
+
+    #[test]
+    fn top_scored_keeps_the_first_seen_on_a_tie() {
+        let mut top: TopScored<&str> = TopScored::new(1);
+        assert!(top.offer(0.5, "premier"));
+        assert!(!top.offer(0.5, "second"), "a tie does not evict");
+        assert_eq!(top.into_items(), vec!["premier"]);
+    }
+
+    /// The bounded batch scorer must agree with the single-pair scorer it replaced
+    /// ([`link_plausibility`]): same signals, same plausibility, including the
+    /// proximity — a candidate is at distance 2 by construction, so it is `1/2`.
+    #[test]
+    fn batch_scoring_matches_the_single_pair_scorer() {
+        // Diamond (A→B, A→C, B→D, C→D) plus a tail, so the batch has several
+        // candidates with different Jaccard / Adamic-Adar values.
+        let mut g = CodeGraph::new();
+        for id in &["A", "B", "C", "D", "E"] {
+            g.add_node(CodeNode {
+                id: id.to_string(),
+                node_type: CodeNodeType::Function,
+                path: Some(format!("src/{}.rs", id.to_lowercase())),
+                name: id.to_string(),
+                project_id: None,
+            });
+        }
+        g.add_edge("A", "B", CodeEdge::default());
+        g.add_edge("A", "C", CodeEdge::default());
+        g.add_edge("B", "D", CodeEdge::default());
+        g.add_edge("C", "D", CodeEdge::default());
+        g.add_edge("D", "E", CodeEdge::default());
+
+        // (B, C) is a genuine distance-2 candidate: same neighbours A and D, not adjacent.
+        let co_change: HashMap<(String, String), f64> = [(("B".to_string(), "C".to_string()), 0.7)]
+            .into_iter()
+            .collect();
+        let dna: HashMap<String, Vec<f64>> = [
+            ("A".to_string(), vec![1.0, 0.0]),
+            ("B".to_string(), vec![0.9, 0.1]),
+            ("C".to_string(), vec![0.8, 0.2]),
+            ("D".to_string(), vec![0.0, 1.0]),
+            ("E".to_string(), vec![0.1, 0.9]),
+        ]
+        .into_iter()
+        .collect();
+
+        let batch = suggest_missing_links(&g, &co_change, Some(&dna), 100, 0.0);
+        assert!(!batch.is_empty(), "the batch must produce candidates");
+
+        let signal = |prediction: &super::super::models::LinkPrediction, name: &str| {
+            prediction
+                .signals
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, value)| *value)
+                .unwrap_or(f64::NAN)
+        };
+
+        for prediction in &batch {
+            let source = g.id_to_index[&prediction.source];
+            let target = g.id_to_index[&prediction.target];
+            let single = link_plausibility(&g, source, target, &co_change, Some(&dna));
+
+            // Every signal but Adamic-Adar is compared to the single-pair scorer
+            // verbatim; Adamic-Adar is batch-normalized (that is the batch contract).
+            for name in ["jaccard", "co_change", "dna_similarity"] {
+                // Read both values on their own lines: the message is only built on a
+                // failure, and a failing branch no passing run ever reaches is not covered.
+                let batch_value = signal(prediction, name);
+                let single_value = signal(&single, name);
+                assert!(
+                    (single_value - batch_value).abs() < 1e-9,
+                    "{} -> {}, signal {name}: batch {batch_value} vs single {single_value}",
+                    prediction.source,
+                    prediction.target,
+                );
+            }
+
+            let proximity = signal(prediction, "proximity");
+            assert!(
+                (proximity - 0.5).abs() < 1e-12,
+                "a distance-2 candidate scores proximity 1/2, got {proximity}"
+            );
+            assert!(
+                (signal(&single, "proximity") - proximity).abs() < 1e-12,
+                "the single-pair BFS agrees on the proximity of a distance-2 pair"
+            );
+
+            let adamic = signal(prediction, "adamic_adar");
+            assert!(
+                (0.0..=1.0).contains(&adamic),
+                "batch Adamic-Adar is normalized to [0, 1], got {adamic}"
+            );
+            let expected = 0.25 * signal(prediction, "jaccard")
+                + 0.30 * signal(prediction, "co_change")
+                + 0.15 * proximity
+                + 0.15 * adamic
+                + 0.15 * signal(prediction, "dna_similarity");
+            assert!(
+                (expected - prediction.plausibility).abs() < 1e-9,
+                "the reported plausibility must be the fusion of the reported signals"
+            );
+        }
+    }
+
     #[test]
     fn test_extract_co_change_data() {
         let mut g = CodeGraph::new();
@@ -8251,5 +8639,80 @@ mod tests {
             "Normal files should have discriminable risk scores (spread={}), not all crushed to same value",
             risk_spread
         );
+    }
+
+    #[test]
+    fn normalize_adamic_divides_by_the_batch_maximum_and_caps_without_one() {
+        // With a batch maximum, the raw sum is divided by it: the best pair gets 1.
+        assert!((normalize_adamic(0.5, 2.0) - 0.25).abs() < 1e-12);
+        assert!((normalize_adamic(2.0, 2.0) - 1.0).abs() < 1e-12);
+        // Without one (maximum 0, so every raw sum is 0 too) the value is only capped.
+        assert_eq!(normalize_adamic(0.0, 0.0), 0.0);
+        assert!((normalize_adamic(0.7, 0.0) - 0.7).abs() < 1e-12);
+        assert_eq!(normalize_adamic(3.0, 0.0), 1.0);
+    }
+
+    /// A graph whose nodes are added in the order given (so that the index of each id is
+    /// its position in `nodes`), with one `Calls` edge per pair in `edges`.
+    fn small_graph(nodes: &[&str], edges: &[(&str, &str)]) -> CodeGraph {
+        let mut g = CodeGraph::new();
+        for name in nodes {
+            g.add_node(CodeNode {
+                id: name.to_string(),
+                node_type: CodeNodeType::Function,
+                path: None,
+                name: name.to_string(),
+                project_id: None,
+            });
+        }
+        for (from, to) in edges {
+            g.add_edge(
+                from,
+                to,
+                CodeEdge {
+                    edge_type: CodeEdgeType::Calls,
+                    weight: 1.0,
+                },
+            );
+        }
+        g
+    }
+
+    #[test]
+    fn candidate_signals_merges_neighbour_lists_whose_first_entry_is_lower() {
+        // Target B has a neighbour (X, index 0) below the one it shares with the source
+        // (S, index 2): the merge must skip X before it meets S.
+        let g = small_graph(
+            &["X", "Z", "S", "A", "B"],
+            &[("X", "Z"), ("S", "A"), ("S", "B"), ("X", "B")],
+        );
+        let adj = undirected_adjacency(&g.graph);
+        let source = g.id_to_index["A"];
+        let target = g.id_to_index["B"];
+        let co_change: HashMap<(&str, &str), f64> = HashMap::new();
+
+        let sig = candidate_signals(&g, &adj, &co_change, None, source, target);
+
+        // A = {S}, B = {S, X}: one common neighbour out of two distinct ones.
+        assert!((sig.jaccard - 0.5).abs() < 1e-12, "jaccard {}", sig.jaccard);
+        // S has degree 2, so its Adamic-Adar term is 1 / ln(2).
+        let expected = 1.0 / 2f64.ln();
+        assert!(
+            (sig.adamic_adar - expected).abs() < 1e-9,
+            "adamic {}",
+            sig.adamic_adar
+        );
+    }
+
+    #[test]
+    fn suggest_missing_links_is_empty_when_asked_for_none_or_when_nothing_is_a_candidate() {
+        // top_n = 0: nothing to return, whatever the graph.
+        let g = small_graph(&["A", "B", "C"], &[("A", "B"), ("B", "C")]);
+        let co_change: HashMap<(String, String), f64> = HashMap::new();
+        assert!(suggest_missing_links(&g, &co_change, None, 0, 0.0).is_empty());
+
+        // A single edge has no pair at distance 2 or 3: no candidate at all.
+        let single = small_graph(&["P", "Q"], &[("P", "Q")]);
+        assert!(suggest_missing_links(&single, &co_change, None, 10, 0.0).is_empty());
     }
 }

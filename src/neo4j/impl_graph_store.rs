@@ -2602,6 +2602,30 @@ impl AnalyticsStore for Neo4jClient {
         self.get_project_structural_dna(project_id).await
     }
 
+    async fn get_file_structural_dna(
+        &self,
+        project_id: &str,
+        path: &str,
+    ) -> anyhow::Result<Option<Vec<f64>>> {
+        self.get_file_structural_dna(project_id, path).await
+    }
+
+    async fn get_import_edges_among(
+        &self,
+        project_id: uuid::Uuid,
+        paths: &[String],
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        self.get_import_edges_among(project_id, paths).await
+    }
+
+    async fn get_call_edges_among(
+        &self,
+        project_id: uuid::Uuid,
+        ids: &[String],
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        self.get_call_edges_among(project_id, ids).await
+    }
+
     async fn batch_update_structural_fingerprints(
         &self,
         updates: &[crate::graph::models::StructuralFingerprintUpdate],
@@ -2990,8 +3014,10 @@ impl AnalyticsStore for Neo4jClient {
     async fn get_note_embeddings_for_project(
         &self,
         project_id: uuid::Uuid,
+        limit: usize,
     ) -> anyhow::Result<Vec<super::models::NoteEmbeddingPoint>> {
-        self.get_note_embeddings_for_project(project_id).await
+        self.get_note_embeddings_for_project(project_id, limit)
+            .await
     }
 
     // ========================================================================

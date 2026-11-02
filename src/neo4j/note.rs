@@ -2241,13 +2241,18 @@ impl Neo4jClient {
         }
     }
 
-    /// Get all note embeddings for a project in a single batch query.
+    /// Get note embeddings for a project, at most `limit` of them, in a single batch query.
     ///
     /// Returns notes that have embeddings, with their vector, metadata, and a content preview.
     /// Used for UMAP 2D projection in the visualization API.
+    ///
+    /// The page is ordered by note id, not by insertion, so two calls on the same project
+    /// return the same sample. `MATCH ... LIMIT` stops the scan: this is a projection for
+    /// a picture, not an export, and every row carries a full vector.
     pub async fn get_note_embeddings_for_project(
         &self,
         project_id: Uuid,
+        limit: usize,
     ) -> Result<Vec<super::models::NoteEmbeddingPoint>> {
         let q = query(
             r#"
@@ -2261,9 +2266,12 @@ impl Neo4jClient {
                    coalesce(n.energy, 0.5) AS energy,
                    coalesce(n.tags, []) AS tags,
                    left(n.content, 120) AS content_preview
+            ORDER BY n.id
+            LIMIT $limit
             "#,
         )
-        .param("project_id", project_id.to_string());
+        .param("project_id", project_id.to_string())
+        .param("limit", limit as i64);
 
         let mut result = self.graph.execute(q).await?;
         let mut points = Vec::new();
