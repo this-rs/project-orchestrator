@@ -22,9 +22,12 @@
 use crate::neo4j::traits::*;
 
 use argon2::{Algorithm, Argon2, Params, Version};
-use chacha20poly1305::aead::rand_core::RngCore;
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+// `rand` is the process-wide randomness source already used elsewhere in the
+// backend; `aead` 0.6 no longer re-exports `OsRng` of its own (chacha20poly1305
+// 0.11), so key, salt and nonce bytes all come from here.
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -43,7 +46,7 @@ impl SecretKey {
     /// A fresh random key, from the operating system's CSPRNG.
     pub fn generate() -> Self {
         let mut bytes = Zeroizing::new([0u8; KEY_LEN]);
-        OsRng.fill_bytes(bytes.as_mut());
+        rand::rng().fill(bytes.as_mut());
         Self(bytes)
     }
 
@@ -106,7 +109,7 @@ impl KdfParams {
 /// A random salt for a new vault.
 pub fn generate_salt() -> [u8; SALT_LEN] {
     let mut salt = [0u8; SALT_LEN];
-    OsRng.fill_bytes(&mut salt);
+    rand::rng().fill(&mut salt);
     salt
 }
 
@@ -146,7 +149,10 @@ pub fn seal(
     associated_data: &[u8],
 ) -> Result<Sealed, CryptoError> {
     let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    // 24 random bytes: `aead` 0.6 dropped `generate_nonce` (a nonce is just an
+    // array), and with a 24-byte nonce a random one is safe without a counter.
+    let mut nonce = XNonce::default();
+    rand::rng().fill(nonce.as_mut_slice());
     let ciphertext = cipher
         .encrypt(
             &nonce,
@@ -157,7 +163,7 @@ pub fn seal(
         )
         .map_err(|_| CryptoError::Seal)?;
     Ok(Sealed {
-        nonce: hex::encode(nonce),
+        nonce: hex::encode(nonce.as_slice()),
         ciphertext: hex::encode(ciphertext),
     })
 }
@@ -176,9 +182,11 @@ pub fn open(
     }
     let ciphertext = hex::decode(&sealed.ciphertext).map_err(|_| CryptoError::Corrupt)?;
     let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
+    // A stored nonce of the wrong length is corrupt data, not a panic.
+    let nonce = XNonce::try_from(&nonce_bytes[..]).map_err(|_| CryptoError::Corrupt)?;
     let plaintext = cipher
         .decrypt(
-            XNonce::from_slice(&nonce_bytes),
+            &nonce,
             Payload {
                 msg: &ciphertext,
                 aad: associated_data,
