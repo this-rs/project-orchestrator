@@ -110,9 +110,20 @@ async fn execute_admin_action(
                 .get(1)
                 .and_then(|a| a.parse::<f64>().ok())
                 .unwrap_or(0.01);
-            let (decayed, pruned) = store.decay_synapses(decay_amount, prune_threshold).await?;
+            let policy =
+                crate::neurons::forgetting::DecayPolicy::legacy(decay_amount, prune_threshold);
+            let report = store.decay_synapses(&policy).await?;
             Ok(format!(
-                "Decayed {decayed} synapses, pruned {pruned} below threshold"
+                "Decayed {} synapses, {} dormant, {} protected, {} archived below threshold{}",
+                report.decayed,
+                report.dormant,
+                report.protected,
+                report.archived,
+                if report.capped {
+                    " (archive cap reached)"
+                } else {
+                    ""
+                }
             ))
         }
         "list_notes_needing_synapses" | "backfill_synapses" => {
@@ -379,7 +390,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("Decayed"));
-        assert!(result.contains("pruned"));
+        assert!(result.contains("archived"));
     }
 
     #[tokio::test]
