@@ -11184,6 +11184,24 @@ impl ChatManager {
         }
     }
 
+    /// Wakes a session for news from ELSEWHERE that it has to answer — the end of a
+    /// delegation it launched — instead of leaving it idle until a human types again.
+    ///
+    /// On the agent engine the news starts (or waits behind) a turn of the
+    /// `BackgroundOutput` kind: the transcript says why the agent went on by itself, and
+    /// it is not counted as a user message. It is the same path the out-of-turn pump
+    /// takes for what the provider reports (`chat::oob_listener::wake_for_background`).
+    ///
+    /// On the historical engine the news follows [`Self::inject_hint`]: queued behind a
+    /// running turn, a turn of its own when the session is idle.
+    pub async fn wake_with_notification(&self, session_id: &str, content: &str) -> Result<()> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            handle.wake_with_background(content).await?;
+            return Ok(());
+        }
+        self.inject_hint(session_id, content).await
+    }
+
     /// Relay a team message from `from_session_id` into `to_session_id`.
     ///
     /// # Behaviour
