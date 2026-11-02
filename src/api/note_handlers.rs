@@ -1712,12 +1712,14 @@ pub async fn decay_synapses(
     let decay_amount = body.decay_amount.unwrap_or(0.01);
     let prune_threshold = body.prune_threshold.unwrap_or(0.1);
 
-    let (decayed, pruned) = state
+    let policy = crate::neurons::forgetting::DecayPolicy::legacy(decay_amount, prune_threshold);
+    let report = state
         .orchestrator
         .neo4j()
-        .decay_synapses(decay_amount, prune_threshold)
+        .decay_synapses(&policy)
         .await
         .map_err(AppError::Internal)?;
+    let (decayed, pruned) = (report.decayed, report.archived);
 
     // Emit graph events for pruned synapses (batch signal for frontend)
     if pruned > 0 {

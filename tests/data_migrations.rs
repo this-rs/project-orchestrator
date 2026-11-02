@@ -17,6 +17,13 @@ use neo4rs::{query, Graph};
 use project_orchestrator::neo4j::client::Neo4jClient;
 use uuid::Uuid;
 
+/// The forgetting policy these tests exercise: the default one, the same the
+/// heartbeat and the homeostasis use in production (one threshold, one
+/// calendar).
+fn policy() -> project_orchestrator::neurons::forgetting::DecayPolicy {
+    project_orchestrator::neurons::forgetting::DecayPolicy::default()
+}
+
 struct Env {
     client: Neo4jClient,
     raw: Graph,
@@ -565,8 +572,8 @@ async fn test_data_migrations_repair_an_upgraded_install() {
     )
     .await
     .unwrap();
-    let (decayed, _) = client.decay_project_synapses(r, 0.1, 0.05).await.unwrap();
-    assert_eq!(decayed, 1);
+    let report = client.decay_project_synapses(r, &policy()).await.unwrap();
+    assert_eq!(report.decayed, 1);
     let mut w = raw
         .execute(
             query("MATCH (a:Note {project_id: $o})-[s:SYNAPSE]->() RETURN s.weight AS w")
@@ -616,10 +623,12 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         (energy_of(frozen.clone()).await.1 - 0.8).abs() < 1e-9,
         "dormant project: energy frozen"
     );
-    client.decay_synapses(0.1, 0.05).await.unwrap();
+    client.decay_synapses(&policy()).await.unwrap();
+    let dormant_pass = client.decay_project_synapses(d, &policy()).await.unwrap();
     assert_eq!(
-        client.decay_project_synapses(d, 0.1, 0.05).await.unwrap(),
-        (0, 0)
+        (dormant_pass.decayed, dormant_pass.archived),
+        (0, 0),
+        "a dormant project is frozen"
     );
     let mut w = raw
         .execute(
@@ -762,7 +771,7 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         let o = Uuid::new_v4();
         raw.run(
             query(
-                "CREATE (:Note {id: $x, project_id: $h})-[:SYNAPSE {weight: 0.5, source: 'coactivation'}]->(:Note {id: randomUUID(), project_id: $h})
+                "CREATE (:Note {id: $x, project_id: $h})-[:SYNAPSE {weight: 0.5, source: 'coactivation', created_at: datetime() - duration({days: 6})}]->(:Note {id: randomUUID(), project_id: $h})
                  CREATE (:Note {id: randomUUID(), project_id: $o})-[:SYNAPSE {weight: 0.5, source: 'coactivation'}]->(:Note {id: randomUUID(), project_id: $o})
                  CREATE (:Project {id: $h, slug: 'h-' + $h, name: 'h', root_path: '/tmp/h', last_synced: datetime()})
                  CREATE (:Project {id: $o, slug: 'o-' + $o, name: 'o', root_path: '/tmp/o', last_synced: datetime()})",
@@ -794,6 +803,18 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         assert_eq!(client.weaken_node_synapses(x, 0.1, 0.05).await.unwrap(), 1);
         assert!((weight_in(h).await.unwrap() - 0.4).abs() < 1e-9);
         assert_eq!(weight_in(o).await, Some(0.5), "other nodes untouched");
+        // The weight is valid as of its own `decayed_at`: age the edge six
+        // days, so the pass has something to charge for. An edge without a
+        // stamp is only stamped, never decayed.
+        raw.run(
+            query(
+                "MATCH (a:Note {project_id: $h})-[s:SYNAPSE]->()
+                 SET s.decayed_at = datetime() - duration({days: 6})",
+            )
+            .param("h", h.to_string()),
+        )
+        .await
+        .unwrap();
 
         use project_orchestrator::homeostasis::{
             execute_actions, ExecuteContext, HomeostasisAction,
@@ -807,10 +828,7 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         execute_actions(
             &store,
             None,
-            &[HomeostasisAction::DecaySynapses {
-                amount: 0.1,
-                prune_threshold: 0.05,
-            }],
+            &[HomeostasisAction::DecaySynapses],
             ExecuteContext {
                 project_id: Some(h),
                 ..Default::default()
@@ -818,9 +836,16 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         )
         .await
         .unwrap();
+        // The decay is proportional to the edge's age (6 days here, a
+        // coactivation edge, half-life of the default policy), not a fixed
+        // subtraction.
+        let half_life =
+            project_orchestrator::neurons::forgetting::DecayPolicy::default().half_life_days;
+        let expected = 0.4 * 2f64.powf(-6.0 / half_life);
+        let got = weight_in(h).await.unwrap();
         assert!(
-            (weight_in(h).await.unwrap() - 0.3).abs() < 1e-9,
-            "corrected project decayed"
+            (got - expected).abs() < 1e-4,
+            "corrected project decayed proportionally: got {got}, expected {expected}"
         );
         assert_eq!(weight_in(o).await, Some(0.5), "other projects untouched");
     }

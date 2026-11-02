@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read, Seek};
 
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 
 use super::{DocumentFormat, ExtractError, ExtractedText, FormatProbe, TextExtractor};
 use crate::documents::ByteInterval;
@@ -212,11 +212,15 @@ struct Relationship {
     target: String,
 }
 
-fn attr(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
+fn attr(e: &BytesStart<'_>, name: &str) -> Option<String> {
     e.attributes()
         .flatten()
         .find(|a| a.key.local_name().as_ref() == name)
-        .and_then(|a| a.unescape_value().ok().map(|v| v.into_owned()))
+        .and_then(|a| {
+            a.normalized_value(XmlVersion::Implicit1_0)
+                .ok()
+                .map(|v| v.into_owned())
+        })
 }
 
 fn parse_relationships(xml: &str) -> Vec<Relationship> {
@@ -224,11 +228,11 @@ fn parse_relationships(xml: &str) -> Vec<Relationship> {
     let mut out = Vec::new();
     while let Ok(event) = reader.read_event() {
         match event {
-            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"Relationship" => {
-                if let (Some(id), Some(target)) = (attr(&e, b"Id"), attr(&e, b"Target")) {
+            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == "Relationship" => {
+                if let (Some(id), Some(target)) = (attr(&e, "Id"), attr(&e, "Target")) {
                     out.push(Relationship {
                         id,
-                        kind: attr(&e, b"Type").unwrap_or_default(),
+                        kind: attr(&e, "Type").unwrap_or_default(),
                         target,
                     });
                 }
@@ -281,15 +285,19 @@ fn ordered_slide_parts<R: Read + Seek>(
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match e.local_name().as_ref() {
-                b"presentation" => saw_root = true,
-                b"sldId" => {
+                "presentation" => saw_root = true,
+                "sldId" => {
                     // `id` (numeric) and `r:id` (relationship reference) share
                     // a local name; the reference is the prefixed one.
                     let reference = e.attributes().flatten().find_map(|a| {
                         a.key
                             .as_ref()
-                            .ends_with(b":id")
-                            .then(|| a.unescape_value().ok().map(|v| v.into_owned()))
+                            .ends_with(":id")
+                            .then(|| {
+                                a.normalized_value(XmlVersion::Implicit1_0)
+                                    .ok()
+                                    .map(|v| v.into_owned())
+                            })
                             .flatten()
                     });
                     if let Some(rid) = reference {
@@ -402,41 +410,41 @@ fn shape_text(
             Ok(Event::Start(e)) => {
                 depth += 1;
                 match e.local_name().as_ref() {
-                    b"sp" if shape_start.is_none() => {
+                    "sp" if shape_start.is_none() => {
                         shape_start = Some(text.len());
                         placeholder = None;
                     }
-                    b"ph" => placeholder = Some(attr(&e, b"type").unwrap_or_else(|| "obj".into())),
-                    b"fld" => {
+                    "ph" => placeholder = Some(attr(&e, "type").unwrap_or_else(|| "obj".into())),
+                    "fld" => {
                         skip_field =
-                            attr(&e, b"type").is_some_and(|t| t.eq_ignore_ascii_case("slidenum"));
+                            attr(&e, "type").is_some_and(|t| t.eq_ignore_ascii_case("slidenum"));
                     }
-                    b"t" if !skip_field => in_text_node = true,
+                    "t" if !skip_field => in_text_node = true,
                     _ => {}
                 }
             }
             Ok(Event::Empty(e)) => match e.local_name().as_ref() {
-                b"ph" => placeholder = Some(attr(&e, b"type").unwrap_or_else(|| "obj".into())),
-                b"br" => text.push('\n'),
+                "ph" => placeholder = Some(attr(&e, "type").unwrap_or_else(|| "obj".into())),
+                "br" => text.push('\n'),
                 _ => {}
             },
             Ok(Event::End(e)) => {
                 depth = depth.saturating_sub(1);
                 match e.local_name().as_ref() {
-                    b"t" => in_text_node = false,
-                    b"fld" => skip_field = false,
-                    b"p" => text.push('\n'),
+                    "t" => in_text_node = false,
+                    "fld" => skip_field = false,
+                    "p" => text.push('\n'),
                     // Table cell: tab-separated; row: newline. The paragraph
                     // newline the cell already emitted is replaced.
-                    b"tc" => {
+                    "tc" => {
                         trim_trailing(&mut text, '\n');
                         text.push('\t');
                     }
-                    b"tr" => {
+                    "tr" => {
                         trim_trailing(&mut text, '\t');
                         text.push('\n');
                     }
-                    b"sp" => {
+                    "sp" => {
                         if let Some(start) = shape_start.take() {
                             let keep = match (mode, placeholder.as_deref()) {
                                 (Mode::Slide, Some("sldNum" | "ftr" | "dt")) => false,
@@ -453,18 +461,14 @@ fn shape_text(
                     _ => {}
                 }
             }
-            Ok(Event::Text(e)) if in_text_node => match e.decode() {
-                Ok(decoded) => text.push_str(&decoded),
-                Err(err) => {
-                    warnings.push(format!("dropped an unreadable text run in {part}: {err}"))
-                }
-            },
+            // quick-xml 0.42 yields text as `str`; UTF-8 is checked by the reader.
+            Ok(Event::Text(e)) if in_text_node => text.push_str(&e),
             // quick-xml does not resolve entity references; see docx.rs.
             Ok(Event::GeneralRef(e)) if in_text_node => match super::xml::resolve_entity(&e) {
                 Some(resolved) => text.push_str(&resolved),
                 None => warnings.push(format!(
                     "dropped an entity reference this parser cannot resolve in {part}: &{};",
-                    String::from_utf8_lossy(e.as_ref())
+                    &*e
                 )),
             },
             Ok(Event::Eof) => break,

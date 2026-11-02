@@ -4,6 +4,7 @@ use crate::neo4j::traits::*;
 
 use super::client::{Neo4jClient, WhereBuilder, WhereParam};
 use super::models::DecisionNode;
+use crate::neurons::forgetting::{DecayPolicy, PassReport};
 use crate::notes::{
     EntityType, MemoryHorizon, Note, NoteAnchor, NoteChange, NoteFilters, NoteImportance,
     NoteScope, NoteStatus, NoteType, PropagatedNote,
@@ -11,6 +12,12 @@ use crate::notes::{
 use anyhow::{Context, Result};
 use neo4rs::query;
 use uuid::Uuid;
+
+/// How much of a scar heals per forgetting pass.
+///
+/// Twenty times slower than the amount a synapse used to lose per pass
+/// (0.02 × 0.05): the memory of a failure must outlive the links it scarred.
+const SCAR_DECAY_PER_PASS: f64 = 0.02 * 0.05;
 
 /// The `project_id` Cypher parameter of a note write.
 ///
@@ -3030,16 +3037,27 @@ impl Neo4jClient {
             UNWIND $items AS pair
             MATCH (a:Note {id: pair.a}), (b:Note {id: pair.b})
             WHERE a.project_id = $project AND b.project_id = $project AND a.id <> b.id
+            // Same revival as reinforce_synapses: an archived pair comes back
+            // at its weight, never at the 0.5 of a new edge.
+            OPTIONAL MATCH (a)-[f1:FORGOTTEN]->(b)
+            OPTIONAL MATCH (b)-[f2:FORGOTTEN]->(a)
+            WITH pair, a, b, f1, f2,
+                 coalesce(f1.weight, f2.weight, 0.5) AS archived,
+                 [x IN [f1, f2] WHERE x IS NOT NULL] AS stale
+            WITH pair, a, b, stale,
+                 CASE WHEN archived < $revive_floor THEN $revive_floor ELSE archived END AS start
+            FOREACH (x IN stale | DELETE x)
             MERGE (a)-[s1:SYNAPSE]->(b)
-              ON CREATE SET s1.weight = 0.5, s1.created_at = datetime(),
+              ON CREATE SET s1.weight = start, s1.created_at = datetime(),
                 s1.reinforcement_count = 1, s1.source = 'coactivation'
               ON MATCH SET s1.weight = CASE
                   WHEN s1.weight + 0.2 > 1.0 THEN 1.0 ELSE s1.weight + 0.2 END,
                 s1.reinforcement_count = coalesce(s1.reinforcement_count, 0) + 1
-            SET s1.last_reinforced_at = datetime(), s1.rule = $rule,
+            SET s1.last_reinforced_at = datetime(), s1.decayed_at = datetime(),
+                s1.rule = $rule,
                 s1.measure = $measure, s1.at = $at, s1.last_session = $session
             MERGE (b)-[s2:SYNAPSE]->(a)
-              ON CREATE SET s2.weight = 0.5, s2.created_at = datetime(),
+              ON CREATE SET s2.weight = start, s2.created_at = datetime(),
                 s2.reinforcement_count = 1, s2.source = 'coactivation'
               ON MATCH SET s2.weight = CASE
                   WHEN s2.weight + 0.2 > 1.0 THEN 1.0 ELSE s2.weight + 0.2 END,
@@ -3057,7 +3075,11 @@ impl Neo4jClient {
                     .param("session", session.to_string())
                     .param("rule", provenance.rule.clone())
                     .param("measure", provenance.measure.clone())
-                    .param("at", provenance.at.clone()),
+                    .param("at", provenance.at.clone())
+                    .param(
+                        "revive_floor",
+                        crate::neurons::forgetting::DecayPolicy::default().forget_threshold,
+                    ),
             )
             .await?;
         let n: i64 = match result.next().await? {
@@ -3108,8 +3130,18 @@ impl Neo4jClient {
             UNWIND $items AS pair
             MATCH (a:Note {id: pair.a}), (b:Note {id: pair.b})
             WHERE a.project_id IS NOT NULL AND a.project_id <> '' AND a.project_id = b.project_id AND a.id <> b.id
+            // An ARCHIVED edge revives: the pair keeps its history instead of
+            // restarting as a brand-new 0.5, and the archive row goes away.
+            OPTIONAL MATCH (a)-[f1:FORGOTTEN]->(b)
+            OPTIONAL MATCH (b)-[f2:FORGOTTEN]->(a)
+            WITH a, b, f1, f2,
+                 coalesce(f1.weight, f2.weight, 0.5) AS archived,
+                 [x IN [f1, f2] WHERE x IS NOT NULL] AS stale
+            WITH a, b, stale,
+                 CASE WHEN archived < $revive_floor THEN $revive_floor ELSE archived END AS start
+            FOREACH (x IN stale | DELETE x)
             MERGE (a)-[s1:SYNAPSE]->(b)
-              ON CREATE SET s1.weight = 0.5, s1.created_at = datetime(),
+              ON CREATE SET s1.weight = start, s1.created_at = datetime(),
                 s1.last_reinforced_at = datetime(), s1.reinforcement_count = 1,
                 s1.source = 'coactivation'
               ON MATCH SET s1.weight = CASE
@@ -3117,10 +3149,11 @@ impl Neo4jClient {
                   ELSE s1.weight + $boost
               END,
                 s1.last_reinforced_at = datetime(),
+                s1.decayed_at = datetime(),
                 s1.reinforcement_count = coalesce(s1.reinforcement_count, 0) + 1,
                 s1.source = CASE WHEN s1.source IS NULL OR s1.source = 'cosine' THEN 'coactivation' ELSE s1.source END
             MERGE (b)-[s2:SYNAPSE]->(a)
-              ON CREATE SET s2.weight = 0.5, s2.created_at = datetime(),
+              ON CREATE SET s2.weight = start, s2.created_at = datetime(),
                 s2.last_reinforced_at = datetime(), s2.reinforcement_count = 1,
                 s2.source = 'coactivation'
               ON MATCH SET s2.weight = CASE
@@ -3128,6 +3161,7 @@ impl Neo4jClient {
                   ELSE s2.weight + $boost
               END,
                 s2.last_reinforced_at = datetime(),
+                s2.decayed_at = datetime(),
                 s2.reinforcement_count = coalesce(s2.reinforcement_count, 0) + 1,
                 s2.source = CASE WHEN s2.source IS NULL OR s2.source = 'cosine' THEN 'coactivation' ELSE s2.source END
             RETURN count(*) AS reinforced
@@ -3142,7 +3176,11 @@ impl Neo4jClient {
                 .execute(
                     query(cypher)
                         .param("items", chunk.to_vec())
-                        .param("boost", boost),
+                        .param("boost", boost)
+                        .param(
+                            "revive_floor",
+                            crate::neurons::forgetting::DecayPolicy::default().forget_threshold,
+                        ),
                 )
                 .await?;
             if let Some(row) = result.next().await? {
@@ -3228,177 +3266,212 @@ impl Neo4jClient {
         })
     }
 
-    /// Decay and prune the synapses of ONE project's notes.
+    /// One forgetting pass over ONE project's notes.
     ///
-    /// Per-project skill maintenance used to call the global
-    /// [`Self::decay_synapses`], so one maintenance pass over N projects decayed
-    /// every synapse N times (×3 in deep maintenance): the whole SYNAPSE layer
-    /// was wiped, and skill detection — which clusters notes by synapses —
-    /// found nothing and archived live skills as orphans. Same differentiated
-    /// rates as the global decay.
+    /// See [`crate::neurons::forgetting`] for the model. This is the
+    /// project-scoped form of [`Self::decay_synapses`]: per-project maintenance
+    /// used to call the global pass, so one pass over N projects decayed every
+    /// synapse N times (×3 in deep maintenance) and the whole SYNAPSE layer was
+    /// wiped. A dormant project is frozen: its knowledge does not decay.
     pub async fn decay_project_synapses(
         &self,
         project_id: Uuid,
-        decay_amount: f64,
-        prune_threshold: f64,
-    ) -> Result<(usize, usize)> {
+        policy: &DecayPolicy,
+    ) -> Result<PassReport> {
         if self
             .dormant_project_ids()
             .await?
             .contains(&project_id.to_string())
         {
-            return Ok((0, 0));
+            return Ok(PassReport::default());
         }
-        let mut result = self
-            .graph
-            .execute(
-                query(
-                    r#"
-                    MATCH (a:Note {project_id: $project_id})-[s:SYNAPSE]->()
-                    SET s.weight = s.weight - CASE
-                        WHEN s.source = 'coactivation' THEN $decay_amount
-                        ELSE $decay_amount_cosine
-                    END
-                    RETURN count(s) AS decayed
-                    "#,
-                )
-                .param("project_id", project_id.to_string())
-                .param("decay_amount", decay_amount)
-                .param("decay_amount_cosine", decay_amount * 2.0),
-            )
-            .await?;
-        let decayed = match result.next().await? {
-            Some(row) => row.get::<i64>("decayed").unwrap_or(0) as usize,
-            None => 0,
-        };
-
-        let mut result = self
-            .graph
-            .execute(
-                query(
-                    r#"
-                    MATCH (a:Note {project_id: $project_id})-[s:SYNAPSE]->()
-                    WHERE s.weight < $threshold
-                    WITH collect(s) AS weak
-                    FOREACH (x IN weak | DELETE x)
-                    RETURN size(weak) AS pruned
-                    "#,
-                )
-                .param("project_id", project_id.to_string())
-                .param("threshold", prune_threshold),
-            )
-            .await?;
-        let pruned = match result.next().await? {
-            Some(row) => row.get::<i64>("pruned").unwrap_or(0) as usize,
-            None => 0,
-        };
-        Ok((decayed, pruned))
+        let dormant = self.dormant_project_ids().await?;
+        self.forgetting_pass(policy, Some(project_id.to_string()), dormant)
+            .await
     }
 
-    /// Decay all synapses and prune weak ones.
+    /// One forgetting pass over every synapse of the graph.
     ///
-    /// Applies differentiated decay based on synapse source:
-    /// - `coactivation` synapses (validated by real usage) decay at `decay_amount`
-    /// - `cosine` synapses (statistical seed) decay at `2 × decay_amount`
-    /// - Synapses without a source tag decay at `2 × decay_amount` (legacy, treated as cosine)
-    pub async fn decay_synapses(
-        &self,
-        decay_amount: f64,
-        prune_threshold: f64,
-    ) -> Result<(usize, usize)> {
-        // Step 1: Decay all synapses with differentiated rates
-        // Coactivation synapses (validated by usage) decay slower
-        // Synapses of dormant projects are frozen (see dormant_project_ids).
+    /// The weight after the pass is `w · 2^(−Δt / h)`, with `Δt` read on the
+    /// edge itself (`coalesce(last_reinforced_at, created_at)`): the SAME result
+    /// whether the caller runs once over six hours or twice over three, and a
+    /// downtime is caught up instead of suspending forgetting.
+    ///
+    /// An edge reinforced [`DecayPolicy::protected_after`] times never falls
+    /// below [`DecayPolicy::protection_floor`]. An edge that may be forgotten is
+    /// ARCHIVED as `:FORGOTTEN` — with its weight, provenance, counters and the
+    /// date — never destroyed: `reinforce_synapses` revives it at the weight it
+    /// had. One pass archives at most [`DecayPolicy::archive_cap`] edges and
+    /// never takes a node below [`DecayPolicy::min_degree`].
+    pub async fn decay_synapses(&self, policy: &DecayPolicy) -> Result<PassReport> {
         let dormant = self.dormant_project_ids().await?;
-        let decay_q = query(
+        self.forgetting_pass(policy, None, dormant).await
+    }
+
+    /// The pass itself. `scope` is `Some(project)` for a project pass, `None`
+    /// for the global one, which freezes the dormant projects.
+    async fn forgetting_pass(
+        &self,
+        policy: &DecayPolicy,
+        scope: Option<String>,
+        dormant: Vec<String>,
+    ) -> Result<PassReport> {
+        // The scope guard, spliced into both queries. A project pass walks only
+        // its own notes; the global pass walks everything except the dormant
+        // projects.
+        let guard = if scope.is_some() {
+            "AND a.project_id = $scope"
+        } else {
+            "AND (a.project_id IS NULL OR NOT a.project_id IN $dormant)"
+        };
+
+        // ---- 1. Proportional decay -------------------------------------
+        // Elapsed time, not a number of passes. `h` depends on the provenance:
+        // a co-activation edge (validated by use) halves slower than a
+        // similarity edge (created by the backfill, never reinforced).
+        let decay_q = format!(
             r#"
             MATCH (a)-[s:SYNAPSE]->()
-            WHERE a.project_id IS NULL OR NOT a.project_id IN $dormant
-            SET s.weight = s.weight - CASE
-                WHEN s.source = 'coactivation' THEN $decay_amount
-                ELSE $decay_amount_cosine
+            WHERE true {guard}
+            WITH s,
+                 coalesce(s.reinforcement_count, 0) AS rc,
+                 CASE WHEN s.source = 'coactivation' THEN $half_life_coactivation
+                      ELSE $half_life_similarity END AS h,
+                 // The stored weight is valid AS OF its own `decayed_at`: the
+                 // elapsed time is what happened since, never since creation.
+                 // An edge that never carried one is stamped now, not decayed:
+                 // the legacy pass already charged for its age, and charging it
+                 // a second time is what archived 928 edges in one pass on the
+                 // restored copy (measured 02/11/2026).
+                 duration.inSeconds(
+                     coalesce(s.decayed_at, datetime()),
+                     datetime()
+                 ).seconds AS elapsed
+            WITH s, rc, h,
+                 CASE WHEN elapsed < 0 THEN 0 ELSE elapsed END AS elapsed
+            WITH s, rc,
+                 s.weight * (2 ^ (-(toFloat(elapsed)) / (h * 86400.0))) AS raw
+            WITH s, rc,
+                 CASE WHEN rc >= $protected_after AND raw < $protection_floor
+                      THEN $protection_floor ELSE raw END AS w
+            SET s.weight = w, s.decayed_at = datetime()
+            RETURN count(s) AS decayed,
+                   sum(CASE WHEN w < $dormancy THEN 1 ELSE 0 END) AS dormant,
+                   sum(CASE WHEN rc >= $protected_after THEN 1 ELSE 0 END) AS protected
+            "#,
+            guard = guard
+        );
+        let mut result = self
+            .graph
+            .execute(
+                query(&decay_q)
+                    .param("scope", scope.clone())
+                    .param("dormant", dormant.clone())
+                    .param("half_life_coactivation", policy.half_life_days)
+                    .param("half_life_similarity", policy.similarity_half_life_days)
+                    .param("protected_after", policy.protected_after as i64)
+                    .param("protection_floor", policy.protection_floor)
+                    .param("dormancy", policy.dormancy_threshold),
+            )
+            .await?;
+        let mut report = match result.next().await? {
+            Some(row) => PassReport::new(
+                row.get::<i64>("decayed").unwrap_or(0) as usize,
+                row.get::<i64>("dormant").unwrap_or(0) as usize,
+                row.get::<i64>("protected").unwrap_or(0) as usize,
+            ),
+            None => PassReport::default(),
+        };
+
+        // ---- 2. Archive, never destroy ---------------------------------
+        // Three conditions, all required: below the forget threshold, never
+        // proven by use, untouched for `forget_after_days`. Two floors: a node
+        // keeps at least `min_degree` edges, and one pass archives at most
+        // `archive_cap` edges, so a single pass can never empty a graph.
+        let cap = policy.archive_cap(report.decayed);
+        let archive_q = format!(
+            r#"
+            MATCH (a)-[s:SYNAPSE]->(b)
+            WHERE true {guard}
+              AND s.weight < $forget_threshold
+              AND coalesce(s.reinforcement_count, 0) < $protected_after
+              AND coalesce(s.last_reinforced_at, s.created_at)
+                  < datetime() - duration({{days: $forget_after_days}})
+              AND COUNT {{ (a)-[:SYNAPSE]->() }} > $min_degree
+              AND COUNT {{ (b)-[:SYNAPSE]->() }} > $min_degree
+            WITH a, b, s
+            LIMIT $cap
+            CREATE (a)-[f:FORGOTTEN]->(b)
+            SET f += properties(s),
+                f.forgotten_at = datetime(),
+                f.forgotten_reason = 'decay'
+            DELETE s
+            RETURN count(f) AS archived
+            "#,
+            guard = guard
+        );
+        let mut result = self
+            .graph
+            .execute(
+                query(&archive_q)
+                    .param("scope", scope)
+                    .param("dormant", dormant)
+                    .param("forget_threshold", policy.forget_threshold)
+                    .param("protected_after", policy.protected_after as i64)
+                    .param("forget_after_days", policy.forget_after_days)
+                    .param("min_degree", policy.min_degree as i64)
+                    .param("cap", cap as i64),
+            )
+            .await?;
+        report.archived = match result.next().await? {
+            Some(row) => row.get::<i64>("archived").unwrap_or(0) as usize,
+            None => 0,
+        };
+        // Reaching the cap means the pass stopped early: what is left is for
+        // the next one, and the caller must see it rather than believe the
+        // graph is clean.
+        report.capped = report.archived >= cap && report.archived > 0;
+
+        tracing::debug!(
+            decayed = report.decayed,
+            dormant = report.dormant,
+            protected = report.protected,
+            archived = report.archived,
+            capped = report.capped,
+            "forgetting pass"
+        );
+
+        // ---- 3. Decay knowledge scars (20x slower than synapse decay) ---
+        // Biomimicry: Elun Scar — scars heal very slowly, allowing the system
+        // to remember failures.
+        let scar_decay_rate = SCAR_DECAY_PER_PASS;
+        let scar_decay_q = query(
+            r#"
+            MATCH (n)
+            WHERE n.scar_intensity IS NOT NULL AND n.scar_intensity > 0
+            AND (n:Note OR n:Decision)
+            SET n.scar_intensity = CASE
+                WHEN n.scar_intensity - $scar_decay < 0.001 THEN 0.0
+                ELSE n.scar_intensity - $scar_decay
             END
-            RETURN count(s) AS decayed
+            RETURN count(n) AS healed
             "#,
         )
-        .param("dormant", dormant.clone())
-        .param("decay_amount", decay_amount)
-        .param("decay_amount_cosine", decay_amount * 2.0);
-
-        let mut result = self.graph.execute(decay_q).await?;
-        let decayed = if let Some(row) = result.next().await? {
-            row.get::<i64>("decayed").unwrap_or(0) as usize
-        } else {
-            0
-        };
-
-        // Step 2: Prune weak synapses (2-step: count first, then delete)
-        // NOTE: Neo4j RETURN count() after DELETE always returns 0,
-        // so we must count before deleting.
-        let count_q = query(
-            r#"
-            MATCH (a)-[s:SYNAPSE]->()
-            WHERE s.weight < $threshold
-              AND (a.project_id IS NULL OR NOT a.project_id IN $dormant)
-            RETURN count(s) AS pruned
-            "#,
-        )
-        .param("dormant", dormant.clone())
-        .param("threshold", prune_threshold);
-
-        let mut result = self.graph.execute(count_q).await?;
-        let pruned = if let Some(row) = result.next().await? {
-            row.get::<i64>("pruned").unwrap_or(0) as usize
-        } else {
-            0
-        };
-
-        if pruned > 0 {
-            let delete_q = query(
-                r#"
-                MATCH (a)-[s:SYNAPSE]->()
-                WHERE s.weight < $threshold
-                  AND (a.project_id IS NULL OR NOT a.project_id IN $dormant)
-                DELETE s
-                "#,
-            )
-            .param("dormant", dormant.clone())
-            .param("threshold", prune_threshold);
-            self.graph.run(delete_q).await?;
-        }
-
-        // Step 3: Decay knowledge scars (20x slower than synapse decay)
-        // Biomimicry: Elun Scar — scars heal very slowly, allowing the system to remember failures
-        let scar_decay_rate = decay_amount * 0.05; // 1/20th of synapse decay
-        if scar_decay_rate > 0.0 {
-            let scar_decay_q = query(
-                r#"
-                MATCH (n)
-                WHERE n.scar_intensity IS NOT NULL AND n.scar_intensity > 0
-                AND (n:Note OR n:Decision)
-                SET n.scar_intensity = CASE
-                    WHEN n.scar_intensity - $scar_decay < 0.001 THEN 0.0
-                    ELSE n.scar_intensity - $scar_decay
-                END
-                RETURN count(n) AS healed
-                "#,
-            )
-            .param("scar_decay", scar_decay_rate);
-            if let Ok(mut result) = self.graph.execute(scar_decay_q).await {
-                if let Ok(Some(row)) = result.next().await {
-                    let healed: i64 = row.get("healed").unwrap_or(0);
-                    if healed > 0 {
-                        tracing::debug!(
-                            "Decayed scars on {} nodes (rate: {:.4})",
-                            healed,
-                            scar_decay_rate
-                        );
-                    }
+        .param("scar_decay", scar_decay_rate);
+        if let Ok(mut result) = self.graph.execute(scar_decay_q).await {
+            if let Ok(Some(row)) = result.next().await {
+                let healed: i64 = row.get("healed").unwrap_or(0);
+                if healed > 0 {
+                    tracing::debug!(
+                        "Decayed scars on {} nodes (rate: {:.4})",
+                        healed,
+                        scar_decay_rate
+                    );
                 }
             }
         }
 
-        Ok((decayed, pruned))
+        Ok(report)
     }
 
     /// Apply scars to nodes traversed during a failed reasoning path.

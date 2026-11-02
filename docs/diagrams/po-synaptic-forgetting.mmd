@@ -1,0 +1,72 @@
+%% name: po-synaptic-forgetting
+%% covers: backend:src/neurons/forgetting.rs
+%% verified: 2bd49022
+%% ---
+%% PROUVE : l'oubli synaptique, tel que le code le fait sur la branche feat/forgetting-proportional
+%%   (PR #1081, base 2bd49022) : la décroissance se compte en TEMPS écoulé et non en passages,
+%%   la preuve d'usage protège une arête, et une arête oubliée est ARCHIVÉE (:FORGOTTEN) —
+%%   jamais détruite — puis ranimée à son poids par le renfort qui la retrouve.
+%% ---
+%% MESURE AYANT MOTIVE LE CHANGEMENT (prod, 01/11/2026, lecture seule) :
+%%   59 254 SYNAPSE (44 013 cosine dont 43 997 jamais renforcées), 2 092 arêtes dans [0.05, 0.15),
+%%   23 projets sur 48 au-dessus du seuil de densité 3.0, 1 351 arêtes supprimables au prochain
+%%   passage d'homéostasie, projet le plus dense : 23 notes pour 1 828 arêtes (ratio 79).
+%% ---
+%% SOURCES LUES :
+%%   src/neurons/forgetting.rs              — DecayPolicy, half_life_for, decayed, protected,
+%%                                            is_forgettable, archive_cap, PassReport, legacy()
+%%   src/neo4j/note.rs                      — forgetting_pass : Cypher de décroissance et d'archivage
+%%   src/neo4j/traits.rs                    — decay_synapses / decay_project_synapses prennent la politique
+%%   src/neo4j/impl_graph_store.rs, mock.rs — les deux implémentations
+%%   appelants : src/heartbeat/checks/synapse_decay.rs (6 h), src/homeostasis.rs (quand la densité
+%%               dépasse 3.0), src/skills/maintenance.rs, src/protocol/executor/system.rs,
+%%               src/api/note_handlers.rs (POST /api/notes/neurons/decay)
+%% ---
+%% NON ETABLI :
+%%   la passe complète n'a pas encore été exécutée sur la copie restaurée avec un binaire release ;
+%%   la Cypher, elle, tourne : tests/data_migrations.rs passe contre un Neo4j 5.26 + APOC jetable
+%%   (décroissance, archivage, degré minimal) ;
+%%   le plafond du backfill (cause du ratio 79) est hors périmètre : une PR séparée ;
+%%   le seuil de densité 3.0 reste le déclencheur de l'homéostasie ; il ne décide plus du montant.
+%% ---
+%% LEGENDE
+%%   ✅ vérifié (le nœud dit par quel test)  🟠 écrit, sans test  ⚪ autre domaine
+
+flowchart TD
+    subgraph legend["Légende"]
+        direction LR
+        L1["✅ vérifié par test"]
+        L2["🟠 écrit, sans test"]
+        L3["⚪ autre domaine"]
+    end
+
+    HB["⚪ SynapseDecayCheck — toutes les 6 h, tout le graphe (projets dormants gelés)"]
+    HO["⚪ HomeostasisController — quand synapses/notes &gt; 3.0, projet seul :<br/>elle décide QUAND, plus COMBIEN (DecaySynapses n'a plus de champ)"]
+    API["⚪ POST /api/notes/neurons/decay, admin decay_synapses<br/>DecayPolicy::legacy(amount, threshold) : les deux nombres<br/>deviennent le calendrier et le seuil"]
+    POL["✅ DecayPolicy::default — un seul seuil<br/>dormancy 0.15, oubli 0.02, oubli après 14 j sans contact,<br/>protection dès 3 renforts, plancher 0.15, degré minimal 3, plafond 5 %<br/>test : the_thresholds_are_ordered_and_single"]
+
+    DEC["✅ w · 2^(−Δt / h), Δt = now − coalesce(last_reinforced_at, created_at)<br/>h : renfort 2.11 j (10.9 j pour atteindre l'oubli), similarité 2× plus vite<br/>test : two_short_passes_forget_exactly_as_one_long_pass,<br/>a_downtime_is_caught_up_by_the_next_pass, a_used_edge_forgets_on_the_legacy_calendar"]
+    PRO["✅ plancher de protection : renforcée ≥ 3 fois → jamais sous 0.15<br/>test : a_proven_edge_never_become_dormant_nor_forgettable"]
+    DOR["🟠 dormante : sous 0.15, conservée, plus traversée"]
+
+    FOR{"✅ oubliable ? poids &lt; 0.02 ET non prouvée ET sans contact depuis 14 j<br/>test : an_abandoned_weak_edge_is_forgettable,<br/>a_fresh_edge_is_not_forgettable, an_edge_of_unknown_age_is_never_forgotten"}
+    DEG{"✅ degré des DEUX bouts &gt; 3 ? (une note garde ses 3 plus fortes arêtes)<br/>test : a_pass_never_orphans_a_node"}
+    CAP["✅ plafond : 5 % des arêtes parcourues par passe<br/>test : one_pass_cannot_empty_the_graph"]
+    ARC["✅ CREATE (:FORGOTTEN) puis DELETE : source, poids, created_at,<br/>reinforcement_count, forgotten_at, forgotten_reason<br/>test : an_abandoned_edge_is_archived_never_destroyed"]
+    REV["✅ renfort sur une paire archivée → ranimée À SON POIDS, jamais 0.5<br/>test : a_reinforced_archived_edge_comes_back_at_its_own_weight"]
+    REP["✅ PassReport journalisé : décrochues, dormantes, protégées, archivées,<br/>plafond atteint — la perte devient un chiffre lisible"]
+
+    HB --> POL
+    HO --> POL
+    API --> POL
+    POL --> DEC
+    DEC --> PRO
+    DEC --> DOR
+    DEC --> FOR
+    FOR -->|oui| DEG
+    FOR -->|non| DOR
+    DEG -->|oui| CAP
+    DEG -->|non| DOR
+    CAP --> ARC
+    ARC --> REP
+    REV -. ranime .-> DEC

@@ -2118,17 +2118,16 @@ pub trait AnalyticsStore: Send + Sync {
     /// Returns the number of synapses reinforced (created + updated).
     async fn reinforce_synapses(&self, note_ids: &[Uuid], boost: f64) -> Result<usize>;
 
-    /// Apply decay to all synapses and prune weak ones.
+    /// One forgetting pass over every synapse of the graph.
     ///
-    /// 1. Subtract `decay_amount` from every synapse weight
-    /// 2. Delete synapses where weight < `prune_threshold`
-    ///
-    /// Returns (decayed_count, pruned_count).
+    /// The model lives in [`crate::neurons::forgetting`]: proportional to the
+    /// ELAPSED TIME (never to the number of passes), protected by the edge's
+    /// own reinforcement count, and archived as `:FORGOTTEN` instead of being
+    /// deleted. See [`crate::neurons::forgetting::DecayPolicy`].
     async fn decay_synapses(
         &self,
-        decay_amount: f64,
-        prune_threshold: f64,
-    ) -> Result<(usize, usize)>;
+        policy: &crate::neurons::forgetting::DecayPolicy,
+    ) -> Result<crate::neurons::forgetting::PassReport>;
 
     // ------------------------------------------------------------------
     // Synaptic layer in shadow mode (`crate::neurons::synaptic_shadow`).
@@ -2523,17 +2522,16 @@ pub trait AnalyticsStore: Send + Sync {
         Ok((0, 0))
     }
 
-    /// Decay and prune the synapses of one project's notes (see the Neo4j
+    /// One forgetting pass over ONE project's notes (see the Neo4j
     /// implementation). Per-project maintenance MUST use this rather than the
     /// global `decay_synapses`. Defaults to the global decay for stores
     /// without a project-scoped variant (test mocks).
     async fn decay_project_synapses(
         &self,
         _project_id: Uuid,
-        decay_amount: f64,
-        prune_threshold: f64,
-    ) -> Result<(usize, usize)> {
-        self.decay_synapses(decay_amount, prune_threshold).await
+        policy: &crate::neurons::forgetting::DecayPolicy,
+    ) -> Result<crate::neurons::forgetting::PassReport> {
+        self.decay_synapses(policy).await
     }
 
     /// Weaken one node's synapses (see the Neo4j implementation). Defaults to

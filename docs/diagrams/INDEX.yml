@@ -392,6 +392,12 @@ diagrams:
     covers:
       - "backend:src/graph/{rules,schema,self_model_tests}.rs"
       - "backend:src/neo4j/graph_schema.rs"
+  - name: po-synaptic-forgetting
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-synaptic-forgetting.mmd
+    covers:
+      - "backend:src/neurons/forgetting.rs"
   - name: po-synaptic-shadow
     owner: theotime
     status: verified

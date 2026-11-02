@@ -2354,10 +2354,9 @@ impl AnalyticsStore for Neo4jClient {
 
     async fn decay_synapses(
         &self,
-        decay_amount: f64,
-        prune_threshold: f64,
-    ) -> anyhow::Result<(usize, usize)> {
-        self.decay_synapses(decay_amount, prune_threshold).await
+        policy: &crate::neurons::forgetting::DecayPolicy,
+    ) -> anyhow::Result<crate::neurons::forgetting::PassReport> {
+        self.decay_synapses(policy).await
     }
 
     async fn shadow_synapse_edges(
@@ -2923,11 +2922,9 @@ impl AnalyticsStore for Neo4jClient {
     async fn decay_project_synapses(
         &self,
         project_id: uuid::Uuid,
-        decay_amount: f64,
-        prune_threshold: f64,
-    ) -> anyhow::Result<(usize, usize)> {
-        self.decay_project_synapses(project_id, decay_amount, prune_threshold)
-            .await
+        policy: &crate::neurons::forgetting::DecayPolicy,
+    ) -> anyhow::Result<crate::neurons::forgetting::PassReport> {
+        self.decay_project_synapses(project_id, policy).await
     }
 
     async fn run_data_migrations(&self) -> Vec<crate::neo4j::data_migrations::MigrationOutcome> {
