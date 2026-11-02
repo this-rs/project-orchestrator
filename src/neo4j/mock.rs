@@ -12877,7 +12877,11 @@ impl AnalyticsStore for MockGraphStore {
                 // archived: forgetting is a sleep, never a loss.
                 let key = if a < b { (a, b) } else { (b, a) };
                 let revived = self.forgotten_synapses.write().await.remove(&key);
-                let start = revived.unwrap_or(0.5);
+                // Same rule as the Cypher: revive AT the archived weight, but
+                // never under the forget threshold 2014 a revived edge must not
+                // be born already forgettable.
+                let floor = crate::neurons::forgetting::DecayPolicy::default().forget_threshold;
+                let start = revived.map(|w| w.max(floor)).unwrap_or(0.5);
                 let entry_a = synapses.entry(a).or_default();
                 if let Some(syn) = entry_a.iter_mut().find(|(id, _)| *id == b) {
                     syn.1 = (syn.1 + boost).min(1.0);

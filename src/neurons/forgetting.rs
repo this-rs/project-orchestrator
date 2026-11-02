@@ -571,9 +571,12 @@ mod pass {
         store.reinforce_synapses(&[a, b], 0.0).await.unwrap();
 
         let w = weight(&store, a, b).await;
+        // The archived weight is under the forget threshold by construction:
+        // the edge comes back right at the threshold, never dead.
+        let expected = archived.max(policy.forget_threshold);
         assert!(
-            (w - archived).abs() < 1e-12,
-            "revived at the weight it had when it slept ({archived}), got {w}"
+            (w - expected).abs() < 1e-12,
+            "revived at {expected} (archived {archived}), got {w}"
         );
         assert!(w < 0.5, "never the 0.5 of a brand-new edge: {w}");
     }

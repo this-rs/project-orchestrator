@@ -3037,8 +3037,18 @@ impl Neo4jClient {
             UNWIND $items AS pair
             MATCH (a:Note {id: pair.a}), (b:Note {id: pair.b})
             WHERE a.project_id = $project AND b.project_id = $project AND a.id <> b.id
+            // Same revival as reinforce_synapses: an archived pair comes back
+            // at its weight, never at the 0.5 of a new edge.
+            OPTIONAL MATCH (a)-[f1:FORGOTTEN]->(b)
+            OPTIONAL MATCH (b)-[f2:FORGOTTEN]->(a)
+            WITH pair, a, b, f1, f2,
+                 coalesce(f1.weight, f2.weight, 0.5) AS archived,
+                 [x IN [f1, f2] WHERE x IS NOT NULL] AS stale
+            WITH pair, a, b, stale,
+                 CASE WHEN archived < $revive_floor THEN $revive_floor ELSE archived END AS start
+            FOREACH (x IN stale | DELETE x)
             MERGE (a)-[s1:SYNAPSE]->(b)
-              ON CREATE SET s1.weight = 0.5, s1.created_at = datetime(),
+              ON CREATE SET s1.weight = start, s1.created_at = datetime(),
                 s1.reinforcement_count = 1, s1.source = 'coactivation'
               ON MATCH SET s1.weight = CASE
                   WHEN s1.weight + 0.2 > 1.0 THEN 1.0 ELSE s1.weight + 0.2 END,
@@ -3047,7 +3057,7 @@ impl Neo4jClient {
                 s1.rule = $rule,
                 s1.measure = $measure, s1.at = $at, s1.last_session = $session
             MERGE (b)-[s2:SYNAPSE]->(a)
-              ON CREATE SET s2.weight = 0.5, s2.created_at = datetime(),
+              ON CREATE SET s2.weight = start, s2.created_at = datetime(),
                 s2.reinforcement_count = 1, s2.source = 'coactivation'
               ON MATCH SET s2.weight = CASE
                   WHEN s2.weight + 0.2 > 1.0 THEN 1.0 ELSE s2.weight + 0.2 END,
@@ -3065,7 +3075,11 @@ impl Neo4jClient {
                     .param("session", session.to_string())
                     .param("rule", provenance.rule.clone())
                     .param("measure", provenance.measure.clone())
-                    .param("at", provenance.at.clone()),
+                    .param("at", provenance.at.clone())
+                    .param(
+                        "revive_floor",
+                        crate::neurons::forgetting::DecayPolicy::default().forget_threshold,
+                    ),
             )
             .await?;
         let n: i64 = match result.next().await? {
@@ -3116,8 +3130,18 @@ impl Neo4jClient {
             UNWIND $items AS pair
             MATCH (a:Note {id: pair.a}), (b:Note {id: pair.b})
             WHERE a.project_id IS NOT NULL AND a.project_id <> '' AND a.project_id = b.project_id AND a.id <> b.id
+            // An ARCHIVED edge revives: the pair keeps its history instead of
+            // restarting as a brand-new 0.5, and the archive row goes away.
+            OPTIONAL MATCH (a)-[f1:FORGOTTEN]->(b)
+            OPTIONAL MATCH (b)-[f2:FORGOTTEN]->(a)
+            WITH a, b, f1, f2,
+                 coalesce(f1.weight, f2.weight, 0.5) AS archived,
+                 [x IN [f1, f2] WHERE x IS NOT NULL] AS stale
+            WITH a, b, stale,
+                 CASE WHEN archived < $revive_floor THEN $revive_floor ELSE archived END AS start
+            FOREACH (x IN stale | DELETE x)
             MERGE (a)-[s1:SYNAPSE]->(b)
-              ON CREATE SET s1.weight = 0.5, s1.created_at = datetime(),
+              ON CREATE SET s1.weight = start, s1.created_at = datetime(),
                 s1.last_reinforced_at = datetime(), s1.reinforcement_count = 1,
                 s1.source = 'coactivation'
               ON MATCH SET s1.weight = CASE
@@ -3129,7 +3153,7 @@ impl Neo4jClient {
                 s1.reinforcement_count = coalesce(s1.reinforcement_count, 0) + 1,
                 s1.source = CASE WHEN s1.source IS NULL OR s1.source = 'cosine' THEN 'coactivation' ELSE s1.source END
             MERGE (b)-[s2:SYNAPSE]->(a)
-              ON CREATE SET s2.weight = 0.5, s2.created_at = datetime(),
+              ON CREATE SET s2.weight = start, s2.created_at = datetime(),
                 s2.last_reinforced_at = datetime(), s2.reinforcement_count = 1,
                 s2.source = 'coactivation'
               ON MATCH SET s2.weight = CASE
@@ -3152,7 +3176,11 @@ impl Neo4jClient {
                 .execute(
                     query(cypher)
                         .param("items", chunk.to_vec())
-                        .param("boost", boost),
+                        .param("boost", boost)
+                        .param(
+                            "revive_floor",
+                            crate::neurons::forgetting::DecayPolicy::default().forget_threshold,
+                        ),
                 )
                 .await?;
             if let Some(row) = result.next().await? {
