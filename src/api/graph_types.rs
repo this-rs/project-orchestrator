@@ -73,6 +73,10 @@ pub struct ProjectGraphResponse {
     pub edges: Vec<GraphEdge>,
     pub communities: Vec<GraphCommunity>,
     pub stats: HashMap<String, LayerStats>,
+    /// Incremental-reload fields (`synced_at`, deletions…); absent unless `since` or
+    /// `include_deleted` was asked, so a plain request stays byte-identical.
+    #[serde(flatten)]
+    pub sync: Option<crate::api::graph_sync::GraphSyncInfo>,
 }
 
 /// Query parameters for the graph endpoint
@@ -84,6 +88,27 @@ pub struct GraphQuery {
     pub community: Option<i64>,
     /// Max nodes per layer (default: 5000)
     pub limit: Option<usize>,
+    /// ISO 8601: only what changed after it (see `graph_sync`)
+    pub since: Option<String>,
+    /// Alias of `since`
+    pub updated_after: Option<String>,
+    /// `true` / `1`: also list what was deleted since `since`
+    #[serde(default, deserialize_with = "de_flag")]
+    pub include_deleted: Option<bool>,
+}
+
+fn de_flag<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    let Some(raw) = Option::<String>::deserialize(d)? else {
+        return Ok(None);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        other => Err(serde::de::Error::custom(format!(
+            "invalid boolean '{other}' (use true/false or 1/0)"
+        ))),
+    }
 }
 
 /// Max nodes per layer for ONE project's graph. `limit` comes from the query string,
@@ -251,6 +276,8 @@ pub struct WorkspaceGraphResponse {
     pub stats: HashMap<String, LayerStats>,
     /// Future: cross-project edges (shared dependencies, etc.)
     pub cross_project_edges: Vec<GraphEdge>,
+    #[serde(flatten)]
+    pub sync: Option<crate::api::graph_sync::GraphSyncInfo>,
 }
 
 /// Per-project intelligence summary within a workspace
@@ -273,6 +300,14 @@ pub struct WorkspaceIntelligenceSummaryResponse {
 // Reusable graph-building helpers
 // ============================================================================
 
+/// (nodes, edges, communities, per-layer stats) of one project.
+pub type GraphParts = (
+    Vec<GraphNode>,
+    Vec<GraphEdge>,
+    Vec<GraphCommunity>,
+    HashMap<String, LayerStats>,
+);
+
 /// Build multi-layer graph data for a single project.
 ///
 /// Returns (nodes, edges, communities, stats) — reused by both project and workspace handlers.
@@ -283,15 +318,32 @@ pub async fn build_project_graph_data(
     limit: usize,
     community_filter: Option<i64>,
     live_sessions: &[Uuid],
-) -> Result<
-    (
-        Vec<GraphNode>,
-        Vec<GraphEdge>,
-        Vec<GraphCommunity>,
-        HashMap<String, LayerStats>,
-    ),
-    AppError,
-> {
+) -> Result<GraphParts, AppError> {
+    let mut stamps = HashMap::new();
+    build_project_graph_data_stamped(
+        neo4j,
+        project,
+        requested_layers,
+        limit,
+        community_filter,
+        live_sessions,
+        &mut stamps,
+    )
+    .await
+}
+
+/// Same as [`build_project_graph_data`], and records in `stamps` the last-change date of every
+/// node whose model keeps one (see `crate::api::graph_sync`).
+#[allow(clippy::too_many_arguments)]
+pub async fn build_project_graph_data_stamped(
+    neo4j: &dyn GraphStore,
+    project: &ProjectNode,
+    requested_layers: &[String],
+    limit: usize,
+    community_filter: Option<i64>,
+    live_sessions: &[Uuid],
+    stamps: &mut HashMap<String, chrono::DateTime<chrono::Utc>>,
+) -> Result<GraphParts, AppError> {
     let mut all_nodes = Vec::new();
     let mut all_edges = Vec::new();
     let mut communities = Vec::new();
@@ -339,6 +391,7 @@ pub async fn build_project_graph_data(
             }
 
             let label = file.path.rsplit('/').next().unwrap_or(&file.path);
+            stamps.insert(file.path.clone(), file.last_parsed);
 
             all_nodes.push(GraphNode {
                 id: file.path.clone(),
@@ -581,6 +634,11 @@ pub async fn build_project_graph_data(
             if knowledge_node_count >= limit {
                 break;
             }
+            stamps.insert(
+                note.id.to_string(),
+                note.last_confirmed_at
+                    .map_or(note.created_at, |c| c.max(note.created_at)),
+            );
             all_nodes.push(GraphNode {
                 id: note.id.to_string(),
                 node_type: "note".to_string(),
@@ -618,6 +676,7 @@ pub async fn build_project_graph_data(
             } else {
                 decision.description.clone()
             };
+            stamps.insert(decision.id.to_string(), decision.decided_at);
             all_nodes.push(GraphNode {
                 id: decision.id.to_string(),
                 node_type: "decision".to_string(),
@@ -1021,6 +1080,9 @@ pub async fn build_project_graph_data(
         }
 
         for session in &sessions {
+            if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&session.created_at) {
+                stamps.insert(session.id.clone(), t.with_timezone(&chrono::Utc));
+            }
             all_nodes.push(GraphNode {
                 id: session.id.clone(),
                 node_type: "chat_session".to_string(),

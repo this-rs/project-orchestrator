@@ -7,6 +7,7 @@ use crate::neo4j::models::*;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use futures::StreamExt;
@@ -1667,7 +1668,7 @@ pub async fn get_workspace_graph(
     State(state): State<OrchestratorState>,
     Path(slug): Path<String>,
     Query(params): Query<GraphQuery>,
-) -> Result<Json<WorkspaceGraphResponse>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let neo4j = state.orchestrator.neo4j_arc();
 
     let workspace = neo4j
@@ -1678,6 +1679,8 @@ pub async fn get_workspace_graph(
     let projects = neo4j.list_workspace_projects(workspace.id).await?;
 
     let requested_layers = parse_layers(&params.layers);
+    let sync = super::graph_sync::SyncParams::from_query(&params)?;
+    let cursor = super::graph_sync::new_cursor();
     // Spending happens once per project: the total is `limit × #projects`.
     let limit = params.effective_workspace_limit();
     let live: Vec<_> = match state.chat_manager.as_ref() {
@@ -1695,8 +1698,8 @@ pub async fn get_workspace_graph(
             let project = project.clone();
             let live = live.clone();
             async move {
-                let result = super::graph_types::build_project_graph_data(
-                    &*neo4j, &project, &layers, limit, community, &live,
+                let result = super::graph_sync::project_graph_response(
+                    &*neo4j, &project, &layers, limit, community, &live, &sync, cursor,
                 )
                 .await;
                 (project, result)
@@ -1712,10 +1715,17 @@ pub async fn get_workspace_graph(
     let mut all_communities = Vec::new();
     let mut merged_stats = std::collections::HashMap::new();
     let mut project_metas = Vec::new();
+    let mut workspace_sync: Option<super::graph_sync::GraphSyncInfo> = None;
 
     for (project, result) in results {
-        let (mut nodes, mut edges, mut communities, stats) = match result {
-            Ok(data) => data,
+        let (mut nodes, mut edges, mut communities, stats, project_sync) = match result {
+            Ok(data) => (
+                data.nodes,
+                data.edges,
+                data.communities,
+                data.stats,
+                data.sync,
+            ),
             Err(e) => {
                 tracing::warn!(project_slug = %project.slug, error = ?e, "Failed to build graph for project, skipping");
                 continue;
@@ -1724,6 +1734,35 @@ pub async fn get_workspace_graph(
 
         let project_slug = &project.slug;
         let project_name = &project.name;
+
+        if let Some(info) = project_sync {
+            let ws = workspace_sync.get_or_insert_with(|| super::graph_sync::GraphSyncInfo {
+                synced_at: info.synced_at.clone(),
+                since: info.since.clone(),
+                ..Default::default()
+            });
+            ws.untracked_nodes += info.untracked_nodes;
+            if let Some(t) = info.deletions_tracked {
+                ws.deletions_tracked = Some(ws.deletions_tracked.unwrap_or(true) && t);
+            }
+            if let Some(dn) = info.deleted_nodes {
+                ws.deleted_nodes
+                    .get_or_insert_with(Vec::new)
+                    .extend(dn.into_iter().map(|mut d| {
+                        d.id = format!("{}::{}", project_slug, d.id);
+                        d
+                    }));
+            }
+            if let Some(de) = info.deleted_edges {
+                ws.deleted_edges
+                    .get_or_insert_with(Vec::new)
+                    .extend(de.into_iter().map(|mut d| {
+                        d.source = format!("{}::{}", project_slug, d.source);
+                        d.target = format!("{}::{}", project_slug, d.target);
+                        d
+                    }));
+            }
+        }
 
         // Prefix node IDs with project slug to avoid collisions
         for node in &mut nodes {
@@ -1777,14 +1816,29 @@ pub async fn get_workspace_graph(
         }
     }
 
-    Ok(Json(WorkspaceGraphResponse {
-        projects: project_metas,
-        nodes: all_nodes,
-        edges: all_edges,
-        communities: all_communities,
-        stats: merged_stats,
-        cross_project_edges: Vec::new(), // Future: detect cross-project links
-    }))
+    if sync.is_active() && workspace_sync.is_none() {
+        workspace_sync = Some(super::graph_sync::GraphSyncInfo {
+            synced_at: super::graph_sync::format_cursor(cursor),
+            since: sync.since.map(super::graph_sync::format_cursor),
+            ..Default::default()
+        });
+    }
+
+    Ok((
+        [(
+            super::graph_sync::SYNCED_AT_HEADER,
+            super::graph_sync::format_cursor(cursor),
+        )],
+        Json(WorkspaceGraphResponse {
+            projects: project_metas,
+            nodes: all_nodes,
+            edges: all_edges,
+            communities: all_communities,
+            stats: merged_stats,
+            cross_project_edges: Vec::new(), // Future: detect cross-project links
+            sync: workspace_sync,
+        }),
+    ))
 }
 
 // ============================================================================
