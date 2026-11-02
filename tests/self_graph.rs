@@ -558,24 +558,46 @@ async fn unpinning_releases_the_edge_the_rule_drew_and_spares_a_hand_placed_one(
     store_pinned_notes(&e.client, None, &[kept.id, dropped.id])
         .await
         .unwrap();
-    let known = e.client.agent_knows(self_id, None, 10).await.unwrap();
-    assert_eq!(
-        known.available, 3,
-        "two pins plus the hand-placed one: {known:?}"
+    // On n'assène AUCUN compte absolu : le soi racine est un nœud PARTAGÉ, et les autres
+    // tests de ce fichier — plus la passe de démarrage — y écrivent leurs propres arêtes.
+    // Ce qui compte est la présence ou l'absence de NOS trois notes.
+    let known = e.client.agent_knows(self_id, None, 5_000).await.unwrap();
+    assert!(
+        known.notes.contains(&kept.id) && known.notes.contains(&dropped.id),
+        "both pins are known, alongside whatever the graph already held: {known:?}"
     );
 
     // Drop one pin.
     store_pinned_notes(&e.client, None, &[kept.id])
         .await
         .unwrap();
-    let known = e.client.agent_knows(self_id, None, 10).await.unwrap();
-    assert_eq!(
-        known.available, 2,
-        "the dropped pin is released, the hand-placed edge stays: {known:?}"
-    );
+    let known = e.client.agent_knows(self_id, None, 5_000).await.unwrap();
+    if known.notes.contains(&dropped.id) {
+        let mut rows = e
+            .raw
+            .execute(
+                query(
+                    "MATCH (:Agent {id: $a})-[r:KNOWS]->(:Note {id: $n}) \
+                     RETURN r.rule AS rule, r.scope AS scope, r.project_id AS project",
+                )
+                .param("a", self_id.to_string())
+                .param("n", dropped.id.to_string()),
+            )
+            .await
+            .unwrap();
+        let mut rules = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            rules.push((
+                row.get::<String>("rule").unwrap_or_default(),
+                row.get::<String>("scope").unwrap_or_default(),
+                row.get::<Option<String>>("project").unwrap_or(None),
+            ));
+        }
+        panic!("the unpinned note is still known by: {rules:?}");
+    }
     assert!(
-        !known.notes.contains(&dropped.id),
-        "the unpinned note is no longer known"
+        known.notes.contains(&kept.id),
+        "the kept pin stays"
     );
     assert!(
         known.notes.contains(&by_hand.id),
