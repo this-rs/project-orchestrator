@@ -25,7 +25,10 @@
 //! # The model
 //!
 //! - **Proportional to elapsed time**, not to passes: `w · 2^(−Δt / h)`, with
-//!   `Δt = now − coalesce(last_reinforced_at, created_at)`. Idempotent, cadence
+//!   `Δt = now − decayed_at`. The stored weight is valid as of `decayed_at`,
+//!   the last time a pass (or a reinforcement) wrote it: never measured from
+//!   creation, because the legacy pass already charged for that age. An edge
+//!   with no `decayed_at` is STAMPED, not decayed. Idempotent, cadence
 //!   independent, and a downtime is caught up automatically.
 //! - **Per provenance.** A co-activation edge (validated by use) halves every
 //!   [`DecayPolicy::half_life_days`]; a similarity edge (created by the
@@ -382,6 +385,9 @@ mod tests {
     }
 
     /// An edge with no timestamp is left alone: unknown age is not an excuse.
+    ///
+    /// (This is the FORGET clock 2014 last reinforcement or creation. The DECAY
+    /// clock is `decayed_at`, and it is never a reason to forget.)
     #[test]
     fn an_edge_of_unknown_age_is_never_forgotten() {
         let p = DecayPolicy::default();

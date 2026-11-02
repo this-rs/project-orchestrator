@@ -564,7 +564,12 @@ impl MockGraphStore {
             note_synapses: RwLock::new(HashMap::new()),
             synapse_meta: RwLock::new(HashMap::new()),
             forgotten_synapses: RwLock::new(HashMap::new()),
-            synapses_decayed_at: RwLock::new(None),
+            // The store has been decayed one legacy interval ago: a single
+            // pass in a test therefore moves the weights, and a second pass
+            // right after moves nothing (the property the model exists for).
+            synapses_decayed_at: RwLock::new(Some(
+                Utc::now() - chrono::Duration::seconds(6 * 3600),
+            )),
             synapse_shadow: RwLock::new(HashMap::new()),
             synapse_shadow_traces: RwLock::new(Vec::new()),
             init_note_energy_calls: RwLock::new(Vec::new()),
@@ -13191,12 +13196,13 @@ impl AnalyticsStore for MockGraphStore {
         // Elapsed time since the previous pass, never a number of passes: two
         // calls in a row decay (almost) nothing the second time. An edge that
         // was never touched by a pass is counted as one legacy interval old.
-        const LEGACY_INTERVAL_SECS: i64 = 6 * 3600;
         let elapsed_secs = {
             let mut last = self.synapses_decayed_at.write().await;
+            // No stamp (a store built by hand): the edge is stamped now rather
+            // than charged for its whole age, as the real store does.
             let elapsed = match *last {
                 Some(at) => (now - at).num_seconds().max(0),
-                None => LEGACY_INTERVAL_SECS,
+                None => 0,
             };
             *last = Some(now);
             elapsed

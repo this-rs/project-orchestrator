@@ -3043,7 +3043,8 @@ impl Neo4jClient {
               ON MATCH SET s1.weight = CASE
                   WHEN s1.weight + 0.2 > 1.0 THEN 1.0 ELSE s1.weight + 0.2 END,
                 s1.reinforcement_count = coalesce(s1.reinforcement_count, 0) + 1
-            SET s1.last_reinforced_at = datetime(), s1.rule = $rule,
+            SET s1.last_reinforced_at = datetime(), s1.decayed_at = datetime(),
+                s1.rule = $rule,
                 s1.measure = $measure, s1.at = $at, s1.last_session = $session
             MERGE (b)-[s2:SYNAPSE]->(a)
               ON CREATE SET s2.weight = 0.5, s2.created_at = datetime(),
@@ -3124,6 +3125,7 @@ impl Neo4jClient {
                   ELSE s1.weight + $boost
               END,
                 s1.last_reinforced_at = datetime(),
+                s1.decayed_at = datetime(),
                 s1.reinforcement_count = coalesce(s1.reinforcement_count, 0) + 1,
                 s1.source = CASE WHEN s1.source IS NULL OR s1.source = 'cosine' THEN 'coactivation' ELSE s1.source END
             MERGE (b)-[s2:SYNAPSE]->(a)
@@ -3135,6 +3137,7 @@ impl Neo4jClient {
                   ELSE s2.weight + $boost
               END,
                 s2.last_reinforced_at = datetime(),
+                s2.decayed_at = datetime(),
                 s2.reinforcement_count = coalesce(s2.reinforcement_count, 0) + 1,
                 s2.source = CASE WHEN s2.source IS NULL OR s2.source = 'cosine' THEN 'coactivation' ELSE s2.source END
             RETURN count(*) AS reinforced
@@ -3306,8 +3309,14 @@ impl Neo4jClient {
                  coalesce(s.reinforcement_count, 0) AS rc,
                  CASE WHEN s.source = 'coactivation' THEN $half_life_coactivation
                       ELSE $half_life_similarity END AS h,
+                 // The stored weight is valid AS OF its own `decayed_at`: the
+                 // elapsed time is what happened since, never since creation.
+                 // An edge that never carried one is stamped now, not decayed:
+                 // the legacy pass already charged for its age, and charging it
+                 // a second time is what archived 928 edges in one pass on the
+                 // restored copy (measured 02/11/2026).
                  duration.inSeconds(
-                     coalesce(s.last_reinforced_at, s.created_at, datetime()),
+                     coalesce(s.decayed_at, datetime()),
                      datetime()
                  ).seconds AS elapsed
             WITH s, rc, h,
@@ -3317,7 +3326,7 @@ impl Neo4jClient {
             WITH s, rc,
                  CASE WHEN rc >= $protected_after AND raw < $protection_floor
                       THEN $protection_floor ELSE raw END AS w
-            SET s.weight = w
+            SET s.weight = w, s.decayed_at = datetime()
             RETURN count(s) AS decayed,
                    sum(CASE WHEN w < $dormancy THEN 1 ELSE 0 END) AS dormant,
                    sum(CASE WHEN rc >= $protected_after THEN 1 ELSE 0 END) AS protected
