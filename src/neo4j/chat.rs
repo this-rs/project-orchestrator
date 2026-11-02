@@ -1175,6 +1175,27 @@ impl Neo4jClient {
         }
     }
 
+    /// See [`crate::neo4j::AnalyticsStore::llm_settings_by_key`].
+    pub async fn llm_settings_by_key(&self, key: &str) -> Result<Vec<(String, String)>> {
+        let mut rows = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (s:LlmSetting {key: $key}) \
+                     RETURN s.scope AS scope, s.value AS value",
+                )
+                .param("key", key.to_string()),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let scope: String = row.get("scope").unwrap_or_default();
+            let value: String = row.get("value").unwrap_or_default();
+            out.push((scope, value));
+        }
+        Ok(out)
+    }
+
     /// See [`crate::neo4j::AnalyticsStore::release_agent_knows`].
     pub async fn release_agent_knows(
         &self,

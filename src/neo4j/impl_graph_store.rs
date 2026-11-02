@@ -3233,6 +3233,10 @@ impl AnalyticsStore for Neo4jClient {
         self.release_agent_knows(agent_id, rule, keep).await
     }
 
+    async fn llm_settings_by_key(&self, key: &str) -> anyhow::Result<Vec<(String, String)>> {
+        self.llm_settings_by_key(key).await
+    }
+
     async fn agent_knows(
         &self,
         agent_id: Uuid,

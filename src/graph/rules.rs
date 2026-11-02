@@ -578,42 +578,48 @@ async fn run_agent_uses_activated(
 /// The pins of every scope: the instance's own, then each project's. A project scope is
 /// read through its slug, which is what [`crate::chat::stages::knowledge_injection`]
 /// keys the setting by.
-/// Les épingles de toutes les portées. Le booléen dit si la lecture est COMPLÈTE : sans la
-/// liste des projets, les portées de projet manquent, et réconcilier sur ce `keep` partiel
-/// effacerait leurs arêtes.
+/// Les épingles de toutes les portées, lues DIRECTEMENT sur les réglages.
+///
+/// On n'énumère plus les projets : la portée est écrite sur le réglage lui-même, et passer
+/// par `list_projects()` rendait la réconciliation otage d'un seul `(:Project)` illisible —
+/// un nœud malformé désactivait silencieusement la réconciliation de toute l'instance.
+/// L'identifiant de projet d'une portée n'est résolu que pour les portées qui PORTENT une
+/// épingle, donc quelques appels au plus.
 async fn pinned_notes_everywhere(
     graph: &dyn GraphStore,
 ) -> anyhow::Result<(Vec<(Uuid, Option<Uuid>)>, usize, bool)> {
-    use crate::chat::stages::knowledge_injection::load_pinned_notes;
+    use crate::chat::stages::knowledge_injection::PINNED_NOTES_KEY;
 
-    let mut scopes: Vec<Option<(String, Uuid)>> = vec![None];
-    // The global pins are the socle; the project-scoped ones are a convenience. A graph that
-    // holds a project the mapper cannot read (a foreign suite left a bare `(:Project)` without
-    // `name`/`slug`) must not kill the rule over it — « never fail without a socle »: the
-    // global pins are still applied, the unreadable scopes are said, not silently skipped.
-    let mut complete = true;
-    match graph.list_projects().await {
-        Ok(projects) => {
-            for project in projects {
-                scopes.push(Some((project.slug, project.id)));
-            }
-        }
-        Err(e) => {
-            complete = false;
-            tracing::warn!(error = %e, "project pin scopes are unreadable: only the global pins are read");
-        }
-    }
-    let read = scopes.len();
+    let settings = graph.llm_settings_by_key(PINNED_NOTES_KEY).await?;
+    let read = settings.len();
 
     let mut seen = std::collections::HashSet::new();
     let mut ids = Vec::new();
-    for scope in scopes {
-        let (slug, project) = match &scope {
-            Some((slug, id)) => (Some(slug.as_str()), Some(*id)),
-            None => (None, None),
+    let mut complete = true;
+    for (scope, raw) in settings {
+        // Une portée projet est désignée par son slug ; `global` n'a pas de projet.
+        let project = if scope == "global" {
+            None
+        } else {
+            match graph.get_project_by_slug(&scope).await {
+                Ok(Some(p)) => Some(p.id),
+                Ok(None) => None,
+                Err(e) => {
+                    complete = false;
+                    tracing::warn!(scope = %scope, error = %e, "pin scope unresolved");
+                    None
+                }
+            }
         };
-        let pinned = load_pinned_notes(graph, slug).await?;
-        for id in pinned {
+        let parsed: Vec<Uuid> = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                complete = false;
+                tracing::warn!(scope = %scope, error = %e, "unreadable pin list, skipped");
+                continue;
+            }
+        };
+        for id in parsed {
             if seen.insert(id) {
                 ids.push((id, project));
             }

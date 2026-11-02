@@ -3022,6 +3022,13 @@ pub trait AnalyticsStore: Send + Sync {
     async fn release_agent_knows(&self, agent_id: Uuid, rule: &str, keep: &[Uuid])
         -> Result<usize>;
 
+    /// Every stored value of one setting key, as `(scope, value)`, across all scopes.
+    ///
+    /// The pin rule needs the scopes that ACTUALLY hold a value, not a list of every project:
+    /// enumerating projects made the reconciliation hostage to one unreadable `(:Project)`
+    /// — a single malformed node silently disabled it for the whole instance.
+    async fn llm_settings_by_key(&self, key: &str) -> Result<Vec<(String, String)>>;
+
     /// What that agent knows, bounded by `limit`, plus how many exist — « la part lue est
     /// dite ». Only `(:Agent)-[:KNOWS]->(:Note)` is read: a `KNOWS` reaching a `File` (the
     /// persona meaning) never leaks into this answer.

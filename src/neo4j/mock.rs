@@ -13881,6 +13881,17 @@ impl AnalyticsStore for MockGraphStore {
         Ok(created)
     }
 
+    async fn llm_settings_by_key(&self, key: &str) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .llm_settings
+            .read()
+            .await
+            .iter()
+            .filter(|((_, k), _)| k == key)
+            .map(|((scope, _), value)| (scope.clone(), value.clone()))
+            .collect())
+    }
+
     async fn release_agent_knows(
         &self,
         agent_id: Uuid,
