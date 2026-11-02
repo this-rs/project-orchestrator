@@ -336,7 +336,15 @@ When asked to "track progress", update **statuses via MCP tools**.
 - Never ask the user to paste a secret in the chat, and never print one (no `echo`, `cat`, `env`, `printenv` on it).
 - Need one? `vault(action: "list_available")` shows names and whether you may read them. If it is missing or not granted, `vault(action: "request_secret", name, reason)` shows the user a secure input card — then END YOUR TURN; you will be told when it is available.
 - Use it only inside a shell command, so the value never enters your context: `orchestrator secret exec -e VAR=NAME -- cmd args` (preferred), or `orchestrator secret get NAME | cmd --password-stdin`.
-- Values that reach any output are replaced by `[secret:NAME]` — that marker means the value is protected, not missing."#;
+- Values that reach any output are replaced by `[secret:NAME]` — that marker means the value is protected, not missing.
+
+**Ending a turn — never on a promise nothing will keep:**
+A turn ends when you stop answering. Nothing restarts you on its own unless you have armed something that does, so "I'll continue once X is done" with nothing scheduled is a promise with nobody to keep it: the human has to relaunch you by hand, and reads it as you dropping the work.
+- **Waiting? make the wait real.** Launch the wait as a **background task** — a shell command started in the background, a monitor on the event (a log line, a file appearing), or a sub-agent started in the background. When it ends, the session is resumed by itself and you go on with what you announced.
+- **No mechanism to name? then do not promise.** Say what you have done, what remains, and what you need from the human — and end the turn there.
+- **Polling inside the turn is fine** (a command that waits with a timeout); what is forbidden is ending the turn *between* the wait and the work.
+- "I'll check back in ten minutes", "let me know when it's finished", "I'm waiting for the CI" all mean the human carries the thread — a defect, not a turn of phrase.
+- The same rule on every engine: the Claude Code CLI wakes its own turn on its background notifications; every other engine wakes through the background task you started."#;
 
 /// §2 — Mega-tools call syntax
 pub const SECTION_MEGATOOLS_SYNTAX: &str = r#"## 2. Mega-tools — Call Syntax
@@ -2056,6 +2064,35 @@ mod tests {
             SubagentVocabulary::of_provider("deepseek"),
             SubagentVocabulary::Agent
         );
+    }
+
+    /// The rule that keeps an agent from ending a turn on a promise nothing will keep
+    /// (WAKE-BG): it is in the identity section, which every level and every engine
+    /// receives, and the sub-agent vocabulary swap leaves it alone.
+    #[test]
+    fn the_no_unkept_promise_rule_is_in_the_section_every_engine_receives() {
+        let identity = all_base_sections()
+            .into_iter()
+            .find(|s| s.id == PromptSectionId::IdentityRole)
+            .expect("the identity section is always there");
+        assert!(
+            identity.condition.is_active(&ComposerContext::default()),
+            "the identity section is active at every level"
+        );
+        assert!(
+            identity
+                .content
+                .contains("never on a promise nothing will keep"),
+            "the rule is written where it is read"
+        );
+        for vocabulary in [SubagentVocabulary::ClaudeCode, SubagentVocabulary::Agent] {
+            let adapted = adapt_subagent_vocabulary(identity.content.to_string(), vocabulary);
+            assert!(
+                adapted.contains("never on a promise nothing will keep")
+                    && adapted.contains("background task"),
+                "the rule survives the {vocabulary:?} vocabulary"
+            );
+        }
     }
 
     #[test]
