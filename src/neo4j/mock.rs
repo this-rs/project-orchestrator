@@ -65,6 +65,15 @@ pub struct MockAnchorStore {
 /// Shadow state of one directed synapse: `(shadow_weight, last shadow decay)`.
 pub type MockShadowSynapse = (f64, Option<chrono::DateTime<chrono::Utc>>);
 
+/// What one mock edge remembers about itself, for the forgetting pass.
+#[derive(Debug, Clone, Copy)]
+pub struct MockSynapseMeta {
+    /// Creation or last reinforcement: the clock the decay reads.
+    pub last_touch: chrono::DateTime<chrono::Utc>,
+    /// Reinforcements so far: what protects the edge from being forgotten.
+    pub reinforcements: u32,
+}
+
 /// `(project, session, provenance)` of a `SYNAPSE` the mock welded.
 pub type SynapseWeld = (Uuid, Uuid, crate::graph::rules::Provenance);
 
@@ -296,6 +305,16 @@ pub struct MockGraphStore {
     pub note_embeddings: RwLock<HashMap<Uuid, (Vec<f32>, String)>>,
     /// Note synapses: bidirectional adjacency list (note_id -> Vec<(neighbor_id, weight)>)
     pub note_synapses: RwLock<HashMap<Uuid, Vec<(Uuid, f64)>>>,
+    /// What the forgetting pass reads on one edge: when it was last touched, and
+    /// how many times it was reinforced. Keyed by the unordered pair, like
+    /// `synapse_sources`.
+    pub synapse_meta: RwLock<HashMap<(Uuid, Uuid), MockSynapseMeta>>,
+    /// Archived edges (the `:FORGOTTEN` relation of the real store): the pair and
+    /// the weight it had. A reinforcement revives it AT THAT WEIGHT, never 0.5.
+    pub forgotten_synapses: RwLock<HashMap<(Uuid, Uuid), f64>>,
+    /// When the last forgetting pass ran: the decay is proportional to the
+    /// ELAPSED TIME, so two passes in a row decay almost nothing the second time.
+    pub synapses_decayed_at: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
     /// Shadow state of the directed synapses (from, to) -> (shadow_weight, last shadow decay).
     pub synapse_shadow: RwLock<HashMap<(Uuid, Uuid), MockShadowSynapse>>,
     /// Synaptic shadow traces, in insertion order.
@@ -543,6 +562,9 @@ impl MockGraphStore {
             function_analytics: RwLock::new(HashMap::new()),
             note_embeddings: RwLock::new(HashMap::new()),
             note_synapses: RwLock::new(HashMap::new()),
+            synapse_meta: RwLock::new(HashMap::new()),
+            forgotten_synapses: RwLock::new(HashMap::new()),
+            synapses_decayed_at: RwLock::new(None),
             synapse_shadow: RwLock::new(HashMap::new()),
             synapse_shadow_traces: RwLock::new(Vec::new()),
             init_note_energy_calls: RwLock::new(Vec::new()),
@@ -12693,6 +12715,7 @@ impl AnalyticsStore for MockGraphStore {
 
         let mut synapses = self.note_synapses.write().await;
         let mut sources = self.synapse_sources.write().await;
+        let mut meta = self.synapse_meta.write().await;
         let mut count = 0;
 
         for &(neighbor_id, weight) in neighbors {
@@ -12721,6 +12744,12 @@ impl AnalyticsStore for MockGraphStore {
                 (neighbor_id, note_id)
             };
             sources.entry(key).or_insert_with(|| "cosine".to_string());
+            // A backfilled edge is born now and has never been reinforced: the
+            // forgetting pass must not undo it the day it ran.
+            meta.entry(key).or_insert(MockSynapseMeta {
+                last_touch: Utc::now(),
+                reinforcements: 0,
+            });
         }
 
         Ok(count)
@@ -12839,11 +12868,16 @@ impl AnalyticsStore for MockGraphStore {
                 }
 
                 // Reinforce or create A → B
+                // An archived edge REVIVES at the weight it had when it was
+                // archived: forgetting is a sleep, never a loss.
+                let key = if a < b { (a, b) } else { (b, a) };
+                let revived = self.forgotten_synapses.write().await.remove(&key);
+                let start = revived.unwrap_or(0.5);
                 let entry_a = synapses.entry(a).or_default();
                 if let Some(syn) = entry_a.iter_mut().find(|(id, _)| *id == b) {
                     syn.1 = (syn.1 + boost).min(1.0);
                 } else {
-                    entry_a.push((b, 0.5));
+                    entry_a.push((b, start));
                 }
                 count += 1;
 
@@ -12852,13 +12886,20 @@ impl AnalyticsStore for MockGraphStore {
                 if let Some(syn) = entry_b.iter_mut().find(|(id, _)| *id == a) {
                     syn.1 = (syn.1 + boost).min(1.0);
                 } else {
-                    entry_b.push((a, 0.5));
+                    entry_b.push((a, start));
                 }
                 count += 1;
 
                 // Tag source as coactivation (upgrade from cosine if applicable)
-                let key = if a < b { (a, b) } else { (b, a) };
                 sources.insert(key, "coactivation".to_string());
+                // The reinforcement is the evidence the forgetting pass honours.
+                let mut meta = self.synapse_meta.write().await;
+                let entry = meta.entry(key).or_insert(MockSynapseMeta {
+                    last_touch: Utc::now(),
+                    reinforcements: 0,
+                });
+                entry.reinforcements += 1;
+                entry.last_touch = Utc::now();
             }
         }
 
@@ -13142,63 +13183,106 @@ impl AnalyticsStore for MockGraphStore {
 
     async fn decay_synapses(
         &self,
-        decay_amount: f64,
-        prune_threshold: f64,
-    ) -> Result<(usize, usize)> {
+        policy: &crate::neurons::forgetting::DecayPolicy,
+    ) -> Result<crate::neurons::forgetting::PassReport> {
+        use crate::neurons::forgetting::PassReport;
+
+        let now = Utc::now();
+        // Elapsed time since the previous pass, never a number of passes: two
+        // calls in a row decay (almost) nothing the second time. An edge that
+        // was never touched by a pass is counted as one legacy interval old.
+        const LEGACY_INTERVAL_SECS: i64 = 6 * 3600;
+        let elapsed_secs = {
+            let mut last = self.synapses_decayed_at.write().await;
+            let elapsed = match *last {
+                Some(at) => (now - at).num_seconds().max(0),
+                None => LEGACY_INTERVAL_SECS,
+            };
+            *last = Some(now);
+            elapsed
+        };
+
+        let mut report = PassReport::default();
         let mut synapses = self.note_synapses.write().await;
         let sources = self.synapse_sources.read().await;
-        let mut decayed = 0usize;
-        let mut pruned = 0usize;
+        let meta = self.synapse_meta.read().await;
+        let ordered = |a: Uuid, b: Uuid| if a < b { (a, b) } else { (b, a) };
 
-        // Decay with differentiated rates: coactivation decays at base rate,
-        // cosine/unknown decays at 2x base rate
-        for (note_id, neighbors) in synapses.iter_mut() {
-            for syn in neighbors.iter_mut() {
-                let key = if *note_id < syn.0 {
-                    (*note_id, syn.0)
-                } else {
-                    (syn.0, *note_id)
-                };
-                let is_coactivation = sources
-                    .get(&key)
-                    .map(|s| s == "coactivation")
-                    .unwrap_or(false);
-                let effective_decay = if is_coactivation {
-                    decay_amount
-                } else {
-                    decay_amount * 2.0
-                };
-                syn.1 -= effective_decay;
-                decayed += 1;
-            }
-        }
-        drop(sources);
-
-        // Prune weak synapses
-        for neighbors in synapses.values_mut() {
-            let before = neighbors.len();
-            neighbors.retain(|(_, w)| *w >= prune_threshold);
-            pruned += before - neighbors.len();
-        }
-
-        // Drop synapses lock before acquiring notes lock to avoid deadlock
-        drop(synapses);
-
-        // Decay knowledge scars (20x slower than synapse decay)
-        let scar_decay_rate = decay_amount * 0.05;
-        if scar_decay_rate > 0.0 {
-            let mut notes = self.notes.write().await;
-            for note in notes.values_mut() {
-                if note.scar_intensity > 0.0 {
-                    note.scar_intensity -= scar_decay_rate;
-                    if note.scar_intensity < 0.001 {
-                        note.scar_intensity = 0.0;
-                    }
+        // ---- 1. Proportional decay, protected by use -------------------
+        for (owner, neighbors) in synapses.iter_mut() {
+            for (other, weight) in neighbors.iter_mut() {
+                let key = ordered(*owner, *other);
+                let source = sources.get(&key).map(|s| s.as_str()).unwrap_or("cosine");
+                let reinforcements = meta.get(&key).map(|m| m.reinforcements).unwrap_or(0);
+                *weight =
+                    policy.decayed_protected(*weight, elapsed_secs as f64, source, reinforcements);
+                report.decayed += 1;
+                if *weight < policy.dormancy_threshold {
+                    report.dormant += 1;
+                }
+                if reinforcements >= policy.protected_after {
+                    report.protected += 1;
                 }
             }
         }
 
-        Ok((decayed, pruned))
+        // ---- 2. Archive, never destroy --------------------------------
+        let cap = policy.archive_cap(report.decayed);
+        // One entry per unordered pair: the adjacency list holds both
+        // directions, and an edge is archived once, not twice.
+        let mut candidates: Vec<(Uuid, Uuid, f64)> = Vec::new();
+        let mut seen: std::collections::HashSet<(Uuid, Uuid)> = std::collections::HashSet::new();
+        for (owner, neighbors) in synapses.iter() {
+            for (other, weight) in neighbors {
+                let key = ordered(*owner, *other);
+                if !seen.insert(key) {
+                    continue;
+                }
+                let reinforcements = meta.get(&key).map(|m| m.reinforcements).unwrap_or(0);
+                let last_touch = meta.get(&key).map(|m| m.last_touch);
+                if !policy.is_forgettable(*weight, reinforcements, last_touch, now) {
+                    continue;
+                }
+                // A node keeps at least `min_degree` edges: the pass never
+                // orphans a note.
+                let degree_a = synapses.get(owner).map(|v| v.len()).unwrap_or(0);
+                let degree_b = synapses.get(other).map(|v| v.len()).unwrap_or(0);
+                if degree_a <= policy.min_degree || degree_b <= policy.min_degree {
+                    continue;
+                }
+                candidates.push((*owner, *other, *weight));
+            }
+        }
+        drop(meta);
+        drop(sources);
+
+        let mut forgotten = self.forgotten_synapses.write().await;
+        for (a, b, weight) in candidates.into_iter().take(cap) {
+            if let Some(neighbors) = synapses.get_mut(&a) {
+                neighbors.retain(|(x, _)| *x != b);
+            }
+            if let Some(neighbors) = synapses.get_mut(&b) {
+                neighbors.retain(|(x, _)| *x != a);
+            }
+            forgotten.insert(ordered(a, b), weight);
+            report.archived += 1;
+        }
+        report.capped = report.archived >= cap && report.archived > 0;
+        drop(forgotten);
+        drop(synapses);
+
+        // ---- 3. Death scars heal, 20x slower than a synapse decays -----
+        let mut notes = self.notes.write().await;
+        for note in notes.values_mut() {
+            if note.scar_intensity > 0.0 {
+                note.scar_intensity -= 0.02 * 0.05;
+                if note.scar_intensity < 0.001 {
+                    note.scar_intensity = 0.0;
+                }
+            }
+        }
+
+        Ok(report)
     }
 
     async fn apply_scars(&self, node_ids: &[Uuid], increment: f64) -> Result<usize> {

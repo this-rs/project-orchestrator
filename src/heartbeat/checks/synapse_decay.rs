@@ -52,10 +52,6 @@ pub(crate) async fn shadow_pass(
     (decayed, settled)
 }
 
-/// Default synapse decay amount per cycle.
-const DEFAULT_DECAY_AMOUNT: f64 = 0.02;
-/// Default prune threshold — synapses below this weight are deleted.
-const DEFAULT_PRUNE_THRESHOLD: f64 = 0.05;
 /// Default energy half-life in days.
 const DEFAULT_HALF_LIFE_DAYS: f64 = crate::notes::ENERGY_HALF_LIFE_DAYS;
 
@@ -74,13 +70,17 @@ impl HeartbeatCheck for SynapseDecayCheck {
 
     async fn run(&self, ctx: &HeartbeatContext) -> Result<()> {
         // 1. Decay synapses
-        let (decayed, pruned) = ctx
+        let report = ctx
             .graph
-            .decay_synapses(DEFAULT_DECAY_AMOUNT, DEFAULT_PRUNE_THRESHOLD)
+            .decay_synapses(&crate::neurons::forgetting::DecayPolicy::default())
             .await?;
         debug!(
-            "SynapseDecayCheck: decayed {} synapses, pruned {}",
-            decayed, pruned
+            decayed = report.decayed,
+            dormant = report.dormant,
+            protected = report.protected,
+            archived = report.archived,
+            capped = report.capped,
+            "SynapseDecayCheck: forgetting pass"
         );
 
         // 2. Update energy scores
@@ -155,10 +155,14 @@ mod tests {
         );
     }
 
+    /// The energy half-life is the only constant left here: the amount and the
+    /// threshold moved into `neurons::forgetting`, where the whole system reads
+    /// them from ONE policy (a second threshold is what let the same edge be
+    /// spared by this check and deleted by the homeostasis on the same day).
     #[test]
     fn test_default_constants() {
-        assert!((DEFAULT_DECAY_AMOUNT - 0.02).abs() < f64::EPSILON);
-        assert!((DEFAULT_PRUNE_THRESHOLD - 0.05).abs() < f64::EPSILON);
         assert!((DEFAULT_HALF_LIFE_DAYS - 90.0).abs() < f64::EPSILON);
+        let policy = crate::neurons::forgetting::DecayPolicy::default();
+        assert!(policy.forget_threshold < policy.dormancy_threshold);
     }
 }

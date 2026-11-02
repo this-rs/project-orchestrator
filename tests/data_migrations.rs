@@ -17,6 +17,13 @@ use neo4rs::{query, Graph};
 use project_orchestrator::neo4j::client::Neo4jClient;
 use uuid::Uuid;
 
+/// The forgetting policy these tests exercise: the default one, the same the
+/// heartbeat and the homeostasis use in production (one threshold, one
+/// calendar).
+fn policy() -> project_orchestrator::neurons::forgetting::DecayPolicy {
+    project_orchestrator::neurons::forgetting::DecayPolicy::default()
+}
+
 struct Env {
     client: Neo4jClient,
     raw: Graph,
@@ -565,8 +572,8 @@ async fn test_data_migrations_repair_an_upgraded_install() {
     )
     .await
     .unwrap();
-    let (decayed, _) = client.decay_project_synapses(r, 0.1, 0.05).await.unwrap();
-    assert_eq!(decayed, 1);
+    let report = client.decay_project_synapses(r, &policy()).await.unwrap();
+    assert_eq!(report.decayed, 1);
     let mut w = raw
         .execute(
             query("MATCH (a:Note {project_id: $o})-[s:SYNAPSE]->() RETURN s.weight AS w")
@@ -616,10 +623,12 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         (energy_of(frozen.clone()).await.1 - 0.8).abs() < 1e-9,
         "dormant project: energy frozen"
     );
-    client.decay_synapses(0.1, 0.05).await.unwrap();
+    client.decay_synapses(&policy()).await.unwrap();
+    let dormant_pass = client.decay_project_synapses(d, &policy()).await.unwrap();
     assert_eq!(
-        client.decay_project_synapses(d, 0.1, 0.05).await.unwrap(),
-        (0, 0)
+        (dormant_pass.decayed, dormant_pass.archived),
+        (0, 0),
+        "a dormant project is frozen"
     );
     let mut w = raw
         .execute(
@@ -807,10 +816,7 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         execute_actions(
             &store,
             None,
-            &[HomeostasisAction::DecaySynapses {
-                amount: 0.1,
-                prune_threshold: 0.05,
-            }],
+            &[HomeostasisAction::DecaySynapses],
             ExecuteContext {
                 project_id: Some(h),
                 ..Default::default()

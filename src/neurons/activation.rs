@@ -2002,18 +2002,23 @@ mod tests {
             .await
             .unwrap();
 
-        // Apply heavy decay
-        let (decayed, _pruned) = store.decay_synapses(0.5, 0.1).await.unwrap();
-        assert!(decayed > 0, "Should have decayed some synapses");
+        // A forgetting pass weakens, it does not destroy: the legacy model
+        // pruned this weak link outright, the archive keeps it.
+        let policy = crate::neurons::forgetting::DecayPolicy::legacy(0.5, 0.1);
+        let report = store.decay_synapses(&policy).await.unwrap();
+        assert!(report.decayed > 0, "Should have decayed some synapses");
+        assert_eq!(
+            report.archived, 0,
+            "a fresh weak edge is weakened, never archived"
+        );
 
-        // The weak synapse (0.15 - 0.5 = -0.35) should be pruned
         let db_synapses_after = store.get_synapses(db_query.id).await.unwrap();
         let weak_link = db_synapses_after
             .iter()
             .find(|(id, _)| *id == auth_password.id);
         assert!(
-            weak_link.is_none(),
-            "Weak synapse should have been pruned after heavy decay"
+            weak_link.is_some(),
+            "a weak link survives the pass: forgetting archives, it never destroys"
         );
 
         // Strong synapses should survive (original 0.92 + boosts - 0.5 decay)
