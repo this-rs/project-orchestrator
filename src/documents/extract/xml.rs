@@ -8,7 +8,7 @@ use crate::neo4j::traits::*;
 /// hand, because Office also emits numeric references (`&#8217;` for a curly
 /// apostrophe) and those have to resolve the same way.
 pub(super) fn resolve_entity(reference: &quick_xml::events::BytesRef<'_>) -> Option<String> {
-    let name = reference.decode().ok()?;
+    let name: &str = reference;
     quick_xml::escape::unescape(&format!("&{name};"))
         .ok()
         .map(|s| s.into_owned())

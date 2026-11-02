@@ -215,46 +215,41 @@ fn extract_body_text(xml: &str, warnings: &mut Vec<String>) -> Result<String, Ex
             Ok(Event::Start(e)) => {
                 depth += 1;
                 match e.local_name().as_ref() {
-                    b"document" => saw_document_root = true,
-                    b"r" => in_run = true,
-                    b"t" => in_text_node = true,
-                    b"instrText" | b"delText" => skipped_hidden_runs += 1,
+                    "document" => saw_document_root = true,
+                    "r" => in_run = true,
+                    "t" => in_text_node = true,
+                    "instrText" | "delText" => skipped_hidden_runs += 1,
                     _ => {}
                 }
             }
             Ok(Event::End(e)) => {
                 depth = depth.saturating_sub(1);
                 match e.local_name().as_ref() {
-                    b"r" => in_run = false,
-                    b"t" => in_text_node = false,
+                    "r" => in_run = false,
+                    "t" => in_text_node = false,
                     // The paragraph break. Without it the whole document is one
                     // line and the sentence chunker downstream has nothing to
                     // cut on.
-                    b"p" => text.push('\n'),
+                    "p" => text.push('\n'),
                     _ => {}
                 }
             }
             // An empty `<w:document/>` is a real, if pointless, document.
-            Ok(Event::Empty(e)) if e.local_name().as_ref() == b"document" => {
+            Ok(Event::Empty(e)) if e.local_name().as_ref() == "document" => {
                 saw_document_root = true;
             }
             // The separators are empty elements, so they only ever arrive here.
             Ok(Event::Empty(e)) if in_run => match e.local_name().as_ref() {
-                b"tab" => text.push('\t'),
+                "tab" => text.push('\t'),
                 // `<w:br/>` is a soft line break inside a paragraph;
                 // `<w:cr/>` is the legacy carriage return with the same effect.
-                b"br" | b"cr" => text.push('\n'),
+                "br" | "cr" => text.push('\n'),
                 _ => {}
             },
-            Ok(Event::Text(e)) if in_text_node => match e.decode() {
-                Ok(decoded) => text.push_str(&decoded),
-                Err(err) => {
-                    // One unreadable run is not a reason to lose the document,
-                    // but losing it silently would poison every chunk built on
-                    // the result with no way for anyone to notice.
-                    warnings.push(format!("dropped an unreadable text run: {err}"));
-                }
-            },
+            // quick-xml 0.42 hands text out as `str` (the reader validates
+            // UTF-8 before it gets there), so there is no decode failure left
+            // to report here.
+            Ok(Event::Text(e)) if in_text_node => text.push_str(&e),
             // quick-xml splits text around entity references rather than
             // resolving them, so `R&amp;D` arrives as three events. Ignoring
             // this one would quietly delete the `&` from every company name and
@@ -263,7 +258,7 @@ fn extract_body_text(xml: &str, warnings: &mut Vec<String>) -> Result<String, Ex
                 Some(resolved) => text.push_str(&resolved),
                 None => warnings.push(format!(
                     "dropped an entity reference this parser cannot resolve: &{};",
-                    String::from_utf8_lossy(e.as_ref())
+                    &*e
                 )),
             },
             Ok(Event::Eof) => break,
