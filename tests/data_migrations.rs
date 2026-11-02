@@ -771,7 +771,7 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         let o = Uuid::new_v4();
         raw.run(
             query(
-                "CREATE (:Note {id: $x, project_id: $h})-[:SYNAPSE {weight: 0.5, source: 'coactivation'}]->(:Note {id: randomUUID(), project_id: $h})
+                "CREATE (:Note {id: $x, project_id: $h})-[:SYNAPSE {weight: 0.5, source: 'coactivation', created_at: datetime() - duration({days: 6})}]->(:Note {id: randomUUID(), project_id: $h})
                  CREATE (:Note {id: randomUUID(), project_id: $o})-[:SYNAPSE {weight: 0.5, source: 'coactivation'}]->(:Note {id: randomUUID(), project_id: $o})
                  CREATE (:Project {id: $h, slug: 'h-' + $h, name: 'h', root_path: '/tmp/h', last_synced: datetime()})
                  CREATE (:Project {id: $o, slug: 'o-' + $o, name: 'o', root_path: '/tmp/o', last_synced: datetime()})",
@@ -824,8 +824,10 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         )
         .await
         .unwrap();
+        // The decay is proportional to the edge's age now (6 days here), so
+        // the pass is judged on HALVING it, not on subtracting a fixed amount.
         assert!(
-            (weight_in(h).await.unwrap() - 0.3).abs() < 1e-9,
+            weight_in(h).await.unwrap() < 0.2,
             "corrected project decayed"
         );
         assert_eq!(weight_in(o).await, Some(0.5), "other projects untouched");
