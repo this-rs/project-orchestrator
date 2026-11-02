@@ -595,10 +595,7 @@ async fn unpinning_releases_the_edge_the_rule_drew_and_spares_a_hand_placed_one(
         }
         panic!("the unpinned note is still known by: {rules:?}");
     }
-    assert!(
-        known.notes.contains(&kept.id),
-        "the kept pin stays"
-    );
+    assert!(known.notes.contains(&kept.id), "the kept pin stays");
     assert!(
         known.notes.contains(&by_hand.id),
         "an edge the rule did not draw is not the rule's to remove"
