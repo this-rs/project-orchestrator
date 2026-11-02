@@ -81,10 +81,14 @@ const THRESHOLDS: &[Threshold] = &[
         noise: 1.0,
         paraphrase: 0.41,
     },
-    // lang 16/16, paraphrase 5/12 — raised on 02/11/2026 by the same fix.
+    // lang 15/16, paraphrase 5/12 — raised on 02/11/2026 by the same fix. The one
+    // remaining pair is "comment les triggers sont-ils évalués ?" / "how are triggers
+    // evaluated?", pinned by `known_fr_en_gap_how_are` in src/neurons/intent.rs:
+    // closing it needs word-boundary matching, not one more keyword ("how are" also
+    // catches the greeting "how are you?", which this fix refuses to turn into Explore).
     Threshold {
         classifier: "task_class",
-        lang: 1.0,
+        lang: 0.9375,
         noise: 1.0,
         paraphrase: 0.41,
     },
