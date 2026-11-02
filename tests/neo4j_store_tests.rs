@@ -2066,3 +2066,90 @@ async fn the_windowed_reads_only_return_what_is_inside_the_window() {
         .await
         .unwrap();
 }
+
+/// The windowed CALLS read (`get_call_edges_among`) is the function-level twin of the
+/// import one: the graph endpoint asks for the symbols it kept and used to receive every
+/// call of the project. Both ends must be inside the window for the edge to come back.
+#[tokio::test]
+async fn the_windowed_call_read_keeps_only_edges_inside_the_window() {
+    let client = store_or_skip!();
+    let store = &client as &dyn GraphStore;
+
+    let project = a_project();
+    store.create_project(&project).await.unwrap();
+    let root = project.slug.clone();
+
+    let caller_file = format!("{root}/caller.rs");
+    let callee_file = format!("{root}/callee.rs");
+    for path in [&caller_file, &callee_file] {
+        let file = FileNode {
+            path: path.clone(),
+            language: "rust".to_string(),
+            hash: "h".to_string(),
+            last_parsed: chrono::Utc::now(),
+            project_id: Some(project.id),
+        };
+        store.upsert_file(&file).await.unwrap();
+        store.link_file_to_project(path, project.id).await.unwrap();
+    }
+
+    // Names carry the project slug so `create_call_relationship`, which resolves the
+    // callee BY NAME, cannot bind to a function left by another test run.
+    let callee_name = format!("callee_{}", Uuid::new_v4().simple());
+    let caller_id = format!("{caller_file}::caller");
+    let callee_id = format!("{callee_file}::{callee_name}");
+    let a_function = |file_path: &str, name: &str| FunctionNode {
+        name: name.to_string(),
+        visibility: Visibility::Public,
+        params: Vec::new(),
+        return_type: None,
+        generics: Vec::new(),
+        is_async: false,
+        is_unsafe: false,
+        complexity: 1,
+        file_path: file_path.to_string(),
+        line_start: 1,
+        line_end: 2,
+        docstring: None,
+        owner: None,
+    };
+    store
+        .upsert_function(&a_function(&caller_file, "caller"))
+        .await
+        .unwrap();
+    store
+        .upsert_function(&a_function(&callee_file, &callee_name))
+        .await
+        .unwrap();
+    store
+        .create_call_relationship(&caller_id, &callee_name, Some(project.id), 1.0, "test")
+        .await
+        .unwrap();
+
+    let all = store.get_project_call_edges(project.id).await.unwrap();
+    assert_eq!(all.len(), 1, "the unfiltered read still sees the call");
+
+    let window = vec![caller_id.clone(), callee_id.clone()];
+    assert_eq!(
+        store
+            .get_call_edges_among(project.id, &window)
+            .await
+            .unwrap(),
+        vec![(caller_id.clone(), callee_id.clone())]
+    );
+
+    let narrow = vec![caller_id];
+    assert!(
+        store
+            .get_call_edges_among(project.id, &narrow)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a call whose callee left the window must not come back"
+    );
+
+    store
+        .delete_project(project.id, &project.name)
+        .await
+        .unwrap();
+}

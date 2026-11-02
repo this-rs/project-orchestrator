@@ -1009,6 +1009,76 @@ mod tests {
         assert!(nothing.is_empty(), "an empty window reads nothing");
     }
 
+    fn a_function(file_path: &str, name: &str) -> FunctionNode {
+        FunctionNode {
+            name: name.to_string(),
+            visibility: Visibility::Public,
+            params: Vec::new(),
+            return_type: None,
+            generics: Vec::new(),
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: file_path.to_string(),
+            line_start: 1,
+            line_end: 2,
+            docstring: None,
+            owner: None,
+        }
+    }
+
+    /// The windowed CALLS read keeps only the edges whose two ends are in the window.
+    #[tokio::test]
+    async fn the_windowed_call_read_keeps_only_edges_inside_the_window() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        for path in ["a.rs", "b.rs"] {
+            let file = FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "h".to_string(),
+                last_parsed: Utc::now(),
+                project_id: Some(project.id),
+            };
+            store.upsert_file(&file).await.unwrap();
+            store.link_file_to_project(path, project.id).await.unwrap();
+        }
+        store
+            .upsert_function(&a_function("a.rs", "caller"))
+            .await
+            .unwrap();
+        store
+            .upsert_function(&a_function("b.rs", "callee"))
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("a.rs::caller", "callee", Some(project.id), 1.0, "test")
+            .await
+            .unwrap();
+
+        let all = store.get_project_call_edges(project.id).await.unwrap();
+        assert_eq!(all.len(), 1, "the whole-project read still sees the call");
+
+        let window = vec!["a.rs::caller".to_string(), "b.rs::callee".to_string()];
+        assert_eq!(
+            store
+                .get_call_edges_among(project.id, &window)
+                .await
+                .unwrap(),
+            vec![("a.rs::caller".to_string(), "b.rs::callee".to_string())]
+        );
+
+        let narrow = vec!["a.rs::caller".to_string()];
+        assert!(
+            store
+                .get_call_edges_among(project.id, &narrow)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an edge whose callee left the window must not come back"
+        );
+    }
+
     /// The targeted DNA read answers `None` for a file that has no DNA — the mock has
     /// none by default, which is also the "analytics not run yet" case in production.
     #[tokio::test]
