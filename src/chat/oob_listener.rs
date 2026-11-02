@@ -1018,13 +1018,16 @@ impl AnnouncedBackground {
 /// The historical engine never needs this: the CLI starts that turn itself when a
 /// background tool of its own ends — which is what [`should_trigger_turn`] guards on
 /// the `Message` side. On the native engine PO **is** the harness, so nothing else
-/// would resume the session: the end of a `Bash run_in_background` (or of a `Monitor`,
-/// or the `TaskStop` that kills it) was mirrored, persisted and drawn, and the agent
-/// stayed idle until a human typed something.
+/// would resume the session: the end of a `Bash run_in_background` (or of a `Monitor`)
+/// was mirrored, persisted and drawn, and the agent stayed idle until a human typed
+/// something.
 ///
-/// What wakes: a task that reached a terminal state, and a line a `Monitor` matched —
-/// each announced ONCE per session ([`AnnouncedBackground`]). Nothing wakes for a task
-/// still running: its launch result already said so, inside the turn.
+/// What wakes: a task that ENDED on its own (`completed` / `failed`), and a line a
+/// `Monitor` matched — each announced ONCE per session ([`AnnouncedBackground`]).
+/// Nothing wakes for a task still running (its launch result already said so, inside
+/// the turn), and nothing wakes for a task somebody STOPPED: a `TaskStop`, the end of
+/// the session or a timeout spend no turn on a task the human or the agent has already
+/// given up on — the transcript shows it ending, the next turn reads it there.
 pub(crate) fn background_wake_lines(
     events: &[nexus_claude::agent::AgentEvent],
     announced: &mut AnnouncedBackground,
@@ -1040,8 +1043,9 @@ pub(crate) fn background_wake_lines(
                         BackgroundTaskStatus::Running => continue,
                         BackgroundTaskStatus::Completed => "completed",
                         BackgroundTaskStatus::Failed => "failed",
-                        // `TaskStop`, the end of the session, a timeout: it did not finish.
-                        BackgroundTaskStatus::Killed => "stopped",
+                        // `TaskStop`, the end of the session, a timeout: somebody already
+                        // gave up on it, the transcript says so, no turn is spent on it.
+                        BackgroundTaskStatus::Killed => continue,
                         _ => continue,
                     };
                     if !announced.first_time(format!("task:{}", task.id)) {
@@ -2072,6 +2076,37 @@ mod tests {
         let lines = background_wake_lines(&ended, &mut announced);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("failed"), "{}", lines[0]);
+    }
+
+    /// A task somebody STOPPED spends no turn: the agent or the human gave up on it,
+    /// the transcript shows it ending, the next turn reads it there.
+    #[test]
+    fn a_task_somebody_stopped_announces_nothing() {
+        use nexus_claude::agent::{AgentEvent, BackgroundTaskKind, BackgroundTaskStatus as Status};
+
+        let mut announced = AnnouncedBackground::default();
+        let stopped = vec![AgentEvent::BackgroundTasks {
+            tasks: vec![bg_task(
+                "bg-4",
+                BackgroundTaskKind::Shell,
+                Status::Killed,
+                "cargo test",
+            )],
+        }];
+        assert!(
+            background_wake_lines(&stopped, &mut announced).is_empty(),
+            "a killed task does not wake the session"
+        );
+        // A later completion of the same id (a retry reusing it) still wakes.
+        let retried = vec![AgentEvent::BackgroundTasks {
+            tasks: vec![bg_task(
+                "bg-5",
+                BackgroundTaskKind::Shell,
+                Status::Completed,
+                "cargo test",
+            )],
+        }];
+        assert_eq!(background_wake_lines(&retried, &mut announced).len(), 1);
     }
 
     /// A `Monitor` match is the tool whose whole point is to resume the agent.
