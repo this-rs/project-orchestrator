@@ -31,7 +31,7 @@ serde-saphyr = "2.0"
 # Manifest parsing for architecture derivation (src/architecture).
 # Pinned to 0.8 because that version is already resolved transitively — a wider
 # range would pull a second copy for no benefit.
-toml = "0.8"
+toml = "1.1"
 
 # Neo4j
 neo4rs = "0.8"
