@@ -3568,8 +3568,8 @@ pub async fn find_cross_project_twins(
     // Bounded selection. Every candidate used to become one `serde_json::Value`
     // (two owned strings plus an object, ~400 B) and be dropped by `truncate(top_n)`
     // afterwards: memory grew with the number of files in the whole workspace for a
-    // request that returns ten rows. Keep the best `top_n` compact hits and build the
-    // JSON only for the survivors.
+    // request that returns ten rows. `TopScored` keeps at most `top_n` hits alive; the
+    // JSON is built only for the survivors.
     struct TwinHit {
         path: String,
         project_slug: String,
@@ -3581,8 +3581,8 @@ pub async fn find_cross_project_twins(
         size_similarity: f64,
         shared_role: Option<String>,
     }
-    // Kept sorted by DESCENDING similarity, so the worst kept hit is the last one.
-    let mut best: Vec<TwinHit> = Vec::with_capacity(top_n.min(64) + 1);
+    let mut best: crate::graph::algorithms::TopScored<TwinHit> =
+        crate::graph::algorithms::TopScored::new(top_n);
     let mut total = 0usize;
 
     // Search across all other projects using multi-signal fusion
@@ -3616,21 +3616,8 @@ pub async fn find_cross_project_twins(
             let sim = compute_multi_signal_similarity(&source_file, &target_file);
             total += 1;
 
-            if top_n == 0 {
-                continue;
-            }
-            // A hit worse than the worst kept one cannot enter the top `top_n`.
-            if best.len() >= top_n
-                && best
-                    .last()
-                    .is_some_and(|hit| sim.similarity <= hit.similarity)
-            {
-                continue;
-            }
-
-            let position = best.partition_point(|hit| hit.similarity >= sim.similarity);
-            best.insert(
-                position,
+            best.offer(
+                sim.similarity,
                 TwinHit {
                     path: record.path.clone(),
                     project_slug: project.slug.clone(),
@@ -3643,13 +3630,11 @@ pub async fn find_cross_project_twins(
                     shared_role: sim.shared_role.clone(),
                 },
             );
-            if best.len() > top_n {
-                best.pop();
-            }
         }
     }
 
     let twins: Vec<serde_json::Value> = best
+        .into_items()
         .iter()
         .map(|hit| {
             serde_json::json!({

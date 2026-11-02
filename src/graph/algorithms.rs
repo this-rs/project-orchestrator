@@ -3230,6 +3230,59 @@ fn undirected_adjacency(
     adj
 }
 
+/// Bounded top-N accumulator, ordered by DESCENDING score.
+///
+/// Why a type and not a `sort` + `truncate`: the callers stream candidates that can
+/// number in the millions (every file of every project for the structural twins), and
+/// building the full list to keep ten rows is what made the endpoint allocate
+/// gigabytes. `offer` keeps at most `top_n` items alive at any time, so memory is
+/// `O(top_n)` and never `O(candidates)`. Ties keep the item seen first.
+pub struct TopScored<T> {
+    top_n: usize,
+    kept: Vec<(f64, T)>,
+}
+
+impl<T> TopScored<T> {
+    pub fn new(top_n: usize) -> Self {
+        // +1 so a full window can hold the challenger while it is positioned.
+        Self {
+            top_n,
+            kept: Vec::with_capacity(top_n.min(64) + 1),
+        }
+    }
+
+    /// Offer a candidate. Returns `true` when it entered the window.
+    pub fn offer(&mut self, score: f64, item: T) -> bool {
+        if self.top_n == 0 {
+            return false;
+        }
+        if self.kept.len() >= self.top_n
+            && self.kept.last().is_some_and(|(worst, _)| score <= *worst)
+        {
+            return false;
+        }
+        let position = self.kept.partition_point(|(kept, _)| *kept >= score);
+        self.kept.insert(position, (score, item));
+        if self.kept.len() > self.top_n {
+            self.kept.pop();
+        }
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.kept.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.kept.is_empty()
+    }
+
+    /// The kept items, best first.
+    pub fn into_items(self) -> Vec<T> {
+        self.kept.into_iter().map(|(_, item)| item).collect()
+    }
+}
+
 /// Find all pairs of nodes at distance exactly 2 (not directly connected).
 ///
 /// Algorithm: for each node, look at the neighbours of its neighbours, keep the nodes
@@ -6462,6 +6515,45 @@ mod tests {
             find_distance_2_3_pairs_bounded(&g, 0).is_empty(),
             "a zero cap yields no candidate rather than an unbounded sweep"
         );
+    }
+
+    /// `TopScored` is the bounded replacement for "collect everything, sort, truncate":
+    /// it must keep exactly the best `top_n`, best first, and never more than `top_n`
+    /// alive — the twins endpoint streams every file of every project through it.
+    #[test]
+    fn top_scored_keeps_the_best_n_and_drops_the_rest() {
+        let mut top: TopScored<&str> = TopScored::new(2);
+        assert!(top.offer(0.4, "quatre"));
+        assert!(top.offer(0.9, "neuf"));
+        assert_eq!(top.len(), 2);
+        assert!(top.offer(0.7, "sept"), "0.7 beats the worst kept (0.4)");
+        assert!(!top.offer(0.1, "un"), "0.1 cannot enter a full window");
+        assert_eq!(top.into_items(), vec!["neuf", "sept"]);
+    }
+
+    #[test]
+    fn top_scored_with_a_zero_window_keeps_nothing() {
+        let mut top: TopScored<&str> = TopScored::new(0);
+        assert!(!top.offer(1.0, "x"));
+        assert!(top.is_empty());
+        assert!(top.into_items().is_empty());
+    }
+
+    #[test]
+    fn top_scored_keeps_everything_when_there_are_fewer_candidates_than_the_window() {
+        let mut top: TopScored<u32> = TopScored::new(10);
+        top.offer(0.2, 1);
+        top.offer(0.8, 2);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top.into_items(), vec![2, 1]);
+    }
+
+    #[test]
+    fn top_scored_keeps_the_first_seen_on_a_tie() {
+        let mut top: TopScored<&str> = TopScored::new(1);
+        assert!(top.offer(0.5, "premier"));
+        assert!(!top.offer(0.5, "second"), "a tie does not evict");
+        assert_eq!(top.into_items(), vec!["premier"]);
     }
 
     /// The bounded batch scorer must agree with the single-pair scorer it replaced

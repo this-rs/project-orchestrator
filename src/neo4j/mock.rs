@@ -963,6 +963,65 @@ mod tests {
     use crate::test_helpers::{test_project, test_project_named};
     use chrono::Utc;
 
+    /// The windowed edge read must keep the edges whose BOTH ends are in the window:
+    /// the multi-layer graph endpoint asks for the files it kept and used to receive
+    /// every edge of the project, filtering afterwards in Rust.
+    #[tokio::test]
+    async fn the_windowed_import_read_keeps_only_the_edges_inside_the_window() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+
+        for path in ["a.rs", "b.rs", "c.rs"] {
+            let file = FileNode {
+                path: path.to_string(),
+                language: "rust".to_string(),
+                hash: "h".to_string(),
+                last_parsed: Utc::now(),
+                project_id: Some(project.id),
+            };
+            store.upsert_file(&file).await.unwrap();
+            store.link_file_to_project(path, project.id).await.unwrap();
+        }
+        store
+            .create_import_relationship("a.rs", "b.rs", "b")
+            .await
+            .unwrap();
+        store
+            .create_import_relationship("b.rs", "c.rs", "c")
+            .await
+            .unwrap();
+
+        let all = store.get_project_import_edges(project.id).await.unwrap();
+        assert_eq!(all.len(), 2, "the whole-project read still sees both edges");
+
+        let window = vec!["a.rs".to_string(), "b.rs".to_string()];
+        let inside = store
+            .get_import_edges_among(project.id, &window)
+            .await
+            .unwrap();
+        assert_eq!(
+            inside,
+            vec![("a.rs".to_string(), "b.rs".to_string())],
+            "b.rs -> c.rs leaves the window, so it must not come back"
+        );
+
+        let nothing = store.get_import_edges_among(project.id, &[]).await.unwrap();
+        assert!(nothing.is_empty(), "an empty window reads nothing");
+    }
+
+    /// The targeted DNA read answers `None` for a file that has no DNA — the mock has
+    /// none by default, which is also the "analytics not run yet" case in production.
+    #[tokio::test]
+    async fn the_targeted_dna_read_is_none_without_analytics() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        assert!(store
+            .get_file_structural_dna(&project.id.to_string(), "src/absent.rs")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     fn make_event(session_id: Uuid, seq: i64, event_type: &str, data: &str) -> ChatEventRecord {
         ChatEventRecord {
             id: Uuid::new_v4(),

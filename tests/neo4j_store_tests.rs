@@ -1979,3 +1979,90 @@ async fn refresh_token_rotation_is_single_use_and_carries_its_user() {
         .unwrap()
         .is_none());
 }
+
+// ===========================================================================
+// Windowed reads (memory): ask for a window, not for the project
+// ===========================================================================
+
+/// `get_import_edges_among` and `get_file_structural_dna` exist because the multi-layer
+/// graph endpoint used to load EVERY import edge and EVERY DNA vector of the project and
+/// keep only what fell inside the window it had been asked for. The filter now runs in
+/// Cypher, so what comes back is the window itself.
+#[tokio::test]
+async fn the_windowed_reads_only_return_what_is_inside_the_window() {
+    let client = store_or_skip!();
+    let store = &client as &dyn GraphStore;
+
+    let project = a_project();
+    store.create_project(&project).await.unwrap();
+    let root = project.slug.clone();
+
+    let a = format!("{root}/a.rs");
+    let b = format!("{root}/b.rs");
+    let c = format!("{root}/c.rs");
+    for path in [&a, &b, &c] {
+        let file = FileNode {
+            path: path.clone(),
+            language: "rust".to_string(),
+            hash: "h".to_string(),
+            last_parsed: chrono::Utc::now(),
+            project_id: Some(project.id),
+        };
+        store.upsert_file(&file).await.unwrap();
+        store.link_file_to_project(path, project.id).await.unwrap();
+    }
+    store.create_import_relationship(&a, &b, "b").await.unwrap();
+    store.create_import_relationship(&b, &c, "c").await.unwrap();
+
+    // The whole-project read still sees both edges.
+    let all = store.get_project_import_edges(project.id).await.unwrap();
+    assert_eq!(all.len(), 2, "the unfiltered read is unchanged");
+
+    // The window keeps only the edge whose two ends are inside it.
+    let window = vec![a.clone(), b.clone()];
+    let inside = store
+        .get_import_edges_among(project.id, &window)
+        .await
+        .unwrap();
+    assert_eq!(
+        inside,
+        vec![(a.clone(), b.clone())],
+        "b.rs -> c.rs leaves the window"
+    );
+
+    // An empty window reads nothing at all.
+    assert!(store
+        .get_import_edges_among(project.id, &[])
+        .await
+        .unwrap()
+        .is_empty());
+
+    // DNA: written for one file, read back for that file only.
+    store
+        .batch_update_structural_dna(&[project_orchestrator::graph::models::StructuralDnaUpdate {
+            path: a.clone(),
+            dna: vec![0.1, 0.9],
+        }])
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_file_structural_dna(&project.id.to_string(), &a)
+            .await
+            .unwrap(),
+        Some(vec![0.1, 0.9])
+    );
+    assert!(
+        store
+            .get_file_structural_dna(&project.id.to_string(), &c)
+            .await
+            .unwrap()
+            .is_none(),
+        "a file without DNA answers None, not an empty vector"
+    );
+
+    store
+        .delete_project(project.id, &project.name)
+        .await
+        .unwrap();
+}
