@@ -507,7 +507,8 @@ pub async fn get_project_graph(
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
 
     let requested_layers = parse_layers(&params.layers);
-    let limit = params.limit.unwrap_or(5000);
+    // Clamped: `limit` is user input and this endpoint materialises every layer.
+    let limit = params.effective_limit();
 
     let live: Vec<_> = match state.chat_manager.as_ref() {
         Some(cm) => cm.live_session_snapshot().await.live.into_iter().collect(),

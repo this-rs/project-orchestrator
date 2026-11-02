@@ -1678,7 +1678,8 @@ pub async fn get_workspace_graph(
     let projects = neo4j.list_workspace_projects(workspace.id).await?;
 
     let requested_layers = parse_layers(&params.layers);
-    let limit = params.limit.unwrap_or(5000);
+    // Spending happens once per project: the total is `limit × #projects`.
+    let limit = params.effective_workspace_limit();
     let live: Vec<_> = match state.chat_manager.as_ref() {
         Some(cm) => cm.live_session_snapshot().await.live.into_iter().collect(),
         None => Vec::new(),

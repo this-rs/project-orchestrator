@@ -86,6 +86,32 @@ pub struct GraphQuery {
     pub limit: Option<usize>,
 }
 
+/// Max nodes per layer for ONE project's graph. `limit` comes from the query string,
+/// so without a ceiling a client can ask for everything and turn a display endpoint
+/// into a full-table materialisation (the code layer alone can be millions of edges).
+pub const MAX_GRAPH_NODES_PER_LAYER: usize = 20_000;
+
+/// Default max nodes per layer when the query string says nothing.
+pub const DEFAULT_GRAPH_NODES_PER_LAYER: usize = 5_000;
+
+impl GraphQuery {
+    /// Per-layer budget of a single project's graph, clamped.
+    pub fn effective_limit(&self) -> usize {
+        self.limit
+            .unwrap_or(DEFAULT_GRAPH_NODES_PER_LAYER)
+            .min(MAX_GRAPH_NODES_PER_LAYER)
+    }
+
+    /// Per-layer budget for the workspace endpoint, which spends it ONCE PER PROJECT:
+    /// the real total is `limit × #projects`, so raising it above the default there
+    /// multiplies. Asking for less is honoured; asking for more stops at the default.
+    pub fn effective_workspace_limit(&self) -> usize {
+        self.limit
+            .unwrap_or(DEFAULT_GRAPH_NODES_PER_LAYER)
+            .min(DEFAULT_GRAPH_NODES_PER_LAYER)
+    }
+}
+
 /// Parse and validate the layers query parameter
 pub fn parse_layers(layers_param: &Option<String>) -> Vec<String> {
     match layers_param {
@@ -1440,6 +1466,54 @@ pub async fn collect_transverse_graph(
     Ok(build_transverse_graph(
         &notes, &skills, &protocols, &carriers,
     ))
+}
+
+#[cfg(test)]
+mod graph_limit_tests {
+    //! `limit` arrives from the query string and is spent on a full materialisation
+    //! of every requested layer, so it must be clamped: an unbounded value turns a
+    //! display endpoint into "load the whole graph". The workspace endpoint spends
+    //! its budget once PER PROJECT, hence the tighter ceiling there.
+    use super::*;
+
+    fn query(limit: Option<usize>) -> GraphQuery {
+        GraphQuery {
+            layers: None,
+            community: None,
+            limit,
+        }
+    }
+
+    #[test]
+    fn a_project_graph_shows_the_default_when_no_limit_is_asked() {
+        assert_eq!(
+            query(None).effective_limit(),
+            DEFAULT_GRAPH_NODES_PER_LAYER
+        );
+    }
+
+    #[test]
+    fn a_project_graph_budget_is_clamped_but_a_smaller_one_is_honoured() {
+        assert_eq!(query(Some(50)).effective_limit(), 50);
+        assert_eq!(
+            query(Some(usize::MAX)).effective_limit(),
+            MAX_GRAPH_NODES_PER_LAYER
+        );
+        assert_eq!(query(Some(0)).effective_limit(), 0);
+    }
+
+    #[test]
+    fn the_workspace_budget_never_exceeds_the_default_because_it_is_multiplied() {
+        assert_eq!(query(Some(50)).effective_workspace_limit(), 50);
+        assert_eq!(
+            query(Some(usize::MAX)).effective_workspace_limit(),
+            DEFAULT_GRAPH_NODES_PER_LAYER
+        );
+        assert_eq!(
+            query(None).effective_workspace_limit(),
+            DEFAULT_GRAPH_NODES_PER_LAYER
+        );
+    }
 }
 
 #[cfg(test)]
