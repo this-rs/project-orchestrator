@@ -2097,7 +2097,6 @@ async fn the_windowed_call_read_keeps_only_edges_inside_the_window() {
     // callee BY NAME, cannot bind to a function left by another test run.
     let callee_name = format!("callee_{}", Uuid::new_v4().simple());
     let caller_id = format!("{caller_file}::caller");
-    let callee_id = format!("{callee_file}::{callee_name}");
     let a_function = |file_path: &str, name: &str| FunctionNode {
         name: name.to_string(),
         visibility: Visibility::Public,
@@ -2129,16 +2128,19 @@ async fn the_windowed_call_read_keeps_only_edges_inside_the_window() {
     let all = store.get_project_call_edges(project.id).await.unwrap();
     assert_eq!(all.len(), 1, "the unfiltered read still sees the call");
 
-    let window = vec![caller_id.clone(), callee_id.clone()];
+    // The read reports the ids Neo4j computed (`file:name:line`), so the window is built
+    // from what the unfiltered read returned rather than from the ids we asked for.
+    let (caller_read_id, callee_read_id) = all[0].clone();
+    let window = vec![caller_read_id.clone(), callee_read_id.clone()];
     assert_eq!(
         store
             .get_call_edges_among(project.id, &window)
             .await
             .unwrap(),
-        vec![(caller_id.clone(), callee_id.clone())]
+        vec![(caller_read_id.clone(), callee_read_id)]
     );
 
-    let narrow = vec![caller_id];
+    let narrow = vec![caller_read_id];
     assert!(
         store
             .get_call_edges_among(project.id, &narrow)

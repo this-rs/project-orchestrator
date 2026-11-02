@@ -1059,16 +1059,20 @@ mod tests {
         let all = store.get_project_call_edges(project.id).await.unwrap();
         assert_eq!(all.len(), 1, "the whole-project read still sees the call");
 
-        let window = vec!["a.rs::caller".to_string(), "b.rs::callee".to_string()];
+        // The read reports function ids in the Neo4j shape (`file:name:line`), so the
+        // window is built from what the unfiltered read returned, never from a guess.
+        let (caller_func_id, callee_func_id) = all[0].clone();
+
+        let window = vec![caller_func_id.clone(), callee_func_id.clone()];
         assert_eq!(
             store
                 .get_call_edges_among(project.id, &window)
                 .await
                 .unwrap(),
-            vec![("a.rs::caller".to_string(), "b.rs::callee".to_string())]
+            vec![(caller_func_id.clone(), callee_func_id)]
         );
 
-        let narrow = vec!["a.rs::caller".to_string()];
+        let narrow = vec![caller_func_id];
         assert!(
             store
                 .get_call_edges_among(project.id, &narrow)
