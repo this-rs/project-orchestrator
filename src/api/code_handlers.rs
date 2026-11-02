@@ -4392,7 +4392,11 @@ mod tests {
 
     /// Build a test router with mock backends
     async fn test_app() -> axum::Router {
-        let app_state = mock_app_state();
+        test_app_on(mock_app_state()).await
+    }
+
+    /// The same router, over a state the caller has seeded.
+    async fn test_app_on(app_state: crate::AppState) -> axum::Router {
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -6788,6 +6792,114 @@ mod tests {
     // ====================================================================
     // POST /api/code/processes/detect — nonexistent project
     // ====================================================================
+
+    #[tokio::test]
+    async fn cross_project_twins_compare_same_language_files_of_the_other_projects() {
+        let (app_state, graph, _search) = crate::test_helpers::mock_app_state_with_stores();
+        let workspace = crate::test_helpers::test_workspace();
+        graph.create_workspace(&workspace).await.unwrap();
+
+        let mut source = crate::test_helpers::test_project_named("twins-source");
+        source.root_path = "/tmp/twins-source".to_string();
+        let mut other = crate::test_helpers::test_project_named("twins-other");
+        other.root_path = "/tmp/twins-other".to_string();
+        for project in [&source, &other] {
+            graph.create_project(project).await.unwrap();
+            graph
+                .add_project_to_workspace(workspace.id, project.id)
+                .await
+                .unwrap();
+        }
+
+        // Same fingerprint everywhere, so the file's own similarity is what varies. A zero
+        // WL hash means "not computed" and takes the other branch of the hash signal.
+        let fingerprint = vec![0.5; 17];
+        let record = |path: &str, wl_hash: u64| crate::graph::models::FileSignalRecord {
+            path: path.to_string(),
+            fingerprint: fingerprint.clone(),
+            wl_hash,
+            function_count: 3,
+        };
+        {
+            let mut signals = graph.file_signals.write().await;
+            signals.insert(source.id, vec![record("/tmp/twins-source/src/lib.rs", 7)]);
+            // The Python file is dropped by the language filter before any scoring.
+            signals.insert(
+                other.id,
+                vec![
+                    record("/tmp/twins-other/src/mod.rs", 7),
+                    record("/tmp/twins-other/src/zero.rs", 0),
+                    record("/tmp/twins-other/src/notes.py", 7),
+                ],
+            );
+        }
+
+        let app = test_app_on(app_state).await;
+        let response = app
+            .oneshot(auth_post(
+                "/api/code/structural-twins/cross-project",
+                serde_json::json!({
+                    "workspace_slug": workspace.slug,
+                    "source_project_slug": source.slug,
+                    "file_path": "src/lib.rs",
+                    "top_n": 5,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Two candidates survive the language filter; the source itself is never one.
+        assert_eq!(json["total"], 2, "{json}");
+        let twins = json["twins"].as_array().unwrap();
+        assert_eq!(twins.len(), 2, "{json}");
+        let mut paths: Vec<&str> = twins
+            .iter()
+            .map(|twin| twin["file_path"].as_str().unwrap())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            [
+                "/tmp/twins-other/src/mod.rs",
+                "/tmp/twins-other/src/zero.rs"
+            ]
+        );
+        assert!(twins.iter().all(|twin| twin["project_slug"] == other.slug));
+    }
+
+    #[tokio::test]
+    async fn structural_endpoints_accept_a_path_relative_to_the_project_root_or_absolute() {
+        // Both spellings reach the store resolved against the root. The mock holds no
+        // fingerprint or DNA for the file, so the answers are the empty ones: a 200 is the
+        // contract here, not a similarity.
+        for endpoint in ["/api/code/structural-twins", "/api/code/structural-profile"] {
+            for file_path in ["src/lib.rs", "/tmp/struct-twins/src/lib.rs"] {
+                let (app_state, graph, _search) = crate::test_helpers::mock_app_state_with_stores();
+                let mut project = crate::test_helpers::test_project_named("struct-twins");
+                project.root_path = "/tmp/struct-twins".to_string();
+                graph.create_project(&project).await.unwrap();
+
+                let app = test_app_on(app_state).await;
+                let response = app
+                    .oneshot(auth_post(
+                        endpoint,
+                        serde_json::json!({
+                            "project_slug": project.slug,
+                            "file_path": file_path,
+                            "top_n": 3,
+                        }),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{endpoint} {file_path}");
+            }
+        }
+    }
 
     /// Create an authenticated POST request with JSON body
     fn auth_post(uri: &str, body: serde_json::Value) -> Request<Body> {

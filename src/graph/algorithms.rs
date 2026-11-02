@@ -3529,12 +3529,9 @@ fn candidate_signals(
             }
         }
     }
+    // An empty union means both nodes are isolated: 0 / 1 = 0, with no branch to miss.
     let union_count = source_neighbors.len() + target_neighbors.len() - common_count;
-    let jaccard = if union_count > 0 {
-        common_count as f64 / union_count as f64
-    } else {
-        0.0
-    };
+    let jaccard = common_count as f64 / union_count.max(1) as f64;
 
     let source_id = &g[source].id;
     let target_id = &g[target].id;
@@ -3563,13 +3560,22 @@ fn candidate_signals(
     }
 }
 
+/// Adamic-Adar of one pair, normalized by the batch maximum.
+///
+/// When the batch maximum is 0 every candidate's raw sum is 0 too (each one is a
+/// non-negative term), so the fallback only ever sees 0 in practice; it is kept so
+/// the value never exceeds 1 whatever the caller passes.
+fn normalize_adamic(raw: f64, max_adamic_adar: f64) -> f64 {
+    if max_adamic_adar > 0.0 {
+        raw / max_adamic_adar
+    } else {
+        raw.min(1.0)
+    }
+}
+
 /// Weighted fusion of the five signals, Adamic-Adar normalized across the batch.
 fn fuse_candidate_signals(signals: &CandidateSignals, max_adamic_adar: f64) -> f64 {
-    let adamic_adar = if max_adamic_adar > 0.0 {
-        signals.adamic_adar / max_adamic_adar
-    } else {
-        signals.adamic_adar.min(1.0)
-    };
+    let adamic_adar = normalize_adamic(signals.adamic_adar, max_adamic_adar);
     0.25 * signals.jaccard
         + 0.30 * signals.co_change
         + 0.15 * CANDIDATE_PROXIMITY
@@ -3649,11 +3655,7 @@ pub fn suggest_missing_links(
             let signals = &raw[index];
             let source = NodeIndex::new(signals.source as usize);
             let target = NodeIndex::new(signals.target as usize);
-            let adamic_adar = if max_adamic_adar > 0.0 {
-                signals.adamic_adar / max_adamic_adar
-            } else {
-                signals.adamic_adar
-            };
+            let adamic_adar = normalize_adamic(signals.adamic_adar, max_adamic_adar);
             super::models::LinkPrediction {
                 source: g[source].id.clone(),
                 target: g[target].id.clone(),
@@ -6613,13 +6615,15 @@ mod tests {
             // Every signal but Adamic-Adar is compared to the single-pair scorer
             // verbatim; Adamic-Adar is batch-normalized (that is the batch contract).
             for name in ["jaccard", "co_change", "dna_similarity"] {
+                // Read both values on their own lines: the message is only built on a
+                // failure, and a failing branch no passing run ever reaches is not covered.
+                let batch_value = signal(prediction, name);
+                let single_value = signal(&single, name);
                 assert!(
-                    (signal(&single, name) - signal(prediction, name)).abs() < 1e-9,
-                    "{} -> {}, signal {name}: batch {} vs single {}",
+                    (single_value - batch_value).abs() < 1e-9,
+                    "{} -> {}, signal {name}: batch {batch_value} vs single {single_value}",
                     prediction.source,
                     prediction.target,
-                    signal(prediction, name),
-                    signal(&single, name)
                 );
             }
 
@@ -8635,5 +8639,80 @@ mod tests {
             "Normal files should have discriminable risk scores (spread={}), not all crushed to same value",
             risk_spread
         );
+    }
+
+    #[test]
+    fn normalize_adamic_divides_by_the_batch_maximum_and_caps_without_one() {
+        // With a batch maximum, the raw sum is divided by it: the best pair gets 1.
+        assert!((normalize_adamic(0.5, 2.0) - 0.25).abs() < 1e-12);
+        assert!((normalize_adamic(2.0, 2.0) - 1.0).abs() < 1e-12);
+        // Without one (maximum 0, so every raw sum is 0 too) the value is only capped.
+        assert_eq!(normalize_adamic(0.0, 0.0), 0.0);
+        assert!((normalize_adamic(0.7, 0.0) - 0.7).abs() < 1e-12);
+        assert_eq!(normalize_adamic(3.0, 0.0), 1.0);
+    }
+
+    /// A graph whose nodes are added in the order given (so that the index of each id is
+    /// its position in `nodes`), with one `Calls` edge per pair in `edges`.
+    fn small_graph(nodes: &[&str], edges: &[(&str, &str)]) -> CodeGraph {
+        let mut g = CodeGraph::new();
+        for name in nodes {
+            g.add_node(CodeNode {
+                id: name.to_string(),
+                node_type: CodeNodeType::Function,
+                path: None,
+                name: name.to_string(),
+                project_id: None,
+            });
+        }
+        for (from, to) in edges {
+            g.add_edge(
+                from,
+                to,
+                CodeEdge {
+                    edge_type: CodeEdgeType::Calls,
+                    weight: 1.0,
+                },
+            );
+        }
+        g
+    }
+
+    #[test]
+    fn candidate_signals_merges_neighbour_lists_whose_first_entry_is_lower() {
+        // Target B has a neighbour (X, index 0) below the one it shares with the source
+        // (S, index 2): the merge must skip X before it meets S.
+        let g = small_graph(
+            &["X", "Z", "S", "A", "B"],
+            &[("X", "Z"), ("S", "A"), ("S", "B"), ("X", "B")],
+        );
+        let adj = undirected_adjacency(&g.graph);
+        let source = g.id_to_index["A"];
+        let target = g.id_to_index["B"];
+        let co_change: HashMap<(&str, &str), f64> = HashMap::new();
+
+        let sig = candidate_signals(&g, &adj, &co_change, None, source, target);
+
+        // A = {S}, B = {S, X}: one common neighbour out of two distinct ones.
+        assert!((sig.jaccard - 0.5).abs() < 1e-12, "jaccard {}", sig.jaccard);
+        // S has degree 2, so its Adamic-Adar term is 1 / ln(2).
+        let expected = 1.0 / 2f64.ln();
+        assert!(
+            (sig.adamic_adar - expected).abs() < 1e-9,
+            "adamic {}",
+            sig.adamic_adar
+        );
+    }
+
+    #[test]
+    fn suggest_missing_links_is_empty_when_asked_for_none_or_when_nothing_is_a_candidate() {
+        // top_n = 0: nothing to return, whatever the graph.
+        let g = small_graph(&["A", "B", "C"], &[("A", "B"), ("B", "C")]);
+        let co_change: HashMap<(String, String), f64> = HashMap::new();
+        assert!(suggest_missing_links(&g, &co_change, None, 0, 0.0).is_empty());
+
+        // A single edge has no pair at distance 2 or 3: no candidate at all.
+        let single = small_graph(&["P", "Q"], &[("P", "Q")]);
+        assert!(suggest_missing_links(&single, &co_change, None, 10, 0.0).is_empty());
     }
 }

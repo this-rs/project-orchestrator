@@ -625,6 +625,20 @@ pub struct EmbeddingsProjectionResponse {
 /// that a canvas cannot render anyway.
 pub const MAX_PROJECTION_POINTS: usize = 5_000;
 
+/// Log that a projection was capped: a read that came back exactly at the limit may have
+/// dropped notes, so the operator is told rather than shown a silently partial picture.
+fn warn_if_projection_truncated(slug: &str, returned: usize, limit: usize) -> bool {
+    let truncated = returned >= limit;
+    if truncated {
+        tracing::warn!(
+            project = %slug,
+            limit,
+            "embeddings projection truncated: the project has more notes than the cap"
+        );
+    }
+    truncated
+}
+
 /// GET /api/projects/:slug/embeddings/projection?dimensions=2|3
 ///
 /// Projects note embeddings from high-dimensional space (768d) to 2D or 3D
@@ -654,13 +668,7 @@ pub async fn get_embeddings_projection(
     let embedding_points = neo4j
         .get_note_embeddings_for_project(pid, MAX_PROJECTION_POINTS)
         .await?;
-    if embedding_points.len() == MAX_PROJECTION_POINTS {
-        tracing::warn!(
-            project = %slug,
-            limit = MAX_PROJECTION_POINTS,
-            "embeddings projection truncated: the project has more notes than the cap"
-        );
-    }
+    warn_if_projection_truncated(&slug, embedding_points.len(), MAX_PROJECTION_POINTS);
 
     if embedding_points.is_empty() {
         return Ok(Json(EmbeddingsProjectionResponse {
@@ -1925,6 +1933,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), AxumStatus::NOT_FOUND);
+    }
+
+    /// A read that comes back at the limit is reported as truncated; a smaller one is not.
+    #[test]
+    fn a_read_at_the_limit_is_reported_as_truncated_and_a_smaller_one_is_not() {
+        assert!(warn_if_projection_truncated("p", 5, 5));
+        assert!(warn_if_projection_truncated("p", 6, 5));
+        assert!(!warn_if_projection_truncated("p", 4, 5));
+    }
+
+    #[tokio::test]
+    async fn test_embeddings_projection_refuses_any_dimension_but_2_or_3() {
+        let app_state = mock_app_state();
+        let project = seed_projection_project(&app_state).await;
+
+        let state = state_from_app(app_state).await;
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(authed_get(&format!(
+                "/api/projects/{}/embeddings/projection?dimensions=4",
+                project.slug
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::BAD_REQUEST);
     }
 
     /// The cap is part of the contract: a client must be able to tell a small project

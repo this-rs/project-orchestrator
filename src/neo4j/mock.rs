@@ -260,6 +260,9 @@ pub struct MockGraphStore {
     /// (and `create_project` sets for a new project). Absent: canonical form.
     pub paths_declared: RwLock<HashMap<Uuid, bool>>,
     pub file_symbols: RwLock<HashMap<String, Vec<String>>>,
+    /// Per-project file signals (`get_project_file_signals`): seeded by tests, read back
+    /// as the Neo4j query would return them.
+    pub file_signals: RwLock<HashMap<Uuid, Vec<crate::graph::models::FileSignalRecord>>>,
     pub task_files: RwLock<HashMap<Uuid, Vec<String>>>,
     pub task_commits: RwLock<HashMap<Uuid, Vec<String>>>,
     pub plan_commits: RwLock<HashMap<Uuid, Vec<String>>>,
@@ -528,6 +531,7 @@ impl MockGraphStore {
             project_files: RwLock::new(HashMap::new()),
             paths_declared: RwLock::new(HashMap::new()),
             file_symbols: RwLock::new(HashMap::new()),
+            file_signals: RwLock::new(HashMap::new()),
             task_files: RwLock::new(HashMap::new()),
             task_commits: RwLock::new(HashMap::new()),
             plan_commits: RwLock::new(HashMap::new()),
@@ -14329,10 +14333,14 @@ impl AnalyticsStore for MockGraphStore {
 
     async fn get_project_file_signals(
         &self,
-        _project_id: &str,
+        project_id: &str,
     ) -> anyhow::Result<Vec<crate::graph::models::FileSignalRecord>> {
-        // Mock: no file signals in tests by default
-        Ok(vec![])
+        // Mock: none unless a test seeded `file_signals`.
+        let signals = self.file_signals.read().await;
+        Ok(Uuid::parse_str(project_id)
+            .ok()
+            .and_then(|id| signals.get(&id).cloned())
+            .unwrap_or_default())
     }
 
     async fn write_predicted_links(
