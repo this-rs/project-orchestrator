@@ -387,8 +387,18 @@ async fn run_agent_knows_project(graph: &dyn GraphStore) -> anyhow::Result<RuleO
     let projects = match graph.list_projects().await {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!(error = %e, "project list unreadable: no project foundation this run");
-            Vec::new()
+            // NE PAS réconcilier sur une lecture ratée : un `keep` vide effacerait tout le
+            // socle de projet à cause d'une erreur transitoire. Une lecture incomplète ne
+            // détruit rien ; elle dit qu'elle n'a pas pu lire, et laisse l'état en place.
+            tracing::warn!(error = %e, "project list unreadable: foundation left untouched");
+            return Ok(RuleOutcome {
+                name: AGENT_KNOWS_PROJECT.name.to_string(),
+                measure: format!(
+                    "non réconciliée : la liste des projets est illisible ({e}) — le socle \
+                     existant est laissé en place"
+                ),
+                ..Default::default()
+            });
         }
     };
     let total = projects.len();
@@ -568,9 +578,12 @@ async fn run_agent_uses_activated(
 /// The pins of every scope: the instance's own, then each project's. A project scope is
 /// read through its slug, which is what [`crate::chat::stages::knowledge_injection`]
 /// keys the setting by.
+/// Les épingles de toutes les portées. Le booléen dit si la lecture est COMPLÈTE : sans la
+/// liste des projets, les portées de projet manquent, et réconcilier sur ce `keep` partiel
+/// effacerait leurs arêtes.
 async fn pinned_notes_everywhere(
     graph: &dyn GraphStore,
-) -> anyhow::Result<(Vec<(Uuid, Option<Uuid>)>, usize)> {
+) -> anyhow::Result<(Vec<(Uuid, Option<Uuid>)>, usize, bool)> {
     use crate::chat::stages::knowledge_injection::load_pinned_notes;
 
     let mut scopes: Vec<Option<(String, Uuid)>> = vec![None];
@@ -578,6 +591,7 @@ async fn pinned_notes_everywhere(
     // holds a project the mapper cannot read (a foreign suite left a bare `(:Project)` without
     // `name`/`slug`) must not kill the rule over it — « never fail without a socle »: the
     // global pins are still applied, the unreadable scopes are said, not silently skipped.
+    let mut complete = true;
     match graph.list_projects().await {
         Ok(projects) => {
             for project in projects {
@@ -585,6 +599,7 @@ async fn pinned_notes_everywhere(
             }
         }
         Err(e) => {
+            complete = false;
             tracing::warn!(error = %e, "project pin scopes are unreadable: only the global pins are read");
         }
     }
@@ -604,7 +619,7 @@ async fn pinned_notes_everywhere(
             }
         }
     }
-    Ok((ids, read))
+    Ok((ids, read, complete))
 }
 
 async fn run_agent_knows_core(graph: &dyn GraphStore) -> anyhow::Result<RuleOutcome> {
@@ -614,7 +629,7 @@ async fn run_agent_knows_core(graph: &dyn GraphStore) -> anyhow::Result<RuleOutc
     // that should have been written to. Measured: the primitive MATCHes both ends, so a
     // missing subject is a silent no-op.
     graph.ensure_agent(self_id, None).await?;
-    let (ids, scopes) = pinned_notes_everywhere(graph).await?;
+    let (ids, scopes, complete) = pinned_notes_everywhere(graph).await?;
 
     let measure = format!("{scopes} portées lues, {} note(s) épinglée(s)", ids.len());
     let provenance = Provenance::new(AGENT_KNOWS_CORE.name, measure.clone());
@@ -623,9 +638,14 @@ async fn run_agent_knows_core(graph: &dyn GraphStore) -> anyhow::Result<RuleOutc
     // before the new set is attested. The reverse order would leave, for one instant, a
     // self that knows both what it declares and what it dropped.
     let keep: Vec<Uuid> = ids.iter().map(|(id, _)| *id).collect();
-    let released = graph
-        .release_agent_knows(self_id, AGENT_KNOWS_CORE.name, &keep)
-        .await?;
+    // Même règle que pour les projets : une lecture incomplète ne supprime rien.
+    let released = if complete {
+        graph
+            .release_agent_knows(self_id, AGENT_KNOWS_CORE.name, &keep)
+            .await?
+    } else {
+        0
+    };
 
     let mut written = 0;
     let mut skipped = 0;
@@ -650,11 +670,13 @@ async fn run_agent_knows_core(graph: &dyn GraphStore) -> anyhow::Result<RuleOutc
         }
     }
 
-    let measure = if released > 0 {
-        format!("{measure}, {released} arête(s) libérée(s)")
-    } else {
-        measure
-    };
+    let mut measure = measure;
+    if !complete {
+        measure.push_str(" — lecture incomplète : aucune arête libérée");
+    }
+    if released > 0 {
+        measure.push_str(&format!(", {released} arête(s) libérée(s)"));
+    }
 
     Ok(RuleOutcome {
         name: AGENT_KNOWS_CORE.name.to_string(),
@@ -714,6 +736,53 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::*;
+
+    /// Une lecture ratée ne doit RIEN détruire : la réconciliation est sautée, pas
+    /// appliquée sur un `keep` vide — sinon une erreur transitoire effacerait le socle.
+    #[tokio::test]
+    async fn a_failed_project_list_wipes_nothing() {
+        let graph = MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&project).await.unwrap();
+        let note = a_note("a foundation");
+        graph.create_note(&note).await.unwrap();
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        let prov = Provenance::scored(AGENT_KNOWS_PROJECT.name, "posée à la main", 42.0);
+        graph
+            .link_agent_knows(
+                self_id,
+                note.id,
+                KnowledgeScope::Project,
+                Some(project.id),
+                &prov,
+            )
+            .await
+            .unwrap();
+
+        graph
+            .fail_list_projects
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let outcome = run(&graph, &[AGENT_KNOWS_PROJECT.name]).await.unwrap();
+        graph
+            .fail_list_projects
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let outcome = outcome.of(AGENT_KNOWS_PROJECT.name).unwrap();
+        assert_eq!(
+            outcome.released, 0,
+            "aucune suppression sur une lecture ratée"
+        );
+        assert!(outcome.measure.contains("illisible"), "{}", outcome.measure);
+        assert_eq!(
+            graph
+                .agent_knows(self_id, Some(project.id), 10)
+                .await
+                .unwrap()
+                .notes,
+            vec![note.id],
+            "l'arête est toujours là"
+        );
+    }
 
     #[test]
     fn every_rule_is_accountable_before_it_runs() {

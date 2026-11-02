@@ -239,6 +239,9 @@ pub struct MockGraphStore {
     /// Makes every `create_chat_session` fail once set (a session written after it, such as
     /// the mirror of a sub-agent, is lost; the sessions already written are untouched).
     pub fail_session_writes: std::sync::atomic::AtomicBool,
+    /// Fait échouer `list_projects` : c'est ce qui prouve qu'une lecture ratée ne DÉTRUIT
+    /// pas le socle (la réconciliation est sautée, pas appliquée sur un `keep` vide).
+    pub fail_list_projects: std::sync::atomic::AtomicBool,
     /// Race injection: once `get_session_children(parent)` has answered, the
     /// sessions queued here under `parent` are written — a delegation that lands
     /// just after its parent's children were listed (B36 cascade).
@@ -506,6 +509,7 @@ impl MockGraphStore {
             agent_uses: RwLock::new(HashMap::new()),
             synapses: RwLock::new(HashMap::new()),
             fail_session_writes: std::sync::atomic::AtomicBool::new(false),
+            fail_list_projects: std::sync::atomic::AtomicBool::new(false),
             land_children_after_read: std::sync::Mutex::new(HashMap::new()),
             plan_tasks: RwLock::new(HashMap::new()),
             task_steps: RwLock::new(HashMap::new()),
@@ -6276,6 +6280,12 @@ impl ProjectStore for MockGraphStore {
     }
 
     async fn list_projects(&self) -> Result<Vec<ProjectNode>> {
+        if self
+            .fail_list_projects
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            anyhow::bail!("list_projects is set to fail (test)");
+        }
         Ok(self.projects.read().await.values().cloned().collect())
     }
 
