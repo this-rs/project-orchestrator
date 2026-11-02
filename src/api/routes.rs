@@ -1351,6 +1351,12 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/knowledge/pinned-notes",
             get(note_handlers::get_pinned_notes).put(note_handlers::put_pinned_notes),
         )
+        // What a person is asked to declare, and what the prompt will really carry of it
+        // (read-only: the declaration itself goes through `pinned-notes`).
+        .route(
+            "/api/knowledge/self-core",
+            get(note_handlers::get_self_core),
+        )
         .route(
             "/api/notes/{note_id}",
             get(note_handlers::get_note)

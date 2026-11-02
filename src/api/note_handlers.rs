@@ -351,6 +351,165 @@ pub async fn put_pinned_notes(
     }))
 }
 
+// ============================================================================
+// The declared core of the self
+// ============================================================================
+
+/// One note of the foundation, with what the prompt would REALLY carry of it.
+#[derive(Debug, Serialize)]
+pub struct SelfCoreNote {
+    pub id: Uuid,
+    pub note_type: String,
+    pub importance: String,
+    /// Characters of the note as written (the prompt keeps far fewer).
+    pub chars: usize,
+    /// The line the prompt carries — already flattened and capped, like the renderer.
+    pub entry: String,
+    /// Whether that line fits in the budget, IN THIS ORDER.
+    pub lands: bool,
+}
+
+/// `GET /api/knowledge/self-core[?project=<slug>]` — what a person is asked to declare.
+///
+/// The declared core is a human act (`pinned_notes_human_only`): this route only READS.
+/// It publishes the two things a screen cannot guess and that decide everything:
+/// how many characters the foundation really gets (`max_content_chars / 2` at the
+/// project's scaffolding level), and how many characters of ONE note the prompt keeps.
+/// A core written for 4 000 characters lands as two lines of 300 — saying it is the
+/// whole point of this endpoint.
+#[derive(Debug, Serialize)]
+pub struct SelfCoreView {
+    /// Always `global`: the core of the self is not a project's foundation.
+    pub scope: String,
+    /// The scaffolding level the budget was read at (L4, the strictest, without a project).
+    pub level: u8,
+    /// Characters the foundation section gets.
+    pub budget_chars: usize,
+    /// Characters of one note the prompt keeps.
+    pub note_char_cap: usize,
+    /// Most notes a foundation may hold — the screen refuses the same bound.
+    pub max_notes: usize,
+    /// The declared core, in order, with what lands of it.
+    pub pinned: Vec<SelfCoreNote>,
+    /// What is proposed when nothing is declared: global, active, critical notes tagged
+    /// `self`. A PROPOSAL, never an injection — the person still declares.
+    pub candidates: Vec<SelfCoreNote>,
+    /// How many entries of `pinned` (or of `candidates`, when nothing is declared) land.
+    pub slots_used: usize,
+}
+
+pub async fn get_self_core(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<PinnedNotesQuery>,
+) -> Result<Json<SelfCoreView>, AppError> {
+    use crate::chat::stages::knowledge_injection::{
+        foundation_entry, foundation_landing, load_pinned_notes, scaffolding_config,
+        PINNED_NOTE_CHARS,
+    };
+    const SELF_TAG: &str = "self";
+    const SELF_CORE_MAX_NOTES: usize = 10;
+
+    let graph = state.orchestrator.neo4j();
+    let project = query.project.as_deref();
+
+    // The budget the turn will really use. Without a project, publish the STRICTEST
+    // level: a generous guess would promise a room the prompt does not have.
+    let level = match project {
+        Some(slug) => {
+            let p = graph
+                .get_project_by_slug(slug)
+                .await
+                .map_err(AppError::Internal)?
+                .ok_or_else(|| AppError::NotFound(format!("Project {slug} not found")))?;
+            graph
+                .compute_scaffolding_level(p.id, None)
+                .await
+                .map_err(AppError::Internal)?
+                .level
+        }
+        None => 4,
+    };
+    let budget_chars = scaffolding_config(level).max_content_chars / 2;
+
+    // The declared core, read exactly as the injection reads it: the GLOBAL pins.
+    let mut pinned_notes: Vec<Note> = Vec::new();
+    for id in load_pinned_notes(graph, None)
+        .await
+        .map_err(AppError::Internal)?
+    {
+        if let Some(note) = graph.get_note(id).await.map_err(AppError::Internal)? {
+            pinned_notes.push(note);
+        }
+    }
+
+    // Nothing declared: propose the kernel. Global, active, critical, tagged `self` —
+    // the shape the subject's own notes have, not a ranking of every note in the graph.
+    let mut candidate_notes: Vec<Note> = Vec::new();
+    if pinned_notes.is_empty() {
+        let filters = NoteFilters {
+            status: Some(vec![NoteStatus::Active]),
+            importance: Some(vec![NoteImportance::Critical]),
+            tags: Some(vec![SELF_TAG.to_string()]),
+            global_only: Some(true),
+            limit: Some(SELF_CORE_MAX_NOTES as i64),
+            sort_by: Some("energy".to_string()),
+            sort_order: Some("desc".to_string()),
+            ..NoteFilters::default()
+        };
+        candidate_notes = graph
+            .list_notes(None, None, &filters)
+            .await
+            .map_err(AppError::Internal)?
+            .0;
+    }
+
+    let view = |notes: &[Note]| -> (Vec<SelfCoreNote>, usize) {
+        let entries: Vec<String> = notes
+            .iter()
+            .map(|n| {
+                foundation_entry(
+                    &format!("{:?}", n.note_type),
+                    &format!("{:?}", n.importance),
+                    &n.content,
+                )
+            })
+            .collect();
+        let (fits, _) = foundation_landing(&entries, budget_chars);
+        let rows = notes
+            .iter()
+            .zip(entries.iter())
+            .enumerate()
+            .map(|(i, (n, e))| SelfCoreNote {
+                id: n.id,
+                note_type: format!("{:?}", n.note_type).to_lowercase(),
+                importance: format!("{:?}", n.importance).to_lowercase(),
+                chars: n.content.chars().count(),
+                entry: e.clone(),
+                lands: i < fits,
+            })
+            .collect();
+        (rows, fits)
+    };
+
+    let (pinned, pinned_fit) = view(&pinned_notes);
+    let (candidates, candidate_fit) = view(&candidate_notes);
+
+    Ok(Json(SelfCoreView {
+        scope: "global".to_string(),
+        level,
+        budget_chars,
+        note_char_cap: PINNED_NOTE_CHARS,
+        max_notes: SELF_CORE_MAX_NOTES,
+        pinned,
+        candidates,
+        slots_used: if pinned_notes.is_empty() {
+            candidate_fit
+        } else {
+            pinned_fit
+        },
+    }))
+}
+
 /// Create a new note
 pub async fn create_note(
     State(state): State<OrchestratorState>,

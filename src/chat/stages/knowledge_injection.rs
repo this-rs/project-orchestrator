@@ -256,6 +256,41 @@ pub const MAX_PINNED_NOTES: usize = 10;
 /// the turn goes on without them, and the ranked knowledge is not lost with them.
 const PINNED_NOTES_BUDGET: Duration = Duration::from_millis(500);
 
+/// Characters of ONE foundation note that reach the prompt.
+///
+/// The renderer flattens a note (newlines become spaces) and cuts it here: a longer note
+/// is a note whose tail nobody reads. The panel that lets a person declare the core reads
+/// the SAME constant, so what it promises and what the prompt carries cannot drift.
+pub const PINNED_NOTE_CHARS: usize = 300;
+
+/// One line of the foundation, EXACTLY as the renderer writes it.
+pub fn foundation_entry(note_type: &str, importance: &str, content: &str) -> String {
+    format!(
+        "- **[{}|{}]** {}\n",
+        note_type.to_lowercase(),
+        importance.to_lowercase(),
+        truncate_content(content, PINNED_NOTE_CHARS),
+    )
+}
+
+/// What the foundation carries within `budget`: how many entries land, and their size.
+///
+/// It STOPS at the first entry that does not fit; it does not skip it and continue,
+/// because the renderer does not either. Sizes are bytes, like the renderer's.
+pub fn foundation_landing(entries: &[String], budget: usize) -> (usize, usize) {
+    let mut kept = 0usize;
+    let mut chars = 0usize;
+    for entry in entries {
+        let len = entry.len();
+        if chars + len > budget {
+            break;
+        }
+        chars += len;
+        kept += 1;
+    }
+    (kept, chars)
+}
+
 /// The settings scope of the pins: `global` (every session) or `project:<slug>`, the
 /// convention of the per-project consents. Keyed by slug like them: a renamed project
 /// leaves its pins behind, and a slug reused by a new project finds the old ones (the
@@ -727,20 +762,14 @@ impl KnowledgeInjectionStage {
         // Half the knowledge budget at most: the pins come first, they must not leave
         // nothing to the ranked notes the message asked for.
         let budget = max_content_chars / 2;
+        let entries: Vec<String> = kept
+            .iter()
+            .map(|note| foundation_entry(&note.note_type, &note.importance, &note.content))
+            .collect();
+        let (fits, _chars_used) = foundation_landing(&entries, budget);
         let mut group = String::new();
-        let mut chars_used = 0;
-        for note in &kept {
-            let entry = format!(
-                "- **[{}|{}]** {}\n",
-                note.note_type.to_lowercase(),
-                note.importance.to_lowercase(),
-                truncate_content(&note.content, 300),
-            );
-            if chars_used + entry.len() > budget {
-                break;
-            }
-            group.push_str(&entry);
-            chars_used += entry.len();
+        for (note, entry) in kept.iter().zip(entries.iter()).take(fits) {
+            group.push_str(entry);
             injected.insert(note.id.clone());
         }
         if group.is_empty() {
@@ -1768,7 +1797,7 @@ fn untrusted_group(source: &str, entries: &str, project: Option<&str>) -> String
 }
 
 /// Truncate content to a maximum number of characters, adding ellipsis if truncated.
-fn truncate_content(content: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_content(content: &str, max_chars: usize) -> String {
     // Normalize: collapse newlines to spaces for inline display
     let normalized: String = content
         .chars()
@@ -4526,5 +4555,48 @@ mod pinned_settings_tests {
             1,
             "and only that gate: at home it is there"
         );
+    }
+
+    // ── The foundation's landing rule: what a declared core really carries ──────
+    //
+    // Mesuré le 02/11/2026 sur le graphe vivant : à L4 le socle disposait de 750
+    // caractères et deux notes y sont entrées. Ce n'est pas `MAX_PINNED_NOTES` (10)
+    // qui décide de ce qu'on lit, c'est cette règle-ci.
+
+    #[test]
+    fn a_foundation_entry_never_exceeds_the_per_note_cap() {
+        let long = "a".repeat(PINNED_NOTE_CHARS * 3);
+        let entry = super::foundation_entry("Guideline", "Critical", &long);
+        // header + capped content + newline; the ellipsis counts in the cap
+        assert!(entry.len() < 40 + PINNED_NOTE_CHARS + 4, "{}", entry.len());
+        assert!(entry.contains("[guideline|critical]"));
+    }
+
+    #[test]
+    fn the_landing_stops_at_the_first_entry_that_does_not_fit() {
+        let e = |text: &str| super::foundation_entry("guideline", "critical", text);
+        let small = e("short");
+        let big = e(&"x".repeat(PINNED_NOTE_CHARS));
+        // 2 small entries fit L4's 750; a big one (≈325) fits too, but not after one more
+        let (fits, chars) = super::foundation_landing(&[small.clone(), small.clone()], 750);
+        assert_eq!(fits, 2);
+        assert!(chars <= 750);
+        let (fits, _) = super::foundation_landing(&[big.clone(), big.clone(), big.clone()], 750);
+        assert_eq!(fits, 2, "750 / 325 = 2 entries, the third is dropped");
+        // A budget too small for the first entry keeps NOTHING, and says so by returning 0.
+        let (fits, chars) = super::foundation_landing(&[big], 10);
+        assert_eq!((fits, chars), (0, 0));
+    }
+
+    #[test]
+    fn two_notes_of_at_most_three_hundred_characters_land_whole_at_l4() {
+        // The design constraint of the declared core, as a test: 300 + header fits twice
+        // in L4's 750, and a note of exactly 300 characters is not truncated.
+        let full = "y".repeat(PINNED_NOTE_CHARS);
+        let entry = super::foundation_entry("guideline", "critical", &full);
+        assert!(entry.contains(&full), "a 300-character note lands whole");
+        assert!(!entry.contains('…'));
+        let (fits, _) = super::foundation_landing(&[entry.clone(), entry], 750);
+        assert_eq!(fits, 2);
     }
 }
