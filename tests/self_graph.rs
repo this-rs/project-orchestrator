@@ -207,7 +207,7 @@ async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
     // anything. `link_agent_knows` MATCHes both ends — a missing subject is a silent no-op,
     // which is the trap this line documents.
     e.client.ensure_agent(self_id, None).await.unwrap();
-    let before = e.client.agent_knows(self_id, 10).await.unwrap();
+    let before = e.client.agent_knows(self_id, None, 10).await.unwrap();
     assert_eq!(before.available, 0, "a fresh subject knows nothing");
     let prov = rules::Provenance::new("agent-knows-core", "3 portées lues, 3 notes épinglées");
 
@@ -219,14 +219,14 @@ async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
         e.client.create_note(&n).await.unwrap();
         assert!(
             e.client
-                .link_agent_knows(self_id, n.id, &prov)
+                .link_agent_knows(self_id, n.id, rules::KnowledgeScope::Global, None, &prov)
                 .await
                 .unwrap(),
             "first link creates the edge"
         );
         assert!(
             !e.client
-                .link_agent_knows(self_id, n.id, &prov)
+                .link_agent_knows(self_id, n.id, rules::KnowledgeScope::Global, None, &prov)
                 .await
                 .unwrap(),
             "a second link attests, it does not create"
@@ -234,13 +234,13 @@ async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
         ids.push(n.id);
     }
 
-    let known = e.client.agent_knows(self_id, 2).await.unwrap();
+    let known = e.client.agent_knows(self_id, None, 2).await.unwrap();
     assert_eq!(known.notes.len(), 2, "bounded");
     assert_eq!(known.available, 3, "and the total is published");
     assert_eq!(known.withheld(), 1, "« la part lue est dite »");
 
     // And the bound is what limits, not luck: unbounded, all three come back.
-    let all = e.client.agent_knows(self_id, 10).await.unwrap();
+    let all = e.client.agent_knows(self_id, None, 10).await.unwrap();
     assert_eq!(all.notes.len(), 3);
     assert_eq!(all.withheld(), 0);
 
@@ -281,6 +281,8 @@ async fn a_knows_edge_to_a_missing_note_draws_nothing() {
         .link_agent_knows(
             self_id,
             Uuid::new_v4(),
+            rules::KnowledgeScope::Global,
+            None,
             &rules::Provenance::new("agent-knows-core", "measured"),
         )
         .await
@@ -519,6 +521,183 @@ fn live_session(e: &Env, label: &str) -> ChatSessionNode {
 }
 
 #[tokio::test]
+async fn unpinning_releases_the_edge_the_rule_drew_and_spares_a_hand_placed_one() {
+    // The rule must be a RECONCILIATION, not an accumulation: what is no longer declared
+    // stops being known. And only the edges the rule drew belong to it — a KNOWS an
+    // operator placed by hand has no rule property and must survive an unpin it never
+    // asked about.
+    use project_orchestrator::chat::stages::knowledge_injection::store_pinned_notes;
+
+    let _serial = serial().await;
+    let Some(e) = env("release").await else {
+        return;
+    };
+    let self_id = e.client.agent_identity_namespace().await.unwrap();
+    e.client.ensure_agent(self_id, None).await.unwrap();
+
+    let mut kept = a_note("api");
+    let mut dropped = a_note("api");
+    let mut by_hand = a_note("api");
+    for n in [&mut kept, &mut dropped, &mut by_hand] {
+        n.project_id = Some(e.project.id);
+        e.client.create_note(n).await.unwrap();
+    }
+
+    e.client
+        .link_agent_knows(
+            self_id,
+            by_hand.id,
+            rules::KnowledgeScope::Global,
+            None,
+            &rules::Provenance::new("a person", "decided by hand"),
+        )
+        .await
+        .unwrap();
+
+    // Two pins: the writer reconciles by itself, no restart needed.
+    store_pinned_notes(&e.client, None, &[kept.id, dropped.id])
+        .await
+        .unwrap();
+    // On n'assène AUCUN compte absolu : le soi racine est un nœud PARTAGÉ, et les autres
+    // tests de ce fichier — plus la passe de démarrage — y écrivent leurs propres arêtes.
+    // Ce qui compte est la présence ou l'absence de NOS trois notes.
+    let known = e.client.agent_knows(self_id, None, 5_000).await.unwrap();
+    assert!(
+        known.notes.contains(&kept.id) && known.notes.contains(&dropped.id),
+        "both pins are known, alongside whatever the graph already held: {known:?}"
+    );
+
+    // Drop one pin.
+    store_pinned_notes(&e.client, None, &[kept.id])
+        .await
+        .unwrap();
+    let known = e.client.agent_knows(self_id, None, 5_000).await.unwrap();
+    if known.notes.contains(&dropped.id) {
+        let mut rows = e
+            .raw
+            .execute(
+                query(
+                    "MATCH (:Agent {id: $a})-[r:KNOWS]->(:Note {id: $n}) \
+                     RETURN r.rule AS rule, r.scope AS scope, r.project_id AS project",
+                )
+                .param("a", self_id.to_string())
+                .param("n", dropped.id.to_string()),
+            )
+            .await
+            .unwrap();
+        let mut rules = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            rules.push((
+                row.get::<String>("rule").unwrap_or_default(),
+                row.get::<String>("scope").unwrap_or_default(),
+                row.get::<Option<String>>("project").unwrap_or(None),
+            ));
+        }
+        panic!("the unpinned note is still known by: {rules:?}");
+    }
+    assert!(known.notes.contains(&kept.id), "the kept pin stays");
+    assert!(
+        known.notes.contains(&by_hand.id),
+        "an edge the rule did not draw is not the rule's to remove"
+    );
+
+    // Leave the shared global scope as we found it: other tests in this file read it.
+    store_pinned_notes(&e.client, None, &[]).await.unwrap();
+    for id in [kept.id, dropped.id, by_hand.id] {
+        e.client.delete_note(id).await.unwrap();
+    }
+    drop_nodes(&e, "Agent", &[self_id]).await;
+    cleanup(&e).await;
+}
+
+#[tokio::test]
+async fn the_foundation_query_ranks_a_project_scale_and_a_global_one() {
+    // Les deux variantes du Cypher de classement, exercées directement : la règle peut être
+    // désactivée par un projet illisible, la requête ne doit pas rester non testée pour
+    // autant.
+    let _serial = serial().await;
+    let Some(e) = env("ranked").await else {
+        return;
+    };
+
+    // Une note de projet : active, critique, fraîche, ancrée à un fichier du projet.
+    let mut note = a_note("api");
+    note.project_id = Some(e.project.id);
+    note.importance = project_orchestrator::notes::NoteImportance::Critical;
+    note.energy = 1.0;
+    e.client.create_note(&note).await.unwrap();
+    let file = Uuid::new_v4();
+    e.raw
+        .run(
+            query(
+                "MATCH (n:Note {id: $n}) \
+                 CREATE (f:File {id: $f, path: $p, project_id: $proj}) \
+                 CREATE (n)-[:LINKED_TO]->(f)",
+            )
+            .param("n", note.id.to_string())
+            .param("f", file.to_string())
+            .param("p", format!("/tmp/{file}.rs"))
+            .param("proj", e.project.id.to_string()),
+        )
+        .await
+        .unwrap();
+
+    // Une SECONDE note ancrée : c'est ce qui fait vivre le comparateur de rang. Avec une
+    // seule, le tri n'appelle jamais son comparateur et les lignes restent non couvertes.
+    let mut second = a_note("api");
+    second.project_id = Some(e.project.id);
+    second.importance = project_orchestrator::notes::NoteImportance::Critical;
+    second.energy = 0.9;
+    e.client.create_note(&second).await.unwrap();
+    let file2 = Uuid::new_v4();
+    e.raw
+        .run(
+            query(
+                "MATCH (n:Note {id: $n}) \
+                 CREATE (f:File {id: $f, path: $p, project_id: $proj}) \
+                 CREATE (n)-[:LINKED_TO]->(f)",
+            )
+            .param("n", second.id.to_string())
+            .param("f", file2.to_string())
+            .param("p", format!("/tmp/{file2}.rs"))
+            .param("proj", e.project.id.to_string()),
+        )
+        .await
+        .unwrap();
+
+    let ranked = e
+        .client
+        .ranked_foundation(Some(e.project.id), 6)
+        .await
+        .unwrap();
+    assert!(
+        ranked.len() >= 2,
+        "two anchored notes are ranked: {ranked:?}"
+    );
+    let hit = ranked
+        .iter()
+        .find(|c| c.note == note.id)
+        .expect("the project's note is ranked");
+    assert_eq!(hit.anchors, 1, "{hit:?}");
+    assert!(hit.score > 0.0, "{hit:?}");
+
+    // L'échelle globale ne la sert pas : elle n'a pas traversé de frontière.
+    let global = e.client.ranked_foundation(None, 8).await.unwrap();
+    assert!(
+        !global.iter().any(|c| c.note == note.id),
+        "une note d'un seul projet ne s'escalade pas"
+    );
+
+    e.raw
+        .run(query("MATCH (f:File {id: $f}) DETACH DELETE f").param("f", file.to_string()))
+        .await
+        .unwrap();
+    e.client.delete_note(note.id).await.unwrap();
+    e.client.delete_note(second.id).await.unwrap();
+    cleanup(&e).await;
+}
+
+#[tokio::test]
 async fn the_catalog_says_what_the_graph_really_has() {
     let _serial = serial().await;
     let Some(e) = env("catalog").await else {
@@ -536,6 +715,8 @@ async fn the_catalog_says_what_the_graph_really_has() {
         .link_agent_knows(
             agent,
             note.id,
+            rules::KnowledgeScope::Global,
+            None,
             &rules::Provenance::new("agent-knows-core", "measured"),
         )
         .await

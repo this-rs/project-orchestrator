@@ -2977,6 +2977,8 @@ pub trait AnalyticsStore: Send + Sync {
         &self,
         agent_id: Uuid,
         note_id: Uuid,
+        scope: crate::graph::rules::KnowledgeScope,
+        project: Option<Uuid>,
         provenance: &crate::graph::rules::Provenance,
     ) -> Result<bool>;
 
@@ -3009,14 +3011,45 @@ pub trait AnalyticsStore: Send + Sync {
         provenance: &crate::graph::rules::Provenance,
     ) -> Result<usize>;
 
+    /// Releases the `KNOWS` edges that a RULE drew to notes that are no longer pinned.
+    ///
+    /// Only the edges whose `rule` property is the given one are touched: an edge a person
+    /// placed by hand has no such rule and survives. This is the half of the rule that
+    /// makes it a reconciliation instead of an accumulation — without it, unpinning a note
+    /// leaves the self « knowing » something it no longer declares.
+    ///
+    /// Returns how many edges were removed.
+    async fn release_agent_knows(&self, agent_id: Uuid, rule: &str, keep: &[Uuid])
+        -> Result<usize>;
+
+    /// Every stored value of one setting key, as `(scope, value)`, across all scopes.
+    ///
+    /// The pin rule needs the scopes that ACTUALLY hold a value, not a list of every project:
+    /// enumerating projects made the reconciliation hostage to one unreadable `(:Project)`
+    /// — a single malformed node silently disabled it for the whole instance.
+    async fn llm_settings_by_key(&self, key: &str) -> Result<Vec<(String, String)>>;
+
     /// What that agent knows, bounded by `limit`, plus how many exist — « la part lue est
     /// dite ». Only `(:Agent)-[:KNOWS]->(:Note)` is read: a `KNOWS` reaching a `File` (the
     /// persona meaning) never leaks into this answer.
     async fn agent_knows(
         &self,
         agent_id: Uuid,
+        project: Option<Uuid>,
         limit: usize,
     ) -> Result<crate::graph::rules::AgentKnowledge>;
+
+    /// The notes a scope would put in a foundation, ranked, with the measurement that
+    /// ranked them.
+    ///
+    /// `project = Some(p)` : la fondation de CE projet. `None` : l'échelle globale, qui
+    /// n'est pas un fourre-tout — elle contient ce qui est ancré dans des fichiers de
+    /// **plusieurs** projets (l'escalade), plus ce qui est né global.
+    async fn ranked_foundation(
+        &self,
+        project: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::graph::rules::FoundationCandidate>>;
 
     /// The graph described as a catalog: its labels, and for each relationship type the
     /// label pairs it really connects, with measured counts. Measured, never declared.

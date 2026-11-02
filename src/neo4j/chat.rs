@@ -1102,6 +1102,8 @@ impl Neo4jClient {
         &self,
         agent_id: Uuid,
         note_id: Uuid,
+        scope: crate::graph::rules::KnowledgeScope,
+        project: Option<Uuid>,
         provenance: &crate::graph::rules::Provenance,
     ) -> Result<bool> {
         let now = chrono::Utc::now().to_rfc3339();
@@ -1112,7 +1114,8 @@ impl Neo4jClient {
                     "MATCH (a:Agent {id: $agent}), (n:Note {id: $note}) \
                      MERGE (a)-[r:KNOWS]->(n) \
                      ON CREATE SET r.created_at = $now \
-                     SET r.rule = $rule, r.measure = $measure, r.at = $at \
+                     SET r.rule = $rule, r.measure = $measure, r.at = $at, \
+                         r.scope = $scope, r.project_id = $project, r.score = $score \
                      RETURN r.created_at = $now AS created",
                 )
                 .param("agent", agent_id.to_string())
@@ -1120,7 +1123,10 @@ impl Neo4jClient {
                 .param("now", now)
                 .param("rule", provenance.rule.clone())
                 .param("measure", provenance.measure.clone())
-                .param("at", provenance.at.clone()),
+                .param("at", provenance.at.clone())
+                .param("scope", scope.as_str())
+                .param("project", project.map(|p| p.to_string()))
+                .param("score", provenance.score),
             )
             .await?;
         match result.next().await? {
@@ -1169,12 +1175,63 @@ impl Neo4jClient {
         }
     }
 
+    /// See [`crate::neo4j::AnalyticsStore::llm_settings_by_key`].
+    pub async fn llm_settings_by_key(&self, key: &str) -> Result<Vec<(String, String)>> {
+        let mut rows = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (s:LlmSetting {key: $key}) \
+                     RETURN s.scope AS scope, s.value AS value",
+                )
+                .param("key", key.to_string()),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let scope: String = row.get("scope").unwrap_or_default();
+            let value: String = row.get("value").unwrap_or_default();
+            out.push((scope, value));
+        }
+        Ok(out)
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::release_agent_knows`].
+    pub async fn release_agent_knows(
+        &self,
+        agent_id: Uuid,
+        rule: &str,
+        keep: &[Uuid],
+    ) -> Result<usize> {
+        let keep: Vec<String> = keep.iter().map(|i| i.to_string()).collect();
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (a:Agent {id: $agent})-[r:KNOWS]->(n:Note) \
+                     WHERE r.rule = $rule AND NOT (n.id IN $keep) \
+                     DELETE r \
+                     RETURN count(*) AS released",
+                )
+                .param("agent", agent_id.to_string())
+                .param("rule", rule.to_string())
+                .param("keep", keep),
+            )
+            .await?;
+        let n: i64 = match result.next().await? {
+            Some(row) => row.get("released").unwrap_or(0),
+            None => 0,
+        };
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
     /// See [`crate::neo4j::AnalyticsStore::agent_knows`]. Two reads, not one: the bounded
     /// list and the total. A single query that returned only the list could not say how
     /// much it had left out.
     pub async fn agent_knows(
         &self,
         agent_id: Uuid,
+        project: Option<Uuid>,
         limit: usize,
     ) -> Result<crate::graph::rules::AgentKnowledge> {
         // One row per edge, ordered in Rust: `collect()` promises no order, so asking the
@@ -1184,26 +1241,119 @@ impl Neo4jClient {
             .graph
             .execute(
                 query(
+                    // Deux échelles : ce qui vaut pour TOUS les projets, et ce qui vaut pour
+                    // celui-ci. Sans projet, seule l'échelle globale est servie — jamais le
+                    // socle d'un autre projet.
                     "MATCH (a:Agent {id: $agent})-[r:KNOWS]->(n:Note) \
-                     RETURN n.id AS id, r.at AS at",
+                     WHERE r.scope = 'global' OR ($project IS NOT NULL AND r.project_id = $project) \
+                     RETURN n.id AS id, coalesce(r.score, 0.0) AS score, r.at AS at",
                 )
-                .param("agent", agent_id.to_string()),
+                .param("agent", agent_id.to_string())
+                .param("project", project.map(|p| p.to_string())),
             )
             .await?;
-        let mut all: Vec<(Uuid, String)> = Vec::new();
+        let mut all: Vec<(Uuid, f64, String)> = Vec::new();
         while let Some(row) = rows.next().await? {
             let id: String = row.get("id")?;
+            let score: f64 = row.get("score").unwrap_or(0.0);
             let at: String = row.get("at").unwrap_or_default();
             if let Ok(id) = Uuid::parse_str(&id) {
-                all.push((id, at));
+                all.push((id, score, at));
             }
         }
-        // Most recently attested first, then by id so two equal stamps stay deterministic.
-        all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        // Strongest first: recency is not relevance. The stamp only breaks ties, then the id
+        // so two equal scores stay deterministic.
+        all.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| a.0.cmp(&b.0))
+        });
         Ok(crate::graph::rules::AgentKnowledge {
             available: all.len(),
-            notes: all.into_iter().take(limit).map(|(id, _)| id).collect(),
+            notes: all.into_iter().take(limit).map(|(id, _, _)| id).collect(),
         })
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::ranked_foundation`].
+    pub async fn ranked_foundation(
+        &self,
+        project: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::graph::rules::FoundationCandidate>> {
+        // Le même filtre aux deux échelles ; ce qui change est le périmètre, et le fait que
+        // l'échelle globale exige une ESCALADE mesurée (des ancres dans plusieurs projets)
+        // ou une naissance globale.
+        let cypher = match project {
+            Some(_) => {
+                r#"
+                MATCH (n:Note {project_id: $project})
+                WHERE n.status = 'active'
+                  AND n.importance IN ['critical', 'high']
+                  AND coalesce(n.energy, 0.0) >= 0.8
+                OPTIONAL MATCH (n)-[:LINKED_TO]->(f:File)
+                WITH n, count(DISTINCT f) AS anchors
+                WHERE anchors > 0
+                OPTIONAL MATCH (n)-[s:SYNAPSE]-()
+                WITH n, anchors, count(DISTINCT s) AS synapses
+                RETURN n.id AS id, anchors, synapses, coalesce(n.energy, 0.0) AS energy
+                ORDER BY synapses DESC, energy DESC, n.id
+                LIMIT $limit
+                "#
+            }
+            None => {
+                r#"
+                MATCH (n:Note)
+                WHERE n.status = 'active'
+                  AND n.importance IN ['critical', 'high']
+                  AND coalesce(n.energy, 0.0) >= 0.8
+                OPTIONAL MATCH (n)-[:LINKED_TO]->(f:File)
+                WITH n, collect(DISTINCT f.project_id) AS projs, count(DISTINCT f) AS anchors
+                WITH n, anchors, [p IN projs WHERE p IS NOT NULL] AS ps
+                WHERE (size(ps) >= 2) OR (n.project_id IS NULL AND anchors > 0)
+                OPTIONAL MATCH (n)-[s:SYNAPSE]-()
+                WITH n, anchors, count(DISTINCT s) AS synapses
+                RETURN n.id AS id, anchors, synapses, coalesce(n.energy, 0.0) AS energy
+                ORDER BY synapses DESC, energy DESC, n.id
+                LIMIT $limit
+                "#
+            }
+        };
+
+        let mut rows = self
+            .graph
+            .execute(
+                query(cypher)
+                    .param("project", project.map(|p| p.to_string()))
+                    .param("limit", limit as i64),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let id: String = row.get("id")?;
+            let Ok(note) = Uuid::parse_str(&id) else {
+                continue;
+            };
+            let anchors: i64 = row.get("anchors").unwrap_or(0);
+            let synapses: i64 = row.get("synapses").unwrap_or(0);
+            let energy: f64 = row.get("energy").unwrap_or(0.0);
+            out.push(crate::graph::rules::FoundationCandidate {
+                note,
+                score: crate::graph::rules::rank_score(synapses, anchors, energy),
+                anchors,
+                synapses,
+                energy,
+            });
+        }
+        // Re-rank in Rust: the score is the single definition of « what comes first », and
+        // it must be the same one the tests exercise.
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.note.cmp(&b.note))
+        });
+        Ok(out)
     }
 
     /// See [`crate::neo4j::GraphStore::list_session_episodes`]. A payload that no longer

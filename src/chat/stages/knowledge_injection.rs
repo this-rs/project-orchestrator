@@ -260,9 +260,15 @@ const PINNED_NOTES_BUDGET: Duration = Duration::from_millis(500);
 /// convention of the per-project consents. Keyed by slug like them: a renamed project
 /// leaves its pins behind, and a slug reused by a new project finds the old ones (the
 /// consent gate still applies to each note at every turn).
+/// Le préfixe d'une portée de projet dans les réglages. Nommé, parce que deux endroits en
+/// dépendent (l'écriture et la lecture) et qu'un format implicite s'est déjà désynchronisé :
+/// la règle des épingles passait la portée entière à `get_project_by_slug`, ne résolvait
+/// jamais un projet, et rabaissait toute épingle de projet à l'échelle globale.
+pub const PROJECT_SCOPE_PREFIX: &str = "project:";
+
 pub fn pinned_notes_scope(project_slug: Option<&str>) -> String {
     match project_slug {
-        Some(slug) => format!("project:{slug}"),
+        Some(slug) => format!("{PROJECT_SCOPE_PREFIX}{slug}"),
         None => crate::chat::provider::settings::GLOBAL.to_string(),
     }
 }
@@ -295,6 +301,16 @@ pub async fn store_pinned_notes(
         graph
             .put_llm_setting(&scope, PINNED_NOTES_KEY, &serde_json::to_string(ids)?)
             .await?;
+    }
+
+    // An unpin must take effect NOW, not at the next restart: the rule reconciles the
+    // `KNOWS` edges with what is declared (it releases the ones it had drawn and writes the
+    // new ones). Best effort — the pin is the person's intent, the edge is derived from it,
+    // and a graph that hesitates must not undo a declaration.
+    if let Err(e) =
+        crate::graph::rules::run(graph, &[crate::graph::rules::AGENT_KNOWS_CORE.name]).await
+    {
+        tracing::warn!(error = %e, "the pins were stored but their KNOWS edges could not be reconciled");
     }
     Ok(())
 }
@@ -604,8 +620,23 @@ impl KnowledgeInjectionStage {
             let mut ids = configured;
             // The self, read as a NODE: what it knows is an edge, not a setting. A graph
             // that cannot answer yields no structural note — never another agent's.
+            // La portée de la session décide de l'échelle servie : le socle de CE projet
+            // plus ce qui vaut partout. Sans projet, seule l'échelle globale est servie —
+            // jamais le socle d'un autre projet.
+            let scope_project = match project_owned.as_deref() {
+                Some(slug) => graph
+                    .get_project_by_slug(slug)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|p| p.id),
+                None => None,
+            };
             let structural = match graph.agent_identity_namespace().await {
-                Ok(self_id) => match graph.agent_knows(self_id, MAX_PINNED_NOTES).await {
+                Ok(self_id) => match graph
+                    .agent_knows(self_id, scope_project, MAX_PINNED_NOTES)
+                    .await
+                {
                     Ok(known) => {
                         if known.withheld() > 0 {
                             // « la part lue est dite »: the bound is published, not silent.

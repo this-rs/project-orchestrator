@@ -30,7 +30,7 @@ use uuid::Uuid;
 use crate::neo4j::traits::GraphStore;
 
 /// Ce qu'une arête dérivée porte, pour être contestable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Provenance {
     /// The rule that drew the edge.
     pub rule: String,
@@ -38,6 +38,11 @@ pub struct Provenance {
     pub measure: String,
     /// When it was measured (RFC 3339).
     pub at: String,
+    /// The deterministic score that ranked it, when the rule ranks. It is what orders the
+    /// read: without it, the injection would pick the twelve most RECENT knowledges instead
+    /// of the twelve strongest — recency is not relevance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
 }
 
 impl Provenance {
@@ -47,6 +52,15 @@ impl Provenance {
             rule: rule.to_string(),
             measure: measure.into(),
             at: chrono::Utc::now().to_rfc3339(),
+            score: None,
+        }
+    }
+
+    /// A provenance that also carries the score the candidate was ranked by.
+    pub fn scored(rule: &str, measure: impl Into<String>, score: f64) -> Self {
+        Self {
+            score: Some(score),
+            ..Self::new(rule, measure)
         }
     }
 
@@ -71,6 +85,43 @@ pub struct Rule {
     pub edge: &'static str,
     /// The label it reaches.
     pub target_label: &'static str,
+}
+
+/// L'échelle à laquelle une connaissance vaut.
+///
+/// Une fondation par projet, et une fondation globale qui n'est pas un fourre-tout : elle
+/// contient ce qui a été MESURÉ comme traversant plusieurs projets, plus ce qui est né
+/// global. C'est ce qui permet d'injecter la bonne échelle au bon moment au lieu de servir
+/// les douze notes les plus récentes de toute l'instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KnowledgeScope {
+    /// The note belongs to one project's foundation.
+    Project,
+    /// The note crosses scopes, or was born global.
+    Global,
+}
+
+impl KnowledgeScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KnowledgeScope::Project => "project",
+            KnowledgeScope::Global => "global",
+        }
+    }
+}
+
+/// One note a rule would put in a foundation, with the measurement that ranked it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FoundationCandidate {
+    pub note: Uuid,
+    /// Degré de co-activation : le seul signal d'usage qui existe aujourd'hui.
+    pub synapses: i64,
+    /// Nombre de fichiers du projet qui ancrent la note.
+    pub anchors: i64,
+    pub energy: f64,
+    /// Le score déterministe qui a servi à classer.
+    pub score: f64,
 }
 
 /// What the self knows, and how much of it was read.
@@ -142,9 +193,58 @@ pub const SESSION_CO_ACTIVATION: Rule = Rule {
     target_label: "Note",
 };
 
+/// Le classement d'une note dans une fondation. Une seule définition, pure.
+///
+/// `2·synapses + anchors(plafonné à 50) + 10·énergie`.
+///
+/// - les **synapses** pèsent double : c'est le seul signal d'usage qui existe aujourd'hui
+///   (`activation_count` est à 0 partout — mesuré sur 28 870 notes) ;
+/// - les **ancres** sont plafonnées : une note liée à 1 741 fichiers écraserait tout le
+///   reste, et « ancrée partout » n'est pas « plus vraie » — c'est souvent une note de
+///   structure, pas une leçon ;
+/// - l'**énergie** vaut 10 points au maximum : elle départage, elle ne domine pas.
+pub fn rank_score(synapses: i64, anchors: i64, energy: f64) -> f64 {
+    2.0 * synapses as f64 + anchors.clamp(0, 50) as f64 + 10.0 * energy
+}
+
+/// `(:Agent)-[:KNOWS {scope:'project'}]->(:Note)` — la fondation d'UN projet.
+///
+/// Ce qu'une personne qui travaille sur ce projet doit avoir sous la main : ses notes
+/// actives, importantes, fraîches, ancrées dans du code du projet, classées par résonance.
+pub const AGENT_KNOWS_PROJECT: Rule = Rule {
+    name: "agent-knows-project",
+    justification: "Une note active, importante, fraîche et ancrée dans le code d'un \
+                    projet est le socle de CE projet : elle devient une connaissance \
+                    d'échelle projet, classée par résonance mesurée.",
+    edge: "KNOWS",
+    target_label: "Note",
+};
+
+/// `(:Agent)-[:KNOWS {scope:'global'}]->(:Note)` — l'échelle qui transcende les projets.
+///
+/// Elle n'est pas un fourre-tout : elle contient ce qui est ancré dans des fichiers de
+/// **plusieurs** projets (l'escalade est mesurée, pas décidée) et ce qui est né global.
+pub const AGENT_KNOWS_GLOBAL: Rule = Rule {
+    name: "agent-knows-global",
+    justification: "Une note ancrée dans des fichiers de plusieurs projets a déjà traversé \
+                    une frontière : elle vaut au-delà de son projet d'origine, et devient \
+                    une connaissance d'échelle globale.",
+    edge: "KNOWS",
+    target_label: "Note",
+};
+
+/// Combien de notes par projet, et combien à l'échelle globale. Bornes basses assumées :
+/// une fondation qui déborde n'est plus une fondation, c'est du contexte.
+pub const FOUNDATION_PER_PROJECT: usize = 6;
+pub const FOUNDATION_GLOBAL: usize = 8;
+/// Combien de projets on parcourt par passage. Au-delà, la part lue est publiée.
+pub const FOUNDATION_MAX_PROJECTS: usize = 50;
+
 /// The rules this engine knows, in a stable order.
 pub const RULES: &[Rule] = &[
     AGENT_KNOWS_CORE,
+    AGENT_KNOWS_PROJECT,
+    AGENT_KNOWS_GLOBAL,
     AGENT_USES_ACTIVATED,
     SESSION_CO_ACTIVATION,
 ];
@@ -164,6 +264,9 @@ pub struct RuleOutcome {
     pub written: usize,
     /// Edges that were already there, re-attested rather than duplicated.
     pub skipped: usize,
+    /// Edges this rule RELEASED: it had drawn them, and its measure no longer holds.
+    /// A rule that only adds is not a rule, it is a log that never strikes a line.
+    pub released: usize,
     pub measure: String,
 }
 
@@ -204,6 +307,46 @@ impl RulesReport {
     }
 }
 
+/// Le budget du passage au démarrage : un graphe lent coûte la matérialisation du socle,
+/// jamais le démarrage du serveur.
+pub const BOOT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Applique toutes les règles une fois, au démarrage, sous budget.
+///
+/// Extrait de `main` pour être testable : un bloc dans la fonction de démarrage ne
+/// s'exécute dans aucun test, donc il ne prouve rien — il était à 0 % de couverture, et
+/// c'était exact.
+///
+/// `None` signifie « pas de rapport » : budget épuisé ou erreur. Jamais une panique, jamais
+/// un démarrage refusé.
+pub async fn run_at_boot(graph: &dyn GraphStore) -> Option<RulesReport> {
+    match tokio::time::timeout(BOOT_BUDGET, run(graph, &[])).await {
+        Ok(Ok(report)) => {
+            // Le rapport se dit ici, pas dans `main` : des lignes de journalisation dans la
+            // fonction de démarrage ne sont exécutées par aucun test, donc ne prouvent rien.
+            for rule in &report.rules {
+                tracing::info!(
+                    rule = %rule.name,
+                    considered = rule.considered,
+                    written = rule.written,
+                    released = rule.released,
+                    "{}",
+                    rule.measure
+                );
+            }
+            Some(report)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "the knowledge rules could not run at boot");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("the knowledge rules timed out at boot");
+            None
+        }
+    }
+}
+
 /// Runs the named rules (all of them when `names` is empty). Deterministic: it reads
 /// counts and settings, never text, and writes nothing but the edges it declares.
 pub async fn run(graph: &dyn GraphStore, names: &[&str]) -> anyhow::Result<RulesReport> {
@@ -222,6 +365,8 @@ pub async fn run(graph: &dyn GraphStore, names: &[&str]) -> anyhow::Result<Rules
     for r in selected {
         let outcome = match r.name {
             "agent-knows-core" => run_agent_knows_core(graph).await?,
+            "agent-knows-project" => run_agent_knows_project(graph).await?,
+            "agent-knows-global" => run_agent_knows_global(graph).await?,
             "session-co-activation" => RuleOutcome {
                 name: r.name.to_string(),
                 measure: "non exécutée ici : sa mesure vient de l'appelant (les notes \
@@ -274,6 +419,147 @@ pub async fn run_with(
     }
 }
 
+/// La fondation d'échelle PROJET : pour chaque projet, ses notes les plus résonnées.
+async fn run_agent_knows_project(graph: &dyn GraphStore) -> anyhow::Result<RuleOutcome> {
+    let self_id = graph.agent_identity_namespace().await?;
+    graph.ensure_agent(self_id, None).await?;
+
+    let projects = match graph.list_projects().await {
+        Ok(p) => p,
+        Err(e) => {
+            // NE PAS réconcilier sur une lecture ratée : un `keep` vide effacerait tout le
+            // socle de projet à cause d'une erreur transitoire. Une lecture incomplète ne
+            // détruit rien ; elle dit qu'elle n'a pas pu lire, et laisse l'état en place.
+            tracing::warn!(error = %e, "project list unreadable: foundation left untouched");
+            return Ok(RuleOutcome {
+                name: AGENT_KNOWS_PROJECT.name.to_string(),
+                measure: format!(
+                    "non réconciliée : la liste des projets est illisible ({e}) — le socle \
+                     existant est laissé en place"
+                ),
+                ..Default::default()
+            });
+        }
+    };
+    let total = projects.len();
+    let read: Vec<_> = projects.into_iter().take(FOUNDATION_MAX_PROJECTS).collect();
+
+    let mut keep: Vec<Uuid> = Vec::new();
+    let (mut considered, mut written, mut skipped) = (0usize, 0usize, 0usize);
+    for project in &read {
+        let candidates = graph
+            .ranked_foundation(Some(project.id), FOUNDATION_PER_PROJECT)
+            .await?;
+        considered += candidates.len();
+        for c in candidates {
+            let provenance = Provenance::scored(
+                AGENT_KNOWS_PROJECT.name,
+                format!(
+                    "projet {}, {} synapse(s), {} ancre(s), énergie {:.2}",
+                    project.slug, c.synapses, c.anchors, c.energy
+                ),
+                c.score,
+            );
+            let created = graph
+                .link_agent_knows(
+                    self_id,
+                    c.note,
+                    KnowledgeScope::Project,
+                    Some(project.id),
+                    &provenance,
+                )
+                .await?;
+            if created {
+                written += 1;
+            } else {
+                skipped += 1;
+            }
+            keep.push(c.note);
+        }
+    }
+
+    let released = graph
+        .release_agent_knows(self_id, AGENT_KNOWS_PROJECT.name, &keep)
+        .await?;
+
+    // « la part lue est dite » : au-delà de FOUNDATION_MAX_PROJECTS, on ne prétend pas
+    // avoir couvert l'instance.
+    let truncation = if total > read.len() {
+        format!(", {} projet(s) NON lus", total - read.len())
+    } else {
+        String::new()
+    };
+    let mut measure = format!(
+        "{} projet(s) lu(s) sur {total}, {considered} note(s) candidate(s){truncation}",
+        read.len()
+    );
+    if released > 0 {
+        measure.push_str(&format!(", {released} arête(s) libérée(s)"));
+    }
+
+    Ok(RuleOutcome {
+        name: AGENT_KNOWS_PROJECT.name.to_string(),
+        considered,
+        written,
+        skipped,
+        released,
+        measure,
+    })
+}
+
+/// L'échelle GLOBALE : ce qui a traversé plusieurs projets, et ce qui est né global.
+async fn run_agent_knows_global(graph: &dyn GraphStore) -> anyhow::Result<RuleOutcome> {
+    let self_id = graph.agent_identity_namespace().await?;
+    graph.ensure_agent(self_id, None).await?;
+
+    let candidates = graph.ranked_foundation(None, FOUNDATION_GLOBAL).await?;
+    let considered = candidates.len();
+    let mut keep: Vec<Uuid> = Vec::new();
+    let (mut written, mut skipped) = (0usize, 0usize);
+    let mut top_score = 0.0f64;
+
+    for c in &candidates {
+        top_score = top_score.max(c.score);
+        let provenance = Provenance::scored(
+            AGENT_KNOWS_GLOBAL.name,
+            format!(
+                "{} synapse(s), {} ancre(s) dans plusieurs projets, énergie {:.2}",
+                c.synapses, c.anchors, c.energy
+            ),
+            c.score,
+        );
+        let created = graph
+            .link_agent_knows(self_id, c.note, KnowledgeScope::Global, None, &provenance)
+            .await?;
+        if created {
+            written += 1;
+        } else {
+            skipped += 1;
+        }
+        keep.push(c.note);
+    }
+
+    let released = graph
+        .release_agent_knows(self_id, AGENT_KNOWS_GLOBAL.name, &keep)
+        .await?;
+
+    let mut measure = format!(
+        "{considered} note(s) escaladée(s) ou née(s) globale(s), meilleur score {top_score:.1}"
+    );
+    if released > 0 {
+        measure.push_str(&format!(", {released} arête(s) libérée(s)"));
+    }
+
+    Ok(RuleOutcome {
+        name: AGENT_KNOWS_GLOBAL.name.to_string(),
+        considered,
+        written,
+        skipped,
+        released,
+        measure,
+    })
+}
+
 async fn run_agent_uses_activated(
     graph: &dyn GraphStore,
     session: Uuid,
@@ -322,6 +608,9 @@ async fn run_agent_uses_activated(
         considered,
         written,
         skipped,
+        // `agent-uses-activated` ne réconcilie pas encore : il atteste. Nommer le zéro
+        // plutôt que l'oublier — un champ absent se lit comme « non mesuré ».
+        released: 0,
         measure,
     })
 }
@@ -329,37 +618,54 @@ async fn run_agent_uses_activated(
 /// The pins of every scope: the instance's own, then each project's. A project scope is
 /// read through its slug, which is what [`crate::chat::stages::knowledge_injection`]
 /// keys the setting by.
-async fn pinned_notes_everywhere(graph: &dyn GraphStore) -> anyhow::Result<(Vec<Uuid>, usize)> {
-    use crate::chat::stages::knowledge_injection::load_pinned_notes;
+/// Les épingles de toutes les portées, lues DIRECTEMENT sur les réglages.
+///
+/// On n'énumère plus les projets : la portée est écrite sur le réglage lui-même, et passer
+/// par `list_projects()` rendait la réconciliation otage d'un seul `(:Project)` illisible —
+/// un nœud malformé désactivait silencieusement la réconciliation de toute l'instance.
+/// L'identifiant de projet d'une portée n'est résolu que pour les portées qui PORTENT une
+/// épingle, donc quelques appels au plus.
+async fn pinned_notes_everywhere(
+    graph: &dyn GraphStore,
+) -> anyhow::Result<(Vec<(Uuid, Option<Uuid>)>, usize, bool)> {
+    use crate::chat::stages::knowledge_injection::{PINNED_NOTES_KEY, PROJECT_SCOPE_PREFIX};
 
-    let mut scopes: Vec<Option<String>> = vec![None];
-    // The global pins are the socle; the project-scoped ones are a convenience. A graph that
-    // holds a project the mapper cannot read (a foreign suite left a bare `(:Project)` without
-    // `name`/`slug`) must not kill the rule over it — « never fail without a socle »: the
-    // global pins are still applied, the unreadable scopes are said, not silently skipped.
-    match graph.list_projects().await {
-        Ok(projects) => {
-            for project in projects {
-                scopes.push(Some(project.slug));
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "project pin scopes are unreadable: only the global pins are read");
-        }
-    }
-    let read = scopes.len();
+    let settings = graph.llm_settings_by_key(PINNED_NOTES_KEY).await?;
+    let read = settings.len();
 
     let mut seen = std::collections::HashSet::new();
     let mut ids = Vec::new();
-    for scope in scopes {
-        let pinned = load_pinned_notes(graph, scope.as_deref()).await?;
-        for id in pinned {
+    let mut complete = true;
+    for (scope, raw) in settings {
+        // Une portée projet est `project:<slug>` ; tout le reste est global. On retire le
+        // préfixe AVANT de résoudre : passer la portée entière ne résout jamais un projet.
+        let project = match scope.strip_prefix(PROJECT_SCOPE_PREFIX) {
+            None => None,
+            Some(slug) => match graph.get_project_by_slug(slug).await {
+                Ok(Some(p)) => Some(p.id),
+                Ok(None) => None,
+                Err(e) => {
+                    complete = false;
+                    tracing::warn!(scope = %scope, error = %e, "pin scope unresolved");
+                    None
+                }
+            },
+        };
+        let parsed: Vec<Uuid> = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                complete = false;
+                tracing::warn!(scope = %scope, error = %e, "unreadable pin list, skipped");
+                continue;
+            }
+        };
+        for id in parsed {
             if seen.insert(id) {
-                ids.push(id);
+                ids.push((id, project));
             }
         }
     }
-    Ok((ids, read))
+    Ok((ids, read, complete))
 }
 
 async fn run_agent_knows_core(graph: &dyn GraphStore) -> anyhow::Result<RuleOutcome> {
@@ -369,21 +675,53 @@ async fn run_agent_knows_core(graph: &dyn GraphStore) -> anyhow::Result<RuleOutc
     // that should have been written to. Measured: the primitive MATCHes both ends, so a
     // missing subject is a silent no-op.
     graph.ensure_agent(self_id, None).await?;
-    let (ids, scopes) = pinned_notes_everywhere(graph).await?;
+    let (ids, scopes, complete) = pinned_notes_everywhere(graph).await?;
 
     let measure = format!("{scopes} portées lues, {} note(s) épinglée(s)", ids.len());
     let provenance = Provenance::new(AGENT_KNOWS_CORE.name, measure.clone());
 
+    // Reconcile FIRST: an edge the rule drew to a note that is no longer pinned must go
+    // before the new set is attested. The reverse order would leave, for one instant, a
+    // self that knows both what it declares and what it dropped.
+    let keep: Vec<Uuid> = ids.iter().map(|(id, _)| *id).collect();
+    // Même règle que pour les projets : une lecture incomplète ne supprime rien.
+    let released = if complete {
+        graph
+            .release_agent_knows(self_id, AGENT_KNOWS_CORE.name, &keep)
+            .await?
+    } else {
+        0
+    };
+
     let mut written = 0;
     let mut skipped = 0;
-    for note in &ids {
+    for (note, project) in &ids {
+        let scope = match project {
+            Some(_) => KnowledgeScope::Project,
+            None => KnowledgeScope::Global,
+        };
+        // Une épingle déclarée passe devant tout ce qui est MESURÉ : c'est une décision,
+        // pas une observation. Le score le dit, et la lecture le respecte.
+        let declared =
+            Provenance::scored(AGENT_KNOWS_CORE.name, provenance.measure.clone(), f64::MAX);
         // A pin that names a note the graph no longer has draws no edge: the store says
         // whether the target exists, and a missing target is a skip, not an error.
-        if graph.link_agent_knows(self_id, *note, &provenance).await? {
+        if graph
+            .link_agent_knows(self_id, *note, scope, *project, &declared)
+            .await?
+        {
             written += 1;
         } else {
             skipped += 1;
         }
+    }
+
+    let mut measure = measure;
+    if !complete {
+        measure.push_str(" — lecture incomplète : aucune arête libérée");
+    }
+    if released > 0 {
+        measure.push_str(&format!(", {released} arête(s) libérée(s)"));
     }
 
     Ok(RuleOutcome {
@@ -391,6 +729,7 @@ async fn run_agent_knows_core(graph: &dyn GraphStore) -> anyhow::Result<RuleOutc
         considered: ids.len(),
         written,
         skipped,
+        released,
         measure,
     })
 }
@@ -433,6 +772,7 @@ async fn run_session_co_activation(
         considered: notes.len(),
         written,
         skipped: 0,
+        released: 0,
         measure,
     })
 }
@@ -442,6 +782,325 @@ mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::*;
+
+    /// Une lecture ratée ne doit RIEN détruire : la réconciliation est sautée, pas
+    /// appliquée sur un `keep` vide — sinon une erreur transitoire effacerait le socle.
+    #[tokio::test]
+    async fn a_failed_project_list_wipes_nothing() {
+        let graph = MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&project).await.unwrap();
+        let note = a_note("a foundation");
+        graph.create_note(&note).await.unwrap();
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        let prov = Provenance::scored(AGENT_KNOWS_PROJECT.name, "posée à la main", 42.0);
+        graph
+            .link_agent_knows(
+                self_id,
+                note.id,
+                KnowledgeScope::Project,
+                Some(project.id),
+                &prov,
+            )
+            .await
+            .unwrap();
+
+        graph
+            .fail_list_projects
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let outcome = run(&graph, &[AGENT_KNOWS_PROJECT.name]).await.unwrap();
+        graph
+            .fail_list_projects
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let outcome = outcome.of(AGENT_KNOWS_PROJECT.name).unwrap();
+        assert_eq!(
+            outcome.released, 0,
+            "aucune suppression sur une lecture ratée"
+        );
+        assert!(outcome.measure.contains("illisible"), "{}", outcome.measure);
+        assert_eq!(
+            graph
+                .agent_knows(self_id, Some(project.id), 10)
+                .await
+                .unwrap()
+                .notes,
+            vec![note.id],
+            "l'arête est toujours là"
+        );
+    }
+
+    /// Le corps de la règle PROJET : des candidats classés deviennent des arêtes d'échelle
+    /// projet, et la réconciliation garde exactement ceux-là.
+    #[tokio::test]
+    async fn the_project_scale_writes_what_it_ranked() {
+        let graph = MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&project).await.unwrap();
+        let mut note = a_note("the foundation of alpha");
+        note.project_id = Some(project.id);
+        note.status = crate::notes::NoteStatus::Active;
+        note.importance = crate::notes::NoteImportance::Critical;
+        graph.create_note(&note).await.unwrap();
+
+        let outcome = run(&graph, &[AGENT_KNOWS_PROJECT.name]).await.unwrap();
+        let outcome = outcome.of(AGENT_KNOWS_PROJECT.name).unwrap();
+        assert_eq!(outcome.considered, 1, "{outcome:?}");
+        assert_eq!(outcome.written, 1, "{outcome:?}");
+        assert_eq!(outcome.released, 0);
+
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        let known = graph
+            .agent_knows(self_id, Some(project.id), 10)
+            .await
+            .unwrap();
+        assert_eq!(known.notes, vec![note.id], "the project scale serves it");
+        // …et l'échelle globale ne le sert pas : il appartient à un projet.
+        let global = graph.agent_knows(self_id, None, 10).await.unwrap();
+        assert!(global.notes.is_empty(), "{global:?}");
+    }
+
+    /// Le corps de la règle GLOBALE : une note née globale devient une connaissance qui
+    /// vaut partout, et elle apparaît même sans projet demandé.
+    #[tokio::test]
+    async fn the_global_scale_writes_what_crosses_projects() {
+        let graph = MockGraphStore::new();
+        let mut note = a_note("a lesson that crosses projects");
+        note.project_id = None;
+        note.status = crate::notes::NoteStatus::Active;
+        note.importance = crate::notes::NoteImportance::Critical;
+        graph.create_note(&note).await.unwrap();
+
+        let outcome = run(&graph, &[AGENT_KNOWS_GLOBAL.name]).await.unwrap();
+        let outcome = outcome.of(AGENT_KNOWS_GLOBAL.name).unwrap();
+        assert_eq!(outcome.written, 1, "{outcome:?}");
+
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        assert_eq!(
+            graph.agent_knows(self_id, None, 10).await.unwrap().notes,
+            vec![note.id]
+        );
+        // Une connaissance globale est servie quel que soit le projet demandé : c'est sa
+        // définition même. Ce qui ne se mélange pas, c'est l'inverse — une note de projet
+        // n'apparaît pas dans le socle d'un autre projet (vérifié ci-dessus).
+        assert_eq!(
+            graph
+                .agent_knows(self_id, Some(Uuid::new_v4()), 10)
+                .await
+                .unwrap()
+                .notes,
+            vec![note.id]
+        );
+    }
+
+    #[test]
+    fn the_scope_names_are_bare_identifiers() {
+        // Le nom part dans le Cypher comme valeur, jamais comme texte inséré — mais il doit
+        // rester une chaîne nue, et les deux échelles doivent être distinctes.
+        assert_eq!(KnowledgeScope::Project.as_str(), "project");
+        assert_eq!(KnowledgeScope::Global.as_str(), "global");
+    }
+
+    /// Deux notes dans la même échelle : c'est ce qui fait vivre le comparateur de rang.
+    /// Avec une seule, le tri n'appelle jamais son comparateur et six lignes restent
+    /// non couvertes — un test qui n'exerce pas ce qu'il croit exercer.
+    #[tokio::test]
+    async fn two_candidates_are_ranked_against_each_other() {
+        let graph = MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&project).await.unwrap();
+        for text in ["first", "second"] {
+            let mut note = a_note(text);
+            note.project_id = Some(project.id);
+            note.status = crate::notes::NoteStatus::Active;
+            note.importance = crate::notes::NoteImportance::Critical;
+            graph.create_note(&note).await.unwrap();
+        }
+
+        let ranked = graph.ranked_foundation(Some(project.id), 6).await.unwrap();
+        assert_eq!(ranked.len(), 2, "{ranked:?}");
+        // Ordre déterministe : le départage se fait sur l'identifiant.
+        assert!(ranked[0].note < ranked[1].note, "{ranked:?}");
+    }
+
+    /// Une échelle qui ne classe plus une note la LIBÈRE : c'est la moitié qui manquait,
+    /// et sa mesure doit le dire.
+    #[tokio::test]
+    async fn a_scale_releases_what_it_no_longer_ranks() {
+        let graph = MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&project).await.unwrap();
+        let mut kept = a_note("kept");
+        kept.project_id = Some(project.id);
+        kept.status = crate::notes::NoteStatus::Active;
+        kept.importance = crate::notes::NoteImportance::Critical;
+        graph.create_note(&kept).await.unwrap();
+        let mut dropped = a_note("dropped");
+        dropped.project_id = Some(project.id);
+        dropped.status = crate::notes::NoteStatus::Active;
+        dropped.importance = crate::notes::NoteImportance::Critical;
+        graph.create_note(&dropped).await.unwrap();
+
+        let first = run(&graph, &[AGENT_KNOWS_PROJECT.name]).await.unwrap();
+        assert_eq!(first.of(AGENT_KNOWS_PROJECT.name).unwrap().written, 2);
+
+        // La note sort du filtre (archivée) : la règle doit la libérer au passage suivant.
+        {
+            let mut notes = graph.notes.write().await;
+            if let Some(n) = notes.get_mut(&dropped.id) {
+                n.status = crate::notes::NoteStatus::Archived;
+            }
+        }
+        let second = run(&graph, &[AGENT_KNOWS_PROJECT.name]).await.unwrap();
+        let outcome = second.of(AGENT_KNOWS_PROJECT.name).unwrap();
+        assert_eq!(outcome.released, 1, "{outcome:?}");
+        assert!(outcome.measure.contains("libérée"), "{}", outcome.measure);
+
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        assert_eq!(
+            graph
+                .agent_knows(self_id, Some(project.id), 10)
+                .await
+                .unwrap()
+                .notes,
+            vec![kept.id]
+        );
+    }
+
+    /// Un second passage atteste au lieu de réécrire : c'est ce que compte `skipped`.
+    #[tokio::test]
+    async fn a_second_pass_attests_instead_of_rewriting() {
+        let graph = MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&project).await.unwrap();
+        let mut note = a_note("kept");
+        note.project_id = Some(project.id);
+        note.status = crate::notes::NoteStatus::Active;
+        note.importance = crate::notes::NoteImportance::Critical;
+        graph.create_note(&note).await.unwrap();
+
+        run(&graph, &[AGENT_KNOWS_PROJECT.name]).await.unwrap();
+        let again = run(&graph, &[AGENT_KNOWS_PROJECT.name]).await.unwrap();
+        let outcome = again.of(AGENT_KNOWS_PROJECT.name).unwrap();
+        assert_eq!(outcome.written, 0);
+        assert_eq!(outcome.skipped, 1, "{outcome:?}");
+    }
+
+    /// Une épingle de portée PROJET garde son projet : l'échelle et le propriétaire sont
+    /// écrits sur l'arête, et l'identifiant est résolu par le slug de la portée.
+    #[tokio::test]
+    async fn a_project_pin_keeps_its_project() {
+        use crate::chat::stages::knowledge_injection::store_pinned_notes;
+
+        let graph = MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&project).await.unwrap();
+        let note = a_note("a project foundation");
+        graph.create_note(&note).await.unwrap();
+
+        store_pinned_notes(&graph, Some("alpha"), &[note.id])
+            .await
+            .unwrap();
+
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        assert_eq!(
+            graph
+                .agent_knows(self_id, Some(project.id), 10)
+                .await
+                .unwrap()
+                .notes,
+            vec![note.id],
+            "the project scale serves it"
+        );
+        assert!(
+            graph
+                .agent_knows(self_id, None, 10)
+                .await
+                .unwrap()
+                .notes
+                .is_empty(),
+            "and it is not global"
+        );
+    }
+
+    /// Une liste d'épingles illisible rend la lecture INCOMPLÈTE : la réconciliation est
+    /// sautée, pas appliquée sur un `keep` partiel.
+    #[tokio::test]
+    async fn an_unreadable_pin_list_blocks_the_release() {
+        use crate::chat::stages::knowledge_injection::store_pinned_notes;
+
+        let graph = MockGraphStore::new();
+        let note = a_note("pinned");
+        graph.create_note(&note).await.unwrap();
+        store_pinned_notes(&graph, None, &[note.id]).await.unwrap();
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        assert_eq!(
+            graph
+                .agent_knows(self_id, None, 10)
+                .await
+                .unwrap()
+                .notes
+                .len(),
+            1
+        );
+
+        // On corrompt la valeur stockée : la lecture devient incomplète.
+        {
+            let mut settings = graph.llm_settings.write().await;
+            for ((_, key), value) in settings.iter_mut() {
+                if key.contains("pinned") {
+                    *value = "{not json".into();
+                }
+            }
+        }
+        let outcome = run(&graph, &[AGENT_KNOWS_CORE.name]).await.unwrap();
+        let outcome = outcome.of(AGENT_KNOWS_CORE.name).unwrap();
+        assert_eq!(outcome.released, 0, "{outcome:?}");
+        assert!(
+            outcome.measure.contains("incomplète"),
+            "{}",
+            outcome.measure
+        );
+        assert_eq!(
+            graph.agent_knows(self_id, None, 10).await.unwrap().notes,
+            vec![note.id],
+            "l'arête survit à une lecture incomplète"
+        );
+    }
+
+    /// Le passage au démarrage rend un rapport pour CHAQUE règle — et ne bloque jamais :
+    /// c'est la seule chose que le démarrage demande.
+    #[tokio::test]
+    async fn the_boot_pass_reports_every_rule() {
+        let graph = MockGraphStore::new();
+        let report = run_at_boot(&graph).await.expect("a report");
+        for rule in RULES {
+            assert!(
+                report.of(rule.name).is_some(),
+                "{} is missing from the boot report",
+                rule.name
+            );
+        }
+    }
+
+    /// Le départage du rang : un note sans synapse ni ancre vaut ce que vaut son énergie.
+    #[test]
+    fn the_rank_score_weighs_synapses_double_and_caps_anchors() {
+        assert_eq!(rank_score(0, 0, 0.0), 0.0);
+        assert_eq!(rank_score(1, 0, 0.0), 2.0, "a synapse counts double");
+        assert_eq!(rank_score(0, 10, 0.0), 10.0);
+        assert_eq!(rank_score(0, 50, 0.0), 50.0);
+        assert_eq!(
+            rank_score(0, 5_000, 0.0),
+            50.0,
+            "anchors are capped: « anchored everywhere » is not « truer »"
+        );
+        assert_eq!(
+            rank_score(0, 0, 1.0),
+            10.0,
+            "energy breaks ties, it does not rule"
+        );
+    }
 
     #[test]
     fn every_rule_is_accountable_before_it_runs() {
@@ -497,15 +1156,22 @@ mod tests {
         graph.create_note(&note).await.unwrap();
         store_pinned_notes(&graph, None, &[note.id]).await.unwrap();
 
+        // The writer itself reconciles: an edge exists the moment the pin does, without
+        // waiting for a restart or a cron.
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        assert_eq!(
+            graph.agent_knows(self_id, None, 10).await.unwrap().notes,
+            vec![note.id],
+            "storing a pin draws its edge"
+        );
+
+        // And an explicit run attests what is already there instead of duplicating it.
         let report = run(&graph, &["agent-knows-core"]).await.unwrap();
         let outcome = report.of("agent-knows-core").unwrap();
         assert_eq!(outcome.considered, 1);
-        assert_eq!(outcome.written, 1, "{report:?}");
-        assert_eq!(report.edges_written, 1);
-
-        let self_id = graph.agent_identity_namespace().await.unwrap();
-        let known = graph.agent_knows(self_id, 10).await.unwrap();
-        assert_eq!(known.notes, vec![note.id]);
+        assert_eq!(outcome.written, 0, "already attested: {report:?}");
+        assert_eq!(outcome.skipped, 1);
+        assert_eq!(outcome.released, 0);
     }
 
     #[tokio::test]
@@ -519,9 +1185,84 @@ mod tests {
 
         let first = run(&graph, &[]).await.unwrap();
         let second = run(&graph, &[]).await.unwrap();
-        assert_eq!(first.edges_written, 1);
+        assert_eq!(first.edges_written, 0, "the pin already drew it");
         assert_eq!(second.edges_written, 0, "idempotent: {second:?}");
         assert_eq!(second.of("agent-knows-core").unwrap().skipped, 1);
+        assert_eq!(first.of("agent-knows-core").unwrap().released, 0);
+    }
+
+    #[tokio::test]
+    async fn a_pin_removed_is_released() {
+        // The half that makes the rule a reconciliation: what is no longer declared stops
+        // being known. Without it the self accumulates foundations it has dropped.
+        use crate::chat::stages::knowledge_injection::store_pinned_notes;
+
+        let graph = MockGraphStore::new();
+        let kept = a_note("kept");
+        let dropped = a_note("dropped");
+        graph.create_note(&kept).await.unwrap();
+        graph.create_note(&dropped).await.unwrap();
+        store_pinned_notes(&graph, None, &[kept.id, dropped.id])
+            .await
+            .unwrap();
+
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        assert_eq!(
+            graph
+                .agent_knows(self_id, None, 10)
+                .await
+                .unwrap()
+                .notes
+                .len(),
+            2
+        );
+
+        store_pinned_notes(&graph, None, &[kept.id]).await.unwrap();
+
+        let known = graph.agent_knows(self_id, None, 10).await.unwrap();
+        assert_eq!(known.notes, vec![kept.id], "the dropped pin is gone");
+
+        // And the measure says it: a release is published, not silent.
+        let outcome = run(&graph, &["agent-knows-core"]).await.unwrap();
+        assert_eq!(outcome.of("agent-knows-core").unwrap().released, 0);
+    }
+
+    #[tokio::test]
+    async fn an_edge_a_person_placed_survives_the_reconciliation() {
+        // Only the edges the RULE drew belong to it. A KNOWS an operator placed by hand has
+        // no such rule and must survive an unpin it never asked about.
+        use crate::chat::stages::knowledge_injection::store_pinned_notes;
+
+        let graph = MockGraphStore::new();
+        let pinned = a_note("pinned");
+        let by_hand = a_note("a person decided this one");
+        graph.create_note(&pinned).await.unwrap();
+        graph.create_note(&by_hand).await.unwrap();
+
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        graph
+            .link_agent_knows(
+                self_id,
+                by_hand.id,
+                KnowledgeScope::Global,
+                None,
+                &Provenance::new("a person", "decided by hand"),
+            )
+            .await
+            .unwrap();
+
+        store_pinned_notes(&graph, None, &[pinned.id])
+            .await
+            .unwrap();
+        // Unpin everything: the rule has nothing left to declare.
+        store_pinned_notes(&graph, None, &[]).await.unwrap();
+
+        let known = graph.agent_knows(self_id, None, 10).await.unwrap();
+        assert_eq!(
+            known.notes,
+            vec![by_hand.id],
+            "the rule removed its own edge, not someone else's"
+        );
     }
 
     #[tokio::test]

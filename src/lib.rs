@@ -2278,6 +2278,10 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             } else {
                 boot::tracker().done_with("migrations", format!("{applied} migration(s) run"));
             }
+            // Le socle du soi se matérialise une fois, borné et non fatal. Le corps vit
+            // dans `graph::rules::run_at_boot`, où il est testable ; ici, un appel.
+            crate::graph::rules::run_at_boot(graph.as_ref()).await;
+
             let handle = engine.start_owned();
             // Keep handle alive for the lifetime of the process
             std::mem::forget(handle);

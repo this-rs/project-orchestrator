@@ -3194,9 +3194,12 @@ impl AnalyticsStore for Neo4jClient {
         &self,
         agent_id: Uuid,
         note_id: Uuid,
+        scope: crate::graph::rules::KnowledgeScope,
+        project: Option<Uuid>,
         provenance: &crate::graph::rules::Provenance,
     ) -> anyhow::Result<bool> {
-        self.link_agent_knows(agent_id, note_id, provenance).await
+        self.link_agent_knows(agent_id, note_id, scope, project, provenance)
+            .await
     }
 
     async fn coactivate_session(
@@ -3221,12 +3224,34 @@ impl AnalyticsStore for Neo4jClient {
             .await
     }
 
+    async fn release_agent_knows(
+        &self,
+        agent_id: Uuid,
+        rule: &str,
+        keep: &[Uuid],
+    ) -> anyhow::Result<usize> {
+        self.release_agent_knows(agent_id, rule, keep).await
+    }
+
+    async fn llm_settings_by_key(&self, key: &str) -> anyhow::Result<Vec<(String, String)>> {
+        self.llm_settings_by_key(key).await
+    }
+
     async fn agent_knows(
         &self,
         agent_id: Uuid,
+        project: Option<Uuid>,
         limit: usize,
     ) -> anyhow::Result<crate::graph::rules::AgentKnowledge> {
-        self.agent_knows(agent_id, limit).await
+        self.agent_knows(agent_id, project, limit).await
+    }
+
+    async fn ranked_foundation(
+        &self,
+        project: Option<Uuid>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::graph::rules::FoundationCandidate>> {
+        self.ranked_foundation(project, limit).await
     }
 
     async fn schema_catalog(&self) -> anyhow::Result<crate::graph::schema::SchemaCatalog> {
