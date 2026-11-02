@@ -718,6 +718,10 @@ pub struct AgentSessionHandle {
     services: Option<Arc<dyn TurnServices>>,
     /// Messages waiting for the running turn to end (`chat::pending_queue`).
     pending: Mutex<std::collections::VecDeque<PendingMessage>>,
+    /// The background events already announced to the agent (the end of a task, a
+    /// `Monitor` line): what keeps a table sent again from waking the same task twice
+    /// (`super::oob_listener::background_wake_lines`).
+    pub(crate) announced_background: std::sync::Mutex<super::oob_listener::AnnouncedBackground>,
     /// The running turn was stopped (by the user, or for a message sent now):
     /// the automated entries of the queue are dropped when it ends.
     interrupted: AtomicBool,
@@ -1486,6 +1490,40 @@ impl AgentSessionHandle {
             }
         }
         self.send_message(content).await
+    }
+
+    /// Wakes this session for an out-of-turn event the agent has to answer — the end of
+    /// a background task, a line a `Monitor` matched (`super::oob_listener::
+    /// background_wake_lines` decides which) — by starting a NEW turn whose prompt is
+    /// `content`, of the kind that says it was not the user.
+    ///
+    /// The announcement is shown and stored as the out-of-turn output it is
+    /// (`ChatEvent::BackgroundOutput`) BEFORE the turn starts, so the transcript says why
+    /// the agent went on by itself.
+    ///
+    /// A turn already running is never interrupted: the announcement is queued and the
+    /// run's own loop reads it when this turn ends (lowest priority in `chat::drain`).
+    /// Returns whether a turn was started (the session was idle).
+    pub async fn wake_with_background(self: &Arc<Self>, content: &str) -> Result<bool> {
+        {
+            let mut queue = self.pending.lock().await;
+            if self.is_streaming.load(Ordering::SeqCst) {
+                queue.push_back(PendingMessage::background_output(content.to_string()));
+                return Ok(false);
+            }
+            self.is_streaming.store(true, Ordering::SeqCst);
+        }
+        self.emit(ChatEvent::BackgroundOutput {
+            source: "background_task".to_string(),
+            content: content.to_string(),
+            received_at: chrono::Utc::now(),
+            correlation_id: None,
+            tool: None,
+        })
+        .await;
+        self.start(PendingMessageKind::BackgroundOutput, content, content)
+            .await?;
+        Ok(true)
     }
 
     /// The held messages, as clients see them.
@@ -3006,6 +3044,7 @@ impl AgentRuntime {
             uuid: Uuid::parse_str(session_id).ok(),
             services,
             pending: Mutex::new(std::collections::VecDeque::new()),
+            announced_background: std::sync::Mutex::new(Default::default()),
             interrupted: AtomicBool::new(false),
             closed: tokio_util::sync::CancellationToken::new(),
             auto_continue: AtomicBool::new(false),
@@ -3118,9 +3157,11 @@ impl AgentRuntime {
 /// mirrored (a sub-agent still running in the background is seen first, in the
 /// form a turn shows it), persisted and broadcast. Then the resume token is
 /// synced — an out-of-turn `init` (the CLI repeats it) may carry a new session
-/// id. The out-of-turn pump (`super::oob_listener::pump_out_of_band`) calls
-/// this once per batch, so each event is emitted exactly once.
-pub(crate) async fn emit_out_of_band(handle: &AgentSessionHandle, events: Vec<AgentEvent>) {
+/// id — and, last, the session is WOKEN for what the agent has to answer: on this
+/// engine nobody else starts that turn (the Claude Code CLI does it for its own).
+/// The out-of-turn pump (`super::oob_listener::pump_out_of_band`) calls this once
+/// per batch, so each event is emitted exactly once.
+pub(crate) async fn emit_out_of_band(handle: &Arc<AgentSessionHandle>, events: Vec<AgentEvent>) {
     if events.is_empty() {
         return;
     }
@@ -3141,6 +3182,7 @@ pub(crate) async fn emit_out_of_band(handle: &AgentSessionHandle, events: Vec<Ag
     for event in chat_events {
         handle.emit(event).await;
     }
+    super::oob_listener::wake_for_background(handle, &events).await;
     handle.sync_resume_token().await;
 }
 
@@ -5564,6 +5606,109 @@ mod session_record_tests {
             "1 at creation + one user message: {n:?}"
         );
         assert_eq!(n.total_cost_usd, Some(0.0), "a free turn is a real 0");
+    }
+
+    /// WAKE-BG: the reported bug — the end of a background task left the session idle
+    /// until a human typed something. An idle session now starts the turn itself, and
+    /// the transcript says why: a `background_output` is on the wire before the turn.
+    #[tokio::test]
+    async fn a_background_wake_starts_a_turn_on_an_idle_session() {
+        let (graph, provider, handle) = rig("native").await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(
+            provider.state.turns_started.lock().unwrap().is_empty(),
+            "nothing runs before the wake"
+        );
+        let mut wire = handle.events_tx.subscribe();
+
+        let wake = "[background] Bash run_in_background bg-7 `cargo build` completed.";
+        assert!(
+            handle.wake_with_background(wake).await.unwrap(),
+            "an idle session starts the turn"
+        );
+
+        // The turn goes to the provider with the announcement as its prompt.
+        while provider.state.turns_started.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the wake never started a turn");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap()[0],
+            wake,
+            "the provider reads the announcement itself"
+        );
+
+        // The reason the agent went on by itself is in the transcript, not only in
+        // the model's context.
+        let mut announced = false;
+        while let Ok(event) = wire.try_recv() {
+            if let ChatEvent::BackgroundOutput { content, .. } = event {
+                assert_eq!(content, wake);
+                announced = true;
+            }
+        }
+        assert!(announced, "a background_output explains the wake");
+
+        provider.state.push(done(Some(0.0)));
+        while handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the woken turn never ended");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Not a user message: it does not count as one.
+        let n = node(&graph, &handle).await;
+        assert_eq!(n.message_count, 1, "1 at creation only: {n:?}");
+    }
+
+    /// The same announcement while a turn RUNS interrupts nothing: it waits in the
+    /// queue and is played when that turn ends.
+    #[tokio::test]
+    async fn a_background_wake_waits_behind_a_running_turn() {
+        let (_, provider, handle) = rig("native").await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        handle.send_message("carry on").await.unwrap();
+        while provider.state.turns_started.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the turn never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert!(
+            !handle
+                .wake_with_background("[background] bg-8 completed.")
+                .await
+                .unwrap(),
+            "a running turn is not interrupted"
+        );
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap().len(),
+            1,
+            "no turn was started on top of the running one"
+        );
+        {
+            let queue = handle.pending.lock().await;
+            assert!(
+                matches!(
+                    queue.back().map(|m| &m.kind),
+                    Some(PendingMessageKind::BackgroundOutput)
+                ),
+                "the announcement waits in the queue: {:?}",
+                queue.back().map(|m| &m.kind)
+            );
+        }
+
+        provider.state.push(done(Some(0.0)));
+        while provider.state.turns_started.lock().unwrap().len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the queued announcement never played"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        provider.state.push(done(Some(0.0)));
+        while handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the run never ended");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }
 

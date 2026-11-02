@@ -980,6 +980,148 @@ pub(crate) fn should_trigger_turn(message: &Message, subagent_parents: &HashSet<
     }
 }
 
+// ---------------------------------------------------------------------------
+// The native engine: which out-of-turn events WAKE the session
+// ---------------------------------------------------------------------------
+
+/// How many background events are remembered as already announced. A session runs a
+/// handful; the cap only guards a pathological one against unbounded growth, and
+/// forgetting an old key can at worst announce an old task once more.
+const MAX_ANNOUNCED_BACKGROUND: usize = 1024;
+
+/// What has already been announced to the agent, so a table sent again does not wake
+/// the same task twice (the provider sends the COMPLETE table on every change).
+#[derive(Debug, Default)]
+pub(crate) struct AnnouncedBackground {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl AnnouncedBackground {
+    /// Whether `key` is new, recording it. Bounded (see [`MAX_ANNOUNCED_BACKGROUND`]).
+    pub(crate) fn first_time(&mut self, key: String) -> bool {
+        if !self.seen.insert(key.clone()) {
+            return false;
+        }
+        self.order.push_back(key);
+        while self.order.len() > MAX_ANNOUNCED_BACKGROUND {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+        true
+    }
+}
+
+/// The lines an out-of-turn batch must WAKE an idle agent session for.
+///
+/// The historical engine never needs this: the CLI starts that turn itself when a
+/// background tool of its own ends — which is what [`should_trigger_turn`] guards on
+/// the `Message` side. On the native engine PO **is** the harness, so nothing else
+/// would resume the session: the end of a `Bash run_in_background` (or of a `Monitor`,
+/// or the `TaskStop` that kills it) was mirrored, persisted and drawn, and the agent
+/// stayed idle until a human typed something.
+///
+/// What wakes: a task that reached a terminal state, and a line a `Monitor` matched —
+/// each announced ONCE per session ([`AnnouncedBackground`]). Nothing wakes for a task
+/// still running: its launch result already said so, inside the turn.
+pub(crate) fn background_wake_lines(
+    events: &[nexus_claude::agent::AgentEvent],
+    announced: &mut AnnouncedBackground,
+) -> Vec<String> {
+    use nexus_claude::agent::{AgentEvent, BackgroundTaskKind, BackgroundTaskStatus, TaskPhase};
+
+    let mut lines = Vec::new();
+    for event in events {
+        match event {
+            AgentEvent::BackgroundTasks { tasks } => {
+                for task in tasks {
+                    let status = match task.status {
+                        BackgroundTaskStatus::Running => continue,
+                        BackgroundTaskStatus::Completed => "completed",
+                        BackgroundTaskStatus::Failed => "failed",
+                        // `TaskStop`, the end of the session, a timeout: it did not finish.
+                        BackgroundTaskStatus::Killed => "stopped",
+                        _ => continue,
+                    };
+                    if !announced.first_time(format!("task:{}", task.id)) {
+                        continue;
+                    }
+                    let kind = match task.kind {
+                        BackgroundTaskKind::Shell => "Bash run_in_background",
+                        BackgroundTaskKind::Monitor => "Monitor",
+                        _ => "background task",
+                    };
+                    let description = if task.description.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" `{}`", task.description)
+                    };
+                    lines.push(format!(
+                        "[background] {kind} {id}{description} {status}. Its output is the file the \
+                         launch reported: read it with Read, then carry on with what it was needed \
+                         for.",
+                        id = task.id,
+                    ));
+                }
+            }
+            AgentEvent::TaskUpdate {
+                phase: TaskPhase::Progress,
+                task_id,
+                summary: Some(line),
+                event_id,
+                ..
+            } => {
+                let key = match event_id {
+                    Some(id) => format!("line:{id}"),
+                    None => format!("line:{}:{}", task_id.as_deref().unwrap_or(""), line),
+                };
+                if !announced.first_time(key) {
+                    continue;
+                }
+                lines.push(format!("[monitor] {line}"));
+            }
+            _ => {}
+        }
+    }
+    lines
+}
+
+/// Wakes the session for what arrived out of turn and what the agent has to answer
+/// ([`background_wake_lines`] decides). Called by the out-of-turn pump of the native
+/// engine once per batch, after the events have been mirrored and broadcast.
+pub(crate) async fn wake_for_background(
+    handle: &Arc<AgentSessionHandle>,
+    events: &[nexus_claude::agent::AgentEvent],
+) {
+    if handle.closed.is_cancelled() {
+        return;
+    }
+    let lines = {
+        let mut announced = handle
+            .announced_background
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        background_wake_lines(events, &mut announced)
+    };
+    if lines.is_empty() {
+        return;
+    }
+    let content = lines.join("\n");
+    match handle.clone().wake_with_background(&content).await {
+        Ok(started) => debug!(
+            session_id = %handle.session_id,
+            started,
+            "OOB: a background event woke the session"
+        ),
+        Err(error) => warn!(
+            session_id = %handle.session_id,
+            %error,
+            "OOB: waking the session for a background event failed"
+        ),
+    }
+}
+
 /// Map a `nexus_claude::Message` variant to `(source, content, correlation_id)`
 /// suitable for `ChatEvent::BackgroundOutput`. Returns `None` for variants
 /// that should be ignored at the OOB level (e.g. `Result` end-of-turn,
@@ -1835,6 +1977,146 @@ mod tests {
         let other = crate::neo4j::mock::MockGraphStore::new();
         emit_subprocess_death("not-a-uuid", None, &events_tx, &next_seq, &other).await;
         assert_eq!(next_seq.load(Ordering::SeqCst), 8);
+    }
+
+    // ── What wakes an idle native session (WAKE-BG) ────────────────────────
+
+    fn bg_task(
+        id: &str,
+        kind: nexus_claude::agent::BackgroundTaskKind,
+        status: nexus_claude::agent::BackgroundTaskStatus,
+        description: &str,
+    ) -> nexus_claude::agent::BackgroundTask {
+        nexus_claude::agent::BackgroundTask {
+            id: id.to_string(),
+            kind,
+            description: description.to_string(),
+            status,
+            started_at_ms: None,
+            tool_call_id: None,
+            parent: None,
+            pid: None,
+        }
+    }
+
+    /// The regression the user reported: nothing woke the session for a finished
+    /// background task, so the agent waited for a human message.
+    #[test]
+    fn a_finished_background_task_wakes_the_session_once() {
+        use nexus_claude::agent::{AgentEvent, BackgroundTaskKind, BackgroundTaskStatus as Status};
+
+        let mut announced = AnnouncedBackground::default();
+        let ended = vec![AgentEvent::BackgroundTasks {
+            tasks: vec![bg_task(
+                "bg-7",
+                BackgroundTaskKind::Shell,
+                Status::Completed,
+                "cargo build",
+            )],
+        }];
+
+        let lines = background_wake_lines(&ended, &mut announced);
+        assert_eq!(lines.len(), 1, "one line for the ended task: {lines:?}");
+        assert!(
+            lines[0].contains("bg-7") && lines[0].contains("completed"),
+            "the line names the task and its end: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("cargo build"),
+            "the line carries what was run: {}",
+            lines[0]
+        );
+
+        // The provider repeats the COMPLETE table on every change: the same end
+        // announced twice would start a second, pointless turn.
+        assert!(
+            background_wake_lines(&ended, &mut announced).is_empty(),
+            "the same task is announced once"
+        );
+    }
+
+    /// A task still running is what the launch result already said, inside the turn.
+    #[test]
+    fn a_running_background_task_announces_nothing() {
+        use nexus_claude::agent::{AgentEvent, BackgroundTaskKind, BackgroundTaskStatus as Status};
+
+        let mut announced = AnnouncedBackground::default();
+        let running = vec![AgentEvent::BackgroundTasks {
+            tasks: vec![
+                bg_task(
+                    "bg-1",
+                    BackgroundTaskKind::Shell,
+                    Status::Running,
+                    "sleep 900",
+                ),
+                bg_task(
+                    "bg-2",
+                    BackgroundTaskKind::Monitor,
+                    Status::Running,
+                    "tail -f",
+                ),
+            ],
+        }];
+        assert!(background_wake_lines(&running, &mut announced).is_empty());
+
+        // It ends later: the same table now wakes.
+        let ended = vec![AgentEvent::BackgroundTasks {
+            tasks: vec![bg_task(
+                "bg-2",
+                BackgroundTaskKind::Monitor,
+                Status::Failed,
+                "tail -f",
+            )],
+        }];
+        let lines = background_wake_lines(&ended, &mut announced);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("failed"), "{}", lines[0]);
+    }
+
+    /// A `Monitor` match is the tool whose whole point is to resume the agent.
+    #[test]
+    fn a_monitor_line_wakes_once_per_line() {
+        use nexus_claude::agent::{AgentEvent, TaskPhase};
+
+        let mut announced = AnnouncedBackground::default();
+        let line = |event_id: Option<&str>, text: &str| {
+            vec![AgentEvent::TaskUpdate {
+                phase: TaskPhase::Progress,
+                task_id: Some("bg-3".to_string()),
+                tool_call_id: None,
+                description: None,
+                status: None,
+                summary: Some(text.to_string()),
+                event_id: event_id.map(str::to_string),
+                data: json!({}),
+            }]
+        };
+
+        let first = background_wake_lines(&line(Some("e1"), "LISTEN"), &mut announced);
+        assert_eq!(first, vec!["[monitor] LISTEN".to_string()]);
+        // Replayed (the same event id): not a second turn.
+        assert!(background_wake_lines(&line(Some("e1"), "LISTEN"), &mut announced).is_empty());
+        // A new line: a new turn.
+        assert_eq!(
+            background_wake_lines(&line(Some("e2"), "READY"), &mut announced),
+            vec!["[monitor] READY".to_string()]
+        );
+    }
+
+    /// The memory of what was announced is bounded (a long session cannot grow it
+    /// without limit); forgetting the oldest key only costs a repeated announcement.
+    #[test]
+    fn the_announced_memory_is_bounded() {
+        let mut announced = AnnouncedBackground::default();
+        for i in 0..(MAX_ANNOUNCED_BACKGROUND + 10) {
+            assert!(announced.first_time(format!("task:{i}")));
+        }
+        assert_eq!(announced.order.len(), MAX_ANNOUNCED_BACKGROUND);
+        assert!(announced.first_time("task:new".to_string()));
+        assert_eq!(announced.order.len(), MAX_ANNOUNCED_BACKGROUND);
+        // The most recent keys are still remembered.
+        assert!(!announced.first_time(format!("task:{}", MAX_ANNOUNCED_BACKGROUND + 9)));
     }
 }
 
