@@ -1913,6 +1913,52 @@ mod agent_path_tests {
         }
     }
 
+    /// WAKE-BG (regression): the end of a background task, received OUT OF TURN,
+    /// starts the turn by itself.
+    ///
+    /// On the native engine PO *is* the harness: no CLI is behind to start that
+    /// turn when a background tool of its own ends. Before the fix the event was
+    /// mirrored, persisted and drawn, and the session stayed idle until the next
+    /// human message — the reported "tu ne te relances jamais tout seul".
+    #[tokio::test]
+    async fn a_background_task_that_ends_out_of_turn_starts_a_turn() {
+        let (provider, handle) = rig().await;
+        let mut rx = handle.events_tx.subscribe();
+
+        let mut ended = bg_task("nt-9", Some("c9"));
+        ended.status = BackgroundTaskStatus::Completed;
+        provider
+            .state
+            .push_oob(AgentEvent::BackgroundTasks { tasks: vec![ended] });
+
+        // The wake starts ONE turn, whose prompt is the announcement itself.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let turns = provider.state.turns_started.lock().unwrap().clone();
+            if let Some(first) = turns.first() {
+                assert!(
+                    first.contains("nt-9"),
+                    "the prompt of the woken turn names the task: {first}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no turn was started for a background task that ended: the session stays \
+                 idle until a human message"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // And the transcript says why the agent went on: the announcement.
+        let event =
+            next_matching(&mut rx, |e| matches!(e, ChatEvent::BackgroundOutput { .. })).await;
+        assert!(
+            matches!(&event, ChatEvent::BackgroundOutput { content, .. } if content.contains("nt-9")),
+            "{event:?}"
+        );
+    }
+
     /// Criterion 1 + 3: an out-of-band event scripted by the fake provider is
     /// received by the pump and emitted as a `ChatEvent`; a typed
     /// `BackgroundTasks` snapshot becomes an `ActiveTasksUpdate` WITHOUT any pid.
