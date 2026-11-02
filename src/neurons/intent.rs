@@ -429,4 +429,61 @@ mod tests {
         assert_eq!(format!("{}", QueryIntentMode::Plan), "plan");
         assert_eq!(format!("{}", QueryIntentMode::Default), "default");
     }
+
+    /// The same request in French and in English must land on the same intent.
+    ///
+    /// The unit-level twin of the `lang` invariant of `tests/text_metamorphic.rs`:
+    /// it NAMES the pairs instead of measuring a rate, so a failure says which
+    /// translation broke instead of printing a percentage. Measured on 02/11/2026
+    /// (origin/main): six of these ten pairs disagreed — each one a keyword present
+    /// in one language and absent in the other.
+    #[test]
+    fn fr_and_en_of_the_same_request_agree() {
+        let pairs: &[(&str, &str)] = &[
+            (
+                "ça plante au démarrage, aide-moi",
+                "it crashes at startup, help me",
+            ),
+            (
+                "c'est quoi un épisode dans ce projet ?",
+                "what is an episode in this project?",
+            ),
+            (
+                "comment les triggers sont-ils évalués ?",
+                "how are triggers evaluated?",
+            ),
+            (
+                "modifie le nom de cette variable partout",
+                "rename this variable everywhere",
+            ),
+            (
+                "il faut ajouter un cache de résultats",
+                "we need to add a results cache",
+            ),
+            (
+                "explique la différence entre les deux modes",
+                "explain the difference between the two modes",
+            ),
+            (
+                "si je modifie ce module, qu'est-ce qui casse ?",
+                "if I change this module, what breaks?",
+            ),
+            ("lance le test de couverture", "run the coverage test"),
+            (
+                "quelle est la différence entre ces deux stratégies ?",
+                "what is the difference between these two strategies?",
+            ),
+            (
+                "le déploiement a planté après la mise à jour",
+                "the deployment crashed after the update",
+            ),
+        ];
+        for (fr, en) in pairs {
+            assert_eq!(
+                IntentDetector::detect(fr),
+                IntentDetector::detect(en),
+                "the same request in FR {fr:?} and EN {en:?} got two intents"
+            );
+        }
+    }
 }

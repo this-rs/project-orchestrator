@@ -73,17 +73,18 @@ struct Threshold {
 // keyword asymmetry, paraphrase blind spots) listed by `cargo test --test text_metamorphic
 // -- --nocapture`. Raise a floor in the same PR that closes a gap, never lower one.
 const THRESHOLDS: &[Threshold] = &[
-    // lang 12/16, paraphrase 5/12
+    // lang 16/16, paraphrase 5/12 — raised on 02/11/2026 by the FR/EN keyword
+    // symmetry fix (see `fr_and_en_of_the_same_request_agree` in src/neurons/intent.rs).
     Threshold {
         classifier: "intent",
-        lang: 0.75,
+        lang: 1.0,
         noise: 1.0,
         paraphrase: 0.41,
     },
-    // lang 10/16, paraphrase 5/12
+    // lang 16/16, paraphrase 5/12 — raised on 02/11/2026 by the same fix.
     Threshold {
         classifier: "task_class",
-        lang: 0.625,
+        lang: 1.0,
         noise: 1.0,
         paraphrase: 0.41,
     },
