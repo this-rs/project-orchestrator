@@ -65,14 +65,15 @@ pub struct HomeostasisMetrics {
 /// A corrective action determined by homeostasis evaluation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HomeostasisAction {
-    /// Decay all synapse weights and prune weak ones.
-    /// Triggered when synapse_health > 3.0 (network too dense).
-    DecaySynapses {
-        /// Amount to subtract from each synapse weight.
-        amount: f64,
-        /// Synapses below this weight are deleted.
-        prune_threshold: f64,
-    },
+    /// One forgetting pass, with the one policy of
+    /// [`crate::neurons::forgetting`].
+    ///
+    /// Triggered when synapse_health > 3.0 (network too dense). The controller
+    /// decides WHEN to forget, never HOW MUCH: the amount and the threshold
+    /// that used to live here (0.02 / 0.15) were a second set of rules, three
+    /// times more aggressive than the heartbeat's (0.02 / 0.05), so the same
+    /// edge could survive one path and be deleted by the other on the same day.
+    DecaySynapses,
     /// Backfill missing SYNAPSE relations via embedding similarity.
     /// Triggered when synapse_health < 0.2 (network too sparse).
     BackfillSynapses,
@@ -84,14 +85,7 @@ pub enum HomeostasisAction {
 impl fmt::Display for HomeostasisAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            HomeostasisAction::DecaySynapses {
-                amount,
-                prune_threshold,
-            } => write!(
-                f,
-                "DecaySynapses(amount={}, prune_threshold={})",
-                amount, prune_threshold
-            ),
+            HomeostasisAction::DecaySynapses => write!(f, "DecaySynapses"),
             HomeostasisAction::BackfillSynapses => write!(f, "BackfillSynapses"),
             HomeostasisAction::ReduceInitialEnergy(e) => {
                 write!(f, "ReduceInitialEnergy({})", e)
@@ -123,10 +117,7 @@ impl HomeostasisController {
 
         // Rule 1: Synapse health (mutually exclusive: decay OR backfill)
         if metrics.synapse_health > 3.0 {
-            actions.push(HomeostasisAction::DecaySynapses {
-                amount: 0.02,
-                prune_threshold: 0.15,
-            });
+            actions.push(HomeostasisAction::DecaySynapses);
         } else if metrics.synapse_health < 0.2 {
             actions.push(HomeostasisAction::BackfillSynapses);
         }
@@ -285,28 +276,33 @@ pub async fn execute_actions(
 
     for action in actions {
         match action {
-            HomeostasisAction::DecaySynapses {
-                amount,
-                prune_threshold,
-            } => {
+            HomeostasisAction::DecaySynapses => {
+                // One policy, shared with the heartbeat, the skills maintenance
+                // and the protocol executor: this controller decides WHEN to
+                // forget, never HOW MUCH (see `neurons::forgetting`).
+                let policy = crate::neurons::forgetting::DecayPolicy::default();
                 info!(
-                    amount,
-                    prune_threshold, "homeostasis: executing DecaySynapses"
+                    dormancy = policy.dormancy_threshold,
+                    forget = policy.forget_threshold,
+                    "homeostasis: executing DecaySynapses"
                 );
                 // Scoped to the project being corrected: the global decay here
                 // decayed every synapse of the graph to fix one project (m4:
                 // 13,422 synapses for a 9-note project, once per project).
-                let decayed = match ctx.project_id {
-                    Some(pid) => {
-                        graph
-                            .decay_project_synapses(pid, *amount, *prune_threshold)
-                            .await
-                    }
-                    None => graph.decay_synapses(*amount, *prune_threshold).await,
+                let pass = match ctx.project_id {
+                    Some(pid) => graph.decay_project_synapses(pid, &policy).await,
+                    None => graph.decay_synapses(&policy).await,
                 };
-                match decayed {
-                    Ok((decayed, pruned)) => {
-                        debug!(decayed, pruned, "homeostasis: DecaySynapses completed");
+                match pass {
+                    Ok(report) => {
+                        debug!(
+                            decayed = report.decayed,
+                            dormant = report.dormant,
+                            protected = report.protected,
+                            archived = report.archived,
+                            capped = report.capped,
+                            "homeostasis: DecaySynapses completed"
+                        );
                         executed += 1;
                     }
                     Err(e) => {
@@ -456,13 +452,7 @@ mod tests {
         };
         let actions = HomeostasisController::evaluate(&metrics);
         assert_eq!(actions.len(), 1);
-        assert_eq!(
-            actions[0],
-            HomeostasisAction::DecaySynapses {
-                amount: 0.02,
-                prune_threshold: 0.15,
-            }
-        );
+        assert_eq!(actions[0], HomeostasisAction::DecaySynapses);
     }
 
     #[test]
@@ -522,13 +512,7 @@ mod tests {
         let actions = HomeostasisController::evaluate(&metrics);
         // Both rules fire: DecaySynapses + ReduceInitialEnergy
         assert_eq!(actions.len(), 2);
-        assert_eq!(
-            actions[0],
-            HomeostasisAction::DecaySynapses {
-                amount: 0.02,
-                prune_threshold: 0.15,
-            }
-        );
+        assert_eq!(actions[0], HomeostasisAction::DecaySynapses);
         assert_eq!(actions[1], HomeostasisAction::ReduceInitialEnergy(0.5));
     }
 
@@ -571,26 +555,14 @@ mod tests {
         };
         let actions = HomeostasisController::evaluate(&metrics);
         assert_eq!(actions.len(), 2);
-        assert_eq!(
-            actions[0],
-            HomeostasisAction::DecaySynapses {
-                amount: 0.02,
-                prune_threshold: 0.15,
-            }
-        );
+        assert_eq!(actions[0], HomeostasisAction::DecaySynapses);
         assert_eq!(actions[1], HomeostasisAction::ReduceInitialEnergy(0.5));
     }
 
     #[test]
     fn test_action_display() {
-        let decay = HomeostasisAction::DecaySynapses {
-            amount: 0.02,
-            prune_threshold: 0.15,
-        };
-        assert_eq!(
-            decay.to_string(),
-            "DecaySynapses(amount=0.02, prune_threshold=0.15)"
-        );
+        let decay = HomeostasisAction::DecaySynapses;
+        assert_eq!(decay.to_string(), "DecaySynapses");
 
         assert_eq!(
             HomeostasisAction::BackfillSynapses.to_string(),
@@ -666,10 +638,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_decay_synapses() {
         let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
-        let actions = vec![HomeostasisAction::DecaySynapses {
-            amount: 0.02,
-            prune_threshold: 0.15,
-        }];
+        let actions = vec![HomeostasisAction::DecaySynapses];
         let result = execute_actions(&graph, None, &actions, ExecuteContext::default())
             .await
             .unwrap();
@@ -777,10 +746,7 @@ mod tests {
         let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
         let search: Arc<dyn crate::meilisearch::SearchStore> = Arc::new(MockSearchStore::new());
         let actions = vec![
-            HomeostasisAction::DecaySynapses {
-                amount: 0.02,
-                prune_threshold: 0.15,
-            },
+            HomeostasisAction::DecaySynapses,
             HomeostasisAction::BackfillSynapses,
         ];
 

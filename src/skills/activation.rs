@@ -2681,8 +2681,9 @@ mod tests {
 
         // Decay: coactivation (A-B) should decay at base rate,
         //        cosine (A-C) should decay at 2x base rate
-        let (decayed, _pruned) = graph.decay_synapses(0.05, 0.0).await.unwrap();
-        assert!(decayed > 0);
+        let policy = crate::neurons::forgetting::DecayPolicy::legacy(0.05, 0.0);
+        let report = graph.decay_synapses(&policy).await.unwrap();
+        assert!(report.decayed > 0);
 
         let synapses = graph.note_synapses.read().await;
         // A→B was 0.8+0.05(boost)=0.85, coactivation decays 0.05 → 0.80
@@ -2706,9 +2707,19 @@ mod tests {
             ab_weight > ac_weight,
             "Coactivation synapse ({ab_weight:.2}) should decay slower than cosine ({ac_weight:.2})"
         );
-        // Verify exact values (within float tolerance)
-        assert!((ab_weight - 0.80).abs() < 0.01, "A-B: {ab_weight}");
-        assert!((ac_weight - 0.60).abs() < 0.01, "A-C: {ac_weight}");
+        // The expected weights come from the policy itself, not from the
+        // subtraction the legacy model used: six hours is one legacy interval.
+        let six_hours = (6 * 3600) as f64;
+        let expected_ab = policy.decayed(0.85, six_hours, "coactivation");
+        let expected_ac = policy.decayed(0.70, six_hours, "cosine");
+        assert!(
+            (ab_weight - expected_ab).abs() < 1e-3,
+            "A-B: {ab_weight} vs {expected_ab}"
+        );
+        assert!(
+            (ac_weight - expected_ac).abs() < 1e-3,
+            "A-C: {ac_weight} vs {expected_ac}"
+        );
     }
 
     #[tokio::test]

@@ -174,17 +174,19 @@ pub async fn run_daily_maintenance(
     // Project-scoped: this runs once per project, and the global decay here
     // decayed every synapse N times per pass (×3 in deep maintenance) — it
     // wiped the whole SYNAPSE layer.
+    // One policy (see `neurons::forgetting`): the adaptive threshold becomes
+    // the forget threshold of THIS project, the cadence comes from the config.
+    let policy = crate::neurons::forgetting::DecayPolicy::legacy(
+        config.synapse_decay_amount,
+        adaptive_prune_threshold,
+    );
     match graph_store
-        .decay_project_synapses(
-            project_id,
-            config.synapse_decay_amount,
-            adaptive_prune_threshold,
-        )
+        .decay_project_synapses(project_id, &policy)
         .await
     {
-        Ok((decayed, pruned)) => {
-            result.synapses_decayed = Some(decayed);
-            result.synapses_pruned = Some(pruned);
+        Ok(report) => {
+            result.synapses_decayed = Some(report.decayed);
+            result.synapses_pruned = Some(report.archived);
         }
         Err(e) => {
             warn!(error = %e, "Failed to decay synapses");
