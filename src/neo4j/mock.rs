@@ -14219,6 +14219,47 @@ impl AnalyticsStore for MockGraphStore {
         Ok(vec![])
     }
 
+    async fn get_file_structural_dna(
+        &self,
+        _project_id: &str,
+        _path: &str,
+    ) -> anyhow::Result<Option<Vec<f64>>> {
+        // Mock: no structural DNA in tests by default
+        Ok(None)
+    }
+
+    async fn get_import_edges_among(
+        &self,
+        project_id: Uuid,
+        paths: &[String],
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let wanted: std::collections::HashSet<&str> = paths.iter().map(|p| p.as_str()).collect();
+        Ok(self
+            .get_project_import_edges(project_id)
+            .await?
+            .into_iter()
+            .filter(|(source, target)| {
+                wanted.contains(source.as_str()) && wanted.contains(target.as_str())
+            })
+            .collect())
+    }
+
+    async fn get_call_edges_among(
+        &self,
+        project_id: Uuid,
+        ids: &[String],
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let wanted: std::collections::HashSet<&str> = ids.iter().map(|i| i.as_str()).collect();
+        Ok(self
+            .get_project_call_edges(project_id)
+            .await?
+            .into_iter()
+            .filter(|(source, target)| {
+                wanted.contains(source.as_str()) && wanted.contains(target.as_str())
+            })
+            .collect())
+    }
+
     async fn get_project_synapse_edges(
         &self,
         _project_id: Uuid,

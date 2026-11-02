@@ -359,9 +359,12 @@ pub async fn build_project_graph_data(
             code_node_count += 1;
         }
 
-        // Get IMPORTS edges (file-level)
+        // Get IMPORTS edges (file-level), restricted IN CYPHER to the files we kept.
+        // Loading every edge of the project and dropping the rest in Rust made the
+        // transfer proportional to the project, not to the window that was asked for.
+        let kept_ids: Vec<String> = node_ids.iter().cloned().collect();
         let import_edges = neo4j
-            .get_project_import_edges(project.id)
+            .get_import_edges_among(project.id, &kept_ids)
             .await
             .unwrap_or_default();
 
@@ -416,9 +419,10 @@ pub async fn build_project_graph_data(
             }
         }
 
-        // CALLS edges between functions
+        // CALLS edges between functions, restricted IN CYPHER to the kept symbols.
+        let call_ids: Vec<String> = node_ids.iter().cloned().collect();
         let call_edges = neo4j
-            .get_project_call_edges(project.id)
+            .get_call_edges_among(project.id, &call_ids)
             .await
             .unwrap_or_default();
 

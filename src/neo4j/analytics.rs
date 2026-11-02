@@ -949,6 +949,66 @@ impl Neo4jClient {
         Ok(edges)
     }
 
+    /// IMPORTS edges of a project restricted to the given file paths.
+    ///
+    /// Same result as [`Self::get_project_import_edges`] filtered on both endpoints,
+    /// but the filter runs in Cypher: the backend receives the edges of the window it
+    /// asked for, not every edge of the project.
+    pub async fn get_import_edges_among(
+        &self,
+        project_id: Uuid,
+        paths: &[String],
+    ) -> Result<Vec<(String, String)>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f1:File)-[:IMPORTS]->(f2:File)<-[:CONTAINS]-(p)
+            WHERE f1.path IN $paths AND f2.path IN $paths
+            RETURN f1.path AS source, f2.path AS target
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("paths", paths.to_vec());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut edges = Vec::new();
+        while let Some(row) = result.next().await? {
+            if let (Ok(source), Ok(target)) =
+                (row.get::<String>("source"), row.get::<String>("target"))
+            {
+                edges.push((source, target));
+            }
+        }
+        Ok(edges)
+    }
+
+    /// CALLS edges of a project restricted to the given node ids.
+    pub async fn get_call_edges_among(
+        &self,
+        project_id: Uuid,
+        ids: &[String],
+    ) -> Result<Vec<(String, String)>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(:File)-[:CONTAINS]->(f1:Function)-[:CALLS]->(f2:Function)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
+            WHERE f1.id IN $ids AND f2.id IN $ids
+            RETURN f1.id AS source, f2.id AS target
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("ids", ids.to_vec());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut edges = Vec::new();
+        while let Some(row) = result.next().await? {
+            if let (Ok(source), Ok(target)) =
+                (row.get::<String>("source"), row.get::<String>("target"))
+            {
+                edges.push((source, target));
+            }
+        }
+        Ok(edges)
+    }
+
     /// Get all EXTENDS edges between structs/classes in a project as (child_file, parent_file) pairs.
     /// Returns file-level edges so the graph analytics engine can weight inter-file coupling.
     pub async fn get_project_extends_edges(
@@ -1427,6 +1487,29 @@ impl Neo4jClient {
         }
 
         Ok(dna_list)
+    }
+
+    /// Read the structural DNA of ONE file: `None` when the file has no DNA yet.
+    pub async fn get_file_structural_dna(
+        &self,
+        project_id: &str,
+        path: &str,
+    ) -> Result<Option<Vec<f64>>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File {path: $path})
+            WHERE f.structural_dna IS NOT NULL
+            RETURN f.structural_dna AS dna
+            "#,
+        )
+        .param("project_id", project_id)
+        .param("path", path);
+
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => Ok(Some(row.get::<Vec<f64>>("dna")?)),
+            None => Ok(None),
+        }
     }
 
     /// Get SYNAPSE edges bridged from Note-level to File-level for the GDS graph.

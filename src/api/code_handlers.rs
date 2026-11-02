@@ -3227,17 +3227,13 @@ pub async fn get_structural_profile(
         body.file_path.clone()
     };
 
-    let all_dna = state
+    // Targeted: the DNA vector of ONE file. Reading the whole project (one vector per
+    // file) to look at a single one is hundreds of MB on a large project.
+    let target_dna = state
         .orchestrator
         .neo4j()
-        .get_project_structural_dna(&project.id.to_string())
+        .get_file_structural_dna(&project.id.to_string(), &resolved_path)
         .await?;
-
-    // Find the target file's DNA
-    let target_dna = all_dna
-        .iter()
-        .find(|(path, _)| path == &resolved_path)
-        .map(|(_, dna)| dna.clone());
 
     match target_dna {
         Some(dna) => Ok(Json(serde_json::json!({
@@ -3569,7 +3565,25 @@ pub async fn find_cross_project_twins(
     let source_ext = resolved_path.rsplit('.').next().unwrap_or("");
 
     let top_n = body.top_n.unwrap_or(10);
-    let mut all_twins: Vec<serde_json::Value> = Vec::new();
+    // Bounded selection. Every candidate used to become one `serde_json::Value`
+    // (two owned strings plus an object, ~400 B) and be dropped by `truncate(top_n)`
+    // afterwards: memory grew with the number of files in the whole workspace for a
+    // request that returns ten rows. Keep the best `top_n` compact hits and build the
+    // JSON only for the survivors.
+    struct TwinHit {
+        path: String,
+        project_slug: String,
+        project_name: String,
+        similarity: f64,
+        fingerprint_similarity: f64,
+        wl_hash_match: f64,
+        name_similarity: f64,
+        size_similarity: f64,
+        shared_role: Option<String>,
+    }
+    // Kept sorted by DESCENDING similarity, so the worst kept hit is the last one.
+    let mut best: Vec<TwinHit> = Vec::with_capacity(top_n.min(64) + 1);
+    let mut total = 0usize;
 
     // Search across all other projects using multi-signal fusion
     for project in &projects {
@@ -3600,39 +3614,66 @@ pub async fn find_cross_project_twins(
             };
 
             let sim = compute_multi_signal_similarity(&source_file, &target_file);
+            total += 1;
 
-            all_twins.push(serde_json::json!({
-                "file_path": record.path,
-                "project_slug": project.slug,
-                "project_name": project.name,
-                "similarity": sim.similarity,
-                "signals": {
-                    "fingerprint_similarity": sim.signals.fingerprint_similarity,
-                    "wl_hash_match": sim.signals.wl_hash_match,
-                    "name_similarity": sim.signals.name_similarity,
-                    "size_similarity": sim.signals.size_similarity,
+            if top_n == 0 {
+                continue;
+            }
+            // A hit worse than the worst kept one cannot enter the top `top_n`.
+            if best.len() >= top_n
+                && best
+                    .last()
+                    .is_some_and(|hit| sim.similarity <= hit.similarity)
+            {
+                continue;
+            }
+
+            let position = best.partition_point(|hit| hit.similarity >= sim.similarity);
+            best.insert(
+                position,
+                TwinHit {
+                    path: record.path.clone(),
+                    project_slug: project.slug.clone(),
+                    project_name: project.name.clone(),
+                    similarity: sim.similarity,
+                    fingerprint_similarity: sim.signals.fingerprint_similarity,
+                    wl_hash_match: sim.signals.wl_hash_match,
+                    name_similarity: sim.signals.name_similarity,
+                    size_similarity: sim.signals.size_similarity,
+                    shared_role: sim.shared_role.clone(),
                 },
-                "shared_role": sim.shared_role,
-            }));
+            );
+            if best.len() > top_n {
+                best.pop();
+            }
         }
     }
 
-    // Sort by descending fused similarity
-    all_twins.sort_by(|a, b| {
-        let sa = a["similarity"].as_f64().unwrap_or(0.0);
-        let sb = b["similarity"].as_f64().unwrap_or(0.0);
-        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let total = all_twins.len();
-    all_twins.truncate(top_n);
+    let twins: Vec<serde_json::Value> = best
+        .iter()
+        .map(|hit| {
+            serde_json::json!({
+                "file_path": hit.path,
+                "project_slug": hit.project_slug,
+                "project_name": hit.project_name,
+                "similarity": hit.similarity,
+                "signals": {
+                    "fingerprint_similarity": hit.fingerprint_similarity,
+                    "wl_hash_match": hit.wl_hash_match,
+                    "name_similarity": hit.name_similarity,
+                    "size_similarity": hit.size_similarity,
+                },
+                "shared_role": hit.shared_role,
+            })
+        })
+        .collect();
 
     Ok(Json(serde_json::json!({
         "file_path": body.file_path,
         "source_project": body.source_project_slug,
-        "twins": all_twins,
+        "twins": twins,
         "total": total,
-        "returned": all_twins.len(),
+        "returned": twins.len(),
     })))
 }
 
