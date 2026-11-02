@@ -3459,7 +3459,10 @@ fn candidate_signals(
     let mut adamic_adar = 0.0f64;
     let (mut i, mut j) = (0usize, 0usize);
     while i < source_neighbors.len() && j < target_neighbors.len() {
-        match source_neighbors[i].index().cmp(&target_neighbors[j].index()) {
+        match source_neighbors[i]
+            .index()
+            .cmp(&target_neighbors[j].index())
+        {
             std::cmp::Ordering::Less => i += 1,
             std::cmp::Ordering::Greater => j += 1,
             std::cmp::Ordering::Equal => {
@@ -6485,8 +6488,9 @@ mod tests {
         g.add_edge("D", "E", CodeEdge::default());
 
         // (B, C) is a genuine distance-2 candidate: same neighbours A and D, not adjacent.
-        let co_change: HashMap<(String, String), f64> =
-            [(("B".to_string(), "C".to_string()), 0.7)].into_iter().collect();
+        let co_change: HashMap<(String, String), f64> = [(("B".to_string(), "C".to_string()), 0.7)]
+            .into_iter()
+            .collect();
         let dna: HashMap<String, Vec<f64>> = [
             ("A".to_string(), vec![1.0, 0.0]),
             ("B".to_string(), vec![0.9, 0.1]),

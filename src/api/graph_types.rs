@@ -1486,10 +1486,7 @@ mod graph_limit_tests {
 
     #[test]
     fn a_project_graph_shows_the_default_when_no_limit_is_asked() {
-        assert_eq!(
-            query(None).effective_limit(),
-            DEFAULT_GRAPH_NODES_PER_LAYER
-        );
+        assert_eq!(query(None).effective_limit(), DEFAULT_GRAPH_NODES_PER_LAYER);
     }
 
     #[test]
