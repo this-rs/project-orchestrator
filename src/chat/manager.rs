@@ -11184,6 +11184,24 @@ impl ChatManager {
         }
     }
 
+    /// Wakes a session for news from ELSEWHERE that it has to answer — the end of a
+    /// delegation it launched — instead of leaving it idle until a human types again.
+    ///
+    /// On the agent engine the news starts (or waits behind) a turn of the
+    /// `BackgroundOutput` kind: the transcript says why the agent went on by itself, and
+    /// it is not counted as a user message. It is the same path the out-of-turn pump
+    /// takes for what the provider reports (`chat::oob_listener::wake_for_background`).
+    ///
+    /// On the historical engine the news follows [`Self::inject_hint`]: queued behind a
+    /// running turn, a turn of its own when the session is idle.
+    pub async fn wake_with_notification(&self, session_id: &str, content: &str) -> Result<()> {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            handle.wake_with_background(content).await?;
+            return Ok(());
+        }
+        self.inject_hint(session_id, content).await
+    }
+
     /// Relay a team message from `from_session_id` into `to_session_id`.
     ///
     /// # Behaviour
@@ -26084,6 +26102,82 @@ mod tests {
                 return ev;
             }
         }
+    }
+
+    /// DELEG-WAKE, moteur agent : une nouvelle venue d'ailleurs passe par le réveil hors
+    /// tour (`wake_with_background`) — un tour de type `BackgroundOutput`, l'annonce
+    /// écrite dans la transcription, et pas un message utilisateur.
+    #[tokio::test]
+    async fn a_notification_wakes_an_agent_session_with_a_background_turn() {
+        use nexus_claude::agent::AgentEvent;
+
+        let (manager, graph, fake) = agent_manager();
+        let manager = Arc::new(manager);
+        let sid = manager
+            .create_session(&agent_request("hello"))
+            .await
+            .expect("the session opens")
+            .session_id;
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+
+        // End the opening turn, so the session is idle when the news arrives.
+        fake.state.push(AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Completed,
+            subtype: None,
+            is_error: false,
+            result_text: Some("ok".into()),
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 1,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let handle = manager
+            .agent_runtime
+            .get(&sid)
+            .await
+            .expect("the agent session is live");
+        while handle.is_streaming.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the opening turn never ended"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let turns_before = fake.state.turns_started.lock().unwrap().len();
+
+        manager
+            .wake_with_notification(&sid, "<task-notification task_id=\"t1\"/>")
+            .await
+            .expect("the session is woken");
+
+        // The announcement is in the transcript, and it IS what the provider was sent.
+        next_matching(&mut rx, |e| {
+            matches!(e, ChatEvent::BackgroundOutput { content, .. } if content.contains("task-notification"))
+        })
+        .await;
+        while fake.state.turns_started.lock().unwrap().len() == turns_before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the wake started no turn"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let sent = fake.state.turns_started.lock().unwrap()[turns_before].clone();
+        assert!(sent.contains("task-notification"), "{sent}");
+
+        // Not a user message: the session's count did not move for it.
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.message_count, 1, "1 at creation only: {node:?}");
     }
 
     /// Two first sessions opened at once on an agent that refuses MCP servers per

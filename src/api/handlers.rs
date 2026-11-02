@@ -1461,6 +1461,16 @@ pub(crate) async fn launch_delegation(
         None => None,
     };
 
+    // The run whose executor delegated, read now: its cost is that run's only
+    // (a manual delegation has none; a later run is another run).
+    let owner = DelegationOwner {
+        run_id: run_of_session(parent_session_id).await,
+        parent_session_id,
+    };
+    // DELEG-WAKE: the session that delegated is told when the delegation ends, so it
+    // can go on by itself instead of waiting for a human message.
+    let wake = delegation_wake(&owner, chat_manager, task_id, &task_title);
+
     // Step 3: Create AgentExecution node for tracking (fire-and-forget)
     let session_uuid = session_id.parse::<Uuid>().ok();
     let execution = {
@@ -1493,14 +1503,9 @@ pub(crate) async fn launch_delegation(
             }
         });
         // From here the execution is closed exactly once, whatever path the
-        // delegation ends on, and never before it is written (B36).
-        DelegationExecution::new(ae, graph.clone(), Some(created))
-    };
-    // The run whose executor delegated, read now: its cost is that run's only
-    // (a manual delegation has none; a later run is another run).
-    let owner = DelegationOwner {
-        run_id: run_of_session(parent_session_id).await,
-        parent_session_id,
+        // delegation ends on, and never before it is written (B36). Its close is also
+        // what wakes the session that delegated (`DelegationWake`).
+        DelegationExecution::new(ae, graph.clone(), Some(created), wake)
     };
 
     // Step 4: Send the enriched prompt to the agent (async — don't block)
@@ -2062,6 +2067,95 @@ struct DelegationOwner {
     parent_session_id: Option<Uuid>,
 }
 
+/// The session to wake when a delegation ends: the one that delegated, unless a plan run
+/// owns the delegation. `None` for a delegation nobody launched from a session.
+fn waking_parent(owner: &DelegationOwner) -> Option<Uuid> {
+    let parent = owner.parent_session_id?;
+    owner.run_id.is_none().then_some(parent)
+}
+
+/// Wakes the session that launched a delegation when that delegation ends
+/// (DELEG-WAKE).
+///
+/// Without it the parent was left idle: an agent that delegated a task and said it would
+/// carry on when it was done had nothing to wake it, so a human had to type again. It is
+/// the delegation-side twin of the out-of-turn wake (`chat::oob_listener::
+/// background_wake_lines`): the same rule, the same turn kind.
+///
+/// Absent for a delegation owned by a plan run — the run's executor reads the task and
+/// drives the plan itself, and a turn injected there would be a second driver.
+struct DelegationWake {
+    manager: Arc<ChatManager>,
+    parent_session_id: Uuid,
+    task_id: Uuid,
+    task_title: String,
+}
+
+/// Who to wake when a delegation ends, built once at its launch: the session that
+/// delegated, with the manager that will reach it. `None` for a delegation a plan run
+/// owns (its executor reads the task and drives the plan — a turn injected there would
+/// be a second driver), and for one nobody launched from a session.
+fn delegation_wake(
+    owner: &DelegationOwner,
+    manager: &Arc<ChatManager>,
+    task_id: Uuid,
+    task_title: &str,
+) -> Option<DelegationWake> {
+    waking_parent(owner).map(|parent| DelegationWake {
+        manager: Arc::clone(manager),
+        parent_session_id: parent,
+        task_id,
+        task_title: task_title.to_string(),
+    })
+}
+
+/// The notification the session that delegated reads (DELEG-WAKE): what ended, how, and
+/// where the answer is. Built from the same `DelegationEnd` that closes the execution, so
+/// the two can never disagree.
+fn delegation_notification(task_id: Uuid, task_title: &str, end: &DelegationEnd) -> String {
+    let status = if end.is_error { "failed" } else { "completed" };
+    let mut detail = String::new();
+    if let Some(secs) = end.duration_secs {
+        detail.push_str(&format!(" in {secs:.0}s"));
+    }
+    if let Some(cost) = end.cost_usd {
+        detail.push_str(&format!(", ${cost:.4}"));
+    }
+    if let Some(stop) = &end.stop {
+        detail.push_str(&format!(
+            ", stopped ({})",
+            crate::chat::provider::event_map::stop_reason_name(*stop)
+        ));
+    }
+    format!(
+        "<task-notification task_id=\"{task_id}\" status=\"{status}\">Delegated task \
+         «{task_title}» ended{detail}. Its answer is on the task and its AgentExecution: read \
+         them with task(action: \"get\"), then carry on with what it was needed for.\
+         </task-notification>"
+    )
+}
+
+impl DelegationWake {
+    /// Tells the parent, once (the execution is closed exactly once). A parent that is
+    /// gone — closed, or never alive on this instance — is not an error: the delegation
+    /// still ended and its result is on the task.
+    async fn notify(&self, end: &DelegationEnd) {
+        let content = delegation_notification(self.task_id, &self.task_title, end);
+        if let Err(error) = self
+            .manager
+            .wake_with_notification(&self.parent_session_id.to_string(), &content)
+            .await
+        {
+            tracing::debug!(
+                parent = %self.parent_session_id,
+                task_id = %self.task_id,
+                %error,
+                "the session that delegated could not be woken"
+            );
+        }
+    }
+}
+
 /// How a delegation ended, as its session's `Result` event reported it — or
 /// without one (`DelegationEnd::failed`).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -2198,6 +2292,9 @@ struct DelegationExecution {
     /// The fire-and-forget write of the open node: the close waits for it, so
     /// it never lands on a node not yet written.
     created: Option<tokio::task::JoinHandle<()>>,
+    /// Who to tell that the delegation is over (`None`: nobody asked to be woken —
+    /// a manual delegation from the API, or one a plan run owns).
+    wake: Option<DelegationWake>,
 }
 
 impl DelegationExecution {
@@ -2205,19 +2302,26 @@ impl DelegationExecution {
         open: crate::neo4j::agent_execution::AgentExecutionNode,
         graph: Arc<dyn crate::neo4j::GraphStore>,
         created: Option<tokio::task::JoinHandle<()>>,
+        wake: Option<DelegationWake>,
     ) -> Self {
         Self {
             open: Some(open),
             graph,
             created,
+            wake,
         }
     }
 
-    /// Close the execution with `end`. A write that fails is logged, never fatal.
+    /// Close the execution with `end`, then wake the session that delegated. A write
+    /// that fails is logged, never fatal; the wake follows the close so the parent never
+    /// reads an execution that is still `running`.
     async fn close(mut self, end: &DelegationEnd) {
         if let Some(open) = self.open.take() {
             write_closed_execution(self.graph.as_ref(), self.created.take(), &end.close(&open))
                 .await;
+        }
+        if let Some(wake) = self.wake.take() {
+            wake.notify(end).await;
         }
     }
 }
@@ -2227,6 +2331,10 @@ impl Drop for DelegationExecution {
         let Some(open) = self.open.take() else {
             return;
         };
+        // No wake here: a drop is the delegation being cut (a cancelled parent, a panic),
+        // and a stop nobody asked to hear about does not spend a turn — the same rule the
+        // background tasks follow (`oob_listener::background_wake_lines`).
+        self.wake.take();
         let closed = DelegationEnd::failed().close(&open);
         let graph = self.graph.clone();
         let created = self.created.take();
@@ -8392,7 +8500,324 @@ pub(crate) mod tests {
         let ae = open_delegation_node();
         graph.create_agent_execution(&ae).await.unwrap();
         let id = ae.id;
-        (mock, id, super::DelegationExecution::new(ae, graph, None))
+        (
+            mock,
+            id,
+            super::DelegationExecution::new(ae, graph, None, None),
+        )
+    }
+
+    // ── DELEG-WAKE : la fin d'une délégation réveille la session qui l'a lancée ──
+
+    /// The session to wake is the one that delegated — unless a plan run owns the
+    /// delegation: the run's executor reads the task and drives the plan itself, and a
+    /// turn injected there would be a second driver.
+    #[test]
+    fn only_a_session_that_delegated_is_woken() {
+        let parent = Uuid::new_v4();
+        assert_eq!(
+            super::waking_parent(&super::DelegationOwner {
+                run_id: None,
+                parent_session_id: Some(parent),
+            }),
+            Some(parent)
+        );
+        assert_eq!(
+            super::waking_parent(&super::DelegationOwner {
+                run_id: Some(Uuid::new_v4()),
+                parent_session_id: Some(parent),
+            }),
+            None,
+            "a delegation a plan run owns wakes nobody"
+        );
+        assert_eq!(
+            super::waking_parent(&super::DelegationOwner {
+                run_id: None,
+                parent_session_id: None,
+            }),
+            None,
+            "a delegation nobody launched from a session wakes nobody"
+        );
+    }
+
+    /// What the agent reads: the task, its end, and where the answer is. It is the same
+    /// `DelegationEnd` that closes the execution, so the two cannot disagree.
+    #[test]
+    fn the_delegation_notification_names_the_task_and_its_end() {
+        let task_id = Uuid::new_v4();
+        let completed = super::DelegationEnd {
+            is_error: false,
+            cost_usd: Some(0.5),
+            duration_secs: Some(120.0),
+            ..Default::default()
+        };
+        let message = super::delegation_notification(task_id, "borne les prédictions", &completed);
+        assert!(message.contains(&task_id.to_string()), "{message}");
+        assert!(message.contains("borne les prédictions"), "{message}");
+        assert!(message.contains("status=\"completed\""), "{message}");
+        assert!(message.contains("in 120s"), "{message}");
+        assert!(message.contains("$0.5000"), "{message}");
+        assert!(
+            message.contains("task(action: \"get\")"),
+            "it says where the answer is: {message}"
+        );
+
+        let failed = super::DelegationEnd {
+            is_error: true,
+            stop: Some(nexus_claude::agent::StopReason::MaxTurns),
+            ..Default::default()
+        };
+        let message = super::delegation_notification(task_id, "t", &failed);
+        assert!(message.contains("status=\"failed\""), "{message}");
+        assert!(message.contains("stopped ("), "{message}");
+        assert!(
+            !message.contains('$'),
+            "an unknown cost is not a 0: {message}"
+        );
+    }
+
+    /// A delegation a plan run owns builds no wake at all, and a parent that is gone is
+    /// not an error: the delegation still ended, its result is on the task.
+    #[tokio::test]
+    async fn a_run_owned_delegation_builds_no_wake_and_a_gone_parent_is_silent() {
+        use crate::chat::manager::{test_support, ChatManager};
+
+        let state = crate::test_helpers::mock_app_state();
+        let manager = Arc::new(ChatManager::new_without_memory(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            test_support::chat_config(),
+        ));
+        let task_id = Uuid::new_v4();
+
+        assert!(
+            super::delegation_wake(
+                &super::DelegationOwner {
+                    run_id: Some(Uuid::new_v4()),
+                    parent_session_id: Some(Uuid::new_v4()),
+                },
+                &manager,
+                task_id,
+                "une tâche",
+            )
+            .is_none(),
+            "a delegation a plan run owns wakes nobody"
+        );
+
+        // A parent that never lived on this instance: the wake fails quietly.
+        let wake = super::delegation_wake(
+            &super::DelegationOwner {
+                run_id: None,
+                parent_session_id: Some(Uuid::new_v4()),
+            },
+            &manager,
+            task_id,
+            "une tâche",
+        )
+        .expect("a session that delegated is woken");
+        wake.notify(&super::DelegationEnd {
+            is_error: true,
+            ..Default::default()
+        })
+        .await;
+    }
+
+    /// Closing a delegation TELLS the session that launched it — the turn it starts is
+    /// what lets an agent go on by itself instead of waiting for a human message.
+    #[tokio::test]
+    async fn closing_a_delegation_wakes_the_session_that_delegated() {
+        use crate::chat::manager::{test_support, ChatManager};
+
+        let state = crate::test_helpers::mock_app_state();
+        let manager = Arc::new(ChatManager::new_without_memory(
+            state.neo4j.clone(),
+            state.meili.clone(),
+            test_support::chat_config(),
+        ));
+        let parent = Uuid::new_v4();
+        let parent_id = parent.to_string();
+        test_support::insert_live_session_without_cli(&manager, &parent_id).await;
+        let mut rx = {
+            let sessions = manager.active_sessions.read().await;
+            sessions[&parent_id].events_tx.subscribe()
+        };
+
+        let graph: Arc<dyn crate::neo4j::GraphStore> =
+            Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let ae = open_delegation_node();
+        graph.create_agent_execution(&ae).await.unwrap();
+        let task_id = ae.task_id;
+        let wake = super::delegation_wake(
+            &super::DelegationOwner {
+                run_id: None,
+                parent_session_id: Some(parent),
+            },
+            &manager,
+            task_id,
+            "borne les prédictions",
+        )
+        .expect("a session that delegated is woken");
+        let execution = super::DelegationExecution::new(ae, graph, None, Some(wake));
+
+        execution
+            .close(&super::DelegationEnd {
+                duration_secs: Some(3.0),
+                ..Default::default()
+            })
+            .await;
+
+        // The parent session received the notification (it is what starts its turn).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the delegation never reached its parent"
+            );
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(crate::chat::types::ChatEvent::UserMessage { content }))
+                | Ok(Ok(crate::chat::types::ChatEvent::SystemHint { content }))
+                | Ok(Ok(crate::chat::types::ChatEvent::BackgroundOutput { content, .. }))
+                    if content.contains(&task_id.to_string()) =>
+                {
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(_)) => panic!("the session's broadcast closed before the notification"),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// The whole route: a delegation that OPENS (on the in-process fake provider, no
+    /// binary) is wired to wake its parent, and does so when its turn ends. The parent
+    /// is a session a person drives (no plan run owns it), so `waking_parent` keeps it.
+    #[tokio::test]
+    async fn a_delegation_that_opens_wakes_its_parent_when_its_turn_ends() {
+        use crate::chat::manager::{test_support, ChatManager};
+        use crate::neo4j::GraphStore;
+        use nexus_claude::agent::{AgentEvent, Cost, CostBasis, StopReason};
+
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = crate::test_helpers::test_project();
+        mock.create_project(&project).await.unwrap();
+        let plan = crate::test_helpers::test_plan_for_project(project.id);
+        mock.create_plan(&plan).await.unwrap();
+        let task = crate::test_helpers::test_task();
+        mock.create_task(plan.id, &task).await.unwrap();
+        let parent = crate::test_helpers::test_chat_session(Some(&project.slug));
+        mock.create_chat_session(&parent).await.unwrap();
+        let parent_id = parent.id.to_string();
+
+        let fake = crate::chat::agent_runtime::fake::FakeProvider::new();
+        let dyn_graph: Arc<dyn GraphStore> = mock.clone();
+        let manager = Arc::new(
+            ChatManager::new_without_memory(
+                dyn_graph,
+                crate::test_helpers::mock_app_state().meili,
+                crate::chat::config::ChatConfig {
+                    provider_path: crate::chat::config::ProviderPath::Agent,
+                    ..Default::default()
+                },
+            )
+            .with_provider_source(Arc::new(fake.clone())),
+        );
+        // The parent is live (a child only opens under a live parent) and listened to.
+        test_support::insert_live_session_without_cli(&manager, &parent_id).await;
+        let mut rx = {
+            let sessions = manager.active_sessions.read().await;
+            sessions[&parent_id].events_tx.subscribe()
+        };
+        let state = crate::test_helpers::server_state_with_chat(manager, mock.clone()).await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            crate::chat::envelope::SESSION_ID_HEADER,
+            parent_id.parse().unwrap(),
+        );
+        let req = DelegateTaskRequest {
+            cwd: parent.cwd.clone(),
+            project_slug: None,
+            custom_sections: Vec::new(),
+            parent_session_id: None,
+            provider: None,
+            model: None,
+            task_class: None,
+            execution_place: None,
+        };
+
+        // The child's turn ends once its prompt reached the provider.
+        let pusher = fake.clone();
+        tokio::spawn(async move {
+            while pusher.state.turns_started.lock().unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            // Let `listen_delegation_result` subscribe to the child first.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            pusher.state.push(AgentEvent::Done {
+                stop_reason: StopReason::Completed,
+                subtype: Some("success".into()),
+                is_error: false,
+                result_text: Some("done".into()),
+                usage: Default::default(),
+                cost: Cost {
+                    usd: Some(0.01),
+                    basis: CostBasis::Reported,
+                },
+                duration_ms: 5,
+                duration_api_ms: None,
+                num_turns: 1,
+                model: Some("m".into()),
+                provider_session_id: Some("p-1".into()),
+                structured_output: None,
+                error: None,
+            });
+        });
+
+        let response = delegate_task(
+            State(state),
+            None,
+            headers,
+            Path((plan.id, task.id)),
+            Json(req),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the delegation opens on the fake provider: {e:?}"));
+        let (status, Json(outcome)) = response;
+        assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+        match outcome {
+            DelegateTaskOutcome::Launched(launched) => {
+                assert_eq!(launched.task_id, task.id);
+                assert!(!launched.session_id.is_empty());
+            }
+            DelegateTaskOutcome::ConfirmationRequired(_) => {
+                panic!("no execution place was asked for: nothing to confirm")
+            }
+        }
+
+        // The parent receives the end of the delegation: it names the task.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the end of the delegation never reached the parent"
+            );
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(crate::chat::types::ChatEvent::UserMessage { content }))
+                | Ok(Ok(crate::chat::types::ChatEvent::SystemHint { content }))
+                | Ok(Ok(crate::chat::types::ChatEvent::BackgroundOutput { content, .. }))
+                    if content.contains(&task.id.to_string()) =>
+                {
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(_)) => panic!("the parent's broadcast closed before the notification"),
+                Err(_) => continue,
+            }
+        }
     }
 
     /// The stored execution, once it is no longer `running` (the drop path
@@ -8815,7 +9240,12 @@ pub(crate) mod tests {
                 .unwrap();
         });
 
-        drop(super::DelegationExecution::new(ae, graph, Some(created)));
+        drop(super::DelegationExecution::new(
+            ae,
+            graph,
+            Some(created),
+            None,
+        ));
 
         let stored = closed_execution(&mock, id).await;
         assert_eq!(stored.status, AgentExecutionStatus::Failed);

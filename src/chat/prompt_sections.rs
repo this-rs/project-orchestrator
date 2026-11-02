@@ -1105,7 +1105,7 @@ When an active plan has **actionable tasks** (pending with all dependencies sati
 1. Use `task(action: "get_next", plan_id)` to find the next actionable task
 2. Use `plan(action: "delegate_task", plan_id, task_id)` to spawn a sub-agent
 3. The sub-agent works inside this session's envelope: same project, a directory this session can see, a permission mode no wider than this session's. A sub-agent cannot delegate further, and at most 4 run at once
-4. Monitor progress via `plan(action: "run_status", plan_id)` or task status updates
+4. **A delegation wakes you when it ends** — you receive a `<task-notification task_id="…" status="completed|failed">` as a turn of its own: read the task (`task(action: "get")`) and carry on with what it was needed for. There is nothing to poll, and no reason to ask the human to ping you when it is done. One exception: a delegation a plan run owns does not wake you (the run drives its own tasks) — for those, read `plan(action: "run_status", plan_id)`
 
 **Delegation hints:**
 - Tasks with `affected_files` that don't overlap can run in parallel

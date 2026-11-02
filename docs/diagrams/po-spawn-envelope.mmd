@@ -1,6 +1,6 @@
 %% name: po-spawn-envelope
 %% covers: backend:src/chat/{envelope,delegation_limits,subagents,mirror,session_pool,cancelled_parents}.rs backend:src/auth/{agent_tokens,jwt,jwt_crypto,tool_profile}.rs
-%% verified: 0ab7a21f
+%% verified: d7a13cbc
 %% ---
 %% PROUVE : ce qu'une session ouverte PAR UN AGENT a le droit d'être (décisions A17, A25, A34),
 %%   tel que le code le fait sur la branche integration/harness-multi-provider (base 84804df0,
@@ -143,8 +143,11 @@ flowchart TD
     MODE --> SPAWN_DEL["✅ delegate_task : delegation_chat_request<br/>demande bypassPermissions, bornée par le plafond ;<br/>spawned_by = SpawnedBy::Delegation{plan, tâche, parent du jeton}<br/>test : a_session_in_ask_mode_cannot_delegate_to_a_bypass_child"]
     C3 --> HUMAN_PATH["✅ humain : comportement antérieur<br/>(delegate_task en bypassPermissions, parent du corps accepté)<br/>test : a_person_delegating_keeps_the_previous_behaviour"]
 
-    RESUME["✅ agent + session_id (envoi à une session existante) :<br/>ensure_child_of — seulement une session qu'il a ouverte<br/>test : an_agent_only_reaches_sessions_it_spawned"]
+    RESUME["✅ agent + session_id (envoi à une session existante) :<br/>ensure_child_of — seulement une session qu'il a ouverte<br/>test : an_agent_only_reaches_sessions_it_saw"]
     C1 --> RESUME
+
+    WAKE["✅ DELEG-WAKE — la fin d'une délégation RÉVEILLE la session qui l'a lancée :<br/>DelegationExecution::close (le point de clôture UNIQUE : résultat, échec, délai) → DelegationWake::notify → ChatManager::wake_with_notification<br/>→ moteur agent : AgentSessionHandle::wake_with_background (tour de type BackgroundOutput, annonce affichée et persistée, en file si un tour tourne) ;<br/>moteur historique : inject_hint. Message : &lt;task-notification task_id status&gt; + durée, coût, arrêt éventuel, et où lire la réponse.<br/>PAS de réveil : délégation d'un run de plan (waking_parent exige run_id None — l'exécuteur du run lit la tâche et pilote le plan), et le Drop (délégation coupée, pas terminée).<br/>tests : only_a_session_that_delegated_is_woken, the_delegation_notification_names_the_task_and_its_end, closing_a_delegation_wakes_the_session_that_delegated (rouge sans le notify)"]
+    PYSR3 --> WAKE
 
     LATER["🟠 B36 : budget de l'enfant = reste du parent — non écrit"]
     SPAWN_DEL -.-> LATER
