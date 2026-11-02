@@ -3224,6 +3224,15 @@ impl AnalyticsStore for Neo4jClient {
             .await
     }
 
+    async fn release_agent_knows(
+        &self,
+        agent_id: Uuid,
+        rule: &str,
+        keep: &[Uuid],
+    ) -> anyhow::Result<usize> {
+        self.release_agent_knows(agent_id, rule, keep).await
+    }
+
     async fn agent_knows(
         &self,
         agent_id: Uuid,

@@ -164,6 +164,9 @@ pub struct RuleOutcome {
     pub written: usize,
     /// Edges that were already there, re-attested rather than duplicated.
     pub skipped: usize,
+    /// Edges this rule RELEASED: it had drawn them, and its measure no longer holds.
+    /// A rule that only adds is not a rule, it is a log that never strikes a line.
+    pub released: usize,
     pub measure: String,
 }
 
@@ -322,6 +325,9 @@ async fn run_agent_uses_activated(
         considered,
         written,
         skipped,
+        // `agent-uses-activated` ne réconcilie pas encore : il atteste. Nommer le zéro
+        // plutôt que l'oublier — un champ absent se lit comme « non mesuré ».
+        released: 0,
         measure,
     })
 }
@@ -374,6 +380,13 @@ async fn run_agent_knows_core(graph: &dyn GraphStore) -> anyhow::Result<RuleOutc
     let measure = format!("{scopes} portées lues, {} note(s) épinglée(s)", ids.len());
     let provenance = Provenance::new(AGENT_KNOWS_CORE.name, measure.clone());
 
+    // Reconcile FIRST: an edge the rule drew to a note that is no longer pinned must go
+    // before the new set is attested. The reverse order would leave, for one instant, a
+    // self that knows both what it declares and what it dropped.
+    let released = graph
+        .release_agent_knows(self_id, AGENT_KNOWS_CORE.name, &ids)
+        .await?;
+
     let mut written = 0;
     let mut skipped = 0;
     for note in &ids {
@@ -386,11 +399,18 @@ async fn run_agent_knows_core(graph: &dyn GraphStore) -> anyhow::Result<RuleOutc
         }
     }
 
+    let measure = if released > 0 {
+        format!("{measure}, {released} arête(s) libérée(s)")
+    } else {
+        measure
+    };
+
     Ok(RuleOutcome {
         name: AGENT_KNOWS_CORE.name.to_string(),
         considered: ids.len(),
         written,
         skipped,
+        released,
         measure,
     })
 }
@@ -433,6 +453,7 @@ async fn run_session_co_activation(
         considered: notes.len(),
         written,
         skipped: 0,
+        released: 0,
         measure,
     })
 }
@@ -497,15 +518,22 @@ mod tests {
         graph.create_note(&note).await.unwrap();
         store_pinned_notes(&graph, None, &[note.id]).await.unwrap();
 
+        // The writer itself reconciles: an edge exists the moment the pin does, without
+        // waiting for a restart or a cron.
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        assert_eq!(
+            graph.agent_knows(self_id, 10).await.unwrap().notes,
+            vec![note.id],
+            "storing a pin draws its edge"
+        );
+
+        // And an explicit run attests what is already there instead of duplicating it.
         let report = run(&graph, &["agent-knows-core"]).await.unwrap();
         let outcome = report.of("agent-knows-core").unwrap();
         assert_eq!(outcome.considered, 1);
-        assert_eq!(outcome.written, 1, "{report:?}");
-        assert_eq!(report.edges_written, 1);
-
-        let self_id = graph.agent_identity_namespace().await.unwrap();
-        let known = graph.agent_knows(self_id, 10).await.unwrap();
-        assert_eq!(known.notes, vec![note.id]);
+        assert_eq!(outcome.written, 0, "already attested: {report:?}");
+        assert_eq!(outcome.skipped, 1);
+        assert_eq!(outcome.released, 0);
     }
 
     #[tokio::test]
@@ -519,9 +547,74 @@ mod tests {
 
         let first = run(&graph, &[]).await.unwrap();
         let second = run(&graph, &[]).await.unwrap();
-        assert_eq!(first.edges_written, 1);
+        assert_eq!(first.edges_written, 0, "the pin already drew it");
         assert_eq!(second.edges_written, 0, "idempotent: {second:?}");
         assert_eq!(second.of("agent-knows-core").unwrap().skipped, 1);
+        assert_eq!(first.of("agent-knows-core").unwrap().released, 0);
+    }
+
+    #[tokio::test]
+    async fn a_pin_removed_is_released() {
+        // The half that makes the rule a reconciliation: what is no longer declared stops
+        // being known. Without it the self accumulates foundations it has dropped.
+        use crate::chat::stages::knowledge_injection::store_pinned_notes;
+
+        let graph = MockGraphStore::new();
+        let kept = a_note("kept");
+        let dropped = a_note("dropped");
+        graph.create_note(&kept).await.unwrap();
+        graph.create_note(&dropped).await.unwrap();
+        store_pinned_notes(&graph, None, &[kept.id, dropped.id])
+            .await
+            .unwrap();
+
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        assert_eq!(graph.agent_knows(self_id, 10).await.unwrap().notes.len(), 2);
+
+        store_pinned_notes(&graph, None, &[kept.id]).await.unwrap();
+
+        let known = graph.agent_knows(self_id, 10).await.unwrap();
+        assert_eq!(known.notes, vec![kept.id], "the dropped pin is gone");
+
+        // And the measure says it: a release is published, not silent.
+        let outcome = run(&graph, &["agent-knows-core"]).await.unwrap();
+        assert_eq!(outcome.of("agent-knows-core").unwrap().released, 0);
+    }
+
+    #[tokio::test]
+    async fn an_edge_a_person_placed_survives_the_reconciliation() {
+        // Only the edges the RULE drew belong to it. A KNOWS an operator placed by hand has
+        // no such rule and must survive an unpin it never asked about.
+        use crate::chat::stages::knowledge_injection::store_pinned_notes;
+
+        let graph = MockGraphStore::new();
+        let pinned = a_note("pinned");
+        let by_hand = a_note("a person decided this one");
+        graph.create_note(&pinned).await.unwrap();
+        graph.create_note(&by_hand).await.unwrap();
+
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        graph
+            .link_agent_knows(
+                self_id,
+                by_hand.id,
+                &Provenance::new("a person", "decided by hand"),
+            )
+            .await
+            .unwrap();
+
+        store_pinned_notes(&graph, None, &[pinned.id])
+            .await
+            .unwrap();
+        // Unpin everything: the rule has nothing left to declare.
+        store_pinned_notes(&graph, None, &[]).await.unwrap();
+
+        let known = graph.agent_knows(self_id, 10).await.unwrap();
+        assert_eq!(
+            known.notes,
+            vec![by_hand.id],
+            "the rule removed its own edge, not someone else's"
+        );
     }
 
     #[tokio::test]

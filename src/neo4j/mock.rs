@@ -13767,6 +13767,24 @@ impl AnalyticsStore for MockGraphStore {
         Ok(created)
     }
 
+    async fn release_agent_knows(
+        &self,
+        agent_id: Uuid,
+        rule: &str,
+        keep: &[Uuid],
+    ) -> Result<usize> {
+        let mut edges = self.agent_knows.write().await;
+        let doomed: Vec<(Uuid, Uuid)> = edges
+            .iter()
+            .filter(|((a, n), p)| *a == agent_id && p.rule == rule && !keep.contains(n))
+            .map(|(k, _)| *k)
+            .collect();
+        for k in &doomed {
+            edges.remove(k);
+        }
+        Ok(doomed.len())
+    }
+
     async fn agent_knows(
         &self,
         agent_id: Uuid,

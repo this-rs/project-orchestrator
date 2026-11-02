@@ -296,6 +296,16 @@ pub async fn store_pinned_notes(
             .put_llm_setting(&scope, PINNED_NOTES_KEY, &serde_json::to_string(ids)?)
             .await?;
     }
+
+    // An unpin must take effect NOW, not at the next restart: the rule reconciles the
+    // `KNOWS` edges with what is declared (it releases the ones it had drawn and writes the
+    // new ones). Best effort — the pin is the person's intent, the edge is derived from it,
+    // and a graph that hesitates must not undo a declaration.
+    if let Err(e) =
+        crate::graph::rules::run(graph, &[crate::graph::rules::AGENT_KNOWS_CORE.name]).await
+    {
+        tracing::warn!(error = %e, "the pins were stored but their KNOWS edges could not be reconciled");
+    }
     Ok(())
 }
 

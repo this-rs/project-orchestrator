@@ -1169,6 +1169,35 @@ impl Neo4jClient {
         }
     }
 
+    /// See [`crate::neo4j::AnalyticsStore::release_agent_knows`].
+    pub async fn release_agent_knows(
+        &self,
+        agent_id: Uuid,
+        rule: &str,
+        keep: &[Uuid],
+    ) -> Result<usize> {
+        let keep: Vec<String> = keep.iter().map(|i| i.to_string()).collect();
+        let mut result = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (a:Agent {id: $agent})-[r:KNOWS]->(n:Note) \
+                     WHERE r.rule = $rule AND NOT (n.id IN $keep) \
+                     DELETE r \
+                     RETURN count(*) AS released",
+                )
+                .param("agent", agent_id.to_string())
+                .param("rule", rule.to_string())
+                .param("keep", keep),
+            )
+            .await?;
+        let n: i64 = match result.next().await? {
+            Some(row) => row.get("released").unwrap_or(0),
+            None => 0,
+        };
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
     /// See [`crate::neo4j::AnalyticsStore::agent_knows`]. Two reads, not one: the bounded
     /// list and the total. A single query that returned only the list could not say how
     /// much it had left out.

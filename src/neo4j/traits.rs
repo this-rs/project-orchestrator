@@ -3011,6 +3011,17 @@ pub trait AnalyticsStore: Send + Sync {
         provenance: &crate::graph::rules::Provenance,
     ) -> Result<usize>;
 
+    /// Releases the `KNOWS` edges that a RULE drew to notes that are no longer pinned.
+    ///
+    /// Only the edges whose `rule` property is the given one are touched: an edge a person
+    /// placed by hand has no such rule and survives. This is the half of the rule that
+    /// makes it a reconciliation instead of an accumulation — without it, unpinning a note
+    /// leaves the self « knowing » something it no longer declares.
+    ///
+    /// Returns how many edges were removed.
+    async fn release_agent_knows(&self, agent_id: Uuid, rule: &str, keep: &[Uuid])
+        -> Result<usize>;
+
     /// What that agent knows, bounded by `limit`, plus how many exist — « la part lue est
     /// dite ». Only `(:Agent)-[:KNOWS]->(:Note)` is read: a `KNOWS` reaching a `File` (the
     /// persona meaning) never leaks into this answer.

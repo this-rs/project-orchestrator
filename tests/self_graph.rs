@@ -519,6 +519,75 @@ fn live_session(e: &Env, label: &str) -> ChatSessionNode {
 }
 
 #[tokio::test]
+async fn unpinning_releases_the_edge_the_rule_drew_and_spares_a_hand_placed_one() {
+    // The rule must be a RECONCILIATION, not an accumulation: what is no longer declared
+    // stops being known. And only the edges the rule drew belong to it — a KNOWS an
+    // operator placed by hand has no rule property and must survive an unpin it never
+    // asked about.
+    use project_orchestrator::chat::stages::knowledge_injection::store_pinned_notes;
+
+    let _serial = serial().await;
+    let Some(e) = env("release").await else {
+        return;
+    };
+    let self_id = e.client.agent_identity_namespace().await.unwrap();
+    e.client.ensure_agent(self_id, None).await.unwrap();
+
+    let mut kept = a_note("api");
+    let mut dropped = a_note("api");
+    let mut by_hand = a_note("api");
+    for n in [&mut kept, &mut dropped, &mut by_hand] {
+        n.project_id = Some(e.project.id);
+        e.client.create_note(n).await.unwrap();
+    }
+
+    e.client
+        .link_agent_knows(
+            self_id,
+            by_hand.id,
+            &rules::Provenance::new("a person", "decided by hand"),
+        )
+        .await
+        .unwrap();
+
+    // Two pins: the writer reconciles by itself, no restart needed.
+    store_pinned_notes(&e.client, None, &[kept.id, dropped.id])
+        .await
+        .unwrap();
+    let known = e.client.agent_knows(self_id, 10).await.unwrap();
+    assert_eq!(
+        known.available, 3,
+        "two pins plus the hand-placed one: {known:?}"
+    );
+
+    // Drop one pin.
+    store_pinned_notes(&e.client, None, &[kept.id])
+        .await
+        .unwrap();
+    let known = e.client.agent_knows(self_id, 10).await.unwrap();
+    assert_eq!(
+        known.available, 2,
+        "the dropped pin is released, the hand-placed edge stays: {known:?}"
+    );
+    assert!(
+        !known.notes.contains(&dropped.id),
+        "the unpinned note is no longer known"
+    );
+    assert!(
+        known.notes.contains(&by_hand.id),
+        "an edge the rule did not draw is not the rule's to remove"
+    );
+
+    // Leave the shared global scope as we found it: other tests in this file read it.
+    store_pinned_notes(&e.client, None, &[]).await.unwrap();
+    for id in [kept.id, dropped.id, by_hand.id] {
+        e.client.delete_note(id).await.unwrap();
+    }
+    drop_nodes(&e, "Agent", &[self_id]).await;
+    cleanup(&e).await;
+}
+
+#[tokio::test]
 async fn the_catalog_says_what_the_graph_really_has() {
     let _serial = serial().await;
     let Some(e) = env("catalog").await else {
