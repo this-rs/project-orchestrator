@@ -803,6 +803,18 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         assert_eq!(client.weaken_node_synapses(x, 0.1, 0.05).await.unwrap(), 1);
         assert!((weight_in(h).await.unwrap() - 0.4).abs() < 1e-9);
         assert_eq!(weight_in(o).await, Some(0.5), "other nodes untouched");
+        // The weight is valid as of its own `decayed_at`: age the edge six
+        // days, so the pass has something to charge for. An edge without a
+        // stamp is only stamped, never decayed.
+        raw.run(
+            query(
+                "MATCH (a:Note {project_id: $h})-[s:SYNAPSE]->()
+                 SET s.decayed_at = datetime() - duration({days: 6})",
+            )
+            .param("h", h.to_string()),
+        )
+        .await
+        .unwrap();
 
         use project_orchestrator::homeostasis::{
             execute_actions, ExecuteContext, HomeostasisAction,
@@ -824,11 +836,16 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         )
         .await
         .unwrap();
-        // The decay is proportional to the edge's age now (6 days here), so
-        // the pass is judged on HALVING it, not on subtracting a fixed amount.
+        // The decay is proportional to the edge's age (6 days here, a
+        // coactivation edge, half-life of the default policy), not a fixed
+        // subtraction.
+        let half_life =
+            project_orchestrator::neurons::forgetting::DecayPolicy::default().half_life_days;
+        let expected = 0.4 * 2f64.powf(-6.0 / half_life);
+        let got = weight_in(h).await.unwrap();
         assert!(
-            weight_in(h).await.unwrap() < 0.2,
-            "corrected project decayed"
+            (got - expected).abs() < 1e-4,
+            "corrected project decayed proportionally: got {got}, expected {expected}"
         );
         assert_eq!(weight_in(o).await, Some(0.5), "other projects untouched");
     }
