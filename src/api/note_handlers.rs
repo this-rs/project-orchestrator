@@ -2119,6 +2119,73 @@ mod tests {
         (test_app_with_state(state).await, ids)
     }
 
+    /// T8 — le socle du soi dit ce qui atterrira VRAIMENT.
+    ///
+    /// La lecture est bornée à dix notes, le RENDU l'est bien plus : chaque note est
+    /// aplatie et coupée à `PINNED_NOTE_CHARS`, et la boucle s'arrête à la première qui ne
+    /// tient pas dans `max_content_chars / 2`. Sans projet, la route annonce le niveau le
+    /// plus strict (L4 : 750 caractères), pas une place généreuse qu'on n'a pas.
+    #[tokio::test]
+    async fn the_self_core_publishes_what_will_really_land() {
+        use crate::notes::models::{Note, NoteImportance, NoteType};
+
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        for _ in 0..4 {
+            let mut n = Note::new(
+                None,
+                NoteType::Guideline,
+                "x".repeat(400),
+                "self-core-test".into(),
+            );
+            n.importance = NoteImportance::Critical;
+            n.tags = vec!["self".to_string()];
+            graph.create_note(&n).await.unwrap();
+        }
+        let state = crate::test_helpers::mock_app_state_with_graph(graph);
+        let app = test_app_with_state(state).await;
+
+        let resp = app
+            .oneshot(auth_get("/api/knowledge/self-core"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+
+        assert_eq!(json["level"], 4, "sans projet : le niveau le plus strict");
+        assert_eq!(json["budget_chars"], 750);
+        assert_eq!(json["note_char_cap"], 300);
+        assert_eq!(json["max_notes"], 10);
+        assert!(
+            json["pinned"].as_array().unwrap().is_empty(),
+            "rien n'est déclaré : la route le dit, elle ne le suppose pas"
+        );
+
+        let candidates = json["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 4);
+        assert_eq!(
+            candidates[0]["chars"], 400,
+            "la taille écrite, pas la coupe"
+        );
+        assert!(candidates[0]["entry"]
+            .as_str()
+            .unwrap()
+            .contains("[guideline|critical]"));
+        // 400 caractères écrits → une ligne de 300 + une ellipse ; 750 / 328 = deux notes.
+        assert_eq!(candidates[0]["lands"], true);
+        assert_eq!(candidates[1]["lands"], true);
+        assert_eq!(
+            candidates[2]["lands"], false,
+            "la troisième n'entre pas dans le budget : elle est dite, pas cachée"
+        );
+        assert_eq!(candidates[3]["lands"], false);
+        assert_eq!(json["slots_used"], 2);
+        let landed = candidates[0]["entry"].as_str().unwrap().chars().count();
+        assert!(
+            landed < 26 + 300 + 4,
+            "la ligne annoncée ne dépasse jamais la coupe du rendu ({landed})"
+        );
+    }
+
     async fn test_app_with_state(app_state: crate::AppState) -> axum::Router {
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
