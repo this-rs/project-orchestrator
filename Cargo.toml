@@ -215,7 +215,7 @@ quick-xml = { version = "0.42", optional = true }
 # not worth hand-rolling on top of `zip`. Default features are off: `dates` and
 # `picture` are not needed to read cell text. 0.37 is the first release that
 # accepts zip 9 — 0.36 pins ^8.6, below the fix for GHSA-m665-v7pm-7grj.
-calamine = { version = "0.37", default-features = false, optional = true }
+calamine = { version = "0.38", default-features = false, optional = true }
 
 # Home directory detection
 dirs = "6"
