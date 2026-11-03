@@ -1,6 +1,6 @@
 <!-- Genere par scripts/diagrams/check-index.mjs --write-orphans. Ne pas editer a la main. -->
 <!-- orphan-ceiling: 1107 -->
-<!-- orphan-ceiling-backend: 446 -->
+<!-- orphan-ceiling-backend: 447 -->
 <!-- orphan-ceiling-frontend: 538 -->
 <!-- orphan-ceiling-nexus: 4 -->
 <!-- orphan-ceiling-website: 127 -->
@@ -51,7 +51,7 @@ collision entre les deux index est une erreur, pas un arrangement.
 - `src/` (5) : `cli.rs`, `homeostasis.rs`, `lib.rs`, `main.rs`, `setup_claude.rs`
 - `src/analytics/` (3) : `distribution.rs`, `hypothesis.rs`, `mod.rs`
 - `src/analytics/stats/` (5) : `anova.rs`, `fitting.rs`, `golden_fixtures.rs`, `mean_std.rs`, `mod.rs`
-- `src/api/` (37) : `attention.rs`, `attention_aggregate.rs`, `auth_handlers.rs`, `chat_handlers.rs`, `code_handlers.rs`, `document_handlers.rs`, `embedded_frontend.rs`, `environment_handlers.rs`, `episode_handlers.rs`, `feedback_handlers.rs`, `graph_handlers.rs`, `graph_types.rs`, `handlers.rs`, `hook_handlers.rs`, `mcp_federation_handlers.rs`, `mod.rs`, `neural_routing_handlers.rs`, `note_handlers.rs`, `persona_handlers.rs`, `profile_handlers.rs`, `project_handlers.rs`, `protocol_handlers.rs`, `query.rs`, `reason_handlers.rs`, `registry_handlers.rs`, `rfc_handlers.rs`, `routes.rs`, `sharing_handlers.rs`, `skill_handlers.rs`, `trajectory_handlers.rs`, `trigger_handlers.rs`, `update_handlers.rs`, `vault_handlers.rs`, `workspace_handlers.rs`, `ws_auth.rs`, `ws_handlers.rs`, `ws_run_handler.rs`
+- `src/api/` (38) : `attention.rs`, `attention_aggregate.rs`, `auth_handlers.rs`, `chat_handlers.rs`, `code_handlers.rs`, `document_handlers.rs`, `embedded_frontend.rs`, `environment_handlers.rs`, `episode_handlers.rs`, `feedback_handlers.rs`, `graph_handlers.rs`, `graph_sync.rs`, `graph_types.rs`, `handlers.rs`, `hook_handlers.rs`, `mcp_federation_handlers.rs`, `mod.rs`, `neural_routing_handlers.rs`, `note_handlers.rs`, `persona_handlers.rs`, `profile_handlers.rs`, `project_handlers.rs`, `protocol_handlers.rs`, `query.rs`, `reason_handlers.rs`, `registry_handlers.rs`, `rfc_handlers.rs`, `routes.rs`, `sharing_handlers.rs`, `skill_handlers.rs`, `trajectory_handlers.rs`, `trigger_handlers.rs`, `update_handlers.rs`, `vault_handlers.rs`, `workspace_handlers.rs`, `ws_auth.rs`, `ws_handlers.rs`, `ws_run_handler.rs`
 - `src/architecture/` (7) : `catalogue.rs`, `compose.rs`, `derive.rs`, `manifest.rs`, `mod.rs`, `runtime_config.rs`, `sync.rs`
 - `src/auth/` (8) : `extractor.rs`, `google.rs`, `jwt.rs`, `middleware.rs`, `mod.rs`, `oauth_server.rs`, `oidc.rs`, `refresh.rs`
 - `src/bin/` (1) : `mcp_server.rs`

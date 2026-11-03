@@ -8,6 +8,7 @@ use crate::neo4j::models::{ProjectNode, ProjectProfile};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -16,9 +17,7 @@ use uuid::Uuid;
 
 use crate::expand_tilde;
 
-use super::graph_types::{
-    parse_layers, GraphQuery, IntelligenceSummaryResponse, ProjectGraphResponse,
-};
+use super::graph_types::{parse_layers, GraphQuery, IntelligenceSummaryResponse};
 use super::handlers::{AppError, OrchestratorState};
 
 // ============================================================================
@@ -498,7 +497,7 @@ pub async fn get_project_graph(
     State(state): State<OrchestratorState>,
     Path(slug): Path<String>,
     Query(params): Query<GraphQuery>,
-) -> Result<Json<ProjectGraphResponse>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let neo4j = state.orchestrator.neo4j();
 
     let project = neo4j
@@ -514,22 +513,27 @@ pub async fn get_project_graph(
         Some(cm) => cm.live_session_snapshot().await.live.into_iter().collect(),
         None => Vec::new(),
     };
-    let (nodes, edges, communities, stats) = super::graph_types::build_project_graph_data(
+    let sync = super::graph_sync::SyncParams::from_query(&params)?;
+    let cursor = super::graph_sync::new_cursor();
+    let body = super::graph_sync::project_graph_response(
         neo4j,
         &project,
         &requested_layers,
         limit,
         params.community,
         &live,
+        &sync,
+        cursor,
     )
     .await?;
 
-    Ok(Json(ProjectGraphResponse {
-        nodes,
-        edges,
-        communities,
-        stats,
-    }))
+    Ok((
+        [(
+            super::graph_sync::SYNCED_AT_HEADER,
+            super::graph_sync::format_cursor(cursor),
+        )],
+        Json(body),
+    ))
 }
 
 // ============================================================================

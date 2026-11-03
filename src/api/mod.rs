@@ -20,6 +20,7 @@ mod episode_session_tests;
 pub mod execution_place_handlers;
 pub mod feedback_handlers;
 pub mod graph_handlers;
+pub mod graph_sync;
 pub mod graph_types;
 pub mod handlers;
 pub mod hook_handlers;
