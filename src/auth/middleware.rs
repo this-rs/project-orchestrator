@@ -1287,6 +1287,20 @@ mod tests {
             "/api/chat/auto-models"
         ));
         assert!(!is_human_only_mutation(&Method::GET, "/api/chat/routing"));
+        // T8: declaring the core of a subject reaches every turn of every session of its
+        // scope, so it is a person's act — and READING what is declared is not.
+        assert!(is_human_only_mutation(
+            &Method::PUT,
+            "/api/knowledge/pinned-notes"
+        ));
+        assert!(!is_human_only_mutation(
+            &Method::GET,
+            "/api/knowledge/pinned-notes"
+        ));
+        assert!(!is_human_only_mutation(
+            &Method::GET,
+            "/api/knowledge/self-core"
+        ));
         // T5: « exécute dans X » is answered by a person; reading a pending place is not.
         assert!(is_human_only_mutation(
             &Method::POST,

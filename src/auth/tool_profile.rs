@@ -599,6 +599,9 @@ const CLOSED_ROUTE_PREFIXES: &[&str] = &[
     "/api/execution-places",
     // a pinned note reaches every turn: only a person pins, no tool calls it
     "/api/knowledge/pinned-notes",
+    // what a person is asked to declare, and what the prompt will carry of it: a screen
+    // reads it, no MCP tool calls it (an agent reads the graph through `note`)
+    "/api/knowledge/self-core",
     // no kept tool calls these
     "/api/activity",
     "/api/agents",
@@ -1446,6 +1449,7 @@ mod tests {
             "/api/notes/update-energy",
             "/api/execution-places/x/confirm",
             "/api/knowledge/pinned-notes",
+            "/api/knowledge/self-core",
             "/api/activity",
             "/api/agents",
             "/api/alerts",

@@ -351,6 +351,165 @@ pub async fn put_pinned_notes(
     }))
 }
 
+// ============================================================================
+// The declared core of the self
+// ============================================================================
+
+/// One note of the foundation, with what the prompt would REALLY carry of it.
+#[derive(Debug, Serialize)]
+pub struct SelfCoreNote {
+    pub id: Uuid,
+    pub note_type: String,
+    pub importance: String,
+    /// Characters of the note as written (the prompt keeps far fewer).
+    pub chars: usize,
+    /// The line the prompt carries — already flattened and capped, like the renderer.
+    pub entry: String,
+    /// Whether that line fits in the budget, IN THIS ORDER.
+    pub lands: bool,
+}
+
+/// `GET /api/knowledge/self-core[?project=<slug>]` — what a person is asked to declare.
+///
+/// The declared core is a human act (`pinned_notes_human_only`): this route only READS.
+/// It publishes the two things a screen cannot guess and that decide everything:
+/// how many characters the foundation really gets (`max_content_chars / 2` at the
+/// project's scaffolding level), and how many characters of ONE note the prompt keeps.
+/// A core written for 4 000 characters lands as two lines of 300 — saying it is the
+/// whole point of this endpoint.
+#[derive(Debug, Serialize)]
+pub struct SelfCoreView {
+    /// Always `global`: the core of the self is not a project's foundation.
+    pub scope: String,
+    /// The scaffolding level the budget was read at (L4, the strictest, without a project).
+    pub level: u8,
+    /// Characters the foundation section gets.
+    pub budget_chars: usize,
+    /// Characters of one note the prompt keeps.
+    pub note_char_cap: usize,
+    /// Most notes a foundation may hold — the screen refuses the same bound.
+    pub max_notes: usize,
+    /// The declared core, in order, with what lands of it.
+    pub pinned: Vec<SelfCoreNote>,
+    /// What is proposed when nothing is declared: global, active, critical notes tagged
+    /// `self`. A PROPOSAL, never an injection — the person still declares.
+    pub candidates: Vec<SelfCoreNote>,
+    /// How many entries of `pinned` (or of `candidates`, when nothing is declared) land.
+    pub slots_used: usize,
+}
+
+pub async fn get_self_core(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<PinnedNotesQuery>,
+) -> Result<Json<SelfCoreView>, AppError> {
+    use crate::chat::stages::knowledge_injection::{
+        foundation_entry, foundation_landing, load_pinned_notes, scaffolding_config,
+        PINNED_NOTE_CHARS,
+    };
+    const SELF_TAG: &str = "self";
+    const SELF_CORE_MAX_NOTES: usize = 10;
+
+    let graph = state.orchestrator.neo4j();
+    let project = query.project.as_deref();
+
+    // The budget the turn will really use. Without a project, publish the STRICTEST
+    // level: a generous guess would promise a room the prompt does not have.
+    let level = match project {
+        Some(slug) => {
+            let p = graph
+                .get_project_by_slug(slug)
+                .await
+                .map_err(AppError::Internal)?
+                .ok_or_else(|| AppError::NotFound(format!("Project {slug} not found")))?;
+            graph
+                .compute_scaffolding_level(p.id, None)
+                .await
+                .map_err(AppError::Internal)?
+                .level
+        }
+        None => 4,
+    };
+    let budget_chars = scaffolding_config(level).max_content_chars / 2;
+
+    // The declared core, read exactly as the injection reads it: the GLOBAL pins.
+    let mut pinned_notes: Vec<Note> = Vec::new();
+    for id in load_pinned_notes(graph, None)
+        .await
+        .map_err(AppError::Internal)?
+    {
+        if let Some(note) = graph.get_note(id).await.map_err(AppError::Internal)? {
+            pinned_notes.push(note);
+        }
+    }
+
+    // Nothing declared: propose the kernel. Global, active, critical, tagged `self` —
+    // the shape the subject's own notes have, not a ranking of every note in the graph.
+    let mut candidate_notes: Vec<Note> = Vec::new();
+    if pinned_notes.is_empty() {
+        let filters = NoteFilters {
+            status: Some(vec![NoteStatus::Active]),
+            importance: Some(vec![NoteImportance::Critical]),
+            tags: Some(vec![SELF_TAG.to_string()]),
+            global_only: Some(true),
+            limit: Some(SELF_CORE_MAX_NOTES as i64),
+            sort_by: Some("energy".to_string()),
+            sort_order: Some("desc".to_string()),
+            ..NoteFilters::default()
+        };
+        candidate_notes = graph
+            .list_notes(None, None, &filters)
+            .await
+            .map_err(AppError::Internal)?
+            .0;
+    }
+
+    let view = |notes: &[Note]| -> (Vec<SelfCoreNote>, usize) {
+        let entries: Vec<String> = notes
+            .iter()
+            .map(|n| {
+                foundation_entry(
+                    &format!("{:?}", n.note_type),
+                    &format!("{:?}", n.importance),
+                    &n.content,
+                )
+            })
+            .collect();
+        let (fits, _) = foundation_landing(&entries, budget_chars);
+        let rows = notes
+            .iter()
+            .zip(entries.iter())
+            .enumerate()
+            .map(|(i, (n, e))| SelfCoreNote {
+                id: n.id,
+                note_type: format!("{:?}", n.note_type).to_lowercase(),
+                importance: format!("{:?}", n.importance).to_lowercase(),
+                chars: n.content.chars().count(),
+                entry: e.clone(),
+                lands: i < fits,
+            })
+            .collect();
+        (rows, fits)
+    };
+
+    let (pinned, pinned_fit) = view(&pinned_notes);
+    let (candidates, candidate_fit) = view(&candidate_notes);
+
+    Ok(Json(SelfCoreView {
+        scope: "global".to_string(),
+        level,
+        budget_chars,
+        note_char_cap: PINNED_NOTE_CHARS,
+        max_notes: SELF_CORE_MAX_NOTES,
+        pinned,
+        candidates,
+        slots_used: if pinned_notes.is_empty() {
+            candidate_fit
+        } else {
+            pinned_fit
+        },
+    }))
+}
+
 /// Create a new note
 pub async fn create_note(
     State(state): State<OrchestratorState>,
@@ -1958,6 +2117,148 @@ mod tests {
         }
         let state = crate::test_helpers::mock_app_state_with_graph(graph);
         (test_app_with_state(state).await, ids)
+    }
+
+    // ====================================================================
+    // GET /api/knowledge/self-core — the declared core
+    // ====================================================================
+
+    /// T8 — une note DÉCLARÉE passe devant tout ce qui est mesuré, et le budget vient du
+    /// projet quand on en nomme un (pas du défaut strict).
+    #[tokio::test]
+    async fn a_declared_note_takes_the_slot_and_a_project_gives_its_own_budget() {
+        use crate::notes::models::{Note, NoteImportance, NoteType};
+
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = crate::test_helpers::test_project_named("self-core-scope");
+        graph.create_project(&project).await.unwrap();
+
+        let mut declared = Note::new(
+            None,
+            NoteType::Guideline,
+            "d".repeat(200),
+            "self-core-test".into(),
+        );
+        declared.importance = NoteImportance::Critical;
+        declared.tags = vec!["self".to_string()];
+        graph.create_note(&declared).await.unwrap();
+
+        // Une personne déclare ce noyau (la porte humaine est testée ailleurs : ici on
+        // pose l'état, pas la permission).
+        crate::chat::stages::knowledge_injection::store_pinned_notes(
+            graph.as_ref(),
+            None,
+            &[declared.id],
+        )
+        .await
+        .unwrap();
+
+        let state = crate::test_helpers::mock_app_state_with_graph(graph);
+        let app = test_app_with_state(state).await;
+        let resp = app
+            .clone()
+            .oneshot(auth_get("/api/knowledge/self-core?project=self-core-scope"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+
+        assert_eq!(
+            json["pinned"].as_array().unwrap().len(),
+            1,
+            "le socle déclaré est lu comme l'injection le lit"
+        );
+        assert_eq!(json["pinned"][0]["lands"], true);
+        assert_eq!(
+            json["slots_used"], 1,
+            "c'est la note DÉCLARÉE qui prend la place"
+        );
+        assert!(
+            json["candidates"].as_array().unwrap().is_empty(),
+            "déclaré ⇒ plus de proposition"
+        );
+        // Le budget suit le niveau du projet, il n'est pas deviné.
+        let level = json["level"].as_u64().unwrap() as u8;
+        assert_eq!(
+            json["budget_chars"].as_u64().unwrap(),
+            crate::chat::stages::knowledge_injection::scaffolding_config(level).max_content_chars
+                as u64
+                / 2
+        );
+
+        // Un projet inconnu est une erreur nommée, pas un repli silencieux.
+        let missing = app
+            .oneshot(auth_get("/api/knowledge/self-core?project=nope"))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// T8 — le socle du soi dit ce qui atterrira VRAIMENT.
+    ///
+    /// La lecture est bornée à dix notes, le RENDU l'est bien plus : chaque note est
+    /// aplatie et coupée à `PINNED_NOTE_CHARS`, et la boucle s'arrête à la première qui ne
+    /// tient pas dans `max_content_chars / 2`. Sans projet, la route annonce le niveau le
+    /// plus strict (L4 : 750 caractères), pas une place généreuse qu'on n'a pas.
+    #[tokio::test]
+    async fn the_self_core_publishes_what_will_really_land() {
+        use crate::notes::models::{Note, NoteImportance, NoteType};
+
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        for _ in 0..4 {
+            let mut n = Note::new(
+                None,
+                NoteType::Guideline,
+                "x".repeat(400),
+                "self-core-test".into(),
+            );
+            n.importance = NoteImportance::Critical;
+            n.tags = vec!["self".to_string()];
+            graph.create_note(&n).await.unwrap();
+        }
+        let state = crate::test_helpers::mock_app_state_with_graph(graph);
+        let app = test_app_with_state(state).await;
+
+        let resp = app
+            .oneshot(auth_get("/api/knowledge/self-core"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+
+        assert_eq!(json["level"], 4, "sans projet : le niveau le plus strict");
+        assert_eq!(json["budget_chars"], 750);
+        assert_eq!(json["note_char_cap"], 300);
+        assert_eq!(json["max_notes"], 10);
+        assert!(
+            json["pinned"].as_array().unwrap().is_empty(),
+            "rien n'est déclaré : la route le dit, elle ne le suppose pas"
+        );
+
+        let candidates = json["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 4);
+        assert_eq!(
+            candidates[0]["chars"], 400,
+            "la taille écrite, pas la coupe"
+        );
+        assert!(candidates[0]["entry"]
+            .as_str()
+            .unwrap()
+            .contains("[guideline|critical]"));
+        // 400 caractères écrits → une ligne de 300 + une ellipse ; 750 / 328 = deux notes.
+        assert_eq!(candidates[0]["lands"], true);
+        assert_eq!(candidates[1]["lands"], true);
+        assert_eq!(
+            candidates[2]["lands"], false,
+            "la troisième n'entre pas dans le budget : elle est dite, pas cachée"
+        );
+        assert_eq!(candidates[3]["lands"], false);
+        assert_eq!(json["slots_used"], 2);
+        let landed = candidates[0]["entry"].as_str().unwrap().chars().count();
+        assert!(
+            landed < 26 + 300 + 4,
+            "la ligne annoncée ne dépasse jamais la coupe du rendu ({landed})"
+        );
     }
 
     async fn test_app_with_state(app_state: crate::AppState) -> axum::Router {
