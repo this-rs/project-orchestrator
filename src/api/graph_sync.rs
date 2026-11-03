@@ -597,6 +597,13 @@ mod tests {
             serde_json::json!({"include_deleted": "peut-être"})
         )
         .is_err());
+
+        // `null` and an absent field both mean "not asked for".
+        assert!(
+            !SyncParams::from_query(&query(serde_json::json!({ "include_deleted": null })))
+                .unwrap()
+                .include_deleted
+        );
     }
 
     #[tokio::test]
@@ -612,5 +619,76 @@ mod tests {
             .collect();
         keys.sort_unstable();
         assert_eq!(keys, ["communities", "edges", "nodes", "stats"]);
+    }
+
+    #[test]
+    fn select_delta_uses_attribute_stamps_and_keeps_untracked_nodes() {
+        let since = DateTime::parse_from_rfc3339("2026-11-02T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mk = |id: &str, updated: Option<&str>| GraphNode {
+            id: id.to_string(),
+            node_type: "note".to_string(),
+            label: id.to_string(),
+            layer: "knowledge".to_string(),
+            attributes: updated.map(|u| serde_json::json!({ "updated_at": u })),
+        };
+        let nodes = vec![
+            mk("fresh", Some("2026-11-03T10:00:00Z")), // dated after `since`
+            mk("stale", Some("2026-11-01T10:00:00Z")), // dated before `since`
+            mk("untracked", None),                     // no date at all
+        ];
+        let edges = vec![GraphEdge {
+            source: "fresh".to_string(),
+            target: "stale".to_string(),
+            edge_type: "SYNAPSE".to_string(),
+            layer: "knowledge".to_string(),
+            attributes: None,
+        }];
+        let (kept, kept_edges, untracked) = select_delta(nodes, edges, &HashMap::new(), since);
+        assert_eq!(untracked, 1, "exactly one node carries no date");
+        let ids: HashSet<&str> = kept.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains("fresh"));
+        assert!(ids.contains("untracked"));
+        assert!(!ids.contains("stale"), "an old attribute stamp is dropped");
+        assert_eq!(
+            kept_edges.len(),
+            1,
+            "the edge touching a kept node survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_diff_rebuilds_a_vanished_edge_from_its_key() {
+        let key = "test:edge-diff";
+        let c1 = new_cursor();
+        let mut nodes = HashSet::from(["a".to_string(), "b".to_string()]);
+        let mut edges = HashSet::from(["a\u{1}SYNAPSE\u{1}b".to_string()]);
+        assert!(
+            snapshot_and_diff(key, c1, None, nodes.clone(), edges.clone()).is_none(),
+            "the first load has nothing to diff against"
+        );
+
+        // `b` and its edge disappear.
+        let c2 = new_cursor();
+        nodes.remove("b");
+        edges.clear();
+        let diff = snapshot_and_diff(key, c2, Some(c1), nodes, edges).unwrap();
+        assert_eq!(
+            diff.0,
+            vec![DeletedNode {
+                id: "b".to_string(),
+                deleted: true
+            }]
+        );
+        assert_eq!(
+            diff.1,
+            vec![DeletedEdge {
+                source: "a".to_string(),
+                edge_type: "SYNAPSE".to_string(),
+                target: "b".to_string(),
+                deleted: true,
+            }]
+        );
     }
 }

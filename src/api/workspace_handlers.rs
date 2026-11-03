@@ -2208,9 +2208,10 @@ mod tests {
     use crate::neo4j::models::{MilestoneStatus, WorkspaceMilestoneNode};
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+    use crate::notes::NoteType;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{
-        mock_app_state, test_bearer_token, test_plan, test_project, test_task_titled,
+        mock_app_state, test_bearer_token, test_note, test_plan, test_project, test_task_titled,
         test_workspace,
     };
     use axum::body::Body;
@@ -2359,6 +2360,56 @@ mod tests {
             vault: crate::vault::VaultService::ephemeral(),
         });
         (create_router(state), milestone_id, task1.id, task2.id)
+    }
+
+    #[tokio::test]
+    async fn get_workspace_graph_with_incremental_params_returns_sync_info() {
+        let app_state = mock_app_state();
+
+        let ws = test_workspace();
+        app_state.neo4j.create_workspace(&ws).await.unwrap();
+
+        let project = test_project();
+        app_state.neo4j.create_project(&project).await.unwrap();
+        app_state
+            .neo4j
+            .add_project_to_workspace(ws.id, project.id)
+            .await
+            .unwrap();
+
+        let note = test_note(project.id, NoteType::Observation, "n");
+        app_state.neo4j.create_note(&note).await.unwrap();
+
+        let app = test_app_with(app_state).await;
+
+        let uri = format!(
+            "/api/workspaces/{}/graph?layers=knowledge&include_deleted=true",
+            ws.slug
+        );
+        let resp = app.oneshot(auth_get(&uri)).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+
+        // The cursor always travels in the header, even when the body stays unchanged.
+        assert!(
+            resp.headers().get("x-graph-synced-at").is_some(),
+            "the synced-at header carries the cursor"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // The sync info is flattened into the body (serde(flatten)), not under a `sync` key.
+        assert!(
+            json.get("synced_at").is_some(),
+            "synced_at carries the cursor"
+        );
+        assert_eq!(
+            json.get("deletions_tracked"),
+            Some(&serde_json::json!(true)),
+            "a first load with include_deleted tracks deletions from the start"
+        );
     }
 
     // ====================================================================
