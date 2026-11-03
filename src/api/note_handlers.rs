@@ -2119,6 +2119,81 @@ mod tests {
         (test_app_with_state(state).await, ids)
     }
 
+    // ====================================================================
+    // GET /api/knowledge/self-core — the declared core
+    // ====================================================================
+
+    /// T8 — une note DÉCLARÉE passe devant tout ce qui est mesuré, et le budget vient du
+    /// projet quand on en nomme un (pas du défaut strict).
+    #[tokio::test]
+    async fn a_declared_note_takes_the_slot_and_a_project_gives_its_own_budget() {
+        use crate::notes::models::{Note, NoteImportance, NoteType};
+
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = crate::test_helpers::test_project_named("self-core-scope");
+        graph.create_project(&project).await.unwrap();
+
+        let mut declared = Note::new(
+            None,
+            NoteType::Guideline,
+            "d".repeat(200),
+            "self-core-test".into(),
+        );
+        declared.importance = NoteImportance::Critical;
+        declared.tags = vec!["self".to_string()];
+        graph.create_note(&declared).await.unwrap();
+
+        // Une personne déclare ce noyau (la porte humaine est testée ailleurs : ici on
+        // pose l'état, pas la permission).
+        crate::chat::stages::knowledge_injection::store_pinned_notes(
+            graph.as_ref(),
+            None,
+            &[declared.id],
+        )
+        .await
+        .unwrap();
+
+        let state = crate::test_helpers::mock_app_state_with_graph(graph);
+        let app = test_app_with_state(state).await;
+        let resp = app
+            .clone()
+            .oneshot(auth_get("/api/knowledge/self-core?project=self-core-scope"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+
+        assert_eq!(
+            json["pinned"].as_array().unwrap().len(),
+            1,
+            "le socle déclaré est lu comme l'injection le lit"
+        );
+        assert_eq!(json["pinned"][0]["lands"], true);
+        assert_eq!(
+            json["slots_used"], 1,
+            "c'est la note DÉCLARÉE qui prend la place"
+        );
+        assert!(
+            json["candidates"].as_array().unwrap().is_empty(),
+            "déclaré ⇒ plus de proposition"
+        );
+        // Le budget suit le niveau du projet, il n'est pas deviné.
+        let level = json["level"].as_u64().unwrap() as u8;
+        assert_eq!(
+            json["budget_chars"].as_u64().unwrap(),
+            crate::chat::stages::knowledge_injection::scaffolding_config(level).max_content_chars
+                as u64
+                / 2
+        );
+
+        // Un projet inconnu est une erreur nommée, pas un repli silencieux.
+        let missing = app
+            .oneshot(auth_get("/api/knowledge/self-core?project=nope"))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
     /// T8 — le socle du soi dit ce qui atterrira VRAIMENT.
     ///
     /// La lecture est bornée à dix notes, le RENDU l'est bien plus : chaque note est
