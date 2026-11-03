@@ -1547,6 +1547,9 @@ mod graph_limit_tests {
             layers: None,
             community: None,
             limit,
+            since: None,
+            updated_after: None,
+            include_deleted: None,
         }
     }
 
