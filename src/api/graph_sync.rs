@@ -348,6 +348,7 @@ pub async fn project_graph_response(
 mod tests {
     use super::*;
     use crate::neo4j::mock::MockGraphStore;
+    use crate::neo4j::traits::{NoteStore, ProjectStore};
     use crate::notes::NoteType;
     use crate::test_helpers::{test_note, test_project};
     use axum::response::IntoResponse;
