@@ -212,6 +212,30 @@ pub const AFTER_TURN_BACKSTOP: Duration =
 /// engines stop a stuck turn at the same moment.
 pub const INTERRUPT_GRACE_DEFAULT: Duration = Duration::from_secs(10);
 
+/// How long a STREAMING session may emit nothing at all before its turn is deemed unable to
+/// end by itself, and is ended from outside.
+///
+/// The tail of a turn is everything after the provider's terminal event: the cost of the
+/// turn, then the host's end of turn (`after_turn`), then the queue. Only the last of those
+/// puts `is_streaming` back to false — so a tail that never finishes leaves the session
+/// "streaming" for good, with the composer closed, the next message merely held, and a Stop
+/// read by a loop that is already over.
+///
+/// Measured on 03/11/2026 (session `16c189ca`, provider `claude-code`): the `result` came at
+/// 13:08 with `stop_reason: completed`, and two hours later the session was still streaming —
+/// the cost of that turn was never written and the session's `updated_at` was frozen at the
+/// turn's START. The Claude Code engine has had this watchdog since 2026-10-09 (session
+/// `b4c28b9f`, two hours too); the native runtime had not.
+///
+/// Silence, not elapsed time, is the signal: every event of an honest tail refreshes the
+/// activity clock (`Self::touch`), so a slow but living end of turn is never cut — the
+/// longest legitimate silence of a tail is one [`AFTER_TURN_BACKSTOP`], well under this.
+pub const TURN_SILENCE_GRACE: Duration = Duration::from_secs(4 * 60);
+
+/// How often the tail's watchdog looks again once the silence budget is spent (the only
+/// case where it wakes more than once).
+const TAIL_WATCHDOG_MIN_TICK: Duration = Duration::from_secs(1);
+
 /// Whether a provider of `kind` keeps a turn it ended `interrupted` (no error) in its
 /// history, so what `prepare` put in front of it was delivered ([`TurnOutcome::answered`]).
 /// Verified per provider, at the pinned nexus rev (9b5f470b):
@@ -704,6 +728,14 @@ pub struct AgentSessionHandle {
     pub streaming_text: Mutex<String>,
     /// Structured events of the turn in progress (mid-stream joins).
     pub streaming_events: Mutex<Vec<ChatEvent>>,
+    /// Which turn the session is on, moved as a turn starts: a watchdog armed for
+    /// the previous turn (a Stop asked of it, or its tail) stands down instead of
+    /// ending the new one.
+    turn_generation: AtomicU64,
+    /// The task running this session's turns (`drive`), so a turn that honours
+    /// neither its provider nor its own event loop can be ended from outside —
+    /// the Claude Code engine's `stream_task` (`ActiveSession::stream_task`).
+    turn_task: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
     /// `{ id, kind }` stamped on `system_init`.
     provider: serde_json::Value,
     /// Tool policy stamped on `system_init`.
@@ -1094,6 +1126,9 @@ impl AgentSessionHandle {
             | ChatEvent::ActiveTasksUpdate { .. } => {}
             other => self.streaming_events.lock().await.push(other.clone()),
         }
+        // The write of this event, when it is one the store keeps: started here, waited
+        // for after the broadcast below.
+        let mut persisted: Option<tokio::task::JoinHandle<()>> = None;
         if !matches!(
             event,
             ChatEvent::StreamDelta { .. }
@@ -1114,7 +1149,31 @@ impl AgentSessionHandle {
                         .unwrap_or_default(),
                     created_at: chrono::Utc::now(),
                 };
-                let _ = self.graph.store_chat_events(uuid, vec![record]).await;
+                // The store has no timeout of its own, and this write is on the turn's own
+                // path: one call that never answered held the whole turn — and past the
+                // provider's terminal event, nothing was left to free the session (measured
+                // 03/11/2026, session 16c189ca: a 32-minute turn ended at 13:08, the session
+                // still "streaming" two hours later, every Stop delivered to nothing).
+                //
+                // The write goes to a task of its own — never dropped, it lands when the
+                // store answers — and it is waited for BELOW the broadcast, not here: an
+                // await placed between the event's making and its going out adds a
+                // scheduler round-trip that reorders what the clients see (measured: the
+                // `tools_cancelled` of a cancel racing the end of its turn was overtaken by
+                // the turn's own events and never read).
+                persisted = Some(super::post_stream::spawn_write(
+                    self.session_id.clone(),
+                    "chat_event",
+                    {
+                        let graph = Arc::clone(&self.graph);
+                        async move {
+                            if let Err(e) = graph.store_chat_events(uuid, vec![record]).await {
+                                tracing::warn!(error = %e, "storing a chat event failed");
+                            }
+                            Ok(())
+                        }
+                    },
+                ));
             }
         }
         if let Some(services) = &self.services {
@@ -1122,6 +1181,17 @@ impl AgentSessionHandle {
             services.observe(&self.session_id, &event);
         }
         let _ = self.events_tx.send(event);
+        if let Some(write) = persisted {
+            if tokio::time::timeout(super::session_record::RECORD_WRITE_BUDGET, write)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    "a chat event write is late: the turn goes on without it"
+                );
+            }
+        }
         covered
     }
 
@@ -1604,10 +1674,11 @@ impl AgentSessionHandle {
                 // turn), then the queue is played.
                 let me = Arc::clone(self);
                 let shown = shown.to_string();
-                tokio::spawn(async move {
+                let run = tokio::spawn(async move {
                     me.compact_on_request(&shown, instructions).await;
                     me.drive(None).await;
                 });
+                self.track_turn_task(run.abort_handle());
                 return Ok(());
             }
         }
@@ -1615,7 +1686,10 @@ impl AgentSessionHandle {
             // `None`: stopped while it was prepared, only the queue is left to play.
             Ok(first) => {
                 let me = Arc::clone(self);
-                tokio::spawn(async move { me.drive(first).await });
+                let run = tokio::spawn(async move { me.drive(first).await });
+                // The run that must be endable from outside: a turn past its event loop
+                // reads no Stop and no provider event any more (`abandon_turn`).
+                self.track_turn_task(run.abort_handle());
                 Ok(())
             }
             Err(error) => {
@@ -1631,7 +1705,8 @@ impl AgentSessionHandle {
                 };
                 if queued {
                     let me = Arc::clone(self);
-                    tokio::spawn(async move { me.drive(None).await });
+                    let run = tokio::spawn(async move { me.drive(None).await });
+                    self.track_turn_task(run.abort_handle());
                 }
                 Err(anyhow::Error::new(error))
             }
@@ -1647,6 +1722,9 @@ impl AgentSessionHandle {
         sent: &str,
     ) -> std::result::Result<Option<(nexus_claude::agent::EventStream, TurnInput)>, ProviderError>
     {
+        // A new turn: a watchdog armed for the previous one (its Stop, its tail) stands
+        // down instead of ending this one — it compares this generation.
+        self.turn_generation.fetch_add(1, Ordering::SeqCst);
         // A Stop belongs to the turn it stopped: the new turn starts unstopped.
         self.interrupted.store(false, Ordering::SeqCst);
         let from_user = kind == PendingMessageKind::User;
@@ -1787,6 +1865,121 @@ impl AgentSessionHandle {
         }
     }
 
+    // ── Ending a turn nothing else ends ────────────────────────────────────
+
+    /// Which turn the session is on (see [`Self::abandon_turn`]).
+    pub fn turn_generation(&self) -> u64 {
+        self.turn_generation.load(Ordering::SeqCst)
+    }
+
+    /// Remembers the task running this session's turns, so a turn that honours neither its
+    /// provider nor its own event loop can be ended from outside ([`Self::abandon_turn`]).
+    fn track_turn_task(&self, task: tokio::task::AbortHandle) {
+        *self
+            .turn_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
+    }
+
+    /// Ends the turn `generation` names if it is still running in `grace`.
+    ///
+    /// The two cases where nothing else can end it: a Stop the provider's loop no longer
+    /// reads (the loop is over — its end-of-turn work is running), and the tail of a
+    /// finished turn that never finished. Engine-agnostic in its verdict: the turn is
+    /// abandoned, the session goes back to idle, the clients are told why. It never closes
+    /// the session — the work is still there, and the next message continues the thread.
+    pub fn arm_abandon_watchdog(self: &Arc<Self>, generation: u64, grace: Duration) {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            if me.abandon_turn(generation).await {
+                tracing::warn!(
+                    session_id = %me.session_id,
+                    grace_ms = grace.as_millis() as u64,
+                    "a turn ignored both its provider and its own loop: abandoned, the session is idle again"
+                );
+            }
+        });
+    }
+
+    /// The watchdog of a finished turn's TAIL — everything still to run before the session
+    /// is idle again (the cost of the turn, the host's end of turn, the queue).
+    ///
+    /// It waits on SILENCE, not on a fixed delay: each wake sleeps what is left of
+    /// [`TURN_SILENCE_GRACE`], re-read from the activity clock, so a tail that keeps emitting
+    /// keeps pushing the verdict back — and a tail that says nothing for the whole budget is
+    /// ended. A new turn (the generation moved) or an idle session stands it down.
+    fn arm_tail_watchdog(self: &Arc<Self>, generation: u64) {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                let left = TURN_SILENCE_GRACE.saturating_sub(me.idle_for());
+                tokio::time::sleep(left.max(TAIL_WATCHDOG_MIN_TICK)).await;
+                if me.turn_generation.load(Ordering::SeqCst) != generation
+                    || !me.is_streaming.load(Ordering::SeqCst)
+                {
+                    return;
+                }
+                if me.idle_for() < TURN_SILENCE_GRACE {
+                    continue;
+                }
+                if me.abandon_turn(generation).await {
+                    tracing::warn!(
+                        session_id = %me.session_id,
+                        silence_ms = me.idle_for().as_millis() as u64,
+                        "the tail of a finished turn said nothing past its budget: the turn is abandoned, the session is idle again"
+                    );
+                }
+                return;
+            }
+        });
+    }
+
+    /// Ends the turn `generation` names, when it is still the session's current one and it
+    /// is still streaming. Returns whether it did.
+    ///
+    /// The flag goes back to idle FIRST, so nothing the aborted task had queued can leave it
+    /// true again; then the run task is aborted. What the turn already emitted is safe — its
+    /// writes run in tasks of their own (`post_stream::spawn_write`). What it held and never
+    /// emitted is lost, which is the trade the Claude Code engine's `abandon_turn_if_stuck`
+    /// makes too: a session stuck for good is the alternative.
+    pub async fn abandon_turn(&self, generation: u64) -> bool {
+        if self.turn_generation.load(Ordering::SeqCst) != generation {
+            return false;
+        }
+        // A closed session is nobody's to end: the watchdog of its last turn may outlive
+        // it, and would write a hint into a thread that is over.
+        if self.closed.is_cancelled() {
+            return false;
+        }
+        if !self.is_streaming.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.is_streaming.store(false, Ordering::SeqCst);
+        if let Some(task) = self
+            .turn_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
+        }
+        self.streaming_text.lock().await.clear();
+        self.streaming_events.lock().await.clear();
+        self.emit(ChatEvent::StreamingStatus {
+            is_streaming: false,
+        })
+        .await;
+        self.emit(ChatEvent::SystemHint {
+            content: "This turn stopped answering — its provider or the store behind it — so it \
+                      was ended and the session is free again. Nothing of the conversation is \
+                      lost: your next message continues it."
+                .to_string(),
+        })
+        .await;
+        true
+    }
+
     /// The next queued message, or — nothing left — the end of the run: the
     /// session stops streaming, decided under the queue lock.
     async fn next_queued(&self) -> Option<PendingMessage> {
@@ -1865,7 +2058,7 @@ impl AgentSessionHandle {
     /// Answers what the turn did, and the tool calls it left without a result
     /// (id, parent).
     async fn play(
-        &self,
+        self: &Arc<Self>,
         stream: nexus_claude::agent::EventStream,
         input: TurnInput,
     ) -> (TurnOutcome, Vec<(String, Option<String>)>) {
@@ -2028,12 +2221,23 @@ impl AgentSessionHandle {
                     });
                 }
                 let event = mask_agent_event(event);
+                // The harness' advisories (credentials_locked, model_retry, ...) are what
+                // explains a silent turn: keep them in the log file (already masked above).
+                if let AgentEvent::ProviderNotice { kind, data } = &event {
+                    tracing::info!(kind = %kind, data = %data, "provider_notice");
+                }
                 let chat_events = self.mapper.lock().await.map(&event);
                 for chat_event in chat_events {
                     track_turn(&mut outcome, &mut tool_ids, &mut pending_tools, &chat_event);
                     self.emit(chat_event).await;
                 }
                 if terminal {
+                    // The turn is over as far as the provider is concerned; its TAIL
+                    // starts here — the cost of the turn, the host's end of turn, then the
+                    // queue — and the session stays "streaming" until the end of it. A tail
+                    // that never finished used to leave that flag set for good, with no
+                    // Stop able to clear it ([`TURN_SILENCE_GRACE`]).
+                    self.arm_tail_watchdog(self.turn_generation());
                     break;
                 }
             }
@@ -2157,9 +2361,18 @@ impl AgentSessionHandle {
             .await;
             return;
         };
-        for event in after.events {
-            self.emit(event).await;
-        }
+        // Emitting what the host answered is part of the end of turn too — and it is where
+        // the store writes happen. Under the same budget, for the same reason: an await of
+        // this tail that never came back left the session "streaming" for good, with the
+        // turn's own events already persisted and nothing left to free it.
+        let events = after.events;
+        let _ =
+            super::post_stream::bounded(&self.session_id, "after_turn_events", backstop, async {
+                for event in events {
+                    self.emit(event).await;
+                }
+            })
+            .await;
         if !after.hints.is_empty() {
             let mut queue = self.pending.lock().await;
             for hint in after.hints {
@@ -3074,6 +3287,8 @@ impl AgentRuntime {
             registry: Arc::downgrade(&self.sessions),
             provider_dead: AtomicBool::new(false),
             stop_grace_ms: AtomicU64::new(INTERRUPT_GRACE_DEFAULT.as_millis() as u64),
+            turn_generation: AtomicU64::new(0),
+            turn_task: std::sync::Mutex::new(None),
         });
         let replaced = {
             let mut sessions = self.sessions.write().await;
@@ -7532,5 +7747,247 @@ mod stored_interrupted_result_tests {
         assert_eq!(ended["stop_reason"], "interrupted", "{ended}");
         assert_eq!(ended["duration_ms"], 42, "{ended}");
         assert!(ended.get("result_text").is_none(), "{ended}");
+    }
+}
+
+/// The turn's TAIL, and how a session stops being "streaming".
+///
+/// The Claude Code engine has had an abandonment for a turn that ignores its stop since
+/// 2026-10-09 (`ChatManager::abandon_turn_if_stuck`, session b4c28b9f). The native runtime
+/// had none. Measured on 03/11/2026 (session 16c189ca): the provider's `result` arrived with
+/// `stop_reason: completed`, the tail of the turn never finished, and two hours later the
+/// session was still "streaming" — the composer closed, the next message merely held, and
+/// every Stop delivered to nothing. These tests hold that verdict in place.
+#[cfg(test)]
+mod abandoned_turn_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+
+    async fn adopting(runtime: &AgentRuntime, provider: &FakeProvider) -> Arc<AgentSessionHandle> {
+        runtime
+            .adopt(
+                "s",
+                "claude-code",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await
+    }
+
+    /// A turn past its provider's terminal event is ended from outside: the session goes
+    /// back to idle, its buffers are dropped, and the thread says why — a system hint, never
+    /// an error block.
+    #[tokio::test]
+    async fn a_turn_past_its_provider_event_is_ended_and_the_session_freed() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+        let mut events = handle.events_tx.subscribe();
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        handle
+            .streaming_text
+            .lock()
+            .await
+            .push_str("the answer of a finished turn");
+
+        assert!(handle.abandon_turn(handle.turn_generation()).await);
+        assert!(
+            !handle.is_streaming.load(Ordering::SeqCst),
+            "the session is idle again"
+        );
+        assert!(
+            handle.streaming_text.lock().await.is_empty(),
+            "the buffers of the abandoned turn are gone"
+        );
+
+        let mut idle_status = false;
+        let mut asked = None;
+        while let Ok(event) = events.try_recv() {
+            if matches!(
+                event,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            ) {
+                idle_status = true;
+            } else if let ChatEvent::SystemHint { content } = event {
+                asked = Some(content);
+            }
+        }
+        assert!(idle_status, "the clients are told the turn is over");
+        let asked = asked.expect("the thread says why the turn ended");
+        assert!(asked.contains("session is free again"), "{asked}");
+        assert!(
+            runtime.owns("s").await,
+            "the session is not closed: the next message continues it"
+        );
+    }
+
+    /// A watchdog armed for the previous turn ends nothing: the new turn owns the session.
+    #[tokio::test]
+    async fn an_abandonment_armed_for_a_previous_turn_ends_nothing() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        let stale = handle.turn_generation();
+
+        // A new turn started meanwhile (OpenTurn moves the generation).
+        handle.turn_generation.fetch_add(1, Ordering::SeqCst);
+
+        assert!(!handle.abandon_turn(stale).await);
+        assert!(
+            handle.is_streaming.load(Ordering::SeqCst),
+            "the running turn is untouched"
+        );
+    }
+
+    /// An idle session is never "abandoned": the verdict is for a turn that is still
+    /// streaming, and a Stop that arrives after the turn ended must not write anything.
+    #[tokio::test]
+    async fn an_idle_session_is_never_abandoned() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+
+        assert!(!handle.abandon_turn(handle.turn_generation()).await);
+    }
+
+    /// A subscriber that keeps what the watchdogs write when they pass their verdict.
+    ///
+    /// Without one, `tracing` never even reads an event's fields: the lines of those
+    /// warnings would never run in a test. The server always has a subscriber; these two
+    /// tests say so, writing into the void.
+    fn on_the_wire() -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .finish(),
+        )
+    }
+
+    /// The tail's watchdog, on the signal it really uses: a session that emits nothing for
+    /// the whole silence budget stops streaming — nobody had to press Stop.
+    #[tokio::test]
+    async fn the_tail_watchdog_frees_a_session_that_never_emits_again() {
+        let _wire = on_the_wire();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        // Silent since longer than the budget: the tail is not slowly working, it is gone.
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+
+        handle.arm_tail_watchdog(handle.turn_generation());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handle.is_streaming.load(Ordering::SeqCst) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !handle.is_streaming.load(Ordering::SeqCst),
+            "the tail's watchdog frees the session it watches"
+        );
+    }
+
+    /// The watchdog the tail arms: past the grace, a session nobody can free is freed, and
+    /// it stays open for the next message.
+    #[tokio::test]
+    async fn the_watchdog_frees_a_session_that_never_stops_streaming() {
+        let _wire = on_the_wire();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+        handle.is_streaming.store(true, Ordering::SeqCst);
+
+        handle.arm_abandon_watchdog(handle.turn_generation(), Duration::from_millis(10));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.is_streaming.load(Ordering::SeqCst) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !handle.is_streaming.load(Ordering::SeqCst),
+            "the watchdog frees the session"
+        );
+        assert!(
+            runtime.owns("s").await,
+            "and leaves it open: the next message continues it"
+        );
+    }
+
+    /// The turn is ended from outside by aborting the task that runs it — what frees what the
+    /// tail held: the flag alone would leave a task parked on an await nobody answers.
+    #[tokio::test]
+    async fn the_run_task_of_an_abandoned_turn_is_aborted() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+        // The run task, tracked as `start` tracks it.
+        let run = tokio::spawn(async { std::future::pending::<()>().await });
+        handle.track_turn_task(run.abort_handle());
+        handle.is_streaming.store(true, Ordering::SeqCst);
+
+        assert!(handle.abandon_turn(handle.turn_generation()).await);
+
+        let outcome = run.await;
+        assert!(
+            outcome.is_err_and(|e| e.is_cancelled()),
+            "the run task is gone, not merely ignored"
+        );
+    }
+
+    /// A closed session is nobody's to end: the watchdog of its last turn may outlive it, and
+    /// would write a hint into a thread that is over.
+    #[tokio::test]
+    async fn a_closed_session_is_never_abandoned() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        handle.closed.cancel();
+
+        assert!(!handle.abandon_turn(handle.turn_generation()).await);
+        assert!(
+            handle.is_streaming.load(Ordering::SeqCst),
+            "a closed session is left exactly as it was"
+        );
+    }
+
+    /// The tail's watchdog stands down when the tail ends on its own: an idle session hears
+    /// nothing from it — no second `streaming_status`, no hint in a finished thread.
+    #[tokio::test]
+    async fn the_tail_watchdog_stands_down_once_the_tail_ended() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+        let mut events = handle.events_tx.subscribe();
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+        handle.arm_tail_watchdog(handle.turn_generation());
+        // The turn's own tail got there first.
+        handle.is_streaming.store(false, Ordering::SeqCst);
+
+        tokio::time::sleep(TAIL_WATCHDOG_MIN_TICK + Duration::from_millis(500)).await;
+
+        let mut hints = 0;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, ChatEvent::SystemHint { .. }) {
+                hints += 1;
+            }
+        }
+        assert_eq!(hints, 0, "the watchdog of a finished tail says nothing");
+        assert!(!handle.is_streaming.load(Ordering::SeqCst));
     }
 }

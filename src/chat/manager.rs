@@ -14553,6 +14553,17 @@ impl ChatManager {
                 nexus_claude::agent::InterruptScope::TurnOnly
             };
             let outcome = handle.interrupt_scoped(scope).await?;
+            // The native engine's Stop is a flag its event loop alone reads: a turn past
+            // that loop (its end-of-turn work) or wedged on an await inside it never sees
+            // it, and `is_streaming` would stay true for good — measured on 03/11/2026
+            // (session 16c189ca): two hours of a composer that could not send, every Stop
+            // delivered to nothing. The Claude Code engine arms `abandon_turn_if_stuck`
+            // below for exactly that reason, with the same grace; the native one arms the
+            // same verdict on its handle.
+            handle.arm_abandon_watchdog(
+                handle.turn_generation(),
+                super::agent_runtime::INTERRUPT_GRACE_DEFAULT,
+            );
             let diagnostic = outcome.diagnostic;
             return Ok(InterruptOutcome {
                 delivered: outcome.turn_interrupted,
