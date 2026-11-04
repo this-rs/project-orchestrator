@@ -78,6 +78,40 @@ impl TaskEnricher {
         Self { graph }
     }
 
+    /// Link the commits made in `cwd` since `since` to a task and a plan.
+    ///
+    /// Only the COMMIT half of [`enrich`]: no auto-note, no AFFECTS, no DISCUSSED. The close
+    /// of a chat session calls this one, because the evidence a session leaves must be the
+    /// commits it produced and nothing else — an auto-note written at every close would fill
+    /// the graph with artefacts nobody asked for, and an artefact is not evidence (RM-2).
+    ///
+    /// Returns `(linked, commits)`: the count `enrich` used to compute itself, and the
+    /// commits found, which the caller usually wants to name.
+    pub(crate) async fn link_commits(
+        &self,
+        task_id: Uuid,
+        plan_id: Uuid,
+        project_id: Option<Uuid>,
+        since: DateTime<Utc>,
+        cwd: &str,
+    ) -> (usize, Vec<GitCommitInfo>) {
+        let commits = match commits_since(cwd, since).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Enricher: failed to get commits: {}", e);
+                return (0, vec![]);
+            }
+        };
+        if commits.is_empty() {
+            info!("Enricher: no commits found for task {}", task_id);
+            return (0, commits);
+        }
+        let linked = self
+            .enrich_commits(&commits, task_id, plan_id, project_id)
+            .await;
+        (linked, commits)
+    }
+
     /// Run all enrichments for a completed task.
     ///
     /// This is fire-and-forget — errors are logged but don't propagate.
@@ -92,19 +126,15 @@ impl TaskEnricher {
     ) -> EnrichResult {
         let mut result = EnrichResult::default();
 
-        // 1. Get commits since task started
-        let commits = match commits_since(cwd, task_start_time).await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Enricher: failed to get commits: {}", e);
-                return result;
-            }
-        };
+        // 1-2. Commits of the window, linked to the task and the plan
+        let (linked, commits) = self
+            .link_commits(task_id, plan_id, project_id, task_start_time, cwd)
+            .await;
 
         if commits.is_empty() {
-            info!("Enricher: no commits found for task {}", task_id);
             return result;
         }
+        result.commits_linked = linked;
 
         // Collect all modified files across all commits
         let all_modified_files: Vec<String> = commits
@@ -113,11 +143,6 @@ impl TaskEnricher {
             .collect::<std::collections::HashSet<String>>()
             .into_iter()
             .collect();
-
-        // 2. Link commits to task and plan
-        result.commits_linked = self
-            .enrich_commits(&commits, task_id, plan_id, project_id)
-            .await;
 
         // 3. Create auto-note from git info
         if let Some(note_id) = self

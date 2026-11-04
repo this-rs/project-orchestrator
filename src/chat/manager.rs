@@ -19306,6 +19306,60 @@ impl ChatManager {
         }
     }
 
+    /// Links to their tasks and plans the commits a session made, before its episode is
+    /// collected.
+    ///
+    /// This is the piece that was missing. `TaskEnricher` already turned git into
+    /// `Commit` + `TOUCHES` + `RESOLVED_BY`, but was wired only into the plan runner: a task
+    /// finished by a CHAT kept `get_task_commits() == []`. The delivery was real; the link
+    /// was never made (RM-4, decision `c23f494b`).
+    ///
+    /// Best effort, and deliberately narrow: a session with no linked task, or no linked
+    /// plan, is left alone — a commit is never attributed to a task by guesswork — and only
+    /// the COMMIT half of the enrichment runs (`TaskEnricher::link_commits`), so a close
+    /// does not litter the graph with an auto-note per session.
+    pub(crate) async fn link_session_commits(
+        graph: std::sync::Arc<dyn crate::neo4j::traits::GraphStore>,
+        session: Uuid,
+    ) {
+        let Ok(Some(node)) = graph.get_chat_session(session).await else {
+            return;
+        };
+        let Ok(links) = graph.get_session_links(session).await else {
+            return;
+        };
+        if links.linked_tasks.is_empty() || links.linked_plans.is_empty() {
+            return;
+        }
+        // The evidence follows the REPOSITORY (`cwd`), not the session's project slug,
+        // which is measured to lie: the session of a backend task carried `nexus-sdk`.
+        let project = match node.project_slug.as_deref() {
+            Some(slug) => graph
+                .get_project_by_slug(slug)
+                .await
+                .ok()
+                .flatten()
+                .map(|p| p.id),
+            None => None,
+        };
+        let enricher = crate::runner::enricher::TaskEnricher::new(graph.clone());
+        for task in &links.linked_tasks {
+            for plan in &links.linked_plans {
+                let (linked, _) = enricher
+                    .link_commits(task.id, plan.id, project, node.created_at, &node.cwd)
+                    .await;
+                if linked > 0 {
+                    info!(
+                        session_id = %session,
+                        task_id = %task.id,
+                        commits = linked,
+                        "the commits of a closed session are linked to its task"
+                    );
+                }
+            }
+        }
+    }
+
     fn record_close_episode(&self, session_id: &str, reason: &str) {
         let Ok(id) = Uuid::parse_str(session_id) else {
             return;
@@ -19314,6 +19368,9 @@ impl ChatManager {
         let embeddings = self.embeddings.clone();
         let reason = reason.to_string();
         let work = async move {
+            // The links first: the episode collected below names the commits of the window,
+            // and the graph must already know which task they resolve.
+            Self::link_session_commits(graph.clone(), id).await;
             let Some(mut episode) =
                 crate::episodes::collector::collect_session_episode(graph.as_ref(), id, &reason)
                     .await?
