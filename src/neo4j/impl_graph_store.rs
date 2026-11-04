@@ -1474,6 +1474,16 @@ impl CommitStore for Neo4jClient {
         self.link_commit_to_task(commit_hash, task_id).await
     }
 
+    async fn link_commit_to_task_from(
+        &self,
+        commit_hash: &str,
+        task_id: Uuid,
+        source: &str,
+    ) -> anyhow::Result<()> {
+        self.link_commit_to_task_from(commit_hash, task_id, source)
+            .await
+    }
+
     async fn link_commit_to_plan(&self, commit_hash: &str, plan_id: Uuid) -> anyhow::Result<()> {
         self.link_commit_to_plan(commit_hash, plan_id).await
     }

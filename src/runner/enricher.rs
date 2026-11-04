@@ -225,8 +225,13 @@ impl TaskEnricher {
                 }
             }
 
-            // Link to task
-            if let Err(e) = self.graph.link_commit_to_task(&commit.hash, task_id).await {
+            // Link to task — provenance `git_window`: the commit was found in a time
+            // window read from git, not declared by the agent (RM-4, decision c23f494b).
+            if let Err(e) = self
+                .graph
+                .link_commit_to_task_from(&commit.hash, task_id, "git_window")
+                .await
+            {
                 warn!(
                     "Enricher: failed to link commit {} to task: {}",
                     commit.hash, e
@@ -550,7 +555,13 @@ impl TaskEnricher {
                 // Get task's affected_files to match against commit
                 if let Ok(Some(task_node)) = self.graph.get_task(task_id).await {
                     if commit_overlaps_task(&commit_files, &task_node.affected_files) {
-                        let _ = self.graph.link_commit_to_task(&commit.hash, task_id).await;
+                        // Provenance `file_overlap`: the match rests on a FORECAST
+                        // (`affected_files`, written at plan time), not on a fact read from
+                        // git. It is the weakest source and never counts as evidence.
+                        let _ = self
+                            .graph
+                            .link_commit_to_task_from(&commit.hash, task_id, "file_overlap")
+                            .await;
                         linked += 1;
                     }
                 }

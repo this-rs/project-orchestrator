@@ -1339,6 +1339,23 @@ pub trait CommitStore: Send + Sync {
     /// Link a commit to a task (RESOLVED_BY relationship)
     async fn link_commit_to_task(&self, commit_hash: &str, task_id: Uuid) -> Result<()>;
 
+    /// Link a commit to a task, recording WHERE the claim comes from — `merged`,
+    /// `git_window` or `declared`.
+    ///
+    /// A store that does not model provenance drops it and writes the plain link, which
+    /// keeps every implementation usable. The Neo4j store keeps it, and the reward only
+    /// counts `merged` and `git_window`: an agent that declares its own link is not
+    /// evidence of delivery (RM-2, RM-4, decision `c23f494b`).
+    async fn link_commit_to_task_from(
+        &self,
+        commit_hash: &str,
+        task_id: Uuid,
+        source: &str,
+    ) -> Result<()> {
+        let _ = source;
+        self.link_commit_to_task(commit_hash, task_id).await
+    }
+
     /// Link a commit to a plan (RESULTED_IN relationship)
     async fn link_commit_to_plan(&self, commit_hash: &str, plan_id: Uuid) -> Result<()>;
 
