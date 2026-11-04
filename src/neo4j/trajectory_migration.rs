@@ -392,8 +392,10 @@ fn build_migrated_trajectory(session_id: &Uuid, parsed: &[ParsedToolUse]) -> Tra
         })
         .collect();
 
-    // Heuristic total reward: based on session length and tool diversity
-    let total_reward = estimate_session_reward(parsed);
+    // The reward of this trajectory. `total_reward` keeps the procedural estimate unless
+    // the flag is on AND evidence exists (RM-6); the migration carries no evidence source
+    // yet, so in practice this stays the process score until RM-8 plumbs it.
+    let total_reward = total_reward(parsed, &[], None);
     let duration_ms = nodes.iter().map(|n| n.delta_ms).sum();
 
     Trajectory {
@@ -419,6 +421,63 @@ fn estimate_confidence(position: usize, total: usize) -> f64 {
     let progress = position as f64 / (total - 1) as f64;
     // Ramp from 0.4 (start) to 0.8 (end)
     0.4 + progress * 0.4
+}
+
+/// Whether the OUTCOME-based reward is allowed to replace the procedural one.
+///
+/// Off by default, and deliberately so: RM-8 is the only place allowed to turn it on, and
+/// only after replaying the existing corpus and showing that the correlation with the
+/// observed result improves. A reward that changes behaviour without a measurement is the
+/// defect this plan exists to fix.
+fn parse_reward_v2(raw: &str) -> bool {
+    matches!(raw.trim(), "1" | "true" | "on" | "yes")
+}
+
+fn reward_v2_enabled() -> bool {
+    std::env::var("REWARD_V2")
+        .map(|v| parse_reward_v2(&v))
+        .unwrap_or(false)
+}
+
+/// What a piece of work is worth, judged on its RESULT rather than its ceremony.
+///
+/// `evidence` is what proves delivery — commit shas found by the enricher, or a merged PR.
+/// `None` when nothing proves anything: that is not a zero, it is "no opinion", and the
+/// caller must not treat it as a bad score.
+///
+/// Nothing here looks at which tools were called. That was the whole defect of
+/// [`estimate_session_reward`], whose pattern bonus rewarded calling `search`, `context`
+/// and `impact` — measuring the ceremony instead of the delivery (RM-1, RM-6).
+fn estimate_outcome_reward(evidence: &[String], cost_usd: Option<f64>) -> Option<f64> {
+    if evidence.is_empty() {
+        return None;
+    }
+
+    // Evidence saturates fast: one commit already proves delivery, ten do not prove ten
+    // times more. The logarithm keeps the order without letting volume dominate.
+    let proven = (0.6 + (evidence.len() as f64).ln() / 4.0).min(0.95);
+
+    // Cost is a damper, never the driver: the same result for ten times the price is worth
+    // less, but a hard task done well is never scored low just for costing a lot.
+    let damping = match cost_usd {
+        Some(cost) if cost > 0.0 => 1.0 / (1.0 + cost / 5.0),
+        _ => 1.0,
+    };
+
+    Some((proven * damping).max(0.2))
+}
+
+/// The reward actually recorded for a trajectory.
+///
+/// The outcome score only takes over when there IS evidence AND the flag is on. Without
+/// evidence the process score is kept rather than zeroed: "nothing proved it" is not the
+/// same as "it was worthless", and a corpus silently flattened to zero would be a worse
+/// defect than the one being fixed.
+fn total_reward(events: &[ParsedToolUse], evidence: &[String], cost_usd: Option<f64>) -> f64 {
+    match estimate_outcome_reward(evidence, cost_usd) {
+        Some(outcome) if reward_v2_enabled() => outcome,
+        _ => estimate_session_reward(events),
+    }
 }
 
 /// Estimate a session's total reward from tool usage patterns.
@@ -545,6 +604,98 @@ mod tests {
             r_theatre - r_livree > 0.05,
             "écart trop faible pour conclure : {:.4}",
             r_theatre - r_livree
+        );
+    }
+
+    /// RM-6 — la preuve est la seule chose qui note, et l'absence de preuve n'est pas zéro.
+    #[test]
+    fn rm6_evidence_is_the_only_thing_that_scores() {
+        assert_eq!(
+            estimate_outcome_reward(&[], Some(0.5)),
+            None,
+            "rien de prouvé = pas d'avis, surtout pas un zéro"
+        );
+
+        let one = estimate_outcome_reward(&["a".to_string()], Some(0.5)).unwrap();
+        let three = estimate_outcome_reward(
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            Some(0.5),
+        )
+        .unwrap();
+
+        assert!(one > 0.5, "un commit prouve la livraison : {one}");
+        assert!(
+            three > one,
+            "trois commits valent plus qu'un : {three} > {one}"
+        );
+        assert!(
+            three <= 0.95,
+            "le volume ne domine pas : la preuve sature ({three})"
+        );
+        assert!(
+            one > 0.0 && three > 0.0,
+            "aucune dimension de la formule ne dépend des outils appelés"
+        );
+    }
+
+    /// Le coût amortit, il ne décide pas : un travail difficile réussi ne tombe pas au
+    /// niveau d'un échec parce qu'il a coûté cher.
+    #[test]
+    fn rm6_cost_damps_but_never_floors_the_evidence() {
+        let evidence = vec!["a".to_string()];
+        let cheap = estimate_outcome_reward(&evidence, Some(0.1)).unwrap();
+        let dear = estimate_outcome_reward(&evidence, Some(50.0)).unwrap();
+
+        assert!(
+            dear < cheap,
+            "même preuve, dix fois le prix : {dear} < {cheap}"
+        );
+        assert!(
+            dear >= 0.2,
+            "le plancher tient : un résultat prouvé n'est jamais noté comme un échec ({dear})"
+        );
+    }
+
+    /// Le drapeau est éteint par défaut : sans RM-8, la récompense garde son régime actuel
+    /// même quand une preuve existe.
+    #[test]
+    fn rm6_the_flag_is_off_by_default_and_gates_the_new_reward() {
+        assert!(parse_reward_v2("1"));
+        assert!(parse_reward_v2("true"));
+        assert!(parse_reward_v2(" on "));
+        assert!(!parse_reward_v2("0"));
+        assert!(!parse_reward_v2("no"));
+        assert!(!parse_reward_v2(""));
+
+        if reward_v2_enabled() {
+            // A developer running the suite with REWARD_V2=1 in the environment turns this
+            // assertion into its opposite; the point is only the default.
+            return;
+        }
+
+        let events = vec![
+            ParsedToolUse {
+                tool_name: "Read".into(),
+                action: String::new(),
+                params: serde_json::json!({}),
+                seq: 0,
+            },
+            ParsedToolUse {
+                tool_name: "Edit".into(),
+                action: String::new(),
+                params: serde_json::json!({}),
+                seq: 1,
+            },
+        ];
+        let process = estimate_session_reward(&events);
+        assert!(
+            process > 0.0,
+            "le score de procédure est bien non nul: {process}"
+        );
+        assert_eq!(
+            total_reward(&events, &["a".to_string()], None),
+            process,
+            "drapeau éteint : la nouvelle formule n'entre pas en jeu, même avec une preuve"
         );
     }
 
