@@ -55,6 +55,23 @@ pub struct EnrichResult {
     pub discussed_added: usize,
 }
 
+/// Whether a commit may be attributed to a task by file overlap.
+///
+/// An **empty** `affected_files` is NOT a match. The previous condition —
+/// `overlap > 0 || task.affected_files.is_empty()` — gave such a task *every* commit of
+/// the run, turning "we know nothing about this task's files" into "every commit is
+/// hers". An absence of information is not a claim, and `affected_files` is optional at
+/// task creation, so that branch fired often (RM-4, decision `c23f494b`).
+///
+/// The commit still reaches the PLAN, unconditionally: that link is the honest half of
+/// the sweep. What we refuse is the task attribution we cannot justify.
+fn commit_overlaps_task(
+    commit_files: &std::collections::HashSet<&str>,
+    task_files: &[String],
+) -> bool {
+    !task_files.is_empty() && task_files.iter().any(|t| commit_files.contains(t.as_str()))
+}
+
 impl TaskEnricher {
     /// Create a new TaskEnricher.
     pub fn new(graph: Arc<dyn GraphStore>) -> Self {
@@ -507,15 +524,7 @@ impl TaskEnricher {
 
                 // Get task's affected_files to match against commit
                 if let Ok(Some(task_node)) = self.graph.get_task(task_id).await {
-                    let task_files: std::collections::HashSet<&str> = task_node
-                        .affected_files
-                        .iter()
-                        .map(|f| f.as_str())
-                        .collect();
-
-                    let overlap = commit_files.intersection(&task_files).count();
-                    if overlap > 0 || task_node.affected_files.is_empty() {
-                        // Match found (or task has no affected_files → link anyway)
+                    if commit_overlaps_task(&commit_files, &task_node.affected_files) {
                         let _ = self.graph.link_commit_to_task(&commit.hash, task_id).await;
                         linked += 1;
                     }
@@ -648,6 +657,42 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+
+    /// RM-4 — une tâche SANS `affected_files` n'absorbe plus tous les commits du run.
+    ///
+    /// L'ancienne condition était `overlap > 0 || task.affected_files.is_empty()` : une
+    /// tâche dont on ignore les fichiers empochait *tous* les commits du run. Comme
+    /// `affected_files` est optionnel à la création d'une tâche, la branche tirait
+    /// souvent — et fabriquait une preuve à partir d'une absence d'information.
+    #[test]
+    fn a_task_without_affected_files_claims_no_commit() {
+        let commit_files: std::collections::HashSet<&str> =
+            ["src/a.rs", "src/b.rs"].into_iter().collect();
+        assert!(
+            !commit_overlaps_task(&commit_files, &[]),
+            "aucun fichier déclaré = aucune revendication ; le commit atteint quand même le plan"
+        );
+    }
+
+    #[test]
+    fn a_shared_file_attributes_the_commit() {
+        let commit_files: std::collections::HashSet<&str> = ["src/a.rs"].into_iter().collect();
+        let task_files = vec!["src/a.rs".to_string(), "src/c.rs".to_string()];
+        assert!(
+            commit_overlaps_task(&commit_files, &task_files),
+            "un fichier commun suffit à attribuer"
+        );
+    }
+
+    #[test]
+    fn disjoint_files_attribute_nothing() {
+        let commit_files: std::collections::HashSet<&str> = ["src/z.rs"].into_iter().collect();
+        let task_files = vec!["src/a.rs".to_string()];
+        assert!(
+            !commit_overlaps_task(&commit_files, &task_files),
+            "aucun recouvrement = aucune attribution"
+        );
+    }
 
     #[test]
     fn test_enrich_result_default() {
