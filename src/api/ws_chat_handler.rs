@@ -697,6 +697,12 @@ async fn handle_ws_chat_loop(
                         // When the user sends a new message, resume_session() will spawn
                         // a fresh CLI and the existing `if event_rx.is_none() { subscribe() }`
                         // logic (below) will re-subscribe automatically.
+                        //
+                        // NOTE: an in-place provider switch does NOT reach this arm — the
+                        // sender of the replaced channel stays alive (measured on the agent
+                        // engine, 2026-11-04). A switch is announced on the channel it
+                        // replaces instead (`relay_conversation`), so the socket is never
+                        // left waiting on a channel nobody writes to.
                         debug!(session_id = %session_id, "Chat broadcast closed (idle cleanup), going dormant");
                         event_rx = None;
                         snapshot_fingerprints.clear();

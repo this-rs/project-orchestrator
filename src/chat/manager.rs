@@ -12476,6 +12476,16 @@ impl ChatManager {
         self.graph
             .update_chat_session_provider(previous, provider, &target_model, routed_by, engine)
             .await?;
+        // The channel a client is LISTENING on, taken while it still exists. An in-place
+        // switch is meant to replace it: `close_session_for_switch` drops the session (and,
+        // with it, its sender) and the reopen makes a NEW channel. A socket that subscribed
+        // to the old one cannot hear the switch on the new one — it is not attached to it —
+        // and, measured on the agent engine (2026-11-04, `agent_e2e_tests`, in-place move in
+        // Auto), it does not hear `RecvError::Closed` either: something around the reopened
+        // session keeps the old sender alive, so that channel stays open and silent forever.
+        // The tab then sat on its typing indicator until the page was reloaded. The switch is
+        // therefore ANNOUNCED on the channel it replaces, below.
+        let replaced_channel = self.get_events_tx(session_id).await.ok();
         if let Err(error) = self.close_session_for_switch(session_id).await {
             debug!(%session_id, %error, "closing the provider process before an in-place switch");
         }
@@ -12504,11 +12514,18 @@ impl ChatManager {
 
         // The SAME thread states the switch — with the relay counts, so a bounded relay
         // is never a silent truncation; there is no new session to follow.
-        self.emit_on_session(
-            session_id,
-            relayed.event(session_id, provider, &target_model),
-        )
-        .await;
+        let switched = relayed.event(session_id, provider, &target_model);
+        self.emit_on_session(session_id, switched.clone()).await;
+        // …and the client attached to the channel this switch just replaced hears the same
+        // statement on it, then nothing more. That frame is the ONLY way it can learn the
+        // session went on without it: `provider_switched` is what makes a socket re-open
+        // itself on the session (the tab followed the switch already, from the response of
+        // the route it called — a router move has no such response). Sent on the channel
+        // directly, not through `emit_on_session`: the event is persisted and published
+        // once, above, and a second pass would give every other client a duplicate.
+        if let Some(replaced) = replaced_channel {
+            let _ = replaced.send(switched);
+        }
 
         let note = serde_json::json!({
             "from_session": session_id,
