@@ -246,10 +246,13 @@ fn journal_of<'a>(events: impl Iterator<Item = (&'a str, &'a str)>) -> SessionJo
 /// - **Stimulus**: its first user message (the node's `preview`), at its creation.
 ///   `UserRequest`, or `Manual` for a session another agent or a runner spawned.
 /// - **Process**: no FSM state; its active span (`created_at` → last update).
-/// - **Outcome**: no artefact list — nothing links what a session wrote back to it yet,
-///   and an episode does not invent it. It does count the distinct files an editing tool
-///   was called on, read from the persisted events (`files_modified`). How it ended is
-///   `session.close_reason`.
+/// - **Outcome**: the commits the session made, read from git in the window
+///   `session.created_at` → close, in `session.cwd` (`commit_shas`), and the number of
+///   distinct files they touch. No note or decision is listed: nothing links what a
+///   session wrote back to it yet, and an episode does not invent it. `files_modified` is
+///   the larger of that file count and the distinct files an editing tool was called on
+///   (see `journal_of`): one is a fact, the other an intent, and neither is complete
+///   alone. How it ended is `session.close_reason`.
 /// - **Validation**: none.
 /// - **Session**: id, messages exchanged, close reason, cost, agent.
 ///
@@ -263,7 +266,11 @@ fn journal_of<'a>(events: impl Iterator<Item = (&'a str, &'a str)>) -> SessionJo
 ///
 /// Known limits: `preview` is the first message cut to ~200 characters; a session
 /// whose process died without a close (removed from the live table, never closed)
-/// leaves no episode until it is resumed and closed.
+/// leaves no episode until it is resumed and closed. Two sessions running in the SAME
+/// repository at the same time each see the other's commits: the window cannot tell them
+/// apart, so the same sha may end up on two episodes. De-duplicating by hash when the
+/// evidence is *counted* absorbs this (the reward counts distinct shas); the graph itself
+/// is not corrected (RM-4, decision `c23f494b`).
 pub async fn collect_session_episode(
     neo4j: &dyn GraphStore,
     session_id: Uuid,
@@ -340,6 +347,29 @@ async fn session_episode(
 
     let journal = read_session_journal(neo4j, session_id).await;
 
+    // The commits this session produced, read from git in the SAME window the enricher
+    // uses (`commits_since`, `session.created_at` in `session.cwd`) — one reader, one
+    // window, so an episode cannot describe a graph it no longer matches.
+    //
+    // A count taken from the journal is an INTENT (a tool call named a file); a commit is
+    // a FACT. Neither is complete alone — a commit does not see what was left uncommitted,
+    // the journal does not see what git did. `files_modified` therefore takes the larger
+    // of the two instead of pretending to add them: it is a floor on both sides.
+    let commits = crate::runner::enricher::commits_since(&session.cwd, session.created_at)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "the commits of a closed session could not be read: its episode keeps no sha"
+            );
+            Vec::new()
+        });
+    let committed_files: std::collections::HashSet<&str> = commits
+        .iter()
+        .flat_map(|c| c.files.iter().map(|f| f.path.as_str()))
+        .collect();
+
     let spawned = session
         .spawned_by
         .as_deref()
@@ -373,8 +403,8 @@ async fn session_episode(
         outcome: Outcome {
             note_ids: Vec::new(),
             decision_ids: Vec::new(),
-            commit_shas: Vec::new(),
-            files_modified: journal.files_modified,
+            commit_shas: commits.iter().map(|c| c.hash.clone()).collect(),
+            files_modified: journal.files_modified.max(committed_files.len()),
         },
         validation: Validation {
             feedback_type: FeedbackType::None,
@@ -729,6 +759,85 @@ mod tests {
         let session_id = session.id;
         store.create_chat_session(&session).await.unwrap();
         (store, session_id, project_id)
+    }
+
+    /// RM-4 — l'épisode nomme les commits que la session a réellement produits.
+    ///
+    /// Avant, `commit_shas` était écrit vide en dur et `files_modified` ne venait que des
+    /// événements : une session qui livre par git déclarait zéro livraison. Ici le
+    /// dépôt est réel, la fenêtre s'ouvre avant le commit, et l'épisode doit le nommer.
+    #[tokio::test]
+    async fn a_session_that_committed_names_its_shas_and_its_files() {
+        use std::process::Command;
+
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git must be installed for this test");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "feat: a"]);
+
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let p = crate::test_helpers::test_project_named("alpha");
+        store.create_project(&p).await.unwrap();
+        let mut session = crate::test_helpers::test_chat_session(Some("alpha"));
+        session.preview = Some("write a".to_string());
+        session.cwd = dir.to_string_lossy().to_string();
+        // The window opens before the commit, so the commit is inside it.
+        session.created_at = Utc::now() - chrono::Duration::seconds(60);
+        session.updated_at = Utc::now();
+        let sid = session.id;
+        store.create_chat_session(&session).await.unwrap();
+
+        let episode = collect_session_episode(&store, sid, "closed")
+            .await
+            .unwrap()
+            .expect("a session with a message and a project leaves an episode");
+
+        assert_eq!(
+            episode.outcome.commit_shas.len(),
+            1,
+            "the commit of the window is named: {:?}",
+            episode.outcome.commit_shas
+        );
+        assert!(
+            !episode.outcome.commit_shas[0].is_empty(),
+            "the sha is named, not blank"
+        );
+        assert!(
+            episode.outcome.files_modified >= 1,
+            "a committed file counts as modified, even with no editing tool call"
+        );
+    }
+
+    /// Une session dont le `cwd` n'est pas un dépôt n'échoue pas et ne nomme aucun sha :
+    /// un compte manquant vaut mieux qu'un close qui tombe.
+    #[tokio::test]
+    async fn a_session_outside_any_repository_keeps_no_sha_and_still_leaves_an_episode() {
+        let (store, sid, _) = store_with_session(Some("alpha"), Some("nothing here")).await;
+        let episode = collect_session_episode(&store, sid, "closed")
+            .await
+            .unwrap()
+            .expect("a session with a message and a project leaves an episode");
+        assert!(
+            episode.outcome.commit_shas.is_empty(),
+            "no repository, no commit to name"
+        );
     }
 
     #[tokio::test]

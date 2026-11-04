@@ -34,12 +34,12 @@ pub struct TaskEnricher {
 
 /// Info about a git commit parsed from `git log`.
 #[derive(Debug, Clone)]
-struct GitCommitInfo {
-    hash: String,
-    message: String,
-    author: String,
-    timestamp: DateTime<Utc>,
-    files: Vec<FileChangedInfo>,
+pub(crate) struct GitCommitInfo {
+    pub(crate) hash: String,
+    pub(crate) message: String,
+    pub(crate) author: String,
+    pub(crate) timestamp: DateTime<Utc>,
+    pub(crate) files: Vec<FileChangedInfo>,
 }
 
 /// Summary of all enrichment performed.
@@ -93,7 +93,7 @@ impl TaskEnricher {
         let mut result = EnrichResult::default();
 
         // 1. Get commits since task started
-        let commits = match self.get_commits_since(cwd, task_start_time).await {
+        let commits = match commits_since(cwd, task_start_time).await {
             Ok(c) => c,
             Err(e) => {
                 warn!("Enricher: failed to get commits: {}", e);
@@ -470,7 +470,7 @@ impl TaskEnricher {
         cwd: &str,
     ) -> usize {
         // 1. Get ALL commits since the run started
-        let commits = match self.get_commits_since(cwd, run_start).await {
+        let commits = match commits_since(cwd, run_start).await {
             Ok(c) => c,
             Err(e) => {
                 warn!("Post-run sweep: failed to get commits: {}", e);
@@ -544,108 +544,123 @@ impl TaskEnricher {
     // ========================================================================
     // Git helpers
     // ========================================================================
+}
 
-    /// Get all commits since a given time in the working directory.
-    async fn get_commits_since(
-        &self,
-        cwd: &str,
-        since: DateTime<Utc>,
-    ) -> Result<Vec<GitCommitInfo>> {
-        let since_str = since.format("%Y-%m-%dT%H:%M:%S").to_string();
+/// All commits made in `cwd` since `since`, newest first, each with its files.
+///
+/// Shared by the enricher — which links them to a task and a plan — and by the episode
+/// collector, which must name the shas a session produced. **One reader, one window**:
+/// two readers would drift, and the episode would then describe a graph it no longer
+/// matches.
+///
+/// A directory that is not a git repository, or a `git` that cannot be spawned, both
+/// yield the empty list: a missing count is better than a close that fails.
+pub(crate) async fn commits_since(cwd: &str, since: DateTime<Utc>) -> Result<Vec<GitCommitInfo>> {
+    let since_str = since.format("%Y-%m-%dT%H:%M:%S").to_string();
 
-        // Get commit hashes + messages + authors + timestamps
-        let output = tokio::process::Command::new("git")
-            .args([
-                "log",
-                "--format=%H|%s|%an|%aI",
-                &format!("--since={}", since_str),
-                "--no-merges",
-            ])
-            .current_dir(cwd)
-            .output()
-            .await;
+    // Get commit hashes + messages + authors + timestamps
+    let output = tokio::process::Command::new("git")
+        .args([
+            "log",
+            "--format=%H|%s|%an|%aI",
+            &format!("--since={}", since_str),
+            "--no-merges",
+        ])
+        .current_dir(cwd)
+        .output()
+        .await;
 
-        let output = match output {
-            Ok(o) if o.status.success() => o,
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                if stderr.contains("not a git repository")
-                    || stderr.contains("dépôt git")
-                    || o.status.code().is_some_and(|c| c > 1)
-                {
-                    return Ok(vec![]);
-                }
-                return Err(anyhow::anyhow!("git log failed: {}", stderr));
-            }
-            Err(e) => {
-                warn!("Failed to run git log: {}", e);
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if stderr.contains("not a git repository")
+                || stderr.contains("dépôt git")
+                || o.status.code().is_some_and(|c| c > 1)
+            {
                 return Ok(vec![]);
             }
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut commits = Vec::new();
-
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.splitn(4, '|').collect();
-            if parts.len() < 4 {
-                continue;
-            }
-
-            let hash = parts[0].to_string();
-            let message = parts[1].to_string();
-            let author = parts[2].to_string();
-            let timestamp = chrono::DateTime::parse_from_rfc3339(parts[3])
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-
-            // Get files changed for this commit
-            let files = self.get_commit_files(cwd, &hash).await.unwrap_or_default();
-
-            commits.push(GitCommitInfo {
-                hash,
-                message,
-                author,
-                timestamp,
-                files,
-            });
+            return Err(anyhow::anyhow!("git log failed: {}", stderr));
         }
-
-        Ok(commits)
-    }
-
-    /// Get files changed in a specific commit with additions/deletions.
-    async fn get_commit_files(&self, cwd: &str, hash: &str) -> Result<Vec<FileChangedInfo>> {
-        let output = tokio::process::Command::new("git")
-            .args(["diff-tree", "--no-commit-id", "-r", "--numstat", hash])
-            .current_dir(cwd)
-            .output()
-            .await?;
-
-        if !output.status.success() {
+        Err(e) => {
+            warn!("Failed to run git log: {}", e);
             return Ok(vec![]);
         }
+    };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut files = Vec::new();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut commits = Vec::new();
 
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() >= 3 {
-                let additions = parts[0].parse::<i64>().ok();
-                let deletions = parts[1].parse::<i64>().ok();
-                let path = parts[2].to_string();
-
-                files.push(FileChangedInfo {
-                    path,
-                    additions,
-                    deletions,
-                });
-            }
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.splitn(4, '|').collect();
+        if parts.len() < 4 {
+            continue;
         }
 
-        Ok(files)
+        let hash = parts[0].to_string();
+        let message = parts[1].to_string();
+        let author = parts[2].to_string();
+        let timestamp = chrono::DateTime::parse_from_rfc3339(parts[3])
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+
+        // Get files changed for this commit
+        let files = commit_files(cwd, &hash).await.unwrap_or_default();
+
+        commits.push(GitCommitInfo {
+            hash,
+            message,
+            author,
+            timestamp,
+            files,
+        });
     }
+
+    Ok(commits)
+}
+
+/// Files changed in one commit, with additions/deletions.
+///
+/// `--root` is not a detail: the FIRST commit of a repository has no parent, and without
+/// it `diff-tree` prints nothing at all — the commit is seen but its files are not, so a
+/// session that opens a repository would report a delivery of zero files.
+pub(crate) async fn commit_files(cwd: &str, hash: &str) -> Result<Vec<FileChangedInfo>> {
+    let output = tokio::process::Command::new("git")
+        .args([
+            "diff-tree",
+            "--no-commit-id",
+            "--root",
+            "-r",
+            "--numstat",
+            hash,
+        ])
+        .current_dir(cwd)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Ok(vec![]);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut files = Vec::new();
+
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 3 {
+            let additions = parts[0].parse::<i64>().ok();
+            let deletions = parts[1].parse::<i64>().ok();
+            let path = parts[2].to_string();
+
+            files.push(FileChangedInfo {
+                path,
+                additions,
+                deletions,
+            });
+        }
+    }
+
+    Ok(files)
 }
 
 // ============================================================================
