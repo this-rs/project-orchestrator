@@ -411,7 +411,11 @@ impl VaultService {
             session_id,
             project_slug,
         };
-        authorize(unlocked, exists, &lock(&self.grants), &req, now)?;
+        if let Err(denied) = authorize(unlocked, exists, &lock(&self.grants), &req, now) {
+            // The name and the reason only — never a value.
+            tracing::warn!(secret = name, session_id, reason = %denied, "vault: access refused");
+            return Err(denied.into());
+        }
         let value = vault.get(name, now)?;
         // Masked BEFORE it is returned: from here on the agent may print it.
         self.masker.register(name, &value);
@@ -437,14 +441,17 @@ impl VaultService {
         let mut vault = lock(&self.vault);
         let unlocked = vault.is_unlocked(now);
         let exists = vault.contains(name);
-        super::grants::authorize_provider(
+        if let Err(denied) = super::grants::authorize_provider(
             unlocked,
             exists,
             &lock(&self.grants),
             name,
             instance_id,
             now,
-        )?;
+        ) {
+            tracing::warn!(secret = name, instance_id, reason = %denied, "vault: provider credential refused");
+            return Err(denied.into());
+        }
         let value = vault.get(name, now)?;
         self.masker.register(name, &value);
         Ok(value)

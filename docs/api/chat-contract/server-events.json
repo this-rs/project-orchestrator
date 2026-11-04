@@ -705,6 +705,53 @@
         }
       }
     },
+    "provider_notice": {
+      "examples": {
+        "full": {
+          "code": "credentials_locked",
+          "data": {
+            "provider": "native",
+            "waited_ms": 372000
+          },
+          "kind": "credentials_locked",
+          "message": "the credential vault is locked: the turn resumes when it is unlocked",
+          "severity": "action_required",
+          "type": "provider_notice"
+        },
+        "minimal": {
+          "kind": "model_recovered",
+          "message": "The model answers again.",
+          "severity": "latency",
+          "type": "provider_notice"
+        }
+      },
+      "fields": {
+        "code": {
+          "required": false,
+          "type": "string"
+        },
+        "data": {
+          "required": false,
+          "type": "object"
+        },
+        "kind": {
+          "required": true,
+          "type": "string"
+        },
+        "message": {
+          "required": true,
+          "type": "string"
+        },
+        "severity": {
+          "required": true,
+          "type": "string"
+        },
+        "type": {
+          "required": true,
+          "type": "string"
+        }
+      }
+    },
     "provider_outage": {
       "examples": {
         "full": {

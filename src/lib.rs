@@ -30,6 +30,7 @@ pub mod homeostasis;
 pub mod identity;
 pub mod ingress;
 pub mod lifecycle;
+pub mod logging;
 pub mod mcp;
 pub mod mcp_federation;
 pub mod meilisearch;
@@ -225,6 +226,9 @@ pub struct YamlConfig {
     /// Storage backend selection (optional — which adapter builds the stores).
     #[serde(default)]
     pub storage: StorageYamlConfig,
+    /// Log file section (optional — persistent, rotated, secret-masked traces).
+    #[serde(default)]
+    pub log: logging::LogYamlConfig,
 }
 
 /// Document storage configuration section.
@@ -983,6 +987,9 @@ pub struct Config {
     /// Priority: env var (STORAGE_BACKEND) > YAML (storage.backend) > default.
     pub storage_backend: String,
 
+    /// Persistent log file (dir, level, retention). Priority: env > YAML `log:` > defaults.
+    pub log: logging::LogSettings,
+
     /// Resolved path to the config.yaml file that was loaded (if any).
     /// Used for persisting runtime changes back to disk.
     pub config_yaml_path: Option<std::path::PathBuf>,
@@ -1119,6 +1126,7 @@ impl Config {
                 .ok()
                 .or(yaml.documents.storage_dir),
             // Storage backend selection (env var > YAML > default)
+            log: logging::LogSettings::from_env(&yaml.log),
             storage_backend: std::env::var("STORAGE_BACKEND").unwrap_or_else(|_| {
                 yaml.storage
                     .backend

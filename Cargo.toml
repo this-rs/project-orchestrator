@@ -39,6 +39,7 @@ neo4rs = "0.8"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
 
 # Error handling
 anyhow = "1.0"
@@ -133,6 +134,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }

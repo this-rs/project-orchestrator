@@ -8,7 +8,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use project_orchestrator::{orchestrator::Orchestrator, setup_claude, update, AppState, Config};
 use std::path::PathBuf;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
 #[command(name = "orchestrator")]
@@ -127,17 +126,18 @@ async fn run() -> Result<()> {
     // Load .env file
     dotenvy::dotenv().ok();
 
-    // Initialize tracing
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,project_orchestrator=debug,tower_http=debug".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    // Configuration first: the log file's location lives in it. Anything it traces
+    // while loading goes to stdout through a throwaway subscriber.
+    let stdout_only = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "info,project_orchestrator=debug,tower_http=debug".into()),
+    );
+    let mut config = tracing::subscriber::with_default(stdout_only.finish(), || {
+        Config::from_yaml_and_env(cli.config.as_deref())
+    })?;
 
-    // Load configuration — explicit --config path wins, otherwise auto-detect
-    let mut config = Config::from_yaml_and_env(cli.config.as_deref())?;
+    // Initialize tracing: stdout + the persistent file (held until the process ends).
+    let log_guard = project_orchestrator::logging::init(&config.log);
 
     match cli.command {
         Commands::Serve {
@@ -157,6 +157,8 @@ async fn run() -> Result<()> {
             if let Some(path) = frontend_path {
                 config.frontend_path = path;
             }
+            // Dates every (re)start in the log file.
+            project_orchestrator::logging::log_startup(&config.log, &log_guard);
             project_orchestrator::start_server(config).await
         }
         Commands::Sync { path } => run_sync(config, &path).await,
