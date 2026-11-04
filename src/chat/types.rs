@@ -3630,6 +3630,26 @@ mod tests {
         assert_eq!(event.fingerprint(), Some("retrying:1:3".to_string()));
     }
 
+    /// A locked vault is polled: the same advisory repeats and is shown once, but
+    /// a sentence that changed (a wait that grew) is a new notice.
+    #[test]
+    fn a_repeated_provider_notice_dedups_and_a_new_sentence_does_not() {
+        let notice = |message: &str| ChatEvent::ProviderNotice {
+            kind: "credentials_locked".into(),
+            code: Some("credentials_locked".into()),
+            message: message.into(),
+            severity: "action_required".into(),
+            data: None,
+        };
+        let first = notice("the vault is locked").fingerprint().unwrap();
+        assert!(first.starts_with("provider_notice:credentials_locked:action_required:"));
+        assert_eq!(notice("the vault is locked").fingerprint().unwrap(), first);
+        assert_ne!(
+            notice("the vault is locked (2 min)").fingerprint().unwrap(),
+            first
+        );
+    }
+
     // ====================================================================
     // classify_api_error
     // ====================================================================

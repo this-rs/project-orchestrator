@@ -199,9 +199,11 @@ fn open_appender(
         .map_err(|e| format!("cannot open a log file in {}: {e}", dir.display()))
 }
 
-/// Install the global subscriber: stdout (as before) + the file when enabled.
+/// The subscriber `init` installs: stdout (as before) + the file when enabled.
 /// A file that cannot be opened is reported on stderr and never stops the server.
-pub fn init(settings: &LogSettings) -> LogGuard {
+/// Separate from `init` so a test can run it locally (`with_default`) instead
+/// of the process-wide subscriber, which can be set only once.
+fn subscriber(settings: &LogSettings) -> (Box<dyn tracing::Subscriber + Send + Sync>, LogGuard) {
     let stdout = tracing_subscriber::fmt::layer().with_filter(stdout_filter());
 
     if settings.file_enabled {
@@ -212,23 +214,30 @@ pub fn init(settings: &LogSettings) -> LogGuard {
                     .with_ansi(false)
                     .with_writer(MaskedMakeWriter(writer))
                     .with_filter(file_filter(settings));
-                tracing_subscriber::registry()
-                    .with(stdout)
-                    .with(file)
-                    .init();
-                return LogGuard {
+                let guard = LogGuard {
                     _worker: Some(worker),
                     dir: Some(settings.dir.clone()),
                 };
+                return (
+                    Box::new(tracing_subscriber::registry().with(stdout).with(file)),
+                    guard,
+                );
             }
             Err(e) => eprintln!("warning: file logging disabled — {e}"),
         }
     }
-    tracing_subscriber::registry().with(stdout).init();
-    LogGuard {
+    let guard = LogGuard {
         _worker: None,
         dir: None,
-    }
+    };
+    (Box::new(tracing_subscriber::registry().with(stdout)), guard)
+}
+
+/// Install the global subscriber (see [`subscriber`]).
+pub fn init(settings: &LogSettings) -> LogGuard {
+    let (subscriber, guard) = subscriber(settings);
+    subscriber.init();
+    guard
 }
 
 /// The line that dates a (re)start in the file.
@@ -342,5 +351,70 @@ mod tests {
         );
         assert!(!text.contains("below the file level"));
         crate::vault::mask::global().forget("log-test-secret");
+    }
+
+    fn settings_in(dir: &Path, file_enabled: bool) -> LogSettings {
+        LogSettings {
+            file_enabled,
+            dir: dir.to_path_buf(),
+            level: "info".into(),
+            max_files: 2,
+        }
+    }
+
+    /// The subscriber the server installs, run locally: the start-up line lands in
+    /// the file with the directory it names, and the worker flushes on drop.
+    #[test]
+    fn the_installed_subscriber_dates_the_start_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings_in(dir.path(), true);
+        let (sub, guard) = subscriber(&settings);
+        assert_eq!(guard.dir.as_deref(), Some(dir.path()));
+        tracing::subscriber::with_default(sub, || log_startup(&settings, &guard));
+        drop(guard);
+        let file = std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let text = std::fs::read_to_string(file).unwrap();
+        assert!(text.contains("orchestrator starting"), "{text}");
+        assert!(text.contains(&dir.path().display().to_string()), "{text}");
+    }
+
+    /// A file that cannot be opened (the directory is a FILE) never stops the
+    /// server: stdout only, and the start-up line says the file is off.
+    #[test]
+    fn a_log_dir_that_cannot_be_opened_falls_back_to_stdout_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("not-a-dir");
+        std::fs::write(&blocked, b"x").unwrap();
+        let settings = settings_in(&blocked, true);
+        let (sub, guard) = subscriber(&settings);
+        assert!(guard.dir.is_none());
+        tracing::subscriber::with_default(sub, || log_startup(&settings, &guard));
+        let off = settings_in(dir.path(), false);
+        let (_, guard) = subscriber(&off);
+        assert!(guard.dir.is_none(), "file logging off: no file");
+    }
+
+    #[test]
+    fn the_masking_writer_flushes_its_inner_writer() {
+        struct Flushed(bool);
+        impl Write for Flushed {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0 = true;
+                Ok(())
+            }
+        }
+        let mut inner = Flushed(false);
+        let mut w = MaskingWriter::new(&mut inner, Arc::new(Masker::from_values([("x", "y")])));
+        w.flush().unwrap();
+        drop(w);
+        assert!(inner.0);
     }
 }
