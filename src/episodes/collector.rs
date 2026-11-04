@@ -3,8 +3,9 @@
 //! Given a completed ProtocolRun, the collector queries Neo4j to build:
 //! - **Stimulus**: from run.triggered_by + run.started_at
 //! - **Process**: from run.states_visited + PersistedReasoningTree (via REASONING_FOR)
-//! - **Outcome**: from PRODUCED_DURING relations (notes + decisions)
-//! - **Validation**: from reasoning feedback (if available)
+//! - **Outcome**: the commits of the run's window (read from git) + the artefacts it
+//!   produced (notes and decisions, via PRODUCED_DURING)
+//! - **Validation**: from the EVIDENCE — a commit is proof, an artefact is not
 //!
 //! The resulting Episode can then be converted to a PortableEpisode for
 //! cross-instance exchange via SkillPackage v3.
@@ -18,6 +19,28 @@ use uuid::Uuid;
 use crate::episodes::models::*;
 #[allow(unused_imports)]
 use crate::neo4j::GraphStore;
+
+/// The validation a finished run leaves: what was PROVEN, not what was written.
+///
+/// `commit_shas` is the evidence — a commit is a fact the agent did not author alone.
+/// Artefacts (notes, decisions) are deliberately absent from this decision: counting them
+/// made "I documented my failure" a positive signal, and gave a reward for producing text
+/// (RM-2, RM-5, decision `c23f494b`).
+///
+/// An empty evidence list is not a failure — it is `None`, "not verified", which is the
+/// truth about a run nothing corroborates.
+fn run_validation(commit_shas: &[String], completed: bool) -> Validation {
+    let evidence = commit_shas.len();
+    Validation {
+        feedback_type: if evidence > 0 && completed {
+            FeedbackType::ImplicitPositive
+        } else {
+            FeedbackType::None
+        },
+        score: None,
+        evidence_count: evidence,
+    }
+}
 
 /// Collect a complete Episode from a completed ProtocolRun.
 ///
@@ -88,7 +111,28 @@ pub async fn collect_episode(
         duration_ms,
     };
 
-    // 4. Build Outcome — notes + decisions produced during this run
+    // 4. Build Outcome — the commits of the run's window, and the artefacts it produced.
+    //
+    // The commits are read from git in the run's OWN window, in the working tree of the
+    // run's project — the same reader the session path uses (`commits_since`), so the two
+    // cannot disagree about what a commit of this work is (RM-4, decision `c23f494b`).
+    let commits = match run.project_id {
+        Some(pid) => match neo4j.get_project(pid).await {
+            Ok(Some(p)) => match p.root_path_opt() {
+                Some(root) => crate::runner::enricher::commits_since(root, run.started_at)
+                    .await
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    let committed_files: std::collections::HashSet<&str> = commits
+        .iter()
+        .flat_map(|c| c.files.iter().map(|f| f.path.as_str()))
+        .collect();
+
     let artefacts = neo4j.get_run_outcomes(run_id).await?;
 
     let mut note_ids = Vec::new();
@@ -104,27 +148,21 @@ pub async fn collect_episode(
     let outcome = Outcome {
         note_ids,
         decision_ids,
-        commit_shas: Vec::new(), // TODO: link commits to runs in the future
-        files_modified: 0,       // TODO: count from commit files_changed
+        commit_shas: commits.iter().map(|c| c.hash.clone()).collect(),
+        files_modified: committed_files.len(),
     };
 
-    // 5. Build Validation — check for reasoning feedback
-    // For now, use implicit signals: if the run completed successfully
-    // and produced artefacts, that's implicit positive feedback.
-    let validation =
-        if !artefacts.is_empty() && run.status == crate::protocol::models::RunStatus::Completed {
-            Validation {
-                feedback_type: FeedbackType::ImplicitPositive,
-                score: None,
-                evidence_count: artefacts.len(),
-            }
-        } else {
-            Validation {
-                feedback_type: FeedbackType::None,
-                score: None,
-                evidence_count: 0,
-            }
-        };
+    // 5. Build Validation — EVIDENCE, not output.
+    //
+    // This used to read: a finished run that produced artefacts is `ImplicitPositive`
+    // with `evidence_count = artefacts.len()`. Writing a note was therefore counted as
+    // proving a result, and an agent that documented its own failure collected a reward
+    // for it. A note is not evidence, and a run that finished is not a run that delivered
+    // (RM-2, RM-5, decision `c23f494b`).
+    let validation = run_validation(
+        &outcome.commit_shas,
+        run.status == crate::protocol::models::RunStatus::Completed,
+    );
 
     // 6. Assemble the Episode
     let episode = Episode {
@@ -585,6 +623,39 @@ mod tests {
         assert_eq!(ec.note_titles.len(), 1);
         assert_eq!(ec.tags, vec!["tag".to_string()]);
         assert_eq!(ec.content, "content");
+    }
+
+    /// RM-5 — un run terminé sans aucune preuve n'est pas « vérifié », il est « non vérifié ».
+    ///
+    /// L'ancienne règle donnait `ImplicitPositive` avec `evidence_count = artefacts.len()`
+    /// dès qu'une note existait : écrire une note était compté comme prouver un résultat.
+    #[test]
+    fn a_finished_run_without_a_commit_is_not_verified() {
+        let v = run_validation(&[], true);
+        assert_eq!(
+            v.feedback_type,
+            FeedbackType::None,
+            "rien ne corrobore le run : None, pas un retour positif"
+        );
+        assert_eq!(v.evidence_count, 0);
+    }
+
+    #[test]
+    fn a_finished_run_with_a_commit_is_proven() {
+        let v = run_validation(&["abc1234".to_string()], true);
+        assert_eq!(v.feedback_type, FeedbackType::ImplicitPositive);
+        assert_eq!(v.evidence_count, 1, "un commit, une preuve");
+    }
+
+    #[test]
+    fn a_run_that_did_not_finish_is_never_positive_even_with_a_commit() {
+        let v = run_validation(&["abc1234".to_string()], false);
+        assert_eq!(
+            v.feedback_type,
+            FeedbackType::None,
+            "un run interrompu garde sa preuve mais ne se déclare pas réussi"
+        );
+        assert_eq!(v.evidence_count, 1);
     }
 
     #[tokio::test]
