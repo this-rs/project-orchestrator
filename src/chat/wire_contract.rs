@@ -50,7 +50,7 @@ const UPDATE_COMMAND: &str = "UPDATE_CHAT_CONTRACT=1 cargo test --lib chat::wire
 
 /// Every `ChatEvent` tag the examples must cover. Adding a variant means
 /// adding its tag here AND its examples in [`server_examples`].
-const EXPECTED_SERVER_TAGS: [&str; 40] = [
+const EXPECTED_SERVER_TAGS: [&str; 41] = [
     "active_tasks_update",
     "ask_user_question",
     "assistant_text",
@@ -68,6 +68,7 @@ const EXPECTED_SERVER_TAGS: [&str; 40] = [
     "permission_decision",
     "permission_mode_changed",
     "permission_request",
+    "provider_notice",
     "provider_outage",
     "provider_switched",
     "refs_resolved",
@@ -156,6 +157,7 @@ fn variant_tag(e: &ChatEvent) -> &'static str {
         ChatEvent::ConversationRelayed { .. } => "conversation_relayed",
         ChatEvent::ProviderSwitched { .. } => "provider_switched",
         ChatEvent::ProviderOutage { .. } => "provider_outage",
+        ChatEvent::ProviderNotice { .. } => "provider_notice",
         ChatEvent::TeamMessage { .. } => "team_message",
     }
 }
@@ -823,6 +825,26 @@ fn server_examples() -> Vec<ServerExample> {
             from_name: s("agent-alpha"),
             content: s("task complete — ready for review"),
         }),
+        ServerExample::new(
+            // `full`: the advisory that costs a human a gesture — a locked vault,
+            // with its code and the structured detail the card picks from.
+            // `minimal`: a latency advisory, where only kind, message and severity
+            // are guaranteed (`code` and `data` are absent, not null).
+            ChatEvent::ProviderNotice {
+                kind: s("credentials_locked"),
+                code: Some(s("credentials_locked")),
+                message: s("the credential vault is locked: the turn resumes when it is unlocked"),
+                severity: s("action_required"),
+                data: Some(serde_json::json!({ "provider": "native", "waited_ms": 372000 })),
+            },
+            ChatEvent::ProviderNotice {
+                kind: s("model_recovered"),
+                code: None,
+                message: s("The model answers again."),
+                severity: s("latency"),
+                data: None,
+            },
+        ),
     ]
 }
 

@@ -1531,14 +1531,52 @@ pub(crate) fn delivery_error_frame(
             mirror_read_only_frame()
         }
         MessageDeliveryError::Resume(e) if is_mirror(e) => mirror_read_only_frame(),
-        MessageDeliveryError::SendAndResume { resume, .. } => serde_json::json!({
-            "type": "error",
-            "message": format!("Failed to send message: {}", resume),
-        }),
-        MessageDeliveryError::Resume(e) => serde_json::json!({
-            "type": "error",
-            "message": format!("Failed to resume session: {}", e),
-        }),
+        MessageDeliveryError::SendAndResume { send, resume } => {
+            let mut frame = serde_json::json!({
+                "type": "error",
+                "message": format!("Failed to send message: {}", resume),
+            });
+            // The typed cause travels with the refusal, whichever half carries it.
+            add_typed_failure(&mut frame, send);
+            if frame.get("code").is_none() {
+                add_typed_failure(&mut frame, resume);
+            }
+            frame
+        }
+        MessageDeliveryError::Resume(e) => {
+            let mut frame = serde_json::json!({
+                "type": "error",
+                "message": format!("Failed to resume session: {}", e),
+            });
+            add_typed_failure(&mut frame, e);
+            frame
+        }
+    }
+}
+
+/// Adds the typed provider failure to a delivery-error frame, when the cause
+/// carries one (`credentials_locked`, `unauthorized`, `auth_required`...).
+///
+/// The client picks its card from `code` (`readProviderError`): without it, a
+/// send refused because the credential vault was locked printed a bare "failed
+/// to send" line, with no way to unlock — measured 03/11/2026. The message is the
+/// typed one, not the anyhow chain's wrapper: it names the action, not the layer.
+fn add_typed_failure(frame: &mut serde_json::Value, error: &anyhow::Error) {
+    let Some(provider) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<nexus_claude::agent::ProviderError>())
+    else {
+        return;
+    };
+    let failure = crate::chat::provider::errors::open_failure(provider, None);
+    let Some(object) = frame.as_object_mut() else {
+        return;
+    };
+    object.insert("code".to_string(), failure.code.into());
+    object.insert("message".to_string(), failure.message.clone().into());
+    object.insert("retryable".to_string(), failure.retryable.into());
+    if let Some(provider_id) = &failure.provider_id {
+        object.insert("provider_id".to_string(), provider_id.clone().into());
     }
 }
 
@@ -1716,6 +1754,45 @@ mod tests {
     #[allow(unused_imports)]
     use std::collections::HashSet;
     use tokio::sync::broadcast;
+
+    /// A send refused because the credential vault is locked must carry the typed
+    /// code: the client picks the unlock card from it. Before this, the frame was a
+    /// bare "Failed to send message: …" and the person had no way out — the vault
+    /// case of 03/11/2026 (plan « coffre verrouillé = attente muette »).
+    #[test]
+    fn a_locked_vault_at_send_carries_its_code() {
+        use crate::chat::manager::MessageDeliveryError;
+        let cause = anyhow::Error::new(nexus_claude::agent::ProviderError::CredentialsLocked)
+            .context("reopening the session to send");
+        let frame = delivery_error_frame(&MessageDeliveryError::SendAndResume {
+            send: cause,
+            resume: anyhow::anyhow!("never reached"),
+        });
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["code"], "credentials_locked");
+        assert_eq!(frame["retryable"], false);
+        assert!(
+            frame["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("locked")),
+            "the sentence names the vault: {frame}"
+        );
+    }
+
+    /// An untyped delivery failure keeps exactly the frame it always had: no code is
+    /// invented, so no card is drawn for something nobody classified.
+    #[test]
+    fn an_untyped_delivery_failure_carries_no_code() {
+        use crate::chat::manager::MessageDeliveryError;
+        let frame = delivery_error_frame(&MessageDeliveryError::Resume(anyhow::anyhow!(
+            "socket went away"
+        )));
+        assert_eq!(frame["type"], "error");
+        assert!(frame.get("code").is_none(), "{frame}");
+        assert!(frame["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Failed to resume session")));
+    }
 
     /// Review of #673, nit 6: the `cancel_failed` frame a spawned cancel_tools
     /// sends carries `seq` like every live frame of the loop.

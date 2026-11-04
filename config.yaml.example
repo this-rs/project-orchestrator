@@ -38,6 +38,25 @@ server:
   frontend_path: "./dist"       # FRONTEND_PATH env override
 
 # -----------------------------------------------------------------------------
+# Log — persistent trace file (in addition to stdout)
+# -----------------------------------------------------------------------------
+# The backend writes the same traces as stdout to a daily-rotated file, so a past
+# incident (restart, silent turn, vault refusal) can still be investigated.
+# Files are named orchestrator.YYYY-MM-DD.log. Every line goes through the vault
+# masker: a secret value delivered to an agent is written as [secret:NAME].
+# Each restart writes an "orchestrator starting" line (version, pid, log dir).
+# Harness notices ("provider_notice") and vault refusals ("vault: access refused")
+# are logged at info/warn, so the default level keeps them.
+log:
+  file_enabled: true            # LOG_FILE_ENABLED env override
+  # Default: <app dir>/logs, next to config.yaml
+  #   macOS/Linux: ~/.config/project-orchestrator/logs  (Windows: %APPDATA%\ProjectOrchestrator\logs)
+  # dir: "~/.local/share/project-orchestrator/logs"   # LOG_DIR env override
+  level: "info"                 # LOG_LEVEL env override; RUST_LOG syntax, FILE only
+  max_files: 14                 # LOG_MAX_FILES env override; daily files kept, oldest deleted
+  # stdout is unchanged: RUST_LOG still drives it.
+
+# -----------------------------------------------------------------------------
 # Neo4j — Knowledge graph database
 # -----------------------------------------------------------------------------
 neo4j:

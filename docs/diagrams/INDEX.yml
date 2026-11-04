@@ -132,6 +132,9 @@ diagrams:
       - "backend:src/chat/provider/{catalog,circuit_breaker,credentials,endpoint_guard,errors,event_map,listing,mod,native_factory,nexus_tools,oneshot,outage,policy,quota,resolver,settings,store}.rs"
       - "backend:src/chat/provider/limits/**"
       - "backend:src/chat/deferred_tools.rs"
+      # Arbitrage : src/logging.rs (journal persistant) existe pour garder les avis du harnais et les
+      # refus du coffre au-dela du terminal ; il est dessine ici, a cote de event_map qui les produit.
+      - "backend:src/logging.rs"
   - name: po-cognitive-routing
     owner: theotime
     status: verified
