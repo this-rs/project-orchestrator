@@ -473,6 +473,81 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
+    /// RM-1 — ce que la récompense actuelle récompense réellement.
+    ///
+    /// Deux trajectoires d'apparence opposée, à résultat connu d'avance :
+    ///
+    /// - `livree` — lit le fichier, applique la correction, lance les tests. Trois
+    ///   appels, trois outils, aucun cérémonial. **Elle livre.**
+    /// - `theatre` — quarante appels, douze couples outil.action distincts, le cycle
+    ///   complet search + context + impact qu'affectionne le bonus de motif.
+    ///   **Elle ne livre rien.**
+    ///
+    /// Ce test CONSTATE le comportement actuel : la formule place le théâtre devant
+    /// la livraison. Il n'est pas une bénédiction, c'est une mesure — RM-6 doit
+    /// inverser cette assertion le jour où la récompense regardera le résultat.
+    #[test]
+    fn rm1_current_reward_prefers_theatre_over_delivery() {
+        let call = |tool: &str, action: &str, seq: i64| ParsedToolUse {
+            tool_name: tool.to_string(),
+            action: action.to_string(),
+            params: serde_json::json!({}),
+            seq,
+        };
+
+        // Ce qu'une session qui livre ressemble : court, monotone, efficace.
+        let livree: Vec<ParsedToolUse> = vec![
+            call("Read", "", 0),
+            call("Edit", "", 1),
+            call("Bash", "", 2),
+        ];
+
+        // Ce qu'une session qui explore ressemble : diversité maximale, cycle complet.
+        let combos: [(&str, &str); 12] = [
+            ("code", "search"),
+            ("code", "get_context"),
+            ("code", "analyze_impact"),
+            ("note", "search_semantic"),
+            ("note", "get_propagated"),
+            ("note", "create"),
+            ("decision", "search_semantic"),
+            ("task", "get"),
+            ("plan", "get"),
+            ("project", "get_graph"),
+            ("code", "get_health"),
+            ("note", "list_project"),
+        ];
+        let theatre: Vec<ParsedToolUse> = (0..40)
+            .map(|i| {
+                let (tool, action) = combos[i % combos.len()];
+                call(tool, action, i as i64)
+            })
+            .collect();
+
+        let r_livree = estimate_session_reward(&livree);
+        let r_theatre = estimate_session_reward(&theatre);
+
+        println!(
+            "RM-1 : livree={r_livree:.4} (3 appels, 0 artefact documenté)  \
+             theatre={r_theatre:.4} (40 appels, 0 livraison)"
+        );
+
+        // La mesure : celle qui livre est notée SOUS celle qui ne livre pas.
+        assert!(
+            r_theatre > r_livree,
+            "le comportement mesuré a changé (theatre={r_theatre:.4}, livree={r_livree:.4}) : \
+             si c'est RM-6, inverser cette assertion et la renommer"
+        );
+
+        // Et l'écart n'est pas marginal : il vient du bonus de motif, qui récompense
+        // nommément le fait d'avoir appelé search, context et impact.
+        assert!(
+            r_theatre - r_livree > 0.05,
+            "écart trop faible pour conclure : {:.4}",
+            r_theatre - r_livree
+        );
+    }
+
     #[test]
     fn test_estimate_confidence_ramp() {
         let total = 10;
