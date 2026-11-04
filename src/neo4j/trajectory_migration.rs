@@ -459,8 +459,12 @@ fn estimate_outcome_reward(evidence: &[String], cost_usd: Option<f64>) -> Option
 
     // Cost is a damper, never the driver: the same result for ten times the price is worth
     // less, but a hard task done well is never scored low just for costing a lot.
+    //
+    // The scale is the one OBSERVED on this instance, not a round number: session costs run
+    // from $0.10 to $25.94 (RM-8's table). A divisor of 5 put every session above $5 on the
+    // floor, so cost stopped discriminating exactly where it mattered most.
     let damping = match cost_usd {
-        Some(cost) if cost > 0.0 => 1.0 / (1.0 + cost / 5.0),
+        Some(cost) if cost > 0.0 => 1.0 / (1.0 + cost / 25.0),
         _ => 1.0,
     };
 
@@ -697,6 +701,141 @@ mod tests {
             process,
             "drapeau éteint : la nouvelle formule n'entre pas en jeu, même avec une preuve"
         );
+    }
+
+    /// Une suite d'appels d'outils, cyclant sur `combos` pour atteindre `count` appels.
+    fn tool_use_seq(combos: &[(&str, &str)], count: usize) -> Vec<ParsedToolUse> {
+        (0..count)
+            .map(|i| {
+                let (tool, action) = combos[i % combos.len()];
+                ParsedToolUse {
+                    tool_name: tool.to_string(),
+                    action: action.to_string(),
+                    params: serde_json::json!({}),
+                    seq: i as i64,
+                }
+            })
+            .collect()
+    }
+
+    /// Un cas du tableau RM-8 : nom, appels d'outils, preuve, coût de la session.
+    type RewardCase = (&'static str, Vec<ParsedToolUse>, Vec<String>, Option<f64>);
+
+    /// RM-8 — le portillon : le tableau AVANT/APRÈS, reproductible.
+    ///
+    ///     cargo test --lib trajectory_migration::tests::rm8 -- --nocapture
+    ///
+    /// Ce que ce test ne peut PAS faire, et le dit : la corrélation sur le corpus RÉEL
+    /// (293 trajectoires) reste impossible tant que ces trajectoires ne portent aucune
+    /// étiquette de résultat — `total_explicit_feedback` et `total_implicit_signals`
+    /// valent 0, et les épisodes déjà en base ont tous `commit_shas` vide. Le corpus réel
+    /// devient mesurable à mesure que RM-4 enregistre la preuve des nouvelles sessions ;
+    /// d'ici là, allumer `REWARD_V2` serait décider sans mesure.
+    #[test]
+    fn rm8_before_after_table() {
+        let ceremony: [(&str, &str); 12] = [
+            ("code", "search"),
+            ("code", "get_context"),
+            ("code", "analyze_impact"),
+            ("note", "search_semantic"),
+            ("note", "get_propagated"),
+            ("note", "create"),
+            ("decision", "search_semantic"),
+            ("task", "get"),
+            ("plan", "get"),
+            ("project", "get_graph"),
+            ("code", "get_health"),
+            ("note", "list_project"),
+        ];
+        let delivering: [(&str, &str); 3] = [("Read", ""), ("Edit", ""), ("Bash", "")];
+
+        let none: Vec<String> = Vec::new();
+        let yes = |n: usize| -> Vec<String> { (0..n).map(|i| format!("sha{i:04}")).collect() };
+
+        let cases: Vec<RewardCase> = vec![
+            (
+                "livre, pas cher",
+                tool_use_seq(&delivering, 3),
+                yes(1),
+                Some(0.10),
+            ),
+            (
+                "livre, cher",
+                tool_use_seq(&delivering, 3),
+                yes(1),
+                Some(25.0),
+            ),
+            (
+                "livre, 5 commits",
+                tool_use_seq(&delivering, 20),
+                yes(5),
+                Some(3.0),
+            ),
+            (
+                "théâtre, rien livré",
+                tool_use_seq(&ceremony, 40),
+                none,
+                Some(2.0),
+            ),
+        ];
+
+        println!("\n{:<22} {:>9} {:>9}", "cas", "process", "outcome");
+        println!("{}", "-".repeat(42));
+        for (name, events, evidence, cost) in &cases {
+            let process = estimate_session_reward(events);
+            let outcome = estimate_outcome_reward(evidence, *cost)
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "aucun".to_string());
+            println!("{:<22} {:>9.4} {:>9}", name, process, outcome);
+        }
+        println!();
+
+        let process_of = |i: usize| estimate_session_reward(&cases[i].1);
+        let outcome_of = |i: usize| estimate_outcome_reward(&cases[i].2, cases[i].3);
+
+        // 1. Le défaut mesuré en RM-1 tient toujours : la procédure note le théâtre au-dessus.
+        assert!(
+            process_of(3) > process_of(0),
+            "le score de procédure préfère encore le théâtre ({:.4} > {:.4})",
+            process_of(3),
+            process_of(0)
+        );
+
+        // 2. La nouvelle règle inverse l'ordre, parce qu'elle ne voit que le résultat.
+        assert_eq!(
+            outcome_of(3),
+            None,
+            "40 appels qui ne livrent rien n'ont pas d'avis, pas un zéro flatteur"
+        );
+        assert!(
+            outcome_of(0).unwrap() > 0.5,
+            "un commit prouve la livraison"
+        );
+
+        // 3. Le coût départage à preuve égale, sans écraser.
+        assert!(
+            outcome_of(1).unwrap() < outcome_of(0).unwrap(),
+            "même preuve, 250 fois le prix : {:.4} < {:.4}",
+            outcome_of(1).unwrap(),
+            outcome_of(0).unwrap()
+        );
+        assert!(
+            outcome_of(1).unwrap() >= 0.2,
+            "un résultat prouvé et coûteux reste au-dessus d'un échec"
+        );
+
+        // 4. Plus de preuve vaut plus, sans dominer.
+        assert!(outcome_of(2).unwrap() > outcome_of(0).unwrap());
+        assert!(outcome_of(2).unwrap() <= 0.95);
+
+        // 5. Et le régime ne bascule pas tout seul : le drapeau est éteint.
+        if !reward_v2_enabled() {
+            assert_eq!(
+                total_reward(&cases[0].1, &cases[0].2, cases[0].3),
+                process_of(0),
+                "drapeau éteint : la récompense enregistrée reste le score de procédure"
+            );
+        }
     }
 
     #[test]
