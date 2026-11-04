@@ -207,6 +207,93 @@ async fn read_session_journal(neo4j: &dyn GraphStore, session_id: Uuid) -> Sessi
     }
 }
 
+/// The header lines an `apply_patch` body uses to name the file it touches.
+const APPLY_PATCH_TAGS: [&str; 4] = [
+    "*** Update File:",
+    "*** Add File:",
+    "*** Delete File:",
+    "*** Move to:",
+];
+
+/// Record `raw` as a written path, unless it names nothing a count can trust.
+///
+/// Refused: a file descriptor (`&1`), a device (`/dev/null`), a variable (`$OUT`) and a
+/// bare flag. Trailing punctuation from the command line (`;`, `\`, quotes) is stripped.
+fn keep_path(out: &mut Vec<String>, raw: &str) {
+    let path = raw
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == '(' || c == ')')
+        .trim_end_matches(';')
+        .trim_end_matches('\\');
+    if path.is_empty()
+        || path.starts_with('&')
+        || path.starts_with('$')
+        || path.starts_with('-')
+        || path.starts_with("/dev/")
+    {
+        return;
+    }
+    if !out.iter().any(|p| p == path) {
+        out.push(path.to_string());
+    }
+}
+
+/// The paths a shell command writes, read prudently.
+///
+/// A count that is too low is better than a count that invents files, so only the forms
+/// that name their target unambiguously are read: a redirection (`> f`, `>> f`, `>f`), a
+/// `tee` (skipping its flags), the last word of a `sed -i` (BSD and GNU put the file in
+/// the same place, only the backup suffix differs), and the `*** Update File:` style
+/// headers of an `apply_patch`. Everything else — a pipe into `xargs`, a glob, a path held
+/// in a variable — names nothing and counts for nothing.
+///
+/// What it counts is "files a shell command named as output", not "source files changed":
+/// a log redirected inside the repository is counted too. The authoritative answer is the
+/// git diff at the close; this is the fallback for a session that left none (RM-3).
+fn shell_write_targets(command: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
+    // `apply_patch` carries its file names inside the patch body, one header line each.
+    for line in command.lines() {
+        let line = line.trim_start();
+        for tag in APPLY_PATCH_TAGS {
+            if let Some(rest) = line.strip_prefix(tag) {
+                keep_path(&mut out, rest.trim());
+            }
+        }
+    }
+
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let is_sed = tokens.contains(&"sed");
+    for (i, token) in tokens.iter().enumerate() {
+        if let Some(rest) = token.strip_prefix(">>").or_else(|| token.strip_prefix('>')) {
+            // `> f` names the next word, `>f` names the rest of this one.
+            if rest.is_empty() {
+                if let Some(next) = tokens.get(i + 1) {
+                    keep_path(&mut out, next);
+                }
+            } else {
+                keep_path(&mut out, rest);
+            }
+        } else if *token == "tee" {
+            let mut j = i + 1;
+            while tokens.get(j).is_some_and(|t| t.starts_with('-')) {
+                j += 1;
+            }
+            if let Some(target) = tokens.get(j) {
+                keep_path(&mut out, target);
+            }
+        } else if is_sed && token.starts_with("-i") {
+            // `sed -i '' 's/a/b/' file` (BSD) and `sed -i.bak 's/a/b/' file` (GNU) both
+            // end on the file, whatever the suffix form.
+            if let Some(last) = tokens.last() {
+                keep_path(&mut out, last);
+            }
+        }
+    }
+
+    out
+}
+
 /// Pure counting over `(event_type, json)` pairs.
 fn journal_of<'a>(events: impl Iterator<Item = (&'a str, &'a str)>) -> SessionJournal {
     let mut files = std::collections::HashSet::new();
@@ -227,6 +314,14 @@ fn journal_of<'a>(events: impl Iterator<Item = (&'a str, &'a str)>) -> SessionJo
                         .find_map(|k| input.get(*k).and_then(|v| v.as_str()))
                     {
                         files.insert(path.to_string());
+                    }
+                } else if tool == "Bash" {
+                    // The native harness writes through the shell at least as much as
+                    // through an editing tool: a heredoc, a `sed -i`, a `git apply`. Before
+                    // this branch such a session counted ZERO files, whatever it wrote, and
+                    // every episode of this graph carried `files_modified: 0` (RM-3).
+                    if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
+                        files.extend(shell_write_targets(command));
                     }
                 }
             }
@@ -813,6 +908,74 @@ mod tests {
             "a, b, c and the notebook count once each; a read, a call without a path and a broken payload count for nothing"
         );
         assert_eq!(journal_of(std::iter::empty()), SessionJournal::default());
+    }
+
+    /// RM-3 — une session qui n'écrit QUE par le shell comptait zéro fichier.
+    ///
+    /// Le harnais natif écrit par le shell (heredoc, `sed -i`, `apply_patch`) au moins
+    /// autant que par un outil d'édition. Avant cette branche `journal_of` ne voyait que
+    /// `EDITING_TOOLS`, donc chaque épisode de ce graphe portait `files_modified: 0`.
+    #[test]
+    fn a_session_that_writes_only_through_the_shell_counts_its_files() {
+        let heredoc = tool_use(
+            "Bash",
+            serde_json::json!({"command": "cat > src/new_module.rs <<'EOF'\nfn f() {}\nEOF"}),
+        );
+        let sed = tool_use(
+            "Bash",
+            serde_json::json!({"command": "sed -i '' 's/a/b/' src/collector.rs"}),
+        );
+        let patch = tool_use(
+            "Bash",
+            serde_json::json!({"command": "apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: src/models.rs\n*** End Patch\nEOF"}),
+        );
+        let events = [
+            ("user_message", "{}"),
+            ("tool_use", heredoc.as_str()),
+            ("tool_use", sed.as_str()),
+            ("tool_use", patch.as_str()),
+        ];
+        assert_eq!(
+            journal_of(events.into_iter()),
+            SessionJournal {
+                files_modified: 3,
+                user_messages: 1
+            },
+            "three distinct files written by the shell, none by an editing tool"
+        );
+    }
+
+    /// Le bruit du shell ne doit pas devenir des fichiers : un `> /dev/null`, un
+    /// descripteur, une variable et un `tee` sans cible ne nomment rien.
+    #[test]
+    fn shell_noise_is_not_a_written_file() {
+        let noisy = tool_use(
+            "Bash",
+            serde_json::json!({"command": "cargo test > /dev/null 2>&1 && echo ok > $OUT | tee -a"}),
+        );
+        let events = [("tool_use", noisy.as_str())];
+        assert_eq!(
+            journal_of(events.into_iter()),
+            SessionJournal::default(),
+            "devices, descriptors, variables and a flagless tee name no file"
+        );
+    }
+
+    /// Un même fichier écrit deux fois — une fois par un outil d'édition, une fois par le
+    /// shell — compte une fois.
+    #[test]
+    fn a_file_written_twice_counts_once_whatever_the_tool() {
+        let edit = tool_use("Edit", serde_json::json!({"file_path": "src/a.rs"}));
+        let shell = tool_use("Bash", serde_json::json!({"command": "echo x >> src/a.rs"}));
+        let events = [("tool_use", edit.as_str()), ("tool_use", shell.as_str())];
+        assert_eq!(
+            journal_of(events.into_iter()),
+            SessionJournal {
+                files_modified: 1,
+                user_messages: 0
+            },
+            "one file, two writes"
+        );
     }
 
     #[tokio::test]
