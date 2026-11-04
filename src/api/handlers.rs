@@ -656,6 +656,52 @@ pub async fn delete_task(
 }
 
 /// Update task status
+/// The human verdict a task status change carries, if any.
+///
+/// `None` when the status is not terminal, or when an AGENT made the change: the MCP proxy
+/// injects `x-session-id`, so its presence means "a session did this", and a session's
+/// `completed` is its own declaration — which RM-2 refused as evidence.
+///
+/// Pure on purpose: the rule is the whole point of RM-7, and it must be readable and
+/// testable without an HTTP request.
+fn human_verdict(from_a_session: bool, new_status: &str) -> Option<f64> {
+    if from_a_session {
+        return None;
+    }
+    match new_status {
+        "completed" => Some(1.0),
+        "failed" | "cancelled" => Some(-1.0),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod human_verdict_tests {
+    use super::human_verdict;
+
+    /// RM-7 — le verdict d'un agent ne compte pas. Seul un humain juge.
+    #[test]
+    fn an_agent_closing_a_task_is_not_a_verdict() {
+        assert_eq!(human_verdict(true, "completed"), None);
+        assert_eq!(human_verdict(true, "failed"), None);
+    }
+
+    #[test]
+    fn a_human_closing_a_task_is_a_verdict_with_a_sign() {
+        assert_eq!(human_verdict(false, "completed"), Some(1.0));
+        assert_eq!(human_verdict(false, "failed"), Some(-1.0));
+        assert_eq!(human_verdict(false, "cancelled"), Some(-1.0));
+    }
+
+    #[test]
+    fn a_non_terminal_status_is_never_a_verdict() {
+        for s in ["pending", "in_progress", "blocked", "interrupted", ""] {
+            assert_eq!(human_verdict(false, s), None, "statut non terminal: {s}");
+            assert_eq!(human_verdict(true, s), None, "statut non terminal: {s}");
+        }
+    }
+}
+
 pub async fn update_task(
     State(state): State<OrchestratorState>,
     headers: axum::http::HeaderMap,
@@ -727,6 +773,38 @@ pub async fn update_task(
         .plan_manager()
         .update_task(task_id, req)
         .await?;
+
+    // The HUMAN verdict on delivery — the outcome signal the reward has been missing.
+    //
+    // A person closes a task through this REST surface; an agent reaches the same handler
+    // through the MCP proxy, which injects `x-session-id`. A terminal status without that
+    // header is a human verdict, recorded where every other learning signal already goes
+    // (`admin(get_learning_stats)`). An agent's own "completed" writes nothing: it is a
+    // declaration, and a declaration is not evidence (RM-2, RM-7, decision `3067a49f`).
+    if let Some((_, new_status)) = &status_change {
+        if let Some(score) =
+            human_verdict(headers.get("x-session-id").is_some(), new_status.as_str())
+        {
+            if let Some(feedback) = crate::feedback::models::ExplicitFeedback::new(
+                crate::feedback::models::FeedbackTarget::Task,
+                task_id,
+                score,
+                "human".to_string(),
+            ) {
+                crate::feedback::tracker::OutcomeTracker::global()
+                    .record_explicit_feedback(feedback.clone())
+                    .await;
+                let graph = state.orchestrator.neo4j_arc();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        crate::feedback::propagator::propagate_feedback(graph, &feedback).await
+                    {
+                        tracing::warn!("[feedback] propagation failed: {}", e);
+                    }
+                });
+            }
+        }
+    }
 
     // Auto-link session to task + plan when transitioning to in_progress
     if is_transition_to_in_progress {
