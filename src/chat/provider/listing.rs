@@ -86,9 +86,13 @@ impl HealthEntry {
             Some(ProviderError::CredentialsLocked) => {
                 "the vault is locked: the SSH key cannot be read".to_string()
             }
-            Some(ProviderError::AuthRequired { .. }) => {
-                "the SSH key is not granted to this instance in the vault".to_string()
-            }
+            // The cause is not always the SSH key: a remote machine can also need its
+            // own `claude login`, or an env variable. Say what the hint says (a fixed
+            // sentence written by PO), never a guessed cause.
+            Some(ProviderError::AuthRequired { login_hint }) => match login_hint {
+                Some(hint) => hint.clone(),
+                None => "the machine needs a sign-in before it can be used".to_string(),
+            },
             _ => return self,
         };
         self.reason = Some(if text.contains(['/', '\\']) || text.len() > 300 {
@@ -588,5 +592,30 @@ mod tests {
         );
         let json = serde_json::to_value(HealthEntry::unknown()).unwrap();
         assert!(json.get("reason").is_none(), "additive: absent unless set");
+    }
+
+    #[test]
+    fn an_auth_required_reason_follows_its_hint_not_the_ssh_key() {
+        let auth = |hint: Option<&str>| {
+            let h = ProviderHealth::unavailable(ProviderError::AuthRequired {
+                login_hint: hint.map(str::to_string),
+            });
+            HealthEntry::from_nexus(&h).with_remote_reason(&h)
+        };
+        // A remote machine that is not logged in: the reason says so, not the vault.
+        let login = auth(Some("claude login"));
+        assert_eq!(login.reason.as_deref(), Some("claude login"));
+        // A vault grant missing: that one really is about the key.
+        let grant = auth(Some(
+            "store the provider key in the vault and grant it to provider instance 'box'",
+        ));
+        assert!(grant.reason.as_deref().unwrap().contains("vault"));
+        // No hint at all: a generic sentence, never a guessed SSH cause.
+        let none = auth(None);
+        assert_eq!(
+            none.reason.as_deref(),
+            Some("the machine needs a sign-in before it can be used")
+        );
+        assert!(!none.reason.unwrap().contains("SSH"));
     }
 }
