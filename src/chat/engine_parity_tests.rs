@@ -3527,7 +3527,7 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     let changed = w
         .wait(
             WAIT,
-            |e| matches!(e, ChatEvent::ModelChanged { model } if model == "fake-claude-2"),
+            |e| matches!(e, ChatEvent::ModelChanged { model, .. } if model == "fake-claude-2"),
         )
         .await;
     cc.check(
@@ -4299,7 +4299,7 @@ async fn the_scenario(path: ProviderPath) -> (Measures, Measures) {
     let changed = wn
         .wait(
             WAIT,
-            |e| matches!(e, ChatEvent::ModelChanged { model } if model == "m2"),
+            |e| matches!(e, ChatEvent::ModelChanged { model, .. } if model == "m2"),
         )
         .await;
     let ends = wn.turn_ends();

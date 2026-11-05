@@ -3268,7 +3268,7 @@ mod turn_routing {
                 })
                 .await
                 {
-                    ChatEvent::ModelChanged { model } => changed.push(model),
+                    ChatEvent::ModelChanged { model, .. } => changed.push(model),
                     _ => return changed,
                 }
             }
@@ -3581,7 +3581,7 @@ mod turn_routing {
         assert_eq!(offered, ["big"], "only the ticked models are candidates");
         drop(requests);
         let ev = next_event(&mut r.rx, |e| matches!(e, ChatEvent::ModelChanged { .. })).await;
-        assert!(matches!(ev, ChatEvent::ModelChanged { ref model } if model == "big"));
+        assert!(matches!(ev, ChatEvent::ModelChanged { ref model, .. } if model == "big"));
     }
 
     #[tokio::test]
@@ -3875,7 +3875,7 @@ mod turn_routing {
         let mut r = rig("full", "auto", true, None, vec![Answer::Pick("big")]).await;
         r.manager.apply_turn_directive(&r.sid, DEBUG).await;
         let ev = next_event(&mut r.rx, |e| matches!(e, ChatEvent::ModelChanged { .. })).await;
-        assert!(matches!(ev, ChatEvent::ModelChanged { ref model } if model == "big"));
+        assert!(matches!(ev, ChatEvent::ModelChanged { ref model, .. } if model == "big"));
         assert!(r
             .provider
             .calls()

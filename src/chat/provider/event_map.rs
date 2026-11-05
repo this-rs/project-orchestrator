@@ -352,6 +352,7 @@ impl EventMapper {
             }
             AgentEvent::ModelChanged { model } => vec![ChatEvent::ModelChanged {
                 model: model.clone(),
+                reason: None,
             }],
             AgentEvent::PolicyModeChanged { mode, native_mode } => {
                 vec![ChatEvent::PermissionModeChanged {
@@ -2166,7 +2167,7 @@ mod tests {
             model: "example-model-large".into(),
         };
         let mapped = mapper.map(&changed);
-        let [ChatEvent::ModelChanged { model }] = mapped.as_slice() else {
+        let [ChatEvent::ModelChanged { model, .. }] = mapped.as_slice() else {
             panic!("ModelChanged maps to one model_changed: {mapped:?}");
         };
         assert_eq!(model, "example-model-large");
