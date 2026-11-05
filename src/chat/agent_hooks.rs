@@ -59,8 +59,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use nexus_claude::agent::{
     CompactionDirective, CompactionInfo, HookReply, HookVerdict, NotificationInfo, PromptInfo,
-    SessionHooks, SessionStartInfo, StopInfo, SubagentStopInfo, ToolCallInfo, ToolResultInfo,
-    TurnContext, TurnDirective,
+    ProviderError, SessionHooks, SessionStartInfo, StopInfo, SubagentStopInfo, ToolCallInfo,
+    ToolResultInfo, TurnContext, TurnDirective,
 };
 use nexus_claude::{
     HookContext, HookInput, HookJSONOutput, HookMatcher, NotificationHookInput,
@@ -1655,6 +1655,66 @@ pub(crate) async fn model_for_images(router: &TurnRouter) -> Option<String> {
     Some(pick.model)
 }
 
+/// The model the session must switch to after the one in force was refused for a MODEL-wide
+/// limit: another model of the SAME instance, chosen by the router from the pool (whose quota
+/// holds are already applied, so a held model cannot be picked), never the model in force,
+/// honouring `choice.allowed_models` when set. A user pin does NOT block this — a pin on a
+/// model with nothing left serves nobody, and the switch is temporary: nothing here clears or
+/// rewrites the pin, only the router's view of the model in force moves.
+///
+/// `None`: nothing to change — no other eligible model of this instance, or the router named
+/// none. `limit` is the typed refusal the turn ended on (informational).
+pub(crate) async fn model_after_limit(
+    router: &TurnRouter,
+    _limit: &ProviderError,
+) -> Option<String> {
+    let choice = locked(&router.choice).clone();
+    let (turn, current_model) = {
+        let state = locked(&router.state);
+        (state.next_turn, state.current_model.clone())
+    };
+    let (mut pool, project) = provider_pool(router).await;
+    if let Some(allowed) = &choice.allowed_models {
+        pool.retain(|facts| allowed.iter().any(|m| m == &facts.model));
+    }
+    let person = apply_person_list_here(&choice, &mut pool, &project, &router.signature());
+    // The model in force has nothing left: never pick it again. The pool already carries
+    // the quota holds (`apply_quota` in the pool source), so any OTHER held model is
+    // rejected by the decision too.
+    pool.retain(|facts| !same_model(&facts.model, &current_model));
+    if pool.is_empty() {
+        return None;
+    }
+    let signature = router.signature();
+    // A forced remedy, not a per-turn routing decision: it must apply whatever the mode or
+    // stage (a pin, a `primary` conversation and a `shadow` stage alike must not leave the
+    // person stuck on an exhausted model).
+    let mut settings = settings_for(&choice.routing, true);
+    settings.mode = ProviderRoutingMode::Full;
+    settings.stage = LearningStage::Auto;
+    let held = held_by_class(&locked(&router.state), turn, &signature.arm_key());
+    let mut request = DecideRequest::new(signature, settings, pool);
+    request.narrowed.extend(person);
+    request.trust = router.trust;
+    request.restrict_provider = Some(router.provider_id.clone());
+    request.current = Some(Pick::new(&router.provider_id, &current_model));
+    narrow(&mut request, held, None);
+    request.session_id = router.session_id;
+    request.turn_index = Some(turn);
+    let decision = router.ask(request).await?;
+    if !decision.applied {
+        return None;
+    }
+    let pick = decision.chosen.clone()?;
+    if pick.provider_id != router.provider_id || same_model(&pick.model, &current_model) {
+        return None;
+    }
+    debug!(model = %pick.model, turn, reason = %decision.reason, "a model limit is answered by switching model");
+    let class = router.signature().arm_key();
+    record_change(&mut locked(&router.state), turn, &pick.model, class);
+    Some(pick.model)
+}
+
 /// Whether the next turn of this conversation may carry images, as PO can really serve it
 /// (F-R4, decision 11cefdb2): the candidates PO may route the turn to govern, not the
 /// snapshot of the model the session opened on. `snapshot` is what that snapshot says
@@ -2668,7 +2728,7 @@ mod provider_move_tests {
             LearningStage::Auto,
         );
         s.allowed_models = Some(vec!["m".into()]);
-        let router = router(s);
+        let router = self::router(s);
         assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
         assert_eq!(decider.calls(), 0, "mixed asks no provider question");
         // The model decision of the turn stays restricted to the session's provider.
@@ -2689,7 +2749,7 @@ mod provider_move_tests {
             LearningStage::Auto,
         );
         s.auto_models = Some(vec![entry("local2", "m")]);
-        let router = router(s);
+        let router = self::router(s);
         assert!(is_move_to(&plan_provider_move(&router).await, "local2"));
         let asked = decider.last();
         assert!(
@@ -2723,7 +2783,7 @@ mod provider_move_tests {
             LearningStage::Auto,
         );
         s.auto_models = Some(vec![entry("local2", "m")]);
-        let router = router(s);
+        let router = self::router(s);
         let directive = directive_for_turn(&router, &TurnContext::new(1, "m")).await;
         assert_eq!(directive.model, None);
         assert_eq!(decider.calls(), 0, "nothing listed here: nothing to ask");
@@ -2742,7 +2802,7 @@ mod provider_move_tests {
         );
         // `gone` was deleted; `local3` lost the project's consent.
         s.auto_models = Some(vec![entry("gone", "x"), entry("local3", "m")]);
-        let router = router(s);
+        let router = self::router(s);
         assert!(is_move_to(&plan_provider_move(&router).await, "local2"));
         let asked = decider.last();
         assert_eq!(asked.pool.len(), 3, "every available model again");
@@ -2764,7 +2824,7 @@ mod provider_move_tests {
         s.routing_pool = Some(vec![entry("local", "m"), entry("local", "big")]);
         s.conversation_routes = true;
         s.auto_models = Some(vec![entry("local2", "m")]);
-        let router = router(s);
+        let router = self::router(s);
         directive_for_turn(&router, &TurnContext::new(1, "m")).await;
         assert_eq!(decider.calls(), 1, "the pool's turn is decided");
         assert!(decider.last().narrowed.is_empty(), "the list is not read");
@@ -2787,7 +2847,7 @@ mod provider_move_tests {
         s.routing_pool = Some(vec![entry("local", "m"), entry("local2", "m")]);
         s.conversation_routes = true;
         s.auto_models = Some(vec![entry("local", "m")]);
-        let router = router(s);
+        let router = self::router(s);
         let plan = plan_provider_move(&router).await;
         assert!(is_move_to(&plan, "local2"), "{plan:?}");
         let asked = decider.last();
@@ -2874,7 +2934,7 @@ mod provider_move_tests {
         s.allowed_models = Some(vec!["m".into()]);
         s.routing_pool = Some(vec![entry("local", "m"), entry("local2", "m")]);
         s.conversation_routes = true;
-        let router = router(s);
+        let router = self::router(s);
         let plan = plan_provider_move(&router).await;
         assert!(is_move_to(&plan, "local2"), "{plan:?}");
         let asked = decider.last();
@@ -2906,7 +2966,7 @@ mod provider_move_tests {
         s.allowed_models = Some(vec!["m".into(), "big".into()]);
         s.routing_pool = Some(vec![entry("local", "m"), entry("local", "big")]);
         s.conversation_routes = true;
-        let router = router(s);
+        let router = self::router(s);
         assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
         assert_eq!(decider.calls(), 0, "no move is asked");
     }
@@ -2927,7 +2987,7 @@ mod provider_move_tests {
         );
         s.explicit_model = true;
         s.provider_imposed = true;
-        let router = router(s);
+        let router = self::router(s);
         assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
         assert_eq!(decider.calls(), 0, "strict: nothing asked");
 
@@ -2988,7 +3048,7 @@ mod provider_move_tests {
     #[tokio::test]
     async fn the_shadow_stage_records_the_provider_decision_and_moves_nothing() {
         let decider = Fake::picking("local2", 0.9, 0.1);
-        let router = router(spec(
+        let router = self::router(spec(
             decider.clone(),
             Arc::new(ThreeProviders),
             ProviderRoutingMode::Full,
@@ -3040,7 +3100,7 @@ mod provider_move_tests {
         // The moved-to session opens fresh: its counter starts at 0, so the relayed turn's
         // predecision (now keyed on the carried `next_turn`) matches the turn sent at index 0.
         s.next_turn = 0;
-        let router = router(s);
+        let router = self::router(s);
         // The relayed turn (0) runs on the pair the move chose: nothing is asked.
         directive_for_turn(&router, &TurnContext::new(0, "m")).await;
         assert_eq!(decider.calls(), 0);
@@ -3127,7 +3187,7 @@ mod provider_move_tests {
         // The moved-to session opens fresh: its counter starts at 0, so the relayed turn's
         // predecision (now keyed on the carried `next_turn`) matches the turn sent at index 0.
         s.next_turn = 0;
-        let router = router(s);
+        let router = self::router(s);
         directive_for_turn(&router, &TurnContext::new(0, "m")).await;
         assert_eq!(plan_provider_move(&router).await, ProviderPlan::Stay);
         let directive = directive_for_turn(&router, &TurnContext::new(1, "m")).await;
@@ -3144,7 +3204,7 @@ mod provider_move_tests {
     #[tokio::test]
     async fn right_after_a_change_a_turn_of_another_class_is_routed_on_the_turn() {
         let decider = picking_model("m2");
-        let router = router(spec(
+        let router = self::router(spec(
             decider.clone(),
             Arc::new(OneProvider),
             ProviderRoutingMode::Full,
@@ -3177,7 +3237,7 @@ mod provider_move_tests {
     async fn right_after_a_change_a_turn_of_the_same_class_is_decided_without_exploration() {
         assert!(RoutingSettings::default().exploration_epsilon > 0.0);
         let decider = picking_model("m2");
-        let router = router(spec(
+        let router = self::router(spec(
             decider.clone(),
             Arc::new(OneProvider),
             ProviderRoutingMode::Full,
@@ -3230,7 +3290,7 @@ mod provider_move_tests {
                 model: "m".into(),
             },
         ]);
-        let router = router(s);
+        let router = self::router(s);
         assert!(is_move_to(&plan_provider_move(&router).await, "local2"));
         let providers: Vec<_> = decider
             .last()
@@ -3244,7 +3304,7 @@ mod provider_move_tests {
     #[tokio::test]
     async fn a_source_that_knows_one_provider_asks_no_provider_question() {
         let decider = Fake::picking("local2", 0.9, 0.1);
-        let router = router(spec(
+        let router = self::router(spec(
             decider.clone(),
             Arc::new(OneProvider),
             ProviderRoutingMode::Full,
@@ -3260,7 +3320,7 @@ mod provider_move_tests {
     #[tokio::test]
     async fn the_conversations_auto_is_decided_at_the_auto_stage_whatever_the_settings() {
         let decider = Fake::picking("local2", 0.9, 0.1);
-        let router = router(spec(
+        let router = self::router(spec(
             decider.clone(),
             Arc::new(ThreeProviders),
             ProviderRoutingMode::Full,
@@ -3297,7 +3357,7 @@ mod provider_move_tests {
             explored: false,
             requests: StdMutex::new(Vec::new()),
         });
-        let router = router(spec(
+        let router = self::router(spec(
             decider.clone(),
             Arc::new(OneProvider),
             ProviderRoutingMode::Primary,
@@ -3320,7 +3380,7 @@ mod provider_move_tests {
 
     /// A router of a `full` + `shadow` setting whose conversation was handed to PO (Auto).
     fn router_after_auto(decider: Arc<Fake>) -> TurnRouter {
-        let router = router(spec(
+        let router = self::router(spec(
             decider,
             Arc::new(ThreeProviders),
             ProviderRoutingMode::Primary,
@@ -3361,7 +3421,7 @@ mod provider_move_tests {
         stage: LearningStage,
         compaction_model: bool,
     ) -> Arc<TurnRouter> {
-        let router = router(spec(decider, Arc::new(SummaryPool), mode, stage));
+        let router = self::router(spec(decider, Arc::new(SummaryPool), mode, stage));
         router.set_compaction_model(compaction_model);
         Arc::new(router)
     }
@@ -3513,6 +3573,7 @@ mod image_routing_tests {
     use crate::chat::message_attachments::{self, MessageAttachment};
     use crate::chat::provider::cognitive::candidates::RejectReason;
     use crate::chat::provider::cognitive::decider::decide_with;
+    use crate::chat::provider::cognitive::decision::DecisionAlternative;
     use crate::chat::provider::cognitive::scorer::PriorHints;
     #[allow(unused_imports)]
     use chrono::Utc;
@@ -3571,7 +3632,7 @@ mod image_routing_tests {
     }
 
     fn router(
-        decider: Arc<Real>,
+        decider: Arc<dyn Decider>,
         pool: Vec<ModelFacts>,
         mode: ProviderRoutingMode,
         allowed_models: Option<Vec<String>>,
@@ -3582,7 +3643,7 @@ mod image_routing_tests {
     }
 
     fn spec(
-        decider: Arc<Real>,
+        decider: Arc<dyn Decider>,
         pool: Arc<dyn PoolSource>,
         mode: ProviderRoutingMode,
         allowed_models: Option<Vec<String>>,
@@ -3636,8 +3697,8 @@ mod image_routing_tests {
 
     #[test]
     fn the_turn_input_says_whether_an_image_goes_with_it() {
-        let router = router(
-            Arc::default(),
+        let router = self::router(
+            Arc::new(Real::default()),
             deepseek_with_vision(),
             ProviderRoutingMode::Full,
             None,
@@ -3653,8 +3714,8 @@ mod image_routing_tests {
 
     #[tokio::test]
     async fn a_pool_with_a_vision_model_makes_images_reachable_and_says_through_whom() {
-        let router = router(
-            Arc::default(),
+        let router = self::router(
+            Arc::new(Real::default()),
             deepseek_with_vision(),
             ProviderRoutingMode::Full,
             None,
@@ -3676,7 +3737,7 @@ mod image_routing_tests {
     async fn another_provider_with_vision_counts_in_full_but_not_in_a_pool_of_this_provider() {
         let pool = vec![facts("deepseek", "flash", false), facts("glm", "v", true)];
         let full = router(
-            Arc::default(),
+            Arc::new(Real::default()),
             pool.clone(),
             ProviderRoutingMode::Full,
             None,
@@ -3686,7 +3747,7 @@ mod image_routing_tests {
         assert_eq!(images.via[0].provider, "glm");
 
         let mixed = router(
-            Arc::default(),
+            Arc::new(Real::default()),
             pool,
             ConversationRoutingMode::Mixed.pilot_mode(),
             Some(vec!["flash".into()]),
@@ -3698,8 +3759,8 @@ mod image_routing_tests {
 
     #[tokio::test]
     async fn a_pool_without_any_vision_model_still_says_images_will_not_pass() {
-        let router = router(
-            Arc::default(),
+        let router = self::router(
+            Arc::new(Real::default()),
             vec![
                 facts("deepseek", "flash", false),
                 facts("deepseek", "pro", false),
@@ -3719,7 +3780,12 @@ mod image_routing_tests {
 
     #[tokio::test]
     async fn an_empty_pool_falls_back_on_the_snapshot_with_its_cause() {
-        let router = router(Arc::default(), Vec::new(), ProviderRoutingMode::Full, None);
+        let router = self::router(
+            Arc::new(Real::default()),
+            Vec::new(),
+            ProviderRoutingMode::Full,
+            None,
+        );
         let images = effective_images(&router, Some(false)).await.unwrap();
         assert!(!images.value);
         assert_eq!(images.source, EffectiveSource::Snapshot);
@@ -3730,7 +3796,7 @@ mod image_routing_tests {
     async fn without_routing_the_snapshot_stands_as_before() {
         // primary: PO does not choose the model.
         let primary = router(
-            Arc::default(),
+            Arc::new(Real::default()),
             deepseek_with_vision(),
             ProviderRoutingMode::Primary,
             None,
@@ -3742,7 +3808,7 @@ mod image_routing_tests {
         );
         // A model changed by hand: the same.
         let manual = router(
-            Arc::default(),
+            Arc::new(Real::default()),
             deepseek_with_vision(),
             ProviderRoutingMode::Full,
             None,
@@ -3763,7 +3829,7 @@ mod image_routing_tests {
     #[tokio::test]
     async fn an_image_turn_is_routed_to_a_vision_candidate_and_the_reason_says_so() {
         let decider = Arc::new(Real::default());
-        let router = router(
+        let router = self::router(
             decider.clone(),
             deepseek_with_vision(),
             ProviderRoutingMode::Full,
@@ -3788,7 +3854,7 @@ mod image_routing_tests {
     #[tokio::test]
     async fn the_hook_routes_an_image_turn_even_right_after_a_change() {
         let decider = Arc::new(Real::default());
-        let router = router(
+        let router = self::router(
             decider.clone(),
             deepseek_with_vision(),
             ProviderRoutingMode::Full,
@@ -3807,7 +3873,7 @@ mod image_routing_tests {
     #[tokio::test]
     async fn a_text_turn_keeps_the_model_in_force() {
         let decider = Arc::new(Real::default());
-        let router = router(
+        let router = self::router(
             decider.clone(),
             deepseek_with_vision(),
             ProviderRoutingMode::Full,
@@ -3836,7 +3902,7 @@ mod image_routing_tests {
     #[tokio::test]
     async fn a_failed_model_switch_undoes_the_router_and_drops_the_decision_it_kept() {
         let decider = Arc::new(Real::default());
-        let router = router(
+        let router = self::router(
             decider.clone(),
             deepseek_with_vision(),
             ProviderRoutingMode::Full,
@@ -3888,7 +3954,7 @@ mod image_routing_tests {
         facts_offline.context_window = None;
         facts_offline.window_unknown = Some(candidates::UnknownWindow::CatalogOffline);
         let offline = router(
-            Arc::default(),
+            Arc::new(Real::default()),
             vec![facts_offline],
             ProviderRoutingMode::Full,
             None,
@@ -3905,7 +3971,7 @@ mod image_routing_tests {
         assert_eq!(effective_images(&primary, None).await, None);
         // A pool that says yes is said, snapshot or not.
         let full = router(
-            Arc::default(),
+            Arc::new(Real::default()),
             deepseek_with_vision(),
             ProviderRoutingMode::Full,
             None,
@@ -3946,7 +4012,7 @@ mod image_routing_tests {
         assert_eq!(model_for_images(&unlisted).await, None);
         // The same pair, named with its window suffix, IS known blind.
         let known = router(
-            Arc::default(),
+            Arc::new(Real::default()),
             deepseek_with_vision(),
             ProviderRoutingMode::Full,
             None,
@@ -4088,8 +4154,8 @@ mod image_routing_tests {
 
     #[tokio::test]
     async fn the_images_of_a_turn_are_forgotten_once_its_hook_ran() {
-        let router = router(
-            Arc::default(),
+        let router = self::router(
+            Arc::new(Real::default()),
             deepseek_with_vision(),
             ProviderRoutingMode::Full,
             None,
@@ -4102,6 +4168,225 @@ mod image_routing_tests {
             !router.signature().needs_images,
             "a compaction during the turn reads no image"
         );
+    }
+
+    /// A decider with a fixed answer: `chosen`/`applied`, or a failure when `fail` is set.
+    /// The request it was asked is kept, so a test can read what the router wanted.
+    struct Scripted {
+        chosen: Option<Pick>,
+        applied: bool,
+        fail: bool,
+        requests: StdMutex<Vec<DecideRequest>>,
+    }
+
+    impl Scripted {
+        fn answering(chosen: Option<Pick>, applied: bool) -> Arc<Self> {
+            Arc::new(Self {
+                chosen,
+                applied,
+                fail: false,
+                requests: StdMutex::new(Vec::new()),
+            })
+        }
+        fn failing() -> Arc<Self> {
+            Arc::new(Self {
+                chosen: None,
+                applied: false,
+                fail: true,
+                requests: StdMutex::new(Vec::new()),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait]
+    impl Decider for Scripted {
+        async fn decide(&self, request: &DecideRequest) -> anyhow::Result<CognitiveDecision> {
+            self.requests.lock().unwrap().push(request.clone());
+            if self.fail {
+                return Err(anyhow::anyhow!("scripted failure"));
+            }
+            Ok(CognitiveDecision {
+                snapshot: None,
+                id: Uuid::new_v4(),
+                at: Utc::now(),
+                signature: request.signature.clone(),
+                chosen: self.chosen.clone(),
+                score: self.chosen.as_ref().map(|_| 1.0),
+                explored: false,
+                exploration_epsilon: 0.0,
+                confidence: None,
+                reason: "scripted".into(),
+                alternatives: self
+                    .chosen
+                    .iter()
+                    .map(|pick| DecisionAlternative {
+                        pick: pick.clone(),
+                        score: Some(1.0),
+                        rejected: None,
+                        p_top1: None,
+                        propensity: None,
+                    })
+                    .collect(),
+                applied: self.applied,
+                mode: request.settings.mode,
+                stage: request.settings.stage,
+                session_id: request.session_id,
+                task_id: None,
+                run_id: None,
+                turn_index: request.turn_index,
+                outcome: None,
+                used: None,
+            })
+        }
+    }
+
+    /// Le modèle en force n'a plus rien : le routeur bascule sur un autre modèle de la même
+    /// instance, jamais sur celui qui a été refusé. La bascule est forcée (`Full` + `Auto`),
+    /// quel que soit le mode de la conversation.
+    #[tokio::test]
+    async fn a_model_wide_limit_is_answered_by_switching_model() {
+        let decider = Arc::new(Real::default());
+        let router = self::router(
+            decider.clone(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Primary,
+            None,
+        );
+        let limit = ProviderError::ModelLimitReached {
+            model: Some("flash".into()),
+            resets_at_ms: None,
+        };
+        assert_eq!(
+            model_after_limit(&router, &limit).await.as_deref(),
+            Some("vision")
+        );
+        let decision = decider.decisions.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(decision.chosen, Some(Pick::new("deepseek", "vision")));
+        assert!(decision.applied, "{decision:#?}");
+        assert_eq!(decision.mode, ProviderRoutingMode::Full);
+        assert_eq!(decision.stage, LearningStage::Auto);
+        // La bascule a bien déplacé le modèle en force.
+        assert_eq!(locked(&router.state).current_model, "vision");
+    }
+
+    /// Plus aucun modèle éligible après avoir écarté celui qui a refusé : rien à basculer, le
+    /// tour reste sur le refus (et rien n'est demandé au décideur).
+    #[tokio::test]
+    async fn a_model_wide_limit_with_no_other_model_leaves_the_turn_on_the_refusal() {
+        let decider = Arc::new(Real::default());
+        let router = self::router(
+            decider.clone(),
+            vec![facts("deepseek", "flash", false)],
+            ProviderRoutingMode::Full,
+            None,
+        );
+        let limit = ProviderError::ModelLimitReached {
+            model: Some("flash".into()),
+            resets_at_ms: None,
+        };
+        assert_eq!(model_after_limit(&router, &limit).await, None);
+        assert!(decider.decisions.lock().unwrap().is_empty());
+    }
+
+    /// La liste « modèles qu'Auto peut utiliser » borne aussi la bascule : un modèle coché
+    /// prend le relais, un modèle non coché ne peut pas.
+    #[tokio::test]
+    async fn a_model_wide_limit_honours_the_ticked_models() {
+        let limit = ProviderError::ModelLimitReached {
+            model: Some("flash".into()),
+            resets_at_ms: None,
+        };
+        // `vision` est coché : c'est lui qui prend le relais.
+        let decider = Arc::new(Real::default());
+        let router = self::router(
+            decider.clone(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Full,
+            Some(vec!["vision".into()]),
+        );
+        assert_eq!(
+            model_after_limit(&router, &limit).await.as_deref(),
+            Some("vision")
+        );
+        // Seul `flash` est coché — et c'est justement lui qui a refusé : rien d'autre.
+        let decider = Arc::new(Real::default());
+        let router = self::router(
+            decider.clone(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Full,
+            Some(vec!["flash".into()]),
+        );
+        assert_eq!(model_after_limit(&router, &limit).await, None);
+    }
+
+    /// Une décision que le routeur ne peut pas suivre ne change rien : non appliquée, sans
+    /// candidat, sur un autre fournisseur, ou sur le modèle déjà refusé (le suffixe de fenêtre
+    /// compte pour le même modèle).
+    #[tokio::test]
+    async fn a_model_wide_limit_that_cannot_name_another_model_leaves_the_turn() {
+        let limit = ProviderError::ModelLimitReached {
+            model: Some("flash".into()),
+            resets_at_ms: None,
+        };
+        // appliquée == false : le routeur a tranché mais l'hôte ne peut pas suivre.
+        let decider = Scripted::answering(Some(Pick::new("deepseek", "vision")), false);
+        let router = self::router(
+            decider.clone(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        assert_eq!(model_after_limit(&router, &limit).await, None);
+        assert_eq!(decider.calls(), 1);
+        // Aucun candidat nommé.
+        let decider = Scripted::answering(None, true);
+        let router = self::router(
+            decider.clone(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        assert_eq!(model_after_limit(&router, &limit).await, None);
+        // Un candidat sur un AUTRE fournisseur : la bascule est intra-instance.
+        let decider = Scripted::answering(Some(Pick::new("glm", "v")), true);
+        let router = self::router(
+            decider.clone(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        assert_eq!(model_after_limit(&router, &limit).await, None);
+        // Un candidat qui est le modèle déjà refusé.
+        let decider = Scripted::answering(Some(Pick::new("deepseek", "flash[1m]")), true);
+        let router = self::router(
+            decider.clone(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        assert_eq!(model_after_limit(&router, &limit).await, None);
+    }
+
+    /// Le décideur qui échoue laisse le tour sur le refus, comme s'il n'y avait rien à
+    /// proposer.
+    #[tokio::test]
+    async fn a_model_wide_limit_the_decider_cannot_answer_leaves_the_turn() {
+        let decider = Scripted::failing();
+        let router = self::router(
+            decider.clone(),
+            deepseek_with_vision(),
+            ProviderRoutingMode::Full,
+            None,
+        );
+        let limit = ProviderError::ModelLimitReached {
+            model: Some("flash".into()),
+            resets_at_ms: None,
+        };
+        assert_eq!(model_after_limit(&router, &limit).await, None);
+        assert_eq!(decider.calls(), 1);
     }
 }
 
@@ -4174,7 +4459,7 @@ mod segment_tests {
 
     #[test]
     fn a_harness_change_opens_a_boundary_at_once() {
-        let router = router(Uuid::new_v4());
+        let router = self::router(Uuid::new_v4());
         // The harness axis confirms a switch at once (a switch is explicit), unlike the
         // other axes that need two deviating turns.
         assert!(feed(&router, 0, "deepseek", "anything").is_empty());
@@ -4193,7 +4478,7 @@ mod segment_tests {
 
     #[test]
     fn a_topic_change_opens_a_boundary_after_two_deviating_turns() {
-        let router = router(Uuid::new_v4());
+        let router = self::router(Uuid::new_v4());
         let routing = "the routing of the provider";
         let other = "neo4j docker tests";
         // Same subject on two turns: the segment absorbs them, no boundary.
@@ -4249,7 +4534,7 @@ mod segment_tests {
 
     #[test]
     fn a_non_increasing_turn_is_tolerated_without_breaking_routing() {
-        let router = router(Uuid::new_v4());
+        let router = self::router(Uuid::new_v4());
         // The first observed turn is 3; turns 2 (before) and 3 (again) are refused by the
         // segmenter, which `observe_turn` tolerates as an empty return instead of an error:
         // routing never breaks on a repeated or out-of-order turn.

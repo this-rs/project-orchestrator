@@ -957,7 +957,7 @@ async fn a_conversation_in_auto_routes_its_turns_whatever_the_global_shadow_stag
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, ChatEvent::ModelChanged { model } if model == "wb")),
+            .any(|e| matches!(e, ChatEvent::ModelChanged { model, .. } if model == "wb")),
         "{events:#?}"
     );
     let mine = decisions_of(&w, &p).await;
@@ -1000,7 +1000,7 @@ async fn a_pool_ticked_on_the_conversation_routes_its_turns_whatever_the_global_
     assert!(turns(&w.primary).is_empty());
     assert!(events
         .iter()
-        .any(|e| matches!(e, ChatEvent::ModelChanged { model } if model == "wb")));
+        .any(|e| matches!(e, ChatEvent::ModelChanged { model, .. } if model == "wb")));
     let change = decisions_of(&w, &p)
         .await
         .into_iter()
@@ -1113,7 +1113,7 @@ async fn a_resumed_conversation_in_auto_still_routes_at_the_auto_stage() {
     assert_eq!(model_of_turn(&w.worker, DEBUG, &[]), ["wb"]);
     assert!(events
         .iter()
-        .any(|e| matches!(e, ChatEvent::ModelChanged { model } if model == "wb")));
+        .any(|e| matches!(e, ChatEvent::ModelChanged { model, .. } if model == "wb")));
     let after = decisions_of(&w, &p).await;
     assert!(after.len() > resumed_at, "the resumed turns are decided");
     let change = after
@@ -1141,7 +1141,7 @@ fn changes(events: &[ChatEvent]) -> Vec<String> {
     events
         .iter()
         .filter_map(|e| match e {
-            ChatEvent::ModelChanged { model } => Some(model.clone()),
+            ChatEvent::ModelChanged { model, .. } => Some(model.clone()),
             _ => None,
         })
         .collect()

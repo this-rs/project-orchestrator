@@ -91,6 +91,11 @@ pub struct QuotaEntry {
     /// The exhaustion this entry carries, if any (may be in the past: see [`QuotaRegistry::exhausted`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exhaustion: Option<Exhaustion>,
+    /// Per-model holds: a refusal named ONE model (`model:<name>` in the `window`), so the other
+    /// models of the instance stay eligible. Keyed by model name; expiry is the same clock rule
+    /// as [`Self::exhaustion`] (a hold whose reset has passed filters nothing).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub model_holds: HashMap<String, Exhaustion>,
 }
 
 /// What a person types for a provider that exposes nothing.
@@ -212,6 +217,26 @@ impl std::fmt::Debug for QuotaRegistry {
 /// Epoch ms of the clock.
 fn ms(clock: &dyn Clock) -> u64 {
     u64::try_from(clock.now().timestamp_millis()).unwrap_or(0)
+}
+
+/// Whether a held name (`"Fable"`, `"opus"`, `"claude-opus-4-1"`) covers `model`.
+///
+/// Providers refuse a FAMILY, and name it in prose while the host asks for an id: the
+/// Claude Code refusal "You've reached your Fable limit" is about `claude-fable-5-1`,
+/// and its windows are called `seven_day_opus`. A held name of four characters or
+/// more, found in the model id, is that family. An id held exactly is that model.
+/// Shorter names are refused as a match on purpose: `"max"`, `"1m"` would take out
+/// half a catalogue.
+fn same_family(held: &str, model: &str) -> bool {
+    let held = held.trim().to_ascii_lowercase();
+    let model = model.trim().to_ascii_lowercase();
+    if held.is_empty() || model.is_empty() {
+        return false;
+    }
+    if held == model {
+        return true;
+    }
+    held.len() >= 4 && model.contains(&held)
 }
 
 impl QuotaRegistry {
@@ -338,12 +363,13 @@ impl QuotaRegistry {
                 cause: ExhaustionCause::Window,
             }
         });
-        let new_entry = QuotaEntry {
+        let mut new_entry = QuotaEntry {
             windows: snapshot.windows.clone(),
             source: QuotaSource::Live,
             observed_at_ms: now,
             set_by: None,
             exhaustion,
+            model_holds: HashMap::new(),
         };
         {
             let mut entries = self.lock();
@@ -351,6 +377,8 @@ impl QuotaRegistry {
                 if existing.observed_at_ms > now {
                     return; // The current entry is newer: keep it.
                 }
+                // A live account snapshot says nothing about a single model: carry the holds.
+                new_entry.model_holds = existing.model_holds.clone();
             }
             entries.insert(instance.to_owned(), new_entry);
         }
@@ -381,6 +409,27 @@ impl QuotaRegistry {
         self.mark(instance, None, ExhaustionCause::OutOfCredit);
     }
 
+    /// ONE model of `provider_id` refused with a rate limit (e.g. "you've reached your limit for
+    /// this model, switch to another"). Same reset/cooldown arithmetic as
+    /// [`Self::mark_rate_limited`], but scoped to that model only: the instance's other models
+    /// stay eligible. The hold is recorded under `window: "model:<name>"` so the filter can tell
+    /// it apart from an account-wide exhaustion.
+    ///
+    /// WIRED IN R4: nothing calls this yet — the producer is a later slice, when the backend bumps
+    /// its nexus pin and a typed provider refusal names a model. Keep it: it is the read side's
+    /// (`model_exhausted`, `apply_quota`) reason to exist, not dead code.
+    pub fn mark_model_rate_limited(
+        &self,
+        provider_id: &str,
+        model: &str,
+        resets_at_ms: Option<u64>,
+        retry_after_ms: Option<u64>,
+    ) {
+        let now = self.now_ms();
+        let resets = resets_at_ms.or_else(|| retry_after_ms.map(|d| now.saturating_add(d)));
+        self.mark_model(provider_id, model, resets, ExhaustionCause::RateLimited);
+    }
+
     fn mark(&self, instance: &str, resets_at_ms: Option<u64>, cause: ExhaustionCause) {
         let now = self.now_ms();
         let (until, known) = match resets_at_ms {
@@ -400,6 +449,7 @@ impl QuotaRegistry {
                     observed_at_ms: now,
                     set_by: None,
                     exhaustion: None,
+                    model_holds: HashMap::new(),
                 });
             // A reset already known and still ahead is never shortened by a refusal.
             let keep = entry
@@ -414,6 +464,67 @@ impl QuotaRegistry {
                     cause,
                 });
                 entry.observed_at_ms = now;
+            }
+        }
+        self.persist_in_background(instance);
+    }
+
+    /// The per-model counterpart of [`Self::mark`]: records a hold on `(instance, model)` without
+    /// touching the instance's account-wide exhaustion, and keeps a reset already known and still
+    /// ahead from being shortened by a later refusal (the same rule as the instance-level one).
+    fn mark_model(
+        &self,
+        instance: &str,
+        model: &str,
+        resets_at_ms: Option<u64>,
+        cause: ExhaustionCause,
+    ) {
+        let now = self.now_ms();
+        let (until, known) = match resets_at_ms {
+            Some(at) => (at, true),
+            None => (
+                now.saturating_add(FALLBACK_COOLDOWN.as_millis() as u64),
+                false,
+            ),
+        };
+        {
+            let mut entries = self.lock();
+            let entry = entries
+                .entry(instance.to_owned())
+                .or_insert_with(|| QuotaEntry {
+                    windows: Vec::new(),
+                    source: QuotaSource::Live,
+                    observed_at_ms: now,
+                    set_by: None,
+                    exhaustion: None,
+                    model_holds: HashMap::new(),
+                });
+            use std::collections::hash_map::Entry;
+            match entry.model_holds.entry(model.to_owned()) {
+                Entry::Occupied(mut slot) => {
+                    // A reset already known and still ahead is never shortened by a refusal.
+                    let keep = slot.get().reset_known
+                        && slot.get().resets_at_ms > now
+                        && slot.get().resets_at_ms >= until;
+                    if !keep {
+                        slot.insert(Exhaustion {
+                            resets_at_ms: until,
+                            reset_known: known,
+                            window: Some(format!("model:{model}")),
+                            cause,
+                        });
+                        entry.observed_at_ms = now;
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(Exhaustion {
+                        resets_at_ms: until,
+                        reset_known: known,
+                        window: Some(format!("model:{model}")),
+                        cause,
+                    });
+                    entry.observed_at_ms = now;
+                }
             }
         }
         self.persist_in_background(instance);
@@ -442,7 +553,7 @@ impl QuotaRegistry {
             } else {
                 Vec::new()
             };
-        let new_entry = QuotaEntry {
+        let mut new_entry = QuotaEntry {
             windows,
             source: QuotaSource::Manual,
             observed_at_ms: now,
@@ -453,6 +564,7 @@ impl QuotaRegistry {
                 window: Some(kind),
                 cause: ExhaustionCause::Manual,
             }),
+            model_holds: HashMap::new(),
         };
         {
             let mut entries = self.lock();
@@ -460,6 +572,8 @@ impl QuotaRegistry {
                 if existing.observed_at_ms > now {
                     return; // The current entry is newer: keep it.
                 }
+                // A person's entry names the ACCOUNT: single-model holds are a different axis.
+                new_entry.model_holds = existing.model_holds.clone();
             }
             entries.insert(instance.to_owned(), new_entry);
         }
@@ -484,6 +598,31 @@ impl QuotaRegistry {
             .get(instance)?
             .exhaustion
             .clone()
+            .filter(|e| e.resets_at_ms > now)
+    }
+
+    /// The hold on ONE model of `instance` in force NOW, `None` once its reset has passed or when
+    /// the model was never held. `window` carries `model:<name>` so the filter can tell a
+    /// model-scoped hold from an account-wide exhaustion ([`Self::exhausted`]).
+    pub fn model_exhausted(&self, instance: &str, model: &str) -> Option<Exhaustion> {
+        let now = self.now_ms();
+        let entries = self.lock();
+        let entry = entries.get(instance)?;
+        // Exact first, then by FAMILY: a provider refuses a family, not an id. Claude
+        // Code says "You've reached your Fable limit" and windows that quota as
+        // `seven_day_opus`, while the model in force is `claude-fable-5-1`. Holding the
+        // family the provider named must therefore take that family's models out.
+        entry
+            .model_holds
+            .get(model)
+            .or_else(|| {
+                entry
+                    .model_holds
+                    .iter()
+                    .find(|(held, _)| same_family(held, model))
+                    .map(|(_, held)| held)
+            })
+            .cloned()
             .filter(|e| e.resets_at_ms > now)
     }
 
@@ -882,6 +1021,16 @@ mod tests {
                 window: Some("seven_day".into()),
                 cause: ExhaustionCause::Window,
             }),
+            // A per-model hold rides the SAME document and round-trips with it.
+            model_holds: HashMap::from([(
+                "claude-fable-5-1".to_owned(),
+                Exhaustion {
+                    resets_at_ms: 43,
+                    reset_known: true,
+                    window: Some("model:claude-fable-5-1".into()),
+                    cause: ExhaustionCause::RateLimited,
+                },
+            )]),
         };
         store.save("claude-code", &entry).await.unwrap();
         assert_eq!(
@@ -1103,6 +1252,171 @@ mod tests {
             registry.view("deepseek").unwrap().source,
             QuotaSource::Live,
             "the live entry is newer and must not be overwritten by an older manual entry"
+        );
+    }
+
+    // ── Per-model holds ─────────────────────────────────────────────────
+
+    #[test]
+    fn a_model_hold_is_scoped_to_that_model_and_never_reads_as_the_account() {
+        let (_clock, registry) = registry();
+        let until = ms_of("2026-10-22T10:00:00Z");
+        registry.mark_model_rate_limited("claude-code", "claude-fable-5-1", Some(until), None);
+
+        let held = registry
+            .model_exhausted("claude-code", "claude-fable-5-1")
+            .expect("the model is held");
+        assert_eq!(held.resets_at_ms, until);
+        assert_eq!(held.window.as_deref(), Some("model:claude-fable-5-1"));
+        assert!(held.reset_known);
+        // The instance itself is NOT exhausted: its other models stay eligible.
+        assert_eq!(registry.exhausted("claude-code"), None);
+        assert_eq!(
+            registry.model_exhausted("claude-code", "claude-sonnet-4-5"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_hold_named_by_family_takes_that_family_and_nothing_else() {
+        // Measured 2026-11-04: Claude Code refuses with "You've reached your Fable
+        // limit", a FAMILY name, while the host asks for `claude-fable-5-1`. A hold
+        // keyed on the refusal's own words must still take that model out — and only
+        // that family, never the catalogue.
+        let (_clock, registry) = registry();
+        let until = ms_of("2026-10-22T10:00:00Z");
+        registry.mark_model_rate_limited("claude-code", "Fable", Some(until), None);
+
+        assert!(
+            registry
+                .model_exhausted("claude-code", "claude-fable-5-1")
+                .is_some(),
+            "the family the provider named covers its models"
+        );
+        assert!(
+            registry
+                .model_exhausted("claude-code", "claude-sonnet-4-5")
+                .is_none(),
+            "another family is untouched"
+        );
+        assert_eq!(
+            registry.exhausted("claude-code"),
+            None,
+            "the account is not out"
+        );
+    }
+
+    #[test]
+    fn a_short_held_name_never_matches_half_the_catalogue() {
+        // A two- or three-letter name would match too much; the match is by family
+        // only from four characters.
+        let (_clock, registry) = registry();
+        registry.mark_model_rate_limited("claude-code", "max", None, None);
+        assert!(registry
+            .model_exhausted("claude-code", "claude-sonnet-4-5-max")
+            .is_none());
+    }
+
+    #[test]
+    fn a_family_match_survives_case_and_never_fires_on_an_empty_name() {
+        // Same name, other case: only the FAMILY path can see it (the exact lookup
+        // is case-sensitive), so this is the `held == model` branch of `same_family`.
+        let (_clock, registry) = registry();
+        let until = ms_of("2026-10-22T10:00:00Z");
+        registry.mark_model_rate_limited("claude-code", "Fable", Some(until), None);
+        assert!(
+            registry.model_exhausted("claude-code", "fable").is_some(),
+            "the same family, written another way"
+        );
+        // An empty model name never matches a hold: the early return, not a panic.
+        assert!(registry.model_exhausted("claude-code", "   ").is_none());
+        // And an instance nobody held has nothing to match against.
+        assert!(registry.model_exhausted("other", "fable").is_none());
+    }
+
+    #[test]
+    fn a_refusal_never_shortens_a_model_reset_already_known() {
+        // Measured rule, same as the instance-level one: a refusal dated EARLIER than
+        // the reset we already know must not make the model eligible sooner.
+        let (_clock, registry) = registry();
+        let far = ms_of("2026-10-24T10:00:00Z");
+        let near = ms_of("2026-10-22T10:00:00Z");
+        registry.mark_model_rate_limited("claude-code", "Fable", Some(far), None);
+        registry.mark_model_rate_limited("claude-code", "Fable", Some(near), None);
+        let held = registry.model_exhausted("claude-code", "Fable").unwrap();
+        assert_eq!(
+            held.resets_at_ms, far,
+            "the reset already known and still ahead is kept"
+        );
+    }
+
+    #[test]
+    fn a_model_hold_without_a_date_uses_the_fallback_and_expires_by_itself() {
+        let (clock, registry) = registry();
+        registry.mark_model_rate_limited("claude-code", "claude-fable-5-1", None, None);
+        let held = registry
+            .model_exhausted("claude-code", "claude-fable-5-1")
+            .unwrap();
+        assert!(!held.reset_known);
+        assert_eq!(held.cause, ExhaustionCause::RateLimited);
+        clock.advance(FALLBACK_COOLDOWN - Duration::from_secs(1));
+        assert!(registry
+            .model_exhausted("claude-code", "claude-fable-5-1")
+            .is_some());
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(
+            registry.model_exhausted("claude-code", "claude-fable-5-1"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_retry_after_delay_dates_the_model_hold_from_the_clock() {
+        let (_clock, registry) = registry();
+        registry.mark_model_rate_limited("claude-code", "claude-fable-5-1", None, Some(90_000));
+        assert_eq!(
+            registry
+                .model_exhausted("claude-code", "claude-fable-5-1")
+                .unwrap()
+                .resets_at_ms,
+            registry.now_ms() + 90_000
+        );
+    }
+
+    #[test]
+    fn a_model_refusal_never_shortens_a_model_reset_already_known() {
+        let (clock, registry) = registry();
+        let until = ms_of("2026-10-24T10:00:00Z");
+        registry.mark_model_rate_limited("claude-code", "claude-fable-5-1", Some(until), None);
+        clock.advance(Duration::from_secs(60));
+        registry.mark_model_rate_limited("claude-code", "claude-fable-5-1", None, Some(1000));
+        assert_eq!(
+            registry
+                .model_exhausted("claude-code", "claude-fable-5-1")
+                .unwrap()
+                .resets_at_ms,
+            until
+        );
+    }
+
+    #[test]
+    fn a_live_snapshot_does_not_wipe_a_model_hold() {
+        let (clock, registry) = registry();
+        let until = ms_of("2026-10-22T10:00:00Z");
+        registry.mark_model_rate_limited("claude-code", "claude-fable-5-1", Some(until), None);
+        // A later account snapshot replaces windows/exhaustion but keeps the model hold.
+        clock.advance(Duration::from_secs(1));
+        registry.observe(
+            "claude-code",
+            &QuotaSnapshot::live(vec![window("requests", QuotaStatus::Allowed, None)]),
+        );
+        assert_eq!(registry.exhausted("claude-code"), None);
+        assert_eq!(
+            registry
+                .model_exhausted("claude-code", "claude-fable-5-1")
+                .unwrap()
+                .resets_at_ms,
+            until
         );
     }
 }

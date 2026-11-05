@@ -594,6 +594,7 @@ fn server_examples() -> Vec<ServerExample> {
         ),
         ServerExample::same(ChatEvent::ModelChanged {
             model: s("example-model-large"),
+            reason: None,
         }),
         ServerExample::same(ChatEvent::CompactionStarted { trigger: s("auto") }),
         ServerExample::same(ChatEvent::CompactionRecovery {

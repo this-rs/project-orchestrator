@@ -982,7 +982,13 @@ pub enum ChatEvent {
         policy_mode: Option<String>,
     },
     /// Model was changed mid-session
-    ModelChanged { model: String },
+    ModelChanged {
+        model: String,
+        /// Why the model changed, when the harness knows (`limit_reached` for the
+        /// automatic switch after a model-scoped refusal). Absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// Context window compaction is starting (emitted via PreCompact hook)
     CompactionStarted {
         /// Compaction trigger: "auto" or "manual"
@@ -1478,7 +1484,11 @@ impl ChatEvent {
             ChatEvent::PermissionModeChanged { mode, .. } => {
                 Some(format!("permission_mode_changed:{}", mode))
             }
-            ChatEvent::ModelChanged { model } => Some(format!("model_changed:{}", model)),
+            ChatEvent::ModelChanged { model, reason } => Some(format!(
+                "model_changed:{}:{}",
+                model,
+                reason.as_deref().unwrap_or("")
+            )),
             ChatEvent::CompactionStarted { trigger } => {
                 Some(format!("compaction_started:{}", trigger))
             }
@@ -2779,6 +2789,7 @@ mod tests {
             },
             ChatEvent::ModelChanged {
                 model: "claude-opus-4-6".into(),
+                reason: None,
             },
             ChatEvent::CompactionStarted {
                 trigger: "auto".into(),
@@ -3067,7 +3078,7 @@ mod tests {
         let json = r#"{"type":"model_changed","model":"claude-opus-4-6"}"#;
         let event: ChatEvent = serde_json::from_str(json).unwrap();
         assert!(
-            matches!(event, ChatEvent::ModelChanged { ref model } if model == "claude-opus-4-6")
+            matches!(event, ChatEvent::ModelChanged { ref model, .. } if model == "claude-opus-4-6")
         );
 
         // SystemInit with all fields
@@ -4400,6 +4411,31 @@ mod pool_spans_providers_tests {
         assert!(
             pool_spans_providers(Some(&[entry("a", "m"), entry("a", "big"), entry("b", "m")])),
             "the count is of providers, not of entries"
+        );
+    }
+
+    /// Two switches in ONE message must not collapse: the reason is part of the
+    /// identity, so a limit and a safeguards refusal read as two different events.
+    #[test]
+    fn a_model_change_fingerprints_with_its_reason() {
+        let changed =
+            |model: &str, reason: Option<&str>| crate::chat::types::ChatEvent::ModelChanged {
+                model: model.to_string(),
+                reason: reason.map(str::to_string),
+            };
+        assert_eq!(
+            changed("m2", Some("limit_reached")).fingerprint(),
+            Some("model_changed:m2:limit_reached".to_string())
+        );
+        assert_ne!(
+            changed("m2", Some("limit_reached")).fingerprint(),
+            changed("m2", Some("request_refused")).fingerprint(),
+            "the reason tells the two switches apart"
+        );
+        assert_eq!(
+            changed("m2", None).fingerprint(),
+            Some("model_changed:m2:".to_string()),
+            "a switch without a reason keeps its plain key"
         );
     }
 }
