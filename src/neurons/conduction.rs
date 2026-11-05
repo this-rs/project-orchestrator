@@ -142,21 +142,21 @@ impl ObjectiveLedger {
 
 /// Map a terminal `done` into an objective state (N1 only; N2/N3 refine it).
 pub fn state_from_stop(stop_reason: Option<&str>, is_error: bool, subtype: &str) -> ObjectiveState {
+    if is_error {
+        // A provider fault (a 429, a dead account) is not the objective being abandoned:
+        // `turn_reward` already excludes it from the reward, and the objective follows.
+        return ObjectiveState::Pursued;
+    }
     match stop_reason {
-        Some("completed") | Some("success") => ObjectiveState::Reached,
-        Some("error") => ObjectiveState::Abandoned {
-            reason: format!("error: {subtype}"),
-        },
+        // The turn limit stopped the work: it resumes once turns are granted.
         Some("max_turns") => ObjectiveState::Blocked {
             on: "turn_limit".into(),
         },
-        Some("interrupted") => ObjectiveState::Abandoned {
-            reason: "interrupted".into(),
-        },
-        _ if is_error => ObjectiveState::Abandoned {
-            reason: format!("is_error: {subtype}"),
-        },
-        // Budget, quota, an ambiguous or missing terminal: no verdict.
+        // The one end `turn_reward` reads as a success.
+        Some("completed") => ObjectiveState::Reached,
+        // Its second success path: no stop reason, an explicit success subtype.
+        None if subtype == "success" => ObjectiveState::Reached,
+        // Every other end (interrupt, error, unknown stop) is ambiguous: no verdict.
         _ => ObjectiveState::Pursued,
     }
 }
@@ -235,19 +235,23 @@ mod tests {
     }
 
     #[test]
-    fn state_from_stop_maps_the_terminal_done() {
+    fn state_from_stop_reads_the_done_like_turn_reward() {
+        // The two successes `turn_reward` recognises.
         assert_eq!(
-            state_from_stop(Some("completed"), false, "success"),
+            state_from_stop(Some("completed"), false, ""),
             ObjectiveState::Reached
         );
         assert_eq!(
-            state_from_stop(Some("max_turns"), false, "done"),
+            state_from_stop(None, false, "success"),
+            ObjectiveState::Reached
+        );
+        // The turn limit stops the work; it resumes once turns are granted.
+        assert_eq!(
+            state_from_stop(Some("max_turns"), false, ""),
             ObjectiveState::Blocked {
                 on: "turn_limit".into()
             }
         );
-        // No terminal `done`: no verdict.
-        assert_eq!(state_from_stop(None, false, ""), ObjectiveState::Pursued);
     }
 
     #[test]
@@ -269,18 +273,20 @@ mod tests {
     }
 
     #[test]
-    fn state_from_stop_maps_every_reason() {
-        assert!(matches!(
-            state_from_stop(Some("error"), false, "boom"),
-            ObjectiveState::Abandoned { .. }
-        ));
-        assert!(matches!(
+    fn state_from_stop_treats_an_ambiguous_end_as_no_verdict() {
+        // An interrupt can be resumed, an error retried, a provider fault is not the
+        // objective being given up: none of them is a verdict.
+        assert_eq!(
             state_from_stop(Some("interrupted"), false, ""),
-            ObjectiveState::Abandoned { .. }
-        ));
-        assert!(matches!(
-            state_from_stop(None, true, "io"),
-            ObjectiveState::Abandoned { .. }
-        ));
+            ObjectiveState::Pursued
+        );
+        assert_eq!(
+            state_from_stop(Some("error"), false, ""),
+            ObjectiveState::Pursued
+        );
+        assert_eq!(
+            state_from_stop(None, true, "quota_exhausted"),
+            ObjectiveState::Pursued
+        );
     }
 }
