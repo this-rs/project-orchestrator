@@ -313,6 +313,20 @@ pub fn enforceable_limits(
     (max_tokens, max_cost_usd, dropped)
 }
 
+/// Whether moving a session that holds a spend cap from the model priced `cost_now` to the one
+/// priced `cost_after` would leave that cap unheld (PYSR-3b): the engine checks a cap against
+/// the model's price at the OPENING only (`unsupported("cost")`), and a live model change does
+/// not check again — a model without a price then spends with nothing counted. `false` when
+/// the cap was not held already (it was left out at the opening, and said).
+pub fn model_change_drops_the_cost_cap(
+    kind: nexus_claude::agent::ProviderKind,
+    cost_now: nexus_claude::agent::CostBasis,
+    cost_after: nexus_claude::agent::CostBasis,
+) -> bool {
+    let held = |cost| enforceable_limits(kind, cost, None, Some(1.0)).1.is_some();
+    held(cost_now) && !held(cost_after)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

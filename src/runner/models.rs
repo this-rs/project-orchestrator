@@ -124,7 +124,34 @@ impl DelegationLimits {
             max_tokens: config.max_tokens,
         }
     }
+
+    /// The caps a session request carries (`ChatRequest::max_tokens` / `max_cost_usd`, then
+    /// `SessionLimits`): `None` for an unlimited one.
+    pub fn request_caps(&self) -> (Option<u64>, Option<f64>) {
+        (
+            self.max_tokens,
+            (self.max_cost_usd > 0.0).then_some(self.max_cost_usd),
+        )
+    }
+
+    /// These limits once `spent_usd` of the spend cap is used (PYSR-3b): what a resumed
+    /// delegation, or a sub-agent opened under it, may still spend. A spend cap used up is
+    /// [`EXHAUSTED_USD`], never `0` (which reads "unlimited"): the engine stops at its first
+    /// priced request. The delay and the token cap are left as they are.
+    pub fn after_spending(self, spent_usd: f64) -> Self {
+        if self.max_cost_usd <= 0.0 || !spent_usd.is_finite() || spent_usd <= 0.0 {
+            return self;
+        }
+        Self {
+            max_cost_usd: (self.max_cost_usd - spent_usd).max(EXHAUSTED_USD),
+            ..self
+        }
+    }
 }
+
+/// The spend cap of a delegation whose budget is used up: the smallest cap an engine still
+/// holds as a cap (`0` would read "unlimited").
+pub const EXHAUSTED_USD: f64 = 1e-6;
 
 impl Default for DelegationLimits {
     fn default() -> Self {
@@ -994,6 +1021,34 @@ mod tests {
         assert!(!config.test_runner);
         assert!((config.max_cost_usd - 50.0).abs() < f64::EPSILON);
         assert_eq!(config.spawning_timeout_secs, 480);
+    }
+
+    /// PYSR-3b — what is left of a delegation's budget: the spend is taken off the spend cap,
+    /// a used-up cap stays a cap (never `0`, which reads "unlimited"), an unlimited one stays
+    /// unlimited, and the delay and the token cap are untouched.
+    #[test]
+    fn a_delegations_budget_after_spending_is_what_is_left_of_it() {
+        let limits = DelegationLimits {
+            timeout_secs: 60,
+            max_cost_usd: 10.0,
+            max_tokens: Some(7),
+        };
+        assert_eq!(limits.after_spending(4.0).max_cost_usd, 6.0);
+        assert_eq!(limits.after_spending(4.0).timeout_secs, 60);
+        assert_eq!(limits.after_spending(4.0).max_tokens, Some(7));
+        assert_eq!(limits.after_spending(0.0), limits);
+        assert_eq!(limits.after_spending(25.0).max_cost_usd, EXHAUSTED_USD);
+        assert_eq!(
+            limits.after_spending(25.0).request_caps(),
+            (Some(7), Some(EXHAUSTED_USD)),
+            "a used-up budget is still a cap"
+        );
+        let unlimited = DelegationLimits {
+            max_cost_usd: 0.0,
+            ..limits
+        };
+        assert_eq!(unlimited.after_spending(25.0), unlimited);
+        assert_eq!(unlimited.request_caps(), (Some(7), None));
     }
 
     #[test]

@@ -12850,6 +12850,57 @@ impl ChatManager {
         }
     }
 
+    /// PYSR-3b: a live session that holds a spend cap (a delegation, a sub-agent of one:
+    /// [`Self::session_limits_of`]) is not moved to a model its engine cannot hold that cap on
+    /// (a native model without a price): the engine checks the cap against the price at the
+    /// opening only, so the session would go on spending with nothing counted. Refused as the
+    /// engine refuses such an opening, `unsupported("cost")` (a 422 over HTTP); the model in
+    /// force stays. A dormant session is not refused here: its resume leaves the cap out and
+    /// says so (`degraded_features: cost_cap`).
+    async fn refuse_a_model_that_drops_the_cost_cap(
+        &self,
+        session_id: &str,
+        model: &str,
+    ) -> Result<()> {
+        let Ok(uuid) = Uuid::parse_str(session_id) else {
+            return Ok(());
+        };
+        let Some(node) = self.graph.get_chat_session(uuid).await.ok().flatten() else {
+            return Ok(());
+        };
+        if node.model == model {
+            return Ok(());
+        }
+        let capped = self
+            .session_limits_of(&node)
+            .await
+            .is_some_and(|limits| limits.request_caps().1.is_some());
+        if !capped {
+            return Ok(());
+        }
+        let provider_id = node
+            .provider_id
+            .clone()
+            .unwrap_or_else(|| super::provider::resolver::CLAUDE_CODE.to_string());
+        let provider = self.provider_for(&provider_id).await?;
+        if super::provider::policy::model_change_drops_the_cost_cap(
+            provider.kind(),
+            provider.capabilities(Some(&node.model)).cost,
+            provider.capabilities(Some(model)).cost,
+        ) {
+            warn!(
+                session_id,
+                from = %node.model,
+                to = model,
+                "model change refused: the session's spend cap cannot be held on that model"
+            );
+            return Err(anyhow::Error::new(
+                nexus_claude::agent::ProviderError::unsupported("cost"),
+            ));
+        }
+        Ok(())
+    }
+
     /// `manual`: the user asked for it, which ends the automatic model routing of the
     /// session. The router's own changes pass `false`.
     async fn set_session_model_inner(
@@ -12858,6 +12909,12 @@ impl ChatManager {
         model: &str,
         manual: bool,
     ) -> Result<bool> {
+        let live_agent = self.agent_runtime.get(session_id).await;
+        // Before anything is pinned or flagged: a refused change changes nothing.
+        if live_agent.is_some() {
+            self.refuse_a_model_that_drops_the_cost_cap(session_id, model)
+                .await?;
+        }
         if manual {
             if let Some(router) = self.turn_routing.get(session_id) {
                 router.mark_manual();
@@ -12865,7 +12922,7 @@ impl ChatManager {
             self.pin_session_model(session_id).await;
             self.flag_routing_override(session_id).await;
         }
-        if let Some(handle) = self.agent_runtime.get(session_id).await {
+        if let Some(handle) = live_agent {
             handle.set_model(model).await?;
             if let Ok(uuid) = Uuid::parse_str(session_id) {
                 let _ = self.graph.update_chat_session_model(uuid, model).await;
@@ -17904,6 +17961,10 @@ impl ChatManager {
         if transcripts_kept_in_memory(provider.kind(), self.native_transcripts.as_deref()) {
             host_missing.push(super::agent_runtime::RESUME_AFTER_RESTART_FEATURE.to_string());
         }
+        // A cap left out is not only a log line: the session's `system_init` says so in its
+        // `degraded_features` (PYSR-3b), so whoever watches the child — the session that
+        // delegated, its person — reads that its budget is not held.
+        host_missing.extend(super::agent_runtime::dropped_cap_features(&dropped));
         // The project's files are on this machine unless the instance is remote.
         let project_dir =
             (!super::provider::resolver::is_remote_instance(provider_id)).then(|| spec.cwd.clone());
@@ -18767,6 +18828,31 @@ impl ChatManager {
         cleanup.registered(router);
         // A resume keeps the access the session was opened with and can only narrow it.
         let access = super::provider::policy::SessionAccess::for_resume(node.access, None);
+        // PYSR-3b: a resumed delegation (or a sub-agent of one) keeps its delay and budget —
+        // re-derived from the same constants, less what it already spent (the engine process
+        // a resume opens counts from zero). A cap this engine cannot hold is left out and
+        // said, as at the opening.
+        let (max_tokens, max_cost_usd, dropped_caps) = match self.session_limits_of(node).await {
+            Some(limits) => {
+                let (tokens, usd) = limits.request_caps();
+                super::provider::policy::enforceable_limits(
+                    provider.kind(),
+                    provider.capabilities(Some(&node.model)).cost,
+                    tokens,
+                    usd,
+                )
+            }
+            None => (None, None, Vec::new()),
+        };
+        if !dropped_caps.is_empty() {
+            warn!(
+                session_id = %sid,
+                provider_id,
+                model = %node.model,
+                dropped = ?dropped_caps,
+                "this engine cannot enforce these caps: the session resumes without them"
+            );
+        }
         let spec = self
             .build_agent_spec_with_access(
                 AgentSpecInput {
@@ -18779,8 +18865,8 @@ impl ChatManager {
                     user_claims,
                     session_id: &sid,
                     third_party: provider_id != super::provider::resolver::CLAUDE_CODE,
-                    max_tokens: None,
-                    max_cost_usd: None,
+                    max_tokens,
+                    max_cost_usd,
                     kind: provider.kind(),
                     remote_cwd: remote_cwd.as_deref(),
                     per_session_mcp,
@@ -18891,6 +18977,8 @@ impl ChatManager {
         if transcripts_kept_in_memory(provider.kind(), self.native_transcripts.as_deref()) {
             host_missing.push(super::agent_runtime::RESUME_AFTER_RESTART_FEATURE.to_string());
         }
+        // A cap left out is said to whoever watches the session (PYSR-3b).
+        host_missing.extend(super::agent_runtime::dropped_cap_features(&dropped_caps));
         // The project's files are on this machine unless the instance is remote.
         let project_dir = (!super::provider::resolver::is_remote_instance(&provider_id))
             .then(|| spec.cwd.clone());
@@ -26352,6 +26440,180 @@ mod tests {
         }
     }
 
+    /// The request of a delegation (`plan(delegate_task)`) on `model`, with its own caps
+    /// (PYSR-3, `launch_delegation`).
+    fn delegation_request(model: &str) -> ChatRequest {
+        let mut req = agent_request("delegated work");
+        req.model = Some(model.to_string());
+        req.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Delegation {
+                plan_id: Uuid::new_v4(),
+                task_id: Uuid::new_v4(),
+                parent_session_id: None,
+                scaffolding_level: None,
+            }
+            .to_json_string(),
+        );
+        (req.max_tokens, req.max_cost_usd) =
+            crate::runner::DelegationLimits::default().request_caps();
+        req
+    }
+
+    /// The fake prices `model` (a spend cap can be held on it).
+    fn price(fake: &super::super::agent_runtime::fake::FakeProvider, model: &str) {
+        fake.model_cost
+            .lock()
+            .unwrap()
+            .insert(model.to_string(), nexus_claude::agent::CostBasis::Reported);
+    }
+
+    /// PYSR-3b — a resumed delegation keeps its budget: the resume's spec carries the spend cap
+    /// (the same constant, `DelegationLimits`), less what the delegation already spent — the
+    /// engine process a resume opens counts from zero. Red before: the resume passed
+    /// `max_cost_usd: None`, so a delegation resumed after an idle close ran uncapped.
+    #[tokio::test]
+    async fn a_resumed_delegation_keeps_its_cap() {
+        let (manager, graph, fake) = agent_manager();
+        price(&fake, "priced");
+        let sid = manager
+            .create_session(&delegation_request("priced"))
+            .await
+            .expect("the delegation opens")
+            .session_id;
+        let cap = crate::runner::DelegationLimits::default().max_cost_usd;
+        let opened = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+        assert_eq!(opened.limits.max_cost_usd, Some(cap));
+        // It spent $12 on its first process.
+        graph
+            .chat_sessions
+            .write()
+            .await
+            .get_mut(&Uuid::parse_str(&sid).unwrap())
+            .unwrap()
+            .total_cost_usd = Some(12.0);
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+
+        manager
+            .resume_session(&sid, "again", None)
+            .await
+            .expect("the delegation resumes");
+        let resumed = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            resumed.limits.max_cost_usd,
+            Some(cap - 12.0),
+            "the resume keeps the cap, less what was spent"
+        );
+    }
+
+    /// PYSR-3b — a session of its own (a person's chat) resumes with no cap, as it opened
+    /// (ISO5: no session budget by default).
+    #[tokio::test]
+    async fn a_resumed_session_of_its_own_stays_uncapped() {
+        let (manager, _graph, fake) = agent_manager();
+        price(&fake, "priced");
+        let mut req = agent_request("hello");
+        req.model = Some("priced".into());
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        fake.state.end_turn();
+        manager.close_session(&sid).await.unwrap();
+        manager.resume_session(&sid, "again", None).await.unwrap();
+        let resumed = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+        assert_eq!(resumed.limits.max_cost_usd, None);
+        assert_eq!(resumed.limits.max_tokens, None);
+    }
+
+    /// PYSR-3b — a spend cap the engine cannot hold (a model without a price) is left out, and
+    /// SAID: the session's `system_init` lists `cost_cap` among its `degraded_features`, so the
+    /// delegating session (and its person) read that the budget is not held. Red before: only
+    /// a `warn!` in the server log.
+    #[tokio::test]
+    async fn a_cap_the_engine_cannot_hold_is_announced_in_degraded_features() {
+        use nexus_claude::agent::AgentEvent;
+        let (manager, _graph, fake) = agent_manager();
+        let sid = manager
+            .create_session(&delegation_request("unpriced"))
+            .await
+            .expect("a capped delegation still opens on an engine that cannot hold the cap")
+            .session_id;
+        let opened = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+        assert_eq!(opened.limits.max_cost_usd, None, "the cap is left out");
+        let mut rx = manager.subscribe(&sid).await.unwrap();
+        fake.state.push(AgentEvent::SessionStarted {
+            provider_session_id: Some("p1".into()),
+            model: Some("unpriced".into()),
+            policy_mode: None,
+            native_mode: None,
+            tools: vec![],
+            mcp_servers: vec![],
+            cwd: None,
+        });
+        let init = next_matching(&mut rx, |e| matches!(e, ChatEvent::SystemInit { .. })).await;
+        let wire = serde_json::to_value(&init).unwrap();
+        let degraded: Vec<String> =
+            serde_json::from_value(wire["degraded_features"].clone()).expect("a list");
+        assert!(
+            degraded
+                .iter()
+                .any(|f| f == super::super::agent_runtime::COST_CAP_FEATURE),
+            "{degraded:?}"
+        );
+    }
+
+    /// PYSR-3b — a live capped delegation is not moved to a model its engine cannot hold the
+    /// cap on (no price): refused `unsupported("cost")`, as the engine refuses such an
+    /// opening; the model in force stays. A move to a priced model is not refused. Red
+    /// before: the change went through and the session spent with nothing counted (the engine
+    /// checks the cap at the opening only).
+    #[tokio::test]
+    async fn a_capped_session_is_not_moved_to_a_model_without_a_price() {
+        let (manager, graph, fake) = agent_manager();
+        price(&fake, "priced");
+        price(&fake, "priced-too");
+        let sid = manager
+            .create_session(&delegation_request("priced"))
+            .await
+            .unwrap()
+            .session_id;
+
+        let refused = manager
+            .set_session_model(&sid, "unpriced")
+            .await
+            .expect_err("the cap would no longer be held");
+        assert!(
+            matches!(
+                refused.downcast_ref::<nexus_claude::agent::ProviderError>(),
+                Some(nexus_claude::agent::ProviderError::Unsupported { capability }) if capability == "cost"
+            ),
+            "{refused:#}"
+        );
+        let node = graph
+            .get_chat_session(Uuid::parse_str(&sid).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.model, "priced", "the model in force stays");
+        assert!(fake.state.models.lock().unwrap().is_empty());
+
+        manager
+            .set_session_model(&sid, "priced-too")
+            .await
+            .expect("a priced model holds the cap");
+        assert_eq!(*fake.state.models.lock().unwrap(), vec!["priced-too"]);
+    }
+
+    /// PYSR-3b — the guard is for capped sessions only: a person's chat moves to any model.
+    #[tokio::test]
+    async fn an_uncapped_session_moves_to_a_model_without_a_price() {
+        let (manager, _graph, fake) = agent_manager();
+        price(&fake, "priced");
+        let mut req = agent_request("hello");
+        req.model = Some("priced".into());
+        let sid = manager.create_session(&req).await.unwrap().session_id;
+        manager.set_session_model(&sid, "unpriced").await.unwrap();
+        assert_eq!(*fake.state.models.lock().unwrap(), vec!["unpriced"]);
+    }
+
     /// DELEG-WAKE, moteur agent : une nouvelle venue d'ailleurs passe par le réveil hors
     /// tour (`wake_with_background`) — un tour de type `BackgroundOutput`, l'annonce
     /// écrite dans la transcription, et pas un message utilisateur.
@@ -29951,6 +30213,131 @@ mod tests {
             .expect("the delegation completes")
             .expect("no panic");
         assert_eq!(answer, Ok("done".to_string()));
+    }
+
+    /// The spec of the child one `Agent` call of `parent` opens, the call then answered.
+    async fn spec_of_a_sub_agent_of(
+        manager: &Arc<ChatManager>,
+        fake: &super::super::agent_runtime::fake::FakeProvider,
+        parent: &str,
+    ) -> nexus_claude::agent::SessionSpec {
+        use nexus_claude::agent::{AgentEvent, StopReason, SubagentRequest};
+        let before = fake.state.opened_specs.lock().unwrap().len();
+        let call = tokio::spawn({
+            let manager = Arc::clone(manager);
+            let parent = parent.to_string();
+            async move {
+                manager
+                    .run_subagent(&parent, None, &SubagentRequest::new("toolu_cap", "do it"))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fake.state.opened_specs.lock().unwrap().len() == before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the sub-agent opens (never 'no candidate')");
+        let spec = fake
+            .state
+            .opened_specs
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fake.state.turns_started.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the child's turn started");
+        fake.state.push(AgentEvent::Done {
+            stop_reason: StopReason::Completed,
+            subtype: Some("success".into()),
+            is_error: false,
+            result_text: Some("done".into()),
+            usage: Default::default(),
+            cost: Default::default(),
+            duration_ms: 5,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: Some("priced".into()),
+            provider_session_id: Some("p-cap".into()),
+            structured_output: None,
+            error: None,
+        });
+        fake.state.end_turn();
+        let answer = tokio::time::timeout(Duration::from_secs(10), call)
+            .await
+            .expect("the call completes")
+            .expect("no panic");
+        assert_eq!(answer, Ok("done".to_string()));
+        spec
+    }
+
+    /// PYSR-3b — a sub-agent of the `Agent` tool opened by a capped delegation runs under what
+    /// is left of its parent's budget (same constants, `DelegationLimits`): the parent's spend
+    /// is taken off, so the child never widens it. The call opens on the parent's engine as
+    /// before (no "no candidate"). Red before: the child got no cap at all.
+    #[tokio::test]
+    async fn a_sub_agent_of_a_capped_delegation_runs_under_what_is_left_of_its_budget() {
+        let (manager, graph, fake) = agent_manager();
+        let manager = Arc::new(manager);
+        manager.enable_subagents();
+        price(&fake, "priced");
+        let mut parent_req = delegation_request("priced");
+        parent_req.message = String::new();
+        let parent = manager
+            .create_session(&parent_req)
+            .await
+            .unwrap()
+            .session_id;
+        let parent_uuid = Uuid::parse_str(&parent).unwrap();
+        graph
+            .chat_sessions
+            .write()
+            .await
+            .get_mut(&parent_uuid)
+            .unwrap()
+            .total_cost_usd = Some(10.0);
+        graph
+            .add_chat_session_children_cost(parent_uuid, 5.0)
+            .await
+            .unwrap();
+
+        let spec = spec_of_a_sub_agent_of(&manager, &fake, &parent).await;
+
+        let cap = crate::runner::DelegationLimits::default().max_cost_usd;
+        assert_eq!(
+            spec.limits.max_cost_usd,
+            Some(cap - 15.0),
+            "the parent's own and children's spend are taken off its budget"
+        );
+    }
+
+    /// PYSR-3b — a sub-agent of a session of its own (a person's chat) gets no cap: its parent
+    /// has none (ISO5).
+    #[tokio::test]
+    async fn a_sub_agent_of_an_uncapped_session_gets_no_cap() {
+        let (manager, _graph, fake) = agent_manager();
+        let manager = Arc::new(manager);
+        manager.enable_subagents();
+        price(&fake, "priced");
+        let mut parent_req = agent_request("");
+        parent_req.model = Some("priced".into());
+        let parent = manager
+            .create_session(&parent_req)
+            .await
+            .unwrap()
+            .session_id;
+
+        let spec = spec_of_a_sub_agent_of(&manager, &fake, &parent).await;
+
+        assert_eq!(spec.limits.max_cost_usd, None);
+        assert_eq!(spec.limits.max_tokens, None);
     }
 
     #[tokio::test]

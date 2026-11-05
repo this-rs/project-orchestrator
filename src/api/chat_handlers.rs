@@ -387,6 +387,8 @@ fn session_node_to_response(s: crate::neo4j::models::ChatSessionNode) -> ChatSes
         updated_at: s.updated_at.to_rfc3339(),
         message_count: s.message_count,
         total_cost_usd: s.total_cost_usd,
+        children_cost_usd: None,
+        aggregated_cost_usd: None,
         conversation_id: s.conversation_id,
         preview: s.preview,
         permission_mode: s.permission_mode,
@@ -599,8 +601,12 @@ pub async fn get_session(
         .as_deref()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
     let snapshot_images = snapshot_images(capabilities.as_ref());
+    // PYSR-3b: what its sub-agents spent, and the two together (`total_cost_usd` stays its own).
+    let costs = crate::chat::subagents::session_costs(neo4j, &node).await;
     let mut session = session_node_to_response(node);
     session.capabilities = capabilities;
+    session.children_cost_usd = Some(costs.children_usd);
+    session.aggregated_cost_usd = Some(costs.aggregated_usd);
     // F-R4: what the next turn can really carry, given the routing candidates.
     if let Some(chat_manager) = state.chat_manager.as_ref() {
         session.effective_capabilities = chat_manager
@@ -2432,9 +2438,25 @@ mod tests {
     async fn test_app_with_sessions(
         sessions: &[crate::neo4j::models::ChatSessionNode],
     ) -> axum::Router {
+        test_app_with_session_costs(sessions, &[]).await
+    }
+
+    /// [`test_app_with_sessions`], each `(session, usd)` of `children_spend` added to that
+    /// session's CHILDREN spend (what its sub-agents spent, PYSR-3).
+    async fn test_app_with_session_costs(
+        sessions: &[crate::neo4j::models::ChatSessionNode],
+        children_spend: &[(Uuid, f64)],
+    ) -> axum::Router {
         let app_state = mock_app_state();
         for s in sessions {
             app_state.neo4j.create_chat_session(s).await.unwrap();
+        }
+        for (session, usd) in children_spend {
+            app_state
+                .neo4j
+                .add_chat_session_children_cost(*session, *usd)
+                .await
+                .unwrap();
         }
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
@@ -4305,6 +4327,52 @@ mod tests {
         assert_eq!(json["id"], session_id.to_string());
         assert_eq!(json["project_slug"], "my-proj");
         assert_eq!(json["model"], "claude-opus-4-6");
+    }
+
+    /// PYSR-3b — the single-session read shows what the session's sub-agents spent and the
+    /// two together: a parent that spent $0.40 itself and whose child spent $1.10 is
+    /// `aggregated_cost_usd` 1.50, `total_cost_usd` staying its own 0.40. Red before: neither
+    /// field existed (the aggregate had no API caller).
+    #[tokio::test]
+    async fn the_session_read_shows_its_childrens_cost_and_the_aggregate() {
+        let mut parent = test_chat_session(Some("my-proj"));
+        parent.total_cost_usd = Some(0.4);
+        let parent_id = parent.id;
+        let app = test_app_with_session_costs(&[parent], &[(parent_id, 1.1)]).await;
+
+        let resp = app
+            .oneshot(auth_get(&format!("/api/chat/sessions/{}", parent_id)))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total_cost_usd"], 0.4, "its own cost is untouched");
+        assert_eq!(json["children_cost_usd"], 1.1);
+        let aggregated = json["aggregated_cost_usd"].as_f64().unwrap();
+        assert!(
+            (aggregated - 1.5).abs() < 1e-9,
+            "own + children: {aggregated}"
+        );
+    }
+
+    /// PYSR-3b — the listings do not carry the two cost fields (single-session read only).
+    #[tokio::test]
+    async fn the_session_listing_does_not_carry_the_aggregate() {
+        let session = test_chat_session(Some("my-proj"));
+        let session_id = session.id;
+        let app = test_app_with_session_costs(&[session], &[(session_id, 1.0)]).await;
+        let resp = app.oneshot(auth_get("/api/chat/sessions")).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let item = &json["items"][0];
+        assert!(item.get("aggregated_cost_usd").is_none(), "{item}");
+        assert!(item.get("children_cost_usd").is_none(), "{item}");
     }
 
     #[tokio::test]

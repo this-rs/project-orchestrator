@@ -82,7 +82,10 @@
 //! parent's model reads why and does the step itself. A covered request never fails the
 //! call, however long its automatic answer takes (unless that answer fails).
 //! The call otherwise waits as long as the child works, bounded by the parent's turn
-//! timeout. What a child spent is added to its parent's CHILDREN spend when the call ends
+//! timeout — and, when the parent runs under a delay and a budget of its own (a delegation,
+//! or a sub-agent of one), by what is left of them: the child is opened with the rest of the
+//! parent's spend cap and its own delay, from the same constants
+//! ([`ChatManager::session_limits_of`], PYSR-3b). What a child spent is added to its parent's CHILDREN spend when the call ends
 //! ([`ChatManager::aggregated_cost_usd`] = own + children); the parent's own
 //! `total_cost_usd` is untouched, so its routing decision is not charged twice (PYSR-3).
 #[allow(unused_imports)]
@@ -682,6 +685,20 @@ impl ChatManager {
             denied_tools,
             ..Default::default()
         };
+        // PYSR-3b: the child of a parent that runs under a delay and a budget (a delegation,
+        // or a sub-agent of one) runs under what is left of them — the same constants
+        // (`DelegationLimits`), never a second set. A parent with none (a person's chat)
+        // gives none (ISO5). A cap the child's engine cannot hold is left out at the opening
+        // (`enforceable_limits`) and said in its `degraded_features`: it never refuses the
+        // engine, so the call never ends on "no candidate".
+        let limits = self.session_limits_of(&parent).await;
+        if let Some(limits) = limits {
+            (child.max_tokens, child.max_cost_usd) = limits.request_caps();
+        }
+        let delay = limits
+            .map(|l| l.timeout_secs)
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs);
         let default_mode = self.default_permission_mode().await;
         env.apply(&mut child, &default_mode)
             .map_err(|e| refused(e.code().to_owned()))?;
@@ -707,7 +724,7 @@ impl ChatManager {
             let tool_use_id = request.tool_call_id.clone();
             tokio::spawn(async move {
                 manager
-                    .open_wait_close(child, cancelled, &parent, &tool_use_id, slot, reuse)
+                    .open_wait_close(child, cancelled, &parent, &tool_use_id, slot, reuse, delay)
                     .await
             })
         };
@@ -845,6 +862,11 @@ impl ChatManager {
     /// `reuse` carries the warm session the pool offered (CACHE-POOL): the child RESUMES it
     /// instead of being opened, and is given back warm once closed. Empty, or refused by the
     /// provider, the child is opened fresh — exactly as before the pool existed.
+    ///
+    /// `delay`: the child's own wall-clock cap (PYSR-3b, `session_limits_of`); past it the
+    /// call fails and the child is closed like on every other end. `None`: bounded by the
+    /// parent's turn only.
+    #[allow(clippy::too_many_arguments)]
     async fn open_wait_close(
         self: Arc<Self>,
         child: ChatRequest,
@@ -853,6 +875,7 @@ impl ChatManager {
         tool_use_id: &str,
         mut slot: SubagentSlot,
         reuse: Option<Reuse>,
+        delay: Option<Duration>,
     ) -> Result<String, String> {
         // A resumed warm session already carries the cost of its earlier turns: only what it
         // spends from here on is this call's (PYSR-3).
@@ -884,9 +907,19 @@ impl ChatManager {
                 drop(slot);
             });
         });
+        let past_delay = async {
+            match delay {
+                Some(delay) => tokio::time::sleep(delay).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         let answer = tokio::select! {
             biased;
             _ = cancelled => Err("the sub-agent's call was cancelled".to_owned()),
+            _ = past_delay => Err(format!(
+                "the sub-agent went past its delay ({}s) and was stopped",
+                delay.map_or(0, |d| d.as_secs())
+            )),
             // A resumed session's thread already holds the answer of the turn it ran
             // before: only what came after `resumed_from` can be this call's answer.
             answer = self.wait_for_answer_after(&child_id, resumed_from.unwrap_or(0)) => answer,
@@ -1022,19 +1055,58 @@ impl ChatManager {
     /// (PYSR-3). `total_cost_usd` stays the own cost.
     pub async fn aggregated_cost_usd(&self, session_id: &str) -> Option<f64> {
         let id = Uuid::parse_str(session_id).ok()?;
-        let own = self
-            .graph
-            .get_chat_session(id)
-            .await
-            .ok()??
-            .total_cost_usd
-            .unwrap_or(0.0);
-        let children = self
-            .graph
-            .get_chat_session_children_cost(id)
-            .await
-            .unwrap_or(0.0);
-        Some(own + children)
+        let node = self.graph.get_chat_session(id).await.ok()??;
+        Some(
+            session_costs(self.graph.as_ref(), &node)
+                .await
+                .aggregated_usd,
+        )
+    }
+
+    /// The delay and budget a session runs under (PYSR-3b), from the ONE source of constants
+    /// ([`crate::runner::DelegationLimits::default`], the PlanRunner's): a delegation
+    /// (`plan(delegate_task)`) has its own, less what it and its sub-agents already spent (a
+    /// resume opens a new engine process, which counts from zero); a sub-agent of the `Agent`
+    /// tool has what is left of its parent's — the parent's whole spend, its sub-agents
+    /// included, is taken off, so a child never widens the budget it was opened under. Any
+    /// other session (a person's chat, a run's executor) has none: `None` (ISO5, a session of
+    /// its own carries no cap by default).
+    ///
+    /// A spend a sub-agent makes is charged to its parent when its call ends
+    /// (`charge_children_cost`): a sibling opened while it still runs does not see it yet.
+    pub(crate) async fn session_limits_of(
+        &self,
+        node: &crate::neo4j::models::ChatSessionNode,
+    ) -> Option<crate::runner::DelegationLimits> {
+        /// A malformed `spawned_by` loop cannot walk forever.
+        const MAX_DEPTH: usize = 16;
+        let mut current = node.clone();
+        for _ in 0..MAX_DEPTH {
+            match current
+                .spawned_by
+                .as_deref()
+                .and_then(SpawnedBy::from_json_str)
+            {
+                Some(SpawnedBy::Delegation { .. }) => {
+                    let spent = session_costs(self.graph.as_ref(), &current)
+                        .await
+                        .aggregated_usd;
+                    return Some(crate::runner::DelegationLimits::default().after_spending(spent));
+                }
+                Some(SpawnedBy::Conversation {
+                    parent_session_id, ..
+                }) => {
+                    current = self
+                        .graph
+                        .get_chat_session(parent_session_id)
+                        .await
+                        .ok()
+                        .flatten()?;
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// The last event sequence the thread of `sid` holds (0 when it has none): the floor a
@@ -1310,6 +1382,34 @@ impl ChatManager {
             .iter()
             .filter_map(|r| serde_json::from_str(&r.data).ok())
             .collect()
+    }
+}
+
+/// The spend of a session as the API shows it (PYSR-3b): its own (`total_cost_usd`), what its
+/// sub-agents spent (`children_cost_usd`, kept apart so its routing decision is not charged
+/// twice), and the two together.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct SessionCosts {
+    pub children_usd: f64,
+    pub aggregated_usd: f64,
+}
+
+/// [`SessionCosts`] of `node`. A children spend that cannot be read is `0` (nothing is
+/// invented); an own cost that is not a number is `0`.
+pub(crate) async fn session_costs(
+    graph: &dyn crate::neo4j::GraphStore,
+    node: &crate::neo4j::models::ChatSessionNode,
+) -> SessionCosts {
+    let own = node.total_cost_usd.filter(|c| c.is_finite()).unwrap_or(0.0);
+    let children_usd = graph
+        .get_chat_session_children_cost(node.id)
+        .await
+        .ok()
+        .filter(|c| c.is_finite())
+        .unwrap_or(0.0);
+    SessionCosts {
+        children_usd,
+        aggregated_usd: own + children_usd,
     }
 }
 

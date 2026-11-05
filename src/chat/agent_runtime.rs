@@ -533,6 +533,30 @@ pub const RESUME_AFTER_RESTART_FEATURE: &str = "resume_after_restart";
 /// (`super::subagents::SubagentHooks`), so an ACP agent has none (M2, gap D3 of M0).
 pub const SUBAGENTS_FEATURE: &str = "subagents";
 
+/// The identifier of a session opened (or resumed) WITHOUT the spend cap it was given — a
+/// delegation's budget (PYSR-3) — because its engine cannot hold one: Codex and ACP take no
+/// limit, a native model without a price cannot count a spend
+/// (`provider::policy::enforceable_limits`). The session still runs, bounded by its delay
+/// only. The HOST knows it, so it is added at adoption (PYSR-3b).
+pub const COST_CAP_FEATURE: &str = "cost_cap";
+
+/// [`COST_CAP_FEATURE`] for the token cap (`SessionLimits::max_tokens`).
+pub const TOKEN_CAP_FEATURE: &str = "token_cap";
+
+/// The `degraded_features` entries of the caps `enforceable_limits` left out (`dropped`
+/// names them by their request field: `max_cost_usd`, `max_tokens`).
+pub fn dropped_cap_features(dropped: &[&str]) -> Vec<String> {
+    dropped
+        .iter()
+        .filter_map(|cap| match *cap {
+            "max_cost_usd" => Some(COST_CAP_FEATURE),
+            "max_tokens" => Some(TOKEN_CAP_FEATURE),
+            _ => None,
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// What a session on the agent engine does NOT do, as the identifiers the
 /// frontend knows (`hooks`, `compaction`, `images`, [`PO_TOOLS_FEATURE`]; the
 /// host adds [`NEXUS_TOOLS_FEATURE`] and [`kind_degraded`]).
@@ -3908,6 +3932,9 @@ pub(crate) mod fake {
         /// How long `open` and `resume` take (none unless a test needs the opening to
         /// yield, or to be dropped while it waits).
         pub open_delay: Arc<StdMutex<Option<std::time::Duration>>>,
+        /// The price basis `capabilities(model)` declares per model (`Unknown` for a model
+        /// not listed, as before): what decides whether a spend cap can be held.
+        pub model_cost: Arc<StdMutex<HashMap<String, nexus_claude::agent::CostBasis>>>,
     }
 
     impl FakeProvider {
@@ -3920,6 +3947,7 @@ pub(crate) mod fake {
                 kind: Arc::new(StdMutex::new(ProviderKind::ClaudeCode)),
                 health: Arc::new(StdMutex::new(None)),
                 open_delay: Arc::new(StdMutex::new(None)),
+                model_cost: Arc::new(StdMutex::new(HashMap::new())),
             }
         }
         pub(crate) fn session(&self) -> Arc<FakeSession> {
@@ -3951,11 +3979,15 @@ pub(crate) mod fake {
         async fn catalog(&self) -> Result<Vec<ModelInfo>, ProviderError> {
             Ok(Vec::new())
         }
-        fn capabilities(&self, _model: Option<&str>) -> Capabilities {
+        fn capabilities(&self, model: Option<&str>) -> Capabilities {
             // A local Claude Code takes MCP servers per session: the host gives it the
             // PO server (`ChatManager::carries_per_session_mcp`).
             let mut caps = Capabilities::none();
             caps.per_session_mcp = true;
+            if let Some(cost) = model.and_then(|m| self.model_cost.lock().unwrap().get(m).copied())
+            {
+                caps.cost = cost;
+            }
             caps
         }
         async fn open(&self, spec: SessionSpec) -> Result<Arc<dyn AgentSession>, ProviderError> {
