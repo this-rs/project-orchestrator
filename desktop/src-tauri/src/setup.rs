@@ -1018,6 +1018,14 @@ pub async fn check_cli_status(
     Ok(project_orchestrator::chat::cli_version::check_cli_status().await)
 }
 
+/// Probe the `codex` program on the PATH via Tauri (read-only, no backend needed).
+/// Same rationale as `check_cli_status`: the setup wizard runs before the API.
+#[tauri::command]
+pub async fn check_codex_status(
+) -> Result<project_orchestrator::chat::cli_version::CodexStatus, String> {
+    Ok(project_orchestrator::chat::cli_version::check_codex_status().await)
+}
+
 /// Install or upgrade the Claude CLI directly via Tauri (no backend/auth required).
 ///
 /// Same rationale as `check_cli_status` — the setup wizard needs this before

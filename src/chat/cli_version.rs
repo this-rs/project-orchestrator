@@ -693,3 +693,78 @@ mod tests {
         }
     }
 }
+
+/// State of the `codex` program on the PATH, as the setup wizard shows it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CodexStatus {
+    /// Whether a `codex` program was found on the PATH.
+    pub installed: bool,
+    /// Version reported by `codex --version`, or None when it did not answer in time.
+    pub version: Option<String>,
+    /// Full path of the program found on the PATH.
+    pub path: Option<String>,
+}
+
+/// Read-only probe of the `codex` program: it looks it up on the PATH and runs
+/// `codex --version` with a 5-second bound. It never installs anything.
+pub async fn check_codex_status() -> CodexStatus {
+    let Some(path) = find_on_path("codex") else {
+        return CodexStatus {
+            installed: false,
+            version: None,
+            path: None,
+        };
+    };
+    let run = tokio::process::Command::new(&path)
+        .arg("--version")
+        .output();
+    let version = match tokio::time::timeout(std::time::Duration::from_secs(5), run).await {
+        Ok(Ok(out)) if out.status.success() => {
+            parse_codex_version(&String::from_utf8_lossy(&out.stdout))
+        }
+        _ => None,
+    };
+    CodexStatus {
+        installed: true,
+        version,
+        path: Some(path.to_string_lossy().into_owned()),
+    }
+}
+
+/// The first PATH entry holding a regular file called `name`.
+fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// `codex-cli 0.9.1` → `0.9.1`: the first word that starts with a digit.
+fn parse_codex_version(stdout: &str) -> Option<String> {
+    stdout
+        .split_whitespace()
+        .find(|word| word.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod codex_status_tests {
+    use super::*;
+
+    #[test]
+    fn version_is_the_first_numeric_word() {
+        assert_eq!(
+            parse_codex_version("codex-cli 0.9.1\n").as_deref(),
+            Some("0.9.1")
+        );
+        assert_eq!(parse_codex_version("0.12.0").as_deref(), Some("0.12.0"));
+        assert_eq!(parse_codex_version("no version here"), None);
+        assert_eq!(parse_codex_version(""), None);
+    }
+
+    #[test]
+    fn a_missing_program_is_not_installed() {
+        let missing = "codex-definitely-not-on-path-7f3a";
+        assert!(find_on_path(missing).is_none());
+    }
+}

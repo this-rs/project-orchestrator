@@ -211,6 +211,7 @@ fn main() {
             setup::detect_claude_code,
             setup::detect_shell_path,
             setup::check_cli_status,
+            setup::check_codex_status,
             setup::install_cli,
             setup::setup_claude_code,
             setup::verify_oidc_discovery,
