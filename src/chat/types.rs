@@ -1842,6 +1842,16 @@ pub struct SessionActivity {
     pub monitors: usize,
     /// Active `Bash run_in_background` subprocesses.
     pub bash_tasks: usize,
+    /// What the session is doing in its current segment, deduced from the tail of its
+    /// events, the counts above and the clock (`chat::segment_state`): `working`,
+    /// `writing`, `reporting`, `watching`, `waiting_on_person`, `done` or `stalled`.
+    /// Additive: absent for a session that is not live (or not tapped yet), and a client
+    /// that predates it keeps reading the five fields above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<super::segment_state::SessionState>,
+    /// Why `state` is what it is: the rule, the event that decided and its age.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_reason: Option<super::segment_state::Reason>,
 }
 
 impl SessionActivity {

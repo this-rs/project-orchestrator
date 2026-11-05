@@ -4253,6 +4253,7 @@ mod tests {
             pending_permissions: 2,
             monitors: 1,
             bash_tasks: 3,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(json["live"], true);
@@ -4260,6 +4261,41 @@ mod tests {
         assert_eq!(json["pending_permissions"], 2);
         assert_eq!(json["monitors"], 1);
         assert_eq!(json["bash_tasks"], 3);
+        assert!(
+            json.get("state").is_none() && json.get("state_reason").is_none(),
+            "a session without a segment state keeps the old shape: {json}"
+        );
+    }
+
+    /// `state` is additive and serialized by name (SEG-1): the old five fields are
+    /// unchanged, and a client that predates it decodes the payload as before.
+    #[test]
+    fn session_activity_carries_its_segment_state_by_name() {
+        use crate::chat::segment_state::{Reason, Rule, SessionState};
+        let activity = SessionActivity {
+            live: true,
+            streaming: true,
+            state: Some(SessionState::Stalled),
+            state_reason: Some(Reason {
+                rule: Rule::NoEventFor,
+                event: Some("tool_timing".into()),
+                age_ms: 2_400_000,
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&activity).unwrap();
+        assert_eq!(json["state"], "stalled");
+        assert_eq!(json["state_reason"]["rule"], "no_event_for");
+        assert_eq!(json["state_reason"]["event"], "tool_timing");
+        assert_eq!(json["state_reason"]["age_ms"], 2_400_000);
+        assert_eq!(json["live"], true);
+        let back: SessionActivity = serde_json::from_value(json).unwrap();
+        assert_eq!(back, activity);
+        let old: SessionActivity = serde_json::from_value(serde_json::json!({
+            "live": true, "streaming": false, "pending_permissions": 0, "monitors": 0, "bash_tasks": 0
+        }))
+        .unwrap();
+        assert_eq!(old.state, None, "a payload without the field still decodes");
     }
 
     #[tokio::test]

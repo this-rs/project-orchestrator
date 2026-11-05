@@ -67,6 +67,8 @@ pub mod retrieval_trigger;
 pub mod routing;
 #[cfg(test)]
 mod routing_modes_e2e_tests;
+pub mod segment_state;
+pub mod segment_tap;
 pub mod session_grants;
 pub mod session_pool;
 pub mod session_record;

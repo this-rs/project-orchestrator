@@ -261,6 +261,26 @@ curl -H "Authorization: Bearer <JWT>" \
   "http://localhost:8080/api/chat/sessions?project_slug=my-project"
 ```
 
+A live session carries `activity` (also served for every live session by
+`GET /api/chat/live-activity`): `live`, `streaming`, `pending_permissions`, `monitors`,
+`bash_tasks`, and — additive, absent when not known — `state` and `state_reason`.
+`state` is what the session does in its current segment, deduced without any model
+from the tail of its events, those counts and the clock (`chat::segment_state`):
+
+| `state` | Meaning |
+|---|---|
+| `working` | a turn runs: a tool is in flight, the model thinks, or a turn is planned |
+| `writing` | text is being written now |
+| `reporting` | the turn ended on something addressed to a person (or its end is not proven) |
+| `watching` | a monitor or a background command runs between turns |
+| `waiting_on_person` | a permission, a question, a secret or a queued message |
+| `done` | the turn ended, its answer went to its spawner (or there was none), no watch, no queue, nothing planned |
+| `stalled` | streaming, but no event for 30 minutes |
+
+`state_reason` is `{ rule, event?, age_ms }`: the rule that decided, the event it read and
+that event's age. A `done` session of the agent engine is released (closed the way the idle
+cleanup closes it: the thread stays, the next message resumes it).
+
 ### POST /api/chat/sessions -- Protected
 
 Create a new chat session.
