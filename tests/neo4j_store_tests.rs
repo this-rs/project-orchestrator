@@ -2219,3 +2219,139 @@ async fn the_embedding_projection_skips_unreadable_rows_and_honours_the_limit() 
         .unwrap();
     assert_eq!(capped.len(), 1, "the limit caps the page");
 }
+
+// ===========================================================================
+// T7 — the four reads that make a relation assertion refutable (src/neo4j/beliefs.rs)
+// ===========================================================================
+
+/// The belief reads against a real graph: an unknown kind is « I don't know » (`None`),
+/// never « absent » (`Some(false)`); an edge outside the closed list is refused; the
+/// verdict written by `record_assertion_check` is read back as the note's last result.
+#[tokio::test]
+async fn the_belief_reads_tell_unknown_from_absent_and_keep_the_last_verdict() {
+    use project_orchestrator::notes::models::{
+        AssertionCheckType, AssertionResult, AssertionRule, Note, NoteStatus, NoteType,
+        ViolationAction,
+    };
+
+    let client = store_or_skip!();
+    let store = &client as &dyn GraphStore;
+    let raw = raw_graph().await;
+
+    let tag = Uuid::new_v4().simple().to_string();
+    let caller = format!("t7_caller_{tag}");
+    let callee = format!("t7_callee_{tag}");
+
+    // Existence: unknown kind, then absent, then present.
+    assert_eq!(store.entity_exists("banana", &caller).await.unwrap(), None);
+    assert_eq!(
+        store.entity_exists("function", &caller).await.unwrap(),
+        Some(false)
+    );
+    raw.run(
+        query(
+            "CREATE (:Function {id: $a_id, name: $a})-[:CALLS]->(:Function {id: $b_id, name: $b})",
+        )
+        .param("a_id", format!("{caller}:id"))
+        .param("a", caller.clone())
+        .param("b_id", format!("{callee}:id"))
+        .param("b", callee.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store.entity_exists("function", &caller).await.unwrap(),
+        Some(true)
+    );
+
+    // Links: an edge outside the closed list is an error, an unknown kind is `None`,
+    // the real edge is seen in its direction only.
+    assert!(store
+        .entities_linked(
+            "function",
+            &caller,
+            "DELETE_EVERYTHING",
+            "function",
+            &callee
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        store
+            .entities_linked("banana", &caller, "CALLS", "function", &callee)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .entities_linked("function", &caller, "CALLS", "function", &callee)
+            .await
+            .unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        store
+            .entities_linked("function", &callee, "CALLS", "function", &caller)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+
+    // An assertion note is listed, then its verdict is written and read back.
+    let mut note = Note::new(
+        None,
+        NoteType::Assertion,
+        format!("t7 belief {tag}"),
+        "t7".into(),
+    );
+    note.assertion_rule = Some(AssertionRule {
+        check_type: AssertionCheckType::Calls,
+        target: format!("function:{caller}"),
+        file_pattern: None,
+        parameters: Some(serde_json::json!({"to": format!("function:{callee}")})),
+        on_violation: ViolationAction::FlagNote,
+    });
+    store.create_note(&note).await.unwrap();
+
+    let listed = store.list_assertion_notes(100_000).await.unwrap();
+    let mine = listed
+        .iter()
+        .find(|n| n.id == note.id)
+        .expect("a note with a rule is listed");
+    assert!(mine.last_assertion_result.is_none(), "never checked yet");
+
+    store
+        .record_assertion_check(
+            note.id,
+            &AssertionResult::failed("refuted"),
+            Some(NoteStatus::NeedsReview),
+        )
+        .await
+        .unwrap();
+    // `None` writes the verdict and leaves the status alone.
+    store
+        .record_assertion_check(note.id, &AssertionResult::failed("still refuted"), None)
+        .await
+        .unwrap();
+
+    let listed = store.list_assertion_notes(100_000).await.unwrap();
+    let mine = listed.iter().find(|n| n.id == note.id).unwrap();
+    let last = mine
+        .last_assertion_result
+        .as_ref()
+        .expect("the written verdict is read back");
+    assert!(!last.passed);
+    assert_eq!(last.message, "still refuted");
+    assert_eq!(mine.status, NoteStatus::NeedsReview, "None kept the status");
+
+    // Clean up.
+    store.delete_note(note.id).await.unwrap();
+    raw.run(
+        query("MATCH (f:Function) WHERE f.name IN [$a, $b] DETACH DELETE f")
+            .param("a", caller)
+            .param("b", callee),
+    )
+    .await
+    .unwrap();
+}

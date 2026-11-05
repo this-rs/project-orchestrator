@@ -491,6 +491,47 @@ mod tests {
         );
     }
 
+    /// Le contrat avec le vérificateur AU SYNC : il ne prétend plus vérifier ce qu'il ne
+    /// peut pas vérifier. Il rend « je ne sais pas », et le runner ne sanctionne pas dessus.
+    #[test]
+    fn the_file_level_verifier_no_longer_claims_relation_checks_pass() {
+        use crate::notes::{FileInfo, NoteImportance, NoteType};
+
+        let note = a_belief(
+            AssertionCheckType::Calls,
+            "function:main",
+            serde_json::json!({"to": "function:helper"}),
+        );
+        let mut note = note;
+        note.note_type = NoteType::Assertion;
+        note.importance = NoteImportance::High;
+
+        let file_info = FileInfo {
+            path: "src/lib.rs".into(),
+            functions: Vec::new(),
+            structs: Vec::new(),
+            symbols: Vec::new(),
+            imports: Vec::new(),
+        };
+        let result = crate::notes::lifecycle::NoteLifecycleManager::new()
+            .verify_assertion(&note, &file_info);
+
+        assert!(
+            !result.passed,
+            "un contrôle de relation ne peut pas être « vrai » sans le graphe"
+        );
+        assert!(
+            matches!(result.check_type, Some(AssertionCheckType::Calls)),
+            "et le contrôle doit rester identifiable, pour que le runner sache qu'il ne \
+             peut pas le trancher depuis un fichier"
+        );
+        assert!(
+            result.message.contains("graphe"),
+            "et le dire : {}",
+            result.message
+        );
+    }
+
     /// La dérive est un PASSAGE : tenue hier, réfutée aujourd'hui.
     #[test]
     fn drift_is_a_passage_from_holding_to_refuted() {
@@ -531,5 +572,324 @@ mod tests {
         let second = reverify(&graph, 10).await.unwrap();
         assert_eq!(second.refuted, 1);
         assert_eq!(second.drifted, 1, "tenue puis réfutée : c'est une dérive");
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Chaque branche du jugement, une par une : « je ne sais pas » n'est jamais « faux ».
+    // ---------------------------------------------------------------------------------
+
+    fn is_unverifiable(v: &Verdict) -> bool {
+        matches!(v, Verdict::Unverifiable(_))
+    }
+
+    async fn judge_alone(note: &Note) -> Verdict {
+        verify(&seeded(note).await, note).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_note_without_a_rule_is_unverifiable() {
+        let mut note = a_belief(
+            AssertionCheckType::Exists,
+            "function:x",
+            serde_json::Value::Null,
+        );
+        note.assertion_rule = None;
+        let verdict = judge_alone(&note).await;
+        assert!(is_unverifiable(&verdict), "{verdict:?}");
+        assert!(verdict.message().contains("aucune procédure"));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_target_is_unverifiable() {
+        for target in ["function:", "sans-deux-points"] {
+            let note = a_belief(AssertionCheckType::Exists, target, serde_json::Value::Null);
+            let verdict = judge_alone(&note).await;
+            assert!(is_unverifiable(&verdict), "{target} → {verdict:?}");
+            assert!(
+                verdict.message().contains("illisible"),
+                "{}",
+                verdict.message()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exists_holds_when_the_entity_is_in_the_graph() {
+        let note = a_belief(
+            AssertionCheckType::Exists,
+            "function:main",
+            serde_json::Value::Null,
+        );
+        let graph = seeded(&note).await;
+        graph
+            .belief_entities
+            .write()
+            .await
+            .insert(("function".into(), "main".into()));
+        assert_eq!(
+            verify(&graph, &note).await.unwrap(),
+            Verdict::Holds("function « main » existe".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn not_exists_is_judged_on_all_three_answers() {
+        let present = a_belief(
+            AssertionCheckType::NotExists,
+            "struct:Old",
+            serde_json::Value::Null,
+        );
+        let graph = seeded(&present).await;
+        graph
+            .belief_entities
+            .write()
+            .await
+            .insert(("struct".into(), "Old".into()));
+        assert!(verify(&graph, &present).await.unwrap().is_refuted());
+
+        let absent = a_belief(
+            AssertionCheckType::NotExists,
+            "struct:Gone",
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            judge_alone(&absent).await,
+            Verdict::Holds("struct « Gone » est bien absent".into())
+        );
+
+        let unknown = a_belief(
+            AssertionCheckType::NotExists,
+            "banana:x",
+            serde_json::Value::Null,
+        );
+        assert!(is_unverifiable(&judge_alone(&unknown).await));
+    }
+
+    #[tokio::test]
+    async fn a_call_check_needs_a_readable_callee_of_a_known_kind() {
+        let no_to = a_belief(
+            AssertionCheckType::Calls,
+            "function:main",
+            serde_json::json!({}),
+        );
+        let verdict = judge_alone(&no_to).await;
+        assert!(is_unverifiable(&verdict));
+        assert!(
+            verdict.message().contains("parameters.to"),
+            "{}",
+            verdict.message()
+        );
+
+        let unreadable = a_belief(
+            AssertionCheckType::Calls,
+            "function:main",
+            serde_json::json!({"to": "function:"}),
+        );
+        let verdict = judge_alone(&unreadable).await;
+        assert!(is_unverifiable(&verdict));
+        assert!(
+            verdict.message().contains("illisible"),
+            "{}",
+            verdict.message()
+        );
+
+        let unknown = a_belief(
+            AssertionCheckType::Calls,
+            "banana:main",
+            serde_json::json!({"to": "function:helper"}),
+        );
+        let verdict = judge_alone(&unknown).await;
+        assert!(is_unverifiable(&verdict));
+        assert!(!verdict.is_refuted(), "un type inconnu ne réfute rien");
+    }
+
+    #[tokio::test]
+    async fn no_calls_holds_when_the_call_is_absent() {
+        let note = a_belief(
+            AssertionCheckType::NoCalls,
+            "function:main",
+            serde_json::json!({"to": "function:forbidden"}),
+        );
+        assert_eq!(
+            judge_alone(&note).await,
+            Verdict::Holds("main n'appelle pas forbidden".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn implements_holds_on_the_edge_and_needs_a_trait_and_a_known_kind() {
+        let note = a_belief(
+            AssertionCheckType::Implements,
+            "struct:Store",
+            serde_json::json!({"trait": "Clone"}),
+        );
+        let graph = seeded(&note).await;
+        graph.belief_links.write().await.insert((
+            "struct".into(),
+            "Store".into(),
+            "IMPLEMENTS_TRAIT".into(),
+            "trait".into(),
+            "Clone".into(),
+        ));
+        assert_eq!(
+            verify(&graph, &note).await.unwrap(),
+            Verdict::Holds("Store implémente Clone".into())
+        );
+
+        let no_trait = a_belief(
+            AssertionCheckType::Implements,
+            "struct:Store",
+            serde_json::json!({}),
+        );
+        let verdict = judge_alone(&no_trait).await;
+        assert!(is_unverifiable(&verdict));
+        assert!(verdict.message().contains("parameters.trait"));
+
+        let unknown = a_belief(
+            AssertionCheckType::Implements,
+            "banana:Store",
+            serde_json::json!({"trait": "Clone"}),
+        );
+        assert!(is_unverifiable(&judge_alone(&unknown).await));
+    }
+
+    #[tokio::test]
+    async fn depends_on_is_judged_on_the_real_edge() {
+        let note = a_belief(
+            AssertionCheckType::DependsOn,
+            "file:src/a.rs",
+            serde_json::json!({"on": "file:src/b.rs"}),
+        );
+        let graph = seeded(&note).await;
+        assert_eq!(
+            verify(&graph, &note).await.unwrap(),
+            Verdict::Fails("src/a.rs ne dépend pas de src/b.rs".into())
+        );
+
+        graph.belief_links.write().await.insert((
+            "file".into(),
+            "src/a.rs".into(),
+            "DEPENDS_ON".into(),
+            "file".into(),
+            "src/b.rs".into(),
+        ));
+        assert_eq!(
+            verify(&graph, &note).await.unwrap(),
+            Verdict::Holds("src/a.rs dépend de src/b.rs".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn depends_on_without_a_readable_known_target_is_unverifiable() {
+        let cases = [
+            ("file:src/a.rs", serde_json::json!({}), "parameters.on"),
+            (
+                "file:src/a.rs",
+                serde_json::json!({"on": "file:"}),
+                "illisible",
+            ),
+            (
+                "file:src/a.rs",
+                serde_json::json!({"on": "banana:x"}),
+                "inconnu",
+            ),
+        ];
+        for (target, params, said) in cases {
+            let note = a_belief(AssertionCheckType::DependsOn, target, params.clone());
+            let verdict = judge_alone(&note).await;
+            assert!(is_unverifiable(&verdict), "{params} → {verdict:?}");
+            assert!(
+                verdict.message().contains(said),
+                "{params} → {}",
+                verdict.message()
+            );
+        }
+    }
+
+    /// `Warn` trace la réfutation sans toucher au statut de la note.
+    #[tokio::test]
+    async fn a_warn_refutation_is_counted_but_not_sanctioned() {
+        let mut note = a_belief(
+            AssertionCheckType::Exists,
+            "function:vanished",
+            serde_json::Value::Null,
+        );
+        if let Some(rule) = note.assertion_rule.as_mut() {
+            rule.on_violation = ViolationAction::Warn;
+        }
+        let graph = seeded(&note).await;
+
+        let report = reverify(&graph, 10).await.unwrap();
+        assert_eq!(report.refuted, 1);
+        assert_eq!(report.unsanctioned, 1);
+        assert_eq!(report.flagged, 0);
+        let stored = graph.notes.read().await.get(&note.id).cloned().unwrap();
+        assert_eq!(
+            stored.status,
+            NoteStatus::Active,
+            "Warn ne casse pas la note"
+        );
+        assert!(
+            stored.last_assertion_result.is_some(),
+            "mais le verdict est tracé"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_boot_pass_returns_its_report() {
+        let note = a_belief(
+            AssertionCheckType::Exists,
+            "function:vanished",
+            serde_json::Value::Null,
+        );
+        let graph = seeded(&note).await;
+        let report = reverify_at_boot(&graph)
+            .await
+            .expect("un rapport, sous budget");
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.refuted, 1);
+    }
+
+    /// Les quatre contrôles de relation, au niveau du FICHIER, disent tous « je ne sais pas ».
+    #[test]
+    fn every_relation_check_is_unverifiable_from_a_file() {
+        use crate::notes::FileInfo;
+
+        let file_info = FileInfo {
+            path: "src/lib.rs".into(),
+            functions: Vec::new(),
+            structs: Vec::new(),
+            symbols: Vec::new(),
+            imports: Vec::new(),
+        };
+        for check in [
+            AssertionCheckType::DependsOn,
+            AssertionCheckType::Calls,
+            AssertionCheckType::NoCalls,
+            AssertionCheckType::Implements,
+        ] {
+            let note = a_belief(check.clone(), "function:main", serde_json::json!({}));
+            let result = crate::notes::lifecycle::NoteLifecycleManager::new()
+                .verify_assertion(&note, &file_info);
+            assert!(
+                !result.passed,
+                "{check:?} ne peut pas être « vrai » depuis un fichier"
+            );
+            assert!(
+                result.message.contains("graphe"),
+                "{check:?} : {}",
+                result.message
+            );
+        }
+    }
+
+    /// `is_unverifiable` distingue « je ne sais pas » de « c'est faux ».
+    #[test]
+    fn an_unverifiable_result_is_told_apart_from_a_failure() {
+        assert!(Verdict::Unverifiable("?".into())
+            .to_result()
+            .is_unverifiable());
+        assert!(!Verdict::Fails("non".into()).to_result().is_unverifiable());
+        assert!(!Verdict::Holds("oui".into()).to_result().is_unverifiable());
     }
 }
