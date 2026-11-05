@@ -11,6 +11,7 @@
 use crate::neo4j::traits::*;
 
 pub mod activation;
+pub mod conduction;
 pub mod config;
 pub mod forgetting;
 pub mod intent;
