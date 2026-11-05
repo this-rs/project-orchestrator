@@ -745,6 +745,112 @@ mod tests {
         );
     }
 
+    /// RM-4 — `link_commits` relie ce que la fenêtre contient et rend les commits trouvés.
+    /// C'est la moitié COMMIT de `enrich`, celle que le close d'une session appelle pour
+    /// qu'une tâche finie par un chat cesse de rendre `get_task_commits() == []`.
+    #[tokio::test]
+    async fn link_commits_links_the_commits_of_the_window() {
+        use crate::test_helpers::{git_repo_with_one_commit, test_plan, test_task};
+
+        let (_repo, cwd) = git_repo_with_one_commit();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+        let task = test_task();
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let enricher = TaskEnricher::new(graph.clone());
+        let (linked, commits) = enricher
+            .link_commits(
+                task_id,
+                plan_id,
+                None,
+                Utc::now() - chrono::Duration::hours(3),
+                &cwd,
+            )
+            .await;
+
+        assert_eq!(commits.len(), 1, "la fenêtre contient exactement un commit");
+        assert!(linked >= 1, "il est relié à la tâche");
+        assert_eq!(
+            graph.get_task_commits(task_id).await.unwrap().len(),
+            1,
+            "la tâche porte désormais le commit"
+        );
+    }
+
+    /// Une fenêtre qui s'ouvre APRÈS le commit ne contient rien : aucun lien n'est écrit.
+    #[tokio::test]
+    async fn link_commits_outside_the_window_links_nothing() {
+        use crate::test_helpers::{git_repo_with_one_commit, test_plan, test_task};
+
+        let (_repo, cwd) = git_repo_with_one_commit();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+        let task = test_task();
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let enricher = TaskEnricher::new(graph.clone());
+        let (linked, commits) = enricher
+            .link_commits(
+                task_id,
+                plan_id,
+                None,
+                Utc::now() - chrono::Duration::seconds(60),
+                &cwd,
+            )
+            .await;
+
+        assert!(commits.is_empty(), "rien n'appartient à cette fenêtre");
+        assert_eq!(linked, 0);
+        assert!(graph.get_task_commits(task_id).await.unwrap().is_empty());
+    }
+
+    /// `enrich` fait la même chose puis écrit ses artefacts — vérifié sur un vrai dépôt,
+    /// parce que c'est le chemin complet que le runner emprunte.
+    #[tokio::test]
+    async fn enrich_on_a_real_repository_links_commits_and_writes_its_artefacts() {
+        use crate::test_helpers::{git_repo_with_one_commit, test_plan, test_task};
+
+        let (_repo, cwd) = git_repo_with_one_commit();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+        let task = test_task();
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let enricher = TaskEnricher::new(graph.clone());
+        let result = enricher
+            .enrich(
+                task_id,
+                plan_id,
+                None,
+                None,
+                Utc::now() - chrono::Duration::hours(3),
+                &cwd,
+            )
+            .await;
+
+        assert!(
+            result.commits_linked >= 1,
+            "le commit de la fenêtre est relié"
+        );
+        assert!(
+            result.note_created,
+            "l'enrichissement complet écrit aussi sa note"
+        );
+    }
+
     #[test]
     fn test_enrich_result_default() {
         let result = EnrichResult::default();

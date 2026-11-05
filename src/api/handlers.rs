@@ -675,9 +675,43 @@ fn human_verdict(from_a_session: bool, new_status: &str) -> Option<f64> {
     }
 }
 
+/// Record the HUMAN verdict a task status change carries, if it carries one.
+///
+/// Pulled out of [`update_task`] so the rule can be exercised without an HTTP request:
+/// the graph is only needed to propagate the score to the neighbouring entities, and a
+/// rule that can only be tested through a router is a rule nobody tests.
+async fn record_human_verdict(
+    graph: std::sync::Arc<dyn crate::neo4j::traits::GraphStore>,
+    from_a_session: bool,
+    new_status: &str,
+    task_id: Uuid,
+) {
+    let Some(score) = human_verdict(from_a_session, new_status) else {
+        return;
+    };
+    let Some(feedback) = crate::feedback::models::ExplicitFeedback::new(
+        crate::feedback::models::FeedbackTarget::Task,
+        task_id,
+        score,
+        "human".to_string(),
+    ) else {
+        return;
+    };
+
+    crate::feedback::tracker::OutcomeTracker::global()
+        .record_explicit_feedback(feedback.clone())
+        .await;
+    tokio::spawn(async move {
+        if let Err(e) = crate::feedback::propagator::propagate_feedback(graph, &feedback).await {
+            tracing::warn!("[feedback] propagation failed: {}", e);
+        }
+    });
+}
+
 #[cfg(test)]
 mod human_verdict_tests {
-    use super::human_verdict;
+    use super::{human_verdict, record_human_verdict};
+    use uuid::Uuid;
 
     /// RM-7 — le verdict d'un agent ne compte pas. Seul un humain juge.
     #[test]
@@ -699,6 +733,41 @@ mod human_verdict_tests {
             assert_eq!(human_verdict(false, s), None, "statut non terminal: {s}");
             assert_eq!(human_verdict(true, s), None, "statut non terminal: {s}");
         }
+    }
+
+    /// Le verdict atteint VRAIMENT les statistiques d'apprentissage — et celui d'un agent
+    /// ne les touche pas. C'est la chaîne complète de RM-7, sans requête HTTP.
+    ///
+    /// Le compteur est un singleton de processus : on mesure un ÉCART, jamais une valeur
+    /// absolue, pour qu'un autre test qui écrirait au même endroit ne fasse pas échouer
+    /// celui-ci sur un nombre qui ne lui appartient pas.
+    #[tokio::test]
+    async fn only_a_human_verdict_reaches_the_learning_stats() {
+        let graph: std::sync::Arc<dyn crate::neo4j::traits::GraphStore> =
+            std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let counter = || async {
+            crate::feedback::tracker::OutcomeTracker::global()
+                .get_learning_stats()
+                .await
+                .total_explicit_feedback
+        };
+
+        let before = counter().await;
+
+        // An agent's own "completed": a declaration, not evidence.
+        record_human_verdict(graph.clone(), true, "completed", Uuid::new_v4()).await;
+        assert_eq!(
+            counter().await,
+            before,
+            "le « terminé » d'un agent ne doit rien écrire"
+        );
+
+        // A person's verdict.
+        record_human_verdict(graph, false, "completed", Uuid::new_v4()).await;
+        assert!(
+            counter().await > before,
+            "le verdict d'un humain doit atteindre les statistiques d'apprentissage"
+        );
     }
 }
 
@@ -782,28 +851,13 @@ pub async fn update_task(
     // (`admin(get_learning_stats)`). An agent's own "completed" writes nothing: it is a
     // declaration, and a declaration is not evidence (RM-2, RM-7, decision `3067a49f`).
     if let Some((_, new_status)) = &status_change {
-        if let Some(score) =
-            human_verdict(headers.get("x-session-id").is_some(), new_status.as_str())
-        {
-            if let Some(feedback) = crate::feedback::models::ExplicitFeedback::new(
-                crate::feedback::models::FeedbackTarget::Task,
-                task_id,
-                score,
-                "human".to_string(),
-            ) {
-                crate::feedback::tracker::OutcomeTracker::global()
-                    .record_explicit_feedback(feedback.clone())
-                    .await;
-                let graph = state.orchestrator.neo4j_arc();
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        crate::feedback::propagator::propagate_feedback(graph, &feedback).await
-                    {
-                        tracing::warn!("[feedback] propagation failed: {}", e);
-                    }
-                });
-            }
-        }
+        record_human_verdict(
+            state.orchestrator.neo4j_arc(),
+            headers.get("x-session-id").is_some(),
+            new_status,
+            task_id,
+        )
+        .await;
     }
 
     // Auto-link session to task + plan when transitioning to in_progress

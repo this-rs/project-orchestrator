@@ -753,6 +753,85 @@ mod tests {
         assert_eq!(v.evidence_count, 1);
     }
 
+    /// RM-4 — un run nomme les commits de SA fenêtre, lus dans l'arbre de SON projet.
+    ///
+    /// Avant, `collect_run_episode` écrivait `commit_shas: Vec::new()` et
+    /// `files_modified: 0` en dur : un run qui livrait du code déclarait zéro preuve, et
+    /// `run_validation` n'avait donc jamais rien à compter.
+    #[tokio::test]
+    async fn a_run_names_the_commits_of_its_window() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::protocol::models::ProtocolRun;
+
+        let (_repo, cwd) = crate::test_helpers::git_repo_with_one_commit();
+
+        let store = MockGraphStore::new();
+        let mut project = crate::test_helpers::test_project_named("alpha");
+        project.root_path = cwd;
+        store.create_project(&project).await.unwrap();
+
+        let mut run = ProtocolRun::new(Uuid::new_v4(), Uuid::new_v4(), "Start");
+        run.project_id = Some(project.id);
+        // The window opens before the (backdated) commit, so the commit is inside it.
+        run.started_at = Utc::now() - chrono::Duration::hours(3);
+        run.complete();
+        let run_id = run.id;
+        store.protocol_runs.write().await.insert(run_id, run);
+
+        let episode = collect_episode(&store, run_id, project.id)
+            .await
+            .unwrap()
+            .expect("a completed run leaves an episode");
+
+        assert_eq!(
+            episode.outcome.commit_shas.len(),
+            1,
+            "the commit of the window is named: {:?}",
+            episode.outcome.commit_shas
+        );
+        assert!(
+            episode.outcome.files_modified >= 1,
+            "a committed file counts as modified"
+        );
+        assert_eq!(
+            episode.validation.evidence_count, 1,
+            "the commit IS the evidence"
+        );
+        assert_eq!(
+            episode.validation.feedback_type,
+            FeedbackType::ImplicitPositive,
+            "a run that delivered is a run that is proven"
+        );
+    }
+
+    /// Un projet sans arbre de travail (projet `work`, ou pas encore lié à un dépôt) ne
+    /// fait pas échouer la collecte : il ne nomme simplement aucun commit.
+    #[tokio::test]
+    async fn a_run_whose_project_has_no_working_tree_keeps_no_sha() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::protocol::models::ProtocolRun;
+
+        let store = MockGraphStore::new();
+        let mut project = crate::test_helpers::test_project_named("no-root");
+        project.root_path = String::new();
+        store.create_project(&project).await.unwrap();
+
+        let mut run = ProtocolRun::new(Uuid::new_v4(), Uuid::new_v4(), "Start");
+        run.project_id = Some(project.id);
+        run.complete();
+        let run_id = run.id;
+        store.protocol_runs.write().await.insert(run_id, run);
+
+        let episode = collect_episode(&store, run_id, project.id)
+            .await
+            .unwrap()
+            .expect("a completed run leaves an episode");
+
+        assert!(episode.outcome.commit_shas.is_empty());
+        assert_eq!(episode.validation.evidence_count, 0);
+        assert_eq!(episode.validation.feedback_type, FeedbackType::None);
+    }
+
     #[tokio::test]
     async fn test_collect_episode_from_completed_run() {
         use crate::neo4j::mock::MockGraphStore;

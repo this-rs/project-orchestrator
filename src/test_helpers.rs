@@ -875,3 +875,54 @@ mod tests {
         assert!(result.is_ok());
     }
 }
+
+/// A throwaway git repository holding ONE commit that touches `a.rs`, with its path.
+///
+/// The `TempDir` is returned so the caller keeps it alive: dropping it deletes the
+/// repository, and a test that only kept the path would then read a directory that no
+/// longer exists. Shared by the episode collector and the enricher, which must read the
+/// SAME window from the SAME working tree (RM-4).
+pub fn git_repo_with_one_commit() -> (tempfile::TempDir, String) {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let path = dir.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&path)
+            .output()
+            .expect("git must be installed for this test");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.invalid"]);
+    git(&["config", "user.name", "test"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(path.join("a.rs"), "fn a() {}\n").expect("write a.rs");
+    git(&["add", "."]);
+    // The commit is dated TWO HOURS AGO on purpose: a window can then be chosen to
+    // include it or to exclude it, without relying on how git reads a future date (it
+    // does not filter on one, which made the first version of this helper useless for
+    // testing an empty window).
+    let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    let out = Command::new("git")
+        .args(["commit", "-q", "-m", "feat: a"])
+        .env("GIT_AUTHOR_DATE", &two_hours_ago)
+        .env("GIT_COMMITTER_DATE", &two_hours_ago)
+        .current_dir(&path)
+        .output()
+        .expect("git commit");
+    assert!(
+        out.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cwd = path.to_string_lossy().to_string();
+    (dir, cwd)
+}
