@@ -329,7 +329,11 @@ fn check(signature: &TaskSignature, facts: &ModelFacts) -> Option<RejectReason> 
     if let Some(quota) = &facts.quota_exhausted {
         // A model-scoped hold is carried as `window: "model:<name>"` (quota.rs): name the model,
         // so the reason is distinguishable from an account-wide exhaustion.
-        if let Some(model) = quota.window.as_deref().and_then(|w| w.strip_prefix("model:")) {
+        if let Some(model) = quota
+            .window
+            .as_deref()
+            .and_then(|w| w.strip_prefix("model:"))
+        {
             return Some(RejectReason::QuotaExhaustedModel {
                 resets_at_ms: quota.resets_at_ms,
                 model: model.to_owned(),
@@ -462,13 +466,13 @@ impl HealthCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::chat::provider::cognitive::signature::{ContextHints, TaskClass};
     use crate::chat::provider::limits::ManualClock;
     use crate::chat::provider::quota::QuotaRegistry;
     use crate::chat::provider::resolver::CLAUDE_CODE;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+    use std::sync::Arc;
 
     fn good() -> ModelFacts {
         ModelFacts {
@@ -875,10 +879,7 @@ mod tests {
 
     fn quota_registry() -> (Arc<ManualClock>, QuotaRegistry) {
         let clock = Arc::new(ManualClock::at("2026-10-21T10:00:00Z"));
-        (
-            Arc::clone(&clock),
-            QuotaRegistry::new().with_clock(clock),
-        )
+        (Arc::clone(&clock), QuotaRegistry::new().with_clock(clock))
     }
 
     /// A Claude Code pair that meets every non-quota constraint.

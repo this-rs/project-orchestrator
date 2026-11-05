@@ -4413,4 +4413,29 @@ mod pool_spans_providers_tests {
             "the count is of providers, not of entries"
         );
     }
+
+    /// Two switches in ONE message must not collapse: the reason is part of the
+    /// identity, so a limit and a safeguards refusal read as two different events.
+    #[test]
+    fn a_model_change_fingerprints_with_its_reason() {
+        let changed =
+            |model: &str, reason: Option<&str>| crate::chat::types::ChatEvent::ModelChanged {
+                model: model.to_string(),
+                reason: reason.map(str::to_string),
+            };
+        assert_eq!(
+            changed("m2", Some("limit_reached")).fingerprint(),
+            Some("model_changed:m2:limit_reached".to_string())
+        );
+        assert_ne!(
+            changed("m2", Some("limit_reached")).fingerprint(),
+            changed("m2", Some("request_refused")).fingerprint(),
+            "the reason tells the two switches apart"
+        );
+        assert_eq!(
+            changed("m2", None).fingerprint(),
+            Some("model_changed:m2:".to_string()),
+            "a switch without a reason keeps its plain key"
+        );
+    }
 }

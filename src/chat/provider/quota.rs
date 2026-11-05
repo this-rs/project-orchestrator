@@ -1318,6 +1318,39 @@ mod tests {
     }
 
     #[test]
+    fn a_family_match_survives_case_and_never_fires_on_an_empty_name() {
+        // Same name, other case: only the FAMILY path can see it (the exact lookup
+        // is case-sensitive), so this is the `held == model` branch of `same_family`.
+        let (_clock, registry) = registry();
+        let until = ms_of("2026-10-22T10:00:00Z");
+        registry.mark_model_rate_limited("claude-code", "Fable", Some(until), None);
+        assert!(
+            registry.model_exhausted("claude-code", "fable").is_some(),
+            "the same family, written another way"
+        );
+        // An empty model name never matches a hold: the early return, not a panic.
+        assert!(registry.model_exhausted("claude-code", "   ").is_none());
+        // And an instance nobody held has nothing to match against.
+        assert!(registry.model_exhausted("other", "fable").is_none());
+    }
+
+    #[test]
+    fn a_refusal_never_shortens_a_model_reset_already_known() {
+        // Measured rule, same as the instance-level one: a refusal dated EARLIER than
+        // the reset we already know must not make the model eligible sooner.
+        let (_clock, registry) = registry();
+        let far = ms_of("2026-10-24T10:00:00Z");
+        let near = ms_of("2026-10-22T10:00:00Z");
+        registry.mark_model_rate_limited("claude-code", "Fable", Some(far), None);
+        registry.mark_model_rate_limited("claude-code", "Fable", Some(near), None);
+        let held = registry.model_exhausted("claude-code", "Fable").unwrap();
+        assert_eq!(
+            held.resets_at_ms, far,
+            "the reset already known and still ahead is kept"
+        );
+    }
+
+    #[test]
     fn a_model_hold_without_a_date_uses_the_fallback_and_expires_by_itself() {
         let (clock, registry) = registry();
         registry.mark_model_rate_limited("claude-code", "claude-fable-5-1", None, None);

@@ -2494,9 +2494,8 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()?;
-        let mut reduced = nexus_claude::agent::TurnInput::text(crate::refs::turn::visible_text(
-            &shown,
-        ));
+        let mut reduced =
+            nexus_claude::agent::TurnInput::text(crate::refs::turn::visible_text(&shown));
         // The images stay: an image is not context bloat, and dropping it would change
         // what the person asked. They are already the `InputBlock::Image` blocks of the
         // refused input, so keep those as they are.

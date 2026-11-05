@@ -1350,15 +1350,12 @@ impl AgentSessionHandle {
                 resets_at_ms,
             } => quota.mark_rate_limited(&self.provider_id, *resets_at_ms, *retry_after_ms),
             ProviderError::ModelLimitReached {
-                // `model: Some(_)` in the pattern, not an `if let` inside the arm: clippy's
-                // collapsible_match, and the behaviour is the same — a refusal that names
-                // no model falls through to `_`, exactly as it did before.
                 model: Some(model),
                 resets_at_ms,
             } => {
                 // A MODEL-wide limit holds only that model: the instance's other models
                 // stay eligible. The model is the one the provider named in its refusal
-                // (the model in force); the handle does not otherwise track the model.
+                // (the model in force); the handle does not otherwise track it.
                 quota.mark_model_rate_limited(&self.provider_id, model, *resets_at_ms, None);
             }
             error if super::provider::cognitive::decider::is_out_of_credit(error) => {
