@@ -1350,15 +1350,16 @@ impl AgentSessionHandle {
                 resets_at_ms,
             } => quota.mark_rate_limited(&self.provider_id, *resets_at_ms, *retry_after_ms),
             ProviderError::ModelLimitReached {
-                model,
+                // `model: Some(_)` in the pattern, not an `if let` inside the arm: clippy's
+                // collapsible_match, and the behaviour is the same — a refusal that names
+                // no model falls through to `_`, exactly as it did before.
+                model: Some(model),
                 resets_at_ms,
             } => {
                 // A MODEL-wide limit holds only that model: the instance's other models
                 // stay eligible. The model is the one the provider named in its refusal
                 // (the model in force); the handle does not otherwise track the model.
-                if let Some(model) = model {
-                    quota.mark_model_rate_limited(&self.provider_id, model, *resets_at_ms, None);
-                }
+                quota.mark_model_rate_limited(&self.provider_id, model, *resets_at_ms, None);
             }
             error if super::provider::cognitive::decider::is_out_of_credit(error) => {
                 quota.mark_out_of_credit(&self.provider_id);
@@ -2357,9 +2358,8 @@ impl AgentSessionHandle {
                     && tried_models.len() < MAX_MODEL_SWITCHES_PER_TURN
                 {
                     if let Some(services) = &self.services {
-                        if let Some(model) = services
-                            .model_after_limit(&self.session_id, &error)
-                            .await
+                        if let Some(model) =
+                            services.model_after_limit(&self.session_id, &error).await
                         {
                             if !tried_models.iter().any(|tried| tried == &model) {
                                 tried_models.push(model.clone());
@@ -2393,9 +2393,8 @@ impl AgentSessionHandle {
             if let Some(error) = context_refusal.take() {
                 if !shown && outcome.tools.is_empty() && !evicted {
                     if let Some(services) = &self.services {
-                        if let Some(reduced) = services
-                            .adapt_context(&self.session_id, &input)
-                            .await
+                        if let Some(reduced) =
+                            services.adapt_context(&self.session_id, &input).await
                         {
                             evicted = true;
                             input = reduced;
@@ -7476,7 +7475,11 @@ mod answered_tests {
             2,
             "the refused turn and its one replayed switch"
         );
-        assert_eq!(host.seen(), [true], "one turn, answered on the second model");
+        assert_eq!(
+            host.seen(),
+            [true],
+            "one turn, answered on the second model"
+        );
         assert_eq!(
             provider.state.models.lock().unwrap().as_slice(),
             ["m2"],
@@ -7555,10 +7558,9 @@ mod answered_tests {
         );
         assert_eq!(host.seen(), [true], "one turn, answered after the eviction");
         assert!(
-            seen.iter().any(
-                |e| matches!(e, ChatEvent::SystemHint { content }
-                    if content.contains("too long") && content.contains("smaller"))
-            ),
+            seen.iter()
+                .any(|e| matches!(e, ChatEvent::SystemHint { content }
+                    if content.contains("too long") && content.contains("smaller"))),
             "the eviction is announced as a system hint: {seen:#?}"
         );
     }
@@ -7634,7 +7636,11 @@ mod answered_tests {
             ["go", "reduced"],
             "the replay carried the reduced input once"
         );
-        assert_eq!(host.seen(), [false], "the second refusal ends the turn unanswered");
+        assert_eq!(
+            host.seen(),
+            [false],
+            "the second refusal ends the turn unanswered"
+        );
         assert!(
             seen.iter()
                 .any(|e| matches!(e, ChatEvent::Result { is_error: true, .. })),
@@ -7717,7 +7723,11 @@ mod answered_tests {
             ["m2", "m3", "m4"],
             "three switches at most, the fourth name is never asked for"
         );
-        assert_eq!(host.seen(), [false], "the last refusal ends the turn unanswered");
+        assert_eq!(
+            host.seen(),
+            [false],
+            "the last refusal ends the turn unanswered"
+        );
         assert!(
             seen.iter()
                 .any(|e| matches!(e, ChatEvent::Result { is_error: true, .. })),
@@ -7730,7 +7740,7 @@ mod answered_tests {
     #[tokio::test]
     async fn a_model_limit_holds_only_the_model_not_the_account() {
         let registry = Arc::new(crate::chat::provider::quota::QuotaRegistry::new());
-        let (provider, handle, host) = session_with_quota(registry.clone(), 0).await;
+        let (provider, handle, _host) = session_with_quota(registry.clone(), 0).await;
         play_events(
             &provider,
             &handle,
