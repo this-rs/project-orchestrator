@@ -274,7 +274,12 @@ curl -X POST http://localhost:8080/api/chat/sessions \
 
 ### GET /api/chat/sessions/{id} -- Protected
 
-Get session details.
+Get session details. Besides the listing's fields, the single-session read carries
+`capabilities`, `effective_capabilities`, and the spend of the session with its sub-agents
+(`Agent` tool): `total_cost_usd` is the session's OWN spend, `children_cost_usd` what its
+sub-agents spent (kept apart so its routing decision is not charged twice), and
+`aggregated_cost_usd` = `total_cost_usd` + `children_cost_usd`. The listings do not carry the
+last two.
 
 ```bash
 curl -H "Authorization: Bearer <JWT>" \

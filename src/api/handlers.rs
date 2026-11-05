@@ -1474,8 +1474,7 @@ pub(crate) async fn launch_delegation(
     // The delegation's OWN delay and budget (PYSR-3), from the PlanRunner's constants: the engine
     // enforces the spend and token caps (`BudgetExceeded`), the listener the delay (`Interrupted`).
     let limits = crate::runner::DelegationLimits::default();
-    chat_request.max_cost_usd = (limits.max_cost_usd > 0.0).then_some(limits.max_cost_usd);
-    chat_request.max_tokens = chat_request.max_tokens.or(limits.max_tokens);
+    put_delegation_caps(&mut chat_request, &limits);
     let graph = state.orchestrator.neo4j_arc();
     // The model alias set on THIS task (A16 level "task"): a delegation used to
     // leave it out, so the alias never applied to a delegated task.
@@ -1752,6 +1751,17 @@ pub(crate) async fn launch_delegation(
     })
 }
 
+/// Puts a delegation's spend and token caps on its session request (→ `SessionLimits`): the
+/// spend cap is the delegation's, a token cap the request already names is kept.
+fn put_delegation_caps(
+    request: &mut crate::chat::types::ChatRequest,
+    limits: &crate::runner::DelegationLimits,
+) {
+    let (tokens, usd) = limits.request_caps();
+    request.max_cost_usd = usd;
+    request.max_tokens = request.max_tokens.or(tokens);
+}
+
 /// Puts the model alias set on the task (A16 level "task") on the request. A
 /// read that fails is "no alias", never a stop.
 async fn apply_task_alias(
@@ -1958,7 +1968,6 @@ async fn listen_delegation_result(
     limits: crate::runner::DelegationLimits,
     halt: Option<Arc<dyn DelegationHalt>>,
 ) -> Option<nexus_claude::agent::StopReason> {
-    use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
     use nexus_claude::agent::StopReason;
 
     // Tokio's clock, so a paused test clock reaches the delay. The delay is the delegation's
@@ -1971,148 +1980,64 @@ async fn listen_delegation_result(
         std::time::Duration::from_secs(limits.timeout_secs)
     };
 
-    // Every `break` but the `Result` one leaves `execution` to drop: closed
-    // `failed` (channel closed without a result).
+    let closure = DelegationClosure {
+        task_id,
+        task_title,
+        event_bus,
+        cwd,
+        close,
+        owner,
+        limits,
+        halt,
+    };
+
+    // Every `break` leaves `execution` to drop: closed `failed` (channel closed without a
+    // result). Every other end — a `Result`, the delay — goes through ONE closure
+    // (`DelegationClosure::finish`, PYSR-3b).
     loop {
         let remaining = timeout.saturating_sub(start.elapsed());
         if remaining.is_zero() {
             tracing::warn!(task_id = %task_id, timeout_secs = limits.timeout_secs, "Delegation past its delay: the child is stopped");
-            // Stop the CHILD, not only the listening: an interrupted turn, then a closed session.
-            if let Some(halt) = &halt {
-                halt.halt().await;
+            // Stop the CHILD, not only the listening: its running turn is interrupted, and
+            // what it spent up to there is read from the `Result` that interrupted turn gives
+            // (bounded wait). The session is closed by the closure, its descendants with it.
+            if let Some(halt) = &closure.halt {
+                halt.interrupt().await;
             }
-            let mut end = DelegationEnd::failed();
-            end.duration_secs = Some(start.elapsed().as_secs_f64());
-            end.stop = Some(StopReason::Interrupted);
-            execution.close(&end).await;
-            return Some(StopReason::Interrupted);
+            let ended = result_after_interrupt(&mut rx).await;
+            let duration_secs = start.elapsed().as_secs_f64();
+            let (end, cost_detail) = match ended {
+                Some(result) => {
+                    let (end, cost_detail) = end_of_result(result, &limits, duration_secs);
+                    (
+                        DelegationEnd {
+                            is_error: true,
+                            ..end
+                        },
+                        cost_detail,
+                    )
+                }
+                None => (
+                    DelegationEnd {
+                        duration_secs: Some(duration_secs),
+                        ..DelegationEnd::failed()
+                    },
+                    None,
+                ),
+            };
+            // The delay is why it ended, whatever the interrupted turn said.
+            let end = DelegationEnd {
+                stop: Some(StopReason::Interrupted),
+                ..end
+            };
+            return closure.finish(end, cost_detail, execution).await;
         }
 
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await {
-            Ok(Ok(crate::chat::types::ChatEvent::Result {
-                cost_usd,
-                mut is_error,
-                cost: cost_detail,
-                usage,
-                model,
-                num_turns,
-                subtype,
-                stop_reason,
-                ..
-            })) => {
-                // The engine enforces the limits we gave it (`ChatRequest::max_cost_usd` /
-                // `max_tokens`) and says so; a cost over the cap with no such word is a
-                // budget stop all the same (an engine that cannot enforce live).
-                let tokens = usage.as_ref().map(|u| {
-                    ["input_tokens", "output_tokens"]
-                        .iter()
-                        .map(|k| u.get(*k).and_then(|v| v.as_u64()).unwrap_or(0))
-                        .sum::<u64>()
-                });
-                let stop =
-                    budget_stop_of(&limits, stop_reason.as_deref(), &subtype, cost_usd, tokens);
-                if stop.is_some() {
-                    is_error = true;
-                }
-                let duration_secs = start.elapsed().as_secs_f64();
-                // Close the loop: the arm that was chosen learns how it went.
-                if let Some(close) = &close {
-                    let outcome = crate::runner::routing::outcome_of_result(
-                        is_error,
-                        (duration_secs * 1000.0) as u64,
-                        cost_detail.as_ref(),
-                    );
-                    close
-                        .routing
-                        .close(close.graph.as_ref(), close.decision_id, &outcome)
-                        .await;
-                }
-                let cost = cost_usd.unwrap_or(0.0);
-                let end = DelegationEnd::of_result(
-                    is_error,
-                    cost_usd,
-                    cost_detail.as_ref(),
-                    usage.as_ref(),
-                    model,
-                    num_turns,
-                    duration_secs,
-                );
-                let end = DelegationEnd { stop, ..end };
-
-                // The delegation's spend is its run's spend (B36), and only
-                // when an executor of that run delegated: only a real spend
-                // (`reported`/`priced`) moves the marginal counter that can
-                // cut the run, exactly as the run's own attempts do.
-                {
-                    let mut global = crate::runner::RUNNER_STATE.write().await;
-                    if let Some(ref mut state) = *global {
-                        if state.owns_delegation(owner.run_id, owner.parent_session_id) {
-                            state.add_attempt_cost(&end.attempt_cost());
-                        }
-                    }
-                }
-
-                // Close the delegation's AgentExecution with its cost, basis,
-                // tokens and model: no execution is left `running` (B36).
-                execution.close(&end).await;
-
-                // Emit a CrudEvent so WebSocket clients see the completion
-                let payload = serde_json::json!({
-                    "event": if is_error { "delegation_failed" } else { "delegation_completed" },
-                    "task_id": task_id,
-                    "task_title": task_title,
-                    "cost_usd": cost,
-                    "duration_secs": duration_secs,
-                    "is_error": is_error,
-                    "stop_reason": stop,
-                });
-
-                event_bus.emit(CrudEvent {
-                    entity_type: EntityType::Task,
-                    action: CrudAction::Updated,
-                    entity_id: task_id.to_string(),
-                    related: None,
-                    payload,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    project_id: None,
-                });
-
-                tracing::info!(
-                    task_id = %task_id,
-                    cost_usd = cost,
-                    duration_secs = duration_secs,
-                    is_error = is_error,
-                    "Delegation completed"
-                );
-
-                // Collect commits from agent worktrees (prevents ghost completions)
-                if let Some(ref cwd) = cwd {
-                    if let Ok(run_branch) = crate::runner::git::current_branch(cwd).await {
-                        if !run_branch.is_empty() {
-                            match crate::runner::git::collect_worktree_commits(cwd, &run_branch)
-                                .await
-                            {
-                                Ok(wt_result) => {
-                                    if !wt_result.recovered_commits.is_empty() {
-                                        tracing::info!(
-                                            task_id = %task_id,
-                                            commits = wt_result.recovered_commits.len(),
-                                            "Delegation: recovered commits from agent worktrees"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        task_id = %task_id,
-                                        "Delegation worktree collection failed (non-fatal): {}", e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-
-                return stop;
+            Ok(Ok(result @ crate::chat::types::ChatEvent::Result { .. })) => {
+                let (end, cost_detail) =
+                    end_of_result(result, &limits, start.elapsed().as_secs_f64());
+                return closure.finish(end, cost_detail, execution).await;
             }
             Ok(Ok(_)) => {
                 // Other event types — keep listening
@@ -2132,11 +2057,240 @@ async fn listen_delegation_result(
     None
 }
 
-/// Stops the child of a delegation that went past its own limits: the running turn is
-/// interrupted and the session closed. A seam, so the listener is driven without a manager.
+/// How long the listener waits, once it interrupted a delegation past its delay, for the
+/// `Result` of the interrupted turn — what tells what the child spent. Past it the end is
+/// closed with an `unknown` cost.
+const INTERRUPT_RESULT_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The `Result` an interrupted delegation gives for its cut turn, within
+/// [`INTERRUPT_RESULT_GRACE`]. `None`: none came (the channel closed, or the turn never
+/// answered).
+async fn result_after_interrupt(
+    rx: &mut tokio::sync::broadcast::Receiver<crate::chat::types::ChatEvent>,
+) -> Option<crate::chat::types::ChatEvent> {
+    tokio::time::timeout(INTERRUPT_RESULT_GRACE, async {
+        loop {
+            match rx.recv().await {
+                Ok(result @ crate::chat::types::ChatEvent::Result { .. }) => return Some(result),
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// The end a delegation's `Result` reports, with the cost detail its routing decision is
+/// closed on. The engine enforces the limits we gave it (`ChatRequest::max_cost_usd` /
+/// `max_tokens`) and says so; a cost over the cap with no such word is a budget stop all the
+/// same (an engine that cannot enforce live). Any other event: [`DelegationEnd::failed`].
+fn end_of_result(
+    result: crate::chat::types::ChatEvent,
+    limits: &crate::runner::DelegationLimits,
+    duration_secs: f64,
+) -> (DelegationEnd, Option<serde_json::Value>) {
+    let crate::chat::types::ChatEvent::Result {
+        cost_usd,
+        is_error,
+        cost: cost_detail,
+        usage,
+        model,
+        num_turns,
+        subtype,
+        stop_reason,
+        ..
+    } = result
+    else {
+        return (DelegationEnd::failed(), None);
+    };
+    let tokens = usage.as_ref().map(|u| {
+        ["input_tokens", "output_tokens"]
+            .iter()
+            .map(|k| u.get(*k).and_then(|v| v.as_u64()).unwrap_or(0))
+            .sum::<u64>()
+    });
+    let stop = budget_stop_of(limits, stop_reason.as_deref(), &subtype, cost_usd, tokens);
+    let end = DelegationEnd::of_result(
+        is_error || stop.is_some(),
+        cost_usd,
+        cost_detail.as_ref(),
+        usage.as_ref(),
+        model,
+        num_turns,
+        duration_secs,
+    );
+    (DelegationEnd { stop, ..end }, cost_detail)
+}
+
+/// What every end of a delegation goes through (PYSR-3b): a `Result` of its own, a stop on
+/// its budget, the delay. Before it, a delegation stopped by its delay skipped most of it
+/// (no event, no cost for the run, no commits recovered, its task left as it was, and only
+/// the child itself closed).
+struct DelegationClosure<'a> {
+    task_id: Uuid,
+    task_title: &'a str,
+    event_bus: std::sync::Arc<crate::events::HybridEmitter>,
+    /// Where to recover the commits of agent worktrees from (`None`: an ephemeral worktree).
+    cwd: Option<String>,
+    close: Option<DelegationClose>,
+    owner: DelegationOwner,
+    limits: crate::runner::DelegationLimits,
+    halt: Option<Arc<dyn DelegationHalt>>,
+}
+
+impl DelegationClosure<'_> {
+    /// Closes the delegation that ended on `end`, in this order: its routing decision learns
+    /// how it went, its spend goes to its run (B36), its task is marked with WHY it was
+    /// stopped (a stop only), its AgentExecution is closed (which wakes the session that
+    /// delegated), clients get a `delegation_completed` / `delegation_failed` event, the
+    /// commits of agent worktrees are recovered, and — when its own limits stopped it — its
+    /// session is closed with every session it spawned (cascade). Returns the stop.
+    async fn finish(
+        self,
+        end: DelegationEnd,
+        cost_detail: Option<serde_json::Value>,
+        execution: DelegationExecution,
+    ) -> Option<nexus_claude::agent::StopReason> {
+        use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
+        let task_id = self.task_id;
+        let duration_secs = end.duration_secs.unwrap_or(0.0);
+        // Close the loop: the arm that was chosen learns how it went.
+        if let Some(close) = &self.close {
+            let outcome = crate::runner::routing::outcome_of_result(
+                end.is_error,
+                (duration_secs * 1000.0) as u64,
+                cost_detail.as_ref(),
+            );
+            close
+                .routing
+                .close(close.graph.as_ref(), close.decision_id, &outcome)
+                .await;
+        }
+
+        // The delegation's spend is its run's spend (B36), and only when an executor of that
+        // run delegated: only a real spend (`reported`/`priced`) moves the marginal counter
+        // that can cut the run, exactly as the run's own attempts do.
+        {
+            let mut global = crate::runner::RUNNER_STATE.write().await;
+            if let Some(ref mut state) = *global {
+                if state.owns_delegation(self.owner.run_id, self.owner.parent_session_id) {
+                    state.add_attempt_cost(&end.attempt_cost());
+                }
+            }
+        }
+
+        // A delegation its own limits stopped leaves its task saying so, before the session
+        // that delegated is woken (it reads the task). Finished work is left alone.
+        if let Some(stop) = end.stop {
+            let reason = delegation_stop_reason(stop, &self.limits);
+            match execution.graph.interrupt_task(task_id, &reason).await {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(task_id = %task_id, error = %e, "Delegation: its task could not be marked stopped")
+                }
+            }
+        }
+
+        // Close the delegation's AgentExecution with its cost, basis, tokens and model: no
+        // execution is left `running` (B36).
+        execution.close(&end).await;
+
+        let cost = end.cost_usd.unwrap_or(0.0);
+        self.event_bus.emit(CrudEvent {
+            entity_type: EntityType::Task,
+            action: CrudAction::Updated,
+            entity_id: task_id.to_string(),
+            related: None,
+            payload: serde_json::json!({
+                "event": if end.is_error { "delegation_failed" } else { "delegation_completed" },
+                "task_id": task_id,
+                "task_title": self.task_title,
+                "cost_usd": cost,
+                "duration_secs": duration_secs,
+                "is_error": end.is_error,
+                "stop_reason": end.stop,
+            }),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            project_id: None,
+        });
+
+        tracing::info!(
+            task_id = %task_id,
+            cost_usd = cost,
+            duration_secs = duration_secs,
+            is_error = end.is_error,
+            stop = ?end.stop,
+            "Delegation completed"
+        );
+
+        // Collect commits from agent worktrees (prevents ghost completions)
+        if let Some(ref cwd) = self.cwd {
+            if let Ok(run_branch) = crate::runner::git::current_branch(cwd).await {
+                if !run_branch.is_empty() {
+                    match crate::runner::git::collect_worktree_commits(cwd, &run_branch).await {
+                        Ok(wt_result) => {
+                            if !wt_result.recovered_commits.is_empty() {
+                                tracing::info!(
+                                    task_id = %task_id,
+                                    commits = wt_result.recovered_commits.len(),
+                                    "Delegation: recovered commits from agent worktrees"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                "Delegation worktree collection failed (non-fatal): {}", e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Stopped by its own limits: the child does not stay open, nor anything it spawned.
+        if end.stop.is_some() {
+            if let Some(halt) = &self.halt {
+                halt.close().await;
+            }
+        }
+        end.stop
+    }
+}
+
+/// The reason a delegation stopped by its own limits leaves on its task (PYSR-3b): the
+/// `StopReason`'s wire name first (`interrupted`, `budget_exceeded`), then what was hit.
+fn delegation_stop_reason(
+    stop: nexus_claude::agent::StopReason,
+    limits: &crate::runner::DelegationLimits,
+) -> String {
+    let name = crate::chat::provider::event_map::stop_reason_name(stop);
+    let what = match stop {
+        nexus_claude::agent::StopReason::Interrupted => {
+            format!("past its delay of {}s", limits.timeout_secs)
+        }
+        nexus_claude::agent::StopReason::BudgetExceeded => match limits.request_caps() {
+            (Some(tokens), Some(usd)) => format!("over its budget (${usd} or {tokens} tokens)"),
+            (None, Some(usd)) => format!("over its budget (${usd})"),
+            (Some(tokens), None) => format!("over its budget ({tokens} tokens)"),
+            (None, None) => "over its budget".to_string(),
+        },
+        _ => "stopped".to_string(),
+    };
+    format!("{name}: the delegation was stopped {what}")
+}
+
+/// Stops the child of a delegation that went past its own limits. A seam, so the listener is
+/// driven without a manager.
 #[async_trait::async_trait]
 pub(crate) trait DelegationHalt: Send + Sync {
-    async fn halt(&self);
+    /// The running turn is interrupted (the session stays, so its last `Result` comes).
+    async fn interrupt(&self);
+    /// The session is closed with every session it spawned (cascade): a sub-agent of the
+    /// child does not outlive the stop.
+    async fn close(&self);
 }
 
 /// [`DelegationHalt`] on a chat session.
@@ -2147,11 +2301,18 @@ struct HaltSession {
 
 #[async_trait::async_trait]
 impl DelegationHalt for HaltSession {
-    async fn halt(&self) {
+    async fn interrupt(&self) {
         if let Err(e) = self.manager.interrupt(&self.session_id).await {
             tracing::debug!(session_id = %self.session_id, "interrupting the delegation past its limit: {e}");
         }
-        if let Err(e) = self.manager.close_session(&self.session_id).await {
+    }
+
+    async fn close(&self) {
+        if let Err(e) = self
+            .manager
+            .close_session_with_cascade(&self.session_id, true)
+            .await
+        {
             tracing::debug!(session_id = %self.session_id, "closing the delegation past its limit: {e}");
         }
     }
@@ -9211,14 +9372,294 @@ pub(crate) mod tests {
         assert_eq!(stored.status, AgentExecutionStatus::Timeout);
     }
 
-    /// A `DelegationHalt` that only records it was asked to stop the child.
-    struct HaltRecorder(Arc<std::sync::atomic::AtomicBool>);
+    /// A `DelegationHalt` that records what it was asked (`interrupted`, `closed`) and, when
+    /// it holds the child's channel, answers the interrupt with the `Result` an interrupted
+    /// turn gives.
+    #[derive(Default)]
+    struct HaltRecorder {
+        interrupted: std::sync::atomic::AtomicBool,
+        closed: std::sync::atomic::AtomicBool,
+        on_interrupt:
+            std::sync::Mutex<Option<tokio::sync::broadcast::Sender<crate::chat::types::ChatEvent>>>,
+        result: std::sync::Mutex<Option<crate::chat::types::ChatEvent>>,
+    }
+
+    impl HaltRecorder {
+        fn answering(
+            tx: tokio::sync::broadcast::Sender<crate::chat::types::ChatEvent>,
+            result: crate::chat::types::ChatEvent,
+        ) -> Self {
+            Self {
+                on_interrupt: std::sync::Mutex::new(Some(tx)),
+                result: std::sync::Mutex::new(Some(result)),
+                ..Default::default()
+            }
+        }
+        fn interrupted(&self) -> bool {
+            self.interrupted.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn closed(&self) -> bool {
+            self.closed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
 
     #[async_trait::async_trait]
     impl super::DelegationHalt for HaltRecorder {
-        async fn halt(&self) {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        async fn interrupt(&self) {
+            self.interrupted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let tx = self.on_interrupt.lock().unwrap().take();
+            let result = self.result.lock().unwrap().take();
+            if let (Some(tx), Some(result)) = (tx, result) {
+                let _ = tx.send(result);
+            }
         }
+        async fn close(&self) {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A store holding one task and one open delegation execution of it.
+    async fn delegation_of_a_task() -> (
+        Arc<crate::neo4j::mock::MockGraphStore>,
+        Uuid,
+        Uuid,
+        super::DelegationExecution,
+    ) {
+        use crate::neo4j::GraphStore;
+        let mock = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: Arc<dyn GraphStore> = mock.clone();
+        let mut task = crate::test_helpers::test_task();
+        task.status = crate::neo4j::models::TaskStatus::InProgress;
+        graph.create_task(Uuid::new_v4(), &task).await.unwrap();
+        let mut ae = open_delegation_node();
+        ae.task_id = task.id;
+        graph.create_agent_execution(&ae).await.unwrap();
+        let id = ae.id;
+        (
+            mock,
+            id,
+            task.id,
+            super::DelegationExecution::new(ae, graph, None, None),
+        )
+    }
+
+    /// The `delegation_completed` / `delegation_failed` event the bus received, if any.
+    fn delegation_event(
+        events: &mut tokio::sync::broadcast::Receiver<crate::events::CrudEvent>,
+    ) -> Option<serde_json::Value> {
+        while let Ok(event) = events.try_recv() {
+            let name = event.payload["event"].as_str().unwrap_or("");
+            if name == "delegation_completed" || name == "delegation_failed" {
+                return Some(event.payload);
+            }
+        }
+        None
+    }
+
+    /// PYSR-3b — a delegation stopped by its DELAY goes through the same closure as one that
+    /// ends on its own: the event is emitted, what the interrupted turn spent is the run's,
+    /// the execution carries that cost, the task is marked with the reason (the StopReason's
+    /// name first), and the child is closed with its descendants. Red before: the delay path
+    /// only halted the child and closed the execution (no event, no cost, task untouched).
+    #[tokio::test(start_paused = true)]
+    async fn a_delegation_stopped_by_its_delay_goes_through_the_normal_closure() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let _guard = crate::runner::runner::RUNNER_GLOBALS_TEST_LOCK.lock().await;
+        let executor = Uuid::new_v4();
+        let state = run_with_executor(Uuid::new_v4(), executor);
+        let run_id = state.run_id;
+        *crate::runner::RUNNER_STATE.write().await = Some(state);
+        let (mock, id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::answering(tx.clone(), reported(0.7)));
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+        let event_bus = Arc::new(crate::events::HybridEmitter::new(bus));
+
+        let stop = super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            event_bus,
+            None,
+            None,
+            execution,
+            super::DelegationOwner {
+                run_id: Some(run_id),
+                parent_session_id: Some(executor),
+            },
+            crate::runner::DelegationLimits {
+                timeout_secs: 90,
+                ..Default::default()
+            },
+            Some(halt.clone()),
+        )
+        .await;
+        drop(tx);
+        let run = crate::runner::RUNNER_STATE.read().await.clone().unwrap();
+        reset_runner_globals().await;
+
+        assert_eq!(stop, Some(nexus_claude::agent::StopReason::Interrupted));
+        assert!(halt.interrupted(), "the child's turn is interrupted");
+        assert!(halt.closed(), "the child is closed (with its descendants)");
+        let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.status, AgentExecutionStatus::Timeout);
+        assert_eq!(stored.cost_usd, 0.7, "what the interrupted turn spent");
+        assert_eq!(run.cost_usd, 0.7, "the delegation's spend is its run's");
+        let task = mock.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, crate::neo4j::models::TaskStatus::Interrupted);
+        let reason = task.interrupted_reason.unwrap_or_default();
+        assert!(reason.starts_with("interrupted:"), "{reason}");
+        let event = delegation_event(&mut events).expect("the delegation's end is emitted");
+        assert_eq!(event["event"], "delegation_failed");
+        assert_eq!(event["stop_reason"], "interrupted");
+        assert_eq!(event["cost_usd"], 0.7);
+    }
+
+    /// PYSR-3b — the interrupted turn never answers: the closure still runs, at an `unknown`
+    /// cost (never a `reported` 0).
+    #[tokio::test(start_paused = true)]
+    async fn a_delegation_stopped_by_its_delay_without_a_last_result_is_closed_unknown() {
+        use crate::neo4j::agent_execution::AgentExecutionStatus;
+        let (mock, id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let halt = Arc::new(HaltRecorder::default());
+        let bus = Arc::new(crate::events::EventBus::default());
+        let mut events = bus.subscribe();
+
+        super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(bus)),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits {
+                timeout_secs: 90,
+                ..Default::default()
+            },
+            Some(halt.clone()),
+        )
+        .await;
+        drop(tx);
+
+        let stored = closed_execution(&mock, id).await;
+        assert_eq!(stored.status, AgentExecutionStatus::Timeout);
+        assert_eq!(stored.cost_basis.as_deref(), Some("unknown"));
+        assert!(halt.closed());
+        let task = mock.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, crate::neo4j::models::TaskStatus::Interrupted);
+        assert!(delegation_event(&mut events).is_some());
+    }
+
+    /// PYSR-3b — a delegation stopped by its BUDGET: same closure — its task says why
+    /// (`budget_exceeded: ...`), and the child is closed with its descendants (before, the
+    /// budget stop left the child open and the task untouched).
+    #[tokio::test]
+    async fn a_delegation_stopped_by_its_budget_marks_its_task_and_closes_its_tree() {
+        let (mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let over = crate::runner::DelegationLimits::default().max_cost_usd + 1.0;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        tx.send(reported(over)).unwrap();
+        let halt = Arc::new(HaltRecorder::default());
+
+        let stop = super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt.clone()),
+        )
+        .await;
+
+        assert_eq!(stop, Some(nexus_claude::agent::StopReason::BudgetExceeded));
+        assert!(halt.closed(), "a budget stop closes the child's tree");
+        assert!(!halt.interrupted(), "its turn already ended");
+        let task = mock.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, crate::neo4j::models::TaskStatus::Interrupted);
+        let reason = task.interrupted_reason.unwrap_or_default();
+        assert!(reason.starts_with("budget_exceeded:"), "{reason}");
+    }
+
+    /// PYSR-3b — a delegation that ends on its own is not stopped: its task is left to the
+    /// agent, and its session to its owner.
+    #[tokio::test]
+    async fn a_delegation_that_ends_on_its_own_is_not_stopped() {
+        let (mock, _id, task_id, execution) = delegation_of_a_task().await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        tx.send(reported(0.5)).unwrap();
+        let halt = Arc::new(HaltRecorder::default());
+
+        let stop = super::listen_delegation_result(
+            rx,
+            task_id,
+            "delegated",
+            Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            None,
+            None,
+            execution,
+            super::DelegationOwner::default(),
+            crate::runner::DelegationLimits::default(),
+            Some(halt.clone()),
+        )
+        .await;
+
+        assert_eq!(stop, None);
+        assert!(!halt.closed() && !halt.interrupted());
+        let task = mock.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, crate::neo4j::models::TaskStatus::InProgress);
+    }
+
+    /// PYSR-3b — the halt of a delegation closes the child AND what the child spawned (a
+    /// sub-agent of its own): before, it used `close_session`, which left the grandchild live.
+    #[tokio::test]
+    async fn halting_a_delegation_closes_its_grandchildren() {
+        use crate::chat::manager::{test_support, ChatManager};
+        let state = crate::test_helpers::mock_app_state();
+        let manager = Arc::new(ChatManager::new_without_memory(
+            state.neo4j,
+            state.meili,
+            crate::chat::config::ChatConfig::default(),
+        ));
+        let child = crate::test_helpers::test_chat_session(None);
+        let mut grandchild = crate::test_helpers::test_chat_session(None);
+        grandchild.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: child.id,
+                tool_use_id: None,
+            }
+            .to_json_string(),
+        );
+        for node in [&child, &grandchild] {
+            manager.graph.create_chat_session(node).await.unwrap();
+        }
+        let (child_id, grandchild_id) = (child.id.to_string(), grandchild.id.to_string());
+        test_support::insert_live_session_without_cli(&manager, &child_id).await;
+        test_support::insert_live_session_without_cli(&manager, &grandchild_id).await;
+
+        let halt = super::HaltSession {
+            manager: manager.clone(),
+            session_id: child_id.clone(),
+        };
+        super::DelegationHalt::close(&halt).await;
+
+        assert!(!manager.is_session_active(&child_id).await);
+        assert!(
+            !manager.is_session_active(&grandchild_id).await,
+            "the grandchild is closed with the delegation"
+        );
     }
 
     /// PYSR-3 — a delegation past ITS OWN delay is stopped: the child is halted (not only
@@ -9230,7 +9671,7 @@ pub(crate) mod tests {
         use crate::neo4j::agent_execution::AgentExecutionStatus;
         let (mock, id, execution) = delegation_execution().await;
         let (tx, rx) = tokio::sync::broadcast::channel(16);
-        let halted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let halted = Arc::new(HaltRecorder::default());
         let event_bus = Arc::new(crate::events::HybridEmitter::new(Arc::new(
             crate::events::EventBus::default(),
         )));
@@ -9249,14 +9690,14 @@ pub(crate) mod tests {
             execution,
             super::DelegationOwner::default(),
             limits,
-            Some(Arc::new(HaltRecorder(halted.clone()))),
+            Some(halted.clone()),
         )
         .await;
         drop(tx);
 
         assert_eq!(stop, Some(nexus_claude::agent::StopReason::Interrupted));
         assert!(
-            halted.load(std::sync::atomic::Ordering::SeqCst),
+            halted.interrupted() && halted.closed(),
             "the child must be stopped"
         );
         let stored = closed_execution(&mock, id).await;
@@ -9334,22 +9775,63 @@ pub(crate) mod tests {
         );
     }
 
-    /// PYSR-3 — ONE source of defaults: a delegation gets the PlanRunner's delay and budget.
+    /// PYSR-3 / PYSR-3b — ONE source of defaults: a delegation gets the PlanRunner's delay and
+    /// budget. Not a comparison of a value with itself (`DelegationLimits::default` reads
+    /// `RunnerConfig::default`): `of_runner` must carry EACH field of a runner configuration
+    /// whose values are all unlike the defaults (a field dropped, swapped or hard-coded fails);
+    /// the defaults must be the PlanRunner's constants, pinned to their values; and the
+    /// request a delegation opens must carry exactly the runner's spend cap (a launch that
+    /// put a cap of its own on the request fails).
     #[test]
     fn a_delegations_defaults_are_the_plan_runners() {
-        let runner = crate::runner::RunnerConfig::default();
+        let runner = crate::runner::RunnerConfig {
+            task_timeout_secs: 4321,
+            max_cost_usd: 1.25,
+            max_tokens: Some(777),
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::runner::DelegationLimits::of_runner(&runner),
+            crate::runner::DelegationLimits {
+                timeout_secs: 4321,
+                max_cost_usd: 1.25,
+                max_tokens: Some(777),
+            }
+        );
+
+        let defaults = crate::runner::RunnerConfig::default();
         let limits = crate::runner::DelegationLimits::default();
-        assert_eq!(limits.timeout_secs, runner.task_timeout_secs);
-        assert_eq!(limits.max_cost_usd, runner.max_cost_usd);
-        assert_eq!(limits.max_tokens, runner.max_tokens);
         assert_eq!(
-            limits.timeout_secs,
-            crate::runner::models::DEFAULT_TASK_TIMEOUT_SECS
+            (
+                defaults.task_timeout_secs,
+                defaults.max_cost_usd,
+                defaults.max_tokens
+            ),
+            (
+                crate::runner::models::DEFAULT_TASK_TIMEOUT_SECS,
+                crate::runner::models::DEFAULT_MAX_COST_USD,
+                None
+            ),
+            "the PlanRunner reads the shared constants"
         );
         assert_eq!(
-            limits.max_cost_usd,
-            crate::runner::models::DEFAULT_MAX_COST_USD
+            limits,
+            crate::runner::DelegationLimits::of_runner(&defaults)
         );
+        assert_eq!((limits.timeout_secs, limits.max_cost_usd), (10800, 50.0));
+
+        let mut request = super::delegation_chat_request(
+            "/tmp".into(),
+            None,
+            Uuid::new_v4(),
+            "t",
+            None,
+            "default",
+        )
+        .unwrap();
+        super::put_delegation_caps(&mut request, &limits);
+        assert_eq!(request.max_cost_usd, Some(defaults.max_cost_usd));
+        assert_eq!(request.max_tokens, defaults.max_tokens);
     }
 
     /// B36 (review 4) — a delegation that never gets to listen (its prompt

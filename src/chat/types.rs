@@ -1754,9 +1754,18 @@ pub struct ChatSession {
     /// Number of messages exchanged
     #[serde(default)]
     pub message_count: i64,
-    /// Total cost in USD
+    /// Total cost in USD — the session's OWN spend (its sub-agents' is apart, below).
     #[serde(default)]
     pub total_cost_usd: Option<f64>,
+    /// What the session's sub-agents (`Agent` tool) spent, kept apart from `total_cost_usd`
+    /// so its routing decision is not charged twice (PYSR-3). Only carried by the
+    /// single-session read (`GET /api/chat/sessions/{id}`), never by listings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub children_cost_usd: Option<f64>,
+    /// `total_cost_usd` + `children_cost_usd`: what the session cost with its sub-agents
+    /// (PYSR-3b). Single-session read only, like `children_cost_usd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregated_cost_usd: Option<f64>,
     /// Nexus conversation ID (for message history)
     #[serde(default)]
     pub conversation_id: Option<String>,
@@ -3291,6 +3300,8 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".into(),
             message_count: 5,
             total_cost_usd: Some(0.15),
+            children_cost_usd: None,
+            aggregated_cost_usd: None,
             conversation_id: Some("conv-abc-123".into()),
             preview: Some("Hello, can you help me?".into()),
             permission_mode: None,
@@ -3518,6 +3529,8 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".into(),
             message_count: 0,
             total_cost_usd: None,
+            children_cost_usd: None,
+            aggregated_cost_usd: None,
             conversation_id: None,
             preview: None,
             permission_mode: None,
