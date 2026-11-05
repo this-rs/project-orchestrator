@@ -3273,6 +3273,35 @@ impl AnalyticsStore for Neo4jClient {
         self.llm_settings_by_key(key).await
     }
 
+    async fn entity_exists(&self, kind: &str, name: &str) -> anyhow::Result<Option<bool>> {
+        self.entity_exists(kind, name).await
+    }
+
+    async fn entities_linked(
+        &self,
+        from_kind: &str,
+        from_name: &str,
+        edge: &str,
+        to_kind: &str,
+        to_name: &str,
+    ) -> anyhow::Result<Option<bool>> {
+        self.entities_linked(from_kind, from_name, edge, to_kind, to_name)
+            .await
+    }
+
+    async fn list_assertion_notes(&self, limit: usize) -> anyhow::Result<Vec<crate::notes::Note>> {
+        self.list_assertion_notes(limit).await
+    }
+
+    async fn record_assertion_check(
+        &self,
+        note_id: Uuid,
+        result: &crate::notes::models::AssertionResult,
+        status: Option<crate::notes::models::NoteStatus>,
+    ) -> anyhow::Result<()> {
+        self.record_assertion_check(note_id, result, status).await
+    }
+
     async fn agent_knows(
         &self,
         agent_id: Uuid,

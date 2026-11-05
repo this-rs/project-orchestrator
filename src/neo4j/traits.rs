@@ -3084,6 +3084,37 @@ pub trait AnalyticsStore: Send + Sync {
     /// — a single malformed node silently disabled it for the whole instance.
     async fn llm_settings_by_key(&self, key: &str) -> Result<Vec<(String, String)>>;
 
+    /// L'entité `kind:name` existe-t-elle dans le graphe ? `kind` est un type de cible
+    /// (`file`, `function`, `struct`, `trait`, `enum`) ; tout autre type est cherché par id.
+    ///
+    /// C'est ce qui rend `Exists`/`NotExists` vérifiable sans le texte source.
+    async fn entity_exists(&self, kind: &str, name: &str) -> Result<Option<bool>>;
+
+    /// `(from)-[:edge]->(to)` existe-t-il ? Les deux bouts sont nommés `kind:name`.
+    /// `edge` est validé contre une liste fermée : il est interpolé dans la requête.
+    async fn entities_linked(
+        &self,
+        from_kind: &str,
+        from_name: &str,
+        edge: &str,
+        to_kind: &str,
+        to_name: &str,
+    ) -> Result<Option<bool>>;
+
+    /// Les croyances : les notes qui déclarent une procédure de vérification.
+    async fn list_assertion_notes(&self, limit: usize) -> Result<Vec<crate::notes::Note>>;
+
+    /// Persiste le verdict d'une vérification, et applique la sanction quand il y en a une.
+    ///
+    /// `status` à `None` laisse le statut de la note intact — une réfutation `Warn` trace
+    /// sans casser.
+    async fn record_assertion_check(
+        &self,
+        note_id: Uuid,
+        result: &crate::notes::models::AssertionResult,
+        status: Option<crate::notes::models::NoteStatus>,
+    ) -> Result<()>;
+
     /// What that agent knows, bounded by `limit`, plus how many exist — « la part lue est
     /// dite ». Only `(:Agent)-[:KNOWS]->(:Note)` is read: a `KNOWS` reaching a `File` (the
     /// persona meaning) never leaks into this answer.

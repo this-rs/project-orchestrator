@@ -4002,7 +4002,17 @@ impl Neo4jClient {
                 .and_then(|s| serde_json::from_str(&s).ok()),
             changes,
             assertion_rule,
-            last_assertion_result: None, // Loaded separately if needed
+            // Lu, et pas laissé à `None` : sans cette lecture, une passe de re-vérification
+            // n'a aucun « avant » et ne peut jamais constater une dérive — elle réécrirait
+            // le même verdict en boucle.
+            last_assertion_result: {
+                let raw: String = node.get("last_assertion_result_json").unwrap_or_default();
+                if raw.is_empty() {
+                    None
+                } else {
+                    serde_json::from_str(&raw).ok()
+                }
+            },
             reactivation_count: node.get("reactivation_count").unwrap_or(0),
             last_reactivated: node
                 .get::<String>("last_reactivated")
