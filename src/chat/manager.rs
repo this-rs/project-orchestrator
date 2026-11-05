@@ -12532,6 +12532,16 @@ impl ChatManager {
         self.graph
             .update_chat_session_provider(previous, provider, &target_model, routed_by, engine)
             .await?;
+        // The channel a client is LISTENING on, taken while it still exists. An in-place
+        // switch is meant to replace it: `close_session_for_switch` drops the session (and,
+        // with it, its sender) and the reopen makes a NEW channel. A socket that subscribed
+        // to the old one cannot hear the switch on the new one — it is not attached to it —
+        // and, measured on the agent engine (2026-11-04, `agent_e2e_tests`, in-place move in
+        // Auto), it does not hear `RecvError::Closed` either: something around the reopened
+        // session keeps the old sender alive, so that channel stays open and silent forever.
+        // The tab then sat on its typing indicator until the page was reloaded. The switch is
+        // therefore ANNOUNCED on the channel it replaces, below.
+        let replaced_channel = self.get_events_tx(session_id).await.ok();
         if let Err(error) = self.close_session_for_switch(session_id).await {
             debug!(%session_id, %error, "closing the provider process before an in-place switch");
         }
@@ -12560,11 +12570,18 @@ impl ChatManager {
 
         // The SAME thread states the switch — with the relay counts, so a bounded relay
         // is never a silent truncation; there is no new session to follow.
-        self.emit_on_session(
-            session_id,
-            relayed.event(session_id, provider, &target_model),
-        )
-        .await;
+        let switched = relayed.event(session_id, provider, &target_model);
+        self.emit_on_session(session_id, switched.clone()).await;
+        // …and the client attached to the channel this switch just replaced hears the same
+        // statement on it, then nothing more. That frame is the ONLY way it can learn the
+        // session went on without it: `provider_switched` is what makes a socket re-open
+        // itself on the session (the tab followed the switch already, from the response of
+        // the route it called — a router move has no such response). Sent on the channel
+        // directly, not through `emit_on_session`: the event is persisted and published
+        // once, above, and a second pass would give every other client a duplicate.
+        if let Some(replaced) = replaced_channel {
+            let _ = replaced.send(switched);
+        }
 
         let note = serde_json::json!({
             "from_session": session_id,
@@ -19364,6 +19381,60 @@ impl ChatManager {
         }
     }
 
+    /// Links to their tasks and plans the commits a session made, before its episode is
+    /// collected.
+    ///
+    /// This is the piece that was missing. `TaskEnricher` already turned git into
+    /// `Commit` + `TOUCHES` + `RESOLVED_BY`, but was wired only into the plan runner: a task
+    /// finished by a CHAT kept `get_task_commits() == []`. The delivery was real; the link
+    /// was never made (RM-4, decision `c23f494b`).
+    ///
+    /// Best effort, and deliberately narrow: a session with no linked task, or no linked
+    /// plan, is left alone — a commit is never attributed to a task by guesswork — and only
+    /// the COMMIT half of the enrichment runs (`TaskEnricher::link_commits`), so a close
+    /// does not litter the graph with an auto-note per session.
+    pub(crate) async fn link_session_commits(
+        graph: std::sync::Arc<dyn crate::neo4j::traits::GraphStore>,
+        session: Uuid,
+    ) {
+        let Ok(Some(node)) = graph.get_chat_session(session).await else {
+            return;
+        };
+        let Ok(links) = graph.get_session_links(session).await else {
+            return;
+        };
+        if links.linked_tasks.is_empty() || links.linked_plans.is_empty() {
+            return;
+        }
+        // The evidence follows the REPOSITORY (`cwd`), not the session's project slug,
+        // which is measured to lie: the session of a backend task carried `nexus-sdk`.
+        let project = match node.project_slug.as_deref() {
+            Some(slug) => graph
+                .get_project_by_slug(slug)
+                .await
+                .ok()
+                .flatten()
+                .map(|p| p.id),
+            None => None,
+        };
+        let enricher = crate::runner::enricher::TaskEnricher::new(graph.clone());
+        for task in &links.linked_tasks {
+            for plan in &links.linked_plans {
+                let (linked, _) = enricher
+                    .link_commits(task.id, plan.id, project, node.created_at, &node.cwd)
+                    .await;
+                if linked > 0 {
+                    info!(
+                        session_id = %session,
+                        task_id = %task.id,
+                        commits = linked,
+                        "the commits of a closed session are linked to its task"
+                    );
+                }
+            }
+        }
+    }
+
     fn record_close_episode(&self, session_id: &str, reason: &str) {
         let Ok(id) = Uuid::parse_str(session_id) else {
             return;
@@ -19372,6 +19443,9 @@ impl ChatManager {
         let embeddings = self.embeddings.clone();
         let reason = reason.to_string();
         let work = async move {
+            // The links first: the episode collected below names the commits of the window,
+            // and the graph must already know which task they resolve.
+            Self::link_session_commits(graph.clone(), id).await;
             let Some(mut episode) =
                 crate::episodes::collector::collect_session_episode(graph.as_ref(), id, &reason)
                     .await?
@@ -20355,6 +20429,64 @@ mod unstarted_turn_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RM-4 — une session finie par un chat relie ses commits à sa tâche.
+    ///
+    /// C'est le chaînon qui manquait : `TaskEnricher` existait et n'était branché que sur
+    /// le chemin runner, donc une tâche terminée par un CHAT gardait
+    /// `get_task_commits() == []` — la livraison était réelle, le lien jamais fait.
+    #[tokio::test]
+    async fn closing_a_session_links_its_commits_to_its_task() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::{LinkedPlanInfo, LinkedSessionInfo, LinkedTaskInfo};
+        use std::sync::Arc;
+
+        let (_repo, cwd) = crate::test_helpers::git_repo_with_one_commit();
+        let graph: Arc<MockGraphStore> = Arc::new(MockGraphStore::new());
+
+        let mut project = crate::test_helpers::test_project_named("alpha");
+        project.root_path = cwd.clone();
+        graph.create_project(&project).await.unwrap();
+
+        let plan = crate::test_helpers::test_plan();
+        graph.create_plan(&plan).await.unwrap();
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan.id, &task).await.unwrap();
+
+        let mut session = crate::test_helpers::test_chat_session(Some("alpha"));
+        session.cwd = cwd;
+        // The window opens before the (backdated) commit of the repository.
+        session.created_at = chrono::Utc::now() - chrono::Duration::hours(3);
+        let sid = session.id;
+        graph.create_chat_session(&session).await.unwrap();
+
+        // The session is attached to the task and the plan, as the auto-linking writes it.
+        graph.session_links.write().await.insert(
+            sid,
+            LinkedSessionInfo {
+                linked_plans: vec![LinkedPlanInfo {
+                    id: plan.id,
+                    title: "Test Plan".to_string(),
+                    source: "auto".to_string(),
+                }],
+                linked_tasks: vec![LinkedTaskInfo {
+                    id: task.id,
+                    title: "Test Task".to_string(),
+                    source: "auto".to_string(),
+                }],
+                linked_rfcs: vec![],
+            },
+        );
+
+        let graph_dyn: Arc<dyn crate::neo4j::traits::GraphStore> = graph.clone();
+        ChatManager::link_session_commits(graph_dyn, sid).await;
+
+        assert!(
+            !graph.get_task_commits(task.id).await.unwrap().is_empty(),
+            "le commit de la fenêtre de la session est désormais relié à sa tâche"
+        );
+    }
+
     /// The review of #688 at 60a277e7 (finding D): a provider kind that does not
     /// serialize to a name falls back to `unknown` (no session grant), never to a
     /// permissive kind.

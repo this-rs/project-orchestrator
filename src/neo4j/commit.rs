@@ -64,17 +64,41 @@ impl Neo4jClient {
         })
     }
 
-    /// Link a commit to a task (RESOLVED_BY relationship)
+    /// Link a commit to a task (RESOLVED_BY relationship).
+    ///
+    /// The link carries its PROVENANCE. A link written by anyone other than the enricher is
+    /// `declared` — an agent's own declaration — and never counts as evidence of delivery
+    /// (RM-2, RM-4, decision `c23f494b`). Use [`Self::link_commit_to_task_from`] to name it.
     pub async fn link_commit_to_task(&self, commit_hash: &str, task_id: Uuid) -> Result<()> {
+        self.link_commit_to_task_from(commit_hash, task_id, "declared")
+            .await
+    }
+
+    /// Link a commit to a task, naming where the claim comes from.
+    ///
+    /// `source` is one of:
+    /// - `merged` — a pull request was merged (the strongest signal, not produced yet);
+    /// - `git_window` — the enricher found it in a time window: a fact read from git;
+    /// - `declared` — an agent asked for the link, so the agent asserts its own evidence.
+    ///
+    /// Only the first two count as evidence when the reward is computed.
+    pub async fn link_commit_to_task_from(
+        &self,
+        commit_hash: &str,
+        task_id: Uuid,
+        source: &str,
+    ) -> Result<()> {
         let q = query(
             r#"
             MATCH (t:Task {id: $task_id})
             MATCH (c:Commit {hash: $hash})
-            MERGE (t)-[:RESOLVED_BY]->(c)
+            MERGE (t)-[r:RESOLVED_BY]->(c)
+            SET r.source = $source
             "#,
         )
         .param("task_id", task_id.to_string())
-        .param("hash", commit_hash);
+        .param("hash", commit_hash)
+        .param("source", source);
 
         self.graph.run(q).await?;
         Ok(())

@@ -3,8 +3,9 @@
 //! Given a completed ProtocolRun, the collector queries Neo4j to build:
 //! - **Stimulus**: from run.triggered_by + run.started_at
 //! - **Process**: from run.states_visited + PersistedReasoningTree (via REASONING_FOR)
-//! - **Outcome**: from PRODUCED_DURING relations (notes + decisions)
-//! - **Validation**: from reasoning feedback (if available)
+//! - **Outcome**: the commits of the run's window (read from git) + the artefacts it
+//!   produced (notes and decisions, via PRODUCED_DURING)
+//! - **Validation**: from the EVIDENCE — a commit is proof, an artefact is not
 //!
 //! The resulting Episode can then be converted to a PortableEpisode for
 //! cross-instance exchange via SkillPackage v3.
@@ -18,6 +19,28 @@ use uuid::Uuid;
 use crate::episodes::models::*;
 #[allow(unused_imports)]
 use crate::neo4j::GraphStore;
+
+/// The validation a finished run leaves: what was PROVEN, not what was written.
+///
+/// `commit_shas` is the evidence — a commit is a fact the agent did not author alone.
+/// Artefacts (notes, decisions) are deliberately absent from this decision: counting them
+/// made "I documented my failure" a positive signal, and gave a reward for producing text
+/// (RM-2, RM-5, decision `c23f494b`).
+///
+/// An empty evidence list is not a failure — it is `None`, "not verified", which is the
+/// truth about a run nothing corroborates.
+fn run_validation(commit_shas: &[String], completed: bool) -> Validation {
+    let evidence = commit_shas.len();
+    Validation {
+        feedback_type: if evidence > 0 && completed {
+            FeedbackType::ImplicitPositive
+        } else {
+            FeedbackType::None
+        },
+        score: None,
+        evidence_count: evidence,
+    }
+}
 
 /// Collect a complete Episode from a completed ProtocolRun.
 ///
@@ -88,7 +111,28 @@ pub async fn collect_episode(
         duration_ms,
     };
 
-    // 4. Build Outcome — notes + decisions produced during this run
+    // 4. Build Outcome — the commits of the run's window, and the artefacts it produced.
+    //
+    // The commits are read from git in the run's OWN window, in the working tree of the
+    // run's project — the same reader the session path uses (`commits_since`), so the two
+    // cannot disagree about what a commit of this work is (RM-4, decision `c23f494b`).
+    let commits = match run.project_id {
+        Some(pid) => match neo4j.get_project(pid).await {
+            Ok(Some(p)) => match p.root_path_opt() {
+                Some(root) => crate::runner::enricher::commits_since(root, run.started_at)
+                    .await
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    let committed_files: std::collections::HashSet<&str> = commits
+        .iter()
+        .flat_map(|c| c.files.iter().map(|f| f.path.as_str()))
+        .collect();
+
     let artefacts = neo4j.get_run_outcomes(run_id).await?;
 
     let mut note_ids = Vec::new();
@@ -104,27 +148,21 @@ pub async fn collect_episode(
     let outcome = Outcome {
         note_ids,
         decision_ids,
-        commit_shas: Vec::new(), // TODO: link commits to runs in the future
-        files_modified: 0,       // TODO: count from commit files_changed
+        commit_shas: commits.iter().map(|c| c.hash.clone()).collect(),
+        files_modified: committed_files.len(),
     };
 
-    // 5. Build Validation — check for reasoning feedback
-    // For now, use implicit signals: if the run completed successfully
-    // and produced artefacts, that's implicit positive feedback.
-    let validation =
-        if !artefacts.is_empty() && run.status == crate::protocol::models::RunStatus::Completed {
-            Validation {
-                feedback_type: FeedbackType::ImplicitPositive,
-                score: None,
-                evidence_count: artefacts.len(),
-            }
-        } else {
-            Validation {
-                feedback_type: FeedbackType::None,
-                score: None,
-                evidence_count: 0,
-            }
-        };
+    // 5. Build Validation — EVIDENCE, not output.
+    //
+    // This used to read: a finished run that produced artefacts is `ImplicitPositive`
+    // with `evidence_count = artefacts.len()`. Writing a note was therefore counted as
+    // proving a result, and an agent that documented its own failure collected a reward
+    // for it. A note is not evidence, and a run that finished is not a run that delivered
+    // (RM-2, RM-5, decision `c23f494b`).
+    let validation = run_validation(
+        &outcome.commit_shas,
+        run.status == crate::protocol::models::RunStatus::Completed,
+    );
 
     // 6. Assemble the Episode
     let episode = Episode {
@@ -207,6 +245,93 @@ async fn read_session_journal(neo4j: &dyn GraphStore, session_id: Uuid) -> Sessi
     }
 }
 
+/// The header lines an `apply_patch` body uses to name the file it touches.
+const APPLY_PATCH_TAGS: [&str; 4] = [
+    "*** Update File:",
+    "*** Add File:",
+    "*** Delete File:",
+    "*** Move to:",
+];
+
+/// Record `raw` as a written path, unless it names nothing a count can trust.
+///
+/// Refused: a file descriptor (`&1`), a device (`/dev/null`), a variable (`$OUT`) and a
+/// bare flag. Trailing punctuation from the command line (`;`, `\`, quotes) is stripped.
+fn keep_path(out: &mut Vec<String>, raw: &str) {
+    let path = raw
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == '(' || c == ')')
+        .trim_end_matches(';')
+        .trim_end_matches('\\');
+    if path.is_empty()
+        || path.starts_with('&')
+        || path.starts_with('$')
+        || path.starts_with('-')
+        || path.starts_with("/dev/")
+    {
+        return;
+    }
+    if !out.iter().any(|p| p == path) {
+        out.push(path.to_string());
+    }
+}
+
+/// The paths a shell command writes, read prudently.
+///
+/// A count that is too low is better than a count that invents files, so only the forms
+/// that name their target unambiguously are read: a redirection (`> f`, `>> f`, `>f`), a
+/// `tee` (skipping its flags), the last word of a `sed -i` (BSD and GNU put the file in
+/// the same place, only the backup suffix differs), and the `*** Update File:` style
+/// headers of an `apply_patch`. Everything else — a pipe into `xargs`, a glob, a path held
+/// in a variable — names nothing and counts for nothing.
+///
+/// What it counts is "files a shell command named as output", not "source files changed":
+/// a log redirected inside the repository is counted too. The authoritative answer is the
+/// git diff at the close; this is the fallback for a session that left none (RM-3).
+fn shell_write_targets(command: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
+    // `apply_patch` carries its file names inside the patch body, one header line each.
+    for line in command.lines() {
+        let line = line.trim_start();
+        for tag in APPLY_PATCH_TAGS {
+            if let Some(rest) = line.strip_prefix(tag) {
+                keep_path(&mut out, rest.trim());
+            }
+        }
+    }
+
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let is_sed = tokens.contains(&"sed");
+    for (i, token) in tokens.iter().enumerate() {
+        if let Some(rest) = token.strip_prefix(">>").or_else(|| token.strip_prefix('>')) {
+            // `> f` names the next word, `>f` names the rest of this one.
+            if rest.is_empty() {
+                if let Some(next) = tokens.get(i + 1) {
+                    keep_path(&mut out, next);
+                }
+            } else {
+                keep_path(&mut out, rest);
+            }
+        } else if *token == "tee" {
+            let mut j = i + 1;
+            while tokens.get(j).is_some_and(|t| t.starts_with('-')) {
+                j += 1;
+            }
+            if let Some(target) = tokens.get(j) {
+                keep_path(&mut out, target);
+            }
+        } else if is_sed && token.starts_with("-i") {
+            // `sed -i '' 's/a/b/' file` (BSD) and `sed -i.bak 's/a/b/' file` (GNU) both
+            // end on the file, whatever the suffix form.
+            if let Some(last) = tokens.last() {
+                keep_path(&mut out, last);
+            }
+        }
+    }
+
+    out
+}
+
 /// Pure counting over `(event_type, json)` pairs.
 fn journal_of<'a>(events: impl Iterator<Item = (&'a str, &'a str)>) -> SessionJournal {
     let mut files = std::collections::HashSet::new();
@@ -228,6 +353,14 @@ fn journal_of<'a>(events: impl Iterator<Item = (&'a str, &'a str)>) -> SessionJo
                     {
                         files.insert(path.to_string());
                     }
+                } else if tool == "Bash" {
+                    // The native harness writes through the shell at least as much as
+                    // through an editing tool: a heredoc, a `sed -i`, a `git apply`. Before
+                    // this branch such a session counted ZERO files, whatever it wrote, and
+                    // every episode of this graph carried `files_modified: 0` (RM-3).
+                    if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
+                        files.extend(shell_write_targets(command));
+                    }
                 }
             }
             _ => {}
@@ -246,10 +379,13 @@ fn journal_of<'a>(events: impl Iterator<Item = (&'a str, &'a str)>) -> SessionJo
 /// - **Stimulus**: its first user message (the node's `preview`), at its creation.
 ///   `UserRequest`, or `Manual` for a session another agent or a runner spawned.
 /// - **Process**: no FSM state; its active span (`created_at` → last update).
-/// - **Outcome**: no artefact list — nothing links what a session wrote back to it yet,
-///   and an episode does not invent it. It does count the distinct files an editing tool
-///   was called on, read from the persisted events (`files_modified`). How it ended is
-///   `session.close_reason`.
+/// - **Outcome**: the commits the session made, read from git in the window
+///   `session.created_at` → close, in `session.cwd` (`commit_shas`), and the number of
+///   distinct files they touch. No note or decision is listed: nothing links what a
+///   session wrote back to it yet, and an episode does not invent it. `files_modified` is
+///   the larger of that file count and the distinct files an editing tool was called on
+///   (see `journal_of`): one is a fact, the other an intent, and neither is complete
+///   alone. How it ended is `session.close_reason`.
 /// - **Validation**: none.
 /// - **Session**: id, messages exchanged, close reason, cost, agent.
 ///
@@ -263,7 +399,11 @@ fn journal_of<'a>(events: impl Iterator<Item = (&'a str, &'a str)>) -> SessionJo
 ///
 /// Known limits: `preview` is the first message cut to ~200 characters; a session
 /// whose process died without a close (removed from the live table, never closed)
-/// leaves no episode until it is resumed and closed.
+/// leaves no episode until it is resumed and closed. Two sessions running in the SAME
+/// repository at the same time each see the other's commits: the window cannot tell them
+/// apart, so the same sha may end up on two episodes. De-duplicating by hash when the
+/// evidence is *counted* absorbs this (the reward counts distinct shas); the graph itself
+/// is not corrected (RM-4, decision `c23f494b`).
 pub async fn collect_session_episode(
     neo4j: &dyn GraphStore,
     session_id: Uuid,
@@ -340,6 +480,29 @@ async fn session_episode(
 
     let journal = read_session_journal(neo4j, session_id).await;
 
+    // The commits this session produced, read from git in the SAME window the enricher
+    // uses (`commits_since`, `session.created_at` in `session.cwd`) — one reader, one
+    // window, so an episode cannot describe a graph it no longer matches.
+    //
+    // A count taken from the journal is an INTENT (a tool call named a file); a commit is
+    // a FACT. Neither is complete alone — a commit does not see what was left uncommitted,
+    // the journal does not see what git did. `files_modified` therefore takes the larger
+    // of the two instead of pretending to add them: it is a floor on both sides.
+    let commits = crate::runner::enricher::commits_since(&session.cwd, session.created_at)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "the commits of a closed session could not be read: its episode keeps no sha"
+            );
+            Vec::new()
+        });
+    let committed_files: std::collections::HashSet<&str> = commits
+        .iter()
+        .flat_map(|c| c.files.iter().map(|f| f.path.as_str()))
+        .collect();
+
     let spawned = session
         .spawned_by
         .as_deref()
@@ -373,8 +536,8 @@ async fn session_episode(
         outcome: Outcome {
             note_ids: Vec::new(),
             decision_ids: Vec::new(),
-            commit_shas: Vec::new(),
-            files_modified: journal.files_modified,
+            commit_shas: commits.iter().map(|c| c.hash.clone()).collect(),
+            files_modified: journal.files_modified.max(committed_files.len()),
         },
         validation: Validation {
             feedback_type: FeedbackType::None,
@@ -557,6 +720,118 @@ mod tests {
         assert_eq!(ec.content, "content");
     }
 
+    /// RM-5 — un run terminé sans aucune preuve n'est pas « vérifié », il est « non vérifié ».
+    ///
+    /// L'ancienne règle donnait `ImplicitPositive` avec `evidence_count = artefacts.len()`
+    /// dès qu'une note existait : écrire une note était compté comme prouver un résultat.
+    #[test]
+    fn a_finished_run_without_a_commit_is_not_verified() {
+        let v = run_validation(&[], true);
+        assert_eq!(
+            v.feedback_type,
+            FeedbackType::None,
+            "rien ne corrobore le run : None, pas un retour positif"
+        );
+        assert_eq!(v.evidence_count, 0);
+    }
+
+    #[test]
+    fn a_finished_run_with_a_commit_is_proven() {
+        let v = run_validation(&["abc1234".to_string()], true);
+        assert_eq!(v.feedback_type, FeedbackType::ImplicitPositive);
+        assert_eq!(v.evidence_count, 1, "un commit, une preuve");
+    }
+
+    #[test]
+    fn a_run_that_did_not_finish_is_never_positive_even_with_a_commit() {
+        let v = run_validation(&["abc1234".to_string()], false);
+        assert_eq!(
+            v.feedback_type,
+            FeedbackType::None,
+            "un run interrompu garde sa preuve mais ne se déclare pas réussi"
+        );
+        assert_eq!(v.evidence_count, 1);
+    }
+
+    /// RM-4 — un run nomme les commits de SA fenêtre, lus dans l'arbre de SON projet.
+    ///
+    /// Avant, `collect_run_episode` écrivait `commit_shas: Vec::new()` et
+    /// `files_modified: 0` en dur : un run qui livrait du code déclarait zéro preuve, et
+    /// `run_validation` n'avait donc jamais rien à compter.
+    #[tokio::test]
+    async fn a_run_names_the_commits_of_its_window() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::protocol::models::ProtocolRun;
+
+        let (_repo, cwd) = crate::test_helpers::git_repo_with_one_commit();
+
+        let store = MockGraphStore::new();
+        let mut project = crate::test_helpers::test_project_named("alpha");
+        project.root_path = cwd;
+        store.create_project(&project).await.unwrap();
+
+        let mut run = ProtocolRun::new(Uuid::new_v4(), Uuid::new_v4(), "Start");
+        run.project_id = Some(project.id);
+        // The window opens before the (backdated) commit, so the commit is inside it.
+        run.started_at = Utc::now() - chrono::Duration::hours(3);
+        run.complete();
+        let run_id = run.id;
+        store.protocol_runs.write().await.insert(run_id, run);
+
+        let episode = collect_episode(&store, run_id, project.id)
+            .await
+            .unwrap()
+            .expect("a completed run leaves an episode");
+
+        assert_eq!(
+            episode.outcome.commit_shas.len(),
+            1,
+            "the commit of the window is named: {:?}",
+            episode.outcome.commit_shas
+        );
+        assert!(
+            episode.outcome.files_modified >= 1,
+            "a committed file counts as modified"
+        );
+        assert_eq!(
+            episode.validation.evidence_count, 1,
+            "the commit IS the evidence"
+        );
+        assert_eq!(
+            episode.validation.feedback_type,
+            FeedbackType::ImplicitPositive,
+            "a run that delivered is a run that is proven"
+        );
+    }
+
+    /// Un projet sans arbre de travail (projet `work`, ou pas encore lié à un dépôt) ne
+    /// fait pas échouer la collecte : il ne nomme simplement aucun commit.
+    #[tokio::test]
+    async fn a_run_whose_project_has_no_working_tree_keeps_no_sha() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::protocol::models::ProtocolRun;
+
+        let store = MockGraphStore::new();
+        let mut project = crate::test_helpers::test_project_named("no-root");
+        project.root_path = String::new();
+        store.create_project(&project).await.unwrap();
+
+        let mut run = ProtocolRun::new(Uuid::new_v4(), Uuid::new_v4(), "Start");
+        run.project_id = Some(project.id);
+        run.complete();
+        let run_id = run.id;
+        store.protocol_runs.write().await.insert(run_id, run);
+
+        let episode = collect_episode(&store, run_id, project.id)
+            .await
+            .unwrap()
+            .expect("a completed run leaves an episode");
+
+        assert!(episode.outcome.commit_shas.is_empty());
+        assert_eq!(episode.validation.evidence_count, 0);
+        assert_eq!(episode.validation.feedback_type, FeedbackType::None);
+    }
+
     #[tokio::test]
     async fn test_collect_episode_from_completed_run() {
         use crate::neo4j::mock::MockGraphStore;
@@ -731,6 +1006,85 @@ mod tests {
         (store, session_id, project_id)
     }
 
+    /// RM-4 — l'épisode nomme les commits que la session a réellement produits.
+    ///
+    /// Avant, `commit_shas` était écrit vide en dur et `files_modified` ne venait que des
+    /// événements : une session qui livre par git déclarait zéro livraison. Ici le
+    /// dépôt est réel, la fenêtre s'ouvre avant le commit, et l'épisode doit le nommer.
+    #[tokio::test]
+    async fn a_session_that_committed_names_its_shas_and_its_files() {
+        use std::process::Command;
+
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git must be installed for this test");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "feat: a"]);
+
+        let store = crate::neo4j::mock::MockGraphStore::new();
+        let p = crate::test_helpers::test_project_named("alpha");
+        store.create_project(&p).await.unwrap();
+        let mut session = crate::test_helpers::test_chat_session(Some("alpha"));
+        session.preview = Some("write a".to_string());
+        session.cwd = dir.to_string_lossy().to_string();
+        // The window opens before the commit, so the commit is inside it.
+        session.created_at = Utc::now() - chrono::Duration::seconds(60);
+        session.updated_at = Utc::now();
+        let sid = session.id;
+        store.create_chat_session(&session).await.unwrap();
+
+        let episode = collect_session_episode(&store, sid, "closed")
+            .await
+            .unwrap()
+            .expect("a session with a message and a project leaves an episode");
+
+        assert_eq!(
+            episode.outcome.commit_shas.len(),
+            1,
+            "the commit of the window is named: {:?}",
+            episode.outcome.commit_shas
+        );
+        assert!(
+            !episode.outcome.commit_shas[0].is_empty(),
+            "the sha is named, not blank"
+        );
+        assert!(
+            episode.outcome.files_modified >= 1,
+            "a committed file counts as modified, even with no editing tool call"
+        );
+    }
+
+    /// Une session dont le `cwd` n'est pas un dépôt n'échoue pas et ne nomme aucun sha :
+    /// un compte manquant vaut mieux qu'un close qui tombe.
+    #[tokio::test]
+    async fn a_session_outside_any_repository_keeps_no_sha_and_still_leaves_an_episode() {
+        let (store, sid, _) = store_with_session(Some("alpha"), Some("nothing here")).await;
+        let episode = collect_session_episode(&store, sid, "closed")
+            .await
+            .unwrap()
+            .expect("a session with a message and a project leaves an episode");
+        assert!(
+            episode.outcome.commit_shas.is_empty(),
+            "no repository, no commit to name"
+        );
+    }
+
     #[tokio::test]
     async fn a_closed_session_gives_an_episode_of_its_first_message_and_its_end() {
         let (store, sid, project_id) =
@@ -813,6 +1167,74 @@ mod tests {
             "a, b, c and the notebook count once each; a read, a call without a path and a broken payload count for nothing"
         );
         assert_eq!(journal_of(std::iter::empty()), SessionJournal::default());
+    }
+
+    /// RM-3 — une session qui n'écrit QUE par le shell comptait zéro fichier.
+    ///
+    /// Le harnais natif écrit par le shell (heredoc, `sed -i`, `apply_patch`) au moins
+    /// autant que par un outil d'édition. Avant cette branche `journal_of` ne voyait que
+    /// `EDITING_TOOLS`, donc chaque épisode de ce graphe portait `files_modified: 0`.
+    #[test]
+    fn a_session_that_writes_only_through_the_shell_counts_its_files() {
+        let heredoc = tool_use(
+            "Bash",
+            serde_json::json!({"command": "cat > src/new_module.rs <<'EOF'\nfn f() {}\nEOF"}),
+        );
+        let sed = tool_use(
+            "Bash",
+            serde_json::json!({"command": "sed -i '' 's/a/b/' src/collector.rs"}),
+        );
+        let patch = tool_use(
+            "Bash",
+            serde_json::json!({"command": "apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: src/models.rs\n*** End Patch\nEOF"}),
+        );
+        let events = [
+            ("user_message", "{}"),
+            ("tool_use", heredoc.as_str()),
+            ("tool_use", sed.as_str()),
+            ("tool_use", patch.as_str()),
+        ];
+        assert_eq!(
+            journal_of(events.into_iter()),
+            SessionJournal {
+                files_modified: 3,
+                user_messages: 1
+            },
+            "three distinct files written by the shell, none by an editing tool"
+        );
+    }
+
+    /// Le bruit du shell ne doit pas devenir des fichiers : un `> /dev/null`, un
+    /// descripteur, une variable et un `tee` sans cible ne nomment rien.
+    #[test]
+    fn shell_noise_is_not_a_written_file() {
+        let noisy = tool_use(
+            "Bash",
+            serde_json::json!({"command": "cargo test > /dev/null 2>&1 && echo ok > $OUT | tee -a"}),
+        );
+        let events = [("tool_use", noisy.as_str())];
+        assert_eq!(
+            journal_of(events.into_iter()),
+            SessionJournal::default(),
+            "devices, descriptors, variables and a flagless tee name no file"
+        );
+    }
+
+    /// Un même fichier écrit deux fois — une fois par un outil d'édition, une fois par le
+    /// shell — compte une fois.
+    #[test]
+    fn a_file_written_twice_counts_once_whatever_the_tool() {
+        let edit = tool_use("Edit", serde_json::json!({"file_path": "src/a.rs"}));
+        let shell = tool_use("Bash", serde_json::json!({"command": "echo x >> src/a.rs"}));
+        let events = [("tool_use", edit.as_str()), ("tool_use", shell.as_str())];
+        assert_eq!(
+            journal_of(events.into_iter()),
+            SessionJournal {
+                files_modified: 1,
+                user_messages: 0
+            },
+            "one file, two writes"
+        );
     }
 
     #[tokio::test]

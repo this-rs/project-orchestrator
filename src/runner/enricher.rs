@@ -34,12 +34,12 @@ pub struct TaskEnricher {
 
 /// Info about a git commit parsed from `git log`.
 #[derive(Debug, Clone)]
-struct GitCommitInfo {
-    hash: String,
-    message: String,
-    author: String,
-    timestamp: DateTime<Utc>,
-    files: Vec<FileChangedInfo>,
+pub(crate) struct GitCommitInfo {
+    pub(crate) hash: String,
+    pub(crate) message: String,
+    pub(crate) author: String,
+    pub(crate) timestamp: DateTime<Utc>,
+    pub(crate) files: Vec<FileChangedInfo>,
 }
 
 /// Summary of all enrichment performed.
@@ -55,10 +55,61 @@ pub struct EnrichResult {
     pub discussed_added: usize,
 }
 
+/// Whether a commit may be attributed to a task by file overlap.
+///
+/// An **empty** `affected_files` is NOT a match. The previous condition —
+/// `overlap > 0 || task.affected_files.is_empty()` — gave such a task *every* commit of
+/// the run, turning "we know nothing about this task's files" into "every commit is
+/// hers". An absence of information is not a claim, and `affected_files` is optional at
+/// task creation, so that branch fired often (RM-4, decision `c23f494b`).
+///
+/// The commit still reaches the PLAN, unconditionally: that link is the honest half of
+/// the sweep. What we refuse is the task attribution we cannot justify.
+fn commit_overlaps_task(
+    commit_files: &std::collections::HashSet<&str>,
+    task_files: &[String],
+) -> bool {
+    !task_files.is_empty() && task_files.iter().any(|t| commit_files.contains(t.as_str()))
+}
+
 impl TaskEnricher {
     /// Create a new TaskEnricher.
     pub fn new(graph: Arc<dyn GraphStore>) -> Self {
         Self { graph }
+    }
+
+    /// Link the commits made in `cwd` since `since` to a task and a plan.
+    ///
+    /// Only the COMMIT half of [`enrich`]: no auto-note, no AFFECTS, no DISCUSSED. The close
+    /// of a chat session calls this one, because the evidence a session leaves must be the
+    /// commits it produced and nothing else — an auto-note written at every close would fill
+    /// the graph with artefacts nobody asked for, and an artefact is not evidence (RM-2).
+    ///
+    /// Returns `(linked, commits)`: the count `enrich` used to compute itself, and the
+    /// commits found, which the caller usually wants to name.
+    pub(crate) async fn link_commits(
+        &self,
+        task_id: Uuid,
+        plan_id: Uuid,
+        project_id: Option<Uuid>,
+        since: DateTime<Utc>,
+        cwd: &str,
+    ) -> (usize, Vec<GitCommitInfo>) {
+        let commits = match commits_since(cwd, since).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Enricher: failed to get commits: {}", e);
+                return (0, vec![]);
+            }
+        };
+        if commits.is_empty() {
+            info!("Enricher: no commits found for task {}", task_id);
+            return (0, commits);
+        }
+        let linked = self
+            .enrich_commits(&commits, task_id, plan_id, project_id)
+            .await;
+        (linked, commits)
     }
 
     /// Run all enrichments for a completed task.
@@ -75,19 +126,15 @@ impl TaskEnricher {
     ) -> EnrichResult {
         let mut result = EnrichResult::default();
 
-        // 1. Get commits since task started
-        let commits = match self.get_commits_since(cwd, task_start_time).await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Enricher: failed to get commits: {}", e);
-                return result;
-            }
-        };
+        // 1-2. Commits of the window, linked to the task and the plan
+        let (linked, commits) = self
+            .link_commits(task_id, plan_id, project_id, task_start_time, cwd)
+            .await;
 
         if commits.is_empty() {
-            info!("Enricher: no commits found for task {}", task_id);
             return result;
         }
+        result.commits_linked = linked;
 
         // Collect all modified files across all commits
         let all_modified_files: Vec<String> = commits
@@ -96,11 +143,6 @@ impl TaskEnricher {
             .collect::<std::collections::HashSet<String>>()
             .into_iter()
             .collect();
-
-        // 2. Link commits to task and plan
-        result.commits_linked = self
-            .enrich_commits(&commits, task_id, plan_id, project_id)
-            .await;
 
         // 3. Create auto-note from git info
         if let Some(note_id) = self
@@ -183,8 +225,13 @@ impl TaskEnricher {
                 }
             }
 
-            // Link to task
-            if let Err(e) = self.graph.link_commit_to_task(&commit.hash, task_id).await {
+            // Link to task — provenance `git_window`: the commit was found in a time
+            // window read from git, not declared by the agent (RM-4, decision c23f494b).
+            if let Err(e) = self
+                .graph
+                .link_commit_to_task_from(&commit.hash, task_id, "git_window")
+                .await
+            {
                 warn!(
                     "Enricher: failed to link commit {} to task: {}",
                     commit.hash, e
@@ -453,7 +500,7 @@ impl TaskEnricher {
         cwd: &str,
     ) -> usize {
         // 1. Get ALL commits since the run started
-        let commits = match self.get_commits_since(cwd, run_start).await {
+        let commits = match commits_since(cwd, run_start).await {
             Ok(c) => c,
             Err(e) => {
                 warn!("Post-run sweep: failed to get commits: {}", e);
@@ -507,16 +554,14 @@ impl TaskEnricher {
 
                 // Get task's affected_files to match against commit
                 if let Ok(Some(task_node)) = self.graph.get_task(task_id).await {
-                    let task_files: std::collections::HashSet<&str> = task_node
-                        .affected_files
-                        .iter()
-                        .map(|f| f.as_str())
-                        .collect();
-
-                    let overlap = commit_files.intersection(&task_files).count();
-                    if overlap > 0 || task_node.affected_files.is_empty() {
-                        // Match found (or task has no affected_files → link anyway)
-                        let _ = self.graph.link_commit_to_task(&commit.hash, task_id).await;
+                    if commit_overlaps_task(&commit_files, &task_node.affected_files) {
+                        // Provenance `file_overlap`: the match rests on a FORECAST
+                        // (`affected_files`, written at plan time), not on a fact read from
+                        // git. It is the weakest source and never counts as evidence.
+                        let _ = self
+                            .graph
+                            .link_commit_to_task_from(&commit.hash, task_id, "file_overlap")
+                            .await;
                         linked += 1;
                     }
                 }
@@ -535,108 +580,123 @@ impl TaskEnricher {
     // ========================================================================
     // Git helpers
     // ========================================================================
+}
 
-    /// Get all commits since a given time in the working directory.
-    async fn get_commits_since(
-        &self,
-        cwd: &str,
-        since: DateTime<Utc>,
-    ) -> Result<Vec<GitCommitInfo>> {
-        let since_str = since.format("%Y-%m-%dT%H:%M:%S").to_string();
+/// All commits made in `cwd` since `since`, newest first, each with its files.
+///
+/// Shared by the enricher — which links them to a task and a plan — and by the episode
+/// collector, which must name the shas a session produced. **One reader, one window**:
+/// two readers would drift, and the episode would then describe a graph it no longer
+/// matches.
+///
+/// A directory that is not a git repository, or a `git` that cannot be spawned, both
+/// yield the empty list: a missing count is better than a close that fails.
+pub(crate) async fn commits_since(cwd: &str, since: DateTime<Utc>) -> Result<Vec<GitCommitInfo>> {
+    let since_str = since.format("%Y-%m-%dT%H:%M:%S").to_string();
 
-        // Get commit hashes + messages + authors + timestamps
-        let output = tokio::process::Command::new("git")
-            .args([
-                "log",
-                "--format=%H|%s|%an|%aI",
-                &format!("--since={}", since_str),
-                "--no-merges",
-            ])
-            .current_dir(cwd)
-            .output()
-            .await;
+    // Get commit hashes + messages + authors + timestamps
+    let output = tokio::process::Command::new("git")
+        .args([
+            "log",
+            "--format=%H|%s|%an|%aI",
+            &format!("--since={}", since_str),
+            "--no-merges",
+        ])
+        .current_dir(cwd)
+        .output()
+        .await;
 
-        let output = match output {
-            Ok(o) if o.status.success() => o,
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                if stderr.contains("not a git repository")
-                    || stderr.contains("dépôt git")
-                    || o.status.code().is_some_and(|c| c > 1)
-                {
-                    return Ok(vec![]);
-                }
-                return Err(anyhow::anyhow!("git log failed: {}", stderr));
-            }
-            Err(e) => {
-                warn!("Failed to run git log: {}", e);
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if stderr.contains("not a git repository")
+                || stderr.contains("dépôt git")
+                || o.status.code().is_some_and(|c| c > 1)
+            {
                 return Ok(vec![]);
             }
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut commits = Vec::new();
-
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.splitn(4, '|').collect();
-            if parts.len() < 4 {
-                continue;
-            }
-
-            let hash = parts[0].to_string();
-            let message = parts[1].to_string();
-            let author = parts[2].to_string();
-            let timestamp = chrono::DateTime::parse_from_rfc3339(parts[3])
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-
-            // Get files changed for this commit
-            let files = self.get_commit_files(cwd, &hash).await.unwrap_or_default();
-
-            commits.push(GitCommitInfo {
-                hash,
-                message,
-                author,
-                timestamp,
-                files,
-            });
+            return Err(anyhow::anyhow!("git log failed: {}", stderr));
         }
-
-        Ok(commits)
-    }
-
-    /// Get files changed in a specific commit with additions/deletions.
-    async fn get_commit_files(&self, cwd: &str, hash: &str) -> Result<Vec<FileChangedInfo>> {
-        let output = tokio::process::Command::new("git")
-            .args(["diff-tree", "--no-commit-id", "-r", "--numstat", hash])
-            .current_dir(cwd)
-            .output()
-            .await?;
-
-        if !output.status.success() {
+        Err(e) => {
+            warn!("Failed to run git log: {}", e);
             return Ok(vec![]);
         }
+    };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut files = Vec::new();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut commits = Vec::new();
 
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() >= 3 {
-                let additions = parts[0].parse::<i64>().ok();
-                let deletions = parts[1].parse::<i64>().ok();
-                let path = parts[2].to_string();
-
-                files.push(FileChangedInfo {
-                    path,
-                    additions,
-                    deletions,
-                });
-            }
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.splitn(4, '|').collect();
+        if parts.len() < 4 {
+            continue;
         }
 
-        Ok(files)
+        let hash = parts[0].to_string();
+        let message = parts[1].to_string();
+        let author = parts[2].to_string();
+        let timestamp = chrono::DateTime::parse_from_rfc3339(parts[3])
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+
+        // Get files changed for this commit
+        let files = commit_files(cwd, &hash).await.unwrap_or_default();
+
+        commits.push(GitCommitInfo {
+            hash,
+            message,
+            author,
+            timestamp,
+            files,
+        });
     }
+
+    Ok(commits)
+}
+
+/// Files changed in one commit, with additions/deletions.
+///
+/// `--root` is not a detail: the FIRST commit of a repository has no parent, and without
+/// it `diff-tree` prints nothing at all — the commit is seen but its files are not, so a
+/// session that opens a repository would report a delivery of zero files.
+pub(crate) async fn commit_files(cwd: &str, hash: &str) -> Result<Vec<FileChangedInfo>> {
+    let output = tokio::process::Command::new("git")
+        .args([
+            "diff-tree",
+            "--no-commit-id",
+            "--root",
+            "-r",
+            "--numstat",
+            hash,
+        ])
+        .current_dir(cwd)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Ok(vec![]);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut files = Vec::new();
+
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 3 {
+            let additions = parts[0].parse::<i64>().ok();
+            let deletions = parts[1].parse::<i64>().ok();
+            let path = parts[2].to_string();
+
+            files.push(FileChangedInfo {
+                path,
+                additions,
+                deletions,
+            });
+        }
+    }
+
+    Ok(files)
 }
 
 // ============================================================================
@@ -648,6 +708,148 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+
+    /// RM-4 — une tâche SANS `affected_files` n'absorbe plus tous les commits du run.
+    ///
+    /// L'ancienne condition était `overlap > 0 || task.affected_files.is_empty()` : une
+    /// tâche dont on ignore les fichiers empochait *tous* les commits du run. Comme
+    /// `affected_files` est optionnel à la création d'une tâche, la branche tirait
+    /// souvent — et fabriquait une preuve à partir d'une absence d'information.
+    #[test]
+    fn a_task_without_affected_files_claims_no_commit() {
+        let commit_files: std::collections::HashSet<&str> =
+            ["src/a.rs", "src/b.rs"].into_iter().collect();
+        assert!(
+            !commit_overlaps_task(&commit_files, &[]),
+            "aucun fichier déclaré = aucune revendication ; le commit atteint quand même le plan"
+        );
+    }
+
+    #[test]
+    fn a_shared_file_attributes_the_commit() {
+        let commit_files: std::collections::HashSet<&str> = ["src/a.rs"].into_iter().collect();
+        let task_files = vec!["src/a.rs".to_string(), "src/c.rs".to_string()];
+        assert!(
+            commit_overlaps_task(&commit_files, &task_files),
+            "un fichier commun suffit à attribuer"
+        );
+    }
+
+    #[test]
+    fn disjoint_files_attribute_nothing() {
+        let commit_files: std::collections::HashSet<&str> = ["src/z.rs"].into_iter().collect();
+        let task_files = vec!["src/a.rs".to_string()];
+        assert!(
+            !commit_overlaps_task(&commit_files, &task_files),
+            "aucun recouvrement = aucune attribution"
+        );
+    }
+
+    /// RM-4 — `link_commits` relie ce que la fenêtre contient et rend les commits trouvés.
+    /// C'est la moitié COMMIT de `enrich`, celle que le close d'une session appelle pour
+    /// qu'une tâche finie par un chat cesse de rendre `get_task_commits() == []`.
+    #[tokio::test]
+    async fn link_commits_links_the_commits_of_the_window() {
+        use crate::test_helpers::{git_repo_with_one_commit, test_plan, test_task};
+
+        let (_repo, cwd) = git_repo_with_one_commit();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+        let task = test_task();
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let enricher = TaskEnricher::new(graph.clone());
+        let (linked, commits) = enricher
+            .link_commits(
+                task_id,
+                plan_id,
+                None,
+                Utc::now() - chrono::Duration::hours(3),
+                &cwd,
+            )
+            .await;
+
+        assert_eq!(commits.len(), 1, "la fenêtre contient exactement un commit");
+        assert!(linked >= 1, "il est relié à la tâche");
+        assert_eq!(
+            graph.get_task_commits(task_id).await.unwrap().len(),
+            1,
+            "la tâche porte désormais le commit"
+        );
+    }
+
+    /// Une fenêtre qui s'ouvre APRÈS le commit ne contient rien : aucun lien n'est écrit.
+    #[tokio::test]
+    async fn link_commits_outside_the_window_links_nothing() {
+        use crate::test_helpers::{git_repo_with_one_commit, test_plan, test_task};
+
+        let (_repo, cwd) = git_repo_with_one_commit();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+        let task = test_task();
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let enricher = TaskEnricher::new(graph.clone());
+        let (linked, commits) = enricher
+            .link_commits(
+                task_id,
+                plan_id,
+                None,
+                Utc::now() - chrono::Duration::seconds(60),
+                &cwd,
+            )
+            .await;
+
+        assert!(commits.is_empty(), "rien n'appartient à cette fenêtre");
+        assert_eq!(linked, 0);
+        assert!(graph.get_task_commits(task_id).await.unwrap().is_empty());
+    }
+
+    /// `enrich` fait la même chose puis écrit ses artefacts — vérifié sur un vrai dépôt,
+    /// parce que c'est le chemin complet que le runner emprunte.
+    #[tokio::test]
+    async fn enrich_on_a_real_repository_links_commits_and_writes_its_artefacts() {
+        use crate::test_helpers::{git_repo_with_one_commit, test_plan, test_task};
+
+        let (_repo, cwd) = git_repo_with_one_commit();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let plan = test_plan();
+        let plan_id = plan.id;
+        graph.create_plan(&plan).await.unwrap();
+        let task = test_task();
+        let task_id = task.id;
+        graph.create_task(plan_id, &task).await.unwrap();
+
+        let enricher = TaskEnricher::new(graph.clone());
+        let result = enricher
+            .enrich(
+                task_id,
+                plan_id,
+                None,
+                None,
+                Utc::now() - chrono::Duration::hours(3),
+                &cwd,
+            )
+            .await;
+
+        assert!(
+            result.commits_linked >= 1,
+            "le commit de la fenêtre est relié"
+        );
+        assert!(
+            result.note_created,
+            "l'enrichissement complet écrit aussi sa note"
+        );
+    }
 
     #[test]
     fn test_enrich_result_default() {

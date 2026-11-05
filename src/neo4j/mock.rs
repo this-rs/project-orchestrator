@@ -276,6 +276,10 @@ pub struct MockGraphStore {
     pub file_signals: RwLock<HashMap<Uuid, Vec<crate::graph::models::FileSignalRecord>>>,
     pub task_files: RwLock<HashMap<Uuid, Vec<String>>>,
     pub task_commits: RwLock<HashMap<Uuid, Vec<String>>>,
+    pub session_links: RwLock<HashMap<Uuid, crate::neo4j::models::LinkedSessionInfo>>,
+    /// What `get_session_links` answers, keyed by session. Unset = a session linked to
+    /// nothing (the default). Seeded by tests that need a session attached to a task and
+    /// a plan — the close of a session reads exactly this to link its commits (RM-4).
     pub plan_commits: RwLock<HashMap<Uuid, Vec<String>>>,
     pub project_releases: RwLock<HashMap<Uuid, Vec<Uuid>>>,
     pub project_milestones: RwLock<HashMap<Uuid, Vec<Uuid>>>,
@@ -546,6 +550,7 @@ impl MockGraphStore {
             file_signals: RwLock::new(HashMap::new()),
             task_files: RwLock::new(HashMap::new()),
             task_commits: RwLock::new(HashMap::new()),
+            session_links: RwLock::new(HashMap::new()),
             plan_commits: RwLock::new(HashMap::new()),
             project_releases: RwLock::new(HashMap::new()),
             project_milestones: RwLock::new(HashMap::new()),
@@ -16488,8 +16493,14 @@ impl ChatStore for MockGraphStore {
         Ok(true)
     }
 
-    async fn get_session_links(&self, _session_id: Uuid) -> Result<LinkedSessionInfo> {
-        Ok(LinkedSessionInfo::default())
+    async fn get_session_links(&self, session_id: Uuid) -> Result<LinkedSessionInfo> {
+        Ok(self
+            .session_links
+            .read()
+            .await
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn get_sessions_for_plan(&self, _plan_id: Uuid) -> Result<Vec<SessionWithLinks>> {
