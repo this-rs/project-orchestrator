@@ -8,6 +8,7 @@
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
+pub mod beliefs;
 pub mod coactivation;
 pub mod hashing;
 pub mod lifecycle;

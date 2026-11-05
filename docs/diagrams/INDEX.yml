@@ -83,6 +83,14 @@ diagrams:
       # Meme arbitrage pour la politique (PR6) : elle LIT le registre et ne regle
       # rien ; elle appartient au meme dessin que ce qu'elle lit.
       - "backend:src/notes/retrieval_policy.rs"
+      # Arbitrage (PR croyances, T7) : la revision des croyances est appelee au demarrage
+      # (lib.rs : reverify_at_boot) et ecrit les notes ; comme le registre de recuperation,
+      # elle n'a pas de diagramme verifie (po-knowledge-notes reste `planned`). Elle rejoint
+      # po-chat-manager, comme notes/coactivation.rs. A reprendre si po-knowledge-notes est verifie.
+      - "backend:src/notes/beliefs.rs"
+      # Meme arbitrage pour son adaptateur Neo4j : sans diagramme de fonctionnalite dedie,
+      # il rejoint le diagramme qui l'appelle.
+      - "backend:src/neo4j/beliefs.rs"
   - name: po-spawn-envelope
     owner: theotime
     status: verified

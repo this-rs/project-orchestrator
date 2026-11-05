@@ -65,6 +65,9 @@ pub struct MockAnchorStore {
 /// Shadow state of one directed synapse: `(shadow_weight, last shadow decay)`.
 pub type MockShadowSynapse = (f64, Option<chrono::DateTime<chrono::Utc>>);
 
+/// Un lien du faux graphe de code : `(from_kind, from_name, edge, to_kind, to_name)`.
+pub type BeliefLink = (String, String, String, String, String);
+
 /// A `KNOWS` edge in the mock: its scale, the project it belongs to (if any), and the
 /// provenance written on it.
 pub type KnowsEdge = (
@@ -240,6 +243,11 @@ pub struct MockGraphStore {
     pub agent_lived: RwLock<std::collections::HashSet<(Uuid, Uuid)>>,
     /// `(:Agent)-[:KNOWS]->(:Note)`, with the provenance written on the edge.
     pub agent_knows: RwLock<HashMap<(Uuid, Uuid), KnowsEdge>>,
+    /// Les entités du faux graphe de code, `(kind, name)` — scriptables, pour qu'un test
+    /// fasse tenir ou tomber une assertion sans construire un vrai dépôt.
+    pub belief_entities: RwLock<std::collections::HashSet<(String, String)>>,
+    /// Les liens du faux graphe de code.
+    pub belief_links: RwLock<std::collections::HashSet<BeliefLink>>,
     /// `coactivate_session`: the pairs it welded, and who welded them — `(project,
     /// session, provenance)`.
     pub synapses: RwLock<HashMap<(Uuid, Uuid), SynapseWeld>>,
@@ -534,6 +542,8 @@ impl MockGraphStore {
             agent_knows: RwLock::new(HashMap::new()),
             agent_uses: RwLock::new(HashMap::new()),
             synapses: RwLock::new(HashMap::new()),
+            belief_entities: RwLock::new(std::collections::HashSet::new()),
+            belief_links: RwLock::new(std::collections::HashSet::new()),
             fail_session_writes: std::sync::atomic::AtomicBool::new(false),
             fail_list_projects: std::sync::atomic::AtomicBool::new(false),
             land_children_after_read: std::sync::Mutex::new(HashMap::new()),
@@ -14032,6 +14042,69 @@ impl AnalyticsStore for MockGraphStore {
             .filter(|((_, k), _)| k == key)
             .map(|((scope, _), value)| (scope.clone(), value.clone()))
             .collect())
+    }
+
+    async fn entity_exists(&self, kind: &str, name: &str) -> Result<Option<bool>> {
+        const KNOWN: &[&str] = &["file", "function", "struct", "trait", "enum", "impl"];
+        if !KNOWN.contains(&kind) {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.belief_entities
+                .read()
+                .await
+                .contains(&(kind.to_string(), name.to_string())),
+        ))
+    }
+
+    async fn entities_linked(
+        &self,
+        from_kind: &str,
+        from_name: &str,
+        edge: &str,
+        to_kind: &str,
+        to_name: &str,
+    ) -> Result<Option<bool>> {
+        const KNOWN: &[&str] = &["file", "function", "struct", "trait", "enum", "impl"];
+        if !KNOWN.contains(&from_kind) || !KNOWN.contains(&to_kind) {
+            return Ok(None);
+        }
+        Ok(Some(self.belief_links.read().await.contains(&(
+            from_kind.to_string(),
+            from_name.to_string(),
+            edge.to_string(),
+            to_kind.to_string(),
+            to_name.to_string(),
+        ))))
+    }
+
+    async fn list_assertion_notes(&self, limit: usize) -> Result<Vec<crate::notes::Note>> {
+        let notes = self.notes.read().await;
+        let mut out: Vec<crate::notes::Note> = notes
+            .values()
+            .filter(|n| n.assertion_rule.is_some())
+            .cloned()
+            .collect();
+        out.sort_by_key(|n| n.created_at);
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    async fn record_assertion_check(
+        &self,
+        note_id: Uuid,
+        result: &crate::notes::models::AssertionResult,
+        status: Option<crate::notes::models::NoteStatus>,
+    ) -> Result<()> {
+        let mut notes = self.notes.write().await;
+        if let Some(n) = notes.get_mut(&note_id) {
+            n.last_assertion_result = Some(result.clone());
+            if let Some(status) = status {
+                n.status = status;
+            }
+        }
+        // Une note disparue entre la lecture et l'écriture : rien à faire, pas d'erreur.
+        Ok(())
     }
 
     async fn release_agent_knows(

@@ -6,6 +6,7 @@ pub(crate) mod agent_execution;
 mod alert;
 mod analytics;
 pub(crate) mod batch;
+pub mod beliefs;
 mod chat;
 pub mod client;
 mod code;
