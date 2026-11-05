@@ -492,10 +492,16 @@ pub fn classify(
         .rposition(|e| e.signal == Signal::Input)
         .map_or(0, |i| i + 1);
     let turn = &tail[start..];
+    // The last end of the turn, with its index and what it says.
     let end = turn
         .iter()
-        .rposition(|e| matches!(e.signal, Signal::Ended { .. }));
-    if let Some(e) = turn[end.map_or(0, |i| i + 1)..]
+        .enumerate()
+        .rev()
+        .find_map(|(i, e)| match e.signal {
+            Signal::Ended { how, text } => Some((i, e, how, text)),
+            _ => None,
+        });
+    if let Some(e) = turn[end.map_or(0, |(i, ..)| i + 1)..]
         .iter()
         .rev()
         .find(|e| e.signal == Signal::Planned)
@@ -508,12 +514,8 @@ pub fn classify(
     // No input in the tail means it may start mid-turn: an end is only proven when
     // the tail holds the input that opened its turn.
     let input_seen = start > 0;
-    let Some(end_at) = end.filter(|_| input_seen) else {
+    let Some((_, end_event, how, text)) = end.filter(|_| input_seen) else {
         return v(SessionState::Reporting, Rule::NoProvenEnd, last);
-    };
-    let end_event = &turn[end_at];
-    let Signal::Ended { how, text } = end_event.signal else {
-        unreachable!("rposition matched an end")
     };
     if let Some(e) = turn.iter().rev().find(|e| e.signal == Signal::Failure) {
         return v(SessionState::Reporting, Rule::TurnFailed, Some(e));
@@ -995,6 +997,249 @@ mod tests {
             );
         }
         assert_eq!(tail.events().len(), TAIL_CAP);
+    }
+
+    #[test]
+    fn every_state_has_its_wire_name() {
+        for (state, name) in [
+            (SessionState::Working, "working"),
+            (SessionState::Writing, "writing"),
+            (SessionState::Reporting, "reporting"),
+            (SessionState::Watching, "watching"),
+            (SessionState::WaitingOnPerson, "waiting_on_person"),
+            (SessionState::Done, "done"),
+            (SessionState::Stalled, "stalled"),
+        ] {
+            assert_eq!(state.as_str(), name);
+            assert_eq!(serde_json::to_value(state).unwrap(), name);
+        }
+    }
+
+    /// The other events of the engines, each on the signal the rules read.
+    #[test]
+    fn the_remaining_events_map_to_their_signals() {
+        use crate::chat::types::ChatEvent as E;
+        let when = chrono::Utc::now();
+        let s = |e: &E| signal_of(e);
+        assert_eq!(
+            s(&E::ToolResult {
+                id: "a".into(),
+                result: serde_json::Value::Null,
+                is_error: false,
+                parent_tool_use_id: None,
+            }),
+            Some(Signal::ToolEnd { id: "a".into() })
+        );
+        assert_eq!(
+            s(&E::ToolCancelled {
+                id: "a".into(),
+                parent_tool_use_id: None,
+            }),
+            Some(Signal::ToolEnd { id: "a".into() })
+        );
+        assert_eq!(
+            s(&E::ToolUse {
+                id: "a".into(),
+                tool: "Bash".into(),
+                input: serde_json::Value::Null,
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            }),
+            Some(Signal::ToolStart { id: "a".into() })
+        );
+        assert_eq!(
+            s(&E::AskUserQuestion {
+                id: "r".into(),
+                tool_call_id: "q".into(),
+                questions: serde_json::Value::Null,
+                input: serde_json::Value::Null,
+                parent_tool_use_id: None,
+                synthetic: None,
+            }),
+            Some(Signal::QuestionAsked { id: "q".into() })
+        );
+        assert_eq!(
+            s(&E::SecretRequest {
+                id: "k".into(),
+                name: "token".into(),
+                reason: "deploy".into(),
+                exists: false,
+            }),
+            Some(Signal::SecretAsked { id: "k".into() })
+        );
+        assert_eq!(
+            s(&E::SecretRequestResolved {
+                id: "k".into(),
+                outcome: "provided".into(),
+            }),
+            Some(Signal::SecretResolved { id: "k".into() })
+        );
+        let notice = |severity: &str| E::ProviderNotice {
+            kind: "credentials_locked".into(),
+            code: None,
+            message: "unlock the vault".into(),
+            severity: severity.into(),
+            data: None,
+        };
+        assert_eq!(s(&notice("action_required")), Some(Signal::PersonMustAct));
+        assert_eq!(s(&notice("latency")), Some(Signal::Progress));
+        let error = |parent: Option<&str>| E::Error {
+            message: "boom".into(),
+            parent_tool_use_id: parent.map(str::to_string),
+            code: None,
+            reason: None,
+            index: None,
+            request_id: None,
+        };
+        assert_eq!(s(&error(None)), Some(Signal::Failure));
+        assert_eq!(s(&error(Some("sub"))), Some(Signal::Progress));
+        assert_eq!(
+            s(&E::SessionError {
+                reason: "subprocess_exited".into(),
+                message: "gone".into(),
+                received_at: when,
+            }),
+            Some(Signal::Failure)
+        );
+        assert_eq!(
+            s(&E::AutoContinue {
+                session_id: "s".into(),
+                delay_ms: 5,
+            }),
+            Some(Signal::Planned)
+        );
+        assert_eq!(
+            s(&E::Retrying {
+                attempt: 1,
+                max_attempts: 3,
+                delay_ms: 5,
+                error_message: "503".into(),
+            }),
+            Some(Signal::Planned)
+        );
+        assert_eq!(
+            s(&E::CompactionStarted {
+                trigger: "auto".into(),
+            }),
+            Some(Signal::Progress)
+        );
+    }
+
+    /// Seeding puts the stored thread in front of the live recording, keeps the cap, and
+    /// leaves out what the recording already has.
+    #[test]
+    fn a_seeded_tail_keeps_the_older_events_before_the_recording() {
+        let mut tail = Tail::starting_at(T0 + 100);
+        tail.record(
+            &ChatEvent::UserMessage {
+                content: "now".into(),
+            },
+            T0 + 100,
+        );
+        let older: Vec<(ChatEvent, u64)> = (0..(TAIL_CAP as u64 + 10))
+            .map(|i| {
+                (
+                    ChatEvent::Thinking {
+                        content: "t".into(),
+                        parent_tool_use_id: None,
+                    },
+                    T0 - 1_000 + i,
+                )
+            })
+            .chain(std::iter::once((
+                ChatEvent::UserMessage {
+                    content: "already recorded".into(),
+                },
+                T0 + 200,
+            )))
+            .collect();
+        tail.seed(older.iter().map(|(e, at)| (e, *at)));
+        assert_eq!(tail.observed_since_ms(), T0 + 100);
+        let events = tail.events();
+        assert_eq!(events.len(), TAIL_CAP, "the cap keeps the newest");
+        assert_eq!(events.last().unwrap().signal, Signal::Input);
+        assert_eq!(events.last().unwrap().at_ms, T0 + 100);
+    }
+
+    /// A question or a secret closed by its answer is no longer waited on.
+    #[test]
+    fn an_answered_question_or_secret_is_not_waited_on() {
+        let question_answered = vec![
+            input(T0),
+            ev(
+                T0 + 1,
+                "ask_user_question",
+                Signal::QuestionAsked { id: "q".into() },
+            ),
+            result(T0 + 2, "q"),
+        ];
+        let secret_resolved = vec![
+            input(T0),
+            ev(
+                T0 + 1,
+                "secret_request",
+                Signal::SecretAsked { id: "k".into() },
+            ),
+            ev(
+                T0 + 2,
+                "secret_request_resolved",
+                Signal::SecretResolved { id: "k".into() },
+            ),
+        ];
+        assert_eq!(
+            classify(&question_answered, T0, &streaming(), T0 + 3)
+                .reason
+                .rule,
+            Rule::TurnRunning
+        );
+        assert_eq!(
+            classify(&secret_resolved, T0, &streaming(), T0 + 3)
+                .reason
+                .rule,
+            Rule::TurnRunning
+        );
+    }
+
+    /// A failure inside the turn is reported even when the turn's end reads as completed,
+    /// and a top-level delta is text for the person when the end carries none.
+    #[test]
+    fn a_failure_in_the_turn_is_a_report_and_a_delta_is_text_for_a_person() {
+        let failed_then_completed = vec![
+            input(T0),
+            ev(T0 + 1, "error", Signal::Failure),
+            end(T0 + 2, TurnEnd::Completed, false),
+        ];
+        let got = classify(&failed_then_completed, T0, &idle(), T0 + 10 * MIN);
+        assert_eq!(
+            (got.state, got.reason.rule),
+            (SessionState::Reporting, Rule::TurnFailed)
+        );
+        assert_eq!(got.reason.event.as_deref(), Some("error"));
+
+        let streamed_answer = vec![
+            input(T0),
+            delta(T0 + 1),
+            end(T0 + 2, TurnEnd::Completed, false),
+        ];
+        let got = classify(&streamed_answer, T0, &idle(), T0 + 10 * MIN);
+        assert_eq!(
+            (got.state, got.reason.rule),
+            (SessionState::Reporting, Rule::AnsweredHuman)
+        );
+    }
+
+    /// A tail whose only end is an earlier turn's: nothing of this turn is proven.
+    #[test]
+    fn an_end_before_the_last_input_proves_nothing() {
+        let old_turn = vec![
+            input(T0),
+            end(T0 + 1, TurnEnd::Completed, false),
+            input(T0 + 2),
+        ];
+        let got = classify(&old_turn, T0, &idle(), T0 + 10 * MIN);
+        assert_eq!(got.reason.rule, Rule::NoProvenEnd);
+        assert_eq!(got.state, SessionState::Reporting);
     }
 
     /// The events as the engines emit them map to the signals the rules read.

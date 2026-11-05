@@ -196,6 +196,47 @@ mod tests {
         assert!(taps.classify(id, streaming, now_ms()).is_none());
     }
 
+    /// A tap that falls behind its channel keeps recording from what is still buffered,
+    /// and it stops when the channel closes (the session is gone).
+    #[tokio::test]
+    async fn a_tap_that_lags_keeps_recording_and_stops_with_its_channel() {
+        let taps = SegmentTaps::default();
+        let id = Uuid::new_v4();
+        let (tx, _keep) = broadcast::channel(2);
+        assert!(taps.ensure(id, &tx).is_some());
+        // Nothing yields: the tap is overrun and sees a `Lagged`.
+        for _ in 0..20 {
+            tx.send(ChatEvent::StreamDelta {
+                text: "x".into(),
+                parent_tool_use_id: None,
+            })
+            .unwrap();
+        }
+        settle().await;
+        tx.send(ChatEvent::UserMessage {
+            content: "after the lag".into(),
+        })
+        .unwrap();
+        settle().await;
+        let streaming = Activity {
+            streaming: true,
+            ..Default::default()
+        };
+        let got = taps.classify(id, streaming, now_ms()).unwrap();
+        assert_eq!(got.state, SessionState::Working, "{got:?}");
+        assert_eq!(
+            got.reason.rule,
+            super::super::segment_state::Rule::TurnRunning
+        );
+
+        drop(tx);
+        settle().await;
+        assert!(
+            taps.classify(id, streaming, now_ms()).is_some(),
+            "the verdict outlives the channel until the session leaves the live set"
+        );
+    }
+
     #[test]
     fn a_spawned_session_answers_its_spawner() {
         assert_eq!(addressee_of(None), Addressee::Human);

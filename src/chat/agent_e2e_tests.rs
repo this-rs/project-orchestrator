@@ -12973,6 +12973,37 @@ mod agent_lifecycle {
         assert!(manager.agent_runtime.owns(&sid).await, "a watch stays live");
     }
 
+    /// The release sweep runs on its own clock (`start_done_release_task`), and the
+    /// wrapper reads the real one: a watching session is kept by both.
+    #[tokio::test]
+    async fn the_release_sweep_runs_on_its_own_clock_and_keeps_a_watch() {
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |_| {});
+        let sid = manager
+            .create_session(&spawned_request())
+            .await
+            .unwrap()
+            .session_id;
+        idle(&manager, &sid).await;
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        handle
+            .set_background_tasks(vec![nexus_claude::agent::BackgroundTask {
+                id: "w2".into(),
+                kind: nexus_claude::agent::BackgroundTaskKind::Shell,
+                description: "tail -F build.log".into(),
+                status: nexus_claude::agent::BackgroundTaskStatus::Running,
+                started_at_ms: Some(1_700_000_000_000),
+                tool_call_id: Some("tool-w2".into()),
+                parent: None,
+                pid: None,
+            }])
+            .await;
+        manager.start_done_release_task();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(manager.release_done_sessions().await.is_empty());
+        assert!(manager.agent_runtime.owns(&sid).await, "a watch stays live");
+    }
+
     #[tokio::test]
     async fn a_full_table_frees_its_most_idle_session_instead_of_refusing() {
         let (_fake, graph) = native_world().await;
