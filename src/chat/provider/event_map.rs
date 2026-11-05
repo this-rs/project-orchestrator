@@ -435,7 +435,24 @@ impl EventMapper {
                     request_id: None,
                 }]
             }
-            // A notice is a diagnostic: nothing in a turn.
+            // An advisory the person may have to act on (`credentials_locked` and
+            // kind): not an error, the turn goes on, but it must reach the screen.
+            // Dropped here until 03/11/2026, a locked vault waited 930 s in silence
+            // (plan "coffre verrouillé = attente muette").
+            AgentEvent::ProviderNotice { kind, data } if notice_severity(kind).is_some() => {
+                vec![ChatEvent::ProviderNotice {
+                    kind: kind.clone(),
+                    code: data
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| Some(kind.clone())),
+                    message: notice_message(kind, data),
+                    severity: notice_severity(kind).unwrap_or("latency").to_string(),
+                    data: Some(data.clone()),
+                }]
+            }
+            // A notice is a diagnostic: nothing in a turn (it goes to the logs).
             AgentEvent::ProviderNotice { .. } => Vec::new(),
             // The account's limits go to the quota registry (`AgentSessionHandle::observe_quota`),
             // not to the thread: nothing to show in a turn.
@@ -543,6 +560,68 @@ pub(crate) fn limit_notice_message(kind: &str, data: &Value) -> Option<String> {
             })
         }
         _ => None,
+    }
+}
+
+/// Longest sentence kept for an advisory: a client shows it in a block, not a log line.
+const NOTICE_MESSAGE_MAX: usize = 400;
+
+/// What a client does with an advisory of the harness. `action_required` becomes a
+/// block in the thread **with the way out**, `latency` only feeds the composer's
+/// "waiting" state (a retry, a recovery), and anything else is a diagnostic that
+/// belongs to the logs.
+///
+/// Measured 03/11/2026: `credentials_locked` asked the person to unlock the vault,
+/// fell into the catch-all ("a notice is a diagnostic") and was dropped — the turn
+/// then waited 930 s with nothing on screen, and only the Stop button ended it.
+/// The rule this class list encodes: anything that expects a human gesture, or a
+/// human decision, is `action_required`; nothing else is.
+pub(crate) fn notice_severity(kind: &str) -> Option<&'static str> {
+    match kind {
+        // A gesture or a decision is expected of the person.
+        "credentials_locked"
+        | "prompt_blocked"
+        | "policy_patterns_partial"
+        | "browser_unavailable"
+        | "mcp_servers_refused"
+        | "mcp_server_status"
+        | "model_not_applied"
+        | "hooks_not_supported"
+        | "extension_ignored" => Some("action_required"),
+        // Nothing to do, but it says why nothing came for a while.
+        "model_retry" | "model_recovered" => Some("latency"),
+        // Everything else is diagnostic: the logs (see `structured_out_of_turn`).
+        _ => None,
+    }
+}
+
+/// The sentence a person reads for an advisory: the harness' own when it wrote one
+/// (`credentials_locked` does), a built one otherwise. Redacted and bounded here —
+/// a notice can carry an endpoint's text, and a thread is not a log file.
+pub(crate) fn notice_message(kind: &str, data: &Value) -> String {
+    let given = data
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if !given.is_empty() {
+        return redact_error_body(given, NOTICE_MESSAGE_MAX);
+    }
+    match kind {
+        "model_retry" => {
+            let attempt = data.get("attempt").and_then(Value::as_u64);
+            let max = data.get("max_attempts").and_then(Value::as_u64);
+            let delay = data.get("delay_ms").and_then(Value::as_u64);
+            match (attempt, max, delay) {
+                (Some(a), Some(m), Some(d)) => format!(
+                    "The model did not answer (attempt {a} of {m}): trying again in {}.",
+                    human_duration(d)
+                ),
+                _ => "The model did not answer: trying again.".to_string(),
+            }
+        }
+        "model_recovered" => "The model answers again.".to_string(),
+        _ => format!("The provider reported: {}.", kind.replace('_', " ")),
     }
 }
 
@@ -1397,6 +1476,93 @@ mod tests {
             json!({"input_tokens": 700, "output_tokens": 50, "cache_read_tokens": 1600})
         );
         assert_eq!(v["cost"], json!({"usd": 0.00096, "basis": "priced"}));
+    }
+
+    /// Measured 03/11/2026: a locked credential vault asked the person to unlock it,
+    /// the advisory was dropped as a "diagnostic", and the turn waited 930 s with
+    /// nothing on screen. It must reach the thread, with its code and its way out.
+    #[test]
+    fn a_locked_vault_notice_reaches_the_thread() {
+        let notice = AgentEvent::ProviderNotice {
+            kind: "credentials_locked".to_string(),
+            data: json!({
+                "provider": "native",
+                "code": "credentials_locked",
+                "message": "the credential vault is locked: the turn resumes when it is unlocked",
+            }),
+        };
+        match EventMapper::new().map(&notice).as_slice() {
+            [ChatEvent::ProviderNotice {
+                kind,
+                code,
+                message,
+                severity,
+                data,
+            }] => {
+                assert_eq!(kind, "credentials_locked");
+                assert_eq!(code.as_deref(), Some("credentials_locked"));
+                assert_eq!(severity, "action_required");
+                assert!(
+                    message.contains("vault is locked"),
+                    "the person reads what happened: {message}"
+                );
+                assert_eq!(
+                    data.as_ref()
+                        .and_then(|d| d.get("provider"))
+                        .and_then(Value::as_str),
+                    Some("native"),
+                    "the structured detail travels with the advisory"
+                );
+            }
+            other => panic!("one provider_notice expected, got {other:?}"),
+        }
+    }
+
+    /// A retry explains a wait; it is not a block in the thread. The client feeds a
+    /// "waiting" state from it and shows nothing else.
+    #[test]
+    fn a_retry_notice_only_feeds_the_waiting_state() {
+        let notice = AgentEvent::ProviderNotice {
+            kind: "model_retry".to_string(),
+            data: json!({"attempt": 1, "max_attempts": 5, "delay_ms": 2000}),
+        };
+        match EventMapper::new().map(&notice).as_slice() {
+            [ChatEvent::ProviderNotice {
+                severity, message, ..
+            }] => {
+                assert_eq!(severity, "latency");
+                assert!(message.contains("1 of 5"), "{message}");
+                assert!(message.contains("2 s"), "{message}");
+            }
+            other => panic!("one provider_notice expected, got {other:?}"),
+        }
+    }
+
+    /// The rest stays a diagnostic: a thread is not a log file.
+    #[test]
+    fn a_diagnostic_notice_stays_out_of_the_thread() {
+        let notice = AgentEvent::ProviderNotice {
+            kind: "lagged".to_string(),
+            data: json!({"skipped": 3}),
+        };
+        assert!(EventMapper::new().map(&notice).is_empty());
+        assert_eq!(notice_severity("lagged"), None);
+    }
+
+    /// Anything that expects a human gesture is `action_required`, and nothing else
+    /// is: the classification is the contract the client renders.
+    #[test]
+    fn every_kind_that_expects_a_gesture_is_action_required() {
+        for kind in [
+            "credentials_locked",
+            "prompt_blocked",
+            "browser_unavailable",
+            "mcp_servers_refused",
+        ] {
+            assert_eq!(notice_severity(kind), Some("action_required"), "{kind}");
+        }
+        assert_eq!(notice_severity("model_retry"), Some("latency"));
+        assert_eq!(notice_severity("usage_estimated"), None);
     }
 
     /// ISO5: a turn a configured limit stopped is shown as such (an `error` frame with its

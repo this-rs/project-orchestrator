@@ -1316,6 +1316,37 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
     },
+    /// An advisory from the harness about the TURN itself, that the person may
+    /// have to act on — a locked credential vault, a prompt the policy blocked, a
+    /// browser that is not installed, an instance the router left out.
+    ///
+    /// An advisory is NOT an error and does NOT end the turn: the turn may well
+    /// go on (the native harness waits for a locked vault and resumes). It is
+    /// persisted like any other event so a reloaded thread still says why a turn
+    /// waited — measured 03/11/2026: a locked vault produced 930 s of silence and
+    /// nothing in the transcript, because this advisory was dropped on the way.
+    ///
+    /// `severity` says what a client does with it: `action_required` becomes a
+    /// block in the thread with the way out, `latency` only feeds a "waiting"
+    /// state (a retry, a recovery), `diagnostic` belongs to the logs. Additive: a
+    /// client that does not know this event ignores it.
+    ProviderNotice {
+        /// The harness' own name for the advisory (`credentials_locked`, `model_retry`, ...).
+        kind: String,
+        /// Stable error-like code when the advisory has one, so the client can pick
+        /// the right card (the same `code` the provider errors use).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        /// One sentence, already safe (no URL, no path, no credential): what
+        /// happened, and what the person can do about it.
+        message: String,
+        /// `action_required` | `latency` | `diagnostic`.
+        severity: String,
+        /// The harness' structured detail (counters, delays, instance id), kept
+        /// as it came for the client and for the logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<serde_json::Value>,
+    },
 }
 
 impl ChatEvent {
@@ -1362,6 +1393,7 @@ impl ChatEvent {
             ChatEvent::ConversationRelayed { .. } => "conversation_relayed",
             ChatEvent::ProviderSwitched { .. } => "provider_switched",
             ChatEvent::ProviderOutage { .. } => "provider_outage",
+            ChatEvent::ProviderNotice { .. } => "provider_notice",
         }
     }
 
@@ -1488,6 +1520,25 @@ impl ChatEvent {
                 max_attempts,
                 ..
             } => Some(format!("retrying:{}:{}", attempt, max_attempts)),
+
+            // An advisory repeats (a locked vault is polled): dedup on kind and
+            // severity, and on the sentence when it changes (a wait that grew).
+            ChatEvent::ProviderNotice {
+                kind,
+                severity,
+                message,
+                ..
+            } => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                message.hash(&mut hasher);
+                Some(format!(
+                    "provider_notice:{}:{}:{}",
+                    kind,
+                    severity,
+                    hasher.finish()
+                ))
+            }
 
             ChatEvent::BackgroundOutput {
                 source,
@@ -3588,6 +3639,26 @@ mod tests {
             error_message: "err".into(),
         };
         assert_eq!(event.fingerprint(), Some("retrying:1:3".to_string()));
+    }
+
+    /// A locked vault is polled: the same advisory repeats and is shown once, but
+    /// a sentence that changed (a wait that grew) is a new notice.
+    #[test]
+    fn a_repeated_provider_notice_dedups_and_a_new_sentence_does_not() {
+        let notice = |message: &str| ChatEvent::ProviderNotice {
+            kind: "credentials_locked".into(),
+            code: Some("credentials_locked".into()),
+            message: message.into(),
+            severity: "action_required".into(),
+            data: None,
+        };
+        let first = notice("the vault is locked").fingerprint().unwrap();
+        assert!(first.starts_with("provider_notice:credentials_locked:action_required:"));
+        assert_eq!(notice("the vault is locked").fingerprint().unwrap(), first);
+        assert_ne!(
+            notice("the vault is locked (2 min)").fingerprint().unwrap(),
+            first
+        );
     }
 
     // ====================================================================
