@@ -20429,6 +20429,64 @@ mod unstarted_turn_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RM-4 — une session finie par un chat relie ses commits à sa tâche.
+    ///
+    /// C'est le chaînon qui manquait : `TaskEnricher` existait et n'était branché que sur
+    /// le chemin runner, donc une tâche terminée par un CHAT gardait
+    /// `get_task_commits() == []` — la livraison était réelle, le lien jamais fait.
+    #[tokio::test]
+    async fn closing_a_session_links_its_commits_to_its_task() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::{LinkedPlanInfo, LinkedSessionInfo, LinkedTaskInfo};
+        use std::sync::Arc;
+
+        let (_repo, cwd) = crate::test_helpers::git_repo_with_one_commit();
+        let graph: Arc<MockGraphStore> = Arc::new(MockGraphStore::new());
+
+        let mut project = crate::test_helpers::test_project_named("alpha");
+        project.root_path = cwd.clone();
+        graph.create_project(&project).await.unwrap();
+
+        let plan = crate::test_helpers::test_plan();
+        graph.create_plan(&plan).await.unwrap();
+        let task = crate::test_helpers::test_task();
+        graph.create_task(plan.id, &task).await.unwrap();
+
+        let mut session = crate::test_helpers::test_chat_session(Some("alpha"));
+        session.cwd = cwd;
+        // The window opens before the (backdated) commit of the repository.
+        session.created_at = chrono::Utc::now() - chrono::Duration::hours(3);
+        let sid = session.id;
+        graph.create_chat_session(&session).await.unwrap();
+
+        // The session is attached to the task and the plan, as the auto-linking writes it.
+        graph.session_links.write().await.insert(
+            sid,
+            LinkedSessionInfo {
+                linked_plans: vec![LinkedPlanInfo {
+                    id: plan.id,
+                    title: "Test Plan".to_string(),
+                    source: "auto".to_string(),
+                }],
+                linked_tasks: vec![LinkedTaskInfo {
+                    id: task.id,
+                    title: "Test Task".to_string(),
+                    source: "auto".to_string(),
+                }],
+                linked_rfcs: vec![],
+            },
+        );
+
+        let graph_dyn: Arc<dyn crate::neo4j::traits::GraphStore> = graph.clone();
+        ChatManager::link_session_commits(graph_dyn, sid).await;
+
+        assert!(
+            !graph.get_task_commits(task.id).await.unwrap().is_empty(),
+            "le commit de la fenêtre de la session est désormais relié à sa tâche"
+        );
+    }
+
     /// The review of #688 at 60a277e7 (finding D): a provider kind that does not
     /// serialize to a name falls back to `unknown` (no session grant), never to a
     /// permissive kind.
