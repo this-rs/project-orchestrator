@@ -161,18 +161,6 @@ pub fn state_from_stop(stop_reason: Option<&str>, is_error: bool, subtype: &str)
     }
 }
 
-fn parse(raw: &str) -> bool {
-    matches!(raw.trim(), "1" | "true" | "on" | "yes")
-}
-
-/// Whether the conduction layer is on. Off by default: off reproduces the
-/// current behaviour exactly (the ledger is never settled, never read).
-pub fn enabled() -> bool {
-    std::env::var("CONDUCTION")
-        .map(|v| parse(&v))
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,12 +251,36 @@ mod tests {
     }
 
     #[test]
-    fn the_flag_parser_is_strict_and_off_by_default() {
-        assert!(parse("on"));
-        assert!(parse("1"));
-        assert!(parse("true"));
-        assert!(!parse("off"));
-        assert!(!parse(""));
-        assert!(!parse("0"));
+    fn the_conflict_explains_itself() {
+        let conflict = Conflict {
+            from: ObjectiveState::Reached,
+            to: ObjectiveState::Pursued,
+        };
+        let text = format!("{conflict}");
+        assert!(text.contains("cannot settle"));
+    }
+
+    #[test]
+    fn the_objective_is_readable() {
+        let ledger = ObjectiveLedger::new(Objective::None);
+        assert!(matches!(ledger.objective(), Objective::None));
+        let transitions: &[ObjectiveTransition] = ledger.transitions();
+        assert!(transitions.is_empty());
+    }
+
+    #[test]
+    fn state_from_stop_maps_every_reason() {
+        assert!(matches!(
+            state_from_stop(Some("error"), false, "boom"),
+            ObjectiveState::Abandoned { .. }
+        ));
+        assert!(matches!(
+            state_from_stop(Some("interrupted"), false, ""),
+            ObjectiveState::Abandoned { .. }
+        ));
+        assert!(matches!(
+            state_from_stop(None, true, "io"),
+            ObjectiveState::Abandoned { .. }
+        ));
     }
 }

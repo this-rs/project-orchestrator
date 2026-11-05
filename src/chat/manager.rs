@@ -2672,7 +2672,7 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
                 }
             }
         }
-        if crate::neurons::conduction::enabled() {
+        {
             let state = crate::neurons::conduction::state_from_stop(
                 outcome.stop_reason.as_deref(),
                 outcome.is_error,
@@ -2687,13 +2687,11 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
                     crate::neurons::conduction::Objective::None,
                 )
             });
-            if let Err(conflict) = ledger.settle(
+            let _ = ledger.settle(
                 state,
                 chrono::Utc::now(),
                 outcome.stop_reason.clone().unwrap_or_default(),
-            ) {
-                debug!(%session_id, %conflict, "objective settle refused");
-            }
+            );
         }
         // The turn carried what waited since the last compaction and was answered:
         // dropped in memory before anything else (before the first await, so the
@@ -19573,20 +19571,13 @@ impl ChatManager {
         }
         self.turn_routing.remove(session_id);
         self.close_routing_decision(session_id).await;
-        if crate::neurons::conduction::enabled() {
-            if let Some(ledger) = self
-                .objective_ledgers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(session_id)
-            {
-                debug!(
-                    %session_id,
-                    objective_state = ?ledger.state(),
-                    "objective ledger at close"
-                );
-            }
-        }
+        let objective_state = self
+            .objective_ledgers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .map(|ledger| ledger.state().clone());
+        debug!(%session_id, objective_state = ?objective_state, "objective ledger at close");
         if self.agent_runtime.owns(session_id).await {
             self.agent_modes
                 .lock()
