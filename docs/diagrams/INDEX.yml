@@ -403,6 +403,15 @@ diagrams:
     covers:
       - "backend:src/graph/{rules,schema,self_model_tests}.rs"
       - "backend:src/neo4j/graph_schema.rs"
+  - name: po-neurons-conduction
+    owner: theotime
+    status: verified
+    file: docs/diagrams/po-neurons-conduction.mmd
+    # Arbitrage : le registre d'objectif (N1) est un neurone MOTEUR, distinct de la
+    # memoire synaptique (po-neurons-embeddings, planned) et de l'oubli/ombre
+    # (po-synaptic-forgetting, po-synaptic-shadow, verified). Fichier dedie : aucun recouvrement.
+    covers:
+      - "backend:src/neurons/conduction.rs"
   - name: po-synaptic-forgetting
     owner: theotime
     status: verified

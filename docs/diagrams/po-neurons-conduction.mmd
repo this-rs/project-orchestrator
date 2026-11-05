@@ -1,0 +1,51 @@
+%% name: po-neurons-conduction
+%% covers: backend:src/neurons/conduction.rs
+%% verified: ff85ba06
+%% ---
+%% PROUVE : le registre d'objectif (N1, plan b380137c) — une session porte un
+%%   objectif et son etat ; un etat TERMINAL ne regresse jamais ; un seul
+%%   ecrivain (after_turn, derriere le drapeau CONDUCTION), un seul lecteur
+%%   (close_session_inner_with).
+%% ---
+%% SOURCES LUES :
+%%   src/neurons/conduction.rs — Objective, ObjectiveState,
+%%     ObjectiveLedger::settle (refus type Conflict), state_from_stop, enabled
+%%   src/chat/manager.rs       — ManagerTurnServices::after_turn (ecrivain),
+%%                               close_session_inner_with (lecteur)
+%% ---
+%% NON ETABLI :
+%%   l'objectif derive vaut Objective::None (la chaine SpawnedBy -> TaskNode ->
+%%   QueryIntentMode arrive en PR-2) ; Reached ne demande pas encore de preuve
+%%   (N3) ; le moteur legacy Claude Code CLI (PostStreamHandler) ne passe pas
+%%   par after_turn, donc n'ecrit pas ce registre.
+%% ---
+%% LEGENDE
+%%   ✅ verifie (le noeud dit par quel test)  🟠 ecrit, sans test  ⚪ autre domaine
+
+flowchart TD
+    subgraph legend["Legende"]
+        direction LR
+        L1["✅ verifie par test"]
+        L2["🟠 ecrit, sans test"]
+        L3["⚪ autre domaine"]
+    end
+
+    NEW["⚪ new(objective) — un objectif par session<br/>Objective { Plan | Task | Intent | None }, etat initial Pursued"]
+    PUR["✅ Pursued — seul etat non terminal, seul point de depart d'une transition<br/>test : a_new_ledger_is_pursued_and_empty"]
+    STOP["⚪ state_from_stop(stop_reason, is_error, subtype)<br/>completed|success -> Reached ; error|interrupted -> Abandoned ; max_turns -> Blocked ; sinon Pursued<br/>test : state_from_stop_maps_the_terminal_done"]
+    REA["✅ Reached — reclame, pas encore prouve (N3)<br/>test : pursuing_to_reached_is_recorded"]
+    ABA["✅ Abandoned { reason } — typé, jamais une chaine libre<br/>test : abandoned_carries_its_reason"]
+    BLO["✅ Blocked { on } — ne progresse plus tant que `on` ne bouge pas<br/>test : settling_the_same_state_is_idempotent"]
+    SET{"✅ settle(to, at, reason)<br/>etat identique -> no-op idempotent<br/>etat terminal -> Conflict (refus)"}
+    CON["✅ Conflict — un etat terminal ne regresse jamais<br/>test : a_terminal_state_never_regresses"]
+    FLAG["⚪ enabled() — CONDUCTION=1|true|on|yes, OFF par defaut<br/>test : the_flag_parser_is_strict_and_off_by_default"]
+
+    NEW --> PUR
+    PUR --> STOP
+    STOP --> SET
+    SET -->|"Pursued -> terminal"| REA
+    SET -->|"Pursued -> terminal"| ABA
+    SET -->|"Pursued -> terminal"| BLO
+    SET -->|"terminal -> autre"| CON
+    CON -.->|refuse| PUR
+    FLAG --> SET

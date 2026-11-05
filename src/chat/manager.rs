@@ -1047,6 +1047,13 @@ pub struct ChatManager {
     /// closed with what happened when the session is closed.
     pub(crate) open_decisions:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Uuid>>>,
+    /// The objective ledger of each live session (N1): written once per turn by
+    /// `after_turn`, read at close. Off unless `CONDUCTION` is set.
+    pub(crate) objective_ledgers: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, crate::neurons::conduction::ObjectiveLedger>,
+        >,
+    >,
     /// Whether the Claude Code CLI is on this server (B2): what the resolver knows of the
     /// built-in instance's health. See [`super::cli_version::ClaudeCliProbe`].
     claude_cli: super::cli_version::ClaudeCliProbe,
@@ -1888,6 +1895,11 @@ pub(crate) struct ManagerTurnServices {
     /// The decisions still open, keyed by session id (shared with [`ChatManager`]),
     /// so a turn's ending can feed its reward to the arm it routed.
     open_decisions: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Uuid>>>,
+    objective_ledgers: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, crate::neurons::conduction::ObjectiveLedger>,
+        >,
+    >,
     /// Mirrors the sub-agents of a Claude Code session into read-only child conversations
     /// (`chat::mirror`, P18c), from [`Self::observe`]. `None` for every other provider.
     mirror: Option<Arc<super::mirror::MirrorTap>>,
@@ -2659,6 +2671,27 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
                     }
                 }
             }
+        }
+        {
+            let state = crate::neurons::conduction::state_from_stop(
+                outcome.stop_reason.as_deref(),
+                outcome.is_error,
+                &outcome.subtype,
+            );
+            let mut ledgers = self
+                .objective_ledgers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let ledger = ledgers.entry(session_id.to_string()).or_insert_with(|| {
+                crate::neurons::conduction::ObjectiveLedger::new(
+                    crate::neurons::conduction::Objective::None,
+                )
+            });
+            let _ = ledger.settle(
+                state,
+                chrono::Utc::now(),
+                outcome.stop_reason.clone().unwrap_or_default(),
+            );
         }
         // The turn carried what waited since the last compaction and was answered:
         // dropped in memory before anything else (before the first await, so the
@@ -3833,6 +3866,9 @@ impl ChatManager {
             open_decisions: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            objective_ledgers: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             claude_cli: super::cli_version::ClaudeCliProbe::default(),
             native_cache: Arc::new(RwLock::new(HashMap::new())),
             native_probers: Arc::new(RwLock::new(HashMap::new())),
@@ -3943,6 +3979,9 @@ impl ChatManager {
             recovery_resumes_claude_code: false,
             cognitive_routing: None,
             open_decisions: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            objective_ledgers: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             claude_cli: super::cli_version::ClaudeCliProbe::default(),
@@ -18010,6 +18049,7 @@ impl ChatManager {
                 .as_ref()
                 .and_then(|routing| routing.store.clone()),
             open_decisions: std::sync::Arc::clone(&self.open_decisions),
+            objective_ledgers: std::sync::Arc::clone(&self.objective_ledgers),
             mirror,
             hook_fallback,
         })
@@ -19531,6 +19571,13 @@ impl ChatManager {
         }
         self.turn_routing.remove(session_id);
         self.close_routing_decision(session_id).await;
+        let objective_state = self
+            .objective_ledgers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .map(|ledger| ledger.state().clone());
+        debug!(%session_id, objective_state = ?objective_state, "objective ledger at close");
         if self.agent_runtime.owns(session_id).await {
             self.agent_modes
                 .lock()
@@ -38356,6 +38403,9 @@ mod refs_turn_services_tests {
             open_decisions: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            objective_ledgers: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             mirror: None,
             hook_fallback: None,
         };
@@ -38789,6 +38839,9 @@ mod held_context_tests {
             stall_step: None,
             routing_store: None,
             open_decisions: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            objective_ledgers: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             mirror: None,
@@ -39402,6 +39455,9 @@ mod image_turn_services_tests {
             stall_step: None,
             routing_store: Some(store.clone()),
             open_decisions: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            objective_ledgers: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             mirror: None,
