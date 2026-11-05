@@ -1924,6 +1924,11 @@ pub(crate) struct AgentTurnState {
     /// unknown: sizes the global cap of each turn's enrichment
     /// (`composer::turn_enrichment_cap`).
     context_window: Option<u64>,
+    /// The user's own text (`shown`) of the last turn `prepare` saw, so a context
+    /// refusal ([`ProviderError::ContextTooSmall`]) can be replayed without the
+    /// injected context. `None`: no turn prepared yet. Shared across clones of the
+    /// state (the same pattern as [`Self::held`]).
+    last_user_message: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// A session's [`HeldContext`] in this process: what waits in memory (the truth
@@ -2368,6 +2373,14 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         sent: &str,
         turn: &crate::refs::turn::TurnExpansion,
     ) -> String {
+        // The user's own text, kept for a context refusal's replay (`adapt_context`):
+        // what `prepare` was shown, before any injection. Set before the `/compact`
+        // early return too, so the last prepared turn is always the last user message.
+        *self
+            .session
+            .last_user_message
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(shown.to_string());
         // `/compact` reaching a provider here is one whose CLI reads the command itself
         // (Claude Code; the others are compacted by the runtime, ISO3): it must head the text
         // the CLI reads, or the CLI hands it to the model as a sentence. Nothing in front.
@@ -2456,6 +2469,50 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         if let Some(decision) = router.forget_image_change() {
             record_not_changed(self.routing_store.as_ref(), decision, "set_model_failed").await;
         }
+    }
+
+    async fn model_after_limit(
+        &self,
+        session_id: &str,
+        limit: &nexus_claude::agent::ProviderError,
+    ) -> Option<String> {
+        let router = self.turn_routing.get(session_id)?;
+        super::agent_hooks::model_after_limit(&router, limit).await
+    }
+
+    async fn adapt_context(
+        &self,
+        _session_id: &str,
+        input: &nexus_claude::agent::TurnInput,
+    ) -> Option<nexus_claude::agent::TurnInput> {
+        // The user's own text, without the injected knowledge blocks, the held prefix
+        // and the hook advice that `prepare` put in front of it, and without the
+        // machine blocks a stored message carries (`<po-refs>`, `<po-attachments>`).
+        let shown = self
+            .session
+            .last_user_message
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?;
+        let mut reduced = nexus_claude::agent::TurnInput::text(crate::refs::turn::visible_text(
+            &shown,
+        ));
+        // The images stay: an image is not context bloat, and dropping it would change
+        // what the person asked. They are already the `InputBlock::Image` blocks of the
+        // refused input, so keep those as they are.
+        reduced
+            .blocks
+            .extend(input.blocks.iter().filter_map(|block| match block {
+                nexus_claude::agent::InputBlock::Image {
+                    media_type,
+                    data_base64,
+                } => Some(nexus_claude::agent::InputBlock::Image {
+                    media_type: media_type.clone(),
+                    data_base64: data_base64.clone(),
+                }),
+                _ => None,
+            }));
+        Some(reduced)
     }
 
     async fn continuation(&self, session_id: &str) -> String {
@@ -12843,6 +12900,7 @@ impl ChatManager {
 
                 let _ = events_tx.send(ChatEvent::ModelChanged {
                     model: model.to_string(),
+                    reason: None,
                 });
                 Ok(true)
             }
@@ -12855,6 +12913,7 @@ impl ChatManager {
                 );
                 let _ = events_tx.send(ChatEvent::ModelChanged {
                     model: model.to_string(),
+                    reason: None,
                 });
                 Ok(true)
             }
@@ -33966,7 +34025,7 @@ mod tests {
         );
 
         assert_eq!(event.event_type(), "model_changed");
-        if let ChatEvent::ModelChanged { model } = event {
+        if let ChatEvent::ModelChanged { model, .. } = event {
             assert_eq!(model, "claude-opus-4-20250514");
         } else {
             panic!("Expected ModelChanged event, got {:?}", event.event_type());

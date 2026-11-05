@@ -49,6 +49,10 @@ use crate::neo4j::GraphStore;
 
 const BROADCAST_BUFFER: usize = 1024;
 
+/// At most this many model switches answer a turn that keeps meeting a model-wide
+/// limit; never the same model twice (the tried models bound both).
+const MAX_MODEL_SWITCHES_PER_TURN: usize = 3;
+
 /// Replaces every secret value delivered by the vault inside an event of the
 /// provider, before anything stores or broadcasts it (same rule as the Claude
 /// path: `ChatManager::mask_cli_message`). Fails CLOSED: an event that holds a
@@ -177,6 +181,51 @@ fn process_exited(event: &AgentEvent) -> bool {
         _ => None,
     };
     matches!(error, Some(ProviderError::ProcessExited { .. }))
+}
+
+/// The strict refusal of a terminal event that a host answers by ADAPTING the turn
+/// instead of showing the provider's words — the family of errors where another model
+/// of the same instance is a fair reaction:
+///
+/// - [`ProviderError::ModelLimitReached`]: that model has nothing left, its neighbours
+///   do (the CLI itself says "Switch to another model");
+/// - [`ProviderError::Refused`]: the request was flagged by the provider's safeguards,
+///   and the CLI's own advice is to rephrase or "try a different model".
+///
+/// A whole-account [`ProviderError::RateLimited`] is NOT one, on purpose: no model of
+/// that account will answer, so a switch would only waste a call. Neither is
+/// [`ProviderError::ContextTooSmall`]: another model with the same window changes
+/// nothing, the CONTEXT is what must shrink.
+fn terminal_adaptable_refusal(event: &AgentEvent) -> Option<ProviderError> {
+    let error = match event {
+        AgentEvent::Done { error, .. } => error.as_ref(),
+        AgentEvent::Error { error } => Some(error),
+        _ => None,
+    }?;
+    let adaptable = error.is_model_limit() || matches!(error, ProviderError::Refused { .. });
+    adaptable.then(|| error.clone())
+}
+
+/// The terminal refusal of a turn whose CONTEXT is too long
+/// ([`ProviderError::ContextTooSmall`]): the remedy is not another model — a model
+/// with the same window refuses it too — but a SMALLER input. The host answers by
+/// evicting what the injected context can drop ([`TurnServices::adapt_context`]).
+fn terminal_context_refusal(event: &AgentEvent) -> Option<ProviderError> {
+    let error = match event {
+        AgentEvent::Done { error, .. } => error.as_ref(),
+        AgentEvent::Error { error } => Some(error),
+        _ => None,
+    }?;
+    matches!(error, ProviderError::ContextTooSmall { .. }).then(|| error.clone())
+}
+
+/// Why the model was switched, as the interface says it: a limit is not a refusal of
+/// what the person asked, and the two must not read the same on the wire.
+fn switch_reason(error: &ProviderError) -> &'static str {
+    match error {
+        ProviderError::Refused { .. } => "request_refused",
+        _ => "limit_reached",
+    }
 }
 
 /// The terminal event of a turn stopped before the provider answered (a Stop during
@@ -642,6 +691,18 @@ pub trait TurnServices: Send + Sync {
     /// The model [`Self::model_for_images`] named could not be made active: whatever the
     /// host decided for the turn on that ground is undone. Default: nothing.
     async fn image_model_not_applied(&self, _session_id: &str, _model: &str) {}
+    /// The model this session must run on because the one in force was refused for a
+    /// MODEL-wide limit: another model of the same instance is the remedy. `limit` is the
+    /// typed refusal the turn ended on. `None`: nothing to change. Default: never.
+    async fn model_after_limit(&self, _session_id: &str, _limit: &ProviderError) -> Option<String> {
+        None
+    }
+    /// The turn's input, REDUCED, when the provider refused it because the context was
+    /// too long: what can leave without losing the task, out and nothing else in.
+    /// `None`: nothing to evict.
+    async fn adapt_context(&self, _session_id: &str, _input: &TurnInput) -> Option<TurnInput> {
+        None
+    }
     /// Hands an event of the session to the other instances (NATS), as the Claude
     /// Code engine publishes each of its events. Default: nowhere.
     fn publish(&self, _session_id: &str, _event: &ChatEvent) {}
@@ -1005,7 +1066,7 @@ impl AgentSessionHandle {
         // opening model). One write here covers all of them. `routing_mode` is a separate
         // property: the Auto marker survives. A failed write is logged, not an error: the
         // provider already runs the model, and the next change writes again.
-        if let ChatEvent::ModelChanged { model } = &event {
+        if let ChatEvent::ModelChanged { model, .. } = &event {
             if let Some(uuid) = self.uuid {
                 if let Err(e) = self.graph.update_chat_session_model(uuid, model).await {
                     tracing::warn!(
@@ -1288,6 +1349,17 @@ impl AgentSessionHandle {
                 retry_after_ms,
                 resets_at_ms,
             } => quota.mark_rate_limited(&self.provider_id, *resets_at_ms, *retry_after_ms),
+            ProviderError::ModelLimitReached {
+                model,
+                resets_at_ms,
+            } => {
+                // A MODEL-wide limit holds only that model: the instance's other models
+                // stay eligible. The model is the one the provider named in its refusal
+                // (the model in force); the handle does not otherwise track the model.
+                if let Some(model) = model {
+                    quota.mark_model_rate_limited(&self.provider_id, model, *resets_at_ms, None);
+                }
+            }
             error if super::provider::cognitive::decider::is_out_of_credit(error) => {
                 quota.mark_out_of_credit(&self.provider_id);
             }
@@ -2060,7 +2132,7 @@ impl AgentSessionHandle {
     async fn play(
         self: &Arc<Self>,
         stream: nexus_claude::agent::EventStream,
-        input: TurnInput,
+        mut input: TurnInput,
     ) -> (TurnOutcome, Vec<(String, Option<String>)>) {
         let mut attempt = 0u32;
         let mut outcome = TurnOutcome {
@@ -2081,6 +2153,18 @@ impl AgentSessionHandle {
         // be sent: the first is already open, and a held turn whose probe the
         // provider refused goes back through `send_turn` at the top of the loop.
         let mut stream: Option<nexus_claude::agent::EventStream> = Some(stream);
+        // A model-scoped refusal (ONE model has nothing left) is answered by switching
+        // to another model of the same instance and replaying the SAME turn once: the
+        // switch is bounded, never the same model twice, and never counts as a retry
+        // (`attempt` untouched) nor feeds the outage detector.
+        let mut model_limit: Option<ProviderError> = None;
+        let mut tried_models: Vec<String> = Vec::new();
+        // A context-scoped refusal (the prompt is too long) is answered by evicting
+        // the injected context once and replaying the REDUCED input: bounded to one
+        // eviction per turn, never counted as a retry, and independent of the model
+        // switch (each answers its own refusal; a single attempt meets one).
+        let mut context_refusal: Option<ProviderError> = None;
+        let mut evicted = false;
         loop {
             let Some(mut current) = stream.take() else {
                 // The probe of a held turn: one more call of the same input. A
@@ -2145,6 +2229,17 @@ impl AgentSessionHandle {
                     outcome.quota_refusal = is_quota_refusal(&event);
                 }
                 exited |= process_exited(&event);
+                // A terminal refusal another model may answer (a model-wide limit, a
+                // safeguards refusal) is captured here, and acted on after the inner
+                // loop once the turn is known to have shown nothing.
+                if terminal && model_limit.is_none() {
+                    model_limit = terminal_adaptable_refusal(&event);
+                }
+                // A terminal "prompt is too long" is captured the same way: acted on
+                // after the inner loop once the turn is known to have shown nothing.
+                if terminal && context_refusal.is_none() {
+                    context_refusal = terminal_context_refusal(&event);
+                }
                 // The provider may have just named its session: stored before the
                 // terminal event goes out, so a client that saw the turn end can
                 // count on a resume.
@@ -2248,6 +2343,75 @@ impl AgentSessionHandle {
                 if let Err(error) = self.session.close().await {
                     tracing::warn!(session_id = %self.session_id, %error, "closing the provider of an abandoned turn failed");
                 }
+            }
+            // A model-scoped refusal whose turn showed nothing and ran no tool is the
+            // ONE case where changing model is the remedy (the CLI itself says so): ask
+            // the host for another model of the same instance and replay the SAME input
+            // once. Bounded (three switches, never the same model twice), never counted
+            // as a retry and never fed to the outage detector. A whole-account refusal
+            // never reaches here: `terminal_adaptable_refusal` reads only the errors
+            // another model can answer.
+            if let Some(error) = model_limit.take() {
+                if !shown
+                    && outcome.tools.is_empty()
+                    && tried_models.len() < MAX_MODEL_SWITCHES_PER_TURN
+                {
+                    if let Some(services) = &self.services {
+                        if let Some(model) = services
+                            .model_after_limit(&self.session_id, &error)
+                            .await
+                        {
+                            if !tried_models.iter().any(|tried| tried == &model) {
+                                tried_models.push(model.clone());
+                                match self
+                                    .set_model_after_limit(&model, switch_reason(&error))
+                                    .await
+                                {
+                                    Ok(()) => continue,
+                                    Err(switch_error) => {
+                                        tracing::warn!(
+                                            session_id = %self.session_id,
+                                            %model,
+                                            %switch_error,
+                                            "the model the host named after a limit could not be made active: the turn ends on the refusal"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // No model to switch to (or the switch failed): the turn ends on the
+                // refusal, as today. The typed error already says what is exhausted.
+            }
+            // A context-scoped refusal whose turn showed nothing and ran no tool is the
+            // ONE case where shrinking the input is the remedy: ask the host for the
+            // input without the injected context and replay it once. Bounded to one
+            // eviction per turn, never counted as a retry and never fed to the outage
+            // detector. If the host has nothing to evict, the turn ends on the refusal,
+            // as today.
+            if let Some(error) = context_refusal.take() {
+                if !shown && outcome.tools.is_empty() && !evicted {
+                    if let Some(services) = &self.services {
+                        if let Some(reduced) = services
+                            .adapt_context(&self.session_id, &input)
+                            .await
+                        {
+                            evicted = true;
+                            input = reduced;
+                            self.emit(ChatEvent::SystemHint {
+                                content: format!(
+                                    "The context was too long for this turn; the turn was replayed \
+                                     with a smaller context ({error})."
+                                ),
+                            })
+                            .await;
+                            continue;
+                        }
+                    }
+                }
+                // Nothing to evict (or the eviction already ran): the turn ends on the
+                // refusal. The typed error already says the context is too small.
             }
             let Some(error) = retry else {
                 // The attempt answered without a retryable failure: the instance is
@@ -2993,6 +3157,24 @@ impl AgentSessionHandle {
             .map_err(anyhow::Error::new)?;
         self.emit(ChatEvent::ModelChanged {
             model: model.to_string(),
+            reason: None,
+        })
+        .await;
+        Ok(())
+    }
+
+    /// Changes the model because the one in force could not answer this turn (a
+    /// MODEL-wide limit, a safeguards refusal): the change carries its REASON, so the
+    /// interface can say why, and two switches in one turn do not collapse into one
+    /// event.
+    async fn set_model_after_limit(&self, model: &str, reason: &str) -> Result<()> {
+        self.session
+            .set_model(model)
+            .await
+            .map_err(anyhow::Error::new)?;
+        self.emit(ChatEvent::ModelChanged {
+            model: model.to_string(),
+            reason: Some(reason.to_string()),
         })
         .await;
         Ok(())
@@ -6723,6 +6905,12 @@ mod answered_tests {
     struct Host {
         answered: StdMutex<Vec<bool>>,
         outcomes: StdMutex<Vec<OutcomeFields>>,
+        /// Models `model_after_limit` names, popped one per call (`Vec::default()` = no switch,
+        /// which is what every other test gets).
+        after_limit_models: StdMutex<Vec<String>>,
+        /// Inputs `adapt_context` returns, popped one per call (`Vec::default()` = nothing to
+        /// evict, which is what every other test gets).
+        evicted_inputs: StdMutex<Vec<TurnInput>>,
     }
 
     #[async_trait::async_trait]
@@ -6748,6 +6936,26 @@ mod answered_tests {
                 error_code: outcome.error_code.clone(),
             });
             AfterTurn::default()
+        }
+        async fn model_after_limit(
+            &self,
+            _session_id: &str,
+            _limit: &ProviderError,
+        ) -> Option<String> {
+            let mut models = self.after_limit_models.lock().unwrap();
+            if models.is_empty() {
+                None
+            } else {
+                Some(models.remove(0))
+            }
+        }
+        async fn adapt_context(&self, _session_id: &str, _input: &TurnInput) -> Option<TurnInput> {
+            let mut inputs = self.evicted_inputs.lock().unwrap();
+            if inputs.is_empty() {
+                None
+            } else {
+                Some(inputs.remove(0))
+            }
         }
     }
 
@@ -7239,6 +7447,315 @@ mod answered_tests {
             .expect("the failure is said on the wire");
         assert!(message.contains("serves again at"), "{message}");
         assert!(message.contains("nothing is switched for you"), "{message}");
+    }
+
+    /// A model-scoped refusal (ONE model has nothing left) is answered by switching to the
+    /// model the host names, announcing the switch with its reason, and replaying the SAME turn
+    /// once — the turn ends answered, not on the refusal.
+    #[tokio::test]
+    async fn a_model_limit_switches_the_session_instead_of_ending_the_turn() {
+        let (provider, handle, host) = session(0).await;
+        host.after_limit_models.lock().unwrap().push("m2".into());
+        let seen = play_events(
+            &provider,
+            &handle,
+            vec![
+                vec![done(
+                    true,
+                    Some(ProviderError::ModelLimitReached {
+                        model: Some("m1".into()),
+                        resets_at_ms: None,
+                    }),
+                )],
+                vec![text("answered on the second model"), done(false, None)],
+            ],
+        )
+        .await;
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap().len(),
+            2,
+            "the refused turn and its one replayed switch"
+        );
+        assert_eq!(host.seen(), [true], "one turn, answered on the second model");
+        assert_eq!(
+            provider.state.models.lock().unwrap().as_slice(),
+            ["m2"],
+            "the switch asked the provider for the model the host named"
+        );
+        assert!(
+            seen.iter().any(
+                |e| matches!(e, ChatEvent::ModelChanged { model, reason: Some(reason) }
+                    if model == "m2" && reason == "limit_reached")
+            ),
+            "the switch is announced with the limit_reached reason: {seen:#?}"
+        );
+    }
+
+    /// A safeguards REFUSAL (`Refused`) is adapted the same way — the CLI's own advice is
+    /// "try a different model" — but it is announced with its OWN reason: a refusal of the
+    /// request is not a limit, and the person must not read the two the same way.
+    #[tokio::test]
+    async fn a_safeguards_refusal_is_adapted_on_another_model_with_its_own_reason() {
+        let (provider, handle, host) = session(0).await;
+        host.after_limit_models.lock().unwrap().push("m2".into());
+        let seen = play_events(
+            &provider,
+            &handle,
+            vec![
+                vec![done(true, Some(ProviderError::Refused { category: None }))],
+                vec![text("answered elsewhere"), done(false, None)],
+            ],
+        )
+        .await;
+        assert_eq!(provider.state.turns_started.lock().unwrap().len(), 2);
+        assert_eq!(host.seen(), [true], "the turn is answered, not refused");
+        assert!(
+            seen.iter().any(
+                |e| matches!(e, ChatEvent::ModelChanged { model, reason: Some(reason) }
+                    if model == "m2" && reason == "request_refused")
+            ),
+            "the switch says the request was refused, not that a limit was hit: {seen:#?}"
+        );
+    }
+
+    /// A context-scoped refusal (`ContextTooSmall`, "prompt is too long") is answered by
+    /// evicting the injected context and replaying the REDUCED input once — the turn ends
+    /// answered, not on the refusal, and the eviction is announced to the person.
+    #[tokio::test]
+    async fn a_context_refusal_evicts_and_replays_once() {
+        let (provider, handle, host) = session(0).await;
+        host.evicted_inputs
+            .lock()
+            .unwrap()
+            .push(TurnInput::text("reduced"));
+        let seen = play_events(
+            &provider,
+            &handle,
+            vec![
+                vec![done(
+                    true,
+                    Some(ProviderError::ContextTooSmall {
+                        needed: Some(10),
+                        available: Some(5),
+                    }),
+                )],
+                vec![text("answered after the eviction"), done(false, None)],
+            ],
+        )
+        .await;
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap().len(),
+            2,
+            "the refused turn and its one evicted replay"
+        );
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap().as_slice(),
+            ["go", "reduced"],
+            "the replay carries the REDUCED input the host returned"
+        );
+        assert_eq!(host.seen(), [true], "one turn, answered after the eviction");
+        assert!(
+            seen.iter().any(
+                |e| matches!(e, ChatEvent::SystemHint { content }
+                    if content.contains("too long") && content.contains("smaller"))
+            ),
+            "the eviction is announced as a system hint: {seen:#?}"
+        );
+    }
+
+    /// A context refusal with nothing to evict keeps today's behaviour: exactly one turn,
+    /// unanswered, the refusal said on the wire.
+    #[tokio::test]
+    async fn a_context_refusal_with_nothing_to_evict_ends_on_the_error() {
+        let (provider, handle, host) = session(0).await;
+        // `evicted_inputs` is empty: the host has nothing to evict.
+        let seen = play_events(
+            &provider,
+            &handle,
+            vec![vec![done(
+                true,
+                Some(ProviderError::ContextTooSmall {
+                    needed: None,
+                    available: None,
+                }),
+            )]],
+        )
+        .await;
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap().len(),
+            1,
+            "no replay without an eviction"
+        );
+        assert_eq!(host.seen(), [false], "the turn ends unanswered");
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, ChatEvent::Result { is_error: true, .. })),
+            "the refusal is said on the wire: {seen:#?}"
+        );
+    }
+
+    /// Two consecutive context refusals stop after ONE eviction: the second refusal ends the
+    /// turn, no infinite loop.
+    #[tokio::test]
+    async fn a_context_refusal_evicts_at_most_once() {
+        let (provider, handle, host) = session(0).await;
+        host.evicted_inputs
+            .lock()
+            .unwrap()
+            .push(TurnInput::text("reduced"));
+        let seen = play_events(
+            &provider,
+            &handle,
+            vec![
+                vec![done(
+                    true,
+                    Some(ProviderError::ContextTooSmall {
+                        needed: Some(10),
+                        available: Some(5),
+                    }),
+                )],
+                vec![done(
+                    true,
+                    Some(ProviderError::ContextTooSmall {
+                        needed: Some(10),
+                        available: Some(5),
+                    }),
+                )],
+            ],
+        )
+        .await;
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap().len(),
+            2,
+            "one eviction, then the second refusal ends the turn"
+        );
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap().as_slice(),
+            ["go", "reduced"],
+            "the replay carried the reduced input once"
+        );
+        assert_eq!(host.seen(), [false], "the second refusal ends the turn unanswered");
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, ChatEvent::Result { is_error: true, .. })),
+            "the final refusal is said on the wire: {seen:#?}"
+        );
+    }
+
+    /// A whole-ACCOUNT refusal (`RateLimited`) must NOT switch model: changing model cannot
+    /// help, and it would waste a call — no `ModelChanged`, no second turn.
+    #[tokio::test]
+    async fn a_whole_account_rate_limit_does_not_switch_model() {
+        let registry = Arc::new(crate::chat::provider::quota::QuotaRegistry::new());
+        let (provider, handle, host) = session_with_quota(registry.clone(), 0).await;
+        host.after_limit_models.lock().unwrap().push("m2".into());
+        let reset = wall_clock_ms() + 3 * 86_400_000;
+        let seen = play_events(
+            &provider,
+            &handle,
+            vec![vec![done(
+                true,
+                Some(ProviderError::RateLimited {
+                    retry_after_ms: None,
+                    resets_at_ms: Some(reset),
+                }),
+            )]],
+        )
+        .await;
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap().len(),
+            1,
+            "no second turn for an account-wide limit"
+        );
+        assert!(
+            provider.state.models.lock().unwrap().is_empty(),
+            "set_model was never asked"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, ChatEvent::ModelChanged { .. })),
+            "no ModelChanged for an account-wide limit: {seen:#?}"
+        );
+    }
+
+    /// Three model limits in a row, the host always naming a NEW model, stop after the cap of
+    /// three switches and end the turn on the fourth refusal.
+    #[tokio::test]
+    async fn three_model_limits_in_a_row_stop_after_the_cap() {
+        let (provider, handle, host) = session(0).await;
+        for model in ["m2", "m3", "m4", "m5"] {
+            host.after_limit_models.lock().unwrap().push(model.into());
+        }
+        let limit = |model: &str| {
+            done(
+                true,
+                Some(ProviderError::ModelLimitReached {
+                    model: Some(model.into()),
+                    resets_at_ms: None,
+                }),
+            )
+        };
+        let seen = play_events(
+            &provider,
+            &handle,
+            vec![
+                vec![limit("m1")],
+                vec![limit("m2")],
+                vec![limit("m3")],
+                vec![limit("m4")],
+            ],
+        )
+        .await;
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap().len(),
+            4,
+            "the refused turn, three switches, then the cap"
+        );
+        assert_eq!(
+            provider.state.models.lock().unwrap().as_slice(),
+            ["m2", "m3", "m4"],
+            "three switches at most, the fourth name is never asked for"
+        );
+        assert_eq!(host.seen(), [false], "the last refusal ends the turn unanswered");
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, ChatEvent::Result { is_error: true, .. })),
+            "the final refusal is said on the wire"
+        );
+    }
+
+    /// A model-scoped refusal writes a per-MODEL hold, not an account-wide exhaustion: the
+    /// instance's other models stay eligible.
+    #[tokio::test]
+    async fn a_model_limit_holds_only_the_model_not_the_account() {
+        let registry = Arc::new(crate::chat::provider::quota::QuotaRegistry::new());
+        let (provider, handle, host) = session_with_quota(registry.clone(), 0).await;
+        play_events(
+            &provider,
+            &handle,
+            vec![vec![done(
+                true,
+                Some(ProviderError::ModelLimitReached {
+                    model: Some("m1".into()),
+                    resets_at_ms: None,
+                }),
+            )]],
+        )
+        .await;
+        assert!(
+            registry.model_exhausted("local", "m1").is_some(),
+            "the refused model is held"
+        );
+        assert!(
+            registry.exhausted("local").is_none(),
+            "the account itself is not held: only the model"
+        );
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap().len(),
+            1,
+            "no switch, no retry"
+        );
     }
 
     /// A2/D1: partial text then a non-retryable failure keeps the old behaviour —

@@ -982,7 +982,13 @@ pub enum ChatEvent {
         policy_mode: Option<String>,
     },
     /// Model was changed mid-session
-    ModelChanged { model: String },
+    ModelChanged {
+        model: String,
+        /// Why the model changed, when the harness knows (`limit_reached` for the
+        /// automatic switch after a model-scoped refusal). Absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// Context window compaction is starting (emitted via PreCompact hook)
     CompactionStarted {
         /// Compaction trigger: "auto" or "manual"
@@ -1446,7 +1452,11 @@ impl ChatEvent {
             ChatEvent::PermissionModeChanged { mode, .. } => {
                 Some(format!("permission_mode_changed:{}", mode))
             }
-            ChatEvent::ModelChanged { model } => Some(format!("model_changed:{}", model)),
+            ChatEvent::ModelChanged { model, reason } => Some(format!(
+                "model_changed:{}:{}",
+                model,
+                reason.as_deref().unwrap_or("")
+            )),
             ChatEvent::CompactionStarted { trigger } => {
                 Some(format!("compaction_started:{}", trigger))
             }
@@ -2728,6 +2738,7 @@ mod tests {
             },
             ChatEvent::ModelChanged {
                 model: "claude-opus-4-6".into(),
+                reason: None,
             },
             ChatEvent::CompactionStarted {
                 trigger: "auto".into(),
@@ -3016,7 +3027,7 @@ mod tests {
         let json = r#"{"type":"model_changed","model":"claude-opus-4-6"}"#;
         let event: ChatEvent = serde_json::from_str(json).unwrap();
         assert!(
-            matches!(event, ChatEvent::ModelChanged { ref model } if model == "claude-opus-4-6")
+            matches!(event, ChatEvent::ModelChanged { ref model, .. } if model == "claude-opus-4-6")
         );
 
         // SystemInit with all fields

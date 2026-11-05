@@ -59,8 +59,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use nexus_claude::agent::{
     CompactionDirective, CompactionInfo, HookReply, HookVerdict, NotificationInfo, PromptInfo,
-    SessionHooks, SessionStartInfo, StopInfo, SubagentStopInfo, ToolCallInfo, ToolResultInfo,
-    TurnContext, TurnDirective,
+    ProviderError, SessionHooks, SessionStartInfo, StopInfo, SubagentStopInfo, ToolCallInfo,
+    ToolResultInfo, TurnContext, TurnDirective,
 };
 use nexus_claude::{
     HookContext, HookInput, HookJSONOutput, HookMatcher, NotificationHookInput,
@@ -1650,6 +1650,66 @@ pub(crate) async fn model_for_images(router: &TurnRouter) -> Option<String> {
         return None;
     }
     *locked(&router.image_change) = Some((turn, current_model));
+    let class = router.signature().arm_key();
+    record_change(&mut locked(&router.state), turn, &pick.model, class);
+    Some(pick.model)
+}
+
+/// The model the session must switch to after the one in force was refused for a MODEL-wide
+/// limit: another model of the SAME instance, chosen by the router from the pool (whose quota
+/// holds are already applied, so a held model cannot be picked), never the model in force,
+/// honouring `choice.allowed_models` when set. A user pin does NOT block this — a pin on a
+/// model with nothing left serves nobody, and the switch is temporary: nothing here clears or
+/// rewrites the pin, only the router's view of the model in force moves.
+///
+/// `None`: nothing to change — no other eligible model of this instance, or the router named
+/// none. `limit` is the typed refusal the turn ended on (informational).
+pub(crate) async fn model_after_limit(
+    router: &TurnRouter,
+    _limit: &ProviderError,
+) -> Option<String> {
+    let choice = locked(&router.choice).clone();
+    let (turn, current_model) = {
+        let state = locked(&router.state);
+        (state.next_turn, state.current_model.clone())
+    };
+    let (mut pool, project) = provider_pool(router).await;
+    if let Some(allowed) = &choice.allowed_models {
+        pool.retain(|facts| allowed.iter().any(|m| m == &facts.model));
+    }
+    let person = apply_person_list_here(&choice, &mut pool, &project, &router.signature());
+    // The model in force has nothing left: never pick it again. The pool already carries
+    // the quota holds (`apply_quota` in the pool source), so any OTHER held model is
+    // rejected by the decision too.
+    pool.retain(|facts| !same_model(&facts.model, &current_model));
+    if pool.is_empty() {
+        return None;
+    }
+    let signature = router.signature();
+    // A forced remedy, not a per-turn routing decision: it must apply whatever the mode or
+    // stage (a pin, a `primary` conversation and a `shadow` stage alike must not leave the
+    // person stuck on an exhausted model).
+    let mut settings = settings_for(&choice.routing, true);
+    settings.mode = ProviderRoutingMode::Full;
+    settings.stage = LearningStage::Auto;
+    let held = held_by_class(&locked(&router.state), turn, &signature.arm_key());
+    let mut request = DecideRequest::new(signature, settings, pool);
+    request.narrowed.extend(person);
+    request.trust = router.trust;
+    request.restrict_provider = Some(router.provider_id.clone());
+    request.current = Some(Pick::new(&router.provider_id, &current_model));
+    narrow(&mut request, held, None);
+    request.session_id = router.session_id;
+    request.turn_index = Some(turn);
+    let decision = router.ask(request).await?;
+    if !decision.applied {
+        return None;
+    }
+    let pick = decision.chosen.clone()?;
+    if pick.provider_id != router.provider_id || same_model(&pick.model, &current_model) {
+        return None;
+    }
+    debug!(model = %pick.model, turn, reason = %decision.reason, "a model limit is answered by switching model");
     let class = router.signature().arm_key();
     record_change(&mut locked(&router.state), turn, &pick.model, class);
     Some(pick.model)

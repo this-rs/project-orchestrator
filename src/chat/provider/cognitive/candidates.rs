@@ -126,6 +126,15 @@ pub enum RejectReason {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         window: Option<String>,
     },
+    /// ONE model of the instance refuses until `resets_at_ms` (QUOTA, a typed provider refusal
+    /// named the model): the instance's other models stay eligible. Distinguishable from
+    /// [`Self::QuotaExhausted`], which condemns the whole instance.
+    QuotaExhaustedModel {
+        /// The instant the model serves again (epoch ms).
+        resets_at_ms: u64,
+        /// The model that is held out.
+        model: String,
+    },
     /// The instance is unhealthy right now.
     Unhealthy,
     /// The request needs tools and the model cannot call them.
@@ -163,6 +172,7 @@ impl RejectReason {
             Self::Remote => "remote",
             Self::NotAllowed => "not_allowed",
             Self::QuotaExhausted { .. } => "quota_exhausted",
+            Self::QuotaExhaustedModel { .. } => "quota_exhausted_model",
             Self::Unhealthy => "unhealthy",
             Self::NoTools => "no_tools",
             Self::ContextTooSmall { .. } => "context_too_small",
@@ -264,12 +274,17 @@ pub fn claude_code_facts(
 /// any more, and is eligible again without anyone doing anything.
 pub fn apply_quota(pool: &mut [ModelFacts], quota: &crate::chat::provider::quota::QuotaRegistry) {
     for facts in pool {
-        facts.quota_exhausted = quota
+        // An account-wide exhaustion condemns every model of the instance and wins the reason
+        // (it may reset later than a single-model hold; the model must not slip back earlier).
+        // When the account itself is free, a per-model hold marks ONLY that model, and its
+        // `window` carries `model:<name>` so `check` can name the model in the rejection.
+        let held = quota
             .exhausted(&facts.provider_id)
-            .map(|held| QuotaExhaustion {
-                resets_at_ms: held.resets_at_ms,
-                window: held.window,
-            });
+            .or_else(|| quota.model_exhausted(&facts.provider_id, &facts.model));
+        facts.quota_exhausted = held.map(|held| QuotaExhaustion {
+            resets_at_ms: held.resets_at_ms,
+            window: held.window,
+        });
         facts.quota_utilization = quota.pressure(&facts.provider_id);
     }
 }
@@ -312,6 +327,14 @@ fn check(signature: &TaskSignature, facts: &ModelFacts) -> Option<RejectReason> 
     }
     // Before health: an exhausted account is healthy, and the reason must say when it is back.
     if let Some(quota) = &facts.quota_exhausted {
+        // A model-scoped hold is carried as `window: "model:<name>"` (quota.rs): name the model,
+        // so the reason is distinguishable from an account-wide exhaustion.
+        if let Some(model) = quota.window.as_deref().and_then(|w| w.strip_prefix("model:")) {
+            return Some(RejectReason::QuotaExhaustedModel {
+                resets_at_ms: quota.resets_at_ms,
+                model: model.to_owned(),
+            });
+        }
         return Some(RejectReason::QuotaExhausted {
             resets_at_ms: quota.resets_at_ms,
             window: quota.window.clone(),
@@ -439,7 +462,10 @@ impl HealthCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use crate::chat::provider::cognitive::signature::{ContextHints, TaskClass};
+    use crate::chat::provider::limits::ManualClock;
+    use crate::chat::provider::quota::QuotaRegistry;
     use crate::chat::provider::resolver::CLAUDE_CODE;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
@@ -843,5 +869,124 @@ mod tests {
                 .unwrap();
             assert_eq!(opus.price, Some(price));
         }
+    }
+
+    // ── Per-model quota holds ───────────────────────────────────────────
+
+    fn quota_registry() -> (Arc<ManualClock>, QuotaRegistry) {
+        let clock = Arc::new(ManualClock::at("2026-10-21T10:00:00Z"));
+        (
+            Arc::clone(&clock),
+            QuotaRegistry::new().with_clock(clock),
+        )
+    }
+
+    /// A Claude Code pair that meets every non-quota constraint.
+    fn claude_facts(model: &str) -> ModelFacts {
+        let mut facts = good();
+        facts.provider_id = CLAUDE_CODE.into();
+        facts.model = model.into();
+        facts
+    }
+
+    /// Builds the pool, applies the quota registry, then the filter, for a tooled chat turn.
+    fn run(pool: &[ModelFacts], registry: &QuotaRegistry) -> Filtered {
+        let mut pool = pool.to_vec();
+        apply_quota(&mut pool, registry);
+        apply(Slot::Automatic, &tooled(), &pool).unwrap()
+    }
+
+    #[test]
+    fn a_model_hold_removes_only_that_model_from_the_pool() {
+        let (_clock, registry) = quota_registry();
+        registry.mark_model_rate_limited(
+            CLAUDE_CODE,
+            "claude-fable-5-1",
+            Some(registry.now_ms() + 3_600_000),
+            None,
+        );
+        let pool = vec![
+            claude_facts("claude-fable-5-1"),
+            claude_facts("claude-sonnet-4-5"),
+        ];
+        let out = run(&pool, &registry);
+        let eligible: Vec<_> = out.eligible.iter().map(|f| f.model.as_str()).collect();
+        assert_eq!(eligible, vec!["claude-sonnet-4-5"], "{:?}", out.rejected);
+        let rejected: Vec<_> = out
+            .rejected
+            .iter()
+            .map(|r| r.candidate.model.as_str())
+            .collect();
+        assert_eq!(rejected, vec!["claude-fable-5-1"]);
+    }
+
+    #[test]
+    fn an_instance_exhaustion_still_removes_every_model() {
+        let (_clock, registry) = quota_registry();
+        registry.mark_out_of_credit(CLAUDE_CODE);
+        let pool = vec![
+            claude_facts("claude-fable-5-1"),
+            claude_facts("claude-sonnet-4-5"),
+        ];
+        let out = run(&pool, &registry);
+        assert!(out.eligible.is_empty(), "{:?}", out.eligible);
+        assert!(out
+            .rejected
+            .iter()
+            .all(|r| r.reason.code() == "quota_exhausted"));
+    }
+
+    #[test]
+    fn an_expired_model_hold_filters_nothing() {
+        let (clock, registry) = quota_registry();
+        registry.mark_model_rate_limited(CLAUDE_CODE, "claude-fable-5-1", None, Some(90_000));
+        clock.advance(Duration::from_millis(90_001));
+        let pool = vec![
+            claude_facts("claude-fable-5-1"),
+            claude_facts("claude-sonnet-4-5"),
+        ];
+        let out = run(&pool, &registry);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.eligible.len(), 2);
+    }
+
+    #[test]
+    fn a_model_scoped_rejection_names_the_model() {
+        let (_clock, registry) = quota_registry();
+        let until = registry.now_ms() + 3_600_000;
+        registry.mark_model_rate_limited(CLAUDE_CODE, "claude-fable-5-1", Some(until), None);
+        let out = run(&[claude_facts("claude-fable-5-1")], &registry);
+        let rejected = out.rejected.into_iter().next().expect("rejected");
+        assert_eq!(
+            rejected.reason,
+            RejectReason::QuotaExhaustedModel {
+                resets_at_ms: until,
+                model: "claude-fable-5-1".into()
+            }
+        );
+        assert_eq!(rejected.reason.code(), "quota_exhausted_model");
+    }
+
+    #[test]
+    fn an_instance_exhaustion_outranks_a_model_hold() {
+        let (_clock, registry) = quota_registry();
+        // The account is out later than the model hold: the model must not slip back earlier.
+        let account_until = registry.now_ms() + 7_200_000;
+        registry.mark_rate_limited(CLAUDE_CODE, Some(account_until), None);
+        registry.mark_model_rate_limited(
+            CLAUDE_CODE,
+            "claude-fable-5-1",
+            Some(registry.now_ms() + 3_600_000),
+            None,
+        );
+        let out = run(&[claude_facts("claude-fable-5-1")], &registry);
+        let rejected = out.rejected.into_iter().next().expect("rejected");
+        assert_eq!(
+            rejected.reason,
+            RejectReason::QuotaExhausted {
+                resets_at_ms: account_until,
+                window: None
+            }
+        );
     }
 }
