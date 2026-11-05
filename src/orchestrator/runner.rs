@@ -2209,7 +2209,18 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .verify_assertions_for_file(&assertion_notes, file_info);
 
         for result in results {
-            if !result.passed {
+            // Ces quatre contrôles ne se décident PAS depuis un fichier : ils demandent le
+            // graphe (`notes::beliefs` les vérifie au démarrage). Ils rendent désormais
+            // « je ne sais pas » au lieu de « c'est vrai » — et un « je ne sais pas » ne
+            // sanctionne rien, sinon on transformerait l'ignorance en culpabilité.
+            let unverifiable_from_file = matches!(
+                result.check_type,
+                Some(crate::notes::AssertionCheckType::DependsOn)
+                    | Some(crate::notes::AssertionCheckType::Calls)
+                    | Some(crate::notes::AssertionCheckType::NoCalls)
+                    | Some(crate::notes::AssertionCheckType::Implements)
+            );
+            if !result.passed && !unverifiable_from_file {
                 // Find the note to get the violation action
                 let note = assertion_notes.iter().find(|n| n.id == result.note_id);
 

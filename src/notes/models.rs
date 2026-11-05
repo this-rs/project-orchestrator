@@ -641,6 +641,21 @@ pub struct AssertionResult {
 }
 
 impl AssertionResult {
+    /// Le verdict dit-il seulement « je n'ai pas pu vérifier » ?
+    ///
+    /// Distinct de `passed == false` : un appelant qui sanctionne sur `!passed` doit
+    /// consulter ce prédicat, sinon il transforme « inconnu » en « coupable » — le miroir
+    /// du mensonge qu'on corrige.
+    pub fn is_unverifiable(&self) -> bool {
+        self.details
+            .as_ref()
+            .and_then(|d| d.get("unverifiable"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+}
+
+impl AssertionResult {
     pub fn passed(message: impl Into<String>) -> Self {
         Self {
             passed: true,

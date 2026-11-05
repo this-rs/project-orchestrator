@@ -466,9 +466,28 @@ impl NoteLifecycleManager {
             .collect()
     }
 
+    /// Un contrôle de RELATION ne se vérifie pas depuis un fichier : il demande le graphe.
+    ///
+    /// Il rendait `passed: true` avec « requires graph access » — une assertion de relation
+    /// ne pouvait donc jamais échouer. Il dit maintenant qu'il ne sait pas, et
+    /// `notes::beliefs` vérifie réellement, contre le graphe, au démarrage.
+    fn unverifiable_here(check: &str) -> AssertionResult {
+        AssertionResult {
+            passed: false,
+            message: format!(
+                "{check} ne se vérifie pas depuis le fichier (il faut le graphe) : \
+             voir notes::beliefs, qui interroge CALLS/IMPLEMENTS_TRAIT/DEPENDS_ON"
+            ),
+            details: Some(serde_json::json!({ "unverifiable": true })),
+            checked_at: Utc::now(),
+        }
+    }
+
     /// Verify an assertion note against a file
     ///
-    /// Returns the verification result based on the assertion rule.
+    /// Returns the verification result based on the assertion rule. Les contrôles de
+    /// RELATION y rendent « je ne sais pas » : ils demandent le graphe, et c'est
+    /// `notes::beliefs` qui les tranche au démarrage.
     pub fn verify_assertion(
         &self,
         note: &Note,
@@ -514,40 +533,20 @@ impl NoteLifecycleManager {
                 self.check_signature_contains(&rule.target, file_info, &rule.parameters)
             }
             AssertionCheckType::DependsOn => {
-                // This requires graph traversal, handled separately
-                AssertionResult {
-                    passed: true,
-                    message: "DependsOn check requires graph access".to_string(),
-                    details: None,
-                    checked_at: chrono::Utc::now(),
-                }
+                // Le graphe seul peut trancher : voir notes::beliefs.
+                Self::unverifiable_here("DependsOn")
             }
             AssertionCheckType::Calls => {
-                // This requires graph traversal, handled separately
-                AssertionResult {
-                    passed: true,
-                    message: "Calls check requires graph access".to_string(),
-                    details: None,
-                    checked_at: chrono::Utc::now(),
-                }
+                // Le graphe seul peut trancher : voir notes::beliefs.
+                Self::unverifiable_here("Calls")
             }
             AssertionCheckType::NoCalls => {
-                // This requires graph traversal, handled separately
-                AssertionResult {
-                    passed: true,
-                    message: "NoCalls check requires graph access".to_string(),
-                    details: None,
-                    checked_at: chrono::Utc::now(),
-                }
+                // Le graphe seul peut trancher : voir notes::beliefs.
+                Self::unverifiable_here("NoCalls")
             }
             AssertionCheckType::Implements => {
-                // This requires graph traversal, handled separately
-                AssertionResult {
-                    passed: true,
-                    message: "Implements check requires graph access".to_string(),
-                    details: None,
-                    checked_at: chrono::Utc::now(),
-                }
+                // Le graphe seul peut trancher : voir notes::beliefs.
+                Self::unverifiable_here("Implements")
             }
         };
 
