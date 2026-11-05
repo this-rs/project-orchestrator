@@ -708,7 +708,23 @@ pub struct CodexStatus {
 /// Read-only probe of the `codex` program: it looks it up on the PATH and runs
 /// `codex --version` with a 5-second bound. It never installs anything.
 pub async fn check_codex_status() -> CodexStatus {
-    let Some(path) = find_on_path("codex") else {
+    let path = std::env::var_os("PATH")
+        .and_then(|paths| find_program_in(&paths, "codex", PROGRAM_SUFFIXES));
+    probe_codex_program(path).await
+}
+
+/// Executable suffixes tried after the bare name. Windows installs a program as
+/// `.exe`, `.cmd` or `.bat`; Unix has none.
+const PROGRAM_SUFFIXES: &[&str] = if cfg!(windows) {
+    &[".exe", ".cmd", ".bat"]
+} else {
+    &[]
+};
+
+/// Runs `codex --version` at `path`. `None` means not installed. A program that cannot
+/// be run, or does not answer in time, is installed with no version.
+async fn probe_codex_program(path: Option<std::path::PathBuf>) -> CodexStatus {
+    let Some(path) = path else {
         return CodexStatus {
             installed: false,
             version: None,
@@ -731,11 +747,19 @@ pub async fn check_codex_status() -> CodexStatus {
     }
 }
 
-/// The first PATH entry holding a regular file called `name`.
-fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join(name))
+/// The first PATH directory holding a program called `name`, with each suffix tried in turn.
+fn find_program_in(
+    paths: &std::ffi::OsStr,
+    name: &str,
+    suffixes: &[&str],
+) -> Option<std::path::PathBuf> {
+    std::env::split_paths(paths)
+        .flat_map(|dir| {
+            std::iter::once(name.to_string())
+                .chain(suffixes.iter().map(|suffix| format!("{name}{suffix}")))
+                .map(move |file| dir.join(file))
+                .collect::<Vec<_>>()
+        })
         .find(|candidate| candidate.is_file())
 }
 
@@ -763,8 +787,69 @@ mod codex_status_tests {
     }
 
     #[test]
+    fn a_program_is_found_in_the_first_directory_that_holds_it() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(second.path().join("codex"), b"").unwrap();
+        let paths = std::env::join_paths([first.path(), second.path()]).unwrap();
+        assert_eq!(
+            find_program_in(&paths, "codex", &[]),
+            Some(second.path().join("codex"))
+        );
+    }
+
+    #[test]
+    fn a_windows_style_suffix_is_tried_after_the_bare_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("codex.cmd"), b"").unwrap();
+        let paths = std::env::join_paths([dir.path()]).unwrap();
+        assert_eq!(
+            find_program_in(&paths, "codex", &[".exe", ".cmd"]),
+            Some(dir.path().join("codex.cmd"))
+        );
+        assert_eq!(find_program_in(&paths, "codex", &[]), None);
+    }
+
+    #[test]
     fn a_missing_program_is_not_installed() {
-        let missing = "codex-definitely-not-on-path-7f3a";
-        assert!(find_on_path(missing).is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let paths = std::env::join_paths([dir.path()]).unwrap();
+        assert_eq!(find_program_in(&paths, "codex", &[]), None);
+    }
+
+    #[tokio::test]
+    async fn no_program_on_the_path_reads_as_not_installed() {
+        let status = probe_codex_program(None).await;
+        assert_eq!(
+            status,
+            CodexStatus {
+                installed: false,
+                version: None,
+                path: None
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_program_that_cannot_run_is_installed_without_a_version() {
+        let missing = std::path::PathBuf::from("/nonexistent/codex-7f3a");
+        let status = probe_codex_program(Some(missing.clone())).await;
+        assert!(status.installed);
+        assert_eq!(status.version, None);
+        assert_eq!(status.path, Some(missing.to_string_lossy().into_owned()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_version_is_read_from_the_program_itself() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("codex");
+        std::fs::write(&script, "#!/bin/sh\necho \"codex-cli 9.9.9\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let status = probe_codex_program(Some(script)).await;
+        assert!(status.installed);
+        assert_eq!(status.version.as_deref(), Some("9.9.9"));
     }
 }
