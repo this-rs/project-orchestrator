@@ -1690,6 +1690,11 @@ impl AgentSessionHandle {
         Ok(true)
     }
 
+    /// How many messages wait for the running turn to end.
+    pub async fn queued_len(&self) -> usize {
+        self.pending.lock().await.len()
+    }
+
     /// The held messages, as clients see them.
     pub async fn queue_snapshot(&self) -> Vec<super::types::PendingQueueEntry> {
         super::pending_queue::snapshot(&*self.pending.lock().await)

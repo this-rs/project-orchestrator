@@ -79,6 +79,11 @@ const DEAD_CLI_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 /// (LOST-TOOL-RESULT, issue #1056). A turn's clock is minutes, not seconds.
 const LOST_TOOL_RESULT_WATCH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often the release sweep looks for sessions whose segment is `Done`
+/// (`release_done_sessions`): the settle window of `segment_state`, so a finished
+/// mission leaves the live set within about a minute.
+const DONE_RELEASE_INTERVAL: Duration = Duration::from_millis(super::segment_state::SETTLE_MS);
+
 /// A turn whose last persisted event is a `tool_use` of one of PO's OWN MCP tools, older
 /// than this, is dead: those hops are bounded (120 s for the REST proxy in `mcp::http_client`,
 /// 300 s for the native MCP client), so a result eight times past the larger bound is not
@@ -348,6 +353,9 @@ pub struct LiveSessionSnapshot {
     /// Per live session, the skills and personas injected into it (see `activation_registry`).
     pub activations:
         std::collections::HashMap<Uuid, crate::chat::activation_registry::SessionActivations>,
+    /// Per live, tapped session, what it is doing in its current segment
+    /// (`chat::segment_state`), classified when the snapshot was taken.
+    pub states: std::collections::HashMap<Uuid, crate::chat::segment_state::Verdict>,
 }
 
 /// Count the live `(monitors, bash)` among a session's tracked background
@@ -381,12 +389,15 @@ impl LiveSessionSnapshot {
     /// honest answer, not a missing value.
     pub fn activity_for(&self, id: Uuid) -> SessionActivity {
         let (monitors, bash_tasks) = self.background_tasks.get(&id).copied().unwrap_or((0, 0));
+        let verdict = self.states.get(&id).cloned();
         SessionActivity {
             live: self.live.contains(&id),
             streaming: self.streaming.contains(&id),
             pending_permissions: self.pending_permissions.get(&id).map_or(0, |p| p.len()),
             monitors,
             bash_tasks,
+            state: verdict.as_ref().map(|v| v.state),
+            state_reason: verdict.map(|v| v.reason),
         }
     }
 }
@@ -1164,6 +1175,9 @@ pub struct ChatManager {
     pub(crate) mirrors: Arc<super::mirror::MirrorRegistry>,
     /// Whether the Claude Code sessions opened here get a mirror tap (always, but in tests).
     pub(crate) subagent_mirrors: bool,
+    /// The taps that record each live session's event tail, so the snapshot can say what
+    /// it is doing (`chat::segment_tap`, `chat::segment_state`).
+    pub(crate) segment_taps: Arc<super::segment_tap::SegmentTaps>,
     /// The warm delegation sessions this server may resume instead of opening a new child
     /// (CACHE-POOL, `chat::session_pool`): a closed sub-agent session whose prefix is still
     /// in the provider's cache, reused by the next delegation of the SAME conversation, on
@@ -3911,6 +3925,7 @@ impl ChatManager {
             )),
             mirrors: Default::default(),
             subagent_mirrors: true,
+            segment_taps: Default::default(),
             session_pool: Arc::new(super::session_pool::SessionPool::from_env()),
             cancelled_parents: Default::default(),
             team_msg_rate: Default::default(),
@@ -4026,6 +4041,7 @@ impl ChatManager {
             )),
             mirrors: Default::default(),
             subagent_mirrors: true,
+            segment_taps: Default::default(),
             session_pool: Arc::new(super::session_pool::SessionPool::from_env()),
             cancelled_parents: Default::default(),
             team_msg_rate: Default::default(),
@@ -6267,9 +6283,20 @@ impl ChatManager {
     /// session); the per-session permission maps are locked after it is
     /// released.
     pub async fn live_session_snapshot(&self) -> LiveSessionSnapshot {
+        self.live_session_snapshot_at(super::segment_tap::now_ms())
+            .await
+    }
+
+    /// [`Self::live_session_snapshot`], the segment states classified at `now_ms` (the clock
+    /// the model is given: `chat::segment_state` never reads one).
+    pub(crate) async fn live_session_snapshot_at(&self, now_ms: u64) -> LiveSessionSnapshot {
         let mut snap = LiveSessionSnapshot::default();
         let mut inputs = Vec::new();
         let mut tasks = Vec::new();
+        // Per session that gets a segment state: its broadcast (tapped) and its queue length.
+        let mut channels: Vec<(Uuid, broadcast::Sender<ChatEvent>)> = Vec::new();
+        let mut queues = Vec::new();
+        let mut queued: HashMap<Uuid, usize> = HashMap::new();
         {
             let sessions = self.active_sessions.read().await;
             for (id, s) in sessions.iter() {
@@ -6280,6 +6307,8 @@ impl ChatManager {
                     }
                     inputs.push((id, s.pending_permission_inputs.clone()));
                     tasks.push((id, s.active_background_tasks.clone()));
+                    channels.push((id, s.events_tx.clone()));
+                    queues.push((id, s.pending_messages.clone()));
                 }
             }
         }
@@ -6295,7 +6324,12 @@ impl ChatManager {
                 if counts != (0, 0) {
                     snap.background_tasks.insert(id, counts);
                 }
+                channels.push((id, handle.events_tx.clone()));
+                queued.insert(id, handle.queued_len().await);
             }
+        }
+        for (id, queue) in queues {
+            queued.insert(id, queue.lock().await.len());
         }
         // An open mirror of a Claude Code sub-agent works as long as its sub-agent (P18c).
         for id in self.mirrors.open_ids() {
@@ -6323,7 +6357,72 @@ impl ChatManager {
                 snap.background_tasks.insert(id, counts);
             }
         }
+        self.classify_segments(&mut snap, channels, &queued, now_ms);
         snap
+    }
+
+    /// Fills `snap.states` (`chat::segment_state`): taps each session on its broadcast
+    /// the first time it is seen (and asks its record, once, who it answers to), forgets
+    /// the taps of sessions that left, then classifies each tapped session at one clock
+    /// value. A mirror has no channel of its own here: it gets no state.
+    fn classify_segments(
+        &self,
+        snap: &mut LiveSessionSnapshot,
+        channels: Vec<(Uuid, broadcast::Sender<ChatEvent>)>,
+        queued: &HashMap<Uuid, usize>,
+        now: u64,
+    ) {
+        use super::segment_state::Activity;
+        let taps = &self.segment_taps;
+        taps.retain(&channels.iter().map(|(id, _)| *id).collect());
+        for (id, tx) in &channels {
+            if let Some(tap) = taps.ensure(*id, tx) {
+                let graph = self.graph.clone();
+                let id = *id;
+                tokio::spawn(async move {
+                    if let Ok(Some(node)) = graph.get_chat_session(id).await {
+                        tap.set_addressee(super::segment_tap::addressee_of(
+                            node.spawned_by.as_deref(),
+                        ));
+                    }
+                    // What the session said before its tap existed (its opening turn, a
+                    // thread resumed after a restart): the stored tail, with its times. A
+                    // store that cannot answer leaves the tail as it is — no evidence.
+                    let cap = super::segment_state::TAIL_CAP as i64;
+                    let Ok(count) = graph.count_chat_events(id).await else {
+                        return;
+                    };
+                    let Ok(records) = graph
+                        .get_chat_events_paginated(id, (count - cap).max(0), cap)
+                        .await
+                    else {
+                        return;
+                    };
+                    let older: Vec<(ChatEvent, u64)> = records
+                        .iter()
+                        .filter_map(|r| {
+                            let event = serde_json::from_str::<ChatEvent>(&r.data).ok()?;
+                            Some((event, r.created_at.timestamp_millis().max(0) as u64))
+                        })
+                        .collect();
+                    tap.seed(&older);
+                });
+            }
+        }
+        for (id, _) in channels {
+            let a = snap.activity_for(id);
+            let activity = Activity {
+                streaming: a.streaming,
+                pending_permissions: a.pending_permissions,
+                monitors: a.monitors,
+                bash_tasks: a.bash_tasks,
+                queued_messages: queued.get(&id).copied().unwrap_or(0),
+                ..Default::default()
+            };
+            if let Some(verdict) = taps.classify(id, activity, now) {
+                snap.states.insert(id, verdict);
+            }
+        }
     }
 
     /// Live activity for every session the manager knows about, keyed by id.
@@ -19837,6 +19936,78 @@ impl ChatManager {
                 }
             }
         });
+    }
+
+    /// Runs [`Self::release_done_sessions`] every [`DONE_RELEASE_INTERVAL`].
+    pub fn start_done_release_task(self: &Arc<Self>) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(DONE_RELEASE_INTERVAL);
+            loop {
+                ticker.tick().await;
+                manager.release_done_sessions().await;
+            }
+        });
+    }
+
+    /// Releases the sessions whose current segment is `Done` (`chat::segment_state`):
+    /// their turn ended, their output went to whoever spawned them (or there was none),
+    /// no watch, no queue, nothing planned. Returns the sessions it closed.
+    ///
+    /// It closes ON THAT STATE ONLY, never on a duration: a session that reports to a
+    /// person, watches, or waits on one is never `Done`, however long it idles (that is
+    /// still the idle cleanup's business, unchanged). The close is the idle cleanup's own,
+    /// [`Self::close_session`]: the thread stays in the graph, readable, and the next
+    /// message resumes the session the ordinary way.
+    ///
+    /// The agent engine's sessions only. A Claude Code session that is `Done` stays live
+    /// until the idle cleanup: a team message is delivered only to a LIVE Claude Code
+    /// session (`inject_team_message` reads `active_sessions` and does not resume), so
+    /// closing one early would make its team unreachable sooner than today.
+    ///
+    /// The verdict is read twice — on a first snapshot, then again on a fresh one just
+    /// before closing — so a message that arrived in between keeps its session.
+    pub(crate) async fn release_done_sessions(&self) -> Vec<String> {
+        self.release_done_sessions_at(super::segment_tap::now_ms())
+            .await
+    }
+
+    /// [`Self::release_done_sessions`] with the clock given (tests move it past the settle
+    /// window instead of sleeping through it).
+    pub(crate) async fn release_done_sessions_at(&self, now_ms: u64) -> Vec<String> {
+        use super::segment_state::SessionState;
+        let done = |snap: &LiveSessionSnapshot| -> std::collections::HashSet<Uuid> {
+            snap.states
+                .iter()
+                .filter(|(_, v)| v.state == SessionState::Done)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        let mut candidates = Vec::new();
+        for id in done(&self.live_session_snapshot_at(now_ms).await) {
+            if self.agent_runtime.owns(&id.to_string()).await {
+                candidates.push(id);
+            }
+        }
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let still = self.live_session_snapshot_at(now_ms).await;
+        let still_done = done(&still);
+        let mut released = Vec::new();
+        for id in candidates {
+            if !still_done.contains(&id) {
+                continue;
+            }
+            let sid = id.to_string();
+            let reason = still.states.get(&id).map(|v| v.reason.clone());
+            info!(session_id = %sid, reason = ?reason, "Session done: its mission is over, releasing it");
+            match self.close_session(&sid).await {
+                Ok(()) => released.push(sid),
+                Err(e) => warn!(session_id = %sid, error = %e, "Failed to release a done session"),
+            }
+        }
+        released
     }
 
     /// The agent engine's sessions the idle cleanup closes, by the rule of the

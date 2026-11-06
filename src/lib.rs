@@ -1919,6 +1919,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             api::routing_handlers::set_routing_store(Some(store));
         }
         cm.start_cleanup_task();
+        // A session whose segment is Done (its mission is over) leaves the live set (SEG-1).
+        cm.start_done_release_task();
         cm.start_dead_cli_watchdog();
         // A turn waiting on a tool result that will never come (issue #1056): nothing else
         // ends it — the stop watchdog needs a stop, the dead-CLI one needs a dead process.

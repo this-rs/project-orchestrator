@@ -1,6 +1,6 @@
 %% name: po-chat-manager
-%% covers: backend:src/chat/manager/recovery.rs backend:src/chat/{mod,manager,cost,anchor,anchor_resolver,eval_transverse,agent_e2e_tests,tree,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments,pending_queue,posture,relay,refs_wiring_tests,untrusted,neutral_place,session_record,tool_clock,retrieval_trigger}.rs backend:src/notes/coactivation.rs backend:src/notes/retrieval_ledger.rs backend:src/notes/retrieval_policy.rs backend:src/notes/beliefs.rs backend:src/neo4j/beliefs.rs
-%% verified: 0ab7a21f
+%% covers: backend:src/chat/manager/recovery.rs backend:src/chat/{mod,manager,cost,anchor,anchor_resolver,eval_transverse,agent_e2e_tests,tree,drain,post_stream,control_pump,oob_listener,config,types,skill_hook,post_tool_hook,hook_ledger,cli_auth,cli_version,model_catalog,compaction_context,message_attachments,pending_queue,posture,relay,refs_wiring_tests,untrusted,neutral_place,session_record,tool_clock,retrieval_trigger,segment_state,segment_tap}.rs backend:src/notes/coactivation.rs backend:src/notes/retrieval_ledger.rs backend:src/notes/retrieval_policy.rs backend:src/notes/beliefs.rs backend:src/neo4j/beliefs.rs
+%% verified: 9e701d31
 %% ---
 %% PROUVE : le harness de chat côté serveur — comment ChatManager lance, pilote et
 %%   ferme une session Claude Code via le SDK nexus_claude (InteractiveClient), et où
@@ -51,6 +51,16 @@
 %%   existé. Lecture morte supprimée, le handler estampille depuis live_session_snapshot.
 %%   live_session_snapshot compte en plus les tâches de fond, SessionActivity est né, et
 %%   `GET /api/chat/live-activity` (api/chat_handlers.rs, hors de ce diagramme) l'expose.
+%% ---
+%% AJOUTE LE 2026-11-05 (SEG-1, feat/seg-1-session-state, relu à 9e701d31) : « streaming » ne disait
+%%   rien de ce que fait l'agent (session 2c7b913b : 4 h 32 en flux, garée dans un appel Agent sans
+%%   résultat, dernier événement un tool_timing — le chien de garde LOST-TOOL-RESULT ne la voyait pas,
+%%   il ne lit que le DERNIER événement et exige un tool_use). SOURCES LUES : segment_state.rs (classify,
+%%   signal_of, Tail::record / seed), segment_tap.rs (SegmentTaps::ensure / retain / classify, NewTap),
+%%   manager.rs (live_session_snapshot_at, classify_segments, release_done_sessions_at,
+%%   start_done_release_task, inject_team_message), agent_runtime.rs (queued_len, next_queued : le
+%%   drapeau de flux natif ne retombe qu'après la queue de tour). Commande :
+%%   grep -n "active_sessions.read" dans inject_team_message → seule table lue, pas de reprise.
 %% ---
 %% CORRIGE LE 2026-11-01 (issue #1056, fix/chat-opening-bounded) : l'OUVERTURE d'une session
 %%   n'est plus dans la réponse d'un appelant AGENT. `api/chat_handlers.rs::create_session` :
@@ -195,8 +205,18 @@ flowchart TD
         direction TB
         SNAP["✅ live_session_snapshot : un seul verrou sur active_sessions<br/>→ live, streaming (AtomicBool), pending_permissions (request_id),<br/>background_tasks (monitors, bash) via count_background_tasks<br/>(les entrées pending_removal_at ne comptent pas : une veille annulée<br/>cesse d'être annoncée tout de suite, pas après la grâce de 5 s)<br/><i>vérifié : a_live_session_reports_what_it_is_waiting_on,<br/>counting_separates_monitors_from_background_commands,<br/>a_cancelled_watch_stops_being_advertised_at_once</i>"]
         ACT["✅ SessionActivity (types.rs) : live · streaming · pending_permissions ·<br/>monitors · bash_tasks ; activity_for(id) — une session absente de la carte<br/>est CALME, pas inconnue ; is_quiet décide si le champ part sur le fil<br/><i>vérifié : an_unknown_session_is_quiet_rather_than_unknown,<br/>a_live_but_idle_session_is_not_quiet,<br/>session_activity_serialises_the_five_fields_the_ui_reads</i>"]
+        SEGTAP["✅ segment_tap::SegmentTaps (dans ChatManager, pas global) : un récepteur passif par session vivante<br/>sur son events_tx (les deux moteurs), posé par live_session_snapshot à la première vue, remplacé quand le canal change<br/>(reprise), oublié quand la session quitte la carte ; amorcé par la queue STOCKÉE (count_chat_events +<br/>get_chat_events_paginated, created_at) et par spawned_by du nœud (Addressee Human | Spawner)<br/><i>vérifié : a_tap_records_what_the_session_broadcasts_and_follows_a_new_channel, a_spawned_session_answers_its_spawner</i>"]
+        SEGSTATE["✅ segment_state::classify (PUR : ni provider, ni graphe, ni réseau, ni modèle ; horloge passée en ms) :<br/>queue typée + activité + horloge → état + raison {rule, event, age_ms} ; working · writing · reporting ·<br/>watching · waiting_on_person · done · stalled ; stalled = en flux sans événement depuis 30 min (STALLED_AFTER_MS) ;<br/>done = fin de tour (result) PROUVÉE après l entrée, propre, rien pour une personne (ou session engendrée), pas de veille,<br/>pas de file, rien de prévu, passé SETTLE_MS (30 s) ; reporting / watching / waiting_on_person ne donnent JAMAIS done<br/><i>vérifié : the_table_of_states, the_2c7b913b_replay_is_stalled_not_working, report_watch_and_wait_never_give_done, replayable</i>"]
+        ACTSTATE["✅ SessionActivity.state + state_reason (additifs, par nom, absents hors session vivante tapée)<br/><i>vérifié : session_activity_carries_its_segment_state_by_name,<br/>agent_lifecycle::a_native_session_reports_its_segment_state_and_a_report_stays_live (fake_openai)</i>"]
+        RELEASE["✅ start_done_release_task (toutes les 30 s) → release_done_sessions : un état DONE (lu deux fois, sur deux<br/>instantanés) ferme la session par close_session — le chemin du nettoyage d inactivité, fil gardé, reprise au message suivant ;<br/>jamais sur une durée seule ; moteur AGENT seulement<br/><i>vérifié : agent_lifecycle::a_finished_spawned_native_session_is_done_and_released, a_watching_native_session_is_not_released</i><br/>🟠 une session Claude Code DONE reste vivante jusqu au nettoyage : inject_team_message ne livre qu à une session<br/>legacy VIVANTE (active_sessions, sans reprise) — la fermer plus tôt couperait son équipe"]
+        SNAP --> SEGTAP
+        SEGTAP --> SEGSTATE
+        SEGSTATE --> ACTSTATE
+        ACT --> ACTSTATE
+        SEGSTATE --> RELEASE
         SNAP --> ACT
     end
+    RELEASE --> CLOSE
 
     WIRES --> SNAP
 

@@ -12820,6 +12820,190 @@ mod agent_lifecycle {
         panic!("an idle native session outlived the session timeout");
     }
 
+    /// The segment state of a live session, once its tap has seeded the stored thread.
+    async fn segment_state_of(
+        manager: &ChatManager,
+        sid: &str,
+        now_ms: u64,
+        want: crate::chat::segment_state::SessionState,
+    ) -> crate::chat::segment_state::Verdict {
+        let id = Uuid::parse_str(sid).unwrap();
+        let mut last = None;
+        for _ in 0..200 {
+            let snap = manager.live_session_snapshot_at(now_ms).await;
+            last = snap.states.get(&id).cloned();
+            // A verdict on the tail before the stored thread was seeded proves nothing.
+            if last.as_ref().is_some_and(|v| {
+                v.state == want && v.reason.rule != crate::chat::segment_state::Rule::NoProvenEnd
+            }) {
+                return last.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("session {sid} never reached {want:?}: last verdict {last:?}");
+    }
+
+    fn spawned_request() -> ChatRequest {
+        let mut r = request(Some("local"), Some("proj"), "default");
+        r.spawned_by = Some(
+            crate::chat::types::SpawnedBy::Conversation {
+                parent_session_id: Uuid::new_v4(),
+                tool_use_id: Some("toolu_seg".into()),
+            }
+            .to_json_string(),
+        );
+        r
+    }
+
+    /// SEG-1 step 3: a real native session of the mock carries its segment state in
+    /// `SessionActivity`, by name. Its opening turn answered a person: `reporting`, never
+    /// `done` — however late the clock is — and the session stays live.
+    #[tokio::test]
+    async fn a_native_session_reports_its_segment_state_and_a_report_stays_live() {
+        use crate::chat::segment_state::{Rule, SessionState};
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |_| {});
+        let sid = manager
+            .create_session(&request(Some("local"), Some("proj"), "default"))
+            .await
+            .unwrap()
+            .session_id;
+        idle(&manager, &sid).await;
+        let now = crate::chat::segment_tap::now_ms();
+        let verdict = segment_state_of(&manager, &sid, now, SessionState::Reporting).await;
+        assert_eq!(verdict.reason.rule, Rule::AnsweredHuman, "{verdict:?}");
+        let activity = manager
+            .session_activity_map()
+            .await
+            .remove(&Uuid::parse_str(&sid).unwrap())
+            .expect("live");
+        assert_eq!(activity.state, Some(SessionState::Reporting));
+        let json = serde_json::to_value(&activity).unwrap();
+        assert_eq!(json["state"], "reporting");
+        assert_eq!(json["state_reason"]["rule"], "answered_human");
+        assert_eq!(json["state_reason"]["event"], "result");
+
+        let a_day_later = now + 24 * 3_600_000;
+        assert!(manager
+            .release_done_sessions_at(a_day_later)
+            .await
+            .is_empty());
+        assert!(
+            manager.agent_runtime.owns(&sid).await,
+            "a report to a person is never released"
+        );
+    }
+
+    /// SEG-1 step 4: a spawned native session whose turn ended (its answer went to its
+    /// spawner) is `done` once the settle window has passed, and the release takes it out
+    /// of the live set through the ordinary close; its thread stays readable, and a new
+    /// message resumes it.
+    #[tokio::test]
+    async fn a_finished_spawned_native_session_is_done_and_released() {
+        use crate::chat::segment_state::{SessionState, SETTLE_MS};
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph.clone(), |_| {});
+        let sid = manager
+            .create_session(&spawned_request())
+            .await
+            .unwrap()
+            .session_id;
+        idle(&manager, &sid).await;
+        let now = crate::chat::segment_tap::now_ms();
+        // Inside the settle window: still working (its end-of-turn work may plan a turn).
+        segment_state_of(&manager, &sid, now, SessionState::Working).await;
+        assert!(manager.release_done_sessions_at(now).await.is_empty());
+        assert!(manager.agent_runtime.owns(&sid).await);
+
+        let later = now + SETTLE_MS + 1_000;
+        segment_state_of(&manager, &sid, later, SessionState::Done).await;
+        assert_eq!(
+            manager.release_done_sessions_at(later).await,
+            vec![sid.clone()]
+        );
+        assert!(!manager.agent_runtime.owns(&sid).await, "no longer live");
+        let uuid = Uuid::parse_str(&sid).unwrap();
+        assert!(
+            !manager.live_session_snapshot().await.live.contains(&uuid),
+            "out of the live set"
+        );
+        let node = graph.get_chat_session(uuid).await.unwrap();
+        assert!(node.is_some(), "the conversation is still there");
+        assert!(
+            graph.count_chat_events(uuid).await.unwrap() > 0,
+            "its thread stays readable"
+        );
+        // Done flips back the ordinary way: a new message resumes the session.
+        manager
+            .route_user_message(&sid, "hi there", None)
+            .await
+            .expect("a released session resumes on its next message");
+        assert!(manager.agent_runtime.owns(&sid).await, "live again");
+    }
+
+    /// SEG-1 step 4: a finished spawned session that WATCHES (a background task still
+    /// running) is never released, whatever the clock.
+    #[tokio::test]
+    async fn a_watching_native_session_is_not_released() {
+        use crate::chat::segment_state::{SessionState, SETTLE_MS};
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |_| {});
+        let sid = manager
+            .create_session(&spawned_request())
+            .await
+            .unwrap()
+            .session_id;
+        idle(&manager, &sid).await;
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        handle
+            .set_background_tasks(vec![nexus_claude::agent::BackgroundTask {
+                id: "w1".into(),
+                kind: nexus_claude::agent::BackgroundTaskKind::Shell,
+                description: "tail -F build.log".into(),
+                status: nexus_claude::agent::BackgroundTaskStatus::Running,
+                started_at_ms: Some(1_700_000_000_000),
+                tool_call_id: Some("tool-w1".into()),
+                parent: None,
+                pid: None,
+            }])
+            .await;
+        let later = crate::chat::segment_tap::now_ms() + SETTLE_MS + 3_600_000;
+        segment_state_of(&manager, &sid, later, SessionState::Watching).await;
+        assert!(manager.release_done_sessions_at(later).await.is_empty());
+        assert!(manager.agent_runtime.owns(&sid).await, "a watch stays live");
+    }
+
+    /// The release sweep runs on its own clock (`start_done_release_task`), and the
+    /// wrapper reads the real one: a watching session is kept by both.
+    #[tokio::test]
+    async fn the_release_sweep_runs_on_its_own_clock_and_keeps_a_watch() {
+        let (_fake, graph) = native_world().await;
+        let manager = configured(graph, |_| {});
+        let sid = manager
+            .create_session(&spawned_request())
+            .await
+            .unwrap()
+            .session_id;
+        idle(&manager, &sid).await;
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+        handle
+            .set_background_tasks(vec![nexus_claude::agent::BackgroundTask {
+                id: "w2".into(),
+                kind: nexus_claude::agent::BackgroundTaskKind::Shell,
+                description: "tail -F build.log".into(),
+                status: nexus_claude::agent::BackgroundTaskStatus::Running,
+                started_at_ms: Some(1_700_000_000_000),
+                tool_call_id: Some("tool-w2".into()),
+                parent: None,
+                pid: None,
+            }])
+            .await;
+        manager.start_done_release_task();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(manager.release_done_sessions().await.is_empty());
+        assert!(manager.agent_runtime.owns(&sid).await, "a watch stays live");
+    }
+
     #[tokio::test]
     async fn a_full_table_frees_its_most_idle_session_instead_of_refusing() {
         let (_fake, graph) = native_world().await;
