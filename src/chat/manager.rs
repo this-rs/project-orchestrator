@@ -39129,6 +39129,7 @@ mod auto_open_bounds_tests {
         use crate::chat::provider::cognitive::signature::{TaskClass, TaskSignature};
         CognitiveDecision {
             snapshot: None,
+            arms_snapshot: Vec::new(),
             id: Uuid::new_v4(),
             at: chrono::Utc::now(),
             signature: TaskSignature::utility(TaskClass::UtilityCompaction, 9_000, None),
@@ -40099,6 +40100,7 @@ mod turn_reward_play_tests {
     fn open_decision(session: Uuid) -> CognitiveDecision {
         CognitiveDecision {
             snapshot: None,
+            arms_snapshot: Vec::new(),
             id: Uuid::new_v4(),
             at: chrono::Utc::now(),
             signature: TaskSignature::utility(TaskClass::UtilityCompaction, 9_000, None),

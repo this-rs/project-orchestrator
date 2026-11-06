@@ -159,6 +159,14 @@ pub struct CognitiveDecision {
     /// decision was applied; differs when the declarative choice was kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub used: Option<Pick>,
+    /// The arms the draw saw, as they stood WHEN the decision was taken (PYSR-1).
+    ///
+    /// An offline replay of the learning needs the posteriors the router actually
+    /// drew from: replaying a Beta against counts recorded later would rewrite the
+    /// history it is meant to explain. Empty on decisions written before this field
+    /// existed, which reads as "unknown", never as "no arms".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arms_snapshot: Vec<super::store::ArmStats>,
 }
 
 impl CognitiveDecision {
@@ -470,6 +478,7 @@ mod tests {
     fn decision() -> CognitiveDecision {
         CognitiveDecision {
             snapshot: None,
+            arms_snapshot: Vec::new(),
             id: uuid::Uuid::new_v4(),
             at: chrono::Utc::now(),
             signature: TaskSignature::utility(TaskClass::UtilityCompaction, 9_000, None),
@@ -490,6 +499,44 @@ mod tests {
             outcome: None,
             used: None,
         }
+    }
+
+    /// PYSR-1: the snapshot SURVIVES the journal. A decision is stored as one JSON string and
+    /// read back the same way; holding the field in memory proves nothing about what a replay
+    /// will find months later.
+    #[test]
+    fn a_persisted_decision_gives_the_snapshot_back() {
+        let sig = TaskSignature::utility(TaskClass::Simple, 9_000, Some("p"));
+        let arms = vec![crate::chat::provider::cognitive::store::ArmStats::fresh(
+            ArmKey::new(sig.arm_key(), "local", "m"),
+            4.0,
+            2.0,
+        )];
+        let mut d = decision();
+        d.signature = sig;
+        d.arms_snapshot = arms.clone();
+        let json = serde_json::to_string(&d).expect("serializes");
+        let back: CognitiveDecision = serde_json::from_str(&json).expect("reads back");
+        assert_eq!(
+            back.arms_snapshot, arms,
+            "the posteriors a replay needs must come back out of the journal"
+        );
+    }
+
+    /// PYSR-1: a decision written before `arms_snapshot` existed still reads — as an EMPTY
+    /// snapshot, i.e. "unknown", never as a deserialization failure. The replay reads the
+    /// journal back, so an old node must not break it.
+    #[test]
+    fn a_decision_without_the_arms_snapshot_still_reads() {
+        let mut json = serde_json::to_value(decision()).expect("serializes");
+        json.as_object_mut()
+            .expect("an object")
+            .remove("arms_snapshot");
+        let back: CognitiveDecision = serde_json::from_value(json).expect("reads back");
+        assert!(
+            back.arms_snapshot.is_empty(),
+            "absent field reads as unknown, not as a failure"
+        );
     }
 
     /// The settlement decision, which had no test: a swapped argument or a

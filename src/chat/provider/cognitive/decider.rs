@@ -268,6 +268,9 @@ fn decide_free(
         outcome: None,
         used: None,
         snapshot: None,
+        // PYSR-1: the posteriors the draw is about to use, kept so the learning can be
+        // replayed offline against the history it really saw.
+        arms_snapshot: arms.to_vec(),
     };
 
     let pool: Vec<ModelFacts> = request
@@ -1633,6 +1636,34 @@ mod tests {
             ..ArmStats::fresh(ArmKey::new(sig.arm_key(), "local", model), alpha, beta)
         };
         vec![arm("a", 2.0, 1.0, 1), arm("b", 3.0, 2.0, 2)]
+    }
+
+    /// PYSR-1: the decision keeps the posteriors the draw used. An offline replay needs
+    /// THOSE numbers — replaying a Beta against counts recorded later would rewrite the
+    /// history it is meant to explain.
+    #[test]
+    fn a_decision_carries_the_arms_it_drew_from() {
+        let sig = pilot();
+        let arms = barely_observed(&sig);
+        let mut req = request(sig, ProviderRoutingMode::Full, LearningStage::Auto);
+        req.pool = vec![facts("local", "a", 1.0), facts("local", "b", 1.0)];
+        let d = decide_with(
+            Uuid::from_u128(3),
+            Utc::now(),
+            &req,
+            &arms,
+            &PriorHints::new(),
+        );
+        let seen: Vec<(String, f64, f64, u64)> = d
+            .arms_snapshot
+            .iter()
+            .map(|a| (a.key.model.clone(), a.alpha, a.beta, a.n))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![("a".to_owned(), 2.0, 1.0, 1), ("b".to_owned(), 3.0, 2.0, 2),],
+            "the snapshot is the store exactly as the draw saw it"
+        );
     }
 
     /// `turns` consecutive same-class turns, each starting from the pair the previous one

@@ -1980,6 +1980,7 @@ mod cognitive_routing {
             }
             Ok(CognitiveDecision {
                 snapshot: None,
+                arms_snapshot: Vec::new(),
                 id: Uuid::new_v4(),
                 at: Utc::now(),
                 signature: request.signature.clone(),
@@ -2065,6 +2066,7 @@ mod cognitive_routing {
             use crate::chat::provider::cognitive::decision::CognitiveDecision;
             Ok(CognitiveDecision {
                 snapshot: None,
+                arms_snapshot: Vec::new(),
                 id: Uuid::new_v4(),
                 at: Utc::now(),
                 signature: request.signature.clone(),
@@ -3153,6 +3155,7 @@ mod turn_routing {
                 && request.settings.stage == LearningStage::Auto;
             let decision = CognitiveDecision {
                 snapshot: None,
+                arms_snapshot: Vec::new(),
                 id: Uuid::new_v4(),
                 at: Utc::now(),
                 signature: request.signature.clone(),
@@ -5164,6 +5167,7 @@ mod provider_switch {
                 }
                 Ok(CognitiveDecision {
                     snapshot: None,
+                    arms_snapshot: Vec::new(),
                     id: Uuid::new_v4(),
                     at: Utc::now(),
                     signature: request.signature.clone(),
@@ -15796,6 +15800,7 @@ mod native_subagents {
                 };
                 Ok(CognitiveDecision {
                     snapshot: None,
+                    arms_snapshot: Vec::new(),
                     id: Uuid::new_v4(),
                     at: Utc::now(),
                     signature: request.signature.clone(),
@@ -15960,6 +15965,7 @@ mod native_subagents {
                 };
                 Ok(CognitiveDecision {
                     snapshot: None,
+                    arms_snapshot: Vec::new(),
                     id: Uuid::new_v4(),
                     at: Utc::now(),
                     signature: request.signature.clone(),
