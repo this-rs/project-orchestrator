@@ -44,6 +44,53 @@
 //! A decision without `arms_snapshot`, without a closed outcome (`outcome.reward`), or without
 //! a served arm is SKIPPED and counted in [`Skipped`]; it never contributes a zero.
 //!
+//! # Comparing variants: paired, then IPS (never a raw difference)
+//!
+//! Variants do not value the same decisions (a variant's pick may have no later outcome while
+//! another's has). So the headline comparison is **paired**: [`VariantReport::paired`] is
+//! computed on the decisions that EVERY variant of the report can value
+//! ([`ReplayReport::paired_n`]). The full-sample numbers (`valued`, `mean_reward`, …) remain as
+//! a secondary table: they are over different samples and must not be subtracted.
+//!
+//! # Bias: the journal comes from the CUMULATIVE policy
+//!
+//! The journal was written by the live router (cumulative Beta, ε-greedy Thompson). Replaying
+//! any other variant on it is **off-policy**, with two distinct biases:
+//!
+//! 1. **Learning (information advantage).** A variant learns from the arm that SERVED. If the
+//!    journal keeps serving an arm that has collapsed, a forgetting variant receives a steady
+//!    stream of failures of that arm that, in production, it would have stopped sampling and so
+//!    never seen. Its gain is then an **upper bound**, not an estimate. Two mitigations exist:
+//!    * the variants suffixed `[on-policy]` ([`Variant::on_policy_learning`]) learn ONLY on the
+//!      decisions where they would have picked the arm that served, which removes the
+//!      advantage at the price of sample size (a variant that never agrees with the journal
+//!      never learns anything and stays on its seed);
+//!    * the posterior of every variant is seeded from the first `arms_snapshot` that shows an
+//!      arm, i.e. from the cumulative router's knowledge: a residual, unmeasured leak.
+//! 2. **Valuation (direct method).** "Next outcome of the picked arm" is a model, not a
+//!    counterfactual.
+//!
+//! **IPS** ([`IpsEstimate`]) corrects (2) on the SAME population of decisions for every
+//! variant, from the propensities logged for that purpose (`DecisionAlternative::propensity`,
+//! `(1−ε)·p_top1 + ε/k`). The target policy of a variant is deterministic (greedy on its
+//! posterior mean), so the estimate is the self-normalised one:
+//! `V = Σ wᵢ·1[pickᵢ = servedᵢ]·rᵢ / Σ wᵢ·1[pickᵢ = servedᵢ]`, `wᵢ = 1 / max(μᵢ, IPS_PROPENSITY_FLOOR)`,
+//! `μᵢ` = logged propensity of the served arm. The propensity is **clipped below at
+//! [`IPS_PROPENSITY_FLOOR`] = 0.05** (weights ≤ 20): with ε small an explored arm has
+//! `μ ≈ ε/k` (e.g. 0.005, weight 200) and one such decision would dominate the estimate; the
+//! clip trades a downward-biased weight on rare picks for a bounded variance, and the number of
+//! clipped decisions is reported (`clipped`). Decisions whose served arm is not the logged
+//! `chosen` (user override, declarative choice kept) or that carry no propensity are NOT
+//! usable and are counted (`unusable`), never given a made-up weight.
+//!
+//! IPS does **not** fix (1): it values the pick fairly, but the posterior that made the pick
+//! was trained on data a different policy would not have collected. Also the logged propensity
+//! is "before the hysteresis" of the live router, so it is approximate when the hysteresis
+//! overrode the draw. A variant's gain is therefore an upper bound on its real gain, until it
+//! is confirmed by an `[on-policy]` run and by IPS together. [`BIAS_NOTICE`] is printed with
+//! every report; no output of this module states that a variant "beats" the cumulative one
+//! without it.
+//!
 //! # What this does not prove
 //!
 //! A journal written under Thompson sampling is not uniform: arms the router stopped trying
@@ -93,28 +140,47 @@ pub struct Variant {
     pub decay: f64,
     /// Whether the cost enters the reward the posterior learns from.
     pub cost_in_reward: bool,
+    /// Learn ONLY from the decisions where this variant would have picked the arm that served
+    /// (its own on-policy subset). Removes the information advantage of learning from arms the
+    /// journal kept serving, at the cost of sample size. See the module doc.
+    pub on_policy_learning: bool,
 }
 
-/// The three variants of PYSR-5.
+/// The variants of PYSR-5: the three of the plan, then their `[on-policy]` twins (the
+/// cumulative one included: greedy-on-mean is not the router's Thompson, so the baseline must
+/// learn under the same rule to be comparable).
 pub fn standard_variants(window: usize) -> Vec<Variant> {
-    vec![
-        Variant {
-            name: "cumulative".into(),
-            decay: 1.0,
-            cost_in_reward: false,
-        },
-        Variant {
-            name: format!("forgetting(window={window})"),
-            decay: decay_for_window(window),
-            cost_in_reward: false,
-        },
-        Variant {
-            name: "cost_in_reward".into(),
-            decay: 1.0,
-            cost_in_reward: true,
-        },
-    ]
+    let base = |name: String, decay: f64, cost_in_reward: bool| Variant {
+        name,
+        decay,
+        cost_in_reward,
+        on_policy_learning: false,
+    };
+    let three = vec![
+        base("cumulative".into(), 1.0, false),
+        base(
+            format!("forgetting(window={window})"),
+            decay_for_window(window),
+            false,
+        ),
+        base("cost_in_reward".into(), 1.0, true),
+    ];
+    let twins: Vec<Variant> = three
+        .iter()
+        .map(|v| Variant {
+            name: format!("{} [on-policy]", v.name),
+            on_policy_learning: true,
+            ..v.clone()
+        })
+        .collect();
+    three.into_iter().chain(twins).collect()
 }
+
+/// Said with every report: the journal comes from the cumulative policy.
+pub const BIAS_NOTICE: &str = "BIAS: the journal was written by the CUMULATIVE policy. A non-cumulative variant's gain is an UPPER BOUND (it learns from arms the journal kept serving, which it would have stopped sampling) unless the [on-policy] and IPS columns agree. Do not read any difference as \"X beats cumulative\".";
+
+/// Floor of the logged propensity in the IPS weights: weights are at most `1/0.05 = 20`.
+pub const IPS_PROPENSITY_FLOOR: f64 = 0.05;
 
 /// Decisions left out, by reason. A decision lands in the first reason that applies.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -125,13 +191,105 @@ pub struct Skipped {
     pub no_outcome: usize,
     /// No arm served the turn (not applied and no `used`).
     pub no_served_arm: usize,
+    /// The snapshot holds no arm of the served arm's class: there is nothing to choose
+    /// among, and a regret against "the best of nothing" would be a made-up number.
+    pub no_class_candidate: usize,
 }
 
 impl Skipped {
     /// All of them.
     pub fn total(&self) -> usize {
-        self.no_snapshot + self.no_outcome + self.no_served_arm
+        self.no_snapshot + self.no_outcome + self.no_served_arm + self.no_class_candidate
     }
+}
+
+/// The value of one pick on one decision.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Valuation {
+    /// Raw reward of the next outcome of the picked arm.
+    pub reward: f64,
+    /// Same, cost-adjusted.
+    pub adjusted: f64,
+    /// Its cost, when known.
+    pub cost_usd: Option<f64>,
+    /// Best valued candidate − `reward`; `None` when no candidate is valued.
+    pub regret: Option<f64>,
+}
+
+/// Means over a set of valued picks.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Metrics {
+    /// Picks the means are over.
+    pub valued: usize,
+    /// Mean raw reward.
+    pub mean_reward: Option<f64>,
+    /// Mean cost-adjusted reward (same weighting for every variant).
+    pub mean_adjusted_reward: Option<f64>,
+    /// Mean USD of the picks whose cost is known.
+    pub mean_cost_usd: Option<f64>,
+    /// Picks whose cost was unknown (not priced at zero).
+    pub cost_unknown: usize,
+    /// Mean regret against the best valued candidate.
+    pub mean_regret: Option<f64>,
+}
+
+impl Metrics {
+    /// Over the decisions where `keep(i)` and the pick is valued.
+    fn over(valuations: &[Option<Valuation>], keep: impl Fn(usize) -> bool) -> Self {
+        let (mut n, mut rs, mut ad, mut cs, mut cn, mut cu) = (0usize, 0.0, 0.0, 0.0, 0usize, 0);
+        let (mut gs, mut gn) = (0.0, 0usize);
+        for (i, v) in valuations.iter().enumerate() {
+            let Some(v) = v.filter(|_| keep(i)) else {
+                continue;
+            };
+            n += 1;
+            rs += v.reward;
+            ad += v.adjusted;
+            match v.cost_usd {
+                Some(c) => {
+                    cs += c;
+                    cn += 1;
+                }
+                None => cu += 1,
+            }
+            if let Some(g) = v.regret {
+                gs += g;
+                gn += 1;
+            }
+        }
+        let avg = |sum: f64, n: usize| (n > 0).then(|| sum / n as f64);
+        Self {
+            valued: n,
+            mean_reward: avg(rs, n),
+            mean_adjusted_reward: avg(ad, n),
+            mean_cost_usd: avg(cs, cn),
+            cost_unknown: cu,
+            mean_regret: avg(gs, gn),
+        }
+    }
+}
+
+/// Self-normalised, clipped inverse-propensity estimate of a variant's reward, on the decisions
+/// whose logged propensity is usable (the same ones for every variant).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IpsEstimate {
+    /// Decisions with a usable propensity (the population, identical across variants).
+    pub usable: usize,
+    /// Decisions without one (served ≠ logged chosen, or no propensity): counted, not weighted.
+    pub unusable: usize,
+    /// Usable decisions where the variant's pick is the served arm (the only informative ones).
+    pub matched: usize,
+    /// Matched decisions whose propensity was raised to [`IPS_PROPENSITY_FLOOR`].
+    pub clipped: usize,
+    /// `Σ w·1[match] / usable`: near 1 when the logged propensities support the variant's
+    /// policy; far from 1 means the estimate rests on little overlap.
+    pub coverage: Option<f64>,
+    /// Effective sample size `(Σw)² / Σw²` of the matched decisions.
+    pub ess: Option<f64>,
+    /// Estimated mean raw reward.
+    pub value: Option<f64>,
+    /// Estimated mean cost-adjusted reward.
+    pub value_adjusted: Option<f64>,
 }
 
 /// What one variant did on the history.
@@ -141,22 +299,31 @@ pub struct VariantReport {
     pub name: String,
     /// Its pick at every replayed decision, in replay order.
     pub picks: Vec<ArmKey>,
+    /// The value of each pick (`None` = unvalued), aligned with `picks`.
+    pub valuations: Vec<Option<Valuation>>,
     /// Decisions where the variant picked something other than the arm that served.
     pub moved: usize,
+    /// Decisions on which the variant learned (all, unless `on_policy_learning`).
+    pub learned_on: usize,
     /// Picks with a valued outcome (the sample the means below are over).
     pub valued: usize,
     /// Picks whose arm is never observed again: left out, not zero.
     pub unvalued: usize,
-    /// Mean raw reward of the valued picks.
+    /// **Secondary** (own sample, not comparable across variants): mean raw reward.
     pub mean_reward: Option<f64>,
-    /// Mean cost-adjusted reward of the valued picks (same weighting for every variant).
+    /// **Secondary**: mean cost-adjusted reward of the valued picks.
     pub mean_adjusted_reward: Option<f64>,
-    /// Mean USD of the valued picks whose cost is known.
+    /// **Secondary**: mean USD of the valued picks whose cost is known.
     pub mean_cost_usd: Option<f64>,
     /// Valued picks whose cost was unknown (not priced at zero).
     pub cost_unknown: usize,
-    /// Mean regret (raw reward) against the best valued candidate, `None` without a sample.
+    /// **Secondary**: mean regret (raw reward) against the best valued candidate.
     pub mean_regret: Option<f64>,
+    /// **Headline (direct method)**: the same metrics over the decisions EVERY variant valued.
+    /// Still an upper bound for a non-cumulative variant: see [`BIAS_NOTICE`].
+    pub paired: Metrics,
+    /// IPS-corrected value of the variant's policy.
+    pub ips: IpsEstimate,
     /// Mean |posterior mean − mean the router logged| for the arm served, a fidelity check:
     /// near 0 for the cumulative variant when the journal is complete.
     pub mean_gap_to_logged: Option<f64>,
@@ -169,6 +336,8 @@ pub struct ReplayReport {
     pub total: usize,
     /// Decisions replayed.
     pub replayed: usize,
+    /// Decisions valued by every variant: the sample of the `paired` column.
+    pub paired_n: usize,
     /// Decisions left out, and why.
     pub skipped: Skipped,
     /// One entry per variant, in the order asked.
@@ -176,26 +345,60 @@ pub struct ReplayReport {
 }
 
 impl ReplayReport {
-    /// A readable table, for a test or a log.
+    /// A readable table, for a test or a log. Always opens with [`BIAS_NOTICE`].
     pub fn render(&self) -> String {
         let f = |v: Option<f64>| v.map_or("n/a".to_owned(), |x| format!("{x:.4}"));
         let mut out = format!(
-            "replayed {}/{} (skipped: {} no_snapshot, {} no_outcome, {} no_served_arm)\n",
+            "{BIAS_NOTICE}\nreplayed {}/{} (skipped: {} no_snapshot, {} no_outcome, {} no_served_arm, {} no_class_candidate)\n",
             self.replayed,
             self.total,
             self.skipped.no_snapshot,
             self.skipped.no_outcome,
-            self.skipped.no_served_arm
+            self.skipped.no_served_arm,
+            self.skipped.no_class_candidate
         );
+        out.push_str(&format!(
+            "-- PAIRED (direct method, same {} decisions for every variant; upper bound for non-cumulative) --\n",
+            self.paired_n
+        ));
         for v in &self.variants {
             out.push_str(&format!(
-                "{:<24} reward={} adjusted={} cost={} regret={} moved={} valued={} unvalued={} cost_unknown={} gap={}\n",
+                "{:<36} reward={} adjusted={} cost={} regret={}\n",
+                v.name,
+                f(v.paired.mean_reward),
+                f(v.paired.mean_adjusted_reward),
+                f(v.paired.mean_cost_usd),
+                f(v.paired.mean_regret),
+            ));
+        }
+        out.push_str(&format!(
+            "-- IPS (clipped at propensity {IPS_PROPENSITY_FLOOR}, self-normalised; same population for every variant) --\n"
+        ));
+        for v in &self.variants {
+            out.push_str(&format!(
+                "{:<36} value={} adjusted={} matched={}/{} clipped={} unusable={} coverage={} ess={}\n",
+                v.name,
+                f(v.ips.value),
+                f(v.ips.value_adjusted),
+                v.ips.matched,
+                v.ips.usable,
+                v.ips.clipped,
+                v.ips.unusable,
+                f(v.ips.coverage),
+                f(v.ips.ess),
+            ));
+        }
+        out.push_str("-- FULL SAMPLE (secondary: each variant on its OWN valued picks; do not subtract) --\n");
+        for v in &self.variants {
+            out.push_str(&format!(
+                "{:<36} reward={} adjusted={} cost={} regret={} moved={} learned_on={} valued={} unvalued={} cost_unknown={} gap={}\n",
                 v.name,
                 f(v.mean_reward),
                 f(v.mean_adjusted_reward),
                 f(v.mean_cost_usd),
                 f(v.mean_regret),
                 v.moved,
+                v.learned_on,
                 v.valued,
                 v.unvalued,
                 v.cost_unknown,
@@ -217,6 +420,8 @@ struct Step<'a> {
     served: ArmKey,
     reward: f64,
     cost_usd: Option<f64>,
+    /// Logged propensity of the served arm, only when the served arm IS the logged `chosen`.
+    propensity: Option<f64>,
 }
 
 /// Replays `decisions` under each of `variants`. `cost` also defines the cost-adjusted score.
@@ -247,11 +452,23 @@ pub fn replay(
             skipped.no_served_arm += 1;
             continue;
         };
+        if !d.arms_snapshot.iter().any(|a| a.key.class == served.class) {
+            skipped.no_class_candidate += 1;
+            continue;
+        }
+        let propensity = d
+            .chosen
+            .as_ref()
+            .filter(|c| c.provider_id == served.provider_id && c.model == served.model)
+            .and_then(|c| d.alternatives.iter().find(|a| &a.pick == c))
+            .and_then(|a| a.propensity)
+            .filter(|p| p.is_finite() && *p > 0.0);
         steps.push(Step {
             snapshot: &d.arms_snapshot,
             served,
             reward,
             cost_usd,
+            propensity,
         });
     }
 
@@ -269,15 +486,24 @@ pub fn replay(
         list.get(at).map(|(_, r, c)| (*r, *c))
     };
 
-    let variants = variants
+    let mut reports: Vec<VariantReport> = variants
         .iter()
         .map(|variant| run_variant(variant, &steps, cost, &next_outcome))
         .collect();
+
+    // Paired set: decisions every variant valued. With no variant, nothing is paired.
+    let paired: Vec<bool> = (0..steps.len())
+        .map(|i| !reports.is_empty() && reports.iter().all(|r| r.valuations[i].is_some()))
+        .collect();
+    for r in &mut reports {
+        r.paired = Metrics::over(&r.valuations, |i| paired[i]);
+    }
     ReplayReport {
         total: decisions.len(),
         replayed: steps.len(),
+        paired_n: paired.iter().filter(|p| **p).count(),
         skipped,
-        variants,
+        variants: reports,
     }
 }
 
@@ -289,10 +515,11 @@ fn run_variant(
 ) -> VariantReport {
     let mut state: HashMap<ArmKey, (f64, f64)> = HashMap::new();
     let mut picks = Vec::with_capacity(steps.len());
-    let (mut moved, mut valued, mut unvalued, mut cost_unknown) = (0, 0, 0, 0);
-    let (mut reward_sum, mut adjusted_sum, mut cost_sum, mut cost_n) = (0.0, 0.0, 0.0, 0usize);
-    let (mut regret_sum, mut regret_n) = (0.0, 0usize);
+    let mut valuations: Vec<Option<Valuation>> = Vec::with_capacity(steps.len());
+    let (mut moved, mut learned_on) = (0, 0);
     let (mut gap_sum, mut gap_n) = (0.0, 0usize);
+    let mut ips = IpsEstimate::default();
+    let (mut w_sum, mut w2_sum, mut wr_sum, mut wa_sum) = (0.0, 0.0, 0.0, 0.0);
 
     for (i, step) in steps.iter().enumerate() {
         // Seed arms never seen by this variant from what the router knew right now.
@@ -302,6 +529,7 @@ fn run_variant(
                 .or_insert((arm.alpha, arm.beta));
         }
         let mean = |key: &ArmKey| state.get(key).map(|(a, b)| a / (a + b));
+        // Never empty: a decision with no arm of the served class was skipped upstream.
         let candidates: Vec<&ArmKey> = step
             .snapshot
             .iter()
@@ -326,55 +554,79 @@ fn run_variant(
             gap_sum += (m - logged.mean()).abs();
             gap_n += 1;
         }
-        if pick != step.served {
+        let matches = pick == step.served;
+        if !matches {
             moved += 1;
         }
-        match next_outcome(&pick, i) {
-            Some((r, c)) => {
-                valued += 1;
-                reward_sum += r;
-                adjusted_sum += cost.adjust(r, c);
-                match c {
-                    Some(c) => {
-                        cost_sum += c;
-                        cost_n += 1;
-                    }
-                    None => cost_unknown += 1,
-                }
-                let best = candidates
-                    .iter()
-                    .filter_map(|k| next_outcome(k, i).map(|(r, _)| r))
-                    .fold(f64::MIN, f64::max);
-                regret_sum += best - r;
-                regret_n += 1;
+        valuations.push(next_outcome(&pick, i).map(|(r, c)| {
+            let best = candidates
+                .iter()
+                .filter_map(|k| next_outcome(k, i).map(|(r, _)| r))
+                .reduce(f64::max);
+            Valuation {
+                reward: r,
+                adjusted: cost.adjust(r, c),
+                cost_usd: c,
+                regret: best.map(|b| b - r),
             }
-            None => unvalued += 1,
+        }));
+
+        // IPS: a deterministic target policy contributes only where it agrees with the journal.
+        match step.propensity {
+            None => ips.unusable += 1,
+            Some(mu) => {
+                ips.usable += 1;
+                if matches {
+                    let clipped = mu < IPS_PROPENSITY_FLOOR;
+                    let w = 1.0 / mu.max(IPS_PROPENSITY_FLOOR);
+                    ips.matched += 1;
+                    ips.clipped += usize::from(clipped);
+                    w_sum += w;
+                    w2_sum += w * w;
+                    wr_sum += w * step.reward;
+                    wa_sum += w * cost.adjust(step.reward, step.cost_usd);
+                }
+            }
         }
         picks.push(pick);
 
-        // Learn from what the journal recorded for the arm that served.
-        let learned = if variant.cost_in_reward {
-            cost.adjust(step.reward, step.cost_usd)
-        } else {
-            step.reward
-        };
-        let entry = state.entry(step.served.clone()).or_insert((1.0, 1.0));
-        *entry = beta_update(entry.0, entry.1, variant.decay, learned);
+        // Learn from what the journal recorded for the arm that served — all of it, or only
+        // where this variant agrees with the journal (its own on-policy subset).
+        if matches || !variant.on_policy_learning {
+            let learned = if variant.cost_in_reward {
+                cost.adjust(step.reward, step.cost_usd)
+            } else {
+                step.reward
+            };
+            let entry = state.entry(step.served.clone()).or_insert((1.0, 1.0));
+            *entry = beta_update(entry.0, entry.1, variant.decay, learned);
+            learned_on += 1;
+        }
     }
 
-    let avg = |sum: f64, n: usize| (n > 0).then(|| sum / n as f64);
+    if ips.matched > 0 {
+        ips.value = Some(wr_sum / w_sum);
+        ips.value_adjusted = Some(wa_sum / w_sum);
+        ips.ess = Some(w_sum * w_sum / w2_sum);
+        ips.coverage = Some(w_sum / ips.usable as f64);
+    }
+    let all = Metrics::over(&valuations, |_| true);
     VariantReport {
         name: variant.name.clone(),
         picks,
         moved,
-        valued,
-        unvalued,
-        mean_reward: avg(reward_sum, valued),
-        mean_adjusted_reward: avg(adjusted_sum, valued),
-        mean_cost_usd: avg(cost_sum, cost_n),
-        cost_unknown,
-        mean_regret: avg(regret_sum, regret_n),
-        mean_gap_to_logged: avg(gap_sum, gap_n),
+        learned_on,
+        valued: all.valued,
+        unvalued: valuations.len() - all.valued,
+        mean_reward: all.mean_reward,
+        mean_adjusted_reward: all.mean_adjusted_reward,
+        mean_cost_usd: all.mean_cost_usd,
+        cost_unknown: all.cost_unknown,
+        mean_regret: all.mean_regret,
+        paired: Metrics::default(),
+        ips,
+        valuations,
+        mean_gap_to_logged: (gap_n > 0).then(|| gap_sum / gap_n as f64),
     }
 }
 
@@ -560,7 +812,8 @@ mod tests {
             Skipped {
                 no_snapshot: 2,
                 no_outcome: 2,
-                no_served_arm: 1
+                no_served_arm: 1,
+                ..Skipped::default()
             }
         );
         assert_eq!(report.replayed, 15);
@@ -594,6 +847,208 @@ mod tests {
             (alpha, beta) = beta_update(alpha, beta, 0.9, r);
             assert_eq!((arm.alpha, arm.beta), (alpha, beta));
         }
+    }
+
+    /// A hand-built journal: every decision serves `a` (class `c`), snapshots `a`=(3,1) and
+    /// `b`=(1,1)... overridable by the caller; `rewards[i]` / `propensities[i]` per decision.
+    fn hand_journal(
+        seeds: [(f64, f64); 2],
+        rewards: &[f64],
+        propensities: &[Option<f64>],
+    ) -> Vec<CognitiveDecision> {
+        let mut base = synthetic_journal(rewards.len() as u64, 10_000);
+        for (i, d) in base.iter_mut().enumerate() {
+            d.signature = TaskSignature::from_chat_request(
+                "hello",
+                false,
+                Some("po"),
+                ContextHints::default(),
+            );
+            let class = d.signature.arm_key();
+            let k = |m: &str| ArmKey::new(class.clone(), "local", m);
+            d.arms_snapshot = vec![
+                ArmStats::fresh(k("a"), seeds[0].0, seeds[0].1),
+                ArmStats::fresh(k("b"), seeds[1].0, seeds[1].1),
+            ];
+            d.chosen = Some(Pick::new("local", "a"));
+            d.used = Some(Pick::new("local", "a"));
+            d.applied = true;
+            d.alternatives = vec![
+                crate::chat::provider::cognitive::decision::DecisionAlternative {
+                    pick: Pick::new("local", "a"),
+                    score: Some(0.5),
+                    rejected: None,
+                    p_top1: Some(0.5),
+                    propensity: propensities[i],
+                },
+            ];
+            d.outcome = Some(DecisionOutcome {
+                success: Some(true),
+                reward: Some(rewards[i]),
+                cost_usd: Some(0.0),
+                ..DecisionOutcome::default()
+            });
+        }
+        base
+    }
+
+    fn cumulative_only() -> Vec<Variant> {
+        standard_variants(30).into_iter().take(1).collect()
+    }
+
+    /// C3: a snapshot with no arm of the served class is skipped and counted; the regret never
+    /// meets `f64::MIN`.
+    #[test]
+    fn a_snapshot_without_a_candidate_of_the_class_is_skipped_not_a_giant_regret() {
+        let mut journal = synthetic_journal(30, 10_000);
+        for arm in &mut journal[5].arms_snapshot {
+            arm.key.class = "another.class".into();
+        }
+        let report = replay(&journal, &standard_variants(10), &CostWeighting::default());
+        assert_eq!(report.skipped.no_class_candidate, 1);
+        assert_eq!(report.replayed, 29);
+        for v in &report.variants {
+            let regret = v.mean_regret.expect("a sample");
+            assert!(
+                (0.0..=1.0).contains(&regret),
+                "{}: regret {regret} is a made-up number",
+                v.name
+            );
+            assert!(v
+                .valuations
+                .iter()
+                .flatten()
+                .all(|x| x.regret.is_none_or(|g| g.abs() <= 1.0)));
+        }
+    }
+
+    /// C2: the headline is over the decisions every variant valued. Variant `amnesiac`
+    /// (γ=0) forgets `b`'s failure at once and moves to `a`, whose outcomes exist; the
+    /// cumulative one keeps picking `b`, which is never served again: it cannot value those
+    /// picks. The shared set excludes them, so `amnesiac`'s zero-reward pick there does not
+    /// reach the paired number — unlike its own full-sample mean.
+    #[test]
+    fn the_paired_numbers_are_over_the_decisions_every_variant_valued() {
+        // d0 served b (r=0); d1 served a (r=0); d2.. served a (r=1); b seeded higher.
+        let mut journal = hand_journal(
+            [(2.0, 2.0), (3.0, 1.0)],
+            &[0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            &[Some(1.0); 6],
+        );
+        journal[0].chosen = Some(Pick::new("local", "b"));
+        journal[0].used = Some(Pick::new("local", "b"));
+        let variants = vec![
+            standard_variants(30)[0].clone(),
+            Variant {
+                name: "amnesiac".into(),
+                decay: 0.0,
+                cost_in_reward: false,
+                on_policy_learning: false,
+            },
+        ];
+        let report = replay(&journal, &variants, &CostWeighting::default());
+        println!("{}", report.render());
+        let (cum, amn) = (&report.variants[0], &report.variants[1]);
+        assert!(
+            amn.valued > cum.valued,
+            "precondition: the full samples differ ({} vs {})",
+            amn.valued,
+            cum.valued
+        );
+        let shared: Vec<usize> = (0..6)
+            .filter(|&i| report.variants.iter().all(|w| w.valuations[i].is_some()))
+            .collect();
+        assert_eq!(report.paired_n, shared.len());
+        assert!(report.paired_n < amn.valued);
+        for v in &report.variants {
+            let by_hand = shared
+                .iter()
+                .map(|&i| v.valuations[i].unwrap().reward)
+                .sum::<f64>()
+                / shared.len() as f64;
+            assert!(
+                (v.paired.mean_reward.unwrap() - by_hand).abs() < 1e-12,
+                "{}",
+                v.name
+            );
+            assert_eq!(v.paired.valued, report.paired_n);
+        }
+        // The decision the cumulative variant cannot value does not move amnesiac's paired mean.
+        assert_ne!(amn.paired.mean_reward, amn.mean_reward);
+    }
+
+    /// IPS weighs by the inverse of the logged propensity: reward 1 at p=0.5 twice, reward 0 at
+    /// p=1 three times → (2+2)/(2+2+1+1+1) = 4/7, not the unweighted 2/5.
+    #[test]
+    fn ips_weights_by_the_inverse_logged_propensity() {
+        let p = [Some(0.5), Some(0.5), Some(1.0), Some(1.0), Some(1.0)];
+        let journal = hand_journal([(9.0, 1.0), (1.0, 9.0)], &[1.0, 1.0, 0.0, 0.0, 0.0], &p);
+        let report = replay(&journal, &cumulative_only(), &CostWeighting::default());
+        let ips = &report.variants[0].ips;
+        assert_eq!((ips.usable, ips.matched, ips.clipped), (5, 5, 0));
+        assert!((ips.value.unwrap() - 4.0 / 7.0).abs() < 1e-12, "{ips:?}");
+        assert!((ips.coverage.unwrap() - 7.0 / 5.0).abs() < 1e-12);
+    }
+
+    /// The clip: p=0.01 is raised to 0.05 (weight 20, not 100) and counted.
+    #[test]
+    fn ips_clips_the_propensity_and_counts_it() {
+        let p = [Some(0.01), Some(1.0), Some(1.0), Some(1.0), Some(1.0)];
+        let journal = hand_journal([(9.0, 1.0), (1.0, 9.0)], &[1.0, 0.0, 0.0, 0.0, 0.0], &p);
+        let report = replay(&journal, &cumulative_only(), &CostWeighting::default());
+        let ips = &report.variants[0].ips;
+        assert_eq!(ips.clipped, 1);
+        assert!((ips.value.unwrap() - 20.0 / 24.0).abs() < 1e-12, "{ips:?}");
+    }
+
+    /// A decision with no usable propensity is counted, never weighted as 1.
+    #[test]
+    fn ips_counts_decisions_without_a_propensity() {
+        let p = [None, Some(1.0), Some(1.0)];
+        let mut journal = hand_journal([(9.0, 1.0), (1.0, 9.0)], &[1.0, 0.0, 0.0], &p);
+        // The served arm is not the logged choice: the propensity belongs to another pick.
+        journal[2].chosen = Some(Pick::new("local", "b"));
+        let report = replay(&journal, &cumulative_only(), &CostWeighting::default());
+        let ips = &report.variants[0].ips;
+        assert_eq!((ips.usable, ips.unusable), (1, 2));
+        assert_eq!(ips.value, Some(0.0));
+    }
+
+    /// C1: a variant that learns on-policy ignores the failures/successes of an arm it would not
+    /// have picked. Off-policy learning flips to `a` once `a`'s journal successes pile up;
+    /// on-policy never learns them (it keeps picking `b`, which is not what served).
+    #[test]
+    fn on_policy_learning_does_not_learn_from_an_arm_it_would_not_have_picked() {
+        let journal = hand_journal([(2.0, 2.0), (3.2, 1.0)], &[1.0; 8], &[Some(1.0); 8]);
+        let variants = standard_variants(30);
+        let report = replay(&journal, &variants, &CostWeighting::default());
+        let off = by_name(&report, "cumulative");
+        let on = report
+            .variants
+            .iter()
+            .find(|v| v.name == "cumulative [on-policy]")
+            .unwrap();
+        assert!(off.picks[..5].iter().all(|k| k.model == "b"));
+        assert!(off.picks[5..].iter().all(|k| k.model == "a"));
+        assert!(on.picks.iter().all(|k| k.model == "b"), "{:?}", on.picks);
+        assert_eq!(on.learned_on, 0);
+        assert_eq!(off.learned_on, 8);
+    }
+
+    /// The report never states a gain without the bias.
+    #[test]
+    fn the_rendered_report_always_carries_the_bias_notice() {
+        let report = replay(
+            &synthetic_journal(20, 10_000),
+            &standard_variants(10),
+            &CostWeighting::default(),
+        );
+        let text = report.render();
+        assert!(text.starts_with("BIAS: the journal was written by the CUMULATIVE policy"));
+        assert!(text.contains("UPPER BOUND"));
+        assert!(text.contains("-- PAIRED") && text.contains("-- IPS"));
+        let empty = replay(&[], &standard_variants(10), &CostWeighting::default());
+        assert!(empty.render().contains("UPPER BOUND"));
     }
 
     #[test]
