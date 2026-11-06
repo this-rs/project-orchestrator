@@ -171,6 +171,15 @@ pub fn decay_for_window(n: usize) -> f64 {
     1.0 - 1.0 / n as f64
 }
 
+/// One Beta update: `alpha ← γ·alpha + r`, `beta ← γ·beta + (1−r)`, with `γ` and `r` clamped to
+/// `[0, 1]`. The single implementation, shared by the in-memory store and the offline replay
+/// (`replay.rs`): a replay that folded observations its own way would drift from the store.
+pub fn beta_update(alpha: f64, beta: f64, decay: f64, reward: f64) -> (f64, f64) {
+    let decay = decay.clamp(0.0, 1.0);
+    let reward = reward.clamp(0.0, 1.0);
+    (alpha * decay + reward, beta * decay + (1.0 - reward))
+}
+
 /// In-memory store, for tests and for a run without a graph.
 pub struct InMemoryRoutingStore {
     arms: Mutex<HashMap<ArmKey, ArmStats>>,
@@ -229,9 +238,9 @@ impl RoutingArmStore for InMemoryRoutingStore {
         // PYSR-5: with a forgetting factor below 1, the old counts fade on each
         // update, so an arm whose quality drops is demoted instead of keeping a
         // decade of good history.
-        let decay = observation.decay.clamp(0.0, 1.0);
-        arm.alpha = arm.alpha * decay + reward;
-        arm.beta = arm.beta * decay + (1.0 - reward);
+        let (alpha, beta) = beta_update(arm.alpha, arm.beta, observation.decay, reward);
+        arm.alpha = alpha;
+        arm.beta = beta;
         arm.n += 1;
         if let Some(cost) = observation.cost_usd {
             arm.cost_sum_usd += cost;
