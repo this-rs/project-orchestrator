@@ -364,6 +364,7 @@ mod tests {
     fn decision(chosen: Option<Pick>) -> CognitiveDecision {
         CognitiveDecision {
             snapshot: None,
+            arms_snapshot: Vec::new(),
             id: Uuid::new_v4(),
             at: chrono::Utc::now(),
             signature: TaskSignature::utility(TaskClass::UtilityCompaction, 9_000, None),

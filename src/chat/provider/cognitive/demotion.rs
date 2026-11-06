@@ -255,6 +255,7 @@ mod tests {
     ) -> CognitiveDecision {
         CognitiveDecision {
             snapshot: None,
+            arms_snapshot: Vec::new(),
             id: Uuid::new_v4(),
             at: chrono::Utc::now() - chrono::Duration::seconds(age),
             signature: TaskSignature {

@@ -386,6 +386,7 @@ mod tests {
         signature.attempt = 1;
         CognitiveDecision {
             snapshot: None,
+            arms_snapshot: Vec::new(),
             id: Uuid::new_v4(),
             at: Utc::now() + chrono::Duration::seconds(at_offset_s),
             signature,
