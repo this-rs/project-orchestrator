@@ -8,24 +8,24 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 - **Claude Code** : moteur historique (`CHAT_PROVIDER_PATH=legacy`) sur `fake_claude`, le faux CLI du dépôt nexus ;
 - **Claude Code (moteur agent)** : le même CLI et le même transcript, piloté par le moteur agent à travers la façade Claude Code de nexus (`CHAT_PROVIDER_PATH=agent`) ;
 - **natif** : moteur agent, instance OpenAI-compatible sur `fake_openai`, outils project-orchestrator sur `fake_mcp`, outils de base sur le vrai `nexus-tools` ;
-- **Codex** : harnais Codex — `fake_codex` présent dans `nexus/src/bin/fake_codex.rs`, replay de transcripts JSONL ; verdicts par fonction déclarés dans `EXPECTED` (ISO4) ;
+- **Codex** : harnais Codex — `fake_codex` présent dans `nexus/src/bin/fake_codex.rs`, replay de transcripts JSONL ; les écarts de capacité (hooks, images…) sont MESURÉS contre les capacités du provider (contract §5), `provider_switch.relay` par replay, le reste `not_measured` ;
 - **opencode** : harnais opencode — `fake_opencode` absent, toutes les fonctions `not_measured` (YARDSTICK, tâche 87eb345e) ;
-- **ACP** : harnais ACP — `fake_acp` présent dans `nexus/src/bin/fake_acp.rs`, replay de transcripts JSONL ; verdicts par fonction déclarés dans `EXPECTED` (ISO4).
+- **ACP** : harnais ACP — `fake_acp` présent dans `nexus/src/bin/fake_acp.rs`, replay de transcripts JSONL ; les écarts de capacité (hooks…) sont MESURÉS contre les capacités du provider, `provider_switch.relay` par replay, le reste `not_measured`.
 
 `ok` : mesuré et conforme. `gap (cause, tâche)` : mesuré absent, cause `harnais` (le backend ou le harnais nexus ne le fait pas) ou `modèle` (le modèle ne le peut pas), fermé par la tâche PO nommée (plan 5ad54c48 « Parité totale », ou e87abcc2 « Claude Code devient optionnel » pour une tâche M…). `declared (cause, tâche)` : écart déclaré dans EXPECTED mais le scénario n'a PAS tourné sur ce moteur (pas de transcript dédié) ; distinct de `gap` (mesuré) et de `not_measured` (impossible à exercer). `not_measured` : les faux binaires ne permettent pas de l'exercer sur ce moteur (raison ci-dessous). Un écart non déclaré, ou un écart déclaré qui disparaît, fait échouer le test.
 
 | Fonction | Ce qui est vérifié | Claude Code | Claude Code (moteur agent) | natif | Codex | opencode | ACP |
 |---|---|---|---|---|---|---|---|
-| `hooks.before_tool` | le hook PreToolUse du graphe est consulté avant un outil | ok | ok | ok | declared (harnais, ISO4) | not_measured | declared (harnais, ISO4) |
-| `hooks.after_tool` | le hook PostToolUse du graphe répond après un Grep bruyant (find_references) | ok | ok | ok | declared (harnais, ISO4) | not_measured | declared (harnais, ISO4) |
-| `hooks.before_compaction` | le hook PreCompact du graphe nomme le projet dans les instructions du résumé (Claude Code : `systemMessage`, le champ que lit le CLI) | ok | ok | ok | declared (harnais, ISO4) | not_measured | declared (harnais, ISO4) |
-| `hooks.session_start` | le hook SessionStart du graphe est consulté à l'ouverture de la session (contract v7) | ok | ok | ok | declared (harnais, ISO4) | not_measured | declared (harnais, ISO4) |
-| `hooks.user_prompt_submit` | le hook UserPromptSubmit du graphe est consulté avant chaque tour (contract v7) | ok | ok | ok | declared (harnais, ISO4) | not_measured | declared (harnais, ISO4) |
-| `hooks.stop` | le hook Stop du graphe est consulté avant la fin du tour ; un block fait continuer le tour avec la raison (contract v7) | ok | ok | ok | declared (harnais, ISO4) | not_measured | declared (harnais, ISO4) |
-| `hooks.subagent_stop` | le hook SubagentStop du graphe est consulté quand un sous-agent s'arrête (contract v7) | ok | ok | ok | declared (harnais, ISO4) | not_measured | declared (harnais, ISO4) |
-| `hooks.notification` | le hook Notification du graphe est appelé quand une permission est attendue (contract v7) | ok | ok | ok | declared (harnais, ISO4) | not_measured | declared (harnais, ISO4) |
+| `hooks.before_tool` | le hook PreToolUse du graphe est consulté avant un outil | ok | ok | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
+| `hooks.after_tool` | le hook PostToolUse du graphe répond après un Grep bruyant (find_references) | ok | ok | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
+| `hooks.before_compaction` | le hook PreCompact du graphe nomme le projet dans les instructions du résumé (Claude Code : `systemMessage`, le champ que lit le CLI) | ok | ok | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
+| `hooks.session_start` | le hook SessionStart du graphe est consulté à l'ouverture de la session (contract v7) | ok | ok | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
+| `hooks.user_prompt_submit` | le hook UserPromptSubmit du graphe est consulté avant chaque tour (contract v7) | ok | ok | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
+| `hooks.stop` | le hook Stop du graphe est consulté avant la fin du tour ; un block fait continuer le tour avec la raison (contract v7) | ok | ok | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
+| `hooks.subagent_stop` | le hook SubagentStop du graphe est consulté quand un sous-agent s'arrête (contract v7) | ok | ok | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
+| `hooks.notification` | le hook Notification du graphe est appelé quand une permission est attendue (contract v7) | ok | ok | ok | gap (harnais, ISO4) | not_measured | gap (harnais, ISO4) |
 | `compaction` | compaction_started et compact_boundary sur le fil | ok | ok | ok | not_measured | not_measured | not_measured |
-| `compaction.manual` | `/compact <instructions>` envoyé depuis le chat : Claude Code reçoit la commande telle quelle (le CLI compacte, compact_boundary trigger manual) ; le natif compacte hors tour (AgentSession::compact), les instructions et le hook PreCompact dans la requête de résumé, aucun tour envoyé au modèle, compaction_started / compact_boundary trigger manual sur le fil (ISO3) | ok | ok | ok | not_measured | not_measured | declared (harnais, ISO4) |
+| `compaction.manual` | `/compact <instructions>` envoyé depuis le chat : Claude Code reçoit la commande telle quelle (le CLI compacte, compact_boundary trigger manual) ; le natif compacte hors tour (AgentSession::compact), les instructions et le hook PreCompact dans la requête de résumé, aucun tour envoyé au modèle, compaction_started / compact_boundary trigger manual sur le fil (ISO3) | ok | ok | ok | not_measured | not_measured | gap (harnais, ISO4) |
 | `message_queue` | un message envoyé pendant un tour l'interrompt et passe ensuite | ok | ok | ok | not_measured | not_measured | not_measured |
 | `auto_continue` | un tour arrêté sur sa limite est continué (auto_continue) | ok | ok | ok | not_measured | not_measured | not_measured |
 | `nats.send` | un message d'une autre instance (NATS) est joué ici | ok | ok | ok | not_measured | not_measured | not_measured |
@@ -41,16 +41,16 @@ Un seul scénario, joué sur les moteurs mesurables, même assertion par fonctio
 | `tool_timing` | un outil qui a attendu une permission porte tool_timing persisté : prise en charge, attente, exécution, fin | ok | ok | ok | not_measured | not_measured | not_measured |
 | `po_tools` | les outils project-orchestrator (MCP) sont donnés et appelables | ok | ok | ok | not_measured | not_measured | not_measured |
 | `tool_search` | un outil différé n'est pas envoyé ; ToolSearch le charge, il est ajouté EN FIN de liste et appelable dans le même tour (CTX2) | not_measured | not_measured | ok | not_measured | not_measured | not_measured |
-| `nexus_tools` | Read / Edit / Bash s'exécutent sur le projet | not_measured | not_measured | ok | not_measured | not_measured | declared (harnais, ISO4) |
+| `nexus_tools` | Read / Edit / Bash s'exécutent sur le projet | not_measured | not_measured | ok | not_measured | not_measured | gap (harnais, ISO4) |
 | `tool_result.huge` | un résultat d'outil MCP d'environ 1 Mo ne tue pas le tour : seul un avis borné (moins de 8 Ko) atteint le fil et le modèle, le tour se clôt et le suivant démarre ; natif : le mégaoctet est gardé sur disque, au chemin que l'avis nomme (Claude Code : ce que fait le CLI est relevé, puis rejoué par fake_claude) | ok | ok | ok | not_measured | not_measured | not_measured |
 | `enrichment` | le contexte du graphe précède le message du tour | ok | ok | ok | not_measured | not_measured | not_measured |
 | `refs` | une référence #kind:id atteint le modèle en pointeur po-context | ok | ok | ok | not_measured | not_measured | not_measured |
 | `provider_switch.relay` | la bascule vers ce moteur relaie la conversation sur le même fil (provider_switched) | ok | ok | ok | ok | not_measured | ok |
-| `images` | une image jointe atteint le provider en bloc image | ok | ok | ok | declared (harnais, ISO4) | not_measured | not_measured |
+| `images` | une image jointe atteint le provider en bloc image | ok | ok | ok | gap (harnais, ISO4) | not_measured | not_measured |
 | `session_record` | le dossier de session porte message_count, total_cost_usd et un titre | ok | ok | ok | not_measured | not_measured | not_measured |
-| `background_tasks` | une tâche d'arrière-plan est suivie (active_tasks_update) | ok | ok | ok | declared (harnais, ISO4) | not_measured | not_measured |
-| `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | ok | ok | declared (harnais, ISO4) | not_measured | not_measured |
-| `ask_user_question` | une question du modèle s'affiche (ask_user_question) et la réponse de l'utilisateur lui revient au tour suivant | ok | ok | ok | declared (harnais, ISO4) | not_measured | not_measured |
+| `background_tasks` | une tâche d'arrière-plan est suivie (active_tasks_update) | ok | ok | ok | gap (harnais, ISO4) | not_measured | not_measured |
+| `cancel_task` | cancel_task arrête une tâche d'arrière-plan | ok | ok | ok | gap (harnais, ISO4) | not_measured | not_measured |
+| `ask_user_question` | une question du modèle s'affiche (ask_user_question) et la réponse de l'utilisateur lui revient au tour suivant | ok | ok | ok | gap (harnais, ISO4) | not_measured | not_measured |
 | `subagents` | un sous-agent (Agent / Task) travaille et sa réponse revient en résultat ; sur le natif, une session enfant qui ne peut pas re-déléguer | ok | ok | ok | not_measured | not_measured | not_measured |
 | `subagents.background` | un sous-agent lancé en arrière-plan (run_in_background: true) rend la main au parent immédiatement ; sa fin est injectée comme task_notification au tour suivant | not_measured | not_measured | not_measured | not_measured | not_measured | not_measured |
 | `subagents.types` | subagent_type valide parmi les types déclarés ; un type inconnu est refusé avec la liste des types connus | not_measured | not_measured | ok | not_measured | not_measured | not_measured |
@@ -69,11 +69,11 @@ Un **vert attesté** est une cellule que ce scénario a jouée sur ce moteur et 
 | Claude Code | 36 | 0 | 0 | 5 | 0 | 41 |
 | Claude Code (moteur agent) | 36 | 0 | 0 | 5 | 0 | 41 |
 | natif | 40 | 0 | 0 | 1 | 0 | 41 |
-| Codex | 1 | 12 | 0 | 28 | 0 | 41 |
+| Codex | 1 | 0 | 12 | 28 | 0 | 41 |
 | opencode | 0 | 0 | 0 | 41 | 0 | 41 |
-| ACP | 1 | 10 | 0 | 30 | 0 | 41 |
+| ACP | 1 | 0 | 10 | 30 | 0 | 41 |
 
-## Écarts déclarés
+## Écarts mesurés
 
 | Moteur | Fonction | Cause | Tâche | Ce qui manque |
 |---|---|---|---|---|
