@@ -798,11 +798,14 @@ fn render(run: &Run<'_>) -> String {
          - **natif** : moteur agent, instance OpenAI-compatible sur `fake_openai`, outils \
          project-orchestrator sur `fake_mcp`, outils de base sur le vrai `nexus-tools` ;\n\
          - **Codex** : harnais Codex — `fake_codex` présent dans `nexus/src/bin/fake_codex.rs`, \
-         replay de transcripts JSONL ; verdicts par fonction déclarés dans `EXPECTED` (ISO4) ;\n\
+         replay de transcripts JSONL ; les écarts de capacité (hooks, images…) sont MESURÉS \
+         contre les capacités du provider (contract §5), `provider_switch.relay` par replay, \
+         le reste `not_measured` ;\n\
          - **opencode** : harnais opencode — `fake_opencode` absent, toutes les fonctions \
          `not_measured` (YARDSTICK, tâche 87eb345e) ;\n\
          - **ACP** : harnais ACP — `fake_acp` présent dans `nexus/src/bin/fake_acp.rs`, \
-         replay de transcripts JSONL ; verdicts par fonction déclarés dans `EXPECTED` (ISO4).\n\n\
+         replay de transcripts JSONL ; les écarts de capacité (hooks…) sont MESURÉS contre \
+         les capacités du provider, `provider_switch.relay` par replay, le reste `not_measured`.\n\n\
          `ok` : mesuré et conforme. `gap (cause, tâche)` : mesuré absent, cause `harnais` \
          (le backend ou le harnais nexus ne le fait pas) ou `modèle` (le modèle ne le peut pas), \
          fermé par la tâche PO nommée (plan 5ad54c48 « Parité totale », ou e87abcc2 « Claude Code devient optionnel » pour une tâche M…). `declared (cause, tâche)` : écart déclaré \
@@ -852,7 +855,7 @@ fn render(run: &Run<'_>) -> String {
             b.total()
         ));
     }
-    out.push_str("\n## Écarts déclarés\n\n");
+    out.push_str("\n## Écarts mesurés\n\n");
     out.push_str("| Moteur | Fonction | Cause | Tâche | Ce qui manque |\n|---|---|---|---|---|\n");
     for (engine, function, x) in declared_in_table_order() {
         if let Expect::Gap { cause, task, why } = x {
@@ -5327,8 +5330,83 @@ fn fill_missing_declared(m: &mut Measures, engine: Engine) {
     }
 }
 
+/// The Codex/ACP column of the matrix, MEASURED: every gap `EXPECTED` declares is read
+/// from the provider's capabilities (contract §5) — the machine-readable declaration of
+/// what the harness really supports, frozen on the session at open. A capability that is
+/// absent is confirmed a measured `gap`; one that is present is measured `ok`, which the
+/// audit reads as "the declared gap was fixed" (it turns the matrix red instead of
+/// silently keeping a dead exception). `provider_switch.relay` is the only function
+/// `EXPECTED` leaves `ok` on these engines: it is measured by the mini-run, the caller
+/// sets it after this.
+fn codex_acp_column(engine: Engine, kind: ProviderKind, caps: &Capabilities) -> Measures {
+    let mut m = Measures::default();
+    for (function, _) in FUNCTIONS {
+        match expected(engine, function) {
+            // Only `provider_switch.relay` is expected `ok` on Codex/ACP: the caller
+            // measures it through the relay mini-run and sets it below.
+            None => {}
+            Some(Expect::NotMeasured { why }) => m.set(function, Verdict::NotMeasured, why),
+            Some(Expect::Gap { cause, .. }) => {
+                let (ok, seen) = harness_gap_measure(kind, caps, function);
+                m.check(function, ok, cause, seen);
+            }
+        }
+    }
+    m
+}
+
+/// Whether the harness really supports a gap `EXPECTED` declares on Codex/ACP, read from
+/// the provider's capabilities (contract §5). `(ok, seen)`: `ok` when the capability is
+/// present (then the declared gap is fixed), and a `seen` naming the capability field.
+fn harness_gap_measure(kind: ProviderKind, caps: &Capabilities, function: &str) -> (bool, String) {
+    use nexus_claude::agent::HookSupport;
+    match function {
+        // Every knowledge-graph and lifecycle hook travels through `SessionSpec::hooks`;
+        // a provider that does not declare `InProtocol` runs none of them in its loop.
+        "hooks.before_tool"
+        | "hooks.after_tool"
+        | "hooks.before_compaction"
+        | "hooks.session_start"
+        | "hooks.user_prompt_submit"
+        | "hooks.stop"
+        | "hooks.subagent_stop"
+        | "hooks.notification" => (
+            caps.hooks == HookSupport::InProtocol,
+            format!(
+                "caps.hooks = {:?} (InProtocol = le provider joue SessionSpec::hooks)",
+                caps.hooks
+            ),
+        ),
+        "images" => (caps.images, format!("caps.images = {}", caps.images)),
+        "background_tasks" => (
+            caps.background_tasks,
+            format!("caps.background_tasks = {}", caps.background_tasks),
+        ),
+        "cancel_task" => (
+            caps.tool_cancel,
+            format!("caps.tool_cancel = {}", caps.tool_cancel),
+        ),
+        "ask_user_question" => (
+            caps.native_question,
+            format!("caps.native_question = {}", caps.native_question),
+        ),
+        "compaction.manual" => (
+            caps.compaction_manual,
+            format!("caps.compaction_manual = {}", caps.compaction_manual),
+        ),
+        // nexus-tools is attached to native sessions only (manager::build_agent_spec);
+        // Codex/ACP bring their own tool environment.
+        "nexus_tools" => (
+            kind == ProviderKind::Native,
+            format!("nexus-tools n'est joint qu'à une session native (kind = {kind:?})"),
+        ),
+        other => unreachable!("{other} n'est pas un écart déclaré sur {kind:?}"),
+    }
+}
+
 /// Mini-run that measures `provider_switch.relay` on ACP by opening a native session then
-/// switching to fake_acp, and fills the rest via [`declared_only`].
+/// switching to fake_acp, and measures the declared harness gaps (hooks, nexus_tools,
+/// compaction.manual) against the ACP provider's capabilities via [`codex_acp_column`].
 async fn run_acp_column() -> Measures {
     use std::collections::BTreeMap;
     let dir = tempfile::TempDir::new().unwrap();
@@ -5495,7 +5573,14 @@ async fn run_acp_column() -> Measures {
         .iter()
         .any(|e| e["kind"] == "in" && e["params"].to_string().contains("<conversation_relay"));
 
-    let mut m = declared_only(Engine::Acp);
+    // The harness gaps EXPECTED declares on ACP (hooks, nexus_tools, compaction.manual)
+    // are measured against the provider's capabilities, not just asserted (ISO4-2).
+    let caps = manager
+        .provider_for("parity-acp")
+        .await
+        .unwrap_or_else(|e| panic!("run_acp_column: provider_for failed: {e:#}"))
+        .capabilities(Some("openclaw"));
+    let mut m = codex_acp_column(Engine::Acp, ProviderKind::Acp, &caps);
     m.set(
         "provider_switch.relay",
         if relay_ok {
@@ -5513,7 +5598,9 @@ async fn run_acp_column() -> Measures {
 }
 
 /// Mini-run that measures `provider_switch.relay` on Codex by opening a native session then
-/// switching to fake_codex, and fills the rest via [`declared_only`].
+/// switching to fake_codex, and measures the declared harness gaps (hooks, images,
+/// background_tasks, cancel_task, ask_user_question) against the Codex provider's
+/// capabilities via [`codex_acp_column`].
 async fn run_codex_column() -> Measures {
     let dir = tempfile::TempDir::new().unwrap();
     let d = dir.path();
@@ -5682,7 +5769,15 @@ async fn run_codex_column() -> Measures {
         .iter()
         .any(|e| e["kind"] == "in" && e["params"].to_string().contains("<conversation_relay"));
 
-    let mut m = declared_only(Engine::Codex);
+    // The harness gaps EXPECTED declares on Codex (hooks, images, background_tasks,
+    // cancel_task, ask_user_question) are measured against the provider's capabilities,
+    // not just asserted (ISO4-2).
+    let caps = manager
+        .provider_for("parity-codex")
+        .await
+        .unwrap_or_else(|e| panic!("run_codex_column: provider_for failed: {e:#}"))
+        .capabilities(Some("gpt-fake"));
+    let mut m = codex_acp_column(Engine::Codex, ProviderKind::Codex, &caps);
     m.set(
         "provider_switch.relay",
         if relay_ok {
