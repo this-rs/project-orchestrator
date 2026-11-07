@@ -263,6 +263,33 @@ const PINNED_NOTES_BUDGET: Duration = Duration::from_millis(500);
 /// the SAME constant, so what it promises and what the prompt carries cannot drift.
 pub const PINNED_NOTE_CHARS: usize = 300;
 
+/// What the structural read of the self said about itself, for the prompt.
+///
+/// « La part lue est dite » : the bound of the read is in the injected text, not only in
+/// a log. « L'ancrage ne peut pas mentir » : a self that could not be resolved is said
+/// so, with its reason, and nothing structural is served in its place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelfRead {
+    /// The self resolved: `read` of its `available` notes were read (bounded by
+    /// [`MAX_PINNED_NOTES`]).
+    Read { read: usize, available: usize },
+    /// The self could not be resolved, or its knowledge could not be read.
+    Unresolved(String),
+}
+
+impl SelfRead {
+    /// The line the prompt carries, newline included. Outside the untrusted container:
+    /// it is the system's own account, not a note's text.
+    fn line(&self) -> String {
+        match self {
+            SelfRead::Read { read, available } => {
+                format!("notes du soi : {read} lues / {available} disponibles\n")
+            }
+            SelfRead::Unresolved(reason) => format!("self_unresolved: {reason}\n"),
+        }
+    }
+}
+
 /// One line of the foundation, EXACTLY as the renderer writes it.
 pub fn foundation_entry(note_type: &str, importance: &str, content: &str) -> String {
     format!(
@@ -636,6 +663,10 @@ impl KnowledgeInjectionStage {
     /// most [`MAX_PINNED_NOTES`], minus the notes the message already references
     /// (`excluded`). Read under [`PINNED_NOTES_BUDGET`]. Returns the ids injected, so
     /// the ranked retrieval does not inject them a second time.
+    ///
+    /// The section opens with the account of the self ([`SelfRead::line`]): how many of
+    /// its notes were read out of how many it knows, or why it could not be resolved. In
+    /// that last case the section is emitted even when empty — the reason is the content.
     #[allow(clippy::too_many_arguments)]
     async fn inject_pinned(
         &self,
@@ -667,7 +698,9 @@ impl KnowledgeInjectionStage {
                     .map(|p| p.id),
                 None => None,
             };
-            let structural = match graph.agent_identity_namespace().await {
+            // « l'ancrage ne peut pas mentir » : un soi non résolu ne sert RIEN de
+            // structurel, et le dit. Pas de repli sur un autre périmètre.
+            let (structural, self_read) = match graph.agent_identity_namespace().await {
                 Ok(self_id) => match graph
                     .agent_knows(self_id, scope_project, MAX_PINNED_NOTES)
                     .await
@@ -681,16 +714,26 @@ impl KnowledgeInjectionStage {
                                 "[knowledge_injection] the self knows more notes than were read"
                             );
                         }
-                        known.notes
+                        let read = SelfRead::Read {
+                            read: known.notes.len(),
+                            available: known.available,
+                        };
+                        (known.notes, read)
                     }
                     Err(e) => {
                         debug!(error = %e, "the knowledge of the self could not be read");
-                        Vec::new()
+                        (
+                            Vec::new(),
+                            SelfRead::Unresolved(format!("knowledge unreadable ({e})")),
+                        )
                     }
                 },
                 Err(e) => {
                     debug!(error = %e, "the self has no identity root yet");
-                    Vec::new()
+                    (
+                        Vec::new(),
+                        SelfRead::Unresolved(format!("no identity root ({e})")),
+                    )
                 }
             };
             ids.extend(structural);
@@ -742,22 +785,28 @@ impl KnowledgeInjectionStage {
                 .collect();
             candidates.retain(|n| !excluded.contains(&n.id));
             if candidates.is_empty() {
-                return Vec::new();
+                return (Vec::new(), self_read);
             }
             // The currency, consent and policy checks read the graph too: under the
             // same budget as the lookups, so a slow graph costs the pins, never the turn.
-            keep_current_notes(graph.as_ref(), reader, candidates, restricted, session).await
+            let kept =
+                keep_current_notes(graph.as_ref(), reader, candidates, restricted, session).await;
+            (kept, self_read)
         };
-        let kept = match timeout(PINNED_NOTES_BUDGET, read).await {
-            Ok(kept) => kept,
+        let (kept, self_read) = match timeout(PINNED_NOTES_BUDGET, read).await {
+            Ok(read) => read,
             Err(_) => {
                 warn!("[knowledge_injection] reading the pinned notes timed out");
-                return injected;
+                // Nothing was read, the self included: said, not implied.
+                (
+                    Vec::new(),
+                    SelfRead::Unresolved(format!(
+                        "the read timed out after {}ms",
+                        PINNED_NOTES_BUDGET.as_millis()
+                    )),
+                )
             }
         };
-        if kept.is_empty() {
-            return injected;
-        }
 
         // Half the knowledge budget at most: the pins come first, they must not leave
         // nothing to the ranked notes the message asked for.
@@ -772,11 +821,14 @@ impl KnowledgeInjectionStage {
             group.push_str(entry);
             injected.insert(note.id.clone());
         }
-        if group.is_empty() {
+        // An empty foundation is not a section — unless the self could not be resolved:
+        // an empty block WITH its reason is the whole point, never a silent one.
+        if group.is_empty() && !matches!(self_read, SelfRead::Unresolved(_)) {
             return injected;
         }
 
         let mut content = String::from("### Foundational Notes\n");
+        content.push_str(&self_read.line());
         content.push_str(&untrusted_group("note", &group, project));
         output.add_section(
             "Foundational Notes",
