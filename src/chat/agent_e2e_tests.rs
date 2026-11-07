@@ -4099,10 +4099,10 @@ mod provider_switch {
         w.graph.create_project(&project).await.unwrap();
         let sid = first_turn(&w).await;
         let id = Uuid::parse_str(&sid).unwrap();
-        // T5: the session had two notes in context. The close welds them (SYNAPSE); the
-        // switch, which is not an end, must not.
-        crate::chat::activation_registry::record_notes(id, [Uuid::new_v4(), Uuid::new_v4()]);
-
+        // T5: the session has two notes in context at the close, which welds them (SYNAPSE).
+        // The switch, which is not an end, must weld nothing. The registry is process-wide and
+        // another test's snapshot prunes the sessions it does not see, so the notes are recorded
+        // as late as possible: right before the close.
         w.manager
             .switch_session_provider(&sid, "local2", None, "second question", None)
             .await
@@ -4120,6 +4120,7 @@ mod provider_switch {
             w.graph.synapses.read().await.len()
         );
 
+        crate::chat::activation_registry::record_notes(id, [Uuid::new_v4(), Uuid::new_v4()]);
         w.manager.close_session(&sid).await.unwrap();
         for _ in 0..200 {
             if !w.graph.synapses.read().await.is_empty() {
