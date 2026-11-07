@@ -663,7 +663,7 @@ impl Neo4jClient {
             r#"
             MATCH (t:ProtocolTransition {protocol_id: $protocol_id})
             RETURN t
-            ORDER BY t.trigger
+            ORDER BY t.trigger, t.id
             "#,
         )
         .param("protocol_id", protocol_id.to_string());

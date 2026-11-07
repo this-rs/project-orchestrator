@@ -259,13 +259,16 @@ async fn fire_transition_inner(
     // 3. Load transitions and find the ones that answer this trigger from the current state.
     //    Several may share a trigger when they are told apart by a typed guard.
     let transitions = store.get_protocol_transitions(run.protocol_id).await?;
-    let candidates: Vec<&ProtocolTransition> = transitions
+    let mut candidates: Vec<&ProtocolTransition> = transitions
         .iter()
         .filter(|t| t.from_state == run.current_state && t.trigger == trigger)
         .collect();
+    // Deterministic order whatever the store returned: guarded candidates first (stable by id),
+    // the unguarded one is the "else" fallback.
+    candidates.sort_by_key(|t| (t.guard_expr.is_none(), t.id));
 
-    // 4. Typed guards (G1): the first candidate whose guard holds fires. A candidate without a
-    //    `guard_expr` is open, exactly as before. If every candidate is guarded and none holds,
+    // 4. Typed guards (G1): the first guarded candidate whose guard holds fires, else the unguarded
+    //    one (the fallback), exactly as before when none is guarded. If every candidate is guarded and none holds,
     //    the transition is REFUSED with the reason and the run does not move (fail closed).
     let mut matching: Option<&ProtocolTransition> = None;
     let mut refusals: Vec<String> = Vec::new();
@@ -1903,6 +1906,31 @@ mod tests {
 
         assert!(result.success, "{:?}", result.error);
         assert_eq!(result.current_state_name, "Processing");
+    }
+
+    #[tokio::test]
+    async fn a_true_guarded_edge_wins_over_an_unguarded_one_inserted_first() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_protocol(&store).await;
+        // The unguarded edge (the "else") is stored FIRST; the guarded one must still win.
+        add_guarded(&store, protocol.id, "Start", "Processing", "go", None).await;
+        add_guarded(
+            &store,
+            protocol.id,
+            "Start",
+            "Done",
+            "go",
+            Some(visited("Start")),
+        )
+        .await;
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
+
+        let result = fire_transition(&store, run.id, "go").await.unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.current_state_name, "Done");
     }
 
     #[tokio::test]

@@ -213,7 +213,7 @@ async fn determine_trigger(
 /// The outgoing transitions of `state` that may fire now: unguarded ones, and those whose typed
 /// guard (G1) holds. If the state has guarded transitions and NONE of them may fire (and there is
 /// no unguarded one), that is an error naming the reasons, never a silent pick of the first edge.
-async fn open_outgoing<'a>(
+pub(super) async fn open_outgoing<'a>(
     store: &dyn GraphStore,
     state: &ProtocolState,
     run: &ProtocolRun,
