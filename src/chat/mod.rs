@@ -79,6 +79,7 @@ pub(crate) mod subagents;
 pub(crate) mod team;
 pub(crate) mod tool_clock;
 pub mod tree;
+pub(crate) mod turn_admission;
 pub mod types;
 pub mod untrusted;
 pub mod viz;

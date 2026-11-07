@@ -783,6 +783,20 @@ impl Breaker {
         transition
     }
 
+    /// Gives back a probe that was granted but will never leave (the call was refused
+    /// further down the door): the pause is open again and ended, so the next
+    /// `attempt` grants the probe afresh instead of waiting out `probe_timeout`.
+    /// Does nothing unless the subject is half-open.
+    pub fn release_probe(&self, key: &Key) {
+        let now = self.clock.now();
+        let mut entries = self.lock_entries();
+        if let Some(e) = entries.get_mut(key) {
+            if matches!(e.mode, Mode::HalfOpen { .. }) {
+                e.open(now, now);
+            }
+        }
+    }
+
     /// The observable state of one subject, as RL7 answers it.
     pub fn state(&self, key: &Key) -> State {
         let entries = self.lock_entries();
@@ -992,6 +1006,23 @@ mod tests {
         assert!(!f.breaker.attempt(&key()).is_allowed());
         f.clock.advance(Duration::from_secs(1));
         assert!(f.breaker.attempt(&key()).is_probe());
+    }
+
+    #[test]
+    fn a_released_probe_is_granted_again_at_once() {
+        // MUTATION: making `release_probe` a no-op leaves the breaker half-open
+        // with a probe nobody holds: the second `attempt` is refused.
+        let f = exact();
+        f.open_by_overload(3);
+        f.clock.advance(Duration::from_secs(4));
+        assert!(f.breaker.attempt(&key()).is_probe());
+        f.breaker.release_probe(&key());
+        assert!(f.breaker.attempt(&key()).is_probe(), "granted afresh");
+        // Releasing a closed or unknown subject is a no-op.
+        f.breaker.release_probe(&Key::for_instance("never-seen"));
+        f.breaker.record(&key(), Signal::Success, true);
+        f.breaker.release_probe(&key());
+        assert_eq!(f.breaker.state(&key()).phase, Phase::Closed);
     }
 
     #[test]

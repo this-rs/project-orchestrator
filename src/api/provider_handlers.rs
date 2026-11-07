@@ -779,9 +779,10 @@ async fn instance_status(state: &OrchestratorState, id: &str) -> Result<HealthEn
 /// configured limits (RL7): one entry per limit, with its usage, what is left,
 /// when it resets and its status (`ok | limited | overloaded | unknown`).
 ///
-/// Nothing is counted yet (RL2) and no breaker exists (RL4), so every limit
-/// answers `unknown` with null numbers: this route settles the SHAPE the
-/// interface is built against, and RL2/RL4 will fill it without changing a key.
+/// The numbers are the MEASURED ones (RL5): RL2's counters fill `used`,
+/// `remaining` and `resets_at`, and RL4's breaker fills `status` — `limited` for a
+/// spent quota, `overloaded` for a provider having a bad minute — with the instant
+/// of the next attempt. Without a configured limit the answer is unchanged.
 ///
 /// Never a secret — not in this response, not in any other: a limit scoped to a
 /// credential names the credential REFERENCE (`vault:<name>`, `env:<VAR>`), which
@@ -803,7 +804,27 @@ pub async fn provider_limits(
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("unknown provider instance '{id}'")))?;
-    Ok(Json(st::rate_limit_report(&record)))
+    // The measured state comes from the ONE gate the chat sessions use. With no chat
+    // manager nothing is counting, so the answer stays the settled shape.
+    Ok(Json(limits_report(
+        state
+            .chat_manager
+            .as_ref()
+            .map(|manager| manager.provider_limits().as_ref()),
+        &record,
+    )))
+}
+
+/// The state of an instance's limits: the gate's MEASURED numbers when there is one,
+/// the settled shape (`unknown`, null numbers) when nothing is counting.
+fn limits_report(
+    gate: Option<&crate::chat::provider::limits::Gate>,
+    record: &st::InstanceRecord,
+) -> st::RateLimitReport {
+    match gate {
+        Some(gate) => gate.report(record),
+        None => st::rate_limit_report(record),
+    }
 }
 
 // ============================================================================
@@ -2256,6 +2277,39 @@ mod tests {
     async fn a_missing_program_is_not_available() {
         let r = run_keyscan("/nonexistent/ssh-keyscan", &[], Duration::from_secs(1)).await;
         assert_eq!(r, Err(KeyScanError::NotAvailable));
+    }
+
+    // ---- RL5: the route reads the measured numbers -----------------------------
+
+    #[test]
+    fn the_limits_route_reads_the_gate_when_there_is_one() {
+        use crate::chat::provider::limits::{Ask, Gate};
+        let limit = st::RateLimit {
+            kind: st::RateLimitKind::Requests,
+            window: st::RateLimitWindow::Unit(st::RateLimitUnit::Minute),
+            calendar: None,
+            max: 5.0,
+            scope: st::RateLimitScope::Instance(st::InstanceScope::Instance),
+        };
+        let record = st::InstanceRecord {
+            id: "deepseek".into(),
+            rate_limit: vec![limit.clone()],
+            ..Default::default()
+        };
+        // Nothing is counting: the settled shape, unknown and null.
+        let unmeasured = limits_report(None, &record);
+        assert_eq!(unmeasured.limits[0].used, None);
+        // A gate that admitted one call: the measured number.
+        let gate = Gate::unlimited();
+        assert!(gate
+            .admit("deepseek", &[limit], &Ask::default())
+            .is_admitted());
+        let measured = limits_report(Some(&gate), &record);
+        // A unit window is a bucket that refills continuously: a hair under one.
+        assert!(measured.limits[0].used.is_some_and(|u| u > 0.9 && u <= 1.0));
+        assert!(measured.limits[0]
+            .remaining
+            .is_some_and(|r| (4.0..4.1).contains(&r)));
     }
 
     // ---- RL7: the limits travel with the instance, and never as a value ------

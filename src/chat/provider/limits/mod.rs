@@ -17,7 +17,10 @@
 //! * [`breaker`] — RL4: the overload backoff and the single probe, per
 //!   (instance, credential REFERENCE). It never opens on a spent quota (that is
 //!   [`QuotaRegistry`](super::quota::QuotaRegistry)'s) and retries nothing itself:
-//!   the count of a retry belongs to [`ledger`].
+//!   the count of a retry belongs to [`ledger`];
+//! * [`admission`] — RL5: the ONE door a call goes through before it costs
+//!   anything. It reads the quota registry, consults the breaker, reserves in the
+//!   ledger, and answers a NAMED refusal (kind, scope, `retry_at`/`reset_at`).
 //!
 //! # What is NOT here
 //!
@@ -30,12 +33,14 @@
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
+pub mod admission;
 pub mod breaker;
 pub mod classify;
 pub mod ledger;
 pub mod profiles;
 pub mod store;
 
+pub use admission::{ask_for, key_for, Admission, Aftermath, Gate, Refusal, RefusalKind};
 pub use breaker::{
     Breaker, Decision, FixedJitter, Jitter, Key, Phase, Policy, Reason, SeededJitter, State,
     SystemJitter, Transition,

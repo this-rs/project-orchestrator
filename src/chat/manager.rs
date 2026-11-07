@@ -1234,6 +1234,12 @@ pub struct ChatManager {
     /// recheck, so a test can make a session busy at exactly that point.
     #[cfg(test)]
     pub(crate) release_hook: std::sync::Mutex<Option<ReleaseHook>>,
+    /// RL5: the ONE door a provider call goes through — RL2's counters and RL4's
+    /// breakers behind a single gate. Shared by every session: the boot injects the
+    /// process-wide instance with [`ChatManager::with_provider_limits`]. The default
+    /// here is an in-memory, unlimited one, so a session a test builds keeps the path
+    /// it had — and no test shares another one's counters.
+    pub(crate) provider_limits: Arc<super::provider::limits::Gate>,
 }
 
 // ============================================================================
@@ -3976,6 +3982,7 @@ impl ChatManager {
             #[cfg(test)]
             release_hook: Default::default(),
             codex: Default::default(),
+            provider_limits: Arc::new(super::provider::limits::Gate::unlimited()),
         }
     }
 
@@ -4095,6 +4102,7 @@ impl ChatManager {
             #[cfg(test)]
             release_hook: Default::default(),
             codex: Default::default(),
+            provider_limits: Arc::new(super::provider::limits::Gate::unlimited()),
         }
     }
 
@@ -4681,6 +4689,23 @@ impl ChatManager {
     pub fn with_config_yaml_path(mut self, path: std::path::PathBuf) -> Self {
         self.config_yaml_path = Some(path);
         self
+    }
+
+    /// Hand the ADMISSION GATE (RL5) the process-wide instance built at boot.
+    ///
+    /// Every session counts against the SAME counters and breakers: a per-session
+    /// gate would hand out the configured allowance once per session, which is
+    /// exactly the waste RL5 exists to prevent.
+    pub fn with_provider_limits(mut self, gate: Arc<super::provider::limits::Gate>) -> Self {
+        self.agent_runtime.set_gate(Arc::clone(&gate));
+        self.provider_limits = gate;
+        self
+    }
+
+    /// The admission gate (RL5): what a caller consults BEFORE a provider call, and
+    /// what `GET /api/chat/providers/{id}/limits` reads its measured numbers from.
+    pub fn provider_limits(&self) -> &Arc<super::provider::limits::Gate> {
+        &self.provider_limits
     }
 
     /// Attach the secrets vault (per-session vault token + output masking).
@@ -31231,6 +31256,24 @@ mod tests {
         assert_eq!(
             pick.provider_id, "b",
             "back at its reset, nobody did anything"
+        );
+    }
+
+    /// RL5: every session counts against the ONE gate the boot injected, and a manager built
+    /// without one has an unlimited gate of its own.
+    #[test]
+    fn the_manager_shares_the_gate_it_was_given() {
+        use crate::chat::provider::limits::Gate;
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let state = mock_app_state();
+        let manager = ChatManager::new_without_memory(graph, state.meili, test_config());
+        let own = manager.provider_limits().clone();
+        let injected = Arc::new(Gate::unlimited());
+        assert!(!Arc::ptr_eq(&own, &injected));
+        let manager = manager.with_provider_limits(injected.clone());
+        assert!(
+            Arc::ptr_eq(manager.provider_limits(), &injected),
+            "the gate every session reads is the injected one, not a copy"
         );
     }
 
