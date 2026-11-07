@@ -358,6 +358,10 @@ pub struct LiveSessionSnapshot {
     pub states: std::collections::HashMap<Uuid, crate::chat::segment_state::Verdict>,
 }
 
+/// A test seam of the release loop (see `ChatManager::release_hook`).
+#[cfg(test)]
+pub(crate) type ReleaseHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// A peer's message that resumes a released session (`inject_team_message`).
 pub(crate) struct TeamInbound {
     pub from_session_id: Uuid,
@@ -1226,6 +1230,10 @@ pub struct ChatManager {
     /// Done. Only those are resumed by a team message (`inject_team_message`); any other
     /// close (a person's, the idle cleanup's) clears the mark.
     pub(crate) released_done: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Test seam: runs in the release loop after the second verdict read, before the
+    /// recheck, so a test can make a session busy at exactly that point.
+    #[cfg(test)]
+    pub(crate) release_hook: std::sync::Mutex<Option<ReleaseHook>>,
 }
 
 // ============================================================================
@@ -3965,6 +3973,8 @@ impl ChatManager {
             cancelled_parents: Default::default(),
             team_msg_rate: Default::default(),
             released_done: Default::default(),
+            #[cfg(test)]
+            release_hook: Default::default(),
             codex: Default::default(),
         }
     }
@@ -4082,6 +4092,8 @@ impl ChatManager {
             cancelled_parents: Default::default(),
             team_msg_rate: Default::default(),
             released_done: Default::default(),
+            #[cfg(test)]
+            release_hook: Default::default(),
             codex: Default::default(),
         }
     }
@@ -20089,6 +20101,17 @@ impl ChatManager {
                 continue;
             }
             let sid = id.to_string();
+            #[cfg(test)]
+            {
+                let hook = self
+                    .release_hook
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some(hook) = hook {
+                    hook(&sid);
+                }
+            }
             // A message may have landed since the second read: only an idle session with an
             // empty queue is closed, or its new turn would be interrupted.
             if !self.is_idle_for_release(&sid).await {

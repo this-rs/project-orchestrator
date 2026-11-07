@@ -895,6 +895,27 @@ mod tests {
         );
     }
 
+    /// The loop itself: a session that is Done on both verdict reads but gets a turn
+    /// started right after the second one is NOT closed.
+    #[tokio::test]
+    async fn a_session_busy_after_the_second_read_survives_the_release_loop() {
+        let manager = std::sync::Arc::new(make_manager());
+        let id = Uuid::new_v4().to_string();
+        test_support::insert_live_session_without_cli(&manager, &id).await;
+        let later = finish_a_turn(&manager, &id).await;
+        let m = manager.clone();
+        *manager.release_hook.lock().unwrap() = Some(std::sync::Arc::new(move |sid: &str| {
+            let sessions = m.active_sessions.try_read().expect("no writer here");
+            sessions[sid].is_streaming.store(true, Ordering::SeqCst);
+        }));
+        assert!(
+            manager.release_done_sessions_at(later).await.is_empty(),
+            "a session that became busy is not released"
+        );
+        assert!(manager.is_session_active(&id).await, "still live");
+        assert!(!manager.released_done.lock().unwrap().contains(&id));
+    }
+
     /// A Done session with a delegated child (or open sub-agent mirror) still live is not
     /// finished: it is kept.
     #[tokio::test]
