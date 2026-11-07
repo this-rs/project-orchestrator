@@ -295,9 +295,7 @@ impl Classification {
     pub fn next_attempt_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         match self.verdict {
             Verdict::QuotaExhausted { reset_at } => reset_at,
-            Verdict::Overloaded { retry_after } => {
-                retry_after.map(|d| now + chrono::Duration::from_std(d).unwrap_or_default())
-            }
+            Verdict::Overloaded { retry_after } => retry_after.map(|d| after(now, d)),
             Verdict::Unknown => None,
         }
     }
@@ -389,9 +387,25 @@ pub fn classify(signals: &Signals<'_>, now: DateTime<Utc>) -> Classification {
     )
 }
 
-/// The instant `delay` after `now`.
-fn after(now: DateTime<Utc>, delay: Duration) -> DateTime<Utc> {
-    now + chrono::Duration::from_std(delay).unwrap_or_default()
+/// The longest wait a provider's own word (`Retry-After`, a retry delay) can impose
+/// on us: a day. A header is untrusted input, and an absurd value (`1e15`, a
+/// `u64::MAX`) must neither shorten a cooldown to nothing nor overflow an instant.
+/// This is the ONE place the ceiling is defined; everything that reads such a hint
+/// goes through [`cap_hint`].
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 3600);
+
+/// A provider's wait hint, bounded by [`MAX_RETRY_AFTER`].
+pub fn cap_hint(hint: Duration) -> Duration {
+    hint.min(MAX_RETRY_AFTER)
+}
+
+/// The instant `delay` after `now`, saturating at the last representable instant
+/// instead of overflowing (chrono panics on `now + huge`).
+pub(super) fn after(now: DateTime<Utc>, delay: Duration) -> DateTime<Utc> {
+    chrono::Duration::from_std(delay)
+        .ok()
+        .and_then(|delay| now.checked_add_signed(delay))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
 }
 
 /// The reason of a refusal our own counting cannot explain: the contradiction
@@ -422,7 +436,7 @@ pub fn from_provider_error(
     now: DateTime<Utc>,
 ) -> Classification {
     let profile = profiles::profile(preset);
-    let retry_after = retry_after_ms.map(Duration::from_millis);
+    let retry_after = retry_after_ms.map(|ms| cap_hint(Duration::from_millis(ms)));
     match kind {
         "rate_limited" => {
             if ours == OurStanding::AtOrAbove {
@@ -579,11 +593,13 @@ fn parse_retry_after(raw: &str, now: DateTime<Utc>) -> Option<Duration> {
     let value = raw.trim();
     if let Ok(seconds) = value.parse::<f64>() {
         return (seconds.is_finite() && seconds >= 0.0)
-            .then(|| Duration::from_millis((seconds * 1000.0).round() as u64));
+            .then(|| cap_hint(Duration::from_millis((seconds * 1000.0).round() as u64)));
     }
     let when = DateTime::parse_from_rfc2822(value).ok()?;
     let delta = when.with_timezone(&Utc) - now;
-    Some(Duration::from_millis(delta.num_milliseconds().max(0) as u64))
+    Some(cap_hint(Duration::from_millis(
+        delta.num_milliseconds().max(0) as u64,
+    )))
 }
 
 /// A `x-ratelimit-reset` value: epoch seconds, seconds to wait, or a Go duration.
@@ -593,11 +609,12 @@ fn parse_reset(raw: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         return if number >= EPOCH_FLOOR {
             DateTime::from_timestamp(number, 0)
         } else {
-            Some(now + chrono::Duration::seconds(number.max(0)))
+            chrono::Duration::try_seconds(number.max(0))
+                .and_then(|delay| now.checked_add_signed(delay))
         };
     }
     let delay = parse_go_duration(value)?;
-    Some(now + chrono::Duration::from_std(delay).ok()?)
+    Some(after(now, delay))
 }
 
 /// A Go-style duration (`500ms`, `1s`, `6m0s`, `1h2m3s`), as OpenAI-compatible
@@ -895,6 +912,58 @@ mod tests {
             Verdict::Overloaded {
                 retry_after: Some(Duration::from_millis(2500))
             }
+        );
+    }
+
+    #[test]
+    fn an_absurd_retry_after_is_capped_and_never_overflows_an_instant() {
+        // MUTATION: removing `cap_hint` from `parse_retry_after` leaves the hint at
+        // 1e15 seconds (first loop red); an `after` that adds unchecked panics on
+        // `next_attempt_at` (second block).
+        for raw in ["1e15", "18446744073709551615", "99999999999999999999999"] {
+            let headers = [("retry-after", raw)];
+            let read = classify(&Signals::new(openai(), 429).headers(&headers), noon());
+            assert_eq!(
+                read.verdict,
+                Verdict::Overloaded {
+                    retry_after: Some(MAX_RETRY_AFTER)
+                },
+                "{raw}"
+            );
+            let at = read.next_attempt_at(noon()).expect("a dated retry");
+            assert_eq!(at, noon() + chrono::Duration::hours(24));
+        }
+        // A date far in the future is capped the same way.
+        let headers = [("retry-after", "Fri, 31 Dec 9999 23:59:59 GMT")];
+        let read = classify(&Signals::new(openai(), 429).headers(&headers), noon());
+        assert_eq!(
+            read.verdict,
+            Verdict::Overloaded {
+                retry_after: Some(MAX_RETRY_AFTER)
+            }
+        );
+        // The saturating instant never panics, whatever the delay.
+        assert_eq!(after(noon(), Duration::MAX), DateTime::<Utc>::MAX_UTC);
+        // The provider-error reading is bounded too.
+        let read = from_provider_error(
+            "overloaded",
+            Some(u64::MAX),
+            OurStanding::Under,
+            "x",
+            noon(),
+        );
+        assert_eq!(
+            read.verdict,
+            Verdict::Overloaded {
+                retry_after: Some(MAX_RETRY_AFTER)
+            }
+        );
+        // A reset header with an absurd count of seconds is no instant, not a panic.
+        let headers = [("x-ratelimit-reset", "9223372036854775000")];
+        let _ = classify(&Signals::new(openai(), 429).headers(&headers), noon());
+        assert_eq!(
+            parse_reset("1000", noon()),
+            noon().checked_add_signed(chrono::Duration::seconds(1000))
         );
     }
 
