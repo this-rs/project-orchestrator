@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::neo4j::client::Neo4jClient;
 use crate::notes::models::{AssertionResult, Note, NoteStatus};
 
-/// Le label, la propriété qui porte le nom, et celle qui porte le projet.
+/// Le label et la propriété qui porte le nom du nœud.
 ///
 /// `None` = type non interrogeable par nom, donc invérifiable. Fermé volontairement :
 /// ces chaînes sont interpolées dans une requête.
@@ -25,7 +25,6 @@ use crate::notes::models::{AssertionResult, Note, NoteStatus};
 struct Target {
     label: &'static str,
     name_prop: &'static str,
-    project_prop: Option<&'static str>,
 }
 
 fn target_of(kind: &str) -> Option<Target> {
@@ -37,23 +36,23 @@ fn target_of(kind: &str) -> Option<Target> {
         "enum" => ("Enum", "name"),
         _ => return None,
     };
-    // Tous les types nommables portent `project_id`, et chacun a son index `*_project_id`.
-    Some(Target {
-        label,
-        name_prop,
-        project_prop: Some("project_id"),
-    })
+    Some(Target { label, name_prop })
 }
 
 /// La clause qui borne `alias` au projet demandé, ou ne borne rien quand il n'y en a pas.
 ///
 /// Sans elle, `Function.name` est ambigu par nature : deux projets peuvent avoir une
 /// fonction du même nom, et une croyance se vérifierait contre l'homonyme de l'autre.
+///
+/// Pas de variante par label : **tous** les types nommables portent `project_id`, et
+/// chacun a son index `*_project_id` (function, struct, trait, enum, file). Un label qui
+/// n'en porterait pas n'a rien à faire dans [`target_of`] — `impl` en est la preuve.
 fn within_project(alias: &str, target: &Target) -> String {
-    match target.project_prop {
-        Some(prop) => format!("($project IS NULL OR {alias}.{prop} = $project)"),
-        None => format!("($project IS NULL OR {alias}.project_id = $project)"),
-    }
+    debug_assert!(
+        !target.label.is_empty(),
+        "un label interpolé n'est jamais vide"
+    );
+    format!("($project IS NULL OR {alias}.project_id = $project)")
 }
 
 /// Les relations qu'une assertion peut interroger. Liste fermée : `edge` est interpolé.
