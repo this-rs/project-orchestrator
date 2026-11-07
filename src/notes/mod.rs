@@ -247,16 +247,15 @@ pub mod provenance {
         }
         // La preuve de provenance est faite ICI, avant la requête : une règle nommée et une
         // mesure datée, sinon l'écrivain n'est même pas appelable.
-        let provenance = match crate::graph::rules::AccountableProvenance::new(
+        // La règle et la mesure sont des constantes non vides : ce constructeur ne peut
+        // pas échouer ici. On le dit par `expect` plutôt que d'écrire une branche
+        // d'erreur que rien ne peut atteindre — une branche morte non couverte finit par
+        // se faire passer pour une poignée d'erreur utile.
+        let provenance = crate::graph::rules::AccountableProvenance::new(
             crate::graph::rules::AGENT_USES_ACTIVATED.name,
             format!("activé dans la session {session_id}"),
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(agent = %agent, label, error = %e, "an activation has no accountable provenance");
-                return;
-            }
-        };
+        )
+        .expect("nom de règle et mesure constants : une provenance accountable est garantie");
         if let Err(e) = graph
             .link_agent_uses(agent, label, target, &provenance)
             .await

@@ -3298,8 +3298,10 @@ impl AnalyticsStore for Neo4jClient {
         note_id: Uuid,
         result: &crate::notes::models::AssertionResult,
         status: Option<crate::notes::models::NoteStatus>,
+        reason: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.record_assertion_check(note_id, result, status).await
+        self.record_assertion_check(note_id, result, status, reason)
+            .await
     }
 
     async fn agent_knows(

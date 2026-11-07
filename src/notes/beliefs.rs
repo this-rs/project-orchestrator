@@ -228,13 +228,29 @@ pub struct ReverificationReport {
     pub drifted: usize,
     pub flagged: usize,
     pub unsanctioned: usize,
+    /// Croyances RÉVISÉES : passées en `obsolete` avec leur raison. La seule catégorie
+    /// qui retire du savoir — elle doit donc être comptée à part et rester petite.
+    pub revised: usize,
+    /// Notes seulement SIGNALÉES qui tiennent de nouveau : le doute est levé.
+    pub healed: usize,
 }
 
 /// Re-vérifie les croyances, applique la sanction d'une réfutation, et persiste le verdict.
 ///
 /// `Unverifiable` n'est jamais sanctionné : on ne casse pas une croyance parce qu'on ne sait
-/// pas la contrôler. Une réfutation applique `on_violation` — `Warn` se contente de tracer,
-/// `FlagNote` et `Block` passent la note en `needs_review`.
+/// pas la contrôler.
+///
+/// Les trois sanctions ne sont pas symétriques, et c'est délibéré :
+/// - `Warn` (défaut) trace sans toucher la note — `unsanctioned` ;
+/// - `FlagNote` la passe en `needs_review` : un humain tranchera ;
+/// - `Block` la RÉVISE (`obsolete`) — mais **seulement sur une dérive avérée**, c'est-à-dire
+///   une croyance qui avait TENU puis ne tient plus. Une assertion qui n'a jamais tenu est
+///   une règle mal écrite, pas une croyance démentie : la réviser effacerait une note dont
+///   le seul tort est d'avoir été mal formulée.
+///
+/// La raison de la sanction est écrite SUR LE NŒUD (`revision_reason`), pas seulement dans
+/// les journaux : sans elle, « pourquoi cette croyance est tombée » est indéchiffrable au
+/// redémarrage suivant.
 pub async fn reverify(
     graph: &dyn GraphStore,
     limit: usize,
@@ -248,18 +264,46 @@ pub async fn reverify(
         let drifted = has_drifted(note.last_assertion_result.as_ref(), &verdict);
 
         let mut status: Option<NoteStatus> = None;
+        let mut reason: Option<String> = None;
         match &verdict {
-            Verdict::Holds(_) => report.held += 1,
+            Verdict::Holds(_) => {
+                report.held += 1;
+                // Une note seulement SIGNALÉE qui tient de nouveau n'est plus en doute :
+                // on la remet active et la raison s'efface. Sans ça, un « à revoir »
+                // resterait collé à une croyance que le monde vient de confirmer.
+                // Une note RÉVISÉE (`obsolete`) n'est jamais ressuscitée par une passe :
+                // la remplacer est une décision humaine (supersede), pas un effet de bord.
+                if note.status == NoteStatus::NeedsReview {
+                    status = Some(NoteStatus::Active);
+                    report.healed += 1;
+                }
+            }
+            // « Je ne sais pas » n'est pas « c'est faux » : aucune sanction, jamais.
             Verdict::Unverifiable(_) => report.unverifiable += 1,
-            Verdict::Fails(_) => {
+            Verdict::Fails(message) => {
                 report.refuted += 1;
                 if drifted {
                     report.drifted += 1;
                 }
                 match note.assertion_rule.as_ref().map(|r| r.on_violation) {
                     Some(ViolationAction::Warn) | None => report.unsanctioned += 1,
-                    Some(ViolationAction::FlagNote) | Some(ViolationAction::Block) => {
+                    Some(ViolationAction::FlagNote) => {
                         status = Some(NoteStatus::NeedsReview);
+                        reason = Some(format!("à revoir : {message}"));
+                        report.flagged += 1;
+                    }
+                    Some(ViolationAction::Block) if drifted => {
+                        status = Some(NoteStatus::Obsolete);
+                        reason = Some(format!("révisée sur dérive : {message}"));
+                        report.revised += 1;
+                    }
+                    // `Block` sans dérive : la croyance n'a jamais tenu. On la signale, on
+                    // ne l'efface pas — la révision est réservée à ce qui a été démenti.
+                    Some(ViolationAction::Block) => {
+                        status = Some(NoteStatus::NeedsReview);
+                        reason = Some(format!(
+                            "jamais tenue, jamais réfutée : {message} — règle à corriger"
+                        ));
                         report.flagged += 1;
                     }
                 }
@@ -267,7 +311,7 @@ pub async fn reverify(
         }
 
         graph
-            .record_assertion_check(note.id, &verdict.to_result(), status)
+            .record_assertion_check(note.id, &verdict.to_result(), status, reason.as_deref())
             .await?;
     }
 
@@ -891,5 +935,161 @@ mod tests {
             .is_unverifiable());
         assert!(!Verdict::Fails("non".into()).to_result().is_unverifiable());
         assert!(!Verdict::Holds("oui".into()).to_result().is_unverifiable());
+    }
+
+    // ---------------------------------------------------------------------------------
+    // T7 — la révision : se rendre compte qu'une croyance tenue est devenue fausse.
+    // ---------------------------------------------------------------------------------
+
+    /// Une croyance qui a TENU, puis que le monde démentit, avec `Block` : elle est
+    /// RÉVISÉE (obsolete), et la raison est écrite sur la note — pas seulement comptée.
+    #[tokio::test]
+    async fn a_block_refutation_on_drift_revises_the_belief_and_records_why() {
+        let mut note = a_belief(
+            AssertionCheckType::Exists,
+            "function:helper",
+            serde_json::Value::Null,
+        );
+        if let Some(rule) = note.assertion_rule.as_mut() {
+            rule.on_violation = ViolationAction::Block;
+        }
+        // Elle AVAIT tenu : c'est ce qui distingue une dérive d'une règle mal écrite.
+        note.last_assertion_result = Some(AssertionResult::passed("helper existe"));
+        let graph = seeded(&note).await;
+
+        // Le monde change : la fonction disparaît.
+        let report = reverify(&graph, 10).await.unwrap();
+
+        assert_eq!(report.refuted, 1);
+        assert_eq!(report.drifted, 1, "tenue puis démentie = une dérive");
+        assert_eq!(report.revised, 1, "Block sur dérive révise");
+        let stored = graph.notes.read().await.get(&note.id).cloned().unwrap();
+        assert_eq!(stored.status, NoteStatus::Obsolete, "la croyance tombe");
+        let reason = stored
+            .revision_reason
+            .as_deref()
+            .expect("la raison est écrite sur la note, pas seulement journalisée");
+        assert!(
+            reason.contains("dérive") && reason.contains("helper"),
+            "la raison dit quoi et pourquoi : {reason}"
+        );
+    }
+
+    /// `Block` sur une assertion qui n'a JAMAIS tenu n'efface rien : c'est une règle mal
+    /// écrite, pas une croyance démentie. Elle est signalée, pas révisée.
+    #[tokio::test]
+    async fn a_block_refutation_without_drift_flags_instead_of_erasing() {
+        let mut note = a_belief(
+            AssertionCheckType::Exists,
+            "function:never_there",
+            serde_json::Value::Null,
+        );
+        if let Some(rule) = note.assertion_rule.as_mut() {
+            rule.on_violation = ViolationAction::Block;
+        }
+        // Aucun `last_assertion_result` : elle n'a jamais tenu.
+        let graph = seeded(&note).await;
+
+        let report = reverify(&graph, 10).await.unwrap();
+
+        assert_eq!(report.drifted, 0);
+        assert_eq!(report.revised, 0, "pas de dérive, pas de révision");
+        assert_eq!(report.flagged, 1);
+        let stored = graph.notes.read().await.get(&note.id).cloned().unwrap();
+        assert_eq!(stored.status, NoteStatus::NeedsReview);
+        assert!(stored
+            .revision_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("jamais tenue"));
+    }
+
+    /// « Je ne sais pas » ne révise JAMAIS, même sous `Block` : on ne casse pas une
+    /// croyance parce qu'on ne sait pas la contrôler.
+    #[tokio::test]
+    async fn an_unverifiable_verdict_never_revises_a_belief() {
+        let mut note = a_belief(
+            AssertionCheckType::Exists,
+            "planete:inconnue",
+            serde_json::Value::Null,
+        );
+        if let Some(rule) = note.assertion_rule.as_mut() {
+            rule.on_violation = ViolationAction::Block;
+        }
+        note.last_assertion_result = Some(AssertionResult::passed("elle avait tenu"));
+        let graph = seeded(&note).await;
+
+        let report = reverify(&graph, 10).await.unwrap();
+
+        assert_eq!(report.unverifiable, 1);
+        assert_eq!(report.revised, 0);
+        assert_eq!(report.flagged, 0);
+        let stored = graph.notes.read().await.get(&note.id).cloned().unwrap();
+        assert_eq!(
+            stored.status,
+            NoteStatus::Active,
+            "un type de cible inconnu ne casse rien"
+        );
+        assert!(stored.revision_reason.is_none());
+    }
+
+    /// Une note seulement SIGNALÉE qui tient de nouveau redevient active et perd sa
+    /// raison : un doute levé ne doit pas rester affiché.
+    #[tokio::test]
+    async fn a_flagged_belief_that_holds_again_is_healed() {
+        let mut note = a_belief(
+            AssertionCheckType::Exists,
+            "function:helper",
+            serde_json::Value::Null,
+        );
+        note.status = NoteStatus::NeedsReview;
+        note.revision_reason = Some("à revoir : une ancienne réfutation".into());
+        let graph = seeded(&note).await;
+        graph
+            .belief_entities
+            .write()
+            .await
+            .insert(("function".into(), "helper".into()));
+
+        let report = reverify(&graph, 10).await.unwrap();
+
+        assert_eq!(report.held, 1);
+        assert_eq!(report.healed, 1, "le doute est levé, et compté");
+        let stored = graph.notes.read().await.get(&note.id).cloned().unwrap();
+        assert_eq!(stored.status, NoteStatus::Active);
+        assert!(
+            stored.revision_reason.is_none(),
+            "la raison d'un doute levé ne reste pas collée à la note"
+        );
+    }
+
+    /// Une note RÉVISÉE n'est jamais ressuscitée par une passe, même si son assertion
+    /// tient de nouveau : la remplacer est une décision humaine.
+    #[tokio::test]
+    async fn a_revised_belief_is_never_resurrected_by_a_pass() {
+        let mut note = a_belief(
+            AssertionCheckType::Exists,
+            "function:helper",
+            serde_json::Value::Null,
+        );
+        note.status = NoteStatus::Obsolete;
+        note.revision_reason = Some("révisée sur dérive".into());
+        let graph = seeded(&note).await;
+        graph
+            .belief_entities
+            .write()
+            .await
+            .insert(("function".into(), "helper".into()));
+
+        let report = reverify(&graph, 10).await.unwrap();
+
+        assert_eq!(report.held, 1);
+        assert_eq!(report.healed, 0);
+        let stored = graph.notes.read().await.get(&note.id).cloned().unwrap();
+        assert_eq!(
+            stored.status,
+            NoteStatus::Obsolete,
+            "une passe ne décide pas de remplacer une croyance révisée"
+        );
     }
 }

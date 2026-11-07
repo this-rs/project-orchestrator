@@ -3111,12 +3111,15 @@ pub trait AnalyticsStore: Send + Sync {
     /// Persiste le verdict d'une vérification, et applique la sanction quand il y en a une.
     ///
     /// `status` à `None` laisse le statut de la note intact — une réfutation `Warn` trace
-    /// sans casser.
+    /// sans casser. `reason` dit, SUR LE NŒUD, pourquoi la note a été révisée : une raison
+    /// qui ne vit que dans les journaux est perdue au premier redémarrage, et « pourquoi
+    /// cette croyance est tombée » devient alors indéchiffrable pour l'agent qui la lit.
     async fn record_assertion_check(
         &self,
         note_id: Uuid,
         result: &crate::notes::models::AssertionResult,
         status: Option<crate::notes::models::NoteStatus>,
+        reason: Option<&str>,
     ) -> Result<()>;
 
     /// What that agent knows, bounded by `limit`, plus how many exist — « la part lue est

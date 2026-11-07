@@ -4013,6 +4013,10 @@ impl Neo4jClient {
                     serde_json::from_str(&raw).ok()
                 }
             },
+            revision_reason: node
+                .get::<String>("revision_reason")
+                .ok()
+                .filter(|s| !s.is_empty()),
             reactivation_count: node.get("reactivation_count").unwrap_or(0),
             last_reactivated: node
                 .get::<String>("last_reactivated")

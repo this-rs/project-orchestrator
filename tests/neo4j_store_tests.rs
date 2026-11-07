@@ -2264,18 +2264,24 @@ async fn the_belief_reads_tell_unknown_from_absent_and_keep_the_last_verdict() {
         Some(true)
     );
 
-    // Links: an edge outside the closed list is an error, an unknown kind is `None`,
+    // Links: an edge outside the closed list is `None` — « je ne sais pas » — and NOT an
+    // error: a single badly written assertion must not make the whole re-verification
+    // pass fail, which would silence every other belief. An unknown kind is `None` too,
     // the real edge is seen in its direction only.
-    assert!(store
-        .entities_linked(
-            "function",
-            &caller,
-            "DELETE_EVERYTHING",
-            "function",
-            &callee
-        )
-        .await
-        .is_err());
+    assert_eq!(
+        store
+            .entities_linked(
+                "function",
+                &caller,
+                "DELETE_EVERYTHING",
+                "function",
+                &callee
+            )
+            .await
+            .unwrap(),
+        None,
+        "une relation inconnue est invérifiable, pas une panne"
+    );
     assert_eq!(
         store
             .entities_linked("banana", &caller, "CALLS", "function", &callee)
@@ -2326,12 +2332,18 @@ async fn the_belief_reads_tell_unknown_from_absent_and_keep_the_last_verdict() {
             note.id,
             &AssertionResult::failed("refuted"),
             Some(NoteStatus::NeedsReview),
+            Some("à revoir : refuted"),
         )
         .await
         .unwrap();
     // `None` writes the verdict and leaves the status alone.
     store
-        .record_assertion_check(note.id, &AssertionResult::failed("still refuted"), None)
+        .record_assertion_check(
+            note.id,
+            &AssertionResult::failed("still refuted"),
+            None,
+            None,
+        )
         .await
         .unwrap();
 

@@ -574,6 +574,7 @@ async fn trace_evolution_note(graph_store: &dyn GraphStore, project_id: Uuid, co
         changes: vec![],
         assertion_rule: None,
         last_assertion_result: None,
+        revision_reason: None,
         sharing_consent: Default::default(),
     };
     if let Err(e) = graph_store.create_note(&note).await {
@@ -1628,6 +1629,7 @@ mod tests {
             changes: vec![],
             assertion_rule: None,
             last_assertion_result: None,
+            revision_reason: None,
             sharing_consent: Default::default(),
         }
     }

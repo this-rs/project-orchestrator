@@ -891,17 +891,7 @@ impl Neo4jClient {
                 completed: true,
                 error: None,
             },
-            Err(e) => {
-                // Same level as the registered ones here; the boot path says
-                // every failed outcome at `error`.
-                let error = format!("{e:#}");
-                warn!(id = %id, error = %error, "Data migration failed, will retry on next start");
-                MigrationOutcome {
-                    id,
-                    error: Some(error),
-                    ..Default::default()
-                }
-            }
+            Err(e) => agent_identity_failure(id, &e),
         }
     }
 
@@ -1161,11 +1151,47 @@ impl Neo4jClient {
     }
 }
 
+/// L'échec de la migration d'identité, mis en forme comme les migrations enregistrées.
+///
+/// Extrait du chemin d'appel exprès : la branche d'erreur d'une migration ne peut pas être
+/// atteinte par un test d'exécution (il faudrait un store qui refuse), et une branche
+/// d'erreur que rien ne traverse est exactement le code qui pourrit sans qu'on le sache —
+/// elle finirait par annoncer un succès. Ici elle est pure, donc mesurable.
+fn agent_identity_failure(id: String, e: &anyhow::Error) -> MigrationOutcome {
+    let error = format!("{e:#}");
+    // Le niveau `error` est posé par le chemin de démarrage, qui voit tous les
+    // `MigrationOutcome` ; ici on garde la même forme que les migrations enregistrées.
+    warn!(id = %id, error = %error, "Data migration failed, will retry on next start");
+    MigrationOutcome {
+        id,
+        error: Some(error),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+
+    /// Un échec de la migration d'identité est un échec DIT : il n'annonce pas un succès,
+    /// il porte sa raison, et il reste rejouable au démarrage suivant.
+    #[test]
+    fn a_failed_agent_identity_migration_says_why_and_stays_retryable() {
+        let cause = anyhow::anyhow!("the graph is unreachable");
+        let outcome = agent_identity_failure("agent_identity_self".to_string(), &cause);
+
+        assert!(!outcome.completed, "un échec n'est pas une complétion");
+        assert!(!outcome.skipped, "un échec n'est pas un saut");
+        assert_eq!(outcome.processed, 0);
+        let error = outcome.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("unreachable"),
+            "la raison est portée, pas avalée : {error}"
+        );
+        assert_eq!(outcome.id, "agent_identity_self");
+    }
 
     #[test]
     fn test_migrations_are_ordered_and_unique() {

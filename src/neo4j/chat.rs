@@ -1227,14 +1227,7 @@ impl Neo4jClient {
         let mut total = 0usize;
         let mut batches = 0u64;
         loop {
-            if batches >= u64::from(crate::neo4j::data_migrations::MAX_BATCHES) {
-                let cap = crate::neo4j::data_migrations::MAX_BATCHES;
-                return Err(anyhow::anyhow!(
-                    "moving {edge} edges onto the durable self did not converge within {cap} \
-                     batches ({total} moved so far): the statement keeps matching edges it \
-                     does not delete"
-                ));
-            }
+            check_agent_edge_cap(edge, total, batches)?;
             let mut rows = self
                 .graph
                 .execute(
@@ -3850,6 +3843,22 @@ impl Neo4jClient {
     }
 }
 
+/// Refuse une migration d'arêtes d'agent qui n'a pas convergé.
+///
+/// Détachée de la boucle exprès : la branche d'erreur d'une boucle de migration est
+/// justement celle qu'un test d'exécution ne peut pas atteindre (il faudrait un statement
+/// qui n'efface jamais ce qu'il déplace). Pure, elle se mesure.
+fn check_agent_edge_cap(edge: &str, moved: usize, batches: u64) -> Result<()> {
+    let cap = crate::neo4j::data_migrations::MAX_BATCHES;
+    if batches >= u64::from(cap) {
+        anyhow::bail!(
+            "moving {edge} edges onto the durable self did not converge within {cap} batches \
+             ({moved} moved so far): the statement keeps matching edges it does not delete"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod injection_tests {
     use super::chat_session_update_clauses;
@@ -3865,6 +3874,25 @@ mod injection_tests {
         assert!(!c.contains('\''), "no string literal expected: {c}");
         let nan = chat_session_update_clauses(false, false, None, Some(f64::NAN), false, false);
         assert_eq!(nan, vec!["s.updated_at = datetime()".to_string()]);
+    }
+
+    /// Une migration qui n'a pas convergé ÉCHOUE en le disant. L'arrêt silencieux serait
+    /// pire que la panne : il laisserait l'attribution sur les facets en annonçant le
+    /// succès, et le démarrage suivant croirait le travail fait.
+    #[test]
+    fn a_migration_that_does_not_converge_fails_and_says_it() {
+        let cap = crate::neo4j::data_migrations::MAX_BATCHES;
+        assert!(
+            super::check_agent_edge_cap("AUTHORED", 0, 0).is_ok(),
+            "un premier lot est toujours permis"
+        );
+        assert!(super::check_agent_edge_cap("AUTHORED", 999, u64::from(cap) - 1).is_ok());
+        let error = super::check_agent_edge_cap("AUTHORED", 500, u64::from(cap))
+            .expect_err("le plafond atteint doit échouer");
+        let said = error.to_string();
+        assert!(said.contains("did not converge"), "{said}");
+        assert!(said.contains("AUTHORED"), "elle nomme l'arête : {said}");
+        assert!(said.contains(&cap.to_string()), "et le plafond : {said}");
     }
 }
 

@@ -2261,6 +2261,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Boot HeartbeatEngine — background daemon for periodic health checks.
     // Runs independently of chat sessions (like ScheduleProvider).
     {
+        use heartbeat::checks::belief_revision::BeliefRevisionCheck;
         use heartbeat::checks::{
             architecture_drift::ArchitectureDriftCheck, consolidation::ConsolidationCheck,
             convention_guard::ConventionGuardCheck, git_drift::GitDriftCheck,
@@ -2292,6 +2293,11 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             // is free — but its per-run bound is not: the engine awaits each
             // check inline, so an unbounded one starves the rest (PR #309).
             Box::new(ArchitectureDriftCheck::new()),
+            // Re-vérifie les croyances (`notes::beliefs`) : sans ce cycle, une assertion
+            // démentie par le monde restait crue jusqu'au prochain redémarrage. Il ne
+            // touche AUCUNE synapse, donc sa position ici est libre — mais il doit rester
+            // avant le replenish, qui est le seul à devoir être dernier.
+            Box::new(BeliefRevisionCheck),
             // MUST run LAST: the engine executes checks in vec order within a tick
             // (engine.rs:88). SynapseDecayCheck and MaintenanceCheck (deep_maintenance
             // applies an aggressive 3x decay + prune) both delete synapses; replenish

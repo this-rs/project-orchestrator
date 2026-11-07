@@ -937,6 +937,33 @@ mod tests {
         }
     }
 
+    /// Chaque refus de provenance a SON message : un `EmptyAt` annoncé comme « aucune
+    /// règle nommée » enverrait corriger le mauvais champ.
+    #[test]
+    fn every_provenance_refusal_names_its_own_field() {
+        let cases = [
+            (ProvenanceError::EmptyRule, "règle"),
+            (ProvenanceError::EmptyMeasure, "mesure"),
+            (ProvenanceError::EmptyAt, "date"),
+        ];
+        for (error, expected) in cases {
+            let said = error.to_string();
+            assert!(
+                said.contains(expected),
+                "{error:?} doit nommer « {expected} », or il dit : {said}"
+            );
+        }
+        let messages: std::collections::HashSet<String> = [
+            ProvenanceError::EmptyRule,
+            ProvenanceError::EmptyMeasure,
+            ProvenanceError::EmptyAt,
+        ]
+        .iter()
+        .map(|e| e.to_string())
+        .collect();
+        assert_eq!(messages.len(), 3, "trois refus, trois messages distincts");
+    }
+
     /// Une lecture ratée ne doit RIEN détruire : la réconciliation est sautée, pas
     /// appliquée sur un `keep` vide — sinon une erreur transitoire effacerait le socle.
     #[tokio::test]

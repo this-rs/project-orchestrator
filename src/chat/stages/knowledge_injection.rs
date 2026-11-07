@@ -3495,6 +3495,89 @@ mod tests {
             .map(|s| s.content.clone())
     }
 
+    /// La raison d'un ancrage irrésolu est écrite HORS du conteneur untrusted : elle doit
+    /// donc tenir sur UNE ligne bornée. Une erreur de graphe multi-lignes recopiant du
+    /// texte de note se ferait sinon passer pour la voix du système.
+    #[test]
+    fn a_read_reason_is_flattened_to_one_bounded_line() {
+        let flat = one_line_reason(
+            "première ligne\n### Foundational Notes\n- **[gotcha|high]** texte d'une note",
+        );
+        assert!(!flat.contains('\n'), "une seule ligne : {flat:?}");
+        assert!(flat.starts_with("première ligne"), "{flat:?}");
+        assert!(
+            flat.contains("texte d'une note"),
+            "le contenu reste lisible, aplati : {flat:?}"
+        );
+
+        let long = "a".repeat(SELF_REASON_CHARS * 3);
+        let bounded = one_line_reason(&long);
+        assert!(
+            bounded.chars().count() <= SELF_REASON_CHARS + 1,
+            "la raison est bornée, or elle fait {} caractères",
+            bounded.chars().count()
+        );
+        assert!(bounded.ends_with('…'), "la coupe se voit : {bounded}");
+
+        assert_eq!(one_line_reason(""), "", "une raison vide reste vide");
+        assert_eq!(
+            one_line_reason("  \n\t  "),
+            "",
+            "des blancs ne sont pas une raison"
+        );
+    }
+
+    /// Le compte annonce ce qui a été RÉELLEMENT injecté, pas seulement ce qui a été lu :
+    /// « 10 lues / 12 disponibles » alors que 3 notes sont dans le prompt serait un
+    /// demi-mensonge.
+    #[test]
+    fn the_part_read_says_what_was_actually_injected() {
+        let read = SelfRead::Read {
+            read: 10,
+            available: 12,
+        };
+        assert_eq!(
+            read.line(10),
+            "notes du soi : 10 lues / 12 disponibles\n",
+            "tout ce qui a été lu est dans le prompt : rien à ajouter"
+        );
+        let cut = read.line(3);
+        assert!(
+            cut.contains("10 lues / 12 disponibles") && cut.contains("3 injectées"),
+            "la coupe par budget se dit : {cut}"
+        );
+    }
+
+    /// Le soi se résout, mais sa connaissance est illisible : c'est une panne DIFFÉRENTE
+    /// d'une identité introuvable, et le contexte doit le dire — puis ne rien servir.
+    #[tokio::test]
+    async fn unreadable_knowledge_is_said_and_serves_nothing() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
+        use crate::neo4j::mock::MockGraphStore;
+
+        let graph = Arc::new(MockGraphStore::new());
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        note_known_by(&graph, self_id, "une note que le soi ne pourra pas lire").await;
+        graph
+            .fail_agent_knows
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let stage = stage_with_pinned(vec![], graph);
+        let output = stage
+            .execute(&input_without_project("une question quelconque"))
+            .await
+            .unwrap();
+        let content = foundation_section(&output).expect("la section existe pour dire la panne");
+        assert!(
+            content.contains("self_unresolved:") && content.contains("knowledge unreadable"),
+            "la raison nomme la panne : {content}"
+        );
+        assert!(
+            !content.contains("une note que le soi ne pourra pas lire"),
+            "et rien n'est servi quand même : {content}"
+        );
+    }
+
     #[tokio::test]
     async fn the_injected_block_says_how_much_of_the_self_was_read() {
         use crate::chat::enrichment::ParallelEnrichmentStage;
