@@ -26,6 +26,7 @@ use crate::neo4j::traits::*;
 pub mod engine;
 pub mod executor;
 pub mod generator;
+pub mod guard;
 pub mod hooks;
 pub mod models;
 pub mod routing;

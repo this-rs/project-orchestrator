@@ -183,11 +183,13 @@ fn build_agent_prompt(
         );
         prompt.push_str("Choose ONE of the following:\n\n");
         for t in &outgoing {
-            let guard_info = t
-                .guard
-                .as_deref()
-                .map(|g| format!(" *(guard: {})*", g))
-                .unwrap_or_default();
+            let guard_info = match (&t.guard_expr, t.guard.as_deref()) {
+                (Some(expr), _) => {
+                    format!(" *(guard, checked by the harness: {})*", expr.describe())
+                }
+                (None, Some(label)) => format!(" *(guard: {label})*"),
+                (None, None) => String::new(),
+            };
             prompt.push_str(&format!("- `{}`{}\n", t.trigger, guard_info));
         }
         prompt.push('\n');
