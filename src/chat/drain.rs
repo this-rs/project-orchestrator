@@ -747,7 +747,12 @@ mod stop_tests {
             "the last write is waited for"
         );
         assert_eq!(
-            graph.get_chat_session(id).await.unwrap().unwrap().message_count,
+            graph
+                .get_chat_session(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .message_count,
             3,
             "settled means both landed, none lost"
         );

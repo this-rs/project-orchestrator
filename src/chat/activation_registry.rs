@@ -245,6 +245,9 @@ mod tests {
         reg.retain_live(&HashSet::new());
 
         assert_eq!(reg.get(pinned).notes.len(), 1, "the pinned session stays");
-        assert!(reg.get(other).notes.is_empty(), "an unpinned one is forgotten");
+        assert!(
+            reg.get(other).notes.is_empty(),
+            "an unpinned one is forgotten"
+        );
     }
 }
