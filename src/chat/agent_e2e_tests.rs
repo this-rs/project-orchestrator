@@ -4165,6 +4165,41 @@ mod provider_switch {
         assert_eq!(episode.source_run_id, None);
     }
 
+    /// T0: the episode counts the messages the closed session counts. A user message whose
+    /// count write is still in flight at the close (`drain::spawn_count_write`, past its step
+    /// budget) is counted by the episode too: the close captures the counter AFTER that write,
+    /// it does not read a counter that is about to move.
+    #[tokio::test]
+    async fn a_closed_session_episode_counts_what_the_session_counts_even_a_late_write() {
+        let w = world().await;
+        let project = crate::test_helpers::test_project_named("proj");
+        w.graph.create_project(&project).await.unwrap();
+        let sid = first_turn(&w).await;
+        let id = Uuid::parse_str(&sid).unwrap();
+
+        // The count of a queued message, written by the drain, lands late.
+        *w.graph.slow_chat_session_update.lock().unwrap() = Some(Duration::from_millis(800));
+        let late = crate::chat::drain::spawn_count_write(
+            sid.clone(),
+            id,
+            w.graph.clone() as Arc<dyn GraphStore>,
+        );
+        w.manager.close_session(&sid).await.unwrap();
+        super::wait_for_session_episode_saves(&w.graph, 1).await;
+        late.await.unwrap();
+        *w.graph.slow_chat_session_update.lock().unwrap() = None;
+
+        let node = w.graph.get_chat_session(id).await.unwrap().unwrap();
+        assert_eq!(node.message_count, 2, "the late write landed: {node:?}");
+        let episodes = w.graph.list_session_episodes(project.id, 10).await.unwrap();
+        assert_eq!(episodes.len(), 1, "{episodes:?}");
+        let trace = episodes[0].session.as_ref().expect("a session episode");
+        assert_eq!(
+            trace.message_count, node.message_count,
+            "the episode counts what the closed session counts"
+        );
+    }
+
     /// With an embedding provider on the manager, the close episode carries the vector
     /// the reflex stage recalls it by.
     #[tokio::test]
