@@ -1259,6 +1259,195 @@ mod tests {
         assert!(!Provenance::new("agent-knows-core", "  ").is_accountable());
     }
 
+    /// C7 : « une arête sans justification est un bug ». Une provenance vide est REFUSÉE
+    /// à l'écriture — par une erreur typée, sans panique, et AUCUNE arête n'existe après.
+    /// La preuve se fait avant l'écrivain : celui-ci n'accepte que le type prouvé, donc
+    /// le seul chemin pour écrire passe par ce refus.
+    #[tokio::test]
+    async fn an_empty_provenance_is_refused_and_draws_nothing() {
+        let graph = MockGraphStore::new();
+        let note = a_note("a note nobody can justify");
+        graph.create_note(&note).await.unwrap();
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        graph.ensure_agent(self_id, None).await.unwrap();
+
+        // Chaque champ vide a son erreur, nommée.
+        assert_eq!(
+            Provenance::new("", "measured").accountable().unwrap_err(),
+            ProvenanceError::EmptyRule
+        );
+        assert_eq!(
+            Provenance::new("   ", "measured")
+                .accountable()
+                .unwrap_err(),
+            ProvenanceError::EmptyRule,
+            "des espaces ne sont pas un nom"
+        );
+        assert_eq!(
+            AccountableProvenance::new("agent-knows-core", "  ").unwrap_err(),
+            ProvenanceError::EmptyMeasure
+        );
+        assert_eq!(
+            AccountableProvenance::scored("agent-knows-core", "", 1.0).unwrap_err(),
+            ProvenanceError::EmptyMeasure
+        );
+        let undated = Provenance {
+            at: String::new(),
+            ..Provenance::new("agent-knows-core", "measured")
+        };
+        assert_eq!(undated.accountable().unwrap_err(), ProvenanceError::EmptyAt);
+        // Lisible comme une erreur ordinaire : elle remonte par `?` dans un `anyhow::Result`.
+        let as_any: anyhow::Error = ProvenanceError::EmptyRule.into();
+        assert!(as_any.to_string().contains("aucune règle"), "{as_any}");
+
+        // Aucune arête dérivée n'a été tracée : ni KNOWS, ni USES, ni SYNAPSE.
+        assert!(graph.agent_knows.read().await.is_empty());
+        assert!(graph.agent_uses.read().await.is_empty());
+        assert!(graph.synapses.read().await.is_empty());
+        assert_eq!(
+            graph.agent_knows(self_id, None, 10).await.unwrap().notes,
+            Vec::<Uuid>::new()
+        );
+
+        // Et la même mesure, une fois nommée, s'écrit : le refus porte sur le vide, pas
+        // sur l'écrivain.
+        let proven = AccountableProvenance::new("agent-knows-core", "measured").unwrap();
+        assert_eq!(proven.rule, "agent-knows-core");
+        assert_eq!(proven.as_provenance().measure, "measured");
+        assert!(proven.clone().into_inner().is_accountable());
+        assert!(graph
+            .link_agent_knows(self_id, note.id, KnowledgeScope::Global, None, &proven)
+            .await
+            .unwrap());
+        assert_eq!(graph.agent_knows.read().await.len(), 1);
+    }
+
+    /// Une arête dérivée telle que le mock la retient : règle, mesure, source, cible.
+    /// `at` est exclu à dessein — c'est la seule chose qui DOIT changer d'un passage à
+    /// l'autre.
+    async fn derived_edges(graph: &MockGraphStore) -> std::collections::BTreeSet<[String; 5]> {
+        let mut out = std::collections::BTreeSet::new();
+        for ((agent, note), (_, _, p)) in graph.agent_knows.read().await.iter() {
+            out.insert([
+                "KNOWS".into(),
+                p.rule.clone(),
+                p.measure.clone(),
+                agent.to_string(),
+                note.to_string(),
+            ]);
+        }
+        for ((agent, label, target), p) in graph.agent_uses.read().await.iter() {
+            out.insert([
+                "USES".into(),
+                p.rule.clone(),
+                p.measure.clone(),
+                agent.to_string(),
+                format!("{label}:{target}"),
+            ]);
+        }
+        for ((a, b), (_, _, p)) in graph.synapses.read().await.iter() {
+            out.insert([
+                "SYNAPSE".into(),
+                p.rule.clone(),
+                p.measure.clone(),
+                a.to_string(),
+                b.to_string(),
+            ]);
+        }
+        out
+    }
+
+    /// Reproductibilité : deux passages du moteur sur les MÊMES données donnent le même
+    /// ensemble d'arêtes (règle, mesure, source, cible). Pas de modèle de langage, pas de
+    /// hasard : seule la date d'observation diffère, et elle est exclue de la comparaison.
+    #[tokio::test]
+    async fn two_passes_on_the_same_data_draw_the_same_edges() {
+        use crate::chat::stages::knowledge_injection::store_pinned_notes;
+
+        let graph = MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&project).await.unwrap();
+        let mut in_project = Vec::new();
+        for text in ["first of alpha", "second of alpha", "third of alpha"] {
+            let mut note = a_note(text);
+            note.project_id = Some(project.id);
+            note.status = crate::notes::NoteStatus::Active;
+            note.importance = crate::notes::NoteImportance::Critical;
+            graph.create_note(&note).await.unwrap();
+            in_project.push(note.id);
+        }
+        let mut global = a_note("born global");
+        global.project_id = None;
+        global.status = crate::notes::NoteStatus::Active;
+        global.importance = crate::notes::NoteImportance::Critical;
+        graph.create_note(&global).await.unwrap();
+        let pinned = a_note("pinned by hand");
+        graph.create_note(&pinned).await.unwrap();
+        store_pinned_notes(&graph, Some("alpha"), &[pinned.id])
+            .await
+            .unwrap();
+
+        // Un passage complet : les règles qui lisent le graphe, puis les deux dont la
+        // mesure vient de l'appelant — avec la MÊME mesure à chaque passage.
+        let session = Uuid::new_v4();
+        let agent = Uuid::new_v4();
+        let (persona, skill) = (Uuid::new_v4(), Uuid::new_v4());
+        let activation = Measurement::Activation {
+            session,
+            agent,
+            personas: vec![persona],
+            skills: vec![skill],
+        };
+        let session_notes = Measurement::SessionNotes {
+            session,
+            project: Some(project.id),
+            notes: in_project.clone(),
+        };
+        async fn pass(
+            graph: &MockGraphStore,
+            activation: &Measurement,
+            session_notes: &Measurement,
+        ) -> RulesReport {
+            let report = run(graph, &[]).await.unwrap();
+            run_with(graph, AGENT_USES_ACTIVATED.name, activation.clone())
+                .await
+                .unwrap();
+            run_with(graph, SESSION_CO_ACTIVATION.name, session_notes.clone())
+                .await
+                .unwrap();
+            report
+        }
+
+        let first = pass(&graph, &activation, &session_notes).await;
+        let after_first = derived_edges(&graph).await;
+        let second = pass(&graph, &activation, &session_notes).await;
+        let after_second = derived_edges(&graph).await;
+
+        assert!(
+            after_first.len() >= 3 + 1 + 1 + 2 + 3,
+            "le jeu de données exerce chaque règle : {after_first:?}"
+        );
+        assert_eq!(
+            after_first, after_second,
+            "le même graphe, les mêmes arêtes"
+        );
+        // Chaque arête porte une provenance : aucune n'est vide, et chaque règle nommée est
+        // une règle déclarée (ou l'épingle posée par la règle du socle).
+        for edge in &after_first {
+            assert!(
+                rule(&edge[1]).is_some(),
+                "règle inconnue sur une arête : {edge:?}"
+            );
+            assert!(!edge[2].trim().is_empty(), "mesure vide : {edge:?}");
+        }
+        // Le second passage n'écrit rien de neuf : il atteste.
+        assert_eq!(
+            second.edges_written, 0,
+            "second passage : {second:?} (premier : {first:?})"
+        );
+        assert!(first.edges_written > 0, "{first:?}");
+    }
+
     fn a_note(content: &str) -> crate::notes::models::Note {
         crate::notes::models::Note::new(
             None,
