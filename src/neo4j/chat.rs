@@ -3843,18 +3843,27 @@ mod injection_tests {
 
 /// The agent identity against a real Neo4j: the write path refuses a foreign id, and the
 /// migration of the edges of model facets onto the self is replayable without duplicates.
-/// Like `tests/harness_neo4j.rs`: skipped when no Neo4j answers at `NEO4J_URI`
-/// (`HARNESS_NEO4J_REQUIRED=1` turns the skip into a failure). Run against a throwaway
-/// instance only:
+/// Skipped unless `AGENT_IDENTITY_NEO4J_URI` is set (`HARNESS_NEO4J_REQUIRED=1` turns the
+/// skip into a failure). Run against a throwaway instance only:
 ///   docker run -d --rm --name po-mig -p 17687:7687 -e NEO4J_AUTH=neo4j/testpassword neo4j:5
-///   NEO4J_URI=bolt://localhost:17687 NEO4J_PASSWORD=testpassword cargo test --lib agent_identity_neo4j
+///   AGENT_IDENTITY_NEO4J_URI=bolt://localhost:17687 NEO4J_PASSWORD=testpassword cargo test --lib agent_identity_neo4j
 #[cfg(test)]
 mod agent_identity_neo4j {
     use super::*;
     use crate::neo4j::traits::*;
 
+    /// Not `NEO4J_URI`: the config tests of `lib.rs` clear and rewrite it while this suite
+    /// runs in parallel (the same reason as the parity test in `neo4j::mock`). Without this
+    /// variable the suite skips, unless `HARNESS_NEO4J_REQUIRED` is set.
     async fn client() -> Option<Neo4jClient> {
-        let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:17687".into());
+        let Ok(uri) = std::env::var("AGENT_IDENTITY_NEO4J_URI") else {
+            assert!(
+                std::env::var("HARNESS_NEO4J_REQUIRED").is_err(),
+                "HARNESS_NEO4J_REQUIRED is set but AGENT_IDENTITY_NEO4J_URI is not"
+            );
+            eprintln!("Skipping agent identity Neo4j tests: AGENT_IDENTITY_NEO4J_URI is not set");
+            return None;
+        };
         let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
         let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
         match Neo4jClient::new(&uri, &user, &password).await {
