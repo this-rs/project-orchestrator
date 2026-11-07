@@ -101,6 +101,35 @@ fn split_target(target: &str) -> Option<(&str, &str)> {
     Some((kind, name))
 }
 
+/// « Absent du graphe » n'est une réfutation que si le graphe a été synchronisé.
+///
+/// La présence est monotone sous indexation (on n'ajoute que des nœuds, on n'en retire
+/// pas) : elle est toujours digne de confiance, même sur un graphe partiel. L'absence ne
+/// l'est pas — sur un projet jamais synchronisé, « absent » veut dire « pas encore
+/// indexé », pas « n'existe pas ». Une croyance fondée sur cette absence ne doit donc
+/// jamais être RÉFUTÉE (et, sous `Block`, effacée) pour une question de calendrier de
+/// synchro : elle devient invérifiable, et la raison le dit.
+async fn absent(
+    graph: &dyn GraphStore,
+    project_id: Option<Uuid>,
+    fails: String,
+) -> anyhow::Result<Verdict> {
+    if let Some(pid) = project_id {
+        // `None` (projet introuvable) = on ne sait pas que le graphe est frais : l'absence
+        // reste invérifiable. Seul `Some(true)` — la synchro a eu lieu — autorise à dire
+        // « absent = n'existe pas ».
+        match graph.project_synced(pid).await? {
+            Some(true) => {}
+            Some(false) | None => {
+                return Ok(Verdict::Unverifiable(format!(
+                    "le code du projet n'a jamais été synchronisé : « absent » n'est pas fiable ({fails})"
+                )));
+            }
+        }
+    }
+    Ok(Verdict::Fails(fails))
+}
+
 /// Vérifie une assertion CONTRE LE GRAPHE.
 pub async fn verify(graph: &dyn GraphStore, note: &Note) -> anyhow::Result<Verdict> {
     let Some(rule) = note.assertion_rule.as_ref() else {
@@ -134,9 +163,14 @@ async fn judge(
 
         AssertionCheckType::Exists => match graph.entity_exists(kind, name, project_id).await? {
             Some(true) => Ok(Verdict::Holds(format!("{kind} « {name} » existe"))),
-            Some(false) => Ok(Verdict::Fails(format!(
-                "{kind} « {name} » est absent du graphe"
-            ))),
+            Some(false) => {
+                absent(
+                    graph,
+                    project_id,
+                    format!("{kind} « {name} » est absent du graphe"),
+                )
+                .await
+            }
             None => Ok(Verdict::Unverifiable(format!(
                 "type de cible « {kind} » inconnu du graphe"
             ))),
@@ -172,14 +206,16 @@ async fn judge(
                 )));
             };
             let wants = rule.check_type == AssertionCheckType::Calls;
-            Ok(match (linked, wants) {
-                (true, true) => Verdict::Holds(format!("{name} appelle bien {to_name}")),
-                (false, true) => Verdict::Fails(format!("{name} n'appelle pas {to_name}")),
-                (true, false) => Verdict::Fails(format!(
+            match (linked, wants) {
+                (true, true) => Ok(Verdict::Holds(format!("{name} appelle bien {to_name}"))),
+                (false, true) => {
+                    absent(graph, project_id, format!("{name} n'appelle pas {to_name}")).await
+                }
+                (true, false) => Ok(Verdict::Fails(format!(
                     "{name} appelle {to_name} alors qu'il ne devrait pas"
-                )),
-                (false, false) => Verdict::Holds(format!("{name} n'appelle pas {to_name}")),
-            })
+                ))),
+                (false, false) => Ok(Verdict::Holds(format!("{name} n'appelle pas {to_name}"))),
+            }
         }
 
         AssertionCheckType::Implements => {
@@ -204,7 +240,12 @@ async fn judge(
             Ok(if linked {
                 Verdict::Holds(format!("{name} implémente {trait_name}"))
             } else {
-                Verdict::Fails(format!("{name} n'implémente pas {trait_name}"))
+                absent(
+                    graph,
+                    project_id,
+                    format!("{name} n'implémente pas {trait_name}"),
+                )
+                .await?
             })
         }
 
@@ -226,7 +267,12 @@ async fn judge(
             Ok(if linked {
                 Verdict::Holds(format!("{name} dépend de {on_name}"))
             } else {
-                Verdict::Fails(format!("{name} ne dépend pas de {on_name}"))
+                absent(
+                    graph,
+                    project_id,
+                    format!("{name} ne dépend pas de {on_name}"),
+                )
+                .await?
             })
         }
     }
@@ -397,6 +443,15 @@ mod tests {
         let graph = MockGraphStore::new();
         graph.create_note(note).await.unwrap();
         graph
+    }
+
+    /// Crée un projet (éventuellement jamais synchronisé) pour tester la portée et le
+    /// garde-fou de synchro : le mock répond « synced » selon `ProjectNode.last_synced`.
+    async fn project(graph: &MockGraphStore, id: Uuid, synced: bool) {
+        let mut p = crate::test_helpers::test_project_named(&format!("p-{id}"));
+        p.id = id;
+        p.last_synced = synced.then(chrono::Utc::now);
+        graph.create_project(&p).await.unwrap();
     }
 
     /// LE test de T7 : une assertion de relation peut enfin ÊTRE FAUSSE. Avant ce module,
@@ -1127,6 +1182,7 @@ mod tests {
         );
         note.project_id = Some(here);
         let graph = seeded(&note).await;
+        project(&graph, here, true).await;
         graph
             .belief_entities
             .write()
@@ -1198,6 +1254,7 @@ mod tests {
         );
         note.project_id = Some(here);
         let graph = seeded(&note).await;
+        project(&graph, here, true).await;
         graph.belief_links.write().await.insert((
             "function".into(),
             "main".into(),
@@ -1220,6 +1277,44 @@ mod tests {
         assert!(
             verify(&graph, &note).await.unwrap().is_refuted(),
             "une arête d'un autre projet ne prouve rien ici"
+        );
+    }
+
+    /// Un projet qui n'a JAMAIS synchronisé son code ne peut pas réfuter une croyance
+    /// fondée sur une absence : « absent du graphe » y veut dire « pas encore indexé »,
+    /// pas « n'existe pas ». La croyance est donc invérifiable — pas réfutée, donc pas
+    /// effacée sous `Block` pour une question de calendrier.
+    #[tokio::test]
+    async fn an_unsynced_project_cannot_refute_a_belief_on_absence() {
+        let here = Uuid::new_v4();
+        let mut note = a_belief(
+            AssertionCheckType::Exists,
+            "function:helper",
+            serde_json::Value::Null,
+        );
+        note.project_id = Some(here);
+        let graph = seeded(&note).await;
+        // Le projet existe mais n'a jamais été synchronisé.
+        project(&graph, here, false).await;
+
+        let verdict = verify(&graph, &note).await.unwrap();
+        assert!(
+            is_unverifiable(&verdict),
+            "une absence sur un projet non synchronisé n'est pas une réfutation : {verdict:?}"
+        );
+
+        // Une fois le code synchronisé, la même absence devient une vraie réfutation.
+        graph
+            .projects
+            .write()
+            .await
+            .get_mut(&here)
+            .unwrap()
+            .last_synced = Some(chrono::Utc::now());
+        let verdict = verify(&graph, &note).await.unwrap();
+        assert!(
+            verdict.is_refuted(),
+            "après synchro, « absent » veut dire « n'existe pas » : {verdict:?}"
         );
     }
 }
