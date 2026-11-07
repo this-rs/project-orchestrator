@@ -2466,9 +2466,9 @@ mod tests {
             second["created_by"], first["created_by"],
             "one model, one agent"
         );
-        assert_ne!(
+        assert_eq!(
             other["created_by"], first["created_by"],
-            "another model, another agent"
+            "another model, the same self"
         );
         assert!(other["created_by"].as_str().unwrap().starts_with("agent:"));
         assert_eq!(

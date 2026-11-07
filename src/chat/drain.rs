@@ -24,6 +24,94 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, info};
 use uuid::Uuid;
 
+/// A counter write still in flight: it resolves when the write is over, whatever its outcome.
+type CountWrite = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
+
+/// The LAST counter write of each session still in flight. The next write waits for it, so
+/// two read-then-writes of the counter never lose one another's +1; the close waits for it
+/// ([`count_writes_settled`]) before it reads the counter (T0).
+fn count_writes() -> &'static std::sync::Mutex<HashMap<Uuid, CountWrite>> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<HashMap<Uuid, CountWrite>>> =
+        std::sync::OnceLock::new();
+    PENDING.get_or_init(Default::default)
+}
+
+/// Held by a counter write until it is over: it leaves the registry (if it is still the last
+/// one) and wakes whoever waits for it — on every path, a failure or a panic included.
+struct CountWriteDone {
+    uuid: Uuid,
+    this: CountWrite,
+    _done: tokio::sync::oneshot::Sender<()>,
+}
+
+impl Drop for CountWriteDone {
+    fn drop(&mut self) {
+        let mut pending = count_writes().lock().unwrap_or_else(|e| e.into_inner());
+        if pending
+            .get(&self.uuid)
+            .is_some_and(|last| last.ptr_eq(&self.this))
+        {
+            pending.remove(&self.uuid);
+        }
+    }
+}
+
+/// Waits, up to `budget`, for the counter writes of `session` still in flight. `false` when
+/// the budget ran out first: the counter read next may still be one message behind.
+pub(crate) async fn count_writes_settled(session: Uuid, budget: std::time::Duration) -> bool {
+    let last = count_writes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&session)
+        .cloned();
+    match last {
+        None => true,
+        // The writes are chained: the last one over means every one before it is over.
+        Some(last) => tokio::time::timeout(budget, last).await.is_ok(),
+    }
+}
+
+/// Counts one user message on the session record, in a task of its own
+/// ([`spawn_write`]: it may land after its step budget, never dropped), AFTER the count
+/// write of the same session still in flight.
+pub(crate) fn spawn_count_write(
+    session_id: String,
+    uuid: Uuid,
+    graph: Arc<dyn GraphStore>,
+) -> tokio::task::JoinHandle<()> {
+    use futures::FutureExt;
+    let (done, over) = tokio::sync::oneshot::channel::<()>();
+    let this: CountWrite = over.map(|_| ()).boxed().shared();
+    let previous = count_writes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(uuid, this.clone());
+    spawn_write(session_id, "drain_message_count", async move {
+        let _over = CountWriteDone {
+            uuid,
+            this,
+            _done: done,
+        };
+        if let Some(previous) = previous {
+            previous.await;
+        }
+        if let Some(node) = graph.get_chat_session(uuid).await? {
+            graph
+                .update_chat_session(
+                    uuid,
+                    None,
+                    None,
+                    Some(node.message_count + 1),
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+        }
+        Ok(())
+    })
+}
+
 /// Drain the pending_messages queue: pop the next message, persist it,
 /// broadcast it, and recursively call `stream_response` to process it.
 ///
@@ -124,25 +212,8 @@ pub(crate) async fn drain_pending_messages(
                     events_tx: events_tx.clone(),
                     nats: nats.clone(),
                 };
-                let count_write = matches!(kind, PendingMessageKind::User).then(|| {
-                    let graph = graph.clone();
-                    spawn_write(session_id.clone(), "drain_message_count", async move {
-                        if let Some(node) = graph.get_chat_session(uuid).await? {
-                            graph
-                                .update_chat_session(
-                                    uuid,
-                                    None,
-                                    None,
-                                    Some(node.message_count + 1),
-                                    None,
-                                    None,
-                                    None,
-                                )
-                                .await?;
-                        }
-                        Ok(())
-                    })
-                });
+                let count_write = matches!(kind, PendingMessageKind::User)
+                    .then(|| spawn_count_write(session_id.clone(), uuid, graph.clone()));
 
                 let (event_type, event_data) = match kind {
                     PendingMessageKind::SystemHint => (
@@ -654,5 +725,40 @@ mod stop_tests {
         let (next, dropped) = pop_next_after_turn(&mut queue, false);
         assert_eq!(next.unwrap().content, "tick");
         assert_eq!(dropped, 0);
+    }
+
+    /// Two count writes in flight at once: the second reads the counter AFTER the first
+    /// wrote it, so no +1 is lost; and once they are over, nothing is left to wait for.
+    #[tokio::test]
+    async fn count_writes_of_one_session_are_ordered_and_settle() {
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let mut session = crate::test_helpers::test_chat_session(None);
+        session.message_count = 1;
+        let id = session.id;
+        graph.create_chat_session(&session).await.unwrap();
+        *graph.slow_chat_session_update.lock().unwrap() =
+            Some(std::time::Duration::from_millis(150));
+
+        let store: Arc<dyn GraphStore> = graph.clone();
+        let first = spawn_count_write(id.to_string(), id, store.clone());
+        let second = spawn_count_write(id.to_string(), id, store.clone());
+        assert!(
+            count_writes_settled(id, std::time::Duration::from_secs(5)).await,
+            "the last write is waited for"
+        );
+        assert_eq!(
+            graph
+                .get_chat_session(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .message_count,
+            3,
+            "settled means both landed, none lost"
+        );
+        first.await.unwrap();
+        second.await.unwrap();
+        assert!(!count_writes().lock().unwrap().contains_key(&id));
+        assert!(count_writes_settled(id, std::time::Duration::ZERO).await);
     }
 }

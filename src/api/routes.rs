@@ -1478,6 +1478,9 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/graph/neighborhood",
             get(graph_handlers::get_neighborhood),
         )
+        // Read-only views of the measured schema and of a causal path between two nodes
+        .route("/api/graph/schema", get(graph_handlers::get_schema_catalog))
+        .route("/api/graph/path", get(graph_handlers::get_typed_path))
         // ================================================================
         // Analysis Profiles
         // ================================================================

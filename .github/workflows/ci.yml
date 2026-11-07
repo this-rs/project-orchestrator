@@ -874,12 +874,16 @@ jobs:
       # actually run; HARNESS_NEO4J_REQUIRED turns a missing Neo4j into a
       # failure. Its own variable, not NEO4J_URI: the config tests of lib.rs
       # clear NEO4J_* in the same process while tests run in parallel.
-      # The Unit Tests job has no Neo4j and no PARITY_NEO4J_URI: it skips.
+      # AGENT_IDENTITY_NEO4J_URI does the same for neo4j::chat::agent_identity_neo4j
+      # (the durable self, its model facet and the facet→self migration): without
+      # it, HARNESS_NEO4J_REQUIRED turns that suite's skip into a failure.
+      # The Unit Tests job has no Neo4j and neither variable: it skips.
       - name: Collect coverage — unit tests (workspace)
         env:
           PARITY_NEO4J_URI: bolt://localhost:${{ job.services.neo4j.ports['7687'] }}
           PARITY_NEO4J_USER: neo4j
           PARITY_NEO4J_PASSWORD: testpassword
+          AGENT_IDENTITY_NEO4J_URI: bolt://localhost:${{ job.services.neo4j.ports['7687'] }}
           HARNESS_NEO4J_REQUIRED: "1"
         run: |
           cargo llvm-cov --no-report --no-fail-fast \

@@ -123,10 +123,60 @@ async fn a_write_makes_its_agent_a_node_and_gives_it_the_note() {
     let Some(e) = env("authored").await else {
         return;
     };
-    let agent = Uuid::new_v4();
+    // The writer is the durable self of the store, the actor every write path stamps.
+    let agent = e.client.agent_identity_namespace().await.unwrap();
     let note = a_note(&format!("agent:{agent}"));
     e.client.create_note(&note).await.unwrap();
 
+    assert_eq!(
+        authored_count(&e, agent, note.id).await,
+        1,
+        "the author owns its note"
+    );
+    let node = e.client.find_agent(agent).await.unwrap();
+    assert!(node.is_some(), "and the author exists as a node");
+
+    // The self is shared by the store and stays; the edge goes with the note.
+    e.client.delete_note(note.id).await.unwrap();
+    cleanup(&e).await;
+}
+
+#[tokio::test]
+async fn a_write_by_a_foreign_actor_draws_no_edge_and_makes_no_node() {
+    let _serial = serial().await;
+    // An actor that is neither this store's self nor one of its facets: the note is kept
+    // (provenance never refuses a write), but no agent is made and no edge is drawn.
+    let Some(e) = env("foreign").await else {
+        return;
+    };
+    let foreign = Uuid::new_v4();
+    let note = a_note(&format!("agent:{foreign}"));
+    e.client.create_note(&note).await.unwrap();
+
+    assert!(
+        e.client.get_note(note.id).await.unwrap().is_some(),
+        "the note is written"
+    );
+    assert_eq!(
+        authored_count(&e, foreign, note.id).await,
+        0,
+        "no edge to a foreign actor"
+    );
+    assert!(
+        e.client.find_agent(foreign).await.unwrap().is_none(),
+        "and no node for it"
+    );
+    // The backfill does not adopt it either.
+    e.client.backfill_agents().await.unwrap();
+    assert_eq!(authored_count(&e, foreign, note.id).await, 0);
+    assert!(e.client.find_agent(foreign).await.unwrap().is_none());
+
+    e.client.delete_note(note.id).await.unwrap();
+    cleanup(&e).await;
+}
+
+/// `(:Agent {id: agent})-[:AUTHORED]->(:Note {id: note})` edges, counted.
+async fn authored_count(e: &Env, agent: Uuid, note: Uuid) -> i64 {
     let mut rows = e
         .raw
         .execute(
@@ -135,23 +185,12 @@ async fn a_write_makes_its_agent_a_node_and_gives_it_the_note() {
                  RETURN count(*) AS n",
             )
             .param("agent", agent.to_string())
-            .param("note", note.id.to_string()),
+            .param("note", note.to_string()),
         )
         .await
         .unwrap();
     let row = rows.next().await.unwrap().expect("a row");
-    assert_eq!(
-        row.get::<i64>("n").unwrap_or(0),
-        1,
-        "the author owns its note"
-    );
-
-    let node = e.client.find_agent(agent).await.unwrap();
-    assert!(node.is_some(), "and the author exists as a node");
-
-    drop_nodes(&e, "Agent", &[agent]).await;
-    e.client.delete_note(note.id).await.unwrap();
-    cleanup(&e).await;
+    row.get::<i64>("n").unwrap_or(0)
 }
 
 #[tokio::test]
@@ -161,7 +200,15 @@ async fn the_backfill_rebuilds_the_attribution_and_says_what_it_did() {
     let Some(e) = env("backfill").await else {
         return;
     };
-    let agent = Uuid::new_v4();
+    // Before the self was the identity, a write stamped the MODEL facet of this store: the
+    // facet exists (its `FACET_OF` hangs it under the self) and the note names it.
+    let root = e.client.agent_identity_namespace().await.unwrap();
+    e.client
+        .ensure_agent(root, Some("claude-opus-5-5"))
+        .await
+        .unwrap();
+    let agent =
+        project_orchestrator::notes::provenance::model_facet_id(root, "claude-opus-5-5").unwrap();
     let note = a_note(&format!("agent:{agent}"));
     // Written without the write hook, so the edge is genuinely missing: this is the state
     // a database predating the feature is in.
@@ -182,12 +229,16 @@ async fn the_backfill_rebuilds_the_attribution_and_says_what_it_did() {
 
     let first = e.client.backfill_agents().await.unwrap();
     assert!(first.from_notes >= 1, "{first:?}");
-    assert!(first.authored >= 1, "the missing edge was drawn: {first:?}");
+    assert_eq!(first.authored, 1, "the missing edge was drawn: {first:?}");
     assert!(first.after >= first.before, "{first:?}");
+    // Drawn on the self, the identity that writes, not on the facet the note names.
+    assert_eq!(authored_count(&e, root, note.id).await, 1);
+    assert_eq!(authored_count(&e, agent, note.id).await, 0);
 
     let second = e.client.backfill_agents().await.unwrap();
     assert_eq!(second.authored, 0, "idempotent: {second:?}");
 
+    // The facet goes; the self is shared by the store and stays.
     drop_nodes(&e, "Agent", &[agent]).await;
     e.client.delete_note(note.id).await.unwrap();
     cleanup(&e).await;
@@ -199,16 +250,14 @@ async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
     let Some(e) = env("knows").await else {
         return;
     };
-    // A FRESH subject, not the shared root: this database is reused by every suite, and a
-    // previous run that failed before its cleanup leaves edges behind. What is measured here
-    // is the mechanism, and the mechanism must not depend on a clean database.
-    let self_id = Uuid::new_v4();
+    // The durable self of this store: the only subject it can know anything as. The database
+    // is shared by every suite, so the assertions below are about what THIS test adds.
+    let self_id = e.client.agent_identity_namespace().await.unwrap();
     // As production does (`agent-knows-core`): the subject exists before it is given
     // anything. `link_agent_knows` MATCHes both ends — a missing subject is a silent no-op,
     // which is the trap this line documents.
     e.client.ensure_agent(self_id, None).await.unwrap();
-    let before = e.client.agent_knows(self_id, None, 10).await.unwrap();
-    assert_eq!(before.available, 0, "a fresh subject knows nothing");
+    let before = e.client.agent_knows(self_id, None, 10_000).await.unwrap();
     let prov = rules::Provenance::new("agent-knows-core", "3 portées lues, 3 notes épinglées");
 
     let mut ids = Vec::new();
@@ -236,13 +285,23 @@ async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
 
     let known = e.client.agent_knows(self_id, None, 2).await.unwrap();
     assert_eq!(known.notes.len(), 2, "bounded");
-    assert_eq!(known.available, 3, "and the total is published");
-    assert_eq!(known.withheld(), 1, "« la part lue est dite »");
+    assert_eq!(
+        known.available,
+        before.available + 3,
+        "and the total is published"
+    );
+    assert_eq!(
+        known.withheld(),
+        known.available - 2,
+        "« la part lue est dite »"
+    );
 
     // And the bound is what limits, not luck: unbounded, all three come back.
-    let all = e.client.agent_knows(self_id, None, 10).await.unwrap();
-    assert_eq!(all.notes.len(), 3);
+    let all = e.client.agent_knows(self_id, None, 10_000).await.unwrap();
     assert_eq!(all.withheld(), 0);
+    for id in &ids {
+        assert!(all.notes.contains(id), "{id} is known");
+    }
 
     // The provenance is ON the edge, not in a table beside it.
     let mut rows = e
@@ -265,7 +324,6 @@ async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
     for id in &ids {
         e.client.delete_note(*id).await.unwrap();
     }
-    drop_nodes(&e, "Agent", &[self_id]).await;
     cleanup(&e).await;
 }
 
@@ -297,7 +355,8 @@ async fn what_a_subject_applies_becomes_a_uses_edge_with_its_provenance() {
     let Some(e) = env("uses").await else {
         return;
     };
-    let agent = Uuid::new_v4();
+    // The durable self: the only agent this store can write for (a foreign id is refused).
+    let agent = e.client.agent_identity_namespace().await.unwrap();
     let persona = Uuid::new_v4();
     e.raw
         .run(query("CREATE (:Persona {id: $id, name: 'Pentest'})").param("id", persona.to_string()))
@@ -349,8 +408,8 @@ async fn what_a_subject_applies_becomes_a_uses_edge_with_its_provenance() {
         "an unusable label is refused, not escaped"
     );
 
+    // The self is shared by the store and stays; the edge goes with the persona.
     drop_nodes(&e, "Persona", &[persona]).await;
-    drop_nodes(&e, "Agent", &[agent]).await;
     cleanup(&e).await;
 }
 
@@ -704,7 +763,7 @@ async fn the_catalog_says_what_the_graph_really_has() {
         return;
     };
     // One edge of a known shape, so the catalog has something true to report.
-    let agent = Uuid::new_v4();
+    let agent = e.client.agent_identity_namespace().await.unwrap();
     let mut note = a_note("api");
     note.project_id = Some(e.project.id);
     e.client.create_note(&note).await.unwrap();
@@ -742,7 +801,6 @@ async fn the_catalog_says_what_the_graph_really_has() {
     }
 
     e.client.delete_note(note.id).await.unwrap();
-    drop_nodes(&e, "Agent", &[agent]).await;
     cleanup(&e).await;
 }
 
@@ -901,11 +959,23 @@ async fn an_agent_that_does_not_exist_is_absent_not_an_error() {
         return;
     };
     assert!(e.client.find_agent(Uuid::new_v4()).await.unwrap().is_none());
-    let known = Uuid::new_v4();
-    e.client.ensure_agent(known, Some("m")).await.unwrap();
-    let found = e.client.find_agent(known).await.unwrap();
-    assert_eq!(found, Some(("model".to_string(), Some("m".to_string()))));
-    drop_nodes(&e, "Agent", &[known]).await;
+    // A foreign id is refused and never becomes a node.
+    let foreign = Uuid::new_v4();
+    assert!(e.client.ensure_agent(foreign, Some("m")).await.is_err());
+    assert!(e.client.find_agent(foreign).await.unwrap().is_none());
+    // The self is made; its model is a dated facet beside it, not the node itself.
+    let root = e.client.agent_identity_namespace().await.unwrap();
+    e.client.ensure_agent(root, Some("m")).await.unwrap();
+    assert_eq!(
+        e.client.find_agent(root).await.unwrap(),
+        Some(("self".to_string(), None))
+    );
+    let facet = project_orchestrator::notes::provenance::model_facet_id(root, "m").unwrap();
+    assert_eq!(
+        e.client.find_agent(facet).await.unwrap(),
+        Some(("model".to_string(), Some("m".to_string())))
+    );
+    drop_nodes(&e, "Agent", &[facet]).await;
     cleanup(&e).await;
 }
 
@@ -928,5 +998,94 @@ async fn a_rule_that_needs_its_caller_says_so_instead_of_pretending() {
         uses.measure
     );
     assert!(report.of(rules::AGENT_KNOWS_CORE.name).is_some());
+    cleanup(&e).await;
+}
+
+/// The graph's size, in nodes and relationships. A read that writes shows up here.
+async fn graph_size(raw: &Graph) -> (i64, i64) {
+    let mut nodes = raw
+        .execute(query("MATCH (n) RETURN count(n) AS c"))
+        .await
+        .unwrap();
+    let n: i64 = nodes.next().await.unwrap().unwrap().get("c").unwrap();
+    let mut rels = raw
+        .execute(query("MATCH ()-[r]->() RETURN count(r) AS c"))
+        .await
+        .unwrap();
+    let r: i64 = rels.next().await.unwrap().unwrap().get("c").unwrap();
+    (n, r)
+}
+
+#[tokio::test]
+async fn a_typed_path_and_the_schema_are_read_only() {
+    let _serial = serial().await;
+    let Some(e) = env("typed_path").await else {
+        return;
+    };
+    let (t, d1, d2) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    e.raw
+        .run(
+            query(
+                "CREATE (t:Task {id: $t, title: 'a task'}) \
+                 CREATE (d1:Decision {id: $d1, description: 'r1'}) \
+                 CREATE (d2:Decision {id: $d2, description: 'r2'}) \
+                 CREATE (t)-[:INFORMED_BY {created_at: datetime()}]->(d1) \
+                 CREATE (d1)-[:NEXT_DECISION]->(d2)",
+            )
+            .param("t", t.to_string())
+            .param("d1", d1.to_string())
+            .param("d2", d2.to_string()),
+        )
+        .await
+        .unwrap();
+
+    let before = graph_size(&e.raw).await;
+    let path = e
+        .client
+        .typed_path("Task", &t.to_string(), "Decision", &d2.to_string(), 4)
+        .await
+        .unwrap();
+    let catalog = e.client.schema_catalog().await.unwrap();
+    let walk = e
+        .client
+        .causal_walk("Task", &t.to_string(), 2)
+        .await
+        .unwrap();
+    // One endpoint absent: reported, not an error.
+    let absent = e
+        .client
+        .typed_path(
+            "Task",
+            &t.to_string(),
+            "Decision",
+            &Uuid::new_v4().to_string(),
+            4,
+        )
+        .await
+        .unwrap();
+    // Both exist, but the chain runs the other way: no path, endpoints found.
+    let reversed = e
+        .client
+        .typed_path("Decision", &d2.to_string(), "Task", &t.to_string(), 4)
+        .await
+        .unwrap();
+    assert_eq!(graph_size(&e.raw).await, before, "the reads wrote nothing");
+
+    assert!(path.endpoints_found, "{path:?}");
+    assert_eq!(path.nodes.len(), 3, "{path:?}");
+    assert_eq!(path.nodes[0].label, "Task");
+    assert_eq!(path.nodes[0].title.as_deref(), Some("a task"));
+    assert_eq!(path.nodes[2].id, d2.to_string());
+    assert_eq!(path.edges, vec!["INFORMED_BY", "NEXT_DECISION"]);
+    assert!(!absent.endpoints_found && !absent.exists(), "{absent:?}");
+    assert!(
+        reversed.endpoints_found && !reversed.exists(),
+        "{reversed:?}"
+    );
+    assert!(catalog.has_edge("INFORMED_BY"));
+    assert!(walk.exists());
+
+    drop_nodes(&e, "Task", &[t]).await;
+    drop_nodes(&e, "Decision", &[d1, d2]).await;
     cleanup(&e).await;
 }

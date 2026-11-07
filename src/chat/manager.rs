@@ -19794,6 +19794,16 @@ impl ChatManager {
         let embeddings = self.embeddings.clone();
         let reason = reason.to_string();
         let work = async move {
+            // The counter before anything reads it: a user message whose count write is still
+            // in flight (the drain's, past its step budget) is counted by the episode as by
+            // the session (T0). Half the budget, so the episode is still written when the
+            // write hangs.
+            if !crate::chat::drain::count_writes_settled(id, CLOSE_EPISODE_BUDGET / 2).await {
+                warn!(
+                    session_id = %id,
+                    "the message counter of a closed session was still being written: its episode may count one message short"
+                );
+            }
             // The links first: the episode collected below names the commits of the window,
             // and the graph must already know which task they resolve.
             Self::link_session_commits(graph.clone(), id).await;

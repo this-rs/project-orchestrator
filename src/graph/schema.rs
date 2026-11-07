@@ -175,6 +175,40 @@ impl CausalWalk {
     }
 }
 
+/// One node of a typed path, with the label it carries in the graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathNode {
+    pub label: String,
+    pub id: String,
+    /// The display name when the node has one (`title`, `name`, `slug`, `path`).
+    pub title: Option<String>,
+}
+
+/// The shortest chain of causal relations from one node to another, read-only.
+///
+/// `endpoints_found` separates the two answers an agent must not confuse: « one of the two
+/// nodes is not in the graph » (`false`) and « both exist, no chain of at most `max_depth`
+/// hops links them » (`true`, `nodes` empty). The walk is directed, from `from` to `to`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedPath {
+    pub from: PathNode,
+    pub to: PathNode,
+    pub max_depth: u32,
+    pub edges_followed: Vec<String>,
+    pub endpoints_found: bool,
+    /// `nodes[0]` is `from`, the last one is `to`; empty when no chain was found.
+    pub nodes: Vec<PathNode>,
+    /// `edges[i]` links `nodes[i]` to `nodes[i + 1]`.
+    pub edges: Vec<String>,
+}
+
+impl TypedPath {
+    /// A chain exists when a path was found at all.
+    pub fn exists(&self) -> bool {
+        !self.edges.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +299,28 @@ mod tests {
         let c = catalog(vec![shape("KNOWS", "Agent", "Note")], &[]);
         assert_eq!(c.volume("KNOWS"), None);
         assert_ne!(c.volume("KNOWS"), Some(0));
+    }
+
+    #[test]
+    fn a_typed_path_exists_only_when_it_has_edges() {
+        let node = |label: &str, id: &str| PathNode {
+            label: label.into(),
+            id: id.into(),
+            title: None,
+        };
+        let mut path = TypedPath {
+            from: node("Task", "a"),
+            to: node("Decision", "b"),
+            max_depth: 4,
+            edges_followed: CAUSAL_TYPES.iter().map(|s| (*s).to_string()).collect(),
+            endpoints_found: true,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        };
+        assert!(!path.exists(), "both endpoints found, no chain: not a path");
+        path.nodes = vec![node("Task", "a"), node("Decision", "b")];
+        path.edges = vec!["INFORMED_BY".into()];
+        assert!(path.exists());
     }
 
     #[test]

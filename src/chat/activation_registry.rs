@@ -106,9 +106,38 @@ impl ActivationRegistry {
     /// Forget every session that is no longer live.
     pub fn retain_live(&self, live: &HashSet<Uuid>) {
         if let Ok(mut reg) = self.by_session.lock() {
-            reg.retain(|id, _| live.contains(id));
+            reg.retain(|id, _| live.contains(id) || pinned_by_a_test(id));
         }
     }
+}
+
+/// Sessions a test keeps out of [`ActivationRegistry::retain_live`]. The process-wide registry
+/// is shared by every test of the binary, and the live snapshot of ANY chat manager forgets
+/// the sessions it does not see live: a test that records into the global registry would lose
+/// its session to a snapshot taken by another test. Test builds only; production never pins.
+#[cfg(test)]
+static PINNED_BY_TESTS: Mutex<Vec<Uuid>> = Mutex::new(Vec::new());
+
+/// Keeps `session` out of every [`retain_live`] of this test binary (see [`PINNED_BY_TESTS`]).
+#[cfg(test)]
+pub(crate) fn pin_for_test(session: Uuid) {
+    PINNED_BY_TESTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(session);
+}
+
+#[cfg(test)]
+fn pinned_by_a_test(id: &Uuid) -> bool {
+    PINNED_BY_TESTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(id)
+}
+
+#[cfg(not(test))]
+fn pinned_by_a_test(_id: &Uuid) -> bool {
+    false
 }
 
 fn global() -> &'static ActivationRegistry {
@@ -201,5 +230,24 @@ mod tests {
     fn unknown_session_is_empty_not_an_error() {
         let reg = ActivationRegistry::default();
         assert_eq!(reg.get(Uuid::new_v4()), SessionActivations::default());
+    }
+
+    /// A test that records into a registry another test's snapshot can reach pins its session:
+    /// `retain_live` forgets the sessions that are not live, except a pinned one.
+    #[test]
+    fn a_pinned_session_survives_the_snapshot_that_forgets_the_others() {
+        let reg = ActivationRegistry::default();
+        let (pinned, other) = (Uuid::new_v4(), Uuid::new_v4());
+        pin_for_test(pinned);
+        reg.record_notes(pinned, [Uuid::new_v4()]);
+        reg.record_notes(other, [Uuid::new_v4()]);
+
+        reg.retain_live(&HashSet::new());
+
+        assert_eq!(reg.get(pinned).notes.len(), 1, "the pinned session stays");
+        assert!(
+            reg.get(other).notes.is_empty(),
+            "an unpinned one is forgotten"
+        );
     }
 }

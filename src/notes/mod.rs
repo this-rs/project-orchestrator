@@ -93,26 +93,24 @@ mod current_knowledge_tests {
 pub mod provenance {
     //! Stable agent provenance: who, among the agents, wrote something to the graph.
     //!
-    //! A write made by a chat session used to read `created_by: "api"`, like a script's:
-    //! two sessions of the same agent could not be told apart from anything else, nor
-    //! recognised as the same agent. An agent's identity is its MODEL, the same in every
-    //! session whatever the context: two sessions of one model are the same agent, two
-    //! models are two agents. It is decoupled from projects (a model writes in many).
+    //! A write made by a chat session used to read `created_by: "api"`, like a script's.
+    //! The identity of the writer is the DURABLE SELF: the id is the root UUID the graph
+    //! creates ONCE and keeps ([`crate::neo4j::AnalyticsStore::agent_identity_namespace`]),
+    //! stable across sessions, models and restarts, private to this store.
     //!
-    //! The id is `uuid v5(root, model)`, the root a UUID the graph creates ONCE and keeps
-    //! ([`crate::neo4j::AnalyticsStore::agent_identity_namespace`]): stable across sessions
-    //! and restarts, private to this store (another instance's agents are other agents),
-    //! and computed, never stored per write.
+    //! The model is NOT the identity. It is a dated fact beside it: a `(:Agent {kind:'model'})`
+    //! facet, attached to the self by `FACET_OF`, carries the model name and `last_seen`.
+    //! Changing model changes the facet read, never the id that writes.
     //!
     //! Written as `agent:<uuid>` where an actor string already lives (`created_by`), so
     //! the values written before (`api`, `system-inference`, `skill-evolution`, ...) stay
-    //! as they are and read as before: [`parse_actor`] says `None` for them.
+    //! as they are and read as before: [`parse_actor`] says `None` for them. Actors written
+    //! before this change named the MODEL facet; the migration of
+    //! [`crate::neo4j::ChatStore`] moves their edges to the self.
     //!
-    //! Limits, on purpose: the identity is the model, not the person or persona behind
-    //! it (every Opus is one agent); a write takes the session's model AT THAT MOMENT, so
-    //! a conversation that switches provider writes under two agents; ids mean nothing on
-    //! another instance; with authentication disabled the calling session is a header,
-    //! a hint and not a proof (`envelope::identify_caller`).
+    //! Limits: the identity is the store's self, not the person or persona behind it; ids
+    //! mean nothing on another instance; with authentication disabled the calling session
+    //! is a header, a hint and not a proof (`envelope::identify_caller`).
 
     use anyhow::Result;
     use uuid::Uuid;
@@ -129,11 +127,10 @@ pub mod provenance {
         "auto", "default", "fast", "deep", "utility", "best", "opus", "sonnet", "haiku", "opusplan",
     ];
 
-    /// The agent id of `model` under the store's `namespace`. Case, surrounding spaces
-    /// and the context-window suffix (`[1m]`, as `agent_hooks::same_model` reads it)
-    /// do not make another agent. `None` for an empty model or a name that is not a
-    /// model ([`NOT_A_MODEL`]): no agent can be named, the caller keeps its fallback.
-    pub fn agent_id(namespace: Uuid, model: &str) -> Option<Uuid> {
+    /// The model name as a fact: trimmed, lower-cased, without the context-window suffix
+    /// (`[1m]`, as `agent_hooks::same_model` reads it). `None` for an empty model or a name
+    /// that is not a model ([`NOT_A_MODEL`]): it names no facet and no writer.
+    pub fn normalized_model(model: &str) -> Option<String> {
         let model = model.trim().to_ascii_lowercase();
         let model = model
             .strip_suffix("[1m]")
@@ -143,7 +140,21 @@ pub mod provenance {
         if model.is_empty() || NOT_A_MODEL.contains(&model.as_str()) {
             return None;
         }
-        Some(Uuid::new_v5(&namespace, model.as_bytes()))
+        Some(model)
+    }
+
+    /// The durable self that writes for a session running `model`, under the store's
+    /// `namespace`. The model only decides WHETHER a writer can be named (a session that
+    /// names no model names none); the id returned is the self, whatever the model.
+    /// `None` keeps the caller's fallback — never another agent's id.
+    pub fn agent_id(namespace: Uuid, model: &str) -> Option<Uuid> {
+        normalized_model(model).map(|_| namespace)
+    }
+
+    /// The id of the model facet of `model` under the store's `namespace`: the dated fact
+    /// that this self ran on that model. A facet is never the writer (see [`agent_id`]).
+    pub fn model_facet_id(namespace: Uuid, model: &str) -> Option<Uuid> {
+        normalized_model(model).map(|m| Uuid::new_v5(&namespace, format!("facet:{m}").as_bytes()))
     }
 
     /// The `created_by` of a write made by the agent `id`.
@@ -159,17 +170,26 @@ pub mod provenance {
             .and_then(|id| Uuid::parse_str(id).ok())
     }
 
-    /// The agent id of the chat session `session_id`: its current model, under this
-    /// store's root. `Ok(None)` for a session that does not exist or has no model.
-    pub async fn agent_id_of_session(
+    /// The durable self of the chat session `session_id`, with the model it runs on (a
+    /// dated fact, not the identity). `Ok(None)` for a session that does not exist or
+    /// names no model: no agent can be named for it.
+    pub async fn self_of_session(
         graph: &dyn GraphStore,
         session_id: Uuid,
-    ) -> Result<Option<Uuid>> {
+    ) -> Result<Option<(Uuid, String)>> {
         let Some(session) = graph.get_chat_session(session_id).await? else {
             return Ok(None);
         };
         let namespace = graph.agent_identity_namespace().await?;
-        Ok(agent_id(namespace, &session.model))
+        Ok(agent_id(namespace, &session.model).map(|id| (id, session.model.clone())))
+    }
+
+    /// The durable self of the chat session `session_id`. See [`self_of_session`].
+    pub async fn agent_id_of_session(
+        graph: &dyn GraphStore,
+        session_id: Uuid,
+    ) -> Result<Option<Uuid>> {
+        Ok(self_of_session(graph, session_id).await?.map(|(id, _)| id))
     }
 
     /// The `created_by` a write must carry: the agent actor of the calling session when
@@ -184,11 +204,12 @@ pub mod provenance {
         let Some(session) = calling_session.and_then(|s| Uuid::parse_str(s.trim()).ok()) else {
             return fallback.to_string();
         };
-        match agent_id_of_session(graph, session).await {
-            Ok(Some(id)) => {
-                // The agent becomes a node the first time it writes. Never a reason to
-                // refuse the write: a graph that cannot make the node is logged.
-                if let Err(e) = graph.ensure_agent(id, None).await {
+        match self_of_session(graph, session).await {
+            Ok(Some((id, model))) => {
+                // The self becomes a node the first time it writes, and the model of the
+                // session is recorded beside it as a dated fact. Never a reason to refuse
+                // the write: a graph that cannot make the node is logged.
+                if let Err(e) = graph.ensure_agent(id, Some(&model)).await {
                     tracing::warn!(agent = %id, error = %e, "the node of an agent could not be made");
                 }
                 actor(id)
@@ -286,8 +307,10 @@ pub mod provenance {
             id
         }
 
+        /// One self writes for the whole store, whatever the model of the session: the node
+        /// of the writer is made once, and a session naming no model keeps its fallback.
         #[tokio::test]
-        async fn a_write_makes_the_agent_a_node_once_per_identity() {
+        async fn a_write_makes_the_durable_self_a_node_once() {
             let graph = MockGraphStore::new();
             let a = session_of(&graph, "claude-opus-5-5").await;
             let a_again = session_of(&graph, " Claude-Opus-5-5 ").await;
@@ -295,42 +318,114 @@ pub mod provenance {
             let none = session_of(&graph, "auto").await;
 
             let by_a = author_of(&graph, Some(&a.to_string()), "api").await;
-            author_of(&graph, Some(&a_again.to_string()), "api").await;
-            assert_eq!(graph.agents.lock().unwrap().len(), 1, "one model, one node");
-            author_of(&graph, Some(&other.to_string()), "api").await;
             assert_eq!(
-                graph.agents.lock().unwrap().len(),
-                2,
-                "two models, two nodes"
+                author_of(&graph, Some(&a_again.to_string()), "api").await,
+                by_a
             );
+            assert_eq!(graph.agents.lock().unwrap().len(), 1, "one self, one node");
+            assert_eq!(
+                author_of(&graph, Some(&other.to_string()), "api").await,
+                by_a,
+                "another model writes as the same self"
+            );
+            assert_eq!(graph.agents.lock().unwrap().len(), 1);
 
             // A session that names no model leaves no node and keeps its fallback.
             assert_eq!(
                 author_of(&graph, Some(&none.to_string()), "api").await,
                 "api"
             );
-            assert_eq!(graph.agents.lock().unwrap().len(), 2);
-            assert!(parse_actor(&by_a).is_some());
+            assert_eq!(graph.agents.lock().unwrap().len(), 1);
+            assert_eq!(
+                parse_actor(&by_a),
+                Some(graph.agent_identity_namespace().await.unwrap())
+            );
         }
 
+        /// Changing the model of a session changes the dated facet, never the writer.
         #[tokio::test]
-        async fn two_sessions_of_one_model_are_the_same_agent() {
+        async fn changing_model_does_not_change_the_identity_that_writes() {
             let graph = MockGraphStore::new();
-            let a = session_of(&graph, "claude-opus-5-5").await;
-            let b = session_of(&graph, " Claude-Opus-5-5 ").await;
-            let other = session_of(&graph, "deepseek-v4").await;
-            let id_a = agent_id_of_session(&graph, a).await.unwrap().unwrap();
-            let id_b = agent_id_of_session(&graph, b).await.unwrap().unwrap();
-            let id_other = agent_id_of_session(&graph, other).await.unwrap().unwrap();
-            assert_eq!(id_a, id_b, "the same model in two sessions is one agent");
-            assert_ne!(id_a, id_other, "two models are two agents");
-            // Survives the session: computed again later, from the store, it is the same.
-            graph.delete_chat_session(a).await.unwrap();
-            let again = agent_id(
-                graph.agent_identity_namespace().await.unwrap(),
-                "claude-opus-5-5",
+            let sid = session_of(&graph, "claude-opus-5-5").await;
+            let before = author_of(&graph, Some(&sid.to_string()), "api").await;
+
+            graph
+                .update_chat_session_model(sid, "deepseek-v4")
+                .await
+                .unwrap();
+            let after = author_of(&graph, Some(&sid.to_string()), "api").await;
+            assert_eq!(before, after, "the writer is the self, not the model");
+            assert_eq!(
+                agent_id_of_session(&graph, sid).await.unwrap(),
+                parse_actor(&after),
             );
-            assert_eq!(again, Some(id_a));
+
+            // The model stays a dated fact: a facet per name, the same for a re-spelling.
+            let ns = graph.agent_identity_namespace().await.unwrap();
+            assert_ne!(
+                model_facet_id(ns, "claude-opus-5-5"),
+                model_facet_id(ns, "deepseek-v4")
+            );
+            assert_eq!(
+                model_facet_id(ns, " Claude-Opus-5-5[1m] "),
+                model_facet_id(ns, "claude-opus-5-5")
+            );
+        }
+
+        /// Two agents of one store do not read each other's knowledge: a read names one
+        /// agent, and only that agent's edges answer it.
+        #[tokio::test]
+        async fn two_distinct_agents_do_not_see_each_others_knowledge() {
+            use crate::graph::rules::{KnowledgeScope, Provenance};
+            let graph = MockGraphStore::new();
+            let note = crate::test_helpers::test_note(
+                Uuid::new_v4(),
+                crate::notes::NoteType::Gotcha,
+                "un savoir",
+            );
+            graph.create_note(&note).await.unwrap();
+            let me = graph.agent_identity_namespace().await.unwrap();
+            let other = Uuid::new_v4();
+            let provenance = Provenance::new("agent-knows-core", "1 portée, 1 note");
+
+            graph
+                .link_agent_knows(other, note.id, KnowledgeScope::Global, None, &provenance)
+                .await
+                .unwrap();
+            assert!(graph
+                .agent_knows(me, None, 10)
+                .await
+                .unwrap()
+                .notes
+                .is_empty());
+            assert_eq!(
+                graph.agent_knows(other, None, 10).await.unwrap().notes,
+                vec![note.id]
+            );
+
+            // Another store is another root, so another agent altogether.
+            let elsewhere = MockGraphStore::new();
+            assert_ne!(elsewhere.agent_identity_namespace().await.unwrap(), me);
+        }
+
+        /// An agent that cannot be resolved receives the fallback and no other agent's
+        /// context: an unknown session, one naming no model, and an unknown agent read.
+        #[tokio::test]
+        async fn an_unresolved_agent_gets_no_other_agents_context() {
+            let graph = MockGraphStore::new();
+            let unknown = Uuid::new_v4();
+            assert_eq!(
+                author_of(&graph, Some(&unknown.to_string()), "api").await,
+                "api"
+            );
+            let no_model = session_of(&graph, "auto").await;
+            assert_eq!(
+                author_of(&graph, Some(&no_model.to_string()), "api").await,
+                "api"
+            );
+            assert!(graph.agents.lock().unwrap().is_empty());
+            let read = graph.agent_knows(unknown, None, 10).await.unwrap();
+            assert!(read.notes.is_empty() && read.available == 0);
         }
 
         #[tokio::test]
