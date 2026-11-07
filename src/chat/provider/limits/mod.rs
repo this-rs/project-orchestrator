@@ -13,7 +13,11 @@
 //!   exhausted quota or an overload";
 //! * [`profiles`] — the DATA of RL3: which headers and codes each endpoint family
 //!   uses, and how solid that knowledge is;
-//! * [`store`] — where a budget's calendar cumul survives a restart.
+//! * [`store`] — where a budget's calendar cumul survives a restart;
+//! * [`breaker`] — RL4: the overload backoff and the single probe, per
+//!   (instance, credential REFERENCE). It never opens on a spent quota (that is
+//!   [`QuotaRegistry`](super::quota::QuotaRegistry)'s) and retries nothing itself:
+//!   the count of a retry belongs to [`ledger`].
 //!
 //! # What is NOT here
 //!
@@ -26,11 +30,16 @@
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
+pub mod breaker;
 pub mod classify;
 pub mod ledger;
 pub mod profiles;
 pub mod store;
 
+pub use breaker::{
+    Breaker, Decision, FixedJitter, Jitter, Key, Phase, Policy, Reason, SeededJitter, State,
+    SystemJitter, Transition,
+};
 pub use classify::{
     apply_verdict, classify, from_provider_error, Classification, ErrorBody, OurStanding, Signal,
     Signals, Verdict, NEAR_RATIO,
