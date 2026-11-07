@@ -3152,6 +3152,20 @@ pub trait AnalyticsStore: Send + Sync {
         id: &str,
         max_depth: u32,
     ) -> Result<crate::graph::schema::CausalWalk>;
+
+    /// The shortest chain of causal relations from `(from_label, from_id)` to
+    /// `(to_label, to_id)`, up to `max_depth` hops (clamped to 1..=4). Both labels must be
+    /// in [`crate::graph::schema::CAUSAL_ANCHORS`]. A missing endpoint is reported in
+    /// `endpoints_found`, never as an error; the same node at both ends is an error.
+    /// Read-only: nothing in the graph is written.
+    async fn typed_path(
+        &self,
+        from_label: &str,
+        from_id: &str,
+        to_label: &str,
+        to_id: &str,
+        max_depth: u32,
+    ) -> Result<crate::graph::schema::TypedPath>;
 }
 
 // ============================================================================

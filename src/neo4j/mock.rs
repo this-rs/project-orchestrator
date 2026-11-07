@@ -14262,6 +14262,44 @@ impl AnalyticsStore for MockGraphStore {
         })
     }
 
+    async fn typed_path(
+        &self,
+        from_label: &str,
+        from_id: &str,
+        to_label: &str,
+        to_id: &str,
+        max_depth: u32,
+    ) -> Result<crate::graph::schema::TypedPath> {
+        // Same guards as the Neo4j store. The mock carries no causal chain and does not
+        // model these nodes, so it cannot confirm that they exist: `endpoints_found` stays
+        // false, which reads as « not confirmed », never as an invented path.
+        for label in [from_label, to_label] {
+            if !crate::graph::schema::CAUSAL_ANCHORS.contains(&label) {
+                anyhow::bail!("{label} is not a causal anchor");
+            }
+        }
+        if from_label == to_label && from_id == to_id {
+            anyhow::bail!("the path needs two distinct nodes");
+        }
+        let node = |label: &str, id: &str| crate::graph::schema::PathNode {
+            label: label.to_string(),
+            id: id.to_string(),
+            title: None,
+        };
+        Ok(crate::graph::schema::TypedPath {
+            from: node(from_label, from_id),
+            to: node(to_label, to_id),
+            max_depth: max_depth.clamp(1, 4),
+            edges_followed: crate::graph::schema::CAUSAL_TYPES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            endpoints_found: false,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        })
+    }
+
     // Chat anchors — same rules as the Neo4j store (both call `anchor::apply_op`).
 
     async fn get_pm_graph_data(

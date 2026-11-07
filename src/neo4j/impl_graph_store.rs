@@ -3331,6 +3331,18 @@ impl AnalyticsStore for Neo4jClient {
     ) -> anyhow::Result<crate::graph::schema::CausalWalk> {
         self.causal_walk(label, id, max_depth).await
     }
+
+    async fn typed_path(
+        &self,
+        from_label: &str,
+        from_id: &str,
+        to_label: &str,
+        to_id: &str,
+        max_depth: u32,
+    ) -> anyhow::Result<crate::graph::schema::TypedPath> {
+        self.typed_path(from_label, from_id, to_label, to_id, max_depth)
+            .await
+    }
 }
 
 #[async_trait]

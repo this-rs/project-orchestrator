@@ -14,7 +14,8 @@ use neo4rs::query;
 use uuid::Uuid;
 
 use crate::graph::schema::{
-    CausalStep, CausalWalk, RelationShape, SchemaCatalog, CAUSAL_ANCHORS, CAUSAL_TYPES,
+    CausalStep, CausalWalk, PathNode, RelationShape, SchemaCatalog, TypedPath, CAUSAL_ANCHORS,
+    CAUSAL_TYPES,
 };
 use crate::neo4j::client::Neo4jClient;
 
@@ -184,6 +185,98 @@ impl Neo4jClient {
             steps,
             truncated,
         })
+    }
+
+    /// See [`crate::neo4j::AnalyticsStore::typed_path`]. Two reads, both read-only: the
+    /// existence of each endpoint (exact, by index), then the shortest causal chain between
+    /// them, only when both exist.
+    pub async fn typed_path(
+        &self,
+        from_label: &str,
+        from_id: &str,
+        to_label: &str,
+        to_id: &str,
+        max_depth: u32,
+    ) -> Result<TypedPath> {
+        for label in [from_label, to_label] {
+            if !CAUSAL_ANCHORS.contains(&label) {
+                anyhow::bail!(
+                    "{label} is not a causal anchor: {}",
+                    CAUSAL_ANCHORS.join(", ")
+                );
+            }
+        }
+        if from_label == to_label && from_id == to_id {
+            anyhow::bail!("the path needs two distinct nodes, got {from_label} {from_id} twice");
+        }
+        // Clamped, and an integer: the depth is interpolated, never a caller string.
+        let depth = max_depth.clamp(1, 4);
+        let family = CAUSAL_TYPES.join("|");
+        let node = |label: &str, id: &str| PathNode {
+            label: label.to_string(),
+            id: id.to_string(),
+            title: None,
+        };
+        let mut found = self
+            .graph
+            .execute(
+                query(&format!(
+                    "MATCH (a:{from_label} {{id: $src}}) MATCH (b:{to_label} {{id: $dst}}) \
+                     RETURN count(*) AS n"
+                ))
+                .param("src", from_id.to_string())
+                .param("dst", to_id.to_string()),
+            )
+            .await?;
+        let both_exist = match found.next().await? {
+            Some(row) => row.get::<i64>("n").unwrap_or(0) > 0,
+            None => false,
+        };
+        let mut result = TypedPath {
+            from: node(from_label, from_id),
+            to: node(to_label, to_id),
+            max_depth: depth,
+            edges_followed: CAUSAL_TYPES.iter().map(|s| (*s).to_string()).collect(),
+            endpoints_found: both_exist,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        };
+        if !both_exist {
+            return Ok(result);
+        }
+
+        let mut rows = self
+            .graph
+            .execute(
+                query(&format!(
+                    "MATCH (a:{from_label} {{id: $src}}), (b:{to_label} {{id: $dst}}) \
+                     MATCH p = shortestPath((a)-[:{family}*1..{depth}]->(b)) \
+                     RETURN [n IN nodes(p) | labels(n)[0]] AS labels, \
+                            [n IN nodes(p) | n.id] AS ids, \
+                            [n IN nodes(p) | coalesce(n.title, n.name, n.slug, n.path)] AS titles, \
+                            [r IN relationships(p) | type(r)] AS edges"
+                ))
+                .param("src", from_id.to_string())
+                .param("dst", to_id.to_string()),
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let labels: Vec<String> = row.get("labels")?;
+            let ids: Vec<String> = row.get("ids")?;
+            let titles: Vec<Option<String>> = row.get("titles").unwrap_or_default();
+            result.edges = row.get("edges")?;
+            result.nodes = labels
+                .into_iter()
+                .zip(ids)
+                .enumerate()
+                .map(|(i, (label, id))| PathNode {
+                    label,
+                    id,
+                    title: titles.get(i).cloned().flatten(),
+                })
+                .collect();
+        }
+        Ok(result)
     }
 
     /// The agent node of an id, when it exists — the read `assign_task` has always had
