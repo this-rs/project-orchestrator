@@ -930,3 +930,92 @@ async fn a_rule_that_needs_its_caller_says_so_instead_of_pretending() {
     assert!(report.of(rules::AGENT_KNOWS_CORE.name).is_some());
     cleanup(&e).await;
 }
+
+/// The graph's size, in nodes and relationships. A read that writes shows up here.
+async fn graph_size(raw: &Graph) -> (i64, i64) {
+    let mut nodes = raw
+        .execute(query("MATCH (n) RETURN count(n) AS c"))
+        .await
+        .unwrap();
+    let n: i64 = nodes.next().await.unwrap().unwrap().get("c").unwrap();
+    let mut rels = raw
+        .execute(query("MATCH ()-[r]->() RETURN count(r) AS c"))
+        .await
+        .unwrap();
+    let r: i64 = rels.next().await.unwrap().unwrap().get("c").unwrap();
+    (n, r)
+}
+
+#[tokio::test]
+async fn a_typed_path_and_the_schema_are_read_only() {
+    let _serial = serial().await;
+    let Some(e) = env("typed_path").await else {
+        return;
+    };
+    let (t, d1, d2) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    e.raw
+        .run(
+            query(
+                "CREATE (t:Task {id: $t, title: 'a task'}) \
+                 CREATE (d1:Decision {id: $d1, description: 'r1'}) \
+                 CREATE (d2:Decision {id: $d2, description: 'r2'}) \
+                 CREATE (t)-[:INFORMED_BY {created_at: datetime()}]->(d1) \
+                 CREATE (d1)-[:NEXT_DECISION]->(d2)",
+            )
+            .param("t", t.to_string())
+            .param("d1", d1.to_string())
+            .param("d2", d2.to_string()),
+        )
+        .await
+        .unwrap();
+
+    let before = graph_size(&e.raw).await;
+    let path = e
+        .client
+        .typed_path("Task", &t.to_string(), "Decision", &d2.to_string(), 4)
+        .await
+        .unwrap();
+    let catalog = e.client.schema_catalog().await.unwrap();
+    let walk = e
+        .client
+        .causal_walk("Task", &t.to_string(), 2)
+        .await
+        .unwrap();
+    // One endpoint absent: reported, not an error.
+    let absent = e
+        .client
+        .typed_path(
+            "Task",
+            &t.to_string(),
+            "Decision",
+            &Uuid::new_v4().to_string(),
+            4,
+        )
+        .await
+        .unwrap();
+    // Both exist, but the chain runs the other way: no path, endpoints found.
+    let reversed = e
+        .client
+        .typed_path("Decision", &d2.to_string(), "Task", &t.to_string(), 4)
+        .await
+        .unwrap();
+    assert_eq!(graph_size(&e.raw).await, before, "the reads wrote nothing");
+
+    assert!(path.endpoints_found, "{path:?}");
+    assert_eq!(path.nodes.len(), 3, "{path:?}");
+    assert_eq!(path.nodes[0].label, "Task");
+    assert_eq!(path.nodes[0].title.as_deref(), Some("a task"));
+    assert_eq!(path.nodes[2].id, d2.to_string());
+    assert_eq!(path.edges, vec!["INFORMED_BY", "NEXT_DECISION"]);
+    assert!(!absent.endpoints_found && !absent.exists(), "{absent:?}");
+    assert!(
+        reversed.endpoints_found && !reversed.exists(),
+        "{reversed:?}"
+    );
+    assert!(catalog.has_edge("INFORMED_BY"));
+    assert!(walk.exists());
+
+    drop_nodes(&e, "Task", &[t]).await;
+    drop_nodes(&e, "Decision", &[d1, d2]).await;
+    cleanup(&e).await;
+}
