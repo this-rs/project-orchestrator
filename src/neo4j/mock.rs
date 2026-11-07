@@ -223,6 +223,9 @@ pub struct MockGraphStore {
     /// Stall injection: `search_decisions_by_vector` sleeps this long before
     /// answering — a dense decision search slower than the turn's budget.
     pub slow_decision_vector_search: std::sync::Mutex<Option<std::time::Duration>>,
+    /// Stall injection: `update_chat_session` sleeps this long before writing — a write of
+    /// the session record (its message counter) that lands after the close read it.
+    pub slow_chat_session_update: std::sync::Mutex<Option<std::time::Duration>>,
     /// Makes `update_chat_session_harness` fail (the capability snapshot is not stored).
     pub fail_harness_writes: std::sync::atomic::AtomicBool,
     /// Makes `save_session_episode` fail (a session closes even when its episode cannot be
@@ -531,6 +534,7 @@ impl MockGraphStore {
             fail_mark_read: std::sync::atomic::AtomicBool::new(false),
             fail_vector_search: std::sync::atomic::AtomicBool::new(false),
             slow_decision_vector_search: std::sync::Mutex::new(None),
+            slow_chat_session_update: std::sync::Mutex::new(None),
             fail_harness_writes: std::sync::atomic::AtomicBool::new(false),
             fail_session_episode_writes: std::sync::atomic::AtomicBool::new(false),
             session_episode_save_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -15781,6 +15785,13 @@ impl ChatStore for MockGraphStore {
         conversation_id: Option<String>,
         preview: Option<String>,
     ) -> Result<Option<ChatSessionNode>> {
+        let delay = *self
+            .slow_chat_session_update
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         let mut sessions = self.chat_sessions.write().await;
         if let Some(session) = sessions.get_mut(&id) {
             session.updated_at = Utc::now();
