@@ -3850,7 +3850,6 @@ mod injection_tests {
 #[cfg(test)]
 mod agent_identity_neo4j {
     use super::*;
-    use crate::neo4j::traits::*;
 
     /// Not `NEO4J_URI`: the config tests of `lib.rs` clear and rewrite it while this suite
     /// runs in parallel (the same reason as the parity test in `neo4j::mock`). Without this
