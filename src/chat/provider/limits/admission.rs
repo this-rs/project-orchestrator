@@ -330,15 +330,6 @@ impl Gate {
         outcome: Outcome,
         classification: Option<&Classification>,
     ) -> Aftermath {
-        let Admission::Admitted(grant, probe) = admission else {
-            // A refusal never reserved anything: there is nothing to give back.
-            return Aftermath::default();
-        };
-        if limits.is_empty() {
-            return Aftermath::default();
-        }
-        let notes = self.ledger.settle(Reservation::Granted(*grant), outcome);
-        let key = key_for(instance, ask);
         let signal = match classification {
             // `None` for a spent quota: the registry holds it, not a breaker.
             Some(classification) => Signal::of(&classification.verdict),
@@ -350,15 +341,58 @@ impl Gate {
                 Outcome::NeverSent => None,
             },
         };
+        self.finish(instance, limits, ask, admission, outcome, signal)
+    }
+
+    /// [`Self::settle`] for a call whose ending says NOTHING about the provider: a
+    /// turn the person stopped, one that was cut short. The counters settle as
+    /// `outcome` says, the breaker records nothing, and an admission that was the
+    /// half-open probe is HANDED BACK — an interrupted probe is neither a recovery
+    /// nor a failure, and must not wedge the breaker until its timeout.
+    pub fn settle_unread(
+        &self,
+        instance: &str,
+        limits: &[RateLimit],
+        ask: &Ask,
+        admission: Admission,
+        outcome: Outcome,
+    ) -> Aftermath {
+        self.finish(instance, limits, ask, admission, outcome, None)
+    }
+
+    /// The one settlement: the counters, then the breaker. With no `signal` the
+    /// breaker learns nothing — and a probe that is not settled is released.
+    fn finish(
+        &self,
+        instance: &str,
+        limits: &[RateLimit],
+        ask: &Ask,
+        admission: Admission,
+        outcome: Outcome,
+        signal: Option<Signal>,
+    ) -> Aftermath {
+        let Admission::Admitted(grant, probe) = admission else {
+            // A refusal never reserved anything: there is nothing to give back.
+            return Aftermath::default();
+        };
+        if limits.is_empty() {
+            return Aftermath::default();
+        }
+        let notes = self.ledger.settle(Reservation::Granted(*grant), outcome);
+        let key = key_for(instance, ask);
         let mut transitions = Vec::new();
-        if let Some(signal) = signal {
-            let mut breakers = self.lock_breakers();
-            let breaker = breakers
-                .entry(key.clone())
-                .or_insert_with(|| self.build_breaker());
-            if let Some(transition) = breaker.record(&key, signal, probe) {
-                transitions.push(transition);
+        let mut breakers = self.lock_breakers();
+        let breaker = breakers
+            .entry(key.clone())
+            .or_insert_with(|| self.build_breaker());
+        match signal {
+            Some(signal) => {
+                if let Some(transition) = breaker.record(&key, signal, probe) {
+                    transitions.push(transition);
+                }
             }
+            None if probe => breaker.release_probe(&key),
+            None => {}
         }
         Aftermath { notes, transitions }
     }

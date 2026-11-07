@@ -9,6 +9,9 @@
 //!   [`ProviderError`] the provider would have answered itself
 //!   (`RateLimited` with the instant it ends, `Overloaded`), so every consumer of a
 //!   send error — the fallback, the interface — already knows what to do with it.
+//! * The retries INSIDE a turn (`play` re-sends through `send_turn` directly) do not
+//!   pass the gate again: only the turn's final state is settled. One admission, one
+//!   settlement, per turn.
 //! * One instance at a time: this never chooses another provider and never turns a
 //!   lone available one into "no candidate" — the refusal names the instance, the
 //!   kind and the instant it ends.
@@ -22,10 +25,48 @@ use std::sync::{Arc, Mutex};
 use nexus_claude::agent::ProviderError;
 
 use super::provider::limits::{
-    ask_for, from_provider_error, Admission, Ask, Gate, Outcome, Refusal, RefusalKind,
+    ask_for, from_provider_error, Admission, Ask, Gate, OurStanding, Outcome, Refusal, RefusalKind,
 };
 use super::provider::settings::{InstanceRecord, RateLimit};
 use crate::neo4j::GraphStore;
+
+/// How a turn ended, as far as the gate needs to know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ending<'a> {
+    /// The provider answered, or refused, with this typed cause (ERR-1).
+    /// `quota_refusal` is the session's own reading that the ACCOUNT refused.
+    Answered {
+        error_code: Option<&'a str>,
+        quota_refusal: bool,
+    },
+    /// The person stopped it, or its task was aborted: no verdict on the provider.
+    Interrupted,
+    /// It never left (the send failed).
+    NeverSent,
+}
+
+/// Settles the turn as interrupted when dropped unsettled.
+pub(crate) struct TurnGuard<'a> {
+    turns: &'a TurnAdmission,
+    provider_id: &'a str,
+    armed: bool,
+}
+
+impl TurnGuard<'_> {
+    /// Settles the turn with `ending` and disarms the guard.
+    pub(crate) fn settle(mut self, ending: Ending<'_>) {
+        self.armed = false;
+        self.turns.settle(self.provider_id, ending);
+    }
+}
+
+impl Drop for TurnGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.turns.settle(self.provider_id, Ending::Interrupted);
+        }
+    }
+}
 
 /// What a turn holds between its admission and its settlement.
 struct Held {
@@ -83,6 +124,12 @@ impl TurnAdmission {
             ),
             None => (Vec::new(), Ask::default(), "openai_compatible"),
         };
+        // A turn admitted earlier and never settled (its task died before the guard
+        // could run) is settled FIRST — before the gate is asked again — or its probe
+        // would still be out and this very admission refused.
+        if let Some(stale) = self.lock().take() {
+            self.settle_held(provider_id, stale, Ending::Interrupted);
+        }
         let admission = self.gate.admit(provider_id, &limits, &ask);
         if let Some(refusal) = admission.refusal() {
             return Err(refusal_error(refusal, self.gate.now()));
@@ -96,40 +143,82 @@ impl TurnAdmission {
         Ok(())
     }
 
-    /// Settles the turn admitted last: `error_code` is the typed cause the turn ended
-    /// on (ERR-1), when it ended on one. A turn that never left gives its
-    /// reservation back.
-    pub(crate) fn settle(&self, provider_id: &str, left: bool, error_code: Option<&str>) {
+    /// Settles the turn admitted last, however it ended (see [`Ending`]).
+    pub(crate) fn settle(&self, provider_id: &str, ending: Ending<'_>) {
         let Some(held) = self.lock().take() else {
             return;
         };
-        let classification = error_code
-            .filter(|code| matches!(*code, "rate_limited" | "overloaded"))
-            .map(|code| {
-                from_provider_error(
-                    code,
-                    None,
-                    self.gate.standing(provider_id, &held.limits, &held.ask),
-                    held.preset,
-                    self.gate.now(),
-                )
-            });
-        let outcome = if left {
-            Outcome::Consumed {
-                tokens: None,
-                cost_usd: None,
-            }
-        } else {
-            Outcome::NeverSent
+        self.settle_held(provider_id, held, ending);
+    }
+
+    fn settle_held(&self, provider_id: &str, held: Held, ending: Ending<'_>) {
+        let consumed = Outcome::Consumed {
+            tokens: None,
+            cost_usd: None,
         };
-        self.gate.settle(
+        match ending {
+            // A turn that never left gives its reservation back; one that was cut
+            // short keeps its unit. NEITHER says anything about the provider, and a
+            // probe among them is handed back, not counted as a recovery.
+            Ending::NeverSent => {
+                self.gate.settle_unread(
+                    provider_id,
+                    &held.limits,
+                    &held.ask,
+                    held.admission,
+                    Outcome::NeverSent,
+                );
+            }
+            Ending::Interrupted => {
+                self.gate.settle_unread(
+                    provider_id,
+                    &held.limits,
+                    &held.ask,
+                    held.admission,
+                    consumed,
+                );
+            }
+            Ending::Answered {
+                error_code,
+                quota_refusal,
+            } => {
+                // A refusal of the ACCOUNT (a 429, a 402) is the quota registry's
+                // business — the session marks it — and never an overload: it is
+                // read as a spent quota, which the breaker ignores.
+                let kind = if quota_refusal || error_code == Some("rate_limited") {
+                    Some("rate_limited")
+                } else {
+                    error_code.filter(|code| *code == "overloaded")
+                };
+                let classification = kind.map(|kind| {
+                    let ours = if kind == "rate_limited" {
+                        OurStanding::AtOrAbove
+                    } else {
+                        self.gate.standing(provider_id, &held.limits, &held.ask)
+                    };
+                    from_provider_error(kind, None, ours, held.preset, self.gate.now())
+                });
+                self.gate.settle(
+                    provider_id,
+                    &held.limits,
+                    &held.ask,
+                    held.admission,
+                    consumed,
+                    classification.as_ref(),
+                );
+            }
+        }
+    }
+
+    /// A guard for the turn in flight: if the task playing it is aborted (a
+    /// watchdog, a closed session) before it settles, dropping the guard settles it
+    /// as [`Ending::Interrupted`] — the probe is handed back instead of staying out.
+    pub(crate) fn guard<'a>(&'a self, provider_id: &'a str) -> TurnGuard<'a> {
+        TurnGuard {
+            turns: self,
             provider_id,
-            &held.limits,
-            &held.ask,
-            held.admission,
-            outcome,
-            classification.as_ref(),
-        );
+            armed: true,
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Held>> {
@@ -169,6 +258,13 @@ mod tests {
         InstanceScope, RateLimitKind, RateLimitScope, RateLimitUnit, RateLimitWindow,
     };
     use std::time::Duration;
+
+    fn answered(error_code: Option<&'static str>, quota_refusal: bool) -> Ending<'static> {
+        Ending::Answered {
+            error_code,
+            quota_refusal,
+        }
+    }
 
     fn requests(max: f64) -> RateLimit {
         RateLimit {
@@ -233,7 +329,7 @@ mod tests {
         let (turns, _clock, _gate) = admission(None);
         let record = record(1.0);
         assert!(turns.admit_record("deepseek", Some(&record)).is_ok());
-        turns.settle("deepseek", false, None);
+        turns.settle("deepseek", Ending::NeverSent);
         assert!(
             turns.admit_record("deepseek", Some(&record)).is_ok(),
             "the slot came back: the first turn was never sent"
@@ -245,10 +341,10 @@ mod tests {
         let (turns, _clock, _gate) = admission(None);
         let record = record(1.0);
         assert!(turns.admit_record("deepseek", Some(&record)).is_ok());
-        turns.settle("deepseek", true, None);
+        turns.settle("deepseek", answered(None, false));
         assert!(turns.admit_record("deepseek", Some(&record)).is_err());
         // Settling with nothing held is a no-op.
-        turns.settle("deepseek", true, None);
+        turns.settle("deepseek", answered(None, false));
     }
 
     #[test]
@@ -256,22 +352,115 @@ mod tests {
         let (turns, _clock, _gate) = admission(None);
         let record = record(10.0);
         assert!(turns.admit_record("deepseek", Some(&record)).is_ok());
-        turns.settle("deepseek", true, Some("overloaded"));
+        turns.settle("deepseek", answered(Some("overloaded"), false));
         let refused = turns.admit_record("deepseek", Some(&record)).unwrap_err();
         assert!(matches!(refused, ProviderError::Overloaded));
     }
 
     #[test]
-    fn a_rate_limited_turn_under_our_ceiling_is_an_overload_not_a_quota() {
-        let (turns, _clock, _gate) = admission(None);
+    fn a_refusal_of_the_account_never_opens_the_overload_breaker() {
+        // MUTATION: reading a quota refusal as an overload (kind forced to
+        // "overloaded") opens the pause and the second admission is refused. The
+        // account's refusal is the quota registry's, never the breaker's.
+        let (turns, _clock, gate) = admission(None);
+        let record = record(10.0);
+        for quota_refusal in [true, false] {
+            assert!(turns.admit_record("deepseek", Some(&record)).is_ok());
+            let code = if quota_refusal {
+                None
+            } else {
+                Some("rate_limited")
+            };
+            turns.settle("deepseek", answered(code, quota_refusal));
+            assert!(
+                turns.admit_record("deepseek", Some(&record)).is_ok(),
+                "a 429 (quota_refusal={quota_refusal}) is not an overload"
+            );
+            turns.settle("deepseek", Ending::NeverSent);
+        }
+        assert!(gate
+            .breaker_state("deepseek", Some("vault:deepseek"))
+            .is_none_or(|state| !state.is_open()));
+    }
+
+    /// An open pause whose time has passed: the next admission is the probe.
+    fn paused_then_ready() -> (TurnAdmission, Arc<ManualClock>, Arc<Gate>, InstanceRecord) {
+        let (turns, clock, gate) = admission(None);
         let record = record(10.0);
         assert!(turns.admit_record("deepseek", Some(&record)).is_ok());
-        turns.settle("deepseek", true, Some("rate_limited"));
-        let refused = turns.admit_record("deepseek", Some(&record)).unwrap_err();
+        turns.settle("deepseek", answered(Some("overloaded"), false));
+        clock.advance(Duration::from_secs(11));
+        (turns, clock, gate, record)
+    }
+
+    fn phase(gate: &Gate) -> crate::chat::provider::limits::Phase {
+        gate.breaker_state("deepseek", Some("vault:deepseek"))
+            .unwrap()
+            .phase
+    }
+
+    #[test]
+    fn a_probe_whose_send_failed_is_handed_back() {
+        // MUTATION: not releasing the probe when nothing is recorded leaves the
+        // breaker half-open: the second admission is refused as "a probe is already
+        // in flight".
+        let (turns, _clock, gate, record) = paused_then_ready();
+        assert!(turns.admit_record("deepseek", Some(&record)).is_ok());
+        assert_eq!(phase(&gate), crate::chat::provider::limits::Phase::HalfOpen);
+        turns.settle("deepseek", Ending::NeverSent);
         assert!(
-            matches!(refused, ProviderError::Overloaded),
-            "no quota proof: the key is not exhausted"
+            turns.admit_record("deepseek", Some(&record)).is_ok(),
+            "the next turn gets the probe again"
         );
+    }
+
+    #[test]
+    fn a_stopped_probe_is_neither_a_recovery_nor_a_failure() {
+        // MUTATION: settling an interrupted probe as an answered turn CLOSES the
+        // breaker without the provider having answered.
+        use crate::chat::provider::limits::Phase;
+        let (turns, _clock, gate, record) = paused_then_ready();
+        assert!(turns.admit_record("deepseek", Some(&record)).is_ok());
+        turns.settle("deepseek", Ending::Interrupted);
+        assert_eq!(phase(&gate), Phase::Open, "handed back, not closed");
+        assert!(turns.admit_record("deepseek", Some(&record)).is_ok());
+    }
+
+    #[test]
+    fn a_probe_refused_for_the_account_is_handed_back() {
+        // MUTATION: a quota verdict that releases nothing leaves the probe out.
+        let (turns, _clock, _gate, record) = paused_then_ready();
+        assert!(turns.admit_record("deepseek", Some(&record)).is_ok());
+        turns.settle("deepseek", answered(Some("rate_limited"), true));
+        assert!(turns.admit_record("deepseek", Some(&record)).is_ok());
+    }
+
+    #[test]
+    fn a_dropped_guard_settles_the_turn_as_interrupted() {
+        // MUTATION: a `Drop` that settles nothing (a task aborted mid-turn) leaves
+        // the probe out for the whole timeout.
+        let (turns, _clock, _gate, record) = paused_then_ready();
+        assert!(turns.admit_record("deepseek", Some(&record)).is_ok());
+        let guard = turns.guard("deepseek");
+        drop(guard);
+        assert!(
+            turns.lock().is_none(),
+            "the drop settled the held admission"
+        );
+        assert!(turns.admit_record("deepseek", Some(&record)).is_ok());
+        // A guard that settled first does not settle twice.
+        turns.guard("deepseek").settle(Ending::NeverSent);
+        assert!(turns.lock().is_none());
+    }
+
+    #[test]
+    fn a_turn_admitted_over_an_unsettled_one_settles_the_stale_one() {
+        // MUTATION: overwriting the held admission without settling it leaks the
+        // probe: the third admission is refused.
+        let (turns, _clock, _gate, record) = paused_then_ready();
+        assert!(turns.admit_record("deepseek", Some(&record)).is_ok()); // the probe
+                                                                        // Its task died; the session admits the next turn over it.
+        assert!(turns.admit_record("deepseek", Some(&record)).is_ok());
     }
 
     #[test]
@@ -309,6 +498,6 @@ mod tests {
         let (turns, _clock, _gate) = admission(None);
         // No stored instance: no configured limit, the turn goes.
         assert!(turns.admit(&graph, "ghost").await.is_ok());
-        turns.settle("ghost", true, None);
+        turns.settle("ghost", answered(None, false));
     }
 }

@@ -1912,7 +1912,7 @@ impl AgentSessionHandle {
         }
         let sent_turn = self.session.send_turn(input.clone()).await;
         if sent_turn.is_err() {
-            self.settle_admission(false, None);
+            self.settle_admission(super::turn_admission::Ending::NeverSent);
         }
         let stream = match sent_turn {
             Ok(stream) => stream,
@@ -1933,11 +1933,10 @@ impl AgentSessionHandle {
         Ok(Some((stream, input)))
     }
 
-    /// Settles the turn admitted last at the gate (RL5): what it consumed, and the typed
-    /// cause it ended on, which is what opens or closes a pause.
-    fn settle_admission(&self, left: bool, error_code: Option<&str>) {
+    /// Settles the turn admitted last at the gate (RL5), however it ended.
+    fn settle_admission(&self, ending: super::turn_admission::Ending<'_>) {
         if let Some(turns) = &self.admission {
-            turns.settle(&self.provider_id, left, error_code);
+            turns.settle(&self.provider_id, ending);
         }
     }
 
@@ -1948,8 +1947,23 @@ impl AgentSessionHandle {
         let mut turn = first;
         loop {
             if let Some((stream, input)) = turn.take() {
+                // If this task is aborted mid-turn the guard settles the admission as
+                // interrupted when dropped: the half-open probe is never left out.
+                let guard = self
+                    .admission
+                    .as_ref()
+                    .map(|turns| turns.guard(&self.provider_id));
                 let (mut outcome, pending_tools) = self.play(stream, input).await;
-                self.settle_admission(true, outcome.error_code.as_deref());
+                if let Some(guard) = guard {
+                    guard.settle(if self.interrupted.load(Ordering::SeqCst) {
+                        super::turn_admission::Ending::Interrupted
+                    } else {
+                        super::turn_admission::Ending::Answered {
+                            error_code: outcome.error_code.as_deref(),
+                            quota_refusal: outcome.quota_refusal,
+                        }
+                    });
+                }
                 outcome.interrupted = self.interrupted.load(Ordering::SeqCst);
                 self.cancel_pending_tools(outcome.interrupted, pending_tools)
                     .await;
