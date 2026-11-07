@@ -925,28 +925,39 @@ impl Neo4jClient {
         Ok(Uuid::parse_str(&ns)?)
     }
 
-    /// See [`crate::neo4j::AnalyticsStore::ensure_agent`]. One statement: the durable self, the
-    /// model identity and the edge between them are MERGEd together, so a concurrent first call
-    /// matches what the other made (both ids are under a uniqueness constraint).
+    /// See [`crate::neo4j::AnalyticsStore::ensure_agent`]. The only agent of this store is its
+    /// durable self (the root): any other id is refused, never made a node. The model, when
+    /// known, is a dated facet beside the self (`FACET_OF`), one per model name; it never
+    /// becomes the identity. One statement, so a concurrent first call matches what the
+    /// other made (ids are under a uniqueness constraint). Returns `true` when the self was
+    /// created by this call.
     pub async fn ensure_agent(&self, agent_id: Uuid, model: Option<&str>) -> Result<bool> {
         let root = self.agent_identity_namespace().await?;
+        if agent_id != root {
+            anyhow::bail!("{agent_id} is not the durable self of this store");
+        }
+        let facet = model.and_then(|m| crate::notes::provenance::model_facet_id(root, m));
+        let model_name = model
+            .and_then(crate::notes::provenance::normalized_model)
+            .unwrap_or_default();
         let now = chrono::Utc::now().to_rfc3339();
         let mut result = self
             .graph
             .execute(
                 query(
                     "MERGE (s:Agent {id: $root}) ON CREATE SET s.kind = 'self', s.created_at = $now \
-                     MERGE (f:Agent {id: $id}) \
-                     ON CREATE SET f.kind = 'model', f.created_at = $now \
-                     SET f.last_seen = $now, \
-                         f.model = CASE WHEN $model = '' THEN f.model ELSE $model END \
-                     MERGE (f)-[:FACET_OF]->(s) \
-                     RETURN f.created_at = $now AS created",
+                     WITH s, s.created_at = $now AS created \
+                     FOREACH (_ IN CASE WHEN $facet = '' THEN [] ELSE [1] END | \
+                         MERGE (f:Agent {id: $facet}) \
+                         ON CREATE SET f.kind = 'model', f.created_at = $now \
+                         SET f.model = $model, f.last_seen = $now \
+                         MERGE (f)-[:FACET_OF]->(s)) \
+                     RETURN created",
                 )
                 .param("root", root.to_string())
-                .param("id", agent_id.to_string())
+                .param("facet", facet.map(|f| f.to_string()).unwrap_or_default())
                 .param("now", now)
-                .param("model", model.unwrap_or_default().to_string()),
+                .param("model", model_name),
             )
             .await?;
         let row = result
@@ -959,6 +970,7 @@ impl Neo4jClient {
     /// See [`crate::neo4j::AnalyticsStore::backfill_agents`].
     pub async fn backfill_agents(&self) -> Result<AgentBackfill> {
         let before = self.count_model_agents().await?;
+        let root = self.agent_identity_namespace().await?;
 
         let mut from_notes = std::collections::HashSet::new();
         let mut note_edges: Vec<(Uuid, Uuid)> = Vec::new();
@@ -1004,9 +1016,26 @@ impl Neo4jClient {
             }
         }
 
-        for id in from_notes.union(&from_episodes) {
-            self.ensure_agent(*id, None).await?;
+        // Actors written before the durable self named the MODEL facet: each one resolves to
+        // the self through its `FACET_OF`. An id this store does not know resolves to nothing
+        // and draws nothing, never to another agent.
+        let mut resolved: std::collections::HashMap<Uuid, Uuid> = Default::default();
+        for raw in from_notes.union(&from_episodes) {
+            if let Some(s) = self.durable_of(*raw, root).await? {
+                resolved.insert(*raw, s);
+            }
         }
+        if !resolved.is_empty() {
+            self.ensure_agent(root, None).await?;
+        }
+        let note_edges: Vec<(Uuid, Uuid)> = note_edges
+            .into_iter()
+            .filter_map(|(a, n)| resolved.get(&a).map(|s| (*s, n)))
+            .collect();
+        let episode_edges: Vec<(Uuid, Uuid)> = episode_edges
+            .into_iter()
+            .filter_map(|(a, e)| resolved.get(&a).map(|s| (*s, e)))
+            .collect();
 
         // The same edges the write path draws, rebuilt from what is already written: one
         // path, not two that could diverge.
@@ -1032,6 +1061,31 @@ impl Neo4jClient {
             authored,
             lived,
         })
+    }
+
+    /// The durable self an agent id stands for in this store: the root itself, or the self
+    /// a model facet of this store hangs under (`FACET_OF`, the actors written before the
+    /// self was the identity). `None` for any other id: a foreign agent is never resolved.
+    async fn durable_of(&self, id: Uuid, root: Uuid) -> Result<Option<Uuid>> {
+        if id == root {
+            return Ok(Some(root));
+        }
+        let mut rows = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (f:Agent {id: $id, kind: 'model'})-[:FACET_OF]->(s:Agent {id: $root}) \
+                     RETURN count(f) AS n",
+                )
+                .param("id", id.to_string())
+                .param("root", root.to_string()),
+            )
+            .await?;
+        let n: i64 = match rows.next().await? {
+            Some(row) => row.get("n")?,
+            None => 0,
+        };
+        Ok((n > 0).then_some(root))
     }
 
     async fn count_model_agents(&self) -> Result<usize> {
