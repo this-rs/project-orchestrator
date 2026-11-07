@@ -280,14 +280,53 @@ enum SelfRead {
 impl SelfRead {
     /// The line the prompt carries, newline included. Outside the untrusted container:
     /// it is the system's own account, not a note's text.
-    fn line(&self) -> String {
+    ///
+    /// `injected` is what actually reached the prompt after the character budget: when it
+    /// is below `read`, saying only "read" would overstate what the model was given.
+    fn line(&self, injected: usize) -> String {
         match self {
-            SelfRead::Read { read, available } => {
+            SelfRead::Read { read, available } if injected >= *read => {
                 format!("notes du soi : {read} lues / {available} disponibles\n")
             }
-            SelfRead::Unresolved(reason) => format!("self_unresolved: {reason}\n"),
+            SelfRead::Read { read, available } => format!(
+                "notes du soi : {read} lues / {available} disponibles, \
+                 {injected} injectées (budget)\n"
+            ),
+            SelfRead::Unresolved(reason) => {
+                format!("self_unresolved: {}\n", one_line_reason(reason))
+            }
         }
     }
+}
+
+/// The longest reason kept in the prompt's own account.
+const SELF_REASON_CHARS: usize = 160;
+
+/// Flattens a reason to ONE line, bounded.
+///
+/// The reason comes from a graph error, and it is written OUTSIDE the untrusted
+/// container: a multi-line error carrying note text would be served as the system's own
+/// voice. Newlines are collapsed and the tail is dropped, so the reason can inform but
+/// never impersonate another part of the prompt.
+fn one_line_reason(reason: &str) -> String {
+    let mut flat = String::with_capacity(reason.len().min(SELF_REASON_CHARS) + 8);
+    let mut last_was_space = false;
+    for c in reason.chars() {
+        if flat.chars().count() >= SELF_REASON_CHARS {
+            flat.push('…');
+            break;
+        }
+        if c.is_control() || c.is_whitespace() {
+            if !last_was_space && !flat.is_empty() {
+                flat.push(' ');
+                last_was_space = true;
+            }
+            continue;
+        }
+        flat.push(c);
+        last_was_space = false;
+    }
+    flat.trim_end().to_string()
 }
 
 /// One line of the foundation, EXACTLY as the renderer writes it.
@@ -821,14 +860,17 @@ impl KnowledgeInjectionStage {
             group.push_str(entry);
             injected.insert(note.id.clone());
         }
-        // An empty foundation is not a section — unless the self could not be resolved:
-        // an empty block WITH its reason is the whole point, never a silent one.
-        if group.is_empty() && !matches!(self_read, SelfRead::Unresolved(_)) {
+        // An empty foundation is not a section — unless there is something to say about it:
+        // an unresolved self (its reason IS the content), or notes that WERE read and then
+        // dropped by the character budget. Silence in that last case would hide a read
+        // that did happen, which is exactly what « la part lue est dite » forbids.
+        let dropped_by_budget = !kept.is_empty() && group.is_empty();
+        if group.is_empty() && !dropped_by_budget && !matches!(self_read, SelfRead::Unresolved(_)) {
             return injected;
         }
 
         let mut content = String::from("### Foundational Notes\n");
-        content.push_str(&self_read.line());
+        content.push_str(&self_read.line(injected.len()));
         content.push_str(&untrusted_group("note", &group, project));
         output.add_section(
             "Foundational Notes",
@@ -3436,7 +3478,9 @@ mod tests {
                 note.id,
                 KnowledgeScope::Global,
                 None,
-                &Provenance::new("test", "lié par le test"),
+                &Provenance::new("test", "lié par le test")
+                    .accountable()
+                    .expect("une provenance de test n'est pas vide"),
             )
             .await
             .unwrap();

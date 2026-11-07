@@ -903,6 +903,40 @@ mod tests {
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::*;
 
+    /// Le refus est porté par la SIGNATURE, pas par une convention d'appel.
+    ///
+    /// `AccountableProvenance` a un champ privé : hors de ce module, on ne peut pas en
+    /// fabriquer une sans passer par `new`/`scored`/`accountable`, qui refusent le vide.
+    /// Mais ce verrou ne vaut que si les écrivains d'arêtes dérivées prennent VRAIMENT ce
+    /// type : une signature revenue à `&Provenance` rouvrirait la porte, et un test
+    /// d'exécution ne le verrait pas — un `Provenance` vide y est déjà impossible à
+    /// construire, donc « aucune arête écrite » y serait vrai par construction. Ce test-ci
+    /// lit les déclarations du trait et rougit sur la dérive.
+    #[test]
+    fn the_writers_of_derived_edges_accept_only_an_accountable_provenance() {
+        const TRAITS: &str = include_str!("../neo4j/traits.rs");
+        for writer in ["link_agent_knows", "link_agent_uses", "coactivate_session"] {
+            let start = TRAITS
+                .find(&format!("fn {writer}("))
+                .unwrap_or_else(|| panic!("{writer} a disparu du trait de stockage"));
+            let end = start
+                + TRAITS[start..]
+                    .find(';')
+                    .expect("une déclaration de méthode se termine par ;");
+            let signature = &TRAITS[start..end];
+            assert!(
+                signature.contains("AccountableProvenance"),
+                "{writer} doit prendre un AccountableProvenance, or sa signature est :\n\
+                 {signature}"
+            );
+            assert!(
+                !signature.contains("provenance: &Provenance"),
+                "{writer} accepte de nouveau une provenance nue, que rien n'oblige à \
+                 justifier :\n{signature}"
+            );
+        }
+    }
+
     /// Une lecture ratée ne doit RIEN détruire : la réconciliation est sautée, pas
     /// appliquée sur un `keep` vide — sinon une erreur transitoire effacerait le socle.
     #[tokio::test]

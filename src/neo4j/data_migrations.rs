@@ -49,7 +49,10 @@ const MAX_RETRIES: u32 = 5;
 
 /// Hard cap on batches per migration and start, against a batch query that
 /// would keep reporting progress without converging.
-const MAX_BATCHES: u32 = 10_000;
+///
+/// The agent-identity migration (`chat.rs`, `move_facet_edges`) shares this cap:
+/// its loop also DELETEs what it moves, so it must converge too.
+pub(crate) const MAX_BATCHES: u32 = 10_000;
 
 /// Edges per statement of the agent-identity migration (`chat.rs`,
 /// `migrate_agent_edges_to_self`). Each statement MERGEs one edge on the self
@@ -884,7 +887,7 @@ impl Neo4jClient {
                 processed: i64::try_from(report.moved_authored + report.moved_lived)
                     .unwrap_or(i64::MAX),
                 deferred: 0,
-                batches: 0,
+                batches: u32::try_from(report.batches).unwrap_or(u32::MAX),
                 completed: true,
                 error: None,
             },
