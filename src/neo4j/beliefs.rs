@@ -152,13 +152,29 @@ impl Neo4jClient {
     }
 
     /// See [`crate::neo4j::AnalyticsStore::list_assertion_notes`].
+    ///
+    /// Le prédicat n'est pas `IS NOT NULL` : `create_note` écrit `assertion_rule_json` sur
+    /// **toutes** les notes, avec la chaîne VIDE quand il n'y a pas de règle. `IS NOT NULL`
+    /// matchait donc tout le corpus — mesuré le 07/11 sur l'instance vivante : **30 813**
+    /// notes, dont **zéro** portant une vraie règle. La re-vérification examinait les 200
+    /// plus anciennes (aucune croyance), publiait `unverifiable: 200`, et n'aurait jamais
+    /// atteint une croyance créée après elles. Le mock, lui, filtrait sur la règle parsée :
+    /// d'où un écart mock/réel qu'aucun test ne voyait.
+    ///
+    /// L'ordre fait aussi le TOUR des croyances : `last_checked_at` d'abord (les jamais
+    /// vérifiées, puis les plus anciennement vérifiées), sinon `created_at`. Sans ça, une
+    /// limite de 200 figerait éternellement le même sous-ensemble.
     pub async fn list_assertion_notes(&self, limit: usize) -> Result<Vec<Note>> {
         let mut rows = self
             .graph
             .execute(
                 query(
-                    "MATCH (n:Note) WHERE n.assertion_rule_json IS NOT NULL \
-                     RETURN n ORDER BY n.created_at ASC LIMIT $limit",
+                    "MATCH (n:Note) \
+                     WHERE n.assertion_rule_json IS NOT NULL \
+                       AND n.assertion_rule_json <> '' \
+                       AND n.assertion_rule_json <> 'null' \
+                     RETURN n \
+                     ORDER BY coalesce(n.last_checked_at, n.created_at) ASC LIMIT $limit",
                 )
                 .param("limit", limit as i64),
             )
