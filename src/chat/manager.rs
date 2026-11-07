@@ -358,6 +358,37 @@ pub struct LiveSessionSnapshot {
     pub states: std::collections::HashMap<Uuid, crate::chat::segment_state::Verdict>,
 }
 
+/// A peer's message that resumes a released session (`inject_team_message`).
+pub(crate) struct TeamInbound {
+    pub from_session_id: Uuid,
+    pub from_name: String,
+    pub text: String,
+}
+
+/// The event a resume stores and broadcasts for its inbound message, with its stored type:
+/// a person's `user_message`, or a peer's typed `team_message` that keeps its sender.
+pub(crate) fn inbound_event(
+    message: &str,
+    team: Option<&TeamInbound>,
+) -> (ChatEvent, &'static str) {
+    match team {
+        Some(t) => (
+            ChatEvent::TeamMessage {
+                from_session_id: t.from_session_id,
+                from_name: t.from_name.clone(),
+                content: t.text.clone(),
+            },
+            "team_message",
+        ),
+        None => (
+            ChatEvent::UserMessage {
+                content: message.to_string(),
+            },
+            "user_message",
+        ),
+    }
+}
+
 /// Count the live `(monitors, bash)` among a session's tracked background
 /// tasks.
 ///
@@ -1191,6 +1222,10 @@ pub struct ChatManager {
     /// Rate-limiting state for `inject_team_message`: sliding window per
     /// (from_session_id, to_session_id) pair. Cleared lazily (no background task).
     pub(crate) team_msg_rate: tokio::sync::Mutex<HashMap<(Uuid, String), Vec<std::time::Instant>>>,
+    /// The Claude Code sessions `release_done_sessions` closed because their segment was
+    /// Done. Only those are resumed by a team message (`inject_team_message`); any other
+    /// close (a person's, the idle cleanup's) clears the mark.
+    pub(crate) released_done: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 // ============================================================================
@@ -3929,6 +3964,7 @@ impl ChatManager {
             session_pool: Arc::new(super::session_pool::SessionPool::from_env()),
             cancelled_parents: Default::default(),
             team_msg_rate: Default::default(),
+            released_done: Default::default(),
             codex: Default::default(),
         }
     }
@@ -4045,6 +4081,7 @@ impl ChatManager {
             session_pool: Arc::new(super::session_pool::SessionPool::from_env()),
             cancelled_parents: Default::default(),
             team_msg_rate: Default::default(),
+            released_done: Default::default(),
             codex: Default::default(),
         }
     }
@@ -11475,18 +11512,37 @@ impl ChatManager {
             auto_continue,
         )) = session_state
         else {
-            // Not live on the Claude Code engine. A session released when its segment was
-            // Done (`release_done_sessions`) is resumed by the message, as a person's
-            // message would resume it; one the agent engine holds, or that does not
-            // exist, is an error as before.
-            if self.agent_runtime.owns(to_session_id).await {
+            // Not live on the Claude Code engine. A session released because its segment
+            // was Done is resumed by the message, as a person's message would resume it;
+            // anything else (closed by a person, idle cleanup, never existed, held by the
+            // agent engine) stays "not found".
+            let released = self
+                .released_done
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(to_session_id);
+            if !released || self.agent_runtime.owns(to_session_id).await {
                 return Err(anyhow!(
                     "inject_team_message: target session {} not found",
                     to_session_id
                 ));
             }
+            let team = TeamInbound {
+                from_session_id,
+                from_name: from_name.to_string(),
+                text: text.to_string(),
+            };
+            let from = self.resume_point(to_session_id).await;
+            let mut opened_on = None;
             return self
-                .resume_session(to_session_id, &format!("[team {}] {}", from_name, text), None)
+                .resume_session_on(
+                    to_session_id,
+                    &format!("[team {}] {}", from_name, text),
+                    None,
+                    from,
+                    &mut opened_on,
+                    Some(&team),
+                )
                 .await
                 .map_err(|e| {
                     anyhow!(
@@ -13387,7 +13443,7 @@ impl ChatManager {
     ) -> Result<()> {
         let mut opened_on: Option<String> = None;
         let result = self
-            .resume_session_on(session_id, message, user_claims, from, &mut opened_on)
+            .resume_session_on(session_id, message, user_claims, from, &mut opened_on, None)
             .await;
         // A failure once the session is read names ITS provider (B6).
         result.map_err(|e| match opened_on {
@@ -13405,6 +13461,7 @@ impl ChatManager {
         user_claims: Option<&crate::auth::jwt::Claims>,
         from: ResumeFrom,
         opened_on: &mut Option<String>,
+        team: Option<&TeamInbound>,
     ) -> Result<()> {
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
         let seen = from.0;
@@ -13450,7 +13507,7 @@ impl ChatManager {
                 .await;
         }
 
-        self.reopen_legacy_session(&session_node, message, user_claims, None)
+        self.reopen_legacy_session_for(&session_node, message, user_claims, None, true, team)
             .await
     }
 
@@ -13479,6 +13536,21 @@ impl ChatManager {
         user_claims: Option<&crate::auth::jwt::Claims>,
         relay: Option<&super::relay::RelayedFrom>,
         fresh_if_refused: bool,
+    ) -> Result<()> {
+        self.reopen_legacy_session_for(node, message, user_claims, relay, fresh_if_refused, None)
+            .await
+    }
+
+    /// [`Self::reopen_legacy_session_with`]; `team` makes the stored and broadcast inbound
+    /// event the peer's typed `team_message` instead of a user message.
+    async fn reopen_legacy_session_for(
+        &self,
+        node: &ChatSessionNode,
+        message: &str,
+        user_claims: Option<&crate::auth::jwt::Claims>,
+        relay: Option<&super::relay::RelayedFrom>,
+        fresh_if_refused: bool,
+        team: Option<&TeamInbound>,
     ) -> Result<()> {
         let sid = node.id.to_string();
         let session_id: &str = sid.as_str();
@@ -13961,34 +14033,33 @@ impl ChatManager {
             },
         );
 
-        // Persist the user_message event
+        // The inbound event: a person's message, or a peer's (typed, with its sender).
+        let (inbound, inbound_type) = inbound_event(message, team);
         let user_event = ChatEventRecord {
             id: Uuid::new_v4(),
             session_id: uuid,
             seq: next_seq.fetch_add(1, Ordering::SeqCst),
-            event_type: "user_message".to_string(),
-            data: serde_json::to_string(&ChatEvent::UserMessage {
-                content: message.to_string(),
-            })
-            .unwrap_or_default(),
+            event_type: inbound_type.to_string(),
+            data: serde_json::to_string(&inbound).unwrap_or_default(),
             created_at: chrono::Utc::now(),
         };
         let _ = self.graph.store_chat_events(uuid, vec![user_event]).await;
-        // The message that resumes the session is a user message: it counts
-        // (`session_record`), as on the agent engine.
-        if let Err(e) = super::session_record::count_user_message(&self.graph, uuid).await {
-            warn!(session_id, error = %e, "Failed to count the resuming message (non-fatal)");
+        if team.is_none() {
+            // The message that resumes the session is a user message: it counts
+            // (`session_record`), as on the agent engine.
+            if let Err(e) = super::session_record::count_user_message(&self.graph, uuid).await {
+                warn!(session_id, error = %e, "Failed to count the resuming message (non-fatal)");
+            }
         }
 
-        // Emit user_message on local broadcast + NATS
-        let user_msg_event = ChatEvent::UserMessage {
-            content: message.to_string(),
-        };
-        let _ = events_tx.send(user_msg_event.clone());
+        // Emit the inbound event on local broadcast + NATS
+        let _ = events_tx.send(inbound.clone());
         if let Some(ref nats) = self.nats {
-            nats.publish_chat_event(session_id, user_msg_event);
+            nats.publish_chat_event(session_id, inbound);
         }
-        self.notify_attention(session_id, AttentionReason::UserMessage);
+        if team.is_none() {
+            self.notify_attention(session_id, AttentionReason::UserMessage);
+        }
 
         // Stream in background
         let session_id_str = session_id.to_string();
@@ -19772,6 +19843,12 @@ impl ChatManager {
         if let Ok(uuid) = Uuid::parse_str(session_id) {
             self.anchor_cache.forget(uuid);
         }
+        // Any close but the Done release (which marks the session AFTER this) ends the
+        // team's right to resume it.
+        self.released_done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
         self.turn_routing.remove(session_id);
         self.close_routing_decision(session_id).await;
         let objective_state = self
@@ -20012,14 +20089,53 @@ impl ChatManager {
                 continue;
             }
             let sid = id.to_string();
+            // A message may have landed since the second read: only an idle session with an
+            // empty queue is closed, or its new turn would be interrupted.
+            if !self.is_idle_for_release(&sid).await {
+                continue;
+            }
+            // A delegated child or an open sub-agent mirror still running: the parent is
+            // not finished (the verdict counts monitors and bash tasks only).
+            let has_live_child = self
+                .session_children(&sid)
+                .await
+                .iter()
+                .filter_map(|c| c.parse::<Uuid>().ok())
+                .any(|c| still.live.contains(&c));
+            if has_live_child {
+                continue;
+            }
             let reason = still.states.get(&id).map(|v| v.reason.clone());
             info!(session_id = %sid, reason = ?reason, "Session done: its mission is over, releasing it");
+            let legacy = !self.agent_runtime.owns(&sid).await;
             match self.close_session(&sid).await {
-                Ok(()) => released.push(sid),
+                Ok(()) => {
+                    if legacy {
+                        self.released_done
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(sid.clone());
+                    }
+                    released.push(sid)
+                }
                 Err(e) => warn!(session_id = %sid, error = %e, "Failed to release a done session"),
             }
         }
         released
+    }
+
+    /// Whether `session_id` is still idle right now: no turn running, nothing queued.
+    pub(crate) async fn is_idle_for_release(&self, session_id: &str) -> bool {
+        if let Some(handle) = self.agent_runtime.get(session_id).await {
+            return !handle.is_streaming.load(Ordering::SeqCst) && handle.queued_len().await == 0;
+        }
+        let sessions = self.active_sessions.read().await;
+        match sessions.get(session_id) {
+            Some(s) => {
+                !s.is_streaming.load(Ordering::SeqCst) && s.pending_messages.lock().await.is_empty()
+            }
+            None => false,
+        }
     }
 
     /// The agent engine's sessions the idle cleanup closes, by the rule of the

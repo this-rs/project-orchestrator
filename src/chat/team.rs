@@ -801,4 +801,136 @@ mod tests {
             "the resume was attempted: {err}"
         );
     }
+
+    /// Only a session released as Done is resumed by a team message: one that is stored
+    /// but was closed otherwise stays "not found", and any later close clears the mark.
+    #[tokio::test]
+    async fn a_team_message_resumes_only_a_session_released_as_done() {
+        let manager = make_manager();
+        let id = Uuid::new_v4().to_string();
+        let err = manager
+            .inject_team_message(Uuid::new_v4(), "peer", &id, "hi")
+            .await
+            .expect_err("never released");
+        assert!(!err.to_string().contains("resuming"), "{err}");
+        assert!(err.to_string().contains("not found"), "{err}");
+
+        let live = Uuid::new_v4().to_string();
+        test_support::insert_live_session_without_cli(&manager, &live).await;
+        let later = finish_a_turn(&manager, &live).await;
+        assert_eq!(
+            manager.release_done_sessions_at(later).await,
+            vec![live.clone()]
+        );
+        assert!(manager.released_done.lock().unwrap().contains(&live));
+        // A person (or the idle cleanup) closing it afterwards ends the right to resume.
+        let _ = manager.close_session(&live).await;
+        assert!(!manager.released_done.lock().unwrap().contains(&live));
+        let err = manager
+            .inject_team_message(Uuid::new_v4(), "peer", &live, "hi")
+            .await
+            .expect_err("closed otherwise");
+        assert!(!err.to_string().contains("resuming"), "{err}");
+    }
+
+    /// The resumed message is stored and broadcast as the typed team event with its sender,
+    /// never as a user message.
+    #[test]
+    fn a_resumed_team_message_keeps_its_type_and_sender() {
+        use crate::chat::manager::{inbound_event, TeamInbound};
+        use crate::chat::types::ChatEvent;
+        let from = Uuid::new_v4();
+        let team = TeamInbound {
+            from_session_id: from,
+            from_name: "peer".into(),
+            text: "raw text".into(),
+        };
+        let (event, kind) = inbound_event("[team peer] raw text", Some(&team));
+        assert_eq!(kind, "team_message");
+        match event {
+            ChatEvent::TeamMessage {
+                from_session_id,
+                from_name,
+                content,
+            } => {
+                assert_eq!(from_session_id, from);
+                assert_eq!(from_name, "peer");
+                assert_eq!(content, "raw text", "stored raw, not the prefixed prompt");
+            }
+            other => panic!("expected a team message, got {other:?}"),
+        }
+        let (event, kind) = inbound_event("hello", None);
+        assert_eq!(kind, "user_message");
+        assert!(matches!(event, ChatEvent::UserMessage { content } if content == "hello"));
+    }
+
+    /// A message that lands after the verdict is read keeps its session: only an idle
+    /// session with an empty queue is released.
+    #[tokio::test]
+    async fn a_session_that_got_busy_since_the_verdict_is_not_released() {
+        let manager = make_manager();
+        let id = Uuid::new_v4().to_string();
+        test_support::insert_live_session_without_cli(&manager, &id).await;
+        assert!(manager.is_idle_for_release(&id).await);
+        {
+            let sessions = manager.active_sessions.read().await;
+            sessions[&id].is_streaming.store(true, Ordering::SeqCst);
+        }
+        assert!(!manager.is_idle_for_release(&id).await, "a turn started");
+        {
+            let sessions = manager.active_sessions.read().await;
+            sessions[&id].is_streaming.store(false, Ordering::SeqCst);
+            sessions[&id].pending_messages.lock().await.push_back(
+                crate::chat::types::PendingMessage::team_message(
+                    "x".into(),
+                    Uuid::new_v4(),
+                    "p".into(),
+                ),
+            );
+        }
+        assert!(!manager.is_idle_for_release(&id).await, "a message waits");
+        assert!(
+            !manager.is_idle_for_release("absent").await,
+            "not live: nothing to release"
+        );
+    }
+
+    /// A Done session with a delegated child (or open sub-agent mirror) still live is not
+    /// finished: it is kept.
+    #[tokio::test]
+    async fn a_done_session_with_a_live_child_is_not_released() {
+        use crate::neo4j::models::ChatSessionNode;
+        use crate::neo4j::traits::*;
+        let mock = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let graph: std::sync::Arc<dyn crate::neo4j::traits::GraphStore> = mock.clone();
+        let manager = ChatManager::new_without_memory(
+            graph,
+            mock_app_state().meili,
+            test_support::chat_config(),
+        );
+        let parent = ChatSessionNode {
+            ..crate::test_helpers::test_chat_session(None)
+        };
+        let child = ChatSessionNode {
+            spawned_by: Some(
+                crate::chat::types::SpawnedBy::Conversation {
+                    parent_session_id: parent.id,
+                    tool_use_id: Some("toolu_c".into()),
+                }
+                .to_json_string(),
+            ),
+            ..crate::test_helpers::test_chat_session(None)
+        };
+        mock.create_chat_session(&parent).await.unwrap();
+        mock.create_chat_session(&child).await.unwrap();
+        let (p, c) = (parent.id.to_string(), child.id.to_string());
+        test_support::insert_live_session_without_cli(&manager, &p).await;
+        test_support::insert_live_session_without_cli(&manager, &c).await;
+        let later = finish_a_turn(&manager, &p).await;
+        assert!(
+            !manager.release_done_sessions_at(later).await.contains(&p),
+            "a live child keeps its parent"
+        );
+        assert!(manager.is_session_active(&p).await);
+    }
 }
