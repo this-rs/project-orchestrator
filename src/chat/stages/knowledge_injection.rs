@@ -3340,6 +3340,195 @@ mod tests {
         );
     }
 
+    // ── Le soi durable, lu comme un nœud (T4) ───────────────────────────
+    //
+    // Trois contraintes, chacune tenue par un test : « la part lue est dite » (la borne
+    // de lecture est DANS le texte injecté, pas seulement dans un journal) ; « l'ancrage
+    // ne peut pas mentir » (un soi non résolu produit un bloc vide avec sa raison, jamais
+    // le contexte d'un autre) ; et deux stores, donc deux soi, donnent deux contextes.
+
+    /// Une entrée de conversation sans projet : seule l'échelle globale du soi est servie.
+    fn input_without_project(message: &str) -> EnrichmentInput {
+        EnrichmentInput {
+            message: message.to_string(),
+            session_id: Uuid::new_v4(),
+            project_slug: None,
+            project_id: None,
+            cwd: None,
+            protocol_run_id: None,
+            protocol_state: None,
+            excluded_note_ids: Default::default(),
+            restricted_content: false,
+            reasoning_path_tracker: None,
+        }
+    }
+
+    /// Une note globale que `agent` connaît (`KNOWS`, échelle globale), créée dans `graph`.
+    async fn note_known_by(
+        graph: &crate::neo4j::mock::MockGraphStore,
+        agent: Uuid,
+        content: &str,
+    ) -> Uuid {
+        use crate::graph::rules::{KnowledgeScope, Provenance};
+        use crate::notes::{Note, NoteType};
+        let note = Note::new(
+            None,
+            NoteType::Guideline,
+            content.to_string(),
+            "test-agent".to_string(),
+        );
+        graph.create_note(&note).await.unwrap();
+        graph
+            .link_agent_knows(
+                agent,
+                note.id,
+                KnowledgeScope::Global,
+                None,
+                &Provenance::new("test", "lié par le test"),
+            )
+            .await
+            .unwrap();
+        note.id
+    }
+
+    fn foundation_section(output: &StageOutput) -> Option<String> {
+        output
+            .sections
+            .iter()
+            .find(|s| s.title == "Foundational Notes")
+            .map(|s| s.content.clone())
+    }
+
+    #[tokio::test]
+    async fn the_injected_block_says_how_much_of_the_self_was_read() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
+        use crate::neo4j::mock::MockGraphStore;
+
+        let graph = Arc::new(MockGraphStore::new());
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        // Plus de notes que la borne de lecture : la part NON lue doit être dite.
+        let total = MAX_PINNED_NOTES + 2;
+        for i in 0..total {
+            note_known_by(&graph, self_id, &format!("socle numéro {i}")).await;
+        }
+
+        let stage = stage_with_pinned(vec![], graph);
+        let output = stage
+            .execute(&input_without_project("une question quelconque"))
+            .await
+            .unwrap();
+        let content = foundation_section(&output).expect("le soi connaît des notes");
+        let expected = format!("notes du soi : {MAX_PINNED_NOTES} lues / {total} disponibles");
+        assert!(
+            content.contains(&expected),
+            "la part lue doit être dite DANS le bloc injecté ({expected:?}), reçu :\n{content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_self_yields_an_empty_block_with_its_reason() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
+        use crate::neo4j::mock::MockGraphStore;
+
+        let graph = Arc::new(MockGraphStore::new());
+        // Un autre agent, dans le même store, connaît une note : ce n'est PAS le soi.
+        let stranger = Uuid::new_v4();
+        note_known_by(&graph, stranger, "le socle d'un autre agent").await;
+        graph
+            .fail_agent_identity
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let stage = stage_with_pinned(vec![], graph);
+        let output = stage
+            .execute(&input_without_project("bonjour"))
+            .await
+            .unwrap();
+        let content = foundation_section(&output)
+            .expect("un soi non résolu doit être dit, pas tu : le bloc existe, avec sa raison");
+        assert!(
+            content.contains("self_unresolved:"),
+            "la raison doit être explicite dans le bloc, reçu :\n{content}"
+        );
+        assert!(
+            content.contains("identity root"),
+            "la raison nomme ce qui n'a pas pu être lu, reçu :\n{content}"
+        );
+        assert!(
+            !content.contains("socle d'un autre agent"),
+            "aucun repli sur le périmètre d'un autre agent, reçu :\n{content}"
+        );
+        assert!(
+            !content.contains("lues /"),
+            "un soi non résolu n'annonce aucune part lue, reçu :\n{content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_distinct_selves_receive_two_distinct_contexts() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
+        use crate::neo4j::mock::MockGraphStore;
+
+        let first = Arc::new(MockGraphStore::new());
+        let second = Arc::new(MockGraphStore::new());
+        let first_self = first.agent_identity_namespace().await.unwrap();
+        let second_self = second.agent_identity_namespace().await.unwrap();
+        assert_ne!(first_self, second_self, "deux stores, deux soi");
+        note_known_by(&first, first_self, "ce que le premier soi sait").await;
+        note_known_by(&second, second_self, "ce que le second soi sait").await;
+
+        let input = input_without_project("même question pour les deux");
+        let of_first = foundation_section(
+            &stage_with_pinned(vec![], first)
+                .execute(&input)
+                .await
+                .unwrap(),
+        )
+        .expect("le premier soi connaît une note");
+        let of_second = foundation_section(
+            &stage_with_pinned(vec![], second)
+                .execute(&input)
+                .await
+                .unwrap(),
+        )
+        .expect("le second soi connaît une note");
+
+        assert_ne!(of_first, of_second);
+        assert!(of_first.contains("le premier soi sait"));
+        assert!(!of_first.contains("le second soi sait"));
+        assert!(of_second.contains("le second soi sait"));
+        assert!(!of_second.contains("le premier soi sait"));
+    }
+
+    /// Le soi est le soi DURABLE du store, pas un modèle : aucun fournisseur de modèle
+    /// n'est nommé dans ce fichier. Les noms sont assemblés à l'exécution pour que ce test
+    /// ne se compte pas lui-même.
+    #[test]
+    fn no_model_provider_is_named_in_this_file() {
+        let source = include_str!("knowledge_injection.rs").to_lowercase();
+        let forbidden = [
+            ["anthr", "opic"].concat(),
+            ["open", "ai"].concat(),
+            ["oll", "ama"].concat(),
+            ["mis", "tral"].concat(),
+            ["coh", "ere"].concat(),
+        ];
+        // Comme identifiant : « coherent » ne compte pas, « <nom>_key » compte.
+        let named_as_identifier = |name: &str| {
+            source.match_indices(name).any(|(at, _)| {
+                let before = source[..at].chars().next_back();
+                let after = source[at + name.len()..].chars().next();
+                !before.is_some_and(|c| c.is_ascii_alphabetic())
+                    && !after.is_some_and(|c| c.is_ascii_alphabetic())
+            })
+        };
+        for name in forbidden {
+            assert!(
+                !named_as_identifier(&name),
+                "l'injection du soi ne nomme aucun fournisseur de modèle, trouvé {name:?}"
+            );
+        }
+    }
+
     // ── Scaffolding integration tests ─────────────────────────────────
 
     /// Helper: create a KnowledgeInjectionStage with a pre-populated MockGraphStore
