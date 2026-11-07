@@ -4101,8 +4101,9 @@ mod provider_switch {
         let id = Uuid::parse_str(&sid).unwrap();
         // T5: the session has two notes in context at the close, which welds them (SYNAPSE).
         // The switch, which is not an end, must weld nothing. The registry is process-wide and
-        // another test's snapshot prunes the sessions it does not see, so the notes are recorded
-        // as late as possible: right before the close.
+        // another test's snapshot forgets the sessions it does not see live: this session is
+        // pinned, so the assertion no longer depends on what the other tests do.
+        crate::chat::activation_registry::pin_for_test(id);
         w.manager
             .switch_session_provider(&sid, "local2", None, "second question", None)
             .await
