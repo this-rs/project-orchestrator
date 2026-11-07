@@ -4099,6 +4099,9 @@ mod provider_switch {
         w.graph.create_project(&project).await.unwrap();
         let sid = first_turn(&w).await;
         let id = Uuid::parse_str(&sid).unwrap();
+        // T5: the session had two notes in context. The close welds them (SYNAPSE); the
+        // switch, which is not an end, must not.
+        crate::chat::activation_registry::record_notes(id, [Uuid::new_v4(), Uuid::new_v4()]);
 
         w.manager
             .switch_session_provider(&sid, "local2", None, "second question", None)
@@ -4110,7 +4113,25 @@ mod provider_switch {
                 .any(|e| e.event_type == "assistant_text" && e.data.contains("the answer"))
         })
         .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            w.graph.synapses.read().await.is_empty(),
+            "a switch welds nothing: {:?}",
+            w.graph.synapses.read().await.len()
+        );
+
         w.manager.close_session(&sid).await.unwrap();
+        for _ in 0..200 {
+            if !w.graph.synapses.read().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            w.graph.synapses.read().await.len(),
+            1,
+            "the close welds the two notes in context: one pair"
+        );
         // Detached write: wait for it, then count EVERY write — a switch that wrote one
         // would show as a second call (the stable id would hide it in the store).
         super::wait_for_session_episode_saves(&w.graph, 1).await;
