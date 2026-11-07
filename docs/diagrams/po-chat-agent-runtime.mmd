@@ -1,5 +1,5 @@
 %% name: po-chat-agent-runtime
-%% covers: backend:src/chat/{agent_runtime,agent_hooks,cancel_relay,session_grants,lasting_rules,manual_compaction,spill,team}.rs backend:src/chat/provider/{transcripts,hooks}.rs backend:src/api/team_handlers.rs backend:src/chat/activation_registry.rs
+%% covers: backend:src/chat/{agent_runtime,agent_hooks,cancel_relay,session_grants,lasting_rules,manual_compaction,spill,team,turn_admission}.rs backend:src/chat/provider/{transcripts,hooks}.rs backend:src/api/team_handlers.rs backend:src/chat/activation_registry.rs
 %% verified: dc44f321
 %% ---
 %% PROUVE : le moteur « agent » du chat (tâche B13) : comment un AgentSession nexus est piloté, ce qu'il
@@ -97,3 +97,5 @@ flowchart TD
     EMIT --> DEGR
     DEGR --> LOST
     CTL --> CLOSE
+    ADM["✅ turn_admission.rs (RL5) — le tour réserve à la porte AVANT send_turn (open_turn) et règle APRÈS play (drive) : un refus est l'erreur typée que le provider aurait rendue (RateLimited avec sa fin, Overloaded) et suit le chemin d'un envoi en échec ; l'enregistrement d'instance illisible = échoue OUVERT ; la porte LIT le QuotaRegistry, elle ne l'écrit pas<br/>test : a_turn_on_an_exhausted_instance_is_refused_at_the_gate_and_never_sent, an_overloaded_turn_pauses_the_instance_and_the_next_turn_is_refused<br/>🟠 pas de repli de candidats à cette couture : un refus de porte (retentable) n'enclenche pas le repli du pool"]
+    SEND -.-> ADM
