@@ -1,6 +1,6 @@
 <!-- Genere par scripts/diagrams/check-index.mjs --write-orphans. Ne pas editer a la main. -->
-<!-- orphan-ceiling: 1107 -->
-<!-- orphan-ceiling-backend: 447 -->
+<!-- orphan-ceiling: 1108 -->
+<!-- orphan-ceiling-backend: 448 -->
 <!-- orphan-ceiling-frontend: 538 -->
 <!-- orphan-ceiling-nexus: 4 -->
 <!-- orphan-ceiling-website: 127 -->
@@ -36,7 +36,7 @@ collision entre les deux index est une erreur, pas un arrangement.
 
 - `nexus` : 14 diagrammes, 77 fichiers possedes la-bas
 
-## backend (447)
+## backend (448)
 
 - `crates/neural-routing-core/src/` (12) : `augmentation.rs`, `error.rs`, `lib.rs`, `mcts.rs`, `migration.rs`, `models.rs`, `proxy_model.rs`, `reward.rs`, `store.rs`, `traits.rs`, `validation.rs`, `vector_builder.rs`
 - `crates/neural-routing-gnn/src/` (9) : `encoder.rs`, `features.rs`, `graph_sage.rs`, `inference.rs`, `lib.rs`, `message_passing.rs`, `rgcn.rs`, `sampler.rs`, `training.rs`
@@ -80,7 +80,7 @@ collision entre les deux index est une erreur, pas un arrangement.
 - `src/pipeline/` (13) : `composer.rs`, `critic.rs`, `episode_adapter.rs`, `evolve.rs`, `feedback.rs`, `gates.rs`, `materialize.rs`, `metrics.rs`, `mod.rs`, `progress.rs`, `regression.rs`, `runner.rs`, `skill_injector.rs`
 - `src/plan/` (3) : `manager.rs`, `mod.rs`, `models.rs`
 - `src/profile/` (5) : `aggregator.rs`, `collector.rs`, `mod.rs`, `signals.rs`, `wiring.rs`
-- `src/protocol/` (9) : `engine.rs`, `generator.rs`, `hooks.rs`, `mod.rs`, `models.rs`, `routing.rs`, `runner.rs`, `seed.rs`, `seed_runner.rs`
+- `src/protocol/` (10) : `engine.rs`, `generator.rs`, `guard.rs`, `hooks.rs`, `mod.rs`, `models.rs`, `routing.rs`, `runner.rs`, `seed.rs`, `seed_runner.rs`
 - `src/protocol/executor/` (3) : `agent.rs`, `mod.rs`, `system.rs`
 - `src/reasoning/` (4) : `cache.rs`, `engine.rs`, `mod.rs`, `models.rs`
 - `src/reception/` (7) : `anchor.rs`, `mod.rs`, `replay.rs`, `score.rs`, `tombstone_scheduler.rs`, `trust.rs`, `verify.rs`

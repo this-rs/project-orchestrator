@@ -543,4 +543,163 @@ mod tests {
         };
         assert!(!not_start.evaluate(&store, &run).await.unwrap().is_pass());
     }
+    #[test]
+    fn every_guard_describes_itself_for_the_refusal_and_the_prompt() {
+        let all = Guard::All {
+            guards: vec![
+                visited("A"),
+                Guard::VisitsAtMost {
+                    state: "B".into(),
+                    max: 2,
+                },
+                Guard::TaskStatusIs {
+                    status: TaskStatus::Completed,
+                },
+            ],
+        };
+        let d = all.describe();
+        assert!(d.starts_with("all of ["), "{d}");
+        assert!(d.contains("`B` visited at most 2 times"), "{d}");
+        assert!(d.contains("linked task is completed"), "{d}");
+
+        let any = Guard::Any {
+            guards: vec![Guard::StepsAllDone, Guard::ChildrenAllCompleted],
+        };
+        let d = any.describe();
+        assert!(d.contains("any of [all steps"), "{d}");
+        assert!(d.contains("all child runs completed"), "{d}");
+
+        let not = Guard::Not {
+            guard: Box::new(visited("A")),
+        };
+        assert_eq!(not.describe(), "not (state `A` visited)");
+    }
+
+    #[tokio::test]
+    async fn task_status_and_steps_are_read_from_the_linked_task() {
+        let store = MockGraphStore::new();
+        let mut run = run_visiting(&["Start"]);
+
+        let mut task = crate::test_helpers::test_task();
+        task.status = TaskStatus::InProgress;
+        let task_id = task.id;
+        store.tasks.write().await.insert(task_id, task);
+        run.task_id = Some(task_id);
+
+        let completed = Guard::TaskStatusIs {
+            status: TaskStatus::Completed,
+        };
+        let verdict = completed.evaluate(&store, &run).await.unwrap();
+        assert!(!verdict.is_pass());
+        assert!(
+            verdict.reason().contains("task is inprogress"),
+            "{}",
+            verdict.reason()
+        );
+        let in_progress = Guard::TaskStatusIs {
+            status: TaskStatus::InProgress,
+        };
+        assert!(in_progress.evaluate(&store, &run).await.unwrap().is_pass());
+
+        // A task id that points to nothing fails closed.
+        let mut dangling = run_visiting(&["Start"]);
+        dangling.task_id = Some(Uuid::new_v4());
+        let verdict = completed.evaluate(&store, &dangling).await.unwrap();
+        assert!(
+            verdict.reason().contains("not found"),
+            "{}",
+            verdict.reason()
+        );
+
+        // A task with no step fails closed, then with one open step, then all done.
+        let verdict = Guard::StepsAllDone.evaluate(&store, &run).await.unwrap();
+        assert!(
+            verdict.reason().contains("no steps"),
+            "{}",
+            verdict.reason()
+        );
+
+        let mut done = crate::test_helpers::test_step(0, "done");
+        done.status = StepStatus::Completed;
+        let mut open = crate::test_helpers::test_step(1, "open");
+        open.status = StepStatus::Pending;
+        let ids = vec![done.id, open.id];
+        store.steps.write().await.insert(done.id, done);
+        store.steps.write().await.insert(open.id, open.clone());
+        store.task_steps.write().await.insert(task_id, ids);
+        let verdict = Guard::StepsAllDone.evaluate(&store, &run).await.unwrap();
+        assert!(
+            verdict.reason().contains("1 of 2 steps not done"),
+            "{}",
+            verdict.reason()
+        );
+
+        open.status = StepStatus::Skipped;
+        store.steps.write().await.insert(open.id, open);
+        assert!(Guard::StepsAllDone
+            .evaluate(&store, &run)
+            .await
+            .unwrap()
+            .is_pass());
+    }
+
+    #[tokio::test]
+    async fn children_all_completed_needs_every_child_completed() {
+        let store = MockGraphStore::new();
+        let run = run_visiting(&["Start"]);
+        let mut child = run_visiting(&["Start"]);
+        child.parent_run_id = Some(run.id);
+        child.status = RunStatus::Running;
+        store
+            .protocol_runs
+            .write()
+            .await
+            .insert(child.id, child.clone());
+
+        let verdict = Guard::ChildrenAllCompleted
+            .evaluate(&store, &run)
+            .await
+            .unwrap();
+        assert!(
+            verdict.reason().contains("1 of 1 child runs not completed"),
+            "{}",
+            verdict.reason()
+        );
+
+        child.status = RunStatus::Completed;
+        store.protocol_runs.write().await.insert(child.id, child);
+        assert!(Guard::ChildrenAllCompleted
+            .evaluate(&store, &run)
+            .await
+            .unwrap()
+            .is_pass());
+    }
+
+    #[tokio::test]
+    async fn not_refuses_when_the_inner_guard_holds_and_a_loop_bound_refuses_when_exceeded() {
+        let store = MockGraphStore::new();
+        let run = run_visiting(&["Start", "Review", "Review"]);
+
+        let not = Guard::Not {
+            guard: Box::new(visited("Review")),
+        };
+        let verdict = not.evaluate(&store, &run).await.unwrap();
+        assert!(!verdict.is_pass());
+        assert!(
+            verdict.reason().contains("it must not hold"),
+            "{}",
+            verdict.reason()
+        );
+
+        let bound = Guard::VisitsAtMost {
+            state: "Review".into(),
+            max: 1,
+        };
+        let verdict = bound.evaluate(&store, &run).await.unwrap();
+        assert!(
+            verdict.reason().contains("2 visits"),
+            "{}",
+            verdict.reason()
+        );
+    }
 }
