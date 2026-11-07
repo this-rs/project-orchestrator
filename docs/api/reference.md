@@ -278,7 +278,7 @@ from the tail of its events, those counts and the clock (`chat::segment_state`):
 | `stalled` | streaming, but no event for 30 minutes |
 
 `state_reason` is `{ rule, event?, age_ms }`: the rule that decided, the event it read and
-that event's age. A `done` session of the agent engine is released (closed the way the idle
+that event's age. A `done` session (either engine) is released (closed the way the idle
 cleanup closes it: the thread stays, the next message resumes it).
 
 ### POST /api/chat/sessions -- Protected

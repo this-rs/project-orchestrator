@@ -605,6 +605,79 @@ mod tests {
         ChatManager::new_without_memory(state.neo4j, state.meili, test_support::chat_config())
     }
 
+    fn turn_end() -> crate::chat::types::ChatEvent {
+        crate::chat::types::ChatEvent::Result {
+            session_id: "s".into(),
+            duration_ms: 1,
+            cost_usd: None,
+            subtype: "success".into(),
+            is_error: false,
+            num_turns: None,
+            result_text: None,
+            cost: None,
+            usage: None,
+            model: None,
+            stop_reason: Some("end_turn".into()),
+            error_code: None,
+            error_message: None,
+        }
+    }
+
+    /// Lets a Claude Code session of the table run one turn that ends with nothing for a
+    /// person, then returns the clock past the settle window.
+    async fn finish_a_turn(manager: &ChatManager, id: &str) -> u64 {
+        let uuid = Uuid::parse_str(id).unwrap();
+        // The first snapshot installs the tap; events sent after it are recorded.
+        manager.live_session_snapshot().await;
+        let tx = manager.active_sessions.read().await[id].events_tx.clone();
+        tx.send(crate::chat::types::ChatEvent::UserMessage {
+            content: "go".into(),
+        })
+        .unwrap();
+        tx.send(turn_end()).unwrap();
+        let later =
+            crate::chat::segment_tap::now_ms() + crate::chat::segment_state::SETTLE_MS + 1_000;
+        for _ in 0..200 {
+            let snap = manager.live_session_snapshot_at(later).await;
+            if snap
+                .states
+                .get(&uuid)
+                .is_some_and(|v| v.state == crate::chat::segment_state::SessionState::Done)
+            {
+                return later;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the session never reached Done");
+    }
+
+    /// SEG-1b: a Claude Code session whose segment is Done leaves the live set (its child
+    /// slot is freed); one that is not Done stays.
+    #[tokio::test]
+    async fn a_done_claude_code_session_leaves_the_live_set_and_a_busy_one_stays() {
+        let manager = make_manager();
+        let done = Uuid::new_v4().to_string();
+        let busy = Uuid::new_v4().to_string();
+        test_support::insert_live_session_without_cli(&manager, &done).await;
+        test_support::insert_live_session_without_cli(&manager, &busy).await;
+        let later = finish_a_turn(&manager, &done).await;
+        // `busy` is streaming: never Done.
+        manager.active_sessions.read().await[&busy]
+            .is_streaming
+            .store(true, Ordering::SeqCst);
+
+        let released = manager.release_done_sessions_at(later).await;
+        assert_eq!(released, vec![done.clone()]);
+        assert!(
+            !manager.is_session_active(&done).await,
+            "out of the live set"
+        );
+        assert!(
+            manager.is_session_active(&busy).await,
+            "a busy session stays"
+        );
+    }
+
     /// An idle target session: `inject_team_message` wins the compare_exchange
     /// and sets `is_streaming = true` (a stream_response is spawned).
     #[tokio::test]
@@ -704,5 +777,28 @@ mod tests {
             .inject_team_message(Uuid::new_v4(), "sender", "nonexistent-id", "hi")
             .await;
         assert!(result.is_err(), "must fail for an unknown session");
+    }
+
+    /// SEG-1b: a team message to a session released as Done tries to resume it (as a
+    /// person's message would) instead of reporting it missing. Here the resume itself
+    /// fails (no stored session, no CLI): the error says so.
+    #[tokio::test]
+    async fn a_team_message_to_a_released_session_tries_to_resume_it() {
+        let manager = make_manager();
+        let id = Uuid::new_v4().to_string();
+        test_support::insert_live_session_without_cli(&manager, &id).await;
+        let later = finish_a_turn(&manager, &id).await;
+        assert_eq!(
+            manager.release_done_sessions_at(later).await,
+            vec![id.clone()]
+        );
+        let err = manager
+            .inject_team_message(Uuid::new_v4(), "peer", &id, "are you there")
+            .await
+            .expect_err("nothing stored to resume in the mock");
+        assert!(
+            err.to_string().contains("resuming it failed"),
+            "the resume was attempted: {err}"
+        );
     }
 }

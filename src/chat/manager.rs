@@ -11475,10 +11475,26 @@ impl ChatManager {
             auto_continue,
         )) = session_state
         else {
-            return Err(anyhow!(
-                "inject_team_message: target session {} not found",
-                to_session_id
-            ));
+            // Not live on the Claude Code engine. A session released when its segment was
+            // Done (`release_done_sessions`) is resumed by the message, as a person's
+            // message would resume it; one the agent engine holds, or that does not
+            // exist, is an error as before.
+            if self.agent_runtime.owns(to_session_id).await {
+                return Err(anyhow!(
+                    "inject_team_message: target session {} not found",
+                    to_session_id
+                ));
+            }
+            return self
+                .resume_session(to_session_id, &format!("[team {}] {}", from_name, text), None)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "inject_team_message: target session {} not found, and resuming it failed: {}",
+                        to_session_id,
+                        e
+                    )
+                });
         };
 
         let session_uuid = Uuid::parse_str(to_session_id).ok();
@@ -19960,10 +19976,9 @@ impl ChatManager {
     /// [`Self::close_session`]: the thread stays in the graph, readable, and the next
     /// message resumes the session the ordinary way.
     ///
-    /// The agent engine's sessions only. A Claude Code session that is `Done` stays live
-    /// until the idle cleanup: a team message is delivered only to a LIVE Claude Code
-    /// session (`inject_team_message` reads `active_sessions` and does not resume), so
-    /// closing one early would make its team unreachable sooner than today.
+    /// Both engines. A Claude Code session that is `Done` is closed too, which frees its
+    /// child slot: a team message to a session that is no longer live resumes it
+    /// (`inject_team_message`), so closing early no longer cuts its team off.
     ///
     /// The verdict is read twice — on a first snapshot, then again on a fresh one just
     /// before closing — so a message that arrived in between keeps its session.
@@ -19983,12 +19998,9 @@ impl ChatManager {
                 .map(|(id, _)| *id)
                 .collect()
         };
-        let mut candidates = Vec::new();
-        for id in done(&self.live_session_snapshot_at(now_ms).await) {
-            if self.agent_runtime.owns(&id.to_string()).await {
-                candidates.push(id);
-            }
-        }
+        let candidates: Vec<Uuid> = done(&self.live_session_snapshot_at(now_ms).await)
+            .into_iter()
+            .collect();
         if candidates.is_empty() {
             return Vec::new();
         }
