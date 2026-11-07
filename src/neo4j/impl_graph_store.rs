@@ -3273,8 +3273,13 @@ impl AnalyticsStore for Neo4jClient {
         self.llm_settings_by_key(key).await
     }
 
-    async fn entity_exists(&self, kind: &str, name: &str) -> anyhow::Result<Option<bool>> {
-        self.entity_exists(kind, name).await
+    async fn entity_exists(
+        &self,
+        kind: &str,
+        name: &str,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Option<bool>> {
+        self.entity_exists(kind, name, project_id).await
     }
 
     async fn entities_linked(
@@ -3284,8 +3289,9 @@ impl AnalyticsStore for Neo4jClient {
         edge: &str,
         to_kind: &str,
         to_name: &str,
+        project_id: Option<Uuid>,
     ) -> anyhow::Result<Option<bool>> {
-        self.entities_linked(from_kind, from_name, edge, to_kind, to_name)
+        self.entities_linked(from_kind, from_name, edge, to_kind, to_name, project_id)
             .await
     }
 

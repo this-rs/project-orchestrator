@@ -2243,9 +2243,15 @@ async fn the_belief_reads_tell_unknown_from_absent_and_keep_the_last_verdict() {
     let callee = format!("t7_callee_{tag}");
 
     // Existence: unknown kind, then absent, then present.
-    assert_eq!(store.entity_exists("banana", &caller).await.unwrap(), None);
     assert_eq!(
-        store.entity_exists("function", &caller).await.unwrap(),
+        store.entity_exists("banana", &caller, None).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .entity_exists("function", &caller, None)
+            .await
+            .unwrap(),
         Some(false)
     );
     raw.run(
@@ -2260,8 +2266,72 @@ async fn the_belief_reads_tell_unknown_from_absent_and_keep_the_last_verdict() {
     .await
     .unwrap();
     assert_eq!(
-        store.entity_exists("function", &caller).await.unwrap(),
+        store
+            .entity_exists("function", &caller, None)
+            .await
+            .unwrap(),
         Some(true)
+    );
+
+    // PORTÉE : `Function.name` est ambigu entre projets. Deux fonctions du MÊME nom dans
+    // deux projets différents ne doivent pas se confondre — sinon une croyance se vérifie
+    // contre l'homonyme de l'autre, et sous `Block` elle est effacée à tort.
+    let project_a = Uuid::new_v4();
+    let project_b = Uuid::new_v4();
+    let shared = format!("t7_shared_{tag}");
+    raw.run(
+        query(
+            "CREATE (:Function {id: $a_id, name: $n, project_id: $pa}), \
+                    (:Function {id: $b_id, name: $n, project_id: $pb})",
+        )
+        .param("a_id", format!("{shared}:a"))
+        .param("b_id", format!("{shared}:b"))
+        .param("n", shared.clone())
+        .param("pa", project_a.to_string())
+        .param("pb", project_b.to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .entity_exists("function", &shared, Some(project_a))
+            .await
+            .unwrap(),
+        Some(true),
+        "le projet qui la porte la voit"
+    );
+    assert_eq!(
+        store
+            .entity_exists("function", &shared, Some(project_b))
+            .await
+            .unwrap(),
+        Some(true),
+        "l'autre projet a son propre homonyme"
+    );
+    assert_eq!(
+        store
+            .entity_exists("function", &shared, Some(Uuid::new_v4()))
+            .await
+            .unwrap(),
+        Some(false),
+        "un troisième projet ne voit AUCUN des deux homonymes"
+    );
+    // Et la portée vaut aussi pour les liens : l'arête créée plus haut n'a pas de projet,
+    // donc elle n'apparaît dans aucun projet précis, mais elle existe hors portée.
+    assert_eq!(
+        store
+            .entities_linked(
+                "function",
+                &shared,
+                "CALLS",
+                "function",
+                &shared,
+                Some(project_a)
+            )
+            .await
+            .unwrap(),
+        Some(false),
+        "aucune arête entre les homonymes d'un même projet"
     );
 
     // Links: an edge outside the closed list is `None` — « je ne sais pas » — and NOT an
@@ -2275,7 +2345,8 @@ async fn the_belief_reads_tell_unknown_from_absent_and_keep_the_last_verdict() {
                 &caller,
                 "DELETE_EVERYTHING",
                 "function",
-                &callee
+                &callee,
+                None
             )
             .await
             .unwrap(),
@@ -2284,24 +2355,33 @@ async fn the_belief_reads_tell_unknown_from_absent_and_keep_the_last_verdict() {
     );
     assert_eq!(
         store
-            .entities_linked("banana", &caller, "CALLS", "function", &callee)
+            .entities_linked("banana", &caller, "CALLS", "function", &callee, None)
             .await
             .unwrap(),
         None
     );
     assert_eq!(
         store
-            .entities_linked("function", &caller, "CALLS", "function", &callee)
+            .entities_linked("function", &caller, "CALLS", "function", &callee, None)
             .await
             .unwrap(),
         Some(true)
     );
     assert_eq!(
         store
-            .entities_linked("function", &callee, "CALLS", "function", &caller)
+            .entities_linked("function", &callee, "CALLS", "function", &caller, None)
             .await
             .unwrap(),
         Some(false)
+    );
+
+    // `impl` n'est plus « nommable » : il ne porte pas de propriété `name`, donc l'ancienne
+    // table répondait `false` (« absent ») à une question qu'on ne sait pas poser. C'est
+    // maintenant invérifiable.
+    assert_eq!(
+        store.entity_exists("impl", "whatever", None).await.unwrap(),
+        None,
+        "un type qu'on ne sait pas nommer est invérifiable, pas absent"
     );
 
     // An assertion note is listed, then its verdict is written and read back.
