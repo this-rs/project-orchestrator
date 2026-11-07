@@ -126,6 +126,58 @@ pub async fn get_neighborhood(
     Ok(Json(resp))
 }
 
+/// GET /api/graph/schema — the graph's catalog: labels, relationship types, the label pairs
+/// each type connects, and measured volumes. Read-only.
+pub async fn get_schema_catalog(
+    State(state): State<OrchestratorState>,
+) -> Result<Json<crate::graph::schema::SchemaCatalog>, AppError> {
+    Ok(Json(state.orchestrator.neo4j().schema_catalog().await?))
+}
+
+/// Query string of `GET /api/graph/path`.
+#[derive(Debug, Deserialize)]
+pub struct TypedPathQuery {
+    pub from_label: String,
+    pub from_id: String,
+    pub to_label: String,
+    pub to_id: String,
+    pub max_depth: Option<u32>,
+}
+
+/// GET /api/graph/path?from_label=&from_id=&to_label=&to_id=&max_depth= — the shortest chain
+/// of causal relations from one node to another, bounded and read-only.
+pub async fn get_typed_path(
+    State(state): State<OrchestratorState>,
+    Query(q): Query<TypedPathQuery>,
+) -> Result<Json<crate::graph::schema::TypedPath>, AppError> {
+    use crate::graph::schema::CAUSAL_ANCHORS;
+    for label in [&q.from_label, &q.to_label] {
+        if !CAUSAL_ANCHORS.contains(&label.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "'{label}' is not a causal anchor. Supported: {}",
+                CAUSAL_ANCHORS.join(", ")
+            )));
+        }
+    }
+    if q.from_label == q.to_label && q.from_id == q.to_id {
+        return Err(AppError::BadRequest(
+            "from and to must be two distinct nodes".to_string(),
+        ));
+    }
+    let path = state
+        .orchestrator
+        .neo4j()
+        .typed_path(
+            &q.from_label,
+            &q.from_id,
+            &q.to_label,
+            &q.to_id,
+            q.max_depth.unwrap_or(4),
+        )
+        .await?;
+    Ok(Json(path))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::api::handlers::ServerState;
@@ -243,6 +295,93 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn schema_and_path_require_auth() {
+        let app = app_with(sample()).await;
+        for uri in [
+            "/api/graph/schema",
+            "/api/graph/path?from_label=Task&from_id=a&to_label=Decision&to_id=b",
+        ] {
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn path_refuses_a_non_anchor_label_and_the_same_node() {
+        let app = app_with(sample()).await;
+        let (status, json) = get(
+            app.clone(),
+            "/api/graph/path?from_label=Task)%20DETACH%20DELETE%20(n&from_id=a&to_label=Decision&to_id=b",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        let (status, _) = get(
+            app,
+            "/api/graph/path?from_label=Task&from_id=a&to_label=Task&to_id=a",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn schema_is_read_only_on_the_mock() {
+        // The reads must not write: the mock's own relationship stores are the witness.
+        let store = Arc::new(MockGraphStore::new());
+        let app_state = mock_app_state_with_graph(store.clone());
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            remote_mcp: crate::RemoteMcpConfig::default(),
+            ingress: Default::default(),
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+            registry_remote_url: None,
+            oidc_client: None,
+            neural_router: crate::test_helpers::mock_neural_router(),
+            trajectory_collector: std::sync::RwLock::new(None),
+            trajectory_store: None,
+            identity: None,
+            reactor_counters: std::sync::OnceLock::new(),
+            confidence_tracker: Arc::new(crate::graph::confidence::ConfidenceTracker::default()),
+            mcp_registry: crate::mcp_federation::registry::new_shared_registry(),
+            model_catalog: crate::chat::model_catalog::ModelCatalogCache::new(None),
+            vault: crate::vault::VaultService::ephemeral(),
+        });
+        let app = create_router(state);
+        let before = store.agent_authored.read().await.len();
+        let (status, json) = get(app.clone(), "/api/graph/schema").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert!(json["labels"].is_array());
+        let (status, json) = get(
+            app,
+            "/api/graph/path?from_label=Task&from_id=a&to_label=Decision&to_id=b&max_depth=2",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["max_depth"], 2);
+        assert_eq!(
+            json["endpoints_found"], false,
+            "the mock cannot confirm nodes"
+        );
+        assert_eq!(store.agent_authored.read().await.len(), before);
     }
 
     #[tokio::test]
