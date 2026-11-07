@@ -123,10 +123,60 @@ async fn a_write_makes_its_agent_a_node_and_gives_it_the_note() {
     let Some(e) = env("authored").await else {
         return;
     };
-    let agent = Uuid::new_v4();
+    // The writer is the durable self of the store, the actor every write path stamps.
+    let agent = e.client.agent_identity_namespace().await.unwrap();
     let note = a_note(&format!("agent:{agent}"));
     e.client.create_note(&note).await.unwrap();
 
+    assert_eq!(
+        authored_count(&e, agent, note.id).await,
+        1,
+        "the author owns its note"
+    );
+    let node = e.client.find_agent(agent).await.unwrap();
+    assert!(node.is_some(), "and the author exists as a node");
+
+    // The self is shared by the store and stays; the edge goes with the note.
+    e.client.delete_note(note.id).await.unwrap();
+    cleanup(&e).await;
+}
+
+#[tokio::test]
+async fn a_write_by_a_foreign_actor_draws_no_edge_and_makes_no_node() {
+    let _serial = serial().await;
+    // An actor that is neither this store's self nor one of its facets: the note is kept
+    // (provenance never refuses a write), but no agent is made and no edge is drawn.
+    let Some(e) = env("foreign").await else {
+        return;
+    };
+    let foreign = Uuid::new_v4();
+    let note = a_note(&format!("agent:{foreign}"));
+    e.client.create_note(&note).await.unwrap();
+
+    assert!(
+        e.client.get_note(note.id).await.unwrap().is_some(),
+        "the note is written"
+    );
+    assert_eq!(
+        authored_count(&e, foreign, note.id).await,
+        0,
+        "no edge to a foreign actor"
+    );
+    assert!(
+        e.client.find_agent(foreign).await.unwrap().is_none(),
+        "and no node for it"
+    );
+    // The backfill does not adopt it either.
+    e.client.backfill_agents().await.unwrap();
+    assert_eq!(authored_count(&e, foreign, note.id).await, 0);
+    assert!(e.client.find_agent(foreign).await.unwrap().is_none());
+
+    e.client.delete_note(note.id).await.unwrap();
+    cleanup(&e).await;
+}
+
+/// `(:Agent {id: agent})-[:AUTHORED]->(:Note {id: note})` edges, counted.
+async fn authored_count(e: &Env, agent: Uuid, note: Uuid) -> i64 {
     let mut rows = e
         .raw
         .execute(
@@ -135,23 +185,12 @@ async fn a_write_makes_its_agent_a_node_and_gives_it_the_note() {
                  RETURN count(*) AS n",
             )
             .param("agent", agent.to_string())
-            .param("note", note.id.to_string()),
+            .param("note", note.to_string()),
         )
         .await
         .unwrap();
     let row = rows.next().await.unwrap().expect("a row");
-    assert_eq!(
-        row.get::<i64>("n").unwrap_or(0),
-        1,
-        "the author owns its note"
-    );
-
-    let node = e.client.find_agent(agent).await.unwrap();
-    assert!(node.is_some(), "and the author exists as a node");
-
-    drop_nodes(&e, "Agent", &[agent]).await;
-    e.client.delete_note(note.id).await.unwrap();
-    cleanup(&e).await;
+    row.get::<i64>("n").unwrap_or(0)
 }
 
 #[tokio::test]
@@ -161,7 +200,15 @@ async fn the_backfill_rebuilds_the_attribution_and_says_what_it_did() {
     let Some(e) = env("backfill").await else {
         return;
     };
-    let agent = Uuid::new_v4();
+    // Before the self was the identity, a write stamped the MODEL facet of this store: the
+    // facet exists (its `FACET_OF` hangs it under the self) and the note names it.
+    let root = e.client.agent_identity_namespace().await.unwrap();
+    e.client
+        .ensure_agent(root, Some("claude-opus-5-5"))
+        .await
+        .unwrap();
+    let agent =
+        project_orchestrator::notes::provenance::model_facet_id(root, "claude-opus-5-5").unwrap();
     let note = a_note(&format!("agent:{agent}"));
     // Written without the write hook, so the edge is genuinely missing: this is the state
     // a database predating the feature is in.
@@ -182,12 +229,16 @@ async fn the_backfill_rebuilds_the_attribution_and_says_what_it_did() {
 
     let first = e.client.backfill_agents().await.unwrap();
     assert!(first.from_notes >= 1, "{first:?}");
-    assert!(first.authored >= 1, "the missing edge was drawn: {first:?}");
+    assert_eq!(first.authored, 1, "the missing edge was drawn: {first:?}");
     assert!(first.after >= first.before, "{first:?}");
+    // Drawn on the self, the identity that writes, not on the facet the note names.
+    assert_eq!(authored_count(&e, root, note.id).await, 1);
+    assert_eq!(authored_count(&e, agent, note.id).await, 0);
 
     let second = e.client.backfill_agents().await.unwrap();
     assert_eq!(second.authored, 0, "idempotent: {second:?}");
 
+    // The facet goes; the self is shared by the store and stays.
     drop_nodes(&e, "Agent", &[agent]).await;
     e.client.delete_note(note.id).await.unwrap();
     cleanup(&e).await;
