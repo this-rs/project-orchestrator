@@ -115,7 +115,7 @@ diagrams:
     status: verified
     file: docs/diagrams/po-chat-agent-runtime.mmd
     covers:
-      - "backend:src/chat/{agent_runtime,agent_hooks,cancel_relay,session_grants,lasting_rules,manual_compaction,spill,team}.rs"
+      - "backend:src/chat/{agent_runtime,agent_hooks,cancel_relay,session_grants,lasting_rules,manual_compaction,spill,team,turn_admission}.rs"
       - "backend:src/chat/provider/{transcripts,hooks}.rs"
       - "backend:src/api/team_handlers.rs"
       - "backend:src/chat/activation_registry.rs"
@@ -332,7 +332,7 @@ diagrams:
     status: planned
     # validate.rs couvert par po-protocol-validation (verified)
     covers:
-      - "backend:src/protocol/{mod,models,engine,generator,hooks,routing,runner,runner_tests,seed,seed_runner}.rs"
+      - "backend:src/protocol/{mod,models,engine,generator,guard,hooks,routing,runner,runner_tests,seed,seed_runner}.rs"
       - "backend:src/protocol/executor/**"
   - name: po-protocol-validation
     owner: theotime

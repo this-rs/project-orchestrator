@@ -174,6 +174,10 @@ pub async fn export_skill(
                     to_state: to_name,
                     trigger: t.trigger.clone(),
                     guard: t.guard.clone(),
+                    guard_expr: t
+                        .guard_expr
+                        .as_ref()
+                        .and_then(|g| serde_json::to_value(g).ok()),
                 })
             })
             .collect();

@@ -290,6 +290,9 @@ pub struct PortableTransition {
     /// Optional guard condition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<String>,
+    /// Optional typed guard (JSON, `protocol::guard::Guard`). Absent in packages written before G1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_expr: Option<serde_json::Value>,
 }
 
 /// Portable relevance vector (5 dimensions, 0.0–1.0).
@@ -844,12 +847,14 @@ mod tests {
             ],
             transitions: vec![
                 PortableTransition {
+                    guard_expr: None,
                     from_state: "START".to_string(),
                     to_state: "WORK".to_string(),
                     trigger: "begin".to_string(),
                     guard: None,
                 },
                 PortableTransition {
+                    guard_expr: None,
                     from_state: "WORK".to_string(),
                     to_state: "DONE".to_string(),
                     trigger: "complete".to_string(),
@@ -886,6 +891,7 @@ mod tests {
                 state_type: "start".to_string(),
             }],
             transitions: vec![PortableTransition {
+                guard_expr: None,
                 from_state: "START".to_string(),
                 to_state: "NONEXISTENT".to_string(),
                 trigger: "go".to_string(),
@@ -925,6 +931,7 @@ mod tests {
                 },
             ],
             transitions: vec![PortableTransition {
+                guard_expr: None,
                 from_state: "S".to_string(),
                 to_state: "E".to_string(),
                 trigger: "done".to_string(),

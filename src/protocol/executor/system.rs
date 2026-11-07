@@ -193,10 +193,7 @@ async fn determine_trigger(
     run: &ProtocolRun,
 ) -> Result<String> {
     let transitions = store.get_protocol_transitions(run.protocol_id).await?;
-    let outgoing: Vec<_> = transitions
-        .iter()
-        .filter(|t| t.from_state == state.id)
-        .collect();
+    let outgoing = open_outgoing(store, state, run, &transitions).await?;
 
     match outgoing.len() {
         0 => Ok("done".to_string()),
@@ -213,6 +210,42 @@ async fn determine_trigger(
     }
 }
 
+/// The outgoing transitions of `state` that may fire now: unguarded ones, and those whose typed
+/// guard (G1) holds. If the state has guarded transitions and NONE of them may fire (and there is
+/// no unguarded one), that is an error naming the reasons, never a silent pick of the first edge.
+pub(super) async fn open_outgoing<'a>(
+    store: &dyn GraphStore,
+    state: &ProtocolState,
+    run: &ProtocolRun,
+    transitions: &'a [crate::protocol::ProtocolTransition],
+) -> Result<Vec<&'a crate::protocol::ProtocolTransition>> {
+    let mut open = Vec::new();
+    let mut refusals = Vec::new();
+    let mut guarded = 0usize;
+    for t in transitions.iter().filter(|t| t.from_state == state.id) {
+        match &t.guard_expr {
+            None => open.push(t),
+            Some(guard) => {
+                guarded += 1;
+                let verdict = guard.evaluate(store, run).await?;
+                if verdict.is_pass() {
+                    open.push(t);
+                } else {
+                    refusals.push(format!("'{}': {}", t.trigger, verdict.reason()));
+                }
+            }
+        }
+    }
+    if open.is_empty() && guarded > 0 {
+        anyhow::bail!(
+            "state '{}': no outgoing transition may fire, every guard failed — {}",
+            state.name,
+            refusals.join(" | ")
+        );
+    }
+    Ok(open)
+}
+
 /// Like [`determine_trigger`] but tries a preferred trigger first, then falls back.
 async fn determine_trigger_with_fallback(
     store: &dyn GraphStore,
@@ -222,10 +255,7 @@ async fn determine_trigger_with_fallback(
     fallback: &str,
 ) -> Result<String> {
     let transitions = store.get_protocol_transitions(run.protocol_id).await?;
-    let outgoing: Vec<_> = transitions
-        .iter()
-        .filter(|t| t.from_state == state.id)
-        .collect();
+    let outgoing = open_outgoing(store, state, run, &transitions).await?;
 
     if let Some(t) = outgoing.iter().find(|t| t.trigger == preferred) {
         return Ok(t.trigger.clone());
@@ -659,5 +689,91 @@ mod tests {
             .notes
             .iter()
             .any(|n| n.contains("Skipped unknown tool: foobar")));
+    }
+    // ---------------------------------------------------------------- G1: typed guards
+
+    use crate::protocol::guard::Guard;
+
+    async fn add_edge(
+        store: &MockGraphStore,
+        protocol: &Protocol,
+        from: &ProtocolState,
+        trigger: &str,
+        guard_expr: Option<Guard>,
+    ) {
+        let mut t = ProtocolTransition::new(protocol.id, from.id, Uuid::new_v4(), trigger);
+        t.guard_expr = guard_expr;
+        store.upsert_protocol_transition(&t).await.unwrap();
+    }
+
+    fn never() -> Guard {
+        Guard::StateVisited {
+            state: "Nowhere".into(),
+        }
+    }
+
+    fn already() -> Guard {
+        Guard::StateVisited {
+            state: "test_state".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn determine_trigger_skips_an_edge_whose_guard_is_false() {
+        let store = MockGraphStore::new();
+        let (protocol, state, run) = make_protocol();
+        // The false edge comes first: the old rule ("first edge") would have taken it.
+        add_edge(&store, &protocol, &state, "alpha", Some(never())).await;
+        add_edge(&store, &protocol, &state, "beta", Some(already())).await;
+
+        assert_eq!(
+            determine_trigger(&store, &state, &run).await.unwrap(),
+            "beta"
+        );
+    }
+
+    #[tokio::test]
+    async fn determine_trigger_fails_closed_when_every_guard_is_false() {
+        let store = MockGraphStore::new();
+        let (protocol, state, run) = make_protocol();
+        add_edge(&store, &protocol, &state, "alpha", Some(never())).await;
+        add_edge(&store, &protocol, &state, "beta", Some(never())).await;
+
+        let error = determine_trigger(&store, &state, &run)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("every guard failed"), "{error}");
+        assert!(
+            error.contains("alpha") && error.contains("beta"),
+            "each refused edge is named: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unguarded_edge_stays_available_next_to_false_guards() {
+        let store = MockGraphStore::new();
+        let (protocol, state, run) = make_protocol();
+        add_edge(&store, &protocol, &state, "alpha", Some(never())).await;
+        add_edge(&store, &protocol, &state, "fallback", None).await;
+
+        assert_eq!(
+            determine_trigger(&store, &state, &run).await.unwrap(),
+            "fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_typed_guards_the_old_selection_is_unchanged() {
+        let store = MockGraphStore::new();
+        let (protocol, state, run) = make_protocol();
+        add_edge(&store, &protocol, &state, "other", None).await;
+        add_edge(&store, &protocol, &state, "done", None).await;
+
+        assert_eq!(
+            determine_trigger(&store, &state, &run).await.unwrap(),
+            "done"
+        );
     }
 }

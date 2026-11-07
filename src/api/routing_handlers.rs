@@ -975,6 +975,7 @@ mod tests {
         for (i, project) in ["p", "p", "p", "q"].into_iter().enumerate() {
             let d = CognitiveDecision {
                 snapshot: None,
+                arms_snapshot: Vec::new(),
                 id: Uuid::new_v4(),
                 at: chrono::Utc::now() - chrono::Duration::seconds(100 - i as i64),
                 signature: TaskSignature::utility(TaskClass::Simple, 9_000, Some(project)),
@@ -1044,6 +1045,7 @@ mod tests {
         store
             .put_decision(&CognitiveDecision {
                 snapshot: None,
+                arms_snapshot: Vec::new(),
                 id: Uuid::new_v4(),
                 at: chrono::Utc::now(),
                 signature: TaskSignature::utility(TaskClass::Simple, 9_000, Some("p")),
@@ -1135,6 +1137,7 @@ mod tests {
         store
             .put_decision(&CognitiveDecision {
                 snapshot: None,
+                arms_snapshot: Vec::new(),
                 id: Uuid::new_v4(),
                 at: chrono::Utc::now(),
                 signature: TaskSignature::utility(TaskClass::Simple, 9_000, Some(project)),

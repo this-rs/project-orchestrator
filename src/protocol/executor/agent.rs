@@ -183,11 +183,13 @@ fn build_agent_prompt(
         );
         prompt.push_str("Choose ONE of the following:\n\n");
         for t in &outgoing {
-            let guard_info = t
-                .guard
-                .as_deref()
-                .map(|g| format!(" *(guard: {})*", g))
-                .unwrap_or_default();
+            let guard_info = match (&t.guard_expr, t.guard.as_deref()) {
+                (Some(expr), _) => {
+                    format!(" *(guard, checked by the harness: {})*", expr.describe())
+                }
+                (None, Some(label)) => format!(" *(guard: {label})*"),
+                (None, None) => String::new(),
+            };
             prompt.push_str(&format!("- `{}`{}\n", t.trigger, guard_info));
         }
         prompt.push('\n');
@@ -261,6 +263,24 @@ fn extract_trigger_from_tool_use(tool: &str, input: &serde_json::Value) -> Optio
     }
     let trigger = input.get("trigger").and_then(|v| v.as_str())?;
     Some(trigger.to_string())
+}
+
+/// Fallback trigger when the agent names none, picked among the transitions that may fire NOW:
+/// unguarded ones and those whose typed guard holds (same rule as the system executor). When every
+/// outgoing edge is guarded and none holds, this is an error naming the reasons.
+async fn determine_open_trigger(
+    store: &dyn GraphStore,
+    transitions: &[ProtocolTransition],
+    state: &ProtocolState,
+    run: &ProtocolRun,
+) -> Result<String> {
+    let open: Vec<ProtocolTransition> =
+        super::system::open_outgoing(store, state, run, transitions)
+            .await?
+            .into_iter()
+            .cloned()
+            .collect();
+    Ok(determine_trigger_from_transitions(&open, state))
 }
 
 /// Determine the trigger from outgoing transitions (fallback when agent doesn't specify one).
@@ -358,6 +378,7 @@ fn agent_session_request(
 /// and extract the trigger from the agent's response.
 #[allow(clippy::too_many_arguments)]
 async fn execute_via_agent(
+    store: &dyn GraphStore,
     chat_manager: &ChatManager,
     prompt: String,
     run: &ProtocolRun,
@@ -507,16 +528,17 @@ async fn execute_via_agent(
     }
 
     // 6. Extract trigger
-    let trigger = detected_trigger
-        .or_else(|| extract_trigger_from_text(&accumulated_text))
-        .unwrap_or_else(|| {
+    let trigger = match detected_trigger.or_else(|| extract_trigger_from_text(&accumulated_text)) {
+        Some(t) => t,
+        None => {
             warn!(
                 run_id = %run.id,
                 state_name = %state.name,
                 "AgentExecutor: no trigger found in agent response — falling back to heuristic"
             );
-            determine_trigger_from_transitions(transitions, state)
-        });
+            determine_open_trigger(store, transitions, state, run).await?
+        }
+    };
 
     if let Some(cost) = session_cost_usd {
         notes.push(format!("Session cost: ${:.4}", cost));
@@ -583,7 +605,7 @@ impl Executor for AgentExecutor {
                 );
 
                 let transitions = store.get_protocol_transitions(run.protocol_id).await?;
-                let trigger = determine_trigger_from_transitions(&transitions, state);
+                let trigger = determine_open_trigger(store, &transitions, state, run).await?;
 
                 let mut notes = vec![format!(
                     "Stub: action '{}' requires LLM but no ChatManager configured",
@@ -623,6 +645,7 @@ impl Executor for AgentExecutor {
 
         // Execute via agent
         execute_via_agent(
+            store,
             chat_manager,
             prompt,
             run,
@@ -1072,5 +1095,36 @@ mod tests {
             msg.contains("Maximum number of active sessions reached"),
             "the request the agent path built reached the manager's opening: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_fallback_trigger_skips_an_edge_whose_guard_is_false() {
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::protocol::guard::Guard;
+
+        let store = MockGraphStore::new();
+        let protocol_id = uuid::Uuid::new_v4();
+        let mut state = ProtocolState::new(protocol_id, "work");
+        state.id = uuid::Uuid::new_v4();
+        let run = ProtocolRun::new(protocol_id, state.id, "work");
+
+        let mut done = ProtocolTransition::new(protocol_id, state.id, uuid::Uuid::new_v4(), "done");
+        done.guard_expr = Some(Guard::StateVisited {
+            state: "Nowhere".into(),
+        });
+        let retry = ProtocolTransition::new(protocol_id, state.id, uuid::Uuid::new_v4(), "retry");
+        let transitions = vec![done.clone(), retry];
+
+        let trigger = determine_open_trigger(&store, &transitions, &state, &run)
+            .await
+            .unwrap();
+        assert_eq!(trigger, "retry", "the guarded 'done' may not fire");
+
+        // Every edge guarded and none holds: an error naming the reason, no silent pick.
+        let err = determine_open_trigger(&store, &[done], &state, &run)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("every guard failed"), "{err}");
     }
 }

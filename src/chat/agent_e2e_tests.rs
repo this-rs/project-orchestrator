@@ -1980,6 +1980,7 @@ mod cognitive_routing {
             }
             Ok(CognitiveDecision {
                 snapshot: None,
+                arms_snapshot: Vec::new(),
                 id: Uuid::new_v4(),
                 at: Utc::now(),
                 signature: request.signature.clone(),
@@ -2065,6 +2066,7 @@ mod cognitive_routing {
             use crate::chat::provider::cognitive::decision::CognitiveDecision;
             Ok(CognitiveDecision {
                 snapshot: None,
+                arms_snapshot: Vec::new(),
                 id: Uuid::new_v4(),
                 at: Utc::now(),
                 signature: request.signature.clone(),
@@ -3153,6 +3155,7 @@ mod turn_routing {
                 && request.settings.stage == LearningStage::Auto;
             let decision = CognitiveDecision {
                 snapshot: None,
+                arms_snapshot: Vec::new(),
                 id: Uuid::new_v4(),
                 at: Utc::now(),
                 signature: request.signature.clone(),
@@ -5222,6 +5225,7 @@ mod provider_switch {
                 }
                 Ok(CognitiveDecision {
                     snapshot: None,
+                    arms_snapshot: Vec::new(),
                     id: Uuid::new_v4(),
                     at: Utc::now(),
                     signature: request.signature.clone(),
@@ -14713,6 +14717,8 @@ mod native_subagents {
         parent: String,
         /// The CRUD bus the manager emits on (session lists).
         bus: Arc<crate::events::EventBus>,
+        /// The scripted provider itself: its journal (`calls()`) is what the tests read.
+        scripted: Arc<ScriptedProvider>,
         _dir: tempfile::TempDir,
         _rules: tempfile::TempDir,
     }
@@ -14777,14 +14783,15 @@ mod native_subagents {
         let mut child_caps = caps();
         child_caps.interactive_permissions = true;
         child_caps.permission_scopes = vec![nexus_claude::agent::PermissionScope::Once];
+        let scripted = Arc::new(ScriptedProvider::new(
+            "claude-code",
+            Script::builder()
+                .capabilities(child_caps)
+                .turn(child_turn)
+                .build(),
+        ));
         let provider = Tapped {
-            inner: Arc::new(ScriptedProvider::new(
-                "claude-code",
-                Script::builder()
-                    .capabilities(child_caps)
-                    .turn(child_turn)
-                    .build(),
-            )),
+            inner: scripted.clone(),
             kind: ProviderKind::Native,
             answers: Arc::default(),
         };
@@ -14810,6 +14817,7 @@ mod native_subagents {
             graph,
             parent,
             bus,
+            scripted,
             _dir: dir,
             _rules: rules,
         }
@@ -14874,6 +14882,70 @@ mod native_subagents {
 
     fn answer(text: &str) -> Vec<Step> {
         vec![steps::text("working"), steps::done_with_text(&caps(), text)]
+    }
+
+    /// ISO2, criterion 1: an `Agent` call with `run_in_background: true` answers at once and
+    /// the child's end wakes the IDLE parent with a `<task-notification>` turn (`subagents.rs`,
+    /// `inject_hint`). Red without that `inject_hint`: the parent never gets a second turn.
+    #[tokio::test]
+    async fn a_background_agent_wakes_the_idle_parent_with_its_task_notification() {
+        // The first turn of every session takes 600 ms: the child is still running when the
+        // call returns.
+        let r = rig_with(answer("CHILD-ANSWER"), "bypassPermissions", 0, 600, None, 0).await;
+        let mut request = SubagentRequest::new("toolu_bg", "do it");
+        request.run_in_background = true;
+        let started = tokio::time::Instant::now();
+        let launched = r
+            .manager
+            .clone()
+            .run_subagent(&r.parent, None, &request)
+            .await;
+        let took = started.elapsed();
+        assert!(launched.is_ok(), "launch answered: {launched:?}");
+        assert!(
+            took < Duration::from_millis(400),
+            "the call blocked for {took:?}"
+        );
+        let turns_of = |r: &Rig| {
+            r.scripted
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    nexus_claude::testkit::RecordedCall::SendTurn(input) => {
+                        Some(format!("{:?}", input.blocks))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !turns_of(&r)
+                .iter()
+                .any(|t| t.contains("<task-notification")),
+            "no notification before the child ends"
+        );
+        // The parent is idle: the notification arrives as the input of a new turn.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let wake = loop {
+            if let Some(t) = turns_of(&r)
+                .into_iter()
+                .find(|t| t.contains("<task-notification"))
+            {
+                break t;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the parent never received the notification: {:?}",
+                turns_of(&r)
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert!(wake.contains("tool_use_id=\\\"toolu_bg\\\""), "{wake}");
+        assert!(wake.contains("status=\\\"completed\\\""), "{wake}");
+        assert!(
+            wake.contains("CHILD-ANSWER"),
+            "the child's answer is the summary: {wake}"
+        );
     }
 
     /// Lot review of #721, finding 1 (decision ed628dad): a child opened by the `Agent` tool
@@ -15046,6 +15118,7 @@ mod native_subagents {
             kind: ProviderKind::Native,
             answers: Arc::default(),
         };
+        let scripted_handle = provider.inner.clone();
         let rules = tempfile::tempdir().unwrap();
         let bus = Arc::new(crate::events::EventBus::new(1024));
         let manager = Arc::new(
@@ -15073,6 +15146,7 @@ mod native_subagents {
             graph,
             parent,
             bus,
+            scripted: scripted_handle,
             _dir: dir,
             _rules: rules,
         });
@@ -15784,6 +15858,7 @@ mod native_subagents {
                 };
                 Ok(CognitiveDecision {
                     snapshot: None,
+                    arms_snapshot: Vec::new(),
                     id: Uuid::new_v4(),
                     at: Utc::now(),
                     signature: request.signature.clone(),
@@ -15948,6 +16023,7 @@ mod native_subagents {
                 };
                 Ok(CognitiveDecision {
                     snapshot: None,
+                    arms_snapshot: Vec::new(),
                     id: Uuid::new_v4(),
                     at: Utc::now(),
                     signature: request.signature.clone(),

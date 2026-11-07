@@ -5965,6 +5965,9 @@ impl ToolHandler {
                 if let Some(v) = args.get("guard") {
                     body.insert("guard".to_string(), v.clone());
                 }
+                if let Some(v) = args.get("guard_expr") {
+                    body.insert("guard_expr".to_string(), v.clone());
+                }
                 let result = http
                     .post(
                         &format!("/api/protocols/{}/transitions", protocol_id),

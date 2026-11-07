@@ -19,6 +19,7 @@ pub mod demotion;
 pub mod feedback;
 pub mod mode;
 pub mod observe;
+pub mod replay;
 pub mod report;
 pub mod scorer;
 pub mod segment;

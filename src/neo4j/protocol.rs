@@ -142,6 +142,15 @@ impl Neo4jClient {
             to_state: node.get::<String>("to_state")?.parse()?,
             trigger: node.get("trigger")?,
             guard: node.get::<String>("guard").ok().filter(|s| !s.is_empty()),
+            // Fail closed: a stored guard that no longer parses must surface as an error,
+            // never be dropped (that would turn a guarded transition into an open one).
+            guard_expr: node
+                .get::<String>("guard_expr")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| serde_json::from_str(&s))
+                .transpose()
+                .context("Stored guard_expr is not a valid guard")?,
         })
     }
 
@@ -615,7 +624,8 @@ impl Neo4jClient {
                 t.from_state = $from_state,
                 t.to_state = $to_state,
                 t.trigger = $trigger,
-                t.guard = $guard
+                t.guard = $guard,
+                t.guard_expr = $guard_expr
             MERGE (proto)-[:HAS_TRANSITION]->(t)
             "#,
         )
@@ -624,7 +634,17 @@ impl Neo4jClient {
         .param("from_state", transition.from_state.to_string())
         .param("to_state", transition.to_state.to_string())
         .param("trigger", transition.trigger.clone())
-        .param("guard", transition.guard.clone().unwrap_or_default());
+        .param("guard", transition.guard.clone().unwrap_or_default())
+        .param(
+            "guard_expr",
+            transition
+                .guard_expr
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .context("Failed to serialize the transition guard_expr")?
+                .unwrap_or_default(),
+        );
 
         self.graph
             .run(q)
@@ -643,7 +663,7 @@ impl Neo4jClient {
             r#"
             MATCH (t:ProtocolTransition {protocol_id: $protocol_id})
             RETURN t
-            ORDER BY t.trigger
+            ORDER BY t.trigger, t.id
             "#,
         )
         .param("protocol_id", protocol_id.to_string());

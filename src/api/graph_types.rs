@@ -963,6 +963,7 @@ pub async fn build_project_graph_data_stamped(
                         attributes: Some(serde_json::json!({
                             "trigger": transition.trigger,
                             "guard": transition.guard,
+                            "guard_expr": transition.guard_expr,
                         })),
                     });
                     behavioral_edge_count += 1;

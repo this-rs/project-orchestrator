@@ -23,8 +23,8 @@ use crate::neo4j::traits::*;
 use crate::neo4j::traits::GraphStore;
 
 use crate::protocol::{
-    ChildCompletionInfo, CompletionStrategy, OnFailureStrategy, ProtocolRun, RunStatus, StateType,
-    TransitionResult,
+    ChildCompletionInfo, CompletionStrategy, OnFailureStrategy, ProtocolRun, ProtocolTransition,
+    RunStatus, StateType, TransitionResult,
 };
 use anyhow::{bail, Context, Result};
 use uuid::Uuid;
@@ -256,11 +256,52 @@ async fn fire_transition_inner(
         });
     }
 
-    // 3. Load transitions and find a match
+    // 3. Load transitions and find the ones that answer this trigger from the current state.
+    //    Several may share a trigger when they are told apart by a typed guard.
     let transitions = store.get_protocol_transitions(run.protocol_id).await?;
-    let matching = transitions
+    let mut candidates: Vec<&ProtocolTransition> = transitions
         .iter()
-        .find(|t| t.from_state == run.current_state && t.trigger == trigger);
+        .filter(|t| t.from_state == run.current_state && t.trigger == trigger)
+        .collect();
+    // Deterministic order whatever the store returned: guarded candidates first (stable by id),
+    // the unguarded one is the "else" fallback.
+    candidates.sort_by_key(|t| (t.guard_expr.is_none(), t.id));
+
+    // 4. Typed guards (G1): the first guarded candidate whose guard holds fires, else the unguarded
+    //    one (the fallback), exactly as before when none is guarded. If every candidate is guarded and none holds,
+    //    the transition is REFUSED with the reason and the run does not move (fail closed).
+    let mut matching: Option<&ProtocolTransition> = None;
+    let mut refusals: Vec<String> = Vec::new();
+    for candidate in &candidates {
+        match &candidate.guard_expr {
+            None => {
+                matching = Some(candidate);
+                break;
+            }
+            Some(guard) => {
+                let verdict = guard.evaluate(store, &run).await?;
+                if verdict.is_pass() {
+                    matching = Some(candidate);
+                    break;
+                }
+                refusals.push(verdict.reason());
+            }
+        }
+    }
+    if matching.is_none() && !refusals.is_empty() {
+        let reason = refusals.join(" | ");
+        tracing::info!(run_id = %run.id, trigger, %reason, "transition refused by guard");
+        return Ok(TransitionResult {
+            success: false,
+            current_state: run.current_state,
+            current_state_name: last_state_name(&run),
+            run_completed: false,
+            status: run.status,
+            error: Some(format!("Transition '{trigger}' refused by guard: {reason}")),
+            child_run_id: None,
+            child_completion: None,
+        });
+    }
 
     let transition = match matching {
         Some(t) => t,
@@ -280,10 +321,6 @@ async fn fire_transition_inner(
             });
         }
     };
-
-    // 4. Check guard (if any) — for now, guards are informational only
-    // Future: evaluate guard expressions against run context
-    // if let Some(guard) = &transition.guard { ... }
 
     // 5. Resolve target state name
     let states = store.get_protocol_states(run.protocol_id).await?;
@@ -1744,5 +1781,210 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, None);
+    }
+    // ---------------------------------------------------------------- G1: typed guards
+
+    use crate::protocol::guard::Guard;
+
+    async fn state_id(store: &MockGraphStore, protocol_id: Uuid, name: &str) -> Uuid {
+        store
+            .get_protocol_states(protocol_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("state {name} missing"))
+            .id
+    }
+
+    async fn add_guarded(
+        store: &MockGraphStore,
+        protocol_id: Uuid,
+        from: &str,
+        to: &str,
+        trigger: &str,
+        guard_expr: Option<Guard>,
+    ) {
+        let mut t = ProtocolTransition::new(
+            protocol_id,
+            state_id(store, protocol_id, from).await,
+            state_id(store, protocol_id, to).await,
+            trigger,
+        );
+        t.guard_expr = guard_expr;
+        store.upsert_protocol_transition(&t).await.unwrap();
+    }
+
+    fn visited(state: &str) -> Guard {
+        Guard::StateVisited {
+            state: state.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_false_guard_refuses_the_transition_and_the_run_does_not_move() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_protocol(&store).await;
+        add_guarded(
+            &store,
+            protocol.id,
+            "Start",
+            "Processing",
+            "go",
+            Some(visited("Nowhere")),
+        )
+        .await;
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
+
+        let result = fire_transition(&store, run.id, "go").await.unwrap();
+
+        assert!(!result.success);
+        let error = result.error.expect("a refusal must carry its reason");
+        assert!(error.contains("refused by guard"), "{error}");
+        assert!(
+            error.contains("Nowhere"),
+            "the reason must name the predicate: {error}"
+        );
+        assert!(
+            error.contains("observed"),
+            "the reason must say what was observed: {error}"
+        );
+        let after = store.get_protocol_run(run.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.current_state, run.current_state,
+            "the run must not move"
+        );
+        assert_eq!(after.states_visited.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_true_guard_lets_the_transition_fire() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_protocol(&store).await;
+        add_guarded(
+            &store,
+            protocol.id,
+            "Start",
+            "Processing",
+            "go",
+            Some(visited("Start")),
+        )
+        .await;
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
+
+        let result = fire_transition(&store, run.id, "go").await.unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.current_state_name, "Processing");
+    }
+
+    #[tokio::test]
+    async fn the_guard_tells_apart_transitions_that_share_a_trigger() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_protocol(&store).await;
+        // Same trigger from Start: the guarded edge to Done is false, the open edge to
+        // Processing must be the one that fires.
+        add_guarded(
+            &store,
+            protocol.id,
+            "Start",
+            "Done",
+            "go",
+            Some(visited("Nowhere")),
+        )
+        .await;
+        add_guarded(&store, protocol.id, "Start", "Processing", "go", None).await;
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
+
+        let result = fire_transition(&store, run.id, "go").await.unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.current_state_name, "Processing");
+    }
+
+    #[tokio::test]
+    async fn a_true_guarded_edge_wins_over_an_unguarded_one_inserted_first() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_protocol(&store).await;
+        // The unguarded edge (the "else") is stored FIRST; the guarded one must still win.
+        add_guarded(&store, protocol.id, "Start", "Processing", "go", None).await;
+        add_guarded(
+            &store,
+            protocol.id,
+            "Start",
+            "Done",
+            "go",
+            Some(visited("Start")),
+        )
+        .await;
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
+
+        let result = fire_transition(&store, run.id, "go").await.unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.current_state_name, "Done");
+    }
+
+    #[tokio::test]
+    async fn a_transition_without_a_typed_guard_behaves_as_before_even_with_a_label() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_protocol(&store).await;
+        // The legacy free-text guard is a label: it must never block anything.
+        let mut t = ProtocolTransition::with_guard(
+            protocol.id,
+            state_id(&store, protocol.id, "Start").await,
+            state_id(&store, protocol.id, "Processing").await,
+            "go",
+            "all tasks completed",
+        );
+        t.guard_expr = None;
+        store.upsert_protocol_transition(&t).await.unwrap();
+        let run = start_run(&store, protocol.id, None, None, None)
+            .await
+            .unwrap();
+
+        let result = fire_transition(&store, run.id, "go").await.unwrap();
+
+        assert!(
+            result.success,
+            "a descriptive label must not be evaluated: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn the_typed_guard_is_stored_and_read_back_unchanged() {
+        let store = MockGraphStore::new();
+        let (_, protocol) = setup_protocol(&store).await;
+        let guard = Guard::All {
+            guards: vec![
+                visited("Start"),
+                Guard::VisitsAtMost {
+                    state: "Retry".into(),
+                    max: 2,
+                },
+            ],
+        };
+        add_guarded(
+            &store,
+            protocol.id,
+            "Start",
+            "Processing",
+            "go",
+            Some(guard.clone()),
+        )
+        .await;
+
+        let stored = store.get_protocol_transitions(protocol.id).await.unwrap();
+        let read = stored.iter().find(|t| t.trigger == "go").unwrap();
+        assert_eq!(read.guard_expr.as_ref(), Some(&guard));
     }
 }
