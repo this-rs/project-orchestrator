@@ -238,6 +238,10 @@ pub struct MockGraphStore {
     pub session_episodes: RwLock<HashMap<Uuid, crate::episodes::models::Episode>>,
     /// The root of the agent ids, made on first use (`agent_identity_namespace`).
     pub agent_identity_root: std::sync::Mutex<Option<Uuid>>,
+    // ── Durable self (T4): an unresolvable self ──
+    /// Makes `agent_identity_namespace` fail (the self cannot be resolved: a reader must
+    /// say so, and serve nobody else's knowledge).
+    pub fail_agent_identity: std::sync::atomic::AtomicBool,
     /// The model identities made by `ensure_agent`: id, then the last model recorded.
     pub agents: std::sync::Mutex<HashMap<Uuid, Option<String>>>,
     /// `(:Agent)-[:AUTHORED]->(:Note)`, as `(agent, note)`.
@@ -540,6 +544,7 @@ impl MockGraphStore {
             session_episode_save_calls: std::sync::atomic::AtomicUsize::new(0),
             session_episodes: RwLock::new(HashMap::new()),
             agent_identity_root: std::sync::Mutex::new(None),
+            fail_agent_identity: std::sync::atomic::AtomicBool::new(false),
             agents: std::sync::Mutex::new(HashMap::new()),
             agent_authored: RwLock::new(std::collections::HashSet::new()),
             agent_lived: RwLock::new(std::collections::HashSet::new()),
@@ -16159,6 +16164,13 @@ impl ChatStore for MockGraphStore {
     }
 
     async fn agent_identity_namespace(&self) -> Result<Uuid> {
+        // Durable self (T4): a test may make the self unresolvable.
+        if self
+            .fail_agent_identity
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("mock: the agent identity root is unreadable");
+        }
         // One lock for the read and the creation: the MERGE of the Neo4j store.
         let mut root = self
             .agent_identity_root
