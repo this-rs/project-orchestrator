@@ -124,6 +124,19 @@ pub struct CreateStateInline {
     pub action: Option<String>,
 }
 
+/// Parse and validate the optional typed guard of a transition request. A malformed guard is a
+/// 400 that names the accepted kinds; it is never stored as free text.
+fn parse_guard_expr(
+    value: &Option<serde_json::Value>,
+) -> Result<Option<crate::protocol::guard::Guard>, AppError> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => crate::protocol::guard::parse_guard(v)
+            .map(Some)
+            .map_err(AppError::BadRequest),
+    }
+}
+
 /// Inline transition definition for protocol creation
 #[derive(Debug, Deserialize)]
 pub struct CreateTransitionInline {
@@ -131,6 +144,9 @@ pub struct CreateTransitionInline {
     pub to_state: Uuid,
     pub trigger: String,
     pub guard: Option<String>,
+    /// Optional TYPED guard (JSON object, see `protocol::guard::Guard`), validated on creation.
+    #[serde(default)]
+    pub guard_expr: Option<serde_json::Value>,
 }
 
 /// Request body for updating a protocol
@@ -170,6 +186,9 @@ pub struct AddTransitionBody {
     pub to_state: Uuid,
     pub trigger: String,
     pub guard: Option<String>,
+    /// Optional TYPED guard (JSON object, see `protocol::guard::Guard`), validated on creation.
+    #[serde(default)]
+    pub guard_expr: Option<serde_json::Value>,
 }
 
 /// Request body for linking a protocol to a skill
@@ -611,6 +630,7 @@ pub async fn create_protocol(
                 to_state: t.to_state,
                 trigger: t.trigger.clone(),
                 guard: t.guard.clone(),
+                guard_expr: parse_guard_expr(&t.guard_expr)?,
             };
             created_transitions.push(pt);
         }
@@ -1007,6 +1027,7 @@ pub async fn add_transition(
     validate_transition_state_types(&states, body.from_state, body.to_state)
         .map_err(AppError::BadRequest)?;
 
+    let guard_expr = parse_guard_expr(&body.guard_expr)?;
     let pt = ProtocolTransition {
         id: Uuid::new_v4(),
         protocol_id,
@@ -1014,6 +1035,7 @@ pub async fn add_transition(
         to_state: body.to_state,
         trigger: body.trigger,
         guard: body.guard,
+        guard_expr,
     };
 
     state
@@ -1652,6 +1674,9 @@ pub struct ComposeTransitionInline {
     pub to_state: String,
     pub trigger: String,
     pub guard: Option<String>,
+    /// Optional TYPED guard (JSON object, see `protocol::guard::Guard`), validated on creation.
+    #[serde(default)]
+    pub guard_expr: Option<serde_json::Value>,
 }
 
 /// Request body for composing a protocol from notes + FSM definition
@@ -1920,6 +1945,7 @@ pub async fn compose_protocol(
             to_state: *to_id,
             trigger: t.trigger.clone(),
             guard: t.guard.clone(),
+            guard_expr: parse_guard_expr(&t.guard_expr)?,
         };
         created_transitions.push(pt);
     }
@@ -2519,6 +2545,7 @@ mod tests {
         let mid_id = states.iter().find(|s| s.name == "work").unwrap().id;
 
         let body = AddTransitionBody {
+            guard_expr: None,
             from_state: terminal_id,
             to_state: mid_id,
             trigger: "go_back".to_string(),
@@ -2548,6 +2575,7 @@ mod tests {
         let mid_id = states.iter().find(|s| s.name == "work").unwrap().id;
 
         let body = AddTransitionBody {
+            guard_expr: None,
             from_state: mid_id,
             to_state: start_id,
             trigger: "restart".to_string(),
@@ -2581,6 +2609,7 @@ mod tests {
             to_state: mid_id,
             trigger: "begin".to_string(),
             guard: None,
+            guard_expr: None,
         };
         let result = add_transition(State(state.clone()), Path(proto_id), Json(body)).await;
         assert!(result.is_ok(), "Should succeed: {:?}", result.err());
@@ -2619,6 +2648,7 @@ mod tests {
         let mid_id = states.iter().find(|s| s.name == "work").unwrap().id;
 
         let transition = ProtocolTransition {
+            guard_expr: None,
             id: Uuid::new_v4(),
             protocol_id: proto_id,
             from_state: start_id,
@@ -3153,6 +3183,7 @@ mod tests {
             to_state: done_id,
             trigger: "finish".to_string(),
             guard: None,
+            guard_expr: None,
         };
         graph
             .protocol_transitions
@@ -3269,6 +3300,7 @@ mod tests {
             to_state: work_id,
             trigger: "begin".to_string(),
             guard: None,
+            guard_expr: None,
         };
         let t2 = ProtocolTransition {
             id: Uuid::new_v4(),
@@ -3277,6 +3309,7 @@ mod tests {
             to_state: done_id,
             trigger: "finish".to_string(),
             guard: None,
+            guard_expr: None,
         };
         {
             let mut transitions = graph.protocol_transitions.write().await;
@@ -3311,5 +3344,21 @@ mod tests {
             response.invalid_protocols.is_empty(),
             "valid protocol should not appear in invalid list"
         );
+    }
+    #[test]
+    fn parse_guard_expr_accepts_a_typed_guard_and_refuses_free_text() {
+        assert!(parse_guard_expr(&None).unwrap().is_none());
+        assert!(parse_guard_expr(&Some(serde_json::Value::Null))
+            .unwrap()
+            .is_none());
+
+        let ok = serde_json::json!({ "kind": "state_visited", "state": "Review" });
+        assert!(parse_guard_expr(&Some(ok)).unwrap().is_some());
+
+        let err = parse_guard_expr(&Some(serde_json::json!("coverage > 80%"))).unwrap_err();
+        match err {
+            AppError::BadRequest(msg) => assert!(msg.contains("Accepted kinds"), "{msg}"),
+            other => panic!("expected a 400, got {other:?}"),
+        }
     }
 }

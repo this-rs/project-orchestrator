@@ -589,8 +589,13 @@ pub struct ProtocolTransition {
     pub to_state: Uuid,
     /// Trigger event name (e.g., "tests_pass", "review_approved", "timeout")
     pub trigger: String,
-    /// Optional guard condition (e.g., "coverage > 80%", "approvals >= 2")
+    /// Descriptive LABEL of the condition (e.g., "all tasks completed"). Never evaluated:
+    /// seeds and skill imports pose free text here, and it must keep loading as it is.
     pub guard: Option<String>,
+    /// Typed guard evaluated by the harness when the transition is about to fire
+    /// (see [`super::guard::Guard`]). `None` = unguarded, exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_expr: Option<super::guard::Guard>,
 }
 
 impl ProtocolTransition {
@@ -608,6 +613,7 @@ impl ProtocolTransition {
             to_state,
             trigger: trigger.into(),
             guard: None,
+            guard_expr: None,
         }
     }
 
@@ -1104,6 +1110,9 @@ pub struct CreateProtocolTransitionRequest {
     pub trigger: String,
     /// Optional guard condition
     pub guard: Option<String>,
+    /// Optional TYPED guard (JSON, see `protocol::guard::Guard`), validated at creation.
+    #[serde(default)]
+    pub guard_expr: Option<serde_json::Value>,
 }
 
 /// Request to update a protocol

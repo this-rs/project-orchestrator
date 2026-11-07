@@ -763,6 +763,15 @@ async fn import_protocols(
             let to_id = name_to_id.get(&portable_transition.to_state);
 
             if let (Some(&from), Some(&to)) = (from_id, to_id) {
+                let guard_expr = match &portable_transition.guard_expr {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(v) => Some(crate::protocol::guard::parse_guard(v).map_err(|e| {
+                        anyhow::anyhow!(
+                            "transition '{}' carries an invalid guard_expr: {e}",
+                            portable_transition.trigger
+                        )
+                    })?),
+                };
                 let transition = ProtocolTransition {
                     id: Uuid::new_v4(),
                     protocol_id,
@@ -770,6 +779,7 @@ async fn import_protocols(
                     to_state: to,
                     trigger: portable_transition.trigger.clone(),
                     guard: portable_transition.guard.clone(),
+                    guard_expr,
                 };
 
                 graph_store
@@ -1214,12 +1224,14 @@ mod tests {
             ],
             transitions: vec![
                 PortableTransition {
+                    guard_expr: None,
                     from_state: "init".to_string(),
                     to_state: "review".to_string(),
                     trigger: "context_loaded".to_string(),
                     guard: None,
                 },
                 PortableTransition {
+                    guard_expr: None,
                     from_state: "review".to_string(),
                     to_state: "done".to_string(),
                     trigger: "review_complete".to_string(),
@@ -1603,6 +1615,7 @@ mod tests {
                     },
                 ],
                 transitions: vec![PortableTransition {
+                    guard_expr: None,
                     from_state: "start".to_string(),
                     to_state: "end".to_string(),
                     trigger: "done".to_string(),
