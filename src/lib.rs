@@ -2258,7 +2258,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
 
         let engine = HeartbeatEngine::new(graph.clone(), search, emitter, checks);
         // One-time data migrations (legacy alert backlog, duplicate and empty
-        // skills — see neo4j::data_migrations) run in the background so an
+        // skills — see neo4j::data_migrations) and the replayable move of the
+        // agent attribution onto the durable self run in the background so an
         // upgraded install repairs its data without blocking startup. The
         // heartbeat only starts once they are done: deep maintenance evolves
         // the same skills the migrations archive and purge.
@@ -2270,13 +2271,24 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             report_canonical_path_repair(graph.ensure_project_canonical_paths().await);
             let outcomes = graph.run_data_migrations().await;
             for o in outcomes.iter().filter(|o| !o.skipped) {
-                tracing::info!(
-                    id = %o.id,
-                    processed = o.processed,
-                    completed = o.completed,
-                    error = ?o.error,
-                    "Data migration result"
-                );
+                // Une migration en échec n'arrête pas le démarrage (la suivante
+                // la rejoue) : elle est donc dite au niveau `error`, jamais
+                // noyée dans un `info`.
+                match &o.error {
+                    Some(error) => tracing::error!(
+                        id = %o.id,
+                        processed = o.processed,
+                        completed = o.completed,
+                        error = %error,
+                        "Data migration result"
+                    ),
+                    None => tracing::info!(
+                        id = %o.id,
+                        processed = o.processed,
+                        completed = o.completed,
+                        "Data migration result"
+                    ),
+                }
             }
             let failed = outcomes.iter().filter(|o| o.error.is_some()).count();
             let applied = outcomes.iter().filter(|o| !o.skipped).count();
