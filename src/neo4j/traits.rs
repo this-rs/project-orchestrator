@@ -2995,10 +2995,11 @@ pub trait AnalyticsStore: Send + Sync {
         filter: &crate::graph::neighborhood::ProjectFilter,
     ) -> Result<Option<crate::graph::neighborhood::ScopedNeighborhood>>;
 
-    /// Makes the agent `agent_id` a node of the graph, idempotently: a `(:Agent {kind:'model'})`
-    /// under its id, attached by `FACET_OF` to the durable `(:Agent {kind:'self'})` whose id is
-    /// [`crate::neo4j::ChatStore::agent_identity_namespace`] (generated once, persisted, never derived from a model).
-    /// `model`, when known, is recorded as a dated fact (`last_seen`), not as the identity.
+    /// Makes the durable self `agent_id` a node of the graph, idempotently: `agent_id` must be
+    /// the store's `(:Agent {kind:'self'})`, whose id is
+    /// [`crate::neo4j::ChatStore::agent_identity_namespace`] (generated once, persisted, never derived from a model);
+    /// any other id is refused. `model`, when known, is a dated `(:Agent {kind:'model'})` facet
+    /// attached to the self by `FACET_OF`, recording `model` and `last_seen`, not the identity.
     /// Returns `true` when the node did not exist and was created by this call.
     async fn ensure_agent(&self, agent_id: Uuid, model: Option<&str>) -> Result<bool>;
 

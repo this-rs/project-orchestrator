@@ -9,6 +9,42 @@ use neo4rs::query;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// The `(:DataMigration)` key of the move of agent edges from model facets to the self.
+pub const AGENT_SELF_MIGRATION_KEY: &str = "agent_identity_self";
+
+/// Agent attribution edges (`AUTHORED`, `LIVED`) counted by where they hang: a model
+/// facet (before the migration), or the durable self (after).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentEdgeCount {
+    pub facet_authored: usize,
+    pub facet_lived: usize,
+    pub self_authored: usize,
+    pub self_lived: usize,
+}
+
+impl AgentEdgeCount {
+    /// Edges still hanging on a model facet.
+    pub fn facet_total(&self) -> usize {
+        self.facet_authored + self.facet_lived
+    }
+
+    /// Edges on the durable self.
+    pub fn self_total(&self) -> usize {
+        self.self_authored + self.self_lived
+    }
+}
+
+/// What the agent-edge migration found and moved, before and after.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentEdgeMigration {
+    pub before: AgentEdgeCount,
+    pub after: AgentEdgeCount,
+    pub moved_authored: usize,
+    pub moved_lived: usize,
+    /// The `(:DataMigration)` marker said `done` before this run (the run is still safe).
+    pub already_done: bool,
+}
+
 /// SET clauses of `update_chat_session`. Free-text fields are bound as
 /// `$cli_session_id`, `$title`, `$conversation_id`, `$preview` by the caller
 /// (the former inline escaping missed backslashes, so a trailing `\\` in a
@@ -925,28 +961,39 @@ impl Neo4jClient {
         Ok(Uuid::parse_str(&ns)?)
     }
 
-    /// See [`crate::neo4j::AnalyticsStore::ensure_agent`]. One statement: the durable self, the
-    /// model identity and the edge between them are MERGEd together, so a concurrent first call
-    /// matches what the other made (both ids are under a uniqueness constraint).
+    /// See [`crate::neo4j::AnalyticsStore::ensure_agent`]. The only agent of this store is its
+    /// durable self (the root): any other id is refused, never made a node. The model, when
+    /// known, is a dated facet beside the self (`FACET_OF`), one per model name; it never
+    /// becomes the identity. One statement, so a concurrent first call matches what the
+    /// other made (ids are under a uniqueness constraint). Returns `true` when the self was
+    /// created by this call.
     pub async fn ensure_agent(&self, agent_id: Uuid, model: Option<&str>) -> Result<bool> {
         let root = self.agent_identity_namespace().await?;
+        if agent_id != root {
+            anyhow::bail!("{agent_id} is not the durable self of this store");
+        }
+        let facet = model.and_then(|m| crate::notes::provenance::model_facet_id(root, m));
+        let model_name = model
+            .and_then(crate::notes::provenance::normalized_model)
+            .unwrap_or_default();
         let now = chrono::Utc::now().to_rfc3339();
         let mut result = self
             .graph
             .execute(
                 query(
                     "MERGE (s:Agent {id: $root}) ON CREATE SET s.kind = 'self', s.created_at = $now \
-                     MERGE (f:Agent {id: $id}) \
-                     ON CREATE SET f.kind = 'model', f.created_at = $now \
-                     SET f.last_seen = $now, \
-                         f.model = CASE WHEN $model = '' THEN f.model ELSE $model END \
-                     MERGE (f)-[:FACET_OF]->(s) \
-                     RETURN f.created_at = $now AS created",
+                     WITH s, s.created_at = $now AS created \
+                     FOREACH (_ IN CASE WHEN $facet = '' THEN [] ELSE [1] END | \
+                         MERGE (f:Agent {id: $facet}) \
+                         ON CREATE SET f.kind = 'model', f.created_at = $now \
+                         SET f.model = $model, f.last_seen = $now \
+                         MERGE (f)-[:FACET_OF]->(s)) \
+                     RETURN created",
                 )
                 .param("root", root.to_string())
-                .param("id", agent_id.to_string())
+                .param("facet", facet.map(|f| f.to_string()).unwrap_or_default())
                 .param("now", now)
-                .param("model", model.unwrap_or_default().to_string()),
+                .param("model", model_name),
             )
             .await?;
         let row = result
@@ -959,6 +1006,7 @@ impl Neo4jClient {
     /// See [`crate::neo4j::AnalyticsStore::backfill_agents`].
     pub async fn backfill_agents(&self) -> Result<AgentBackfill> {
         let before = self.count_model_agents().await?;
+        let root = self.agent_identity_namespace().await?;
 
         let mut from_notes = std::collections::HashSet::new();
         let mut note_edges: Vec<(Uuid, Uuid)> = Vec::new();
@@ -1004,9 +1052,26 @@ impl Neo4jClient {
             }
         }
 
-        for id in from_notes.union(&from_episodes) {
-            self.ensure_agent(*id, None).await?;
+        // Actors written before the durable self named the MODEL facet: each one resolves to
+        // the self through its `FACET_OF`. An id this store does not know resolves to nothing
+        // and draws nothing, never to another agent.
+        let mut resolved: std::collections::HashMap<Uuid, Uuid> = Default::default();
+        for raw in from_notes.union(&from_episodes) {
+            if let Some(s) = self.durable_of(*raw, root).await? {
+                resolved.insert(*raw, s);
+            }
         }
+        if !resolved.is_empty() {
+            self.ensure_agent(root, None).await?;
+        }
+        let note_edges: Vec<(Uuid, Uuid)> = note_edges
+            .into_iter()
+            .filter_map(|(a, n)| resolved.get(&a).map(|s| (*s, n)))
+            .collect();
+        let episode_edges: Vec<(Uuid, Uuid)> = episode_edges
+            .into_iter()
+            .filter_map(|(a, e)| resolved.get(&a).map(|s| (*s, e)))
+            .collect();
 
         // The same edges the write path draws, rebuilt from what is already written: one
         // path, not two that could diverge.
@@ -1032,6 +1097,205 @@ impl Neo4jClient {
             authored,
             lived,
         })
+    }
+
+    /// Moves the `AUTHORED` and `LIVED` edges drawn from a MODEL facet onto the durable self
+    /// of this store, so the attribution is read on the identity that writes.
+    ///
+    /// Replayable and idempotent: a second run finds no facet edge and moves nothing; an
+    /// edge already present on the self is merged, never duplicated. Work is bounded by
+    /// `batch` edges per statement, looping until none is left. The facet nodes stay (they
+    /// hold the dated model facts). The run is recorded on a `(:DataMigration)` node keyed
+    /// [`AGENT_SELF_MIGRATION_KEY`], and the edge counts are reported before and after.
+    pub async fn migrate_agent_edges_to_self(&self, batch: usize) -> Result<AgentEdgeMigration> {
+        let batch = i64::try_from(batch.max(1)).unwrap_or(i64::MAX);
+        let root = self.agent_identity_namespace().await?;
+        let before = self.count_agent_edges(root).await?;
+        let already_done =
+            self.migration_status(AGENT_SELF_MIGRATION_KEY).await? == Some("done".into());
+
+        let moved_authored = self
+            .move_facet_edges("AUTHORED", "Note", root, batch)
+            .await?;
+        let moved_lived = self
+            .move_facet_edges("LIVED", "SessionEpisode", root, batch)
+            .await?;
+
+        let after = self.count_agent_edges(root).await?;
+        self.record_agent_migration(
+            AGENT_SELF_MIGRATION_KEY,
+            moved_authored + moved_lived,
+            after.facet_total(),
+        )
+        .await?;
+        let report = AgentEdgeMigration {
+            before,
+            after,
+            moved_authored,
+            moved_lived,
+            already_done,
+        };
+        tracing::info!(
+            moved_authored,
+            moved_lived,
+            facet_edges_before = report.before.facet_total(),
+            facet_edges_after = report.after.facet_total(),
+            self_edges_before = report.before.self_total(),
+            self_edges_after = report.after.self_total(),
+            already_done,
+            "agent edges migrated to the durable self"
+        );
+        Ok(report)
+    }
+
+    /// Edge counts of the agent attribution of this store: from the model facets, and on
+    /// the durable self.
+    async fn count_agent_edges(&self, root: Uuid) -> Result<AgentEdgeCount> {
+        let mut count = AgentEdgeCount::default();
+        for (edge, target) in [("AUTHORED", "Note"), ("LIVED", "SessionEpisode")] {
+            let facet = self
+                .count_one(
+                    &format!(
+                        "MATCH (f:Agent {{kind: 'model'}})-[:FACET_OF]->(:Agent {{id: $root}}) \
+                     MATCH (f)-[r:{edge}]->(:{target}) RETURN count(r) AS n"
+                    ),
+                    root,
+                )
+                .await?;
+            let own = self
+                .count_one(
+                    &format!(
+                        "MATCH (:Agent {{id: $root}})-[r:{edge}]->(:{target}) RETURN count(r) AS n"
+                    ),
+                    root,
+                )
+                .await?;
+            if edge == "AUTHORED" {
+                count.facet_authored = facet;
+                count.self_authored = own;
+            } else {
+                count.facet_lived = facet;
+                count.self_lived = own;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn count_one(&self, statement: &str, root: Uuid) -> Result<usize> {
+        let mut rows = self
+            .graph
+            .execute(query(statement).param("root", root.to_string()))
+            .await?;
+        let n: i64 = match rows.next().await? {
+            Some(row) => row.get("n")?,
+            None => 0,
+        };
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// Moves one edge type, in batches, until none is left on a facet. Returns the number
+    /// of edges moved. Each statement deletes what it moved, so the loop always ends.
+    async fn move_facet_edges(
+        &self,
+        edge: &str,
+        target: &str,
+        root: Uuid,
+        batch: i64,
+    ) -> Result<usize> {
+        // The labels and the edge come from this file's own call sites, never from input.
+        let statement = format!(
+            "MATCH (s:Agent {{id: $root}}) \
+             MATCH (f:Agent {{kind: 'model'}})-[:FACET_OF]->(s) \
+             MATCH (f)-[r:{edge}]->(t:{target}) \
+             WITH s, f, r, t LIMIT $batch \
+             MERGE (s)-[m:{edge}]->(t) \
+             ON CREATE SET m.created_at = coalesce(r.created_at, $now), m.migrated_from = f.id \
+             WITH r \
+             DELETE r \
+             RETURN count(*) AS moved"
+        );
+        let mut total = 0usize;
+        loop {
+            let mut rows = self
+                .graph
+                .execute(
+                    query(&statement)
+                        .param("root", root.to_string())
+                        .param("batch", batch)
+                        .param("now", chrono::Utc::now().to_rfc3339()),
+                )
+                .await?;
+            let moved: i64 = match rows.next().await? {
+                Some(row) => row.get("moved")?,
+                None => 0,
+            };
+            if moved == 0 {
+                return Ok(total);
+            }
+            total += usize::try_from(moved).unwrap_or(0);
+        }
+    }
+
+    async fn migration_status(&self, key: &str) -> Result<Option<String>> {
+        let mut rows = self
+            .graph
+            .execute(
+                query("MATCH (m:DataMigration {key: $key}) RETURN m.status AS status")
+                    .param("key", key),
+            )
+            .await?;
+        Ok(match rows.next().await? {
+            Some(row) => row.get::<String>("status").ok(),
+            None => None,
+        })
+    }
+
+    async fn record_agent_migration(
+        &self,
+        key: &str,
+        moved: usize,
+        facet_left: usize,
+    ) -> Result<()> {
+        self.graph
+            .run(
+                query(
+                    "MERGE (m:DataMigration {key: $key}) \
+                     ON CREATE SET m.created_at = $now, m.runs = 0 \
+                     SET m.status = 'done', m.runs = m.runs + 1, m.last_run_at = $now, \
+                         m.last_moved = $moved, m.last_facet_edges_left = $left",
+                )
+                .param("key", key)
+                .param("now", chrono::Utc::now().to_rfc3339())
+                .param("moved", i64::try_from(moved).unwrap_or(i64::MAX))
+                .param("left", i64::try_from(facet_left).unwrap_or(i64::MAX)),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The durable self an agent id stands for in this store: the root itself, or the self
+    /// a model facet of this store hangs under (`FACET_OF`, the actors written before the
+    /// self was the identity). `None` for any other id: a foreign agent is never resolved.
+    async fn durable_of(&self, id: Uuid, root: Uuid) -> Result<Option<Uuid>> {
+        if id == root {
+            return Ok(Some(root));
+        }
+        let mut rows = self
+            .graph
+            .execute(
+                query(
+                    "MATCH (f:Agent {id: $id, kind: 'model'})-[:FACET_OF]->(s:Agent {id: $root}) \
+                     RETURN count(f) AS n",
+                )
+                .param("id", id.to_string())
+                .param("root", root.to_string()),
+            )
+            .await?;
+        let n: i64 = match rows.next().await? {
+            Some(row) => row.get("n")?,
+            None => 0,
+        };
+        Ok((n > 0).then_some(root))
     }
 
     async fn count_model_agents(&self) -> Result<usize> {
@@ -3574,5 +3838,180 @@ mod injection_tests {
         assert!(!c.contains('\''), "no string literal expected: {c}");
         let nan = chat_session_update_clauses(false, false, None, Some(f64::NAN), false, false);
         assert_eq!(nan, vec!["s.updated_at = datetime()".to_string()]);
+    }
+}
+
+/// The agent identity against a real Neo4j: the write path refuses a foreign id, and the
+/// migration of the edges of model facets onto the self is replayable without duplicates.
+/// Like `tests/harness_neo4j.rs`: skipped when no Neo4j answers at `NEO4J_URI`
+/// (`HARNESS_NEO4J_REQUIRED=1` turns the skip into a failure). Run against a throwaway
+/// instance only:
+///   docker run -d --rm --name po-mig -p 17687:7687 -e NEO4J_AUTH=neo4j/testpassword neo4j:5
+///   NEO4J_URI=bolt://localhost:17687 NEO4J_PASSWORD=testpassword cargo test --lib agent_identity_neo4j
+#[cfg(test)]
+mod agent_identity_neo4j {
+    use super::*;
+    use crate::neo4j::traits::*;
+
+    async fn client() -> Option<Neo4jClient> {
+        let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:17687".into());
+        let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
+        let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
+        match Neo4jClient::new(&uri, &user, &password).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                assert!(
+                    std::env::var("HARNESS_NEO4J_REQUIRED").is_err(),
+                    "HARNESS_NEO4J_REQUIRED is set but no Neo4j answers at {uri}: {e}"
+                );
+                eprintln!("Skipping agent identity Neo4j tests: no Neo4j at {uri}");
+                None
+            }
+        }
+    }
+
+    async fn run(c: &Neo4jClient, q: &str, params: Vec<(&str, String)>) {
+        let mut query_ = query(q);
+        for (k, v) in params {
+            query_ = query_.param(k, v);
+        }
+        c.graph.run(query_).await.unwrap();
+    }
+
+    /// A note or an episode node, and a facet-or-self edge from `agent` to it.
+    async fn link(c: &Neo4jClient, agent: Uuid, edge: &str, target: &str, target_id: Uuid) {
+        run(
+            c,
+            &format!(
+                "MERGE (t:{target} {{id: $t}}) \
+                 WITH t MATCH (a:Agent {{id: $a}}) MERGE (a)-[:{edge}]->(t)"
+            ),
+            vec![("t", target_id.to_string()), ("a", agent.to_string())],
+        )
+        .await;
+    }
+
+    async fn ids_of(c: &Neo4jClient, agent: Uuid, edge: &str) -> Vec<String> {
+        let mut rows = c
+            .graph
+            .execute(
+                query(&format!(
+                    "MATCH (:Agent {{id: $a}})-[:{edge}]->(t) RETURN t.id AS id ORDER BY id"
+                ))
+                .param("a", agent.to_string()),
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            out.push(row.get::<String>("id").unwrap());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_foreign_id_is_never_made_an_agent() {
+        let Some(c) = client().await else { return };
+        assert!(c.ensure_agent(Uuid::new_v4(), None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_self_is_made_once_and_the_model_is_a_dated_facet_beside_it() {
+        let Some(c) = client().await else { return };
+        let root = c.agent_identity_namespace().await.unwrap();
+        c.ensure_agent(root, Some("claude-opus-5-5")).await.unwrap();
+        c.ensure_agent(root, Some("deepseek-v4")).await.unwrap();
+        c.ensure_agent(root, Some("deepseek-v4")).await.unwrap();
+
+        let facet = crate::notes::provenance::model_facet_id(root, "deepseek-v4").unwrap();
+        let mut rows = c
+            .graph
+            .execute(
+                query(
+                    "MATCH (f:Agent {id: $f, kind: 'model'})-[:FACET_OF]->(s:Agent {id: $root, kind: 'self'}) \
+                     RETURN f.model AS model, f.last_seen AS seen",
+                )
+                .param("f", facet.to_string())
+                .param("root", root.to_string()),
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("the facet hangs under the self");
+        assert_eq!(row.get::<String>("model").unwrap(), "deepseek-v4");
+        assert!(row.get::<String>("seen").is_ok(), "the fact is dated");
+    }
+
+    #[tokio::test]
+    async fn the_migration_moves_facet_edges_to_the_self_and_replays_without_duplicates() {
+        let Some(c) = client().await else { return };
+        let root = c.agent_identity_namespace().await.unwrap();
+        c.ensure_agent(root, Some("claude-opus-5-5")).await.unwrap();
+        let facet = crate::notes::provenance::model_facet_id(root, "claude-opus-5-5").unwrap();
+        c.ensure_agent(root, Some("claude-opus-5-5")).await.unwrap();
+
+        // Drain what an earlier run left on the shared instance, so the counts below are ours.
+        c.migrate_agent_edges_to_self(50).await.unwrap();
+
+        let (n1, n2, n3, e1) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        for n in [n1, n2, n3] {
+            link(&c, facet, "AUTHORED", "Note", n).await;
+        }
+        // An edge the self already holds for n1: the move must merge it, not duplicate it.
+        link(&c, root, "AUTHORED", "Note", n1).await;
+        link(&c, facet, "LIVED", "SessionEpisode", e1).await;
+
+        // Batches of 2 for 4 edges: the loop must take more than one statement.
+        let first = c.migrate_agent_edges_to_self(2).await.unwrap();
+        assert_eq!(first.before.facet_authored, 3);
+        assert_eq!(first.before.facet_lived, 1);
+        assert_eq!(first.moved_authored, 3);
+        assert_eq!(first.moved_lived, 1);
+        assert_eq!(first.after.facet_total(), 0, "nothing left on a facet");
+
+        // The shared instance keeps other runs' edges: only this test's nodes are read.
+        let mine = |ids: Vec<String>, among: &[Uuid]| -> Vec<String> {
+            let among: Vec<String> = among.iter().map(Uuid::to_string).collect();
+            ids.into_iter().filter(|id| among.contains(id)).collect()
+        };
+        let notes = [n1, n2, n3];
+        let mut expected: Vec<String> = notes.iter().map(Uuid::to_string).collect();
+        expected.sort();
+        let self_authored = mine(ids_of(&c, root, "AUTHORED").await, &notes);
+        assert_eq!(self_authored, expected, "one edge per note, n1 not doubled");
+        assert_eq!(
+            mine(ids_of(&c, root, "LIVED").await, &[e1]),
+            vec![e1.to_string()]
+        );
+
+        // Replay: nothing moves, nothing is duplicated, the marker counts the runs.
+        let second = c.migrate_agent_edges_to_self(2).await.unwrap();
+        assert_eq!(second.moved_authored, 0);
+        assert_eq!(second.moved_lived, 0);
+        assert!(second.already_done);
+        assert_eq!(second.after, first.after);
+        assert_eq!(
+            mine(ids_of(&c, root, "AUTHORED").await, &notes),
+            expected,
+            "a replay duplicates nothing"
+        );
+
+        // Leave the instance as found: this test's nodes and their edges go.
+        for id in [n1, n2, n3, e1] {
+            run(
+                &c,
+                "MATCH (t {id: $id}) WHERE t:Note OR t:SessionEpisode DETACH DELETE t",
+                vec![("id", id.to_string())],
+            )
+            .await;
+        }
     }
 }
