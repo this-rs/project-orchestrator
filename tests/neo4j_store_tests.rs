@@ -2432,7 +2432,24 @@ async fn the_belief_reads_tell_unknown_from_absent_and_keep_the_last_verdict() {
     });
     store.create_note(&note).await.unwrap();
 
+    // Une note SANS règle ne doit PAS être listée. `create_note` écrit pourtant
+    // `assertion_rule_json` sur toutes les notes, avec la chaîne vide : un filtre
+    // `IS NOT NULL` matchait donc tout le corpus (30 813 notes mesurées sur l'instance
+    // vivante, zéro croyance), et la re-vérification examinait les 200 plus anciennes
+    // sans jamais atteindre une vraie croyance.
+    let plain = Note::new(
+        None,
+        NoteType::Context,
+        format!("t7 plain {tag}"),
+        "t7".into(),
+    );
+    store.create_note(&plain).await.unwrap();
+
     let listed = store.list_assertion_notes(100_000).await.unwrap();
+    assert!(
+        !listed.iter().any(|n| n.id == plain.id),
+        "une note sans procédure n'est pas une croyance"
+    );
     let mine = listed
         .iter()
         .find(|n| n.id == note.id)
