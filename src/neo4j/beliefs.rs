@@ -136,6 +136,21 @@ impl Neo4jClient {
             .map(|row| row.get::<bool>("ok").unwrap_or(false)))
     }
 
+    /// See [`crate::neo4j::AnalyticsStore::project_synced`].
+    pub async fn project_synced(&self, project_id: Uuid) -> Result<Option<bool>> {
+        let mut rows = self
+            .graph
+            .execute(
+                query("MATCH (p:Project {id: $id}) RETURN p.last_synced IS NOT NULL AS synced")
+                    .param("id", project_id.to_string()),
+            )
+            .await?;
+        Ok(rows
+            .next()
+            .await?
+            .map(|row| row.get::<bool>("synced").unwrap_or(false)))
+    }
+
     /// See [`crate::neo4j::AnalyticsStore::list_assertion_notes`].
     pub async fn list_assertion_notes(&self, limit: usize) -> Result<Vec<Note>> {
         let mut rows = self

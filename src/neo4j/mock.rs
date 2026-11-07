@@ -14140,6 +14140,15 @@ impl AnalyticsStore for MockGraphStore {
         ))
     }
 
+    async fn project_synced(&self, project_id: Uuid) -> Result<Option<bool>> {
+        Ok(self
+            .projects
+            .read()
+            .await
+            .get(&project_id)
+            .map(|p| p.last_synced.is_some()))
+    }
+
     async fn list_assertion_notes(&self, limit: usize) -> Result<Vec<crate::notes::Note>> {
         let notes = self.notes.read().await;
         let mut out: Vec<crate::notes::Note> = notes

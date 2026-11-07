@@ -2384,6 +2384,38 @@ async fn the_belief_reads_tell_unknown_from_absent_and_keep_the_last_verdict() {
         "un type qu'on ne sait pas nommer est invérifiable, pas absent"
     );
 
+    // La FRAÎCHEUR de synchro : un projet jamais synchronisé ne peut pas réfuter sur une
+    // absence ; un projet synchronisé le peut ; un projet inconnu laisse la question ouverte.
+    let synced = Uuid::new_v4();
+    let unsynced = Uuid::new_v4();
+    raw.run(
+        query(
+            "CREATE (:Project {id: $a, slug: $as, last_synced: datetime()}), \
+                    (:Project {id: $b, slug: $bs})",
+        )
+        .param("a", synced.to_string())
+        .param("as", format!("synced-{tag}"))
+        .param("b", unsynced.to_string())
+        .param("bs", format!("unsynced-{tag}")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store.project_synced(synced).await.unwrap(),
+        Some(true),
+        "last_synced posé = synchronisé"
+    );
+    assert_eq!(
+        store.project_synced(unsynced).await.unwrap(),
+        Some(false),
+        "last_synced absent = jamais synchronisé"
+    );
+    assert_eq!(
+        store.project_synced(Uuid::new_v4()).await.unwrap(),
+        None,
+        "projet inconnu = on ne sait pas"
+    );
+
     // An assertion note is listed, then its verdict is written and read back.
     let mut note = Note::new(
         None,

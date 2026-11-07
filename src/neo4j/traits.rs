@@ -3121,6 +3121,15 @@ pub trait AnalyticsStore: Send + Sync {
         project_id: Option<Uuid>,
     ) -> Result<Option<bool>>;
 
+    /// Le code de ce projet a-t-il été synchronisé au moins une fois (`last_synced` posé) ?
+    /// `None` = projet inconnu, donc on ne sait pas.
+    ///
+    /// C'est ce qui distingue « absent du graphe » de « pas encore indexé » : un projet
+    /// jamais synchronisé ne peut pas RÉFUTER une croyance sur son code — son absence ne
+    /// prouve rien. La présence, elle, reste digne de confiance même sur un graphe partiel
+    /// (l'indexation n'ajoute que des nœuds, elle n'en retire pas).
+    async fn project_synced(&self, project_id: Uuid) -> Result<Option<bool>>;
+
     /// Les croyances : les notes qui déclarent une procédure de vérification.
     async fn list_assertion_notes(&self, limit: usize) -> Result<Vec<crate::notes::Note>>;
 

@@ -3295,6 +3295,10 @@ impl AnalyticsStore for Neo4jClient {
             .await
     }
 
+    async fn project_synced(&self, project_id: Uuid) -> anyhow::Result<Option<bool>> {
+        self.project_synced(project_id).await
+    }
+
     async fn list_assertion_notes(&self, limit: usize) -> anyhow::Result<Vec<crate::notes::Note>> {
         self.list_assertion_notes(limit).await
     }
