@@ -487,6 +487,7 @@ fn portable_note_to_note(
         changes: vec![],
         assertion_rule: None,
         last_assertion_result: None,
+        revision_reason: None,
         sharing_consent: Default::default(),
     })
 }
@@ -551,6 +552,7 @@ fn decision_to_note(
         changes: vec![],
         assertion_rule: None,
         last_assertion_result: None,
+        revision_reason: None,
         sharing_consent: Default::default(),
     })
 }
@@ -642,6 +644,7 @@ fn episode_to_note(
         changes: vec![],
         assertion_rule: None,
         last_assertion_result: None,
+        revision_reason: None,
         sharing_consent: Default::default(),
     })
 }
@@ -1437,6 +1440,7 @@ mod tests {
             changes: vec![],
             assertion_rule: None,
             last_assertion_result: None,
+            revision_reason: None,
             memory_horizon: MemoryHorizon::Operational,
             scar_intensity: 0.0,
             sharing_consent: Default::default(),

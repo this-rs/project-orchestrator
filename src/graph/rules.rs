@@ -17,12 +17,20 @@
 //!
 //! Chaque arête écrite porte `rule`, `measure` et `at`. `measure` est la **mesure**
 //! qui l'a justifiée, en clair, avec ses chiffres (« 3 portées lues, 7 notes
-//! épinglées »). Une arête sans provenance est un bug, et
-//! [`Provenance::is_accountable`] est le prédicat que les tests opposent à tout écrivain.
+//! épinglées »). Une arête sans provenance est un bug — et ce n'est pas une convention :
+//! les écrivains du store ([`GraphStore::link_agent_knows`], [`GraphStore::link_agent_uses`],
+//! [`GraphStore::coactivate_session`]) n'acceptent que [`AccountableProvenance`], un type
+//! qu'on n'obtient qu'en passant par [`Provenance::accountable`], qui REFUSE une règle,
+//! une mesure ou une date vide avec une [`ProvenanceError`]. Une provenance vide ne
+//! compile pas jusqu'à l'écriture.
 //!
 //! C'est ce qui rend une croyance **contestable** : on peut relire la mesure, la
 //! refaire, et constater qu'elle a changé. Une note qui affirme sans mesure est une
 //! opinion ; une arête qui porte sa mesure est une observation datée.
+//!
+//! Les SYNAPSE antérieures au moteur n'ont pas de provenance : elles sont exemptées
+//! (décision 651e…), et aucune migration ne les réécrit. La garantie porte sur ce qui
+//! s'écrit à partir de maintenant.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -30,6 +38,11 @@ use uuid::Uuid;
 use crate::neo4j::traits::GraphStore;
 
 /// Ce qu'une arête dérivée porte, pour être contestable.
+///
+/// C'est le **relevé** : ce qu'on lit sur une arête, ou ce qu'on s'apprête à y écrire.
+/// Ses champs sont publics parce qu'une lecture du graphe peut rendre n'importe quoi — y
+/// compris une arête héritée sans règle. Pour ÉCRIRE, il faut d'abord le prouver :
+/// [`Provenance::accountable`] rend l'[`AccountableProvenance`] que les écrivains exigent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Provenance {
     /// The rule that drew the edge.
@@ -67,9 +80,117 @@ impl Provenance {
     /// Whether this provenance can be contested: it must name a rule and a measure. An
     /// edge whose origin cannot be named is indistinguishable from an accident.
     pub fn is_accountable(&self) -> bool {
-        !self.rule.trim().is_empty()
-            && !self.measure.trim().is_empty()
-            && !self.at.trim().is_empty()
+        self.check().is_ok()
+    }
+
+    /// Ce qui manque pour qu'elle soit contestable, nommé. `Ok(())` quand rien ne manque.
+    pub fn check(&self) -> Result<(), ProvenanceError> {
+        if self.rule.trim().is_empty() {
+            return Err(ProvenanceError::EmptyRule);
+        }
+        if self.measure.trim().is_empty() {
+            return Err(ProvenanceError::EmptyMeasure);
+        }
+        if self.at.trim().is_empty() {
+            return Err(ProvenanceError::EmptyAt);
+        }
+        Ok(())
+    }
+
+    /// La preuve qu'un écrivain exige : la provenance nomme une règle, une mesure et une
+    /// date, sinon elle est REFUSÉE ici — avant toute requête, sans panique, sans arête.
+    pub fn accountable(self) -> Result<AccountableProvenance, ProvenanceError> {
+        self.check()?;
+        Ok(AccountableProvenance(self))
+    }
+}
+
+/// Pourquoi une provenance ne peut pas être écrite. Une erreur typée : l'appelant peut
+/// la distinguer d'une panne du graphe, et un test peut la nommer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvenanceError {
+    /// Aucune règle nommée : l'arête ne pourrait pas dire qui l'a tracée.
+    EmptyRule,
+    /// Aucune mesure : l'arête ne pourrait pas dire pourquoi.
+    EmptyMeasure,
+    /// Aucune date : l'observation ne serait pas datée.
+    EmptyAt,
+}
+
+impl std::fmt::Display for ProvenanceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyRule => write!(f, "provenance refusée : aucune règle nommée"),
+            Self::EmptyMeasure => write!(f, "provenance refusée : aucune mesure"),
+            Self::EmptyAt => write!(f, "provenance refusée : aucune date"),
+        }
+    }
+}
+
+impl std::error::Error for ProvenanceError {}
+
+/// Une provenance qui a PROUVÉ qu'elle nomme une règle, une mesure et une date.
+///
+/// C'est le seul type que les écrivains d'arêtes dérivées acceptent, et son champ est
+/// privé : la seule porte est [`Provenance::accountable`] (ou les raccourcis
+/// [`AccountableProvenance::new`] et [`AccountableProvenance::scored`]), qui refusent le
+/// vide. Un relevé lu sur une arête héritée ne peut donc pas être recopié tel quel sur
+/// une arête neuve sans repasser par la preuve.
+///
+/// Un écrivain ne prend pas un `&Provenance` — c'est le compilateur qui le dit :
+///
+/// ```compile_fail
+/// use project_orchestrator::graph::rules::{KnowledgeScope, Provenance};
+/// use project_orchestrator::neo4j::mock::MockGraphStore;
+/// use project_orchestrator::neo4j::traits::GraphStore;
+///
+/// async fn write(graph: &MockGraphStore) {
+///     let empty = Provenance::new("", "");
+///     let _ = graph
+///         .link_agent_knows(
+///             uuid::Uuid::new_v4(),
+///             uuid::Uuid::new_v4(),
+///             KnowledgeScope::Global,
+///             None,
+///             &empty, // erreur : `&Provenance` n'est pas `&AccountableProvenance`
+///         )
+///         .await;
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AccountableProvenance(Provenance);
+
+impl AccountableProvenance {
+    /// Une provenance datée de maintenant, prouvée — ou refusée.
+    pub fn new(rule: &str, measure: impl Into<String>) -> Result<Self, ProvenanceError> {
+        Provenance::new(rule, measure).accountable()
+    }
+
+    /// Une provenance datée de maintenant qui porte aussi son score, prouvée — ou refusée.
+    pub fn scored(
+        rule: &str,
+        measure: impl Into<String>,
+        score: f64,
+    ) -> Result<Self, ProvenanceError> {
+        Provenance::scored(rule, measure, score).accountable()
+    }
+
+    /// Le relevé tel qu'il sera écrit.
+    pub fn as_provenance(&self) -> &Provenance {
+        &self.0
+    }
+
+    /// Le relevé, en reprenant la propriété.
+    pub fn into_inner(self) -> Provenance {
+        self.0
+    }
+}
+
+impl std::ops::Deref for AccountableProvenance {
+    type Target = Provenance;
+
+    fn deref(&self) -> &Provenance {
+        &self.0
     }
 }
 
@@ -452,14 +573,14 @@ async fn run_agent_knows_project(graph: &dyn GraphStore) -> anyhow::Result<RuleO
             .await?;
         considered += candidates.len();
         for c in candidates {
-            let provenance = Provenance::scored(
+            let provenance = AccountableProvenance::scored(
                 AGENT_KNOWS_PROJECT.name,
                 format!(
                     "projet {}, {} synapse(s), {} ancre(s), énergie {:.2}",
                     project.slug, c.synapses, c.anchors, c.energy
                 ),
                 c.score,
-            );
+            )?;
             let created = graph
                 .link_agent_knows(
                     self_id,
@@ -520,14 +641,14 @@ async fn run_agent_knows_global(graph: &dyn GraphStore) -> anyhow::Result<RuleOu
 
     for c in &candidates {
         top_score = top_score.max(c.score);
-        let provenance = Provenance::scored(
+        let provenance = AccountableProvenance::scored(
             AGENT_KNOWS_GLOBAL.name,
             format!(
                 "{} synapse(s), {} ancre(s) dans plusieurs projets, énergie {:.2}",
                 c.synapses, c.anchors, c.energy
             ),
             c.score,
-        );
+        )?;
         let created = graph
             .link_agent_knows(self_id, c.note, KnowledgeScope::Global, None, &provenance)
             .await?;
@@ -586,7 +707,7 @@ async fn run_agent_uses_activated(
         personas.len(),
         skills.len()
     );
-    let provenance = Provenance::new(AGENT_USES_ACTIVATED.name, measure.clone());
+    let provenance = AccountableProvenance::new(AGENT_USES_ACTIVATED.name, measure.clone())?;
 
     let mut written = 0;
     let mut skipped = 0;
@@ -678,7 +799,6 @@ async fn run_agent_knows_core(graph: &dyn GraphStore) -> anyhow::Result<RuleOutc
     let (ids, scopes, complete) = pinned_notes_everywhere(graph).await?;
 
     let measure = format!("{scopes} portées lues, {} note(s) épinglée(s)", ids.len());
-    let provenance = Provenance::new(AGENT_KNOWS_CORE.name, measure.clone());
 
     // Reconcile FIRST: an edge the rule drew to a note that is no longer pinned must go
     // before the new set is attested. The reverse order would leave, for one instant, a
@@ -703,7 +823,7 @@ async fn run_agent_knows_core(graph: &dyn GraphStore) -> anyhow::Result<RuleOutc
         // Une épingle déclarée passe devant tout ce qui est MESURÉ : c'est une décision,
         // pas une observation. Le score le dit, et la lecture le respecte.
         let declared =
-            Provenance::scored(AGENT_KNOWS_CORE.name, provenance.measure.clone(), f64::MAX);
+            AccountableProvenance::scored(AGENT_KNOWS_CORE.name, measure.clone(), f64::MAX)?;
         // A pin that names a note the graph no longer has draws no edge: the store says
         // whether the target exists, and a missing target is a skip, not an error.
         if graph
@@ -762,7 +882,7 @@ async fn run_session_co_activation(
         "{} note(s) dans le contexte de la session {session}",
         notes.len()
     );
-    let provenance = Provenance::new(name, measure.clone());
+    let provenance = AccountableProvenance::new(name, measure.clone())?;
     let written = graph
         .coactivate_session(project, notes, session, &provenance)
         .await?;
@@ -783,6 +903,67 @@ mod tests {
     use crate::neo4j::mock::MockGraphStore;
     use crate::neo4j::traits::*;
 
+    /// Le refus est porté par la SIGNATURE, pas par une convention d'appel.
+    ///
+    /// `AccountableProvenance` a un champ privé : hors de ce module, on ne peut pas en
+    /// fabriquer une sans passer par `new`/`scored`/`accountable`, qui refusent le vide.
+    /// Mais ce verrou ne vaut que si les écrivains d'arêtes dérivées prennent VRAIMENT ce
+    /// type : une signature revenue à `&Provenance` rouvrirait la porte, et un test
+    /// d'exécution ne le verrait pas — un `Provenance` vide y est déjà impossible à
+    /// construire, donc « aucune arête écrite » y serait vrai par construction. Ce test-ci
+    /// lit les déclarations du trait et rougit sur la dérive.
+    #[test]
+    fn the_writers_of_derived_edges_accept_only_an_accountable_provenance() {
+        const TRAITS: &str = include_str!("../neo4j/traits.rs");
+        for writer in ["link_agent_knows", "link_agent_uses", "coactivate_session"] {
+            let start = TRAITS
+                .find(&format!("fn {writer}("))
+                .unwrap_or_else(|| panic!("{writer} a disparu du trait de stockage"));
+            let end = start
+                + TRAITS[start..]
+                    .find(';')
+                    .expect("une déclaration de méthode se termine par ;");
+            let signature = &TRAITS[start..end];
+            assert!(
+                signature.contains("AccountableProvenance"),
+                "{writer} doit prendre un AccountableProvenance, or sa signature est :\n\
+                 {signature}"
+            );
+            assert!(
+                !signature.contains("provenance: &Provenance"),
+                "{writer} accepte de nouveau une provenance nue, que rien n'oblige à \
+                 justifier :\n{signature}"
+            );
+        }
+    }
+
+    /// Chaque refus de provenance a SON message : un `EmptyAt` annoncé comme « aucune
+    /// règle nommée » enverrait corriger le mauvais champ.
+    #[test]
+    fn every_provenance_refusal_names_its_own_field() {
+        let cases = [
+            (ProvenanceError::EmptyRule, "règle"),
+            (ProvenanceError::EmptyMeasure, "mesure"),
+            (ProvenanceError::EmptyAt, "date"),
+        ];
+        for (error, expected) in cases {
+            let said = error.to_string();
+            assert!(
+                said.contains(expected),
+                "{error:?} doit nommer « {expected} », or il dit : {said}"
+            );
+        }
+        let messages: std::collections::HashSet<String> = [
+            ProvenanceError::EmptyRule,
+            ProvenanceError::EmptyMeasure,
+            ProvenanceError::EmptyAt,
+        ]
+        .iter()
+        .map(|e| e.to_string())
+        .collect();
+        assert_eq!(messages.len(), 3, "trois refus, trois messages distincts");
+    }
+
     /// Une lecture ratée ne doit RIEN détruire : la réconciliation est sautée, pas
     /// appliquée sur un `keep` vide — sinon une erreur transitoire effacerait le socle.
     #[tokio::test]
@@ -793,7 +974,8 @@ mod tests {
         let note = a_note("a foundation");
         graph.create_note(&note).await.unwrap();
         let self_id = graph.agent_identity_namespace().await.unwrap();
-        let prov = Provenance::scored(AGENT_KNOWS_PROJECT.name, "posée à la main", 42.0);
+        let prov = AccountableProvenance::scored(AGENT_KNOWS_PROJECT.name, "posée à la main", 42.0)
+            .unwrap();
         graph
             .link_agent_knows(
                 self_id,
@@ -1138,6 +1320,195 @@ mod tests {
         assert!(!Provenance::new("agent-knows-core", "  ").is_accountable());
     }
 
+    /// C7 : « une arête sans justification est un bug ». Une provenance vide est REFUSÉE
+    /// à l'écriture — par une erreur typée, sans panique, et AUCUNE arête n'existe après.
+    /// La preuve se fait avant l'écrivain : celui-ci n'accepte que le type prouvé, donc
+    /// le seul chemin pour écrire passe par ce refus.
+    #[tokio::test]
+    async fn an_empty_provenance_is_refused_and_draws_nothing() {
+        let graph = MockGraphStore::new();
+        let note = a_note("a note nobody can justify");
+        graph.create_note(&note).await.unwrap();
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        graph.ensure_agent(self_id, None).await.unwrap();
+
+        // Chaque champ vide a son erreur, nommée.
+        assert_eq!(
+            Provenance::new("", "measured").accountable().unwrap_err(),
+            ProvenanceError::EmptyRule
+        );
+        assert_eq!(
+            Provenance::new("   ", "measured")
+                .accountable()
+                .unwrap_err(),
+            ProvenanceError::EmptyRule,
+            "des espaces ne sont pas un nom"
+        );
+        assert_eq!(
+            AccountableProvenance::new("agent-knows-core", "  ").unwrap_err(),
+            ProvenanceError::EmptyMeasure
+        );
+        assert_eq!(
+            AccountableProvenance::scored("agent-knows-core", "", 1.0).unwrap_err(),
+            ProvenanceError::EmptyMeasure
+        );
+        let undated = Provenance {
+            at: String::new(),
+            ..Provenance::new("agent-knows-core", "measured")
+        };
+        assert_eq!(undated.accountable().unwrap_err(), ProvenanceError::EmptyAt);
+        // Lisible comme une erreur ordinaire : elle remonte par `?` dans un `anyhow::Result`.
+        let as_any: anyhow::Error = ProvenanceError::EmptyRule.into();
+        assert!(as_any.to_string().contains("aucune règle"), "{as_any}");
+
+        // Aucune arête dérivée n'a été tracée : ni KNOWS, ni USES, ni SYNAPSE.
+        assert!(graph.agent_knows.read().await.is_empty());
+        assert!(graph.agent_uses.read().await.is_empty());
+        assert!(graph.synapses.read().await.is_empty());
+        assert_eq!(
+            graph.agent_knows(self_id, None, 10).await.unwrap().notes,
+            Vec::<Uuid>::new()
+        );
+
+        // Et la même mesure, une fois nommée, s'écrit : le refus porte sur le vide, pas
+        // sur l'écrivain.
+        let proven = AccountableProvenance::new("agent-knows-core", "measured").unwrap();
+        assert_eq!(proven.rule, "agent-knows-core");
+        assert_eq!(proven.as_provenance().measure, "measured");
+        assert!(proven.clone().into_inner().is_accountable());
+        assert!(graph
+            .link_agent_knows(self_id, note.id, KnowledgeScope::Global, None, &proven)
+            .await
+            .unwrap());
+        assert_eq!(graph.agent_knows.read().await.len(), 1);
+    }
+
+    /// Une arête dérivée telle que le mock la retient : règle, mesure, source, cible.
+    /// `at` est exclu à dessein — c'est la seule chose qui DOIT changer d'un passage à
+    /// l'autre.
+    async fn derived_edges(graph: &MockGraphStore) -> std::collections::BTreeSet<[String; 5]> {
+        let mut out = std::collections::BTreeSet::new();
+        for ((agent, note), (_, _, p)) in graph.agent_knows.read().await.iter() {
+            out.insert([
+                "KNOWS".into(),
+                p.rule.clone(),
+                p.measure.clone(),
+                agent.to_string(),
+                note.to_string(),
+            ]);
+        }
+        for ((agent, label, target), p) in graph.agent_uses.read().await.iter() {
+            out.insert([
+                "USES".into(),
+                p.rule.clone(),
+                p.measure.clone(),
+                agent.to_string(),
+                format!("{label}:{target}"),
+            ]);
+        }
+        for ((a, b), (_, _, p)) in graph.synapses.read().await.iter() {
+            out.insert([
+                "SYNAPSE".into(),
+                p.rule.clone(),
+                p.measure.clone(),
+                a.to_string(),
+                b.to_string(),
+            ]);
+        }
+        out
+    }
+
+    /// Reproductibilité : deux passages du moteur sur les MÊMES données donnent le même
+    /// ensemble d'arêtes (règle, mesure, source, cible). Pas de modèle de langage, pas de
+    /// hasard : seule la date d'observation diffère, et elle est exclue de la comparaison.
+    #[tokio::test]
+    async fn two_passes_on_the_same_data_draw_the_same_edges() {
+        use crate::chat::stages::knowledge_injection::store_pinned_notes;
+
+        let graph = MockGraphStore::new();
+        let project = crate::test_helpers::test_project_named("alpha");
+        graph.create_project(&project).await.unwrap();
+        let mut in_project = Vec::new();
+        for text in ["first of alpha", "second of alpha", "third of alpha"] {
+            let mut note = a_note(text);
+            note.project_id = Some(project.id);
+            note.status = crate::notes::NoteStatus::Active;
+            note.importance = crate::notes::NoteImportance::Critical;
+            graph.create_note(&note).await.unwrap();
+            in_project.push(note.id);
+        }
+        let mut global = a_note("born global");
+        global.project_id = None;
+        global.status = crate::notes::NoteStatus::Active;
+        global.importance = crate::notes::NoteImportance::Critical;
+        graph.create_note(&global).await.unwrap();
+        let pinned = a_note("pinned by hand");
+        graph.create_note(&pinned).await.unwrap();
+        store_pinned_notes(&graph, Some("alpha"), &[pinned.id])
+            .await
+            .unwrap();
+
+        // Un passage complet : les règles qui lisent le graphe, puis les deux dont la
+        // mesure vient de l'appelant — avec la MÊME mesure à chaque passage.
+        let session = Uuid::new_v4();
+        let agent = Uuid::new_v4();
+        let (persona, skill) = (Uuid::new_v4(), Uuid::new_v4());
+        let activation = Measurement::Activation {
+            session,
+            agent,
+            personas: vec![persona],
+            skills: vec![skill],
+        };
+        let session_notes = Measurement::SessionNotes {
+            session,
+            project: Some(project.id),
+            notes: in_project.clone(),
+        };
+        async fn pass(
+            graph: &MockGraphStore,
+            activation: &Measurement,
+            session_notes: &Measurement,
+        ) -> RulesReport {
+            let report = run(graph, &[]).await.unwrap();
+            run_with(graph, AGENT_USES_ACTIVATED.name, activation.clone())
+                .await
+                .unwrap();
+            run_with(graph, SESSION_CO_ACTIVATION.name, session_notes.clone())
+                .await
+                .unwrap();
+            report
+        }
+
+        let first = pass(&graph, &activation, &session_notes).await;
+        let after_first = derived_edges(&graph).await;
+        let second = pass(&graph, &activation, &session_notes).await;
+        let after_second = derived_edges(&graph).await;
+
+        assert!(
+            after_first.len() >= 3 + 1 + 1 + 2 + 3,
+            "le jeu de données exerce chaque règle : {after_first:?}"
+        );
+        assert_eq!(
+            after_first, after_second,
+            "le même graphe, les mêmes arêtes"
+        );
+        // Chaque arête porte une provenance : aucune n'est vide, et chaque règle nommée est
+        // une règle déclarée (ou l'épingle posée par la règle du socle).
+        for edge in &after_first {
+            assert!(
+                rule(&edge[1]).is_some(),
+                "règle inconnue sur une arête : {edge:?}"
+            );
+            assert!(!edge[2].trim().is_empty(), "mesure vide : {edge:?}");
+        }
+        // Le second passage n'écrit rien de neuf : il atteste.
+        assert_eq!(
+            second.edges_written, 0,
+            "second passage : {second:?} (premier : {first:?})"
+        );
+        assert!(first.edges_written > 0, "{first:?}");
+    }
+
     fn a_note(content: &str) -> crate::notes::models::Note {
         crate::notes::models::Note::new(
             None,
@@ -1246,7 +1617,7 @@ mod tests {
                 by_hand.id,
                 KnowledgeScope::Global,
                 None,
-                &Provenance::new("a person", "decided by hand"),
+                &AccountableProvenance::new("a person", "decided by hand").unwrap(),
             )
             .await
             .unwrap();

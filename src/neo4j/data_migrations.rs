@@ -13,6 +13,12 @@
 //! Every batch query takes a `$scope` parameter: `null` for the whole
 //! database, or a project id to restrict the migration to one project (used
 //! by the integration tests, which share one Neo4j instance).
+//!
+//! One migration is not a Cypher entry of the registry: the move of the agent
+//! attribution edges onto the durable self (`chat.rs`,
+//! `migrate_agent_edges_to_self`), replayable on every start, which
+//! [`Neo4jClient::run_data_migrations`] runs after the registry with
+//! [`AGENT_SELF_BATCH`] edges per statement.
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
@@ -25,6 +31,7 @@ use serde::Serialize;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use super::chat::AGENT_SELF_MIGRATION_KEY;
 use super::client::Neo4jClient;
 use super::models::SymbolOwner;
 use super::symbol_key::{
@@ -42,7 +49,17 @@ const MAX_RETRIES: u32 = 5;
 
 /// Hard cap on batches per migration and start, against a batch query that
 /// would keep reporting progress without converging.
-const MAX_BATCHES: u32 = 10_000;
+///
+/// The agent-identity migration (`chat.rs`, `move_facet_edges`) shares this cap:
+/// its loop also DELETEs what it moves, so it must converge too.
+pub(crate) const MAX_BATCHES: u32 = 10_000;
+
+/// Edges per statement of the agent-identity migration (`chat.rs`,
+/// `migrate_agent_edges_to_self`). Each statement MERGEs one edge on the self
+/// and deletes one on a facet: 500 keeps a transaction short on a graph where
+/// the self can hold tens of thousands of `AUTHORED` edges, while the loop
+/// still drains a backlog of that size in a few dozen statements.
+pub const AGENT_SELF_BATCH: usize = 500;
 
 /// Relationships that make a skill referenced by something other than its
 /// member notes/decisions. A referenced skill is never archived as a
@@ -832,9 +849,55 @@ impl Neo4jClient {
         ]
     }
 
-    /// Run every pending data migration, in order. Never fails: errors are
-    /// reported per migration and the next start retries.
+    /// Run every pending data migration, in order, then the agent-identity
+    /// migration. Never fails: errors are reported per migration and the next
+    /// start retries.
+    ///
+    /// The identity migration (`chat.rs`, `migrate_agent_edges_to_self`) is not
+    /// an entry of [`Self::data_migrations`]: it resolves the durable self in
+    /// Rust and keeps its own replayable marker (`(:DataMigration {key})`,
+    /// `status: 'done'`, run counters), so it runs on EVERY start and moves
+    /// nothing once the facets are empty — that is how a facet edge written by
+    /// an older binary after the first run still reaches the self. It runs even
+    /// when the Cypher chain stopped on a failure: it depends on none of those
+    /// migrations, and halting it there would leave the attribution on the
+    /// facets for as long as, say, the worktree purge keeps failing on an
+    /// instance without apoc.
     pub async fn run_data_migrations(&self) -> Vec<MigrationOutcome> {
+        let mut outcomes = self.run_registered_migrations().await;
+        outcomes.push(self.run_agent_identity_migration().await);
+        outcomes
+    }
+
+    /// The agent-identity migration as one [`MigrationOutcome`], so the boot
+    /// path reports it like the others (id [`AGENT_SELF_MIGRATION_KEY`],
+    /// `processed` = edges moved). Its counters before/after are logged by the
+    /// migration itself.
+    async fn run_agent_identity_migration(&self) -> MigrationOutcome {
+        let id = AGENT_SELF_MIGRATION_KEY.to_string();
+        info!(
+            id = %id,
+            batch = AGENT_SELF_BATCH,
+            "Data migration: Move the agent attribution edges from the model facets to the durable self"
+        );
+        match self.migrate_agent_edges_to_self(AGENT_SELF_BATCH).await {
+            Ok(report) => MigrationOutcome {
+                id,
+                skipped: false,
+                processed: i64::try_from(report.moved_authored + report.moved_lived)
+                    .unwrap_or(i64::MAX),
+                deferred: 0,
+                batches: u32::try_from(report.batches).unwrap_or(u32::MAX),
+                completed: true,
+                error: None,
+            },
+            Err(e) => agent_identity_failure(id, &e),
+        }
+    }
+
+    /// The registered Cypher migrations ([`Self::data_migrations`]), in order,
+    /// each once: a completed one is skipped, a failed one stops the chain.
+    async fn run_registered_migrations(&self) -> Vec<MigrationOutcome> {
         let mut outcomes = Vec::new();
         for migration in Self::data_migrations() {
             let outcome = match self.migration_completed(migration.id).await {
@@ -1088,11 +1151,47 @@ impl Neo4jClient {
     }
 }
 
+/// L'échec de la migration d'identité, mis en forme comme les migrations enregistrées.
+///
+/// Extrait du chemin d'appel exprès : la branche d'erreur d'une migration ne peut pas être
+/// atteinte par un test d'exécution (il faudrait un store qui refuse), et une branche
+/// d'erreur que rien ne traverse est exactement le code qui pourrit sans qu'on le sache —
+/// elle finirait par annoncer un succès. Ici elle est pure, donc mesurable.
+fn agent_identity_failure(id: String, e: &anyhow::Error) -> MigrationOutcome {
+    let error = format!("{e:#}");
+    // Le niveau `error` est posé par le chemin de démarrage, qui voit tous les
+    // `MigrationOutcome` ; ici on garde la même forme que les migrations enregistrées.
+    warn!(id = %id, error = %error, "Data migration failed, will retry on next start");
+    MigrationOutcome {
+        id,
+        error: Some(error),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
+
+    /// Un échec de la migration d'identité est un échec DIT : il n'annonce pas un succès,
+    /// il porte sa raison, et il reste rejouable au démarrage suivant.
+    #[test]
+    fn a_failed_agent_identity_migration_says_why_and_stays_retryable() {
+        let cause = anyhow::anyhow!("the graph is unreachable");
+        let outcome = agent_identity_failure("agent_identity_self".to_string(), &cause);
+
+        assert!(!outcome.completed, "un échec n'est pas une complétion");
+        assert!(!outcome.skipped, "un échec n'est pas un saut");
+        assert_eq!(outcome.processed, 0);
+        let error = outcome.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("unreachable"),
+            "la raison est portée, pas avalée : {error}"
+        );
+        assert_eq!(outcome.id, "agent_identity_self");
+    }
 
     #[test]
     fn test_migrations_are_ordered_and_unique() {

@@ -2261,6 +2261,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Boot HeartbeatEngine — background daemon for periodic health checks.
     // Runs independently of chat sessions (like ScheduleProvider).
     {
+        use heartbeat::checks::belief_revision::BeliefRevisionCheck;
         use heartbeat::checks::{
             architecture_drift::ArchitectureDriftCheck, consolidation::ConsolidationCheck,
             convention_guard::ConventionGuardCheck, git_drift::GitDriftCheck,
@@ -2292,6 +2293,11 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             // is free — but its per-run bound is not: the engine awaits each
             // check inline, so an unbounded one starves the rest (PR #309).
             Box::new(ArchitectureDriftCheck::new()),
+            // Re-vérifie les croyances (`notes::beliefs`) : sans ce cycle, une assertion
+            // démentie par le monde restait crue jusqu'au prochain redémarrage. Il ne
+            // touche AUCUNE synapse, donc sa position ici est libre — mais il doit rester
+            // avant le replenish, qui est le seul à devoir être dernier.
+            Box::new(BeliefRevisionCheck),
             // MUST run LAST: the engine executes checks in vec order within a tick
             // (engine.rs:88). SynapseDecayCheck and MaintenanceCheck (deep_maintenance
             // applies an aggressive 3x decay + prune) both delete synapses; replenish
@@ -2302,7 +2308,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
 
         let engine = HeartbeatEngine::new(graph.clone(), search, emitter, checks);
         // One-time data migrations (legacy alert backlog, duplicate and empty
-        // skills — see neo4j::data_migrations) run in the background so an
+        // skills — see neo4j::data_migrations) and the replayable move of the
+        // agent attribution onto the durable self run in the background so an
         // upgraded install repairs its data without blocking startup. The
         // heartbeat only starts once they are done: deep maintenance evolves
         // the same skills the migrations archive and purge.
@@ -2314,13 +2321,24 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             report_canonical_path_repair(graph.ensure_project_canonical_paths().await);
             let outcomes = graph.run_data_migrations().await;
             for o in outcomes.iter().filter(|o| !o.skipped) {
-                tracing::info!(
-                    id = %o.id,
-                    processed = o.processed,
-                    completed = o.completed,
-                    error = ?o.error,
-                    "Data migration result"
-                );
+                // Une migration en échec n'arrête pas le démarrage (la suivante
+                // la rejoue) : elle est donc dite au niveau `error`, jamais
+                // noyée dans un `info`.
+                match &o.error {
+                    Some(error) => tracing::error!(
+                        id = %o.id,
+                        processed = o.processed,
+                        completed = o.completed,
+                        error = %error,
+                        "Data migration result"
+                    ),
+                    None => tracing::info!(
+                        id = %o.id,
+                        processed = o.processed,
+                        completed = o.completed,
+                        "Data migration result"
+                    ),
+                }
             }
             let failed = outcomes.iter().filter(|o| o.error.is_some()).count();
             let applied = outcomes.iter().filter(|o| !o.skipped).count();

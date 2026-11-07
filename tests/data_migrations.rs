@@ -15,6 +15,7 @@ use project_orchestrator::neo4j::traits::*;
 
 use neo4rs::{query, Graph};
 use project_orchestrator::neo4j::client::Neo4jClient;
+use project_orchestrator::neo4j::AGENT_SELF_MIGRATION_KEY;
 use uuid::Uuid;
 
 /// The forgetting policy these tests exercise: the default one, the same the
@@ -1449,12 +1450,28 @@ async fn test_data_migrations_repair_an_upgraded_install() {
     // registry, not to a frozen number. Hard-coding it turned a new migration
     // into a CI failure that had nothing to do with the migration itself
     // (measured 29/10/2026: adding one made this line fail with 6 != 5).
-    let registered = Neo4jClient::data_migrations().len();
-    assert_eq!(first.len(), registered, "{first:?}");
+    // The agent-identity migration comes last, after the registry: it is the
+    // one Rust-driven, replayable step of the startup runner.
+    let mut expected_ids: Vec<String> = Neo4jClient::data_migrations()
+        .iter()
+        .map(|m| m.id.to_string())
+        .collect();
+    expected_ids.push(AGENT_SELF_MIGRATION_KEY.to_string());
+    let ran_ids: Vec<String> = first.iter().map(|o| o.id.clone()).collect();
+    assert_eq!(ran_ids, expected_ids, "{first:?}");
     assert!(
         first.iter().all(|o| o.completed && o.error.is_none()),
         "{first:?}"
     );
     let second = client.run_data_migrations().await;
-    assert!(second.iter().all(|o| o.skipped), "{second:?}");
+    // Every registered migration is skipped on the second start; the identity
+    // one is replayed by design and moves nothing.
+    for o in &second {
+        if o.id == AGENT_SELF_MIGRATION_KEY {
+            assert!(o.completed && o.error.is_none(), "{o:?}");
+            assert_eq!(o.processed, 0, "a replay moves nothing: {o:?}");
+        } else {
+            assert!(o.skipped, "{o:?}");
+        }
+    }
 }

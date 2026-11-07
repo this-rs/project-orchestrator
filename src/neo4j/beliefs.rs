@@ -58,10 +58,11 @@ impl Neo4jClient {
         to_name: &str,
     ) -> Result<Option<bool>> {
         if !LINK_EDGES.contains(&edge) {
-            anyhow::bail!(
-                "{edge} is not an assertion relation: {}",
-                LINK_EDGES.join(", ")
-            );
+            // Une relation inconnue n'est pas une réfutation : c'est une question qu'on ne
+            // sait pas poser au graphe. Lever une erreur ici ferait échouer TOUTE la passe
+            // de re-vérification à cause d'une seule assertion mal écrite — une croyance
+            // fautive rendrait muettes toutes les autres. `None` = « je ne sais pas ».
+            return Ok(None);
         }
         let (Some((from_label, from_prop)), Some((to_label, to_prop))) =
             (label_and_prop(from_kind), label_and_prop(to_kind))
@@ -113,20 +114,26 @@ impl Neo4jClient {
         note_id: Uuid,
         result: &AssertionResult,
         status: Option<NoteStatus>,
+        reason: Option<&str>,
     ) -> Result<()> {
         let payload = serde_json::to_string(result)?;
         // `status` à `None` n'écrit rien : une réfutation `Warn` trace sans casser la note.
+        // `reason` va SUR LE NŒUD (et non dans un journal) : c'est ce qui permet à l'agent
+        // de relire, plus tard, pourquoi sa croyance a été révisée.
         self.graph
             .run(
                 query(
                     "MATCH (n:Note {id: $id}) \
                      SET n.last_assertion_result_json = $result, n.last_checked_at = datetime() \
                      FOREACH (_ IN CASE WHEN $status IS NULL THEN [] ELSE [1] END | \
-                        SET n.status = $status)",
+                        SET n.status = $status, \
+                            n.revision_reason = $reason, \
+                            n.revised_at = datetime())",
                 )
                 .param("id", note_id.to_string())
                 .param("result", payload)
-                .param("status", status.map(|s| s.to_string())),
+                .param("status", status.map(|s| s.to_string()))
+                .param("reason", reason.map(|r| r.to_string())),
             )
             .await?;
         Ok(())

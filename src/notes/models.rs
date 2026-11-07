@@ -812,6 +812,12 @@ pub struct Note {
     pub assertion_rule: Option<AssertionRule>,
     /// Last assertion result (for assertion notes)
     pub last_assertion_result: Option<AssertionResult>,
+    /// Pourquoi cette note a été RÉVISÉE par la re-vérification de ses croyances
+    /// (`notes::beliefs::reverify`). Distinct de `last_assertion_result` : celui-ci dit
+    /// ce que le monde a répondu, celui-ci dit ce que le système en a FAIT, et pourquoi.
+    /// `None` = jamais révisée.
+    #[serde(default)]
+    pub revision_reason: Option<String>,
 
     // Validity window (PR5: preserve without forcing)
     /// The note is knowledge only FROM this instant (None = since always).
@@ -910,6 +916,7 @@ impl Note {
             changes: vec![NoteChange::new(ChangeType::Created, created_by)],
             assertion_rule: None,
             last_assertion_result: None,
+            revision_reason: None,
             valid_from: None,
             valid_until: None,
             revision: None,
@@ -984,6 +991,7 @@ impl Note {
             changes: vec![NoteChange::new(ChangeType::Created, created_by)],
             assertion_rule: None,
             last_assertion_result: None,
+            revision_reason: None,
             valid_from: None,
             valid_until: None,
             revision: None,

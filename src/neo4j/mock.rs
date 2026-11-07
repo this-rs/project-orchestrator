@@ -238,6 +238,16 @@ pub struct MockGraphStore {
     pub session_episodes: RwLock<HashMap<Uuid, crate::episodes::models::Episode>>,
     /// The root of the agent ids, made on first use (`agent_identity_namespace`).
     pub agent_identity_root: std::sync::Mutex<Option<Uuid>>,
+    // ── Durable self (T4): an unresolvable self ──
+    /// Makes `agent_identity_namespace` fail (the self cannot be resolved: a reader must
+    /// say so, and serve nobody else's knowledge).
+    pub fail_agent_identity: std::sync::atomic::AtomicBool,
+    /// Makes `agent_knows` fail: the self resolves, but its knowledge cannot be read.
+    /// Distinct de `fail_agent_identity` — deux pannes différentes, deux raisons
+    /// différentes dans le contexte injecté.
+    pub fail_agent_knows: std::sync::atomic::AtomicBool,
+    /// A `agent_knows` slower than the turn's budget (the read times out).
+    pub slow_agent_knows: std::sync::Mutex<Option<std::time::Duration>>,
     /// The model identities made by `ensure_agent`: id, then the last model recorded.
     pub agents: std::sync::Mutex<HashMap<Uuid, Option<String>>>,
     /// `(:Agent)-[:AUTHORED]->(:Note)`, as `(agent, note)`.
@@ -540,6 +550,9 @@ impl MockGraphStore {
             session_episode_save_calls: std::sync::atomic::AtomicUsize::new(0),
             session_episodes: RwLock::new(HashMap::new()),
             agent_identity_root: std::sync::Mutex::new(None),
+            fail_agent_identity: std::sync::atomic::AtomicBool::new(false),
+            fail_agent_knows: std::sync::atomic::AtomicBool::new(false),
+            slow_agent_knows: std::sync::Mutex::new(None),
             agents: std::sync::Mutex::new(HashMap::new()),
             agent_authored: RwLock::new(std::collections::HashSet::new()),
             agent_lived: RwLock::new(std::collections::HashSet::new()),
@@ -13988,7 +14001,7 @@ impl AnalyticsStore for MockGraphStore {
         note_id: Uuid,
         scope: crate::graph::rules::KnowledgeScope,
         project: Option<Uuid>,
-        provenance: &crate::graph::rules::Provenance,
+        provenance: &crate::graph::rules::AccountableProvenance,
     ) -> Result<bool> {
         // A missing target draws nothing, exactly like the Cypher `MATCH`.
         if self.notes.read().await.get(&note_id).is_none() {
@@ -13996,7 +14009,10 @@ impl AnalyticsStore for MockGraphStore {
         }
         let mut edges = self.agent_knows.write().await;
         let created = !edges.contains_key(&(agent_id, note_id));
-        edges.insert((agent_id, note_id), (scope, project, provenance.clone()));
+        edges.insert(
+            (agent_id, note_id),
+            (scope, project, provenance.as_provenance().clone()),
+        );
         Ok(created)
     }
 
@@ -14005,15 +14021,15 @@ impl AnalyticsStore for MockGraphStore {
         project: Uuid,
         notes: &[Uuid],
         session: Uuid,
-        provenance: &crate::graph::rules::Provenance,
+        provenance: &crate::graph::rules::AccountableProvenance,
     ) -> Result<usize> {
         let mut n = 0;
         for i in 0..notes.len() {
             for j in (i + 1)..notes.len() {
-                self.synapses
-                    .write()
-                    .await
-                    .insert((notes[i], notes[j]), (project, session, provenance.clone()));
+                self.synapses.write().await.insert(
+                    (notes[i], notes[j]),
+                    (project, session, provenance.as_provenance().clone()),
+                );
                 n += 1;
             }
         }
@@ -14025,7 +14041,7 @@ impl AnalyticsStore for MockGraphStore {
         agent_id: Uuid,
         label: &str,
         target_id: Uuid,
-        provenance: &crate::graph::rules::Provenance,
+        provenance: &crate::graph::rules::AccountableProvenance,
     ) -> Result<bool> {
         if !crate::graph::rules::USABLE_LABELS.contains(&label) {
             anyhow::bail!("{label} is not a usable label");
@@ -14033,7 +14049,7 @@ impl AnalyticsStore for MockGraphStore {
         let key = (agent_id, label.to_string(), target_id);
         let mut edges = self.agent_uses.write().await;
         let created = !edges.contains_key(&key);
-        edges.insert(key, provenance.clone());
+        edges.insert(key, provenance.as_provenance().clone());
         Ok(created)
     }
 
@@ -14099,12 +14115,18 @@ impl AnalyticsStore for MockGraphStore {
         note_id: Uuid,
         result: &crate::notes::models::AssertionResult,
         status: Option<crate::notes::models::NoteStatus>,
+        reason: Option<&str>,
     ) -> Result<()> {
         let mut notes = self.notes.write().await;
         if let Some(n) = notes.get_mut(&note_id) {
             n.last_assertion_result = Some(result.clone());
             if let Some(status) = status {
                 n.status = status;
+                // Le Cypher écrit `n.revision_reason = $reason`, donc null quand il n'y a
+                // pas de raison : le mock doit faire pareil, sinon il laisserait sur la
+                // note une raison périmée que la vraie base efface — et le test passerait
+                // sur un mensonge.
+                n.revision_reason = reason.map(|r| r.to_string());
             }
         }
         // Une note disparue entre la lecture et l'écriture : rien à faire, pas d'erreur.
@@ -14136,6 +14158,18 @@ impl AnalyticsStore for MockGraphStore {
         limit: usize,
     ) -> Result<crate::graph::rules::AgentKnowledge> {
         use crate::graph::rules::KnowledgeScope;
+        // Le verrou est relâché AVANT l'attente : un `MutexGuard` gardé à travers un
+        // `await` rend le futur non `Send`, et bloquerait toute la tâche.
+        let delay = *self.slow_agent_knows.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        if self
+            .fail_agent_knows
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("mock: the knowledge of the self is unreadable");
+        }
         let edges = self.agent_knows.read().await;
         let mut all: Vec<(Uuid, f64, String)> = edges
             .iter()
@@ -16156,6 +16190,13 @@ impl ChatStore for MockGraphStore {
     }
 
     async fn agent_identity_namespace(&self) -> Result<Uuid> {
+        // Durable self (T4): a test may make the self unresolvable.
+        if self
+            .fail_agent_identity
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("mock: the agent identity root is unreadable");
+        }
         // One lock for the read and the creation: the MERGE of the Neo4j store.
         let mut root = self
             .agent_identity_root

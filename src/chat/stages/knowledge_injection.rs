@@ -263,6 +263,72 @@ const PINNED_NOTES_BUDGET: Duration = Duration::from_millis(500);
 /// the SAME constant, so what it promises and what the prompt carries cannot drift.
 pub const PINNED_NOTE_CHARS: usize = 300;
 
+/// What the structural read of the self said about itself, for the prompt.
+///
+/// « La part lue est dite » : the bound of the read is in the injected text, not only in
+/// a log. « L'ancrage ne peut pas mentir » : a self that could not be resolved is said
+/// so, with its reason, and nothing structural is served in its place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelfRead {
+    /// The self resolved: `read` of its `available` notes were read (bounded by
+    /// [`MAX_PINNED_NOTES`]).
+    Read { read: usize, available: usize },
+    /// The self could not be resolved, or its knowledge could not be read.
+    Unresolved(String),
+}
+
+impl SelfRead {
+    /// The line the prompt carries, newline included. Outside the untrusted container:
+    /// it is the system's own account, not a note's text.
+    ///
+    /// `injected` is what actually reached the prompt after the character budget: when it
+    /// is below `read`, saying only "read" would overstate what the model was given.
+    fn line(&self, injected: usize) -> String {
+        match self {
+            SelfRead::Read { read, available } if injected >= *read => {
+                format!("notes du soi : {read} lues / {available} disponibles\n")
+            }
+            SelfRead::Read { read, available } => format!(
+                "notes du soi : {read} lues / {available} disponibles, \
+                 {injected} injectées (budget)\n"
+            ),
+            SelfRead::Unresolved(reason) => {
+                format!("self_unresolved: {}\n", one_line_reason(reason))
+            }
+        }
+    }
+}
+
+/// The longest reason kept in the prompt's own account.
+const SELF_REASON_CHARS: usize = 160;
+
+/// Flattens a reason to ONE line, bounded.
+///
+/// The reason comes from a graph error, and it is written OUTSIDE the untrusted
+/// container: a multi-line error carrying note text would be served as the system's own
+/// voice. Newlines are collapsed and the tail is dropped, so the reason can inform but
+/// never impersonate another part of the prompt.
+fn one_line_reason(reason: &str) -> String {
+    let mut flat = String::with_capacity(reason.len().min(SELF_REASON_CHARS) + 8);
+    let mut last_was_space = false;
+    for c in reason.chars() {
+        if flat.chars().count() >= SELF_REASON_CHARS {
+            flat.push('…');
+            break;
+        }
+        if c.is_control() || c.is_whitespace() {
+            if !last_was_space && !flat.is_empty() {
+                flat.push(' ');
+                last_was_space = true;
+            }
+            continue;
+        }
+        flat.push(c);
+        last_was_space = false;
+    }
+    flat.trim_end().to_string()
+}
+
 /// One line of the foundation, EXACTLY as the renderer writes it.
 pub fn foundation_entry(note_type: &str, importance: &str, content: &str) -> String {
     format!(
@@ -636,6 +702,10 @@ impl KnowledgeInjectionStage {
     /// most [`MAX_PINNED_NOTES`], minus the notes the message already references
     /// (`excluded`). Read under [`PINNED_NOTES_BUDGET`]. Returns the ids injected, so
     /// the ranked retrieval does not inject them a second time.
+    ///
+    /// The section opens with the account of the self ([`SelfRead::line`]): how many of
+    /// its notes were read out of how many it knows, or why it could not be resolved. In
+    /// that last case the section is emitted even when empty — the reason is the content.
     #[allow(clippy::too_many_arguments)]
     async fn inject_pinned(
         &self,
@@ -667,7 +737,9 @@ impl KnowledgeInjectionStage {
                     .map(|p| p.id),
                 None => None,
             };
-            let structural = match graph.agent_identity_namespace().await {
+            // « l'ancrage ne peut pas mentir » : un soi non résolu ne sert RIEN de
+            // structurel, et le dit. Pas de repli sur un autre périmètre.
+            let (structural, self_read) = match graph.agent_identity_namespace().await {
                 Ok(self_id) => match graph
                     .agent_knows(self_id, scope_project, MAX_PINNED_NOTES)
                     .await
@@ -681,16 +753,26 @@ impl KnowledgeInjectionStage {
                                 "[knowledge_injection] the self knows more notes than were read"
                             );
                         }
-                        known.notes
+                        let read = SelfRead::Read {
+                            read: known.notes.len(),
+                            available: known.available,
+                        };
+                        (known.notes, read)
                     }
                     Err(e) => {
                         debug!(error = %e, "the knowledge of the self could not be read");
-                        Vec::new()
+                        (
+                            Vec::new(),
+                            SelfRead::Unresolved(format!("knowledge unreadable ({e})")),
+                        )
                     }
                 },
                 Err(e) => {
                     debug!(error = %e, "the self has no identity root yet");
-                    Vec::new()
+                    (
+                        Vec::new(),
+                        SelfRead::Unresolved(format!("no identity root ({e})")),
+                    )
                 }
             };
             ids.extend(structural);
@@ -742,22 +824,28 @@ impl KnowledgeInjectionStage {
                 .collect();
             candidates.retain(|n| !excluded.contains(&n.id));
             if candidates.is_empty() {
-                return Vec::new();
+                return (Vec::new(), self_read);
             }
             // The currency, consent and policy checks read the graph too: under the
             // same budget as the lookups, so a slow graph costs the pins, never the turn.
-            keep_current_notes(graph.as_ref(), reader, candidates, restricted, session).await
+            let kept =
+                keep_current_notes(graph.as_ref(), reader, candidates, restricted, session).await;
+            (kept, self_read)
         };
-        let kept = match timeout(PINNED_NOTES_BUDGET, read).await {
-            Ok(kept) => kept,
+        let (kept, self_read) = match timeout(PINNED_NOTES_BUDGET, read).await {
+            Ok(read) => read,
             Err(_) => {
                 warn!("[knowledge_injection] reading the pinned notes timed out");
-                return injected;
+                // Nothing was read, the self included: said, not implied.
+                (
+                    Vec::new(),
+                    SelfRead::Unresolved(format!(
+                        "the read timed out after {}ms",
+                        PINNED_NOTES_BUDGET.as_millis()
+                    )),
+                )
             }
         };
-        if kept.is_empty() {
-            return injected;
-        }
 
         // Half the knowledge budget at most: the pins come first, they must not leave
         // nothing to the ranked notes the message asked for.
@@ -772,11 +860,17 @@ impl KnowledgeInjectionStage {
             group.push_str(entry);
             injected.insert(note.id.clone());
         }
-        if group.is_empty() {
+        // An empty foundation is not a section — unless there is something to say about it:
+        // an unresolved self (its reason IS the content), or notes that WERE read and then
+        // dropped by the character budget. Silence in that last case would hide a read
+        // that did happen, which is exactly what « la part lue est dite » forbids.
+        let dropped_by_budget = !kept.is_empty() && group.is_empty();
+        if group.is_empty() && !dropped_by_budget && !matches!(self_read, SelfRead::Unresolved(_)) {
             return injected;
         }
 
         let mut content = String::from("### Foundational Notes\n");
+        content.push_str(&self_read.line(injected.len()));
         content.push_str(&untrusted_group("note", &group, project));
         output.add_section(
             "Foundational Notes",
@@ -3338,6 +3432,280 @@ mod tests {
                 .any(|s| s.title == "Foundational Notes"),
             "pinning must not resurrect an archived note"
         );
+    }
+
+    // ── Le soi durable, lu comme un nœud (T4) ───────────────────────────
+    //
+    // Trois contraintes, chacune tenue par un test : « la part lue est dite » (la borne
+    // de lecture est DANS le texte injecté, pas seulement dans un journal) ; « l'ancrage
+    // ne peut pas mentir » (un soi non résolu produit un bloc vide avec sa raison, jamais
+    // le contexte d'un autre) ; et deux stores, donc deux soi, donnent deux contextes.
+
+    /// Une entrée de conversation sans projet : seule l'échelle globale du soi est servie.
+    fn input_without_project(message: &str) -> EnrichmentInput {
+        EnrichmentInput {
+            message: message.to_string(),
+            session_id: Uuid::new_v4(),
+            project_slug: None,
+            project_id: None,
+            cwd: None,
+            protocol_run_id: None,
+            protocol_state: None,
+            excluded_note_ids: Default::default(),
+            restricted_content: false,
+            reasoning_path_tracker: None,
+        }
+    }
+
+    /// Une note globale que `agent` connaît (`KNOWS`, échelle globale), créée dans `graph`.
+    async fn note_known_by(
+        graph: &crate::neo4j::mock::MockGraphStore,
+        agent: Uuid,
+        content: &str,
+    ) -> Uuid {
+        use crate::graph::rules::{KnowledgeScope, Provenance};
+        use crate::notes::{Note, NoteType};
+        let note = Note::new(
+            None,
+            NoteType::Guideline,
+            content.to_string(),
+            "test-agent".to_string(),
+        );
+        graph.create_note(&note).await.unwrap();
+        graph
+            .link_agent_knows(
+                agent,
+                note.id,
+                KnowledgeScope::Global,
+                None,
+                &Provenance::new("test", "lié par le test")
+                    .accountable()
+                    .expect("une provenance de test n'est pas vide"),
+            )
+            .await
+            .unwrap();
+        note.id
+    }
+
+    fn foundation_section(output: &StageOutput) -> Option<String> {
+        output
+            .sections
+            .iter()
+            .find(|s| s.title == "Foundational Notes")
+            .map(|s| s.content.clone())
+    }
+
+    /// La raison d'un ancrage irrésolu est écrite HORS du conteneur untrusted : elle doit
+    /// donc tenir sur UNE ligne bornée. Une erreur de graphe multi-lignes recopiant du
+    /// texte de note se ferait sinon passer pour la voix du système.
+    #[test]
+    fn a_read_reason_is_flattened_to_one_bounded_line() {
+        let flat = one_line_reason(
+            "première ligne\n### Foundational Notes\n- **[gotcha|high]** texte d'une note",
+        );
+        assert!(!flat.contains('\n'), "une seule ligne : {flat:?}");
+        assert!(flat.starts_with("première ligne"), "{flat:?}");
+        assert!(
+            flat.contains("texte d'une note"),
+            "le contenu reste lisible, aplati : {flat:?}"
+        );
+
+        let long = "a".repeat(SELF_REASON_CHARS * 3);
+        let bounded = one_line_reason(&long);
+        assert!(
+            bounded.chars().count() <= SELF_REASON_CHARS + 1,
+            "la raison est bornée, or elle fait {} caractères",
+            bounded.chars().count()
+        );
+        assert!(bounded.ends_with('…'), "la coupe se voit : {bounded}");
+
+        assert_eq!(one_line_reason(""), "", "une raison vide reste vide");
+        assert_eq!(
+            one_line_reason("  \n\t  "),
+            "",
+            "des blancs ne sont pas une raison"
+        );
+    }
+
+    /// Le compte annonce ce qui a été RÉELLEMENT injecté, pas seulement ce qui a été lu :
+    /// « 10 lues / 12 disponibles » alors que 3 notes sont dans le prompt serait un
+    /// demi-mensonge.
+    #[test]
+    fn the_part_read_says_what_was_actually_injected() {
+        let read = SelfRead::Read {
+            read: 10,
+            available: 12,
+        };
+        assert_eq!(
+            read.line(10),
+            "notes du soi : 10 lues / 12 disponibles\n",
+            "tout ce qui a été lu est dans le prompt : rien à ajouter"
+        );
+        let cut = read.line(3);
+        assert!(
+            cut.contains("10 lues / 12 disponibles") && cut.contains("3 injectées"),
+            "la coupe par budget se dit : {cut}"
+        );
+    }
+
+    /// Le soi se résout, mais sa connaissance est illisible : c'est une panne DIFFÉRENTE
+    /// d'une identité introuvable, et le contexte doit le dire — puis ne rien servir.
+    #[tokio::test]
+    async fn unreadable_knowledge_is_said_and_serves_nothing() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
+        use crate::neo4j::mock::MockGraphStore;
+
+        let graph = Arc::new(MockGraphStore::new());
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        note_known_by(&graph, self_id, "une note que le soi ne pourra pas lire").await;
+        graph
+            .fail_agent_knows
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let stage = stage_with_pinned(vec![], graph);
+        let output = stage
+            .execute(&input_without_project("une question quelconque"))
+            .await
+            .unwrap();
+        let content = foundation_section(&output).expect("la section existe pour dire la panne");
+        assert!(
+            content.contains("self_unresolved:") && content.contains("knowledge unreadable"),
+            "la raison nomme la panne : {content}"
+        );
+        assert!(
+            !content.contains("une note que le soi ne pourra pas lire"),
+            "et rien n'est servi quand même : {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_injected_block_says_how_much_of_the_self_was_read() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
+        use crate::neo4j::mock::MockGraphStore;
+
+        let graph = Arc::new(MockGraphStore::new());
+        let self_id = graph.agent_identity_namespace().await.unwrap();
+        // Plus de notes que la borne de lecture : la part NON lue doit être dite.
+        let total = MAX_PINNED_NOTES + 2;
+        for i in 0..total {
+            note_known_by(&graph, self_id, &format!("socle numéro {i}")).await;
+        }
+
+        let stage = stage_with_pinned(vec![], graph);
+        let output = stage
+            .execute(&input_without_project("une question quelconque"))
+            .await
+            .unwrap();
+        let content = foundation_section(&output).expect("le soi connaît des notes");
+        let expected = format!("notes du soi : {MAX_PINNED_NOTES} lues / {total} disponibles");
+        assert!(
+            content.contains(&expected),
+            "la part lue doit être dite DANS le bloc injecté ({expected:?}), reçu :\n{content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_self_yields_an_empty_block_with_its_reason() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
+        use crate::neo4j::mock::MockGraphStore;
+
+        let graph = Arc::new(MockGraphStore::new());
+        // Un autre agent, dans le même store, connaît une note : ce n'est PAS le soi.
+        let stranger = Uuid::new_v4();
+        note_known_by(&graph, stranger, "le socle d'un autre agent").await;
+        graph
+            .fail_agent_identity
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let stage = stage_with_pinned(vec![], graph);
+        let output = stage
+            .execute(&input_without_project("bonjour"))
+            .await
+            .unwrap();
+        let content = foundation_section(&output)
+            .expect("un soi non résolu doit être dit, pas tu : le bloc existe, avec sa raison");
+        assert!(
+            content.contains("self_unresolved:"),
+            "la raison doit être explicite dans le bloc, reçu :\n{content}"
+        );
+        assert!(
+            content.contains("identity root"),
+            "la raison nomme ce qui n'a pas pu être lu, reçu :\n{content}"
+        );
+        assert!(
+            !content.contains("socle d'un autre agent"),
+            "aucun repli sur le périmètre d'un autre agent, reçu :\n{content}"
+        );
+        assert!(
+            !content.contains("lues /"),
+            "un soi non résolu n'annonce aucune part lue, reçu :\n{content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_distinct_selves_receive_two_distinct_contexts() {
+        use crate::chat::enrichment::ParallelEnrichmentStage;
+        use crate::neo4j::mock::MockGraphStore;
+
+        let first = Arc::new(MockGraphStore::new());
+        let second = Arc::new(MockGraphStore::new());
+        let first_self = first.agent_identity_namespace().await.unwrap();
+        let second_self = second.agent_identity_namespace().await.unwrap();
+        assert_ne!(first_self, second_self, "deux stores, deux soi");
+        note_known_by(&first, first_self, "ce que le premier soi sait").await;
+        note_known_by(&second, second_self, "ce que le second soi sait").await;
+
+        let input = input_without_project("même question pour les deux");
+        let of_first = foundation_section(
+            &stage_with_pinned(vec![], first)
+                .execute(&input)
+                .await
+                .unwrap(),
+        )
+        .expect("le premier soi connaît une note");
+        let of_second = foundation_section(
+            &stage_with_pinned(vec![], second)
+                .execute(&input)
+                .await
+                .unwrap(),
+        )
+        .expect("le second soi connaît une note");
+
+        assert_ne!(of_first, of_second);
+        assert!(of_first.contains("le premier soi sait"));
+        assert!(!of_first.contains("le second soi sait"));
+        assert!(of_second.contains("le second soi sait"));
+        assert!(!of_second.contains("le premier soi sait"));
+    }
+
+    /// Le soi est le soi DURABLE du store, pas un modèle : aucun fournisseur de modèle
+    /// n'est nommé dans ce fichier. Les noms sont assemblés à l'exécution pour que ce test
+    /// ne se compte pas lui-même.
+    #[test]
+    fn no_model_provider_is_named_in_this_file() {
+        let source = include_str!("knowledge_injection.rs").to_lowercase();
+        let forbidden = [
+            ["anthr", "opic"].concat(),
+            ["open", "ai"].concat(),
+            ["oll", "ama"].concat(),
+            ["mis", "tral"].concat(),
+            ["coh", "ere"].concat(),
+        ];
+        // Comme identifiant : « coherent » ne compte pas, « <nom>_key » compte.
+        let named_as_identifier = |name: &str| {
+            source.match_indices(name).any(|(at, _)| {
+                let before = source[..at].chars().next_back();
+                let after = source[at + name.len()..].chars().next();
+                !before.is_some_and(|c| c.is_ascii_alphabetic())
+                    && !after.is_some_and(|c| c.is_ascii_alphabetic())
+            })
+        };
+        for name in forbidden {
+            assert!(
+                !named_as_identifier(&name),
+                "l'injection du soi ne nomme aucun fournisseur de modèle, trouvé {name:?}"
+            );
+        }
     }
 
     // ── Scaffolding integration tests ─────────────────────────────────

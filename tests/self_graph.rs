@@ -17,6 +17,7 @@ use neo4rs::{query, Graph};
 use project_orchestrator::graph::rules;
 use project_orchestrator::neo4j::client::Neo4jClient;
 use project_orchestrator::neo4j::models::{ChatSessionNode, ProjectNode};
+use project_orchestrator::neo4j::AGENT_SELF_MIGRATION_KEY;
 
 use project_orchestrator::notes::models::{Note, NoteType};
 use uuid::Uuid;
@@ -244,6 +245,83 @@ async fn the_backfill_rebuilds_the_attribution_and_says_what_it_did() {
     cleanup(&e).await;
 }
 
+/// `(:DataMigration {key})` marker of the agent-identity migration: its status and run count.
+async fn identity_marker(e: &Env) -> Option<(String, i64)> {
+    let mut rows = e
+        .raw
+        .execute(
+            query("MATCH (m:DataMigration {key: $key}) RETURN m.status AS status, m.runs AS runs")
+                .param("key", AGENT_SELF_MIGRATION_KEY),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap()?;
+    Some((row.get("status").unwrap(), row.get("runs").unwrap()))
+}
+
+#[tokio::test]
+async fn the_startup_runner_moves_the_facet_edges_once_and_replays_moving_nothing() {
+    let _serial = serial().await;
+    // The migration is wired on the startup path (`run_data_migrations`), not called by
+    // hand: what this pins is that the boot moves a facet edge to the self, and that the
+    // next boot finds the marker and moves nothing.
+    let Some(e) = env("startup-migration").await else {
+        return;
+    };
+    let root = e.client.agent_identity_namespace().await.unwrap();
+    e.client
+        .ensure_agent(root, Some("claude-opus-5-5"))
+        .await
+        .unwrap();
+    let facet =
+        project_orchestrator::notes::provenance::model_facet_id(root, "claude-opus-5-5").unwrap();
+    // The state a database predating the self is in: the edge hangs on the model facet.
+    let note = a_note(&format!("agent:{facet}"));
+    e.client.create_note(&note).await.unwrap();
+    e.raw
+        .run(
+            query(
+                "MATCH (f:Agent {id: $facet}), (n:Note {id: $note}) \
+                 MERGE (f)-[:AUTHORED]->(n)",
+            )
+            .param("facet", facet.to_string())
+            .param("note", note.id.to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authored_count(&e, facet, note.id).await, 1);
+
+    // First boot: the runner reports the identity migration with what it moved.
+    let first = e.client.run_data_migrations().await;
+    let mine = first
+        .iter()
+        .find(|o| o.id == AGENT_SELF_MIGRATION_KEY)
+        .expect("the identity migration is on the startup path");
+    assert!(mine.completed && mine.error.is_none(), "{mine:?}");
+    assert!(mine.processed >= 1, "our facet edge moved: {mine:?}");
+    assert_eq!(authored_count(&e, root, note.id).await, 1);
+    assert_eq!(authored_count(&e, facet, note.id).await, 0);
+    let (status, runs) = identity_marker(&e).await.expect("the marker is written");
+    assert_eq!(status, "done");
+
+    // Second boot: the marker is there, the migration replays and moves nothing.
+    let second = e.client.run_data_migrations().await;
+    let mine = second
+        .iter()
+        .find(|o| o.id == AGENT_SELF_MIGRATION_KEY)
+        .expect("replayed on every start");
+    assert!(mine.completed && mine.error.is_none(), "{mine:?}");
+    assert_eq!(mine.processed, 0, "{mine:?}");
+    assert_eq!(authored_count(&e, root, note.id).await, 1, "not duplicated");
+    let (status, runs_after) = identity_marker(&e).await.unwrap();
+    assert_eq!(status, "done");
+    assert_eq!(runs_after, runs + 1, "the marker counts the replay");
+
+    e.client.delete_note(note.id).await.unwrap();
+    drop_nodes(&e, "Agent", &[facet]).await;
+    cleanup(&e).await;
+}
+
 #[tokio::test]
 async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
     let _serial = serial().await;
@@ -258,7 +336,9 @@ async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
     // which is the trap this line documents.
     e.client.ensure_agent(self_id, None).await.unwrap();
     let before = e.client.agent_knows(self_id, None, 10_000).await.unwrap();
-    let prov = rules::Provenance::new("agent-knows-core", "3 portées lues, 3 notes épinglées");
+    let prov =
+        rules::AccountableProvenance::new("agent-knows-core", "3 portées lues, 3 notes épinglées")
+            .unwrap();
 
     let mut ids = Vec::new();
     for i in 0..3 {
@@ -341,7 +421,7 @@ async fn a_knows_edge_to_a_missing_note_draws_nothing() {
             Uuid::new_v4(),
             rules::KnowledgeScope::Global,
             None,
-            &rules::Provenance::new("agent-knows-core", "measured"),
+            &rules::AccountableProvenance::new("agent-knows-core", "measured").unwrap(),
         )
         .await
         .unwrap();
@@ -400,7 +480,7 @@ async fn what_a_subject_applies_becomes_a_uses_edge_with_its_provenance() {
             agent,
             "Persona) DETACH DELETE (n",
             persona,
-            &rules::Provenance::new("agent-uses-activated", "measured"),
+            &rules::AccountableProvenance::new("agent-uses-activated", "measured").unwrap(),
         )
         .await;
     assert!(
@@ -608,7 +688,7 @@ async fn unpinning_releases_the_edge_the_rule_drew_and_spares_a_hand_placed_one(
             by_hand.id,
             rules::KnowledgeScope::Global,
             None,
-            &rules::Provenance::new("a person", "decided by hand"),
+            &rules::AccountableProvenance::new("a person", "decided by hand").unwrap(),
         )
         .await
         .unwrap();
@@ -776,7 +856,7 @@ async fn the_catalog_says_what_the_graph_really_has() {
             note.id,
             rules::KnowledgeScope::Global,
             None,
-            &rules::Provenance::new("agent-knows-core", "measured"),
+            &rules::AccountableProvenance::new("agent-knows-core", "measured").unwrap(),
         )
         .await
         .unwrap();

@@ -7,6 +7,7 @@
 use crate::neo4j::traits::*;
 
 pub mod architecture_drift;
+pub mod belief_revision;
 pub mod consolidation;
 pub mod convention_guard;
 pub mod git_drift;

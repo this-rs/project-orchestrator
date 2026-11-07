@@ -41,6 +41,9 @@ pub struct AgentEdgeMigration {
     pub after: AgentEdgeCount,
     pub moved_authored: usize,
     pub moved_lived: usize,
+    /// Statements executed, both edge types together. Reported so a run that moved
+    /// nothing is told apart from a run that never started.
+    pub batches: u64,
     /// The `(:DataMigration)` marker said `done` before this run (the run is still safe).
     pub already_done: bool,
 }
@@ -1114,10 +1117,10 @@ impl Neo4jClient {
         let already_done =
             self.migration_status(AGENT_SELF_MIGRATION_KEY).await? == Some("done".into());
 
-        let moved_authored = self
+        let (moved_authored, batches_authored) = self
             .move_facet_edges("AUTHORED", "Note", root, batch)
             .await?;
-        let moved_lived = self
+        let (moved_lived, batches_lived) = self
             .move_facet_edges("LIVED", "SessionEpisode", root, batch)
             .await?;
 
@@ -1133,6 +1136,7 @@ impl Neo4jClient {
             after,
             moved_authored,
             moved_lived,
+            batches: batches_authored + batches_lived,
             already_done,
         };
         tracing::info!(
@@ -1194,14 +1198,20 @@ impl Neo4jClient {
     }
 
     /// Moves one edge type, in batches, until none is left on a facet. Returns the number
-    /// of edges moved. Each statement deletes what it moved, so the loop always ends.
+    /// of edges moved and the number of statements it took.
+    ///
+    /// Each statement deletes what it moved, so the loop converges — but a `MERGE` that
+    /// kept matching without removing the facet edge would make it spin forever. The
+    /// batch count is therefore capped by [`MAX_BATCHES`], shared with the registered
+    /// migrations: hitting the cap is an ERROR, not a quiet stop, because a silent stop
+    /// would leave attribution on the facets while reporting success.
     async fn move_facet_edges(
         &self,
         edge: &str,
         target: &str,
         root: Uuid,
         batch: i64,
-    ) -> Result<usize> {
+    ) -> Result<(usize, u64)> {
         // The labels and the edge come from this file's own call sites, never from input.
         let statement = format!(
             "MATCH (s:Agent {{id: $root}}) \
@@ -1215,7 +1225,9 @@ impl Neo4jClient {
              RETURN count(*) AS moved"
         );
         let mut total = 0usize;
+        let mut batches = 0u64;
         loop {
+            check_agent_edge_cap(edge, total, batches)?;
             let mut rows = self
                 .graph
                 .execute(
@@ -1229,8 +1241,9 @@ impl Neo4jClient {
                 Some(row) => row.get("moved")?,
                 None => 0,
             };
+            batches += 1;
             if moved == 0 {
-                return Ok(total);
+                return Ok((total, batches));
             }
             total += usize::try_from(moved).unwrap_or(0);
         }
@@ -1250,6 +1263,12 @@ impl Neo4jClient {
         })
     }
 
+    /// Records the run on the marker node.
+    ///
+    /// `status` is `done` only when NO attribution edge is left on a facet: writing
+    /// `done` while `last_facet_edges_left > 0` would make the marker claim a migration
+    /// that has not finished, and [`Self::migrate_agent_edges_to_self`] would then treat
+    /// the next run as already complete. `partial` keeps it replayable.
     async fn record_agent_migration(
         &self,
         key: &str,
@@ -1261,7 +1280,8 @@ impl Neo4jClient {
                 query(
                     "MERGE (m:DataMigration {key: $key}) \
                      ON CREATE SET m.created_at = $now, m.runs = 0 \
-                     SET m.status = 'done', m.runs = m.runs + 1, m.last_run_at = $now, \
+                     SET m.status = CASE WHEN $left = 0 THEN 'done' ELSE 'partial' END, \
+                         m.runs = m.runs + 1, m.last_run_at = $now, \
                          m.last_moved = $moved, m.last_facet_edges_left = $left",
                 )
                 .param("key", key)
@@ -1368,7 +1388,7 @@ impl Neo4jClient {
         note_id: Uuid,
         scope: crate::graph::rules::KnowledgeScope,
         project: Option<Uuid>,
-        provenance: &crate::graph::rules::Provenance,
+        provenance: &crate::graph::rules::AccountableProvenance,
     ) -> Result<bool> {
         let now = chrono::Utc::now().to_rfc3339();
         let mut result = self
@@ -1405,7 +1425,7 @@ impl Neo4jClient {
         agent_id: Uuid,
         label: &str,
         target_id: Uuid,
-        provenance: &crate::graph::rules::Provenance,
+        provenance: &crate::graph::rules::AccountableProvenance,
     ) -> Result<bool> {
         if !crate::graph::rules::USABLE_LABELS.contains(&label) {
             anyhow::bail!(
@@ -3823,6 +3843,22 @@ impl Neo4jClient {
     }
 }
 
+/// Refuse une migration d'arêtes d'agent qui n'a pas convergé.
+///
+/// Détachée de la boucle exprès : la branche d'erreur d'une boucle de migration est
+/// justement celle qu'un test d'exécution ne peut pas atteindre (il faudrait un statement
+/// qui n'efface jamais ce qu'il déplace). Pure, elle se mesure.
+fn check_agent_edge_cap(edge: &str, moved: usize, batches: u64) -> Result<()> {
+    let cap = crate::neo4j::data_migrations::MAX_BATCHES;
+    if batches >= u64::from(cap) {
+        anyhow::bail!(
+            "moving {edge} edges onto the durable self did not converge within {cap} batches \
+             ({moved} moved so far): the statement keeps matching edges it does not delete"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod injection_tests {
     use super::chat_session_update_clauses;
@@ -3838,6 +3874,25 @@ mod injection_tests {
         assert!(!c.contains('\''), "no string literal expected: {c}");
         let nan = chat_session_update_clauses(false, false, None, Some(f64::NAN), false, false);
         assert_eq!(nan, vec!["s.updated_at = datetime()".to_string()]);
+    }
+
+    /// Une migration qui n'a pas convergé ÉCHOUE en le disant. L'arrêt silencieux serait
+    /// pire que la panne : il laisserait l'attribution sur les facets en annonçant le
+    /// succès, et le démarrage suivant croirait le travail fait.
+    #[test]
+    fn a_migration_that_does_not_converge_fails_and_says_it() {
+        let cap = crate::neo4j::data_migrations::MAX_BATCHES;
+        assert!(
+            super::check_agent_edge_cap("AUTHORED", 0, 0).is_ok(),
+            "un premier lot est toujours permis"
+        );
+        assert!(super::check_agent_edge_cap("AUTHORED", 999, u64::from(cap) - 1).is_ok());
+        let error = super::check_agent_edge_cap("AUTHORED", 500, u64::from(cap))
+            .expect_err("le plafond atteint doit échouer");
+        let said = error.to_string();
+        assert!(said.contains("did not converge"), "{said}");
+        assert!(said.contains("AUTHORED"), "elle nomme l'arête : {said}");
+        assert!(said.contains(&cap.to_string()), "et le plafond : {said}");
     }
 }
 

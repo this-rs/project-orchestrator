@@ -133,6 +133,7 @@ mod tests {
             changes: vec![],
             assertion_rule: None,
             last_assertion_result: None,
+            revision_reason: None,
             memory_horizon: crate::notes::MemoryHorizon::Operational,
             scar_intensity: 0.0,
             sharing_consent: Default::default(),

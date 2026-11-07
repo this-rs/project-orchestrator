@@ -245,10 +245,17 @@ pub mod provenance {
         if let Err(e) = graph.ensure_agent(agent, None).await {
             tracing::debug!(agent = %agent, error = %e, "the node of an activated agent could not be made");
         }
-        let provenance = crate::graph::rules::Provenance::new(
+        // La preuve de provenance est faite ICI, avant la requête : une règle nommée et une
+        // mesure datée, sinon l'écrivain n'est même pas appelable.
+        // La règle et la mesure sont des constantes non vides : ce constructeur ne peut
+        // pas échouer ici. On le dit par `expect` plutôt que d'écrire une branche
+        // d'erreur que rien ne peut atteindre — une branche morte non couverte finit par
+        // se faire passer pour une poignée d'erreur utile.
+        let provenance = crate::graph::rules::AccountableProvenance::new(
             crate::graph::rules::AGENT_USES_ACTIVATED.name,
             format!("activé dans la session {session_id}"),
-        );
+        )
+        .expect("nom de règle et mesure constants : une provenance accountable est garantie");
         if let Err(e) = graph
             .link_agent_uses(agent, label, target, &provenance)
             .await
@@ -376,7 +383,7 @@ pub mod provenance {
         /// agent, and only that agent's edges answer it.
         #[tokio::test]
         async fn two_distinct_agents_do_not_see_each_others_knowledge() {
-            use crate::graph::rules::{KnowledgeScope, Provenance};
+            use crate::graph::rules::{AccountableProvenance, KnowledgeScope};
             let graph = MockGraphStore::new();
             let note = crate::test_helpers::test_note(
                 Uuid::new_v4(),
@@ -386,7 +393,8 @@ pub mod provenance {
             graph.create_note(&note).await.unwrap();
             let me = graph.agent_identity_namespace().await.unwrap();
             let other = Uuid::new_v4();
-            let provenance = Provenance::new("agent-knows-core", "1 portée, 1 note");
+            let provenance =
+                AccountableProvenance::new("agent-knows-core", "1 portée, 1 note").unwrap();
 
             graph
                 .link_agent_knows(other, note.id, KnowledgeScope::Global, None, &provenance)
