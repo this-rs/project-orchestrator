@@ -199,13 +199,6 @@ impl Aftermath {
     pub fn is_empty(&self) -> bool {
         self.notes.is_empty() && self.transitions.is_empty()
     }
-
-    /// The first transition that OPENED a pause, with the instant it ends.
-    pub fn opened(&self) -> Option<&Transition> {
-        self.transitions
-            .iter()
-            .find(|t| t.until.is_some() && t.to != super::breaker::Phase::Closed)
-    }
 }
 
 /// The admission gate: RL2's counters and RL4's breakers behind one door, reading
@@ -267,16 +260,6 @@ impl Gate {
         Self::from_store(Arc::new(SystemClock), Arc::new(MemoryStore::new()))
     }
 
-    /// The counters, for a caller that wants the measured numbers alone.
-    pub fn ledger(&self) -> &Ledger {
-        &self.ledger
-    }
-
-    /// The breaker policy in force.
-    pub fn policy(&self) -> &Policy {
-        &self.policy
-    }
-
     /// The instant this gate reads — the ONE clock of every decision it takes, so
     /// a caller that renders a `retry_after` measures it against the same now.
     pub fn now(&self) -> DateTime<Utc> {
@@ -332,13 +315,6 @@ impl Gate {
         }
     }
 
-    /// [`Self::admit`] for a stored instance: the limits and the credential
-    /// reference are read from the record, so a call site is one line and cannot
-    /// disagree with the configuration about which credential it is using.
-    pub fn admit_record(&self, record: &InstanceRecord, model: Option<&str>) -> Admission {
-        self.admit(&record.id, &record.rate_limit, &ask_for(record, model))
-    }
-
     /// What the call really consumed, and what its outcome says about the pause.
     ///
     /// `classification` is RL3's reading of the refusal, when there was one: it is
@@ -387,25 +363,6 @@ impl Gate {
         Aftermath { notes, transitions }
     }
 
-    /// [`Self::settle`] for a stored instance.
-    pub fn settle_record(
-        &self,
-        record: &InstanceRecord,
-        model: Option<&str>,
-        admission: Admission,
-        outcome: Outcome,
-        classification: Option<&Classification>,
-    ) -> Aftermath {
-        self.settle(
-            &record.id,
-            &record.rate_limit,
-            &ask_for(record, model),
-            admission,
-            outcome,
-            classification,
-        )
-    }
-
     /// Where our own counting stands for the call about to be classified (RL3's
     /// `Signals::ours`), without reserving anything.
     pub fn standing(&self, instance: &str, limits: &[RateLimit], ask: &Ask) -> OurStanding {
@@ -422,14 +379,6 @@ impl Gate {
         let key = Key::new(instance, credential.map(str::to_string)).ok()?;
         let breakers = self.lock_breakers();
         breakers.get(&key).map(|breaker| breaker.state(&key))
-    }
-
-    /// The pauses observed so far, oldest first (RL4's bounded trace).
-    pub fn transitions(&self) -> Vec<Transition> {
-        let breakers = self.lock_breakers();
-        let mut all: Vec<Transition> = breakers.values().flat_map(|s| s.trace()).collect();
-        all.sort_by(|a, b| a.at.cmp(&b.at));
-        all
     }
 
     /// The state of one instance's limits: RL1's shape, RL2's numbers, and RL4's
@@ -1062,6 +1011,55 @@ mod tests {
         assert!(gate
             .breaker_state("deepseek", Some("sk-not-a-reference"))
             .is_none());
+    }
+
+    #[test]
+    fn the_words_and_the_empty_cases_read_as_documented() {
+        assert_eq!(RefusalKind::Quota.as_str(), "quota");
+        assert_eq!(RefusalKind::Overload.as_str(), "overload");
+        // A refusal has no grant; an admission has no refusal.
+        let gate = gate(clock());
+        let limits = vec![requests(1.0)];
+        assert!(gate.admit("deepseek", &limits, &ask()).refusal().is_none());
+        let refused = gate.admit("deepseek", &limits, &ask());
+        assert!(refused.refusal().is_some());
+        assert!(refused.grant().is_none());
+        // The worst state wins, whatever the order.
+        use RateLimitStatus::*;
+        assert_eq!(worse_status(Ok, Unknown), Unknown);
+        assert_eq!(worse_status(Unknown, Ok), Unknown);
+        assert_eq!(worse_status(Ok, Ok), Ok);
+        assert_eq!(worse_status(Overloaded, Unknown), Overloaded);
+        assert_eq!(worse_status(Limited, Overloaded), Limited);
+    }
+
+    #[test]
+    fn a_hold_with_no_representable_instant_still_refuses_with_a_name() {
+        let held = Exhaustion {
+            resets_at_ms: u64::MAX,
+            reset_known: true,
+            window: Some("seven_day".into()),
+            cause: crate::chat::provider::quota::ExhaustionCause::Window,
+        };
+        let refusal = refusal_of_quota("deepseek", &held);
+        assert_eq!(refusal.kind, RefusalKind::Quota);
+        assert_eq!(refusal.scope, "seven_day");
+        assert_eq!((refusal.retry_at, refusal.reset_at), (None, None));
+        assert!(refusal.message.contains("until it resets"));
+    }
+
+    #[test]
+    fn a_denial_that_no_wait_can_cure_says_nothing_goes_out() {
+        let denial = Denial {
+            kind: RateLimitKind::Requests,
+            window: "1 minute".into(),
+            scope: "instance".into(),
+            max: 1.0,
+            retry_at: None,
+        };
+        let refusal = refusal_of_denial("deepseek", &denial);
+        assert_eq!(refusal.retry_at, None);
+        assert!(refusal.message.contains("nothing goes out until it resets"));
     }
 
     #[test]
