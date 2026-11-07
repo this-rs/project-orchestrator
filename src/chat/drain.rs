@@ -24,11 +24,6 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, info};
 use uuid::Uuid;
 
-/// Drain the pending_messages queue: pop the next message, persist it,
-/// broadcast it, and recursively call `stream_response` to process it.
-///
-/// If the queue is empty but `has_pending` was true (race), clean up streaming status.
-#[allow(clippy::too_many_arguments)]
 /// A counter write still in flight: it resolves when the write is over, whatever its outcome.
 type CountWrite = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
 
@@ -117,6 +112,11 @@ pub(crate) fn spawn_count_write(
     })
 }
 
+/// Drain the pending_messages queue: pop the next message, persist it,
+/// broadcast it, and recursively call `stream_response` to process it.
+///
+/// If the queue is empty but `has_pending` was true (race), clean up streaming status.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn drain_pending_messages(
     has_pending: bool,
     client: Arc<Mutex<InteractiveClient>>,
