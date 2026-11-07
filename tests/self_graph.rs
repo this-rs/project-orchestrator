@@ -258,7 +258,9 @@ async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
     // which is the trap this line documents.
     e.client.ensure_agent(self_id, None).await.unwrap();
     let before = e.client.agent_knows(self_id, None, 10_000).await.unwrap();
-    let prov = rules::Provenance::new("agent-knows-core", "3 portées lues, 3 notes épinglées");
+    let prov =
+        rules::AccountableProvenance::new("agent-knows-core", "3 portées lues, 3 notes épinglées")
+            .unwrap();
 
     let mut ids = Vec::new();
     for i in 0..3 {
@@ -341,7 +343,7 @@ async fn a_knows_edge_to_a_missing_note_draws_nothing() {
             Uuid::new_v4(),
             rules::KnowledgeScope::Global,
             None,
-            &rules::Provenance::new("agent-knows-core", "measured"),
+            &rules::AccountableProvenance::new("agent-knows-core", "measured").unwrap(),
         )
         .await
         .unwrap();
@@ -400,7 +402,7 @@ async fn what_a_subject_applies_becomes_a_uses_edge_with_its_provenance() {
             agent,
             "Persona) DETACH DELETE (n",
             persona,
-            &rules::Provenance::new("agent-uses-activated", "measured"),
+            &rules::AccountableProvenance::new("agent-uses-activated", "measured").unwrap(),
         )
         .await;
     assert!(
@@ -608,7 +610,7 @@ async fn unpinning_releases_the_edge_the_rule_drew_and_spares_a_hand_placed_one(
             by_hand.id,
             rules::KnowledgeScope::Global,
             None,
-            &rules::Provenance::new("a person", "decided by hand"),
+            &rules::AccountableProvenance::new("a person", "decided by hand").unwrap(),
         )
         .await
         .unwrap();
@@ -776,7 +778,7 @@ async fn the_catalog_says_what_the_graph_really_has() {
             note.id,
             rules::KnowledgeScope::Global,
             None,
-            &rules::Provenance::new("agent-knows-core", "measured"),
+            &rules::AccountableProvenance::new("agent-knows-core", "measured").unwrap(),
         )
         .await
         .unwrap();

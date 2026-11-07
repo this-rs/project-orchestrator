@@ -1368,7 +1368,7 @@ impl Neo4jClient {
         note_id: Uuid,
         scope: crate::graph::rules::KnowledgeScope,
         project: Option<Uuid>,
-        provenance: &crate::graph::rules::Provenance,
+        provenance: &crate::graph::rules::AccountableProvenance,
     ) -> Result<bool> {
         let now = chrono::Utc::now().to_rfc3339();
         let mut result = self
@@ -1405,7 +1405,7 @@ impl Neo4jClient {
         agent_id: Uuid,
         label: &str,
         target_id: Uuid,
-        provenance: &crate::graph::rules::Provenance,
+        provenance: &crate::graph::rules::AccountableProvenance,
     ) -> Result<bool> {
         if !crate::graph::rules::USABLE_LABELS.contains(&label) {
             anyhow::bail!(

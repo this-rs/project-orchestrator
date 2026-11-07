@@ -7,7 +7,7 @@
 
 use uuid::Uuid;
 
-use crate::graph::rules::Provenance;
+use crate::graph::rules::AccountableProvenance;
 use crate::neo4j::mock::MockGraphStore;
 use crate::neo4j::traits::*;
 use crate::notes::models::{Note, NoteType};
@@ -108,7 +108,7 @@ async fn what_a_subject_knows_is_a_note_never_a_persona_file() {
             note.id,
             crate::graph::rules::KnowledgeScope::Global,
             None,
-            &Provenance::new("agent-knows-core", "1 portée, 1 note")
+            &AccountableProvenance::new("agent-knows-core", "1 portée, 1 note").unwrap()
         )
         .await
         .unwrap());
@@ -129,7 +129,7 @@ async fn two_subjects_do_not_share_their_knowledge() {
 
     let first = Uuid::new_v4();
     let second = Uuid::new_v4();
-    let prov = Provenance::new("agent-knows-core", "measured");
+    let prov = AccountableProvenance::new("agent-knows-core", "measured").unwrap();
     graph
         .link_agent_knows(
             first,
@@ -164,7 +164,7 @@ async fn a_truncated_read_says_what_it_left_out() {
     // never mistake a partial read for the whole of what the subject knows.
     let graph = MockGraphStore::new();
     let self_id = graph.agent_identity_namespace().await.unwrap();
-    let prov = Provenance::new("agent-knows-core", "measured");
+    let prov = AccountableProvenance::new("agent-knows-core", "measured").unwrap();
     for i in 0..3 {
         let note = a_note(&format!("belief {i}"), "api");
         graph.create_note(&note).await.unwrap();
@@ -198,7 +198,8 @@ async fn a_knows_edge_always_carries_its_measure() {
     let note = a_note("a belief", "api");
     graph.create_note(&note).await.unwrap();
     let self_id = graph.agent_identity_namespace().await.unwrap();
-    let prov = Provenance::new("agent-knows-core", "3 portées lues, 1 note épinglée");
+    let prov =
+        AccountableProvenance::new("agent-knows-core", "3 portées lues, 1 note épinglée").unwrap();
 
     graph
         .link_agent_knows(
@@ -237,7 +238,7 @@ async fn a_knows_edge_to_a_missing_note_draws_nothing() {
             Uuid::new_v4(),
             crate::graph::rules::KnowledgeScope::Global,
             None,
-            &Provenance::new("agent-knows-core", "measured"),
+            &AccountableProvenance::new("agent-knows-core", "measured").unwrap(),
         )
         .await
         .unwrap();
@@ -397,7 +398,7 @@ async fn an_unusable_label_is_refused_before_any_query() {
             Uuid::new_v4(),
             "User; MATCH (n) DETACH DELETE n //",
             Uuid::new_v4(),
-            &Provenance::new("agent-uses-activated", "measured"),
+            &AccountableProvenance::new("agent-uses-activated", "measured").unwrap(),
         )
         .await
         .unwrap_err();

@@ -13988,7 +13988,7 @@ impl AnalyticsStore for MockGraphStore {
         note_id: Uuid,
         scope: crate::graph::rules::KnowledgeScope,
         project: Option<Uuid>,
-        provenance: &crate::graph::rules::Provenance,
+        provenance: &crate::graph::rules::AccountableProvenance,
     ) -> Result<bool> {
         // A missing target draws nothing, exactly like the Cypher `MATCH`.
         if self.notes.read().await.get(&note_id).is_none() {
@@ -13996,7 +13996,10 @@ impl AnalyticsStore for MockGraphStore {
         }
         let mut edges = self.agent_knows.write().await;
         let created = !edges.contains_key(&(agent_id, note_id));
-        edges.insert((agent_id, note_id), (scope, project, provenance.clone()));
+        edges.insert(
+            (agent_id, note_id),
+            (scope, project, provenance.as_provenance().clone()),
+        );
         Ok(created)
     }
 
@@ -14005,15 +14008,15 @@ impl AnalyticsStore for MockGraphStore {
         project: Uuid,
         notes: &[Uuid],
         session: Uuid,
-        provenance: &crate::graph::rules::Provenance,
+        provenance: &crate::graph::rules::AccountableProvenance,
     ) -> Result<usize> {
         let mut n = 0;
         for i in 0..notes.len() {
             for j in (i + 1)..notes.len() {
-                self.synapses
-                    .write()
-                    .await
-                    .insert((notes[i], notes[j]), (project, session, provenance.clone()));
+                self.synapses.write().await.insert(
+                    (notes[i], notes[j]),
+                    (project, session, provenance.as_provenance().clone()),
+                );
                 n += 1;
             }
         }
@@ -14025,7 +14028,7 @@ impl AnalyticsStore for MockGraphStore {
         agent_id: Uuid,
         label: &str,
         target_id: Uuid,
-        provenance: &crate::graph::rules::Provenance,
+        provenance: &crate::graph::rules::AccountableProvenance,
     ) -> Result<bool> {
         if !crate::graph::rules::USABLE_LABELS.contains(&label) {
             anyhow::bail!("{label} is not a usable label");
@@ -14033,7 +14036,7 @@ impl AnalyticsStore for MockGraphStore {
         let key = (agent_id, label.to_string(), target_id);
         let mut edges = self.agent_uses.write().await;
         let created = !edges.contains_key(&key);
-        edges.insert(key, provenance.clone());
+        edges.insert(key, provenance.as_provenance().clone());
         Ok(created)
     }
 
