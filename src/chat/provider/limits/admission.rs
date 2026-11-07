@@ -146,8 +146,10 @@ impl Refusal {
 /// The answer of [`Gate::admit`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Admission {
-    /// The call may go out. Settle it with [`Gate::settle`].
-    Admitted(Box<Grant>),
+    /// The call may go out. Settle it with [`Gate::settle`]. `probe` is true when
+    /// this call is the ONE half-open probe of its breaker: it alone settles a
+    /// half-open pause.
+    Admitted(Box<Grant>, bool),
     /// The call must not go out.
     Refused(Box<Refusal>),
 }
@@ -155,21 +157,26 @@ pub enum Admission {
 impl Admission {
     /// Whether the call may go out.
     pub fn is_admitted(&self) -> bool {
-        matches!(self, Self::Admitted(_))
+        matches!(self, Self::Admitted(..))
+    }
+
+    /// Whether this admitted call is the half-open probe.
+    pub fn is_probe(&self) -> bool {
+        matches!(self, Self::Admitted(_, true))
     }
 
     /// The refusal, when there is one.
     pub fn refusal(&self) -> Option<&Refusal> {
         match self {
             Self::Refused(refusal) => Some(refusal),
-            Self::Admitted(_) => None,
+            Self::Admitted(..) => None,
         }
     }
 
     /// The grant, when there is one.
     pub fn grant(self) -> Option<Grant> {
         match self {
-            Self::Admitted(grant) => Some(*grant),
+            Self::Admitted(grant, _) => Some(*grant),
             Self::Refused(_) => None,
         }
     }
@@ -284,13 +291,16 @@ impl Gate {
         if limits.is_empty() {
             // No limit configured: the path is exactly what it was. No clock read,
             // no lock, no breaker — nothing here can cost anything.
-            return Admission::Admitted(Box::new(Grant {
-                instance: instance.to_string(),
-                takes: Vec::new(),
-            }));
+            return Admission::Admitted(
+                Box::new(Grant {
+                    instance: instance.to_string(),
+                    takes: Vec::new(),
+                }),
+                false,
+            );
         }
         let key = key_for(instance, ask);
-        {
+        let probe = {
             let mut breakers = self.lock_breakers();
             let breaker = breakers
                 .entry(key.clone())
@@ -304,10 +314,19 @@ impl Gate {
                     instance, &key, &decision,
                 )));
             }
-        }
+            decision.is_probe()
+        };
         match self.ledger.try_reserve(instance, limits, ask) {
-            Reservation::Granted(grant) => Admission::Admitted(Box::new(grant)),
+            Reservation::Granted(grant) => Admission::Admitted(Box::new(grant), probe),
             Reservation::Denied(denial) => {
+                if probe {
+                    // The probe was granted but never leaves: hand it back, or the
+                    // breaker would wait out its whole timeout for a call that
+                    // does not exist.
+                    if let Some(breaker) = self.lock_breakers().get(&key) {
+                        breaker.release_probe(&key);
+                    }
+                }
                 Admission::Refused(Box::new(refusal_of_denial(instance, &denial)))
             }
         }
@@ -335,7 +354,7 @@ impl Gate {
         outcome: Outcome,
         classification: Option<&Classification>,
     ) -> Aftermath {
-        let Admission::Admitted(grant) = admission else {
+        let Admission::Admitted(grant, probe) = admission else {
             // A refusal never reserved anything: there is nothing to give back.
             return Aftermath::default();
         };
@@ -361,7 +380,7 @@ impl Gate {
             let breaker = breakers
                 .entry(key.clone())
                 .or_insert_with(|| self.build_breaker());
-            if let Some(transition) = breaker.record(&key, signal) {
+            if let Some(transition) = breaker.record(&key, signal, probe) {
                 transitions.push(transition);
             }
         }
@@ -400,7 +419,7 @@ impl Gate {
         instance: &str,
         credential: Option<&str>,
     ) -> Option<super::breaker::State> {
-        let key = Key::new(instance, credential.map(str::to_string));
+        let key = Key::new(instance, credential.map(str::to_string)).ok()?;
         let breakers = self.lock_breakers();
         breakers.get(&key).map(|breaker| breaker.state(&key))
     }
@@ -425,10 +444,12 @@ impl Gate {
             // actually taken under.
             let call_credential = ask_for(record, None).credential_ref;
             for state in report.limits.iter_mut() {
-                let key = Key::new(
+                let Ok(key) = Key::new(
                     record.id.clone(),
                     state.credential.clone().or_else(|| call_credential.clone()),
-                );
+                ) else {
+                    continue;
+                };
                 let Some(breaker) = breakers.get(&key) else {
                     continue;
                 };
@@ -490,8 +511,12 @@ impl Gate {
 }
 
 /// The ONE breaker key of an admission: the pair RL4 keys its machine by.
+///
+/// A credential that is not a REFERENCE (`vault:`/`env:`) is never made a key: the
+/// subject falls back to the bare instance, so a stray value in a record can neither
+/// reach a log line nor split one instance's pause in two.
 pub fn key_for(instance: &str, ask: &Ask) -> Key {
-    Key::new(instance, ask.credential_ref.clone())
+    Key::new(instance, ask.credential_ref.clone()).unwrap_or_else(|_| Key::for_instance(instance))
 }
 
 /// What a stored instance tells the ledger about the call about to be made.
@@ -588,9 +613,7 @@ fn refusal_of_denial(instance: &str, denial: &Denial) -> Refusal {
 
 /// A breaker key's scope, as a label a human reads. No field of it is a value.
 fn scope_label(key: &Key) -> String {
-    key.credential
-        .clone()
-        .unwrap_or_else(|| "instance".to_string())
+    key.credential().unwrap_or("instance").to_string()
 }
 
 /// The worst of two states, so a report names the one a reader must act on.
@@ -629,6 +652,7 @@ mod tests {
             jitter_ratio: 0.0,
             max_retries: 3,
             probe_timeout: Duration::from_secs(30),
+            min_cooldown: Duration::from_millis(100),
         }
     }
 
@@ -936,6 +960,110 @@ mod tests {
         assert!(second.refusal().unwrap().retry_at.is_none());
     }
 
+    fn consumed() -> Outcome {
+        Outcome::Consumed {
+            tokens: None,
+            cost_usd: None,
+        }
+    }
+
+    #[test]
+    fn only_the_probe_settles_a_half_open_pause() {
+        // MUTATION: settling every admission as the probe (`probe` forced true in
+        // `settle`) lets the straggler close the pause before the probe is back.
+        let clock = clock();
+        let gate = gate(Arc::clone(&clock));
+        let limits = vec![requests(100.0)];
+        let straggler = gate.admit("deepseek", &limits, &ask());
+        for _ in 0..2 {
+            let admission = gate.admit("deepseek", &limits, &ask());
+            gate.settle(
+                "deepseek",
+                &limits,
+                &ask(),
+                admission,
+                consumed(),
+                Some(&overload()),
+            );
+        }
+        let state = gate
+            .breaker_state("deepseek", Some("vault:deepseek"))
+            .unwrap();
+        clock.advance(Duration::from_secs(
+            (state.until.unwrap() - clock.now()).num_seconds() as u64 + 1,
+        ));
+        let probe = gate.admit("deepseek", &limits, &ask());
+        assert!(probe.is_probe());
+        assert!(!straggler.is_probe());
+        // The call admitted BEFORE the pause comes back now: it changes nothing.
+        let after = gate.settle("deepseek", &limits, &ask(), straggler, consumed(), None);
+        assert!(after.transitions.is_empty());
+        assert!(gate
+            .breaker_state("deepseek", Some("vault:deepseek"))
+            .unwrap()
+            .is_open());
+        // The probe settles it.
+        let after = gate.settle("deepseek", &limits, &ask(), probe, consumed(), None);
+        assert!(after.transitions.iter().any(|t| t.to == Phase::Closed));
+    }
+
+    #[test]
+    fn a_probe_the_counters_refuse_is_handed_back() {
+        // MUTATION: dropping the `release_probe` call leaves the breaker half-open
+        // with a probe that never left.
+        let clock = clock();
+        let gate = gate(Arc::clone(&clock));
+        // Two per minute: two calls fill it, and the pause (20 s) is too short to
+        // refill a whole unit.
+        let limits = vec![requests(2.0)];
+        for _ in 0..2 {
+            let admission = gate.admit("deepseek", &limits, &ask());
+            gate.settle(
+                "deepseek",
+                &limits,
+                &ask(),
+                admission,
+                consumed(),
+                Some(&overload()),
+            );
+        }
+        let until = gate
+            .breaker_state("deepseek", Some("vault:deepseek"))
+            .unwrap()
+            .until
+            .unwrap();
+        clock.advance(Duration::from_secs(
+            (until - clock.now()).num_seconds() as u64 + 1,
+        ));
+        let refused = gate.admit("deepseek", &limits, &ask());
+        assert_eq!(refused.refusal().unwrap().kind, RefusalKind::Quota);
+        assert_eq!(
+            gate.breaker_state("deepseek", Some("vault:deepseek"))
+                .unwrap()
+                .phase,
+            Phase::Open,
+            "the probe was handed back, not left out with nobody holding it"
+        );
+    }
+
+    #[test]
+    fn a_stray_value_in_a_record_never_becomes_a_key() {
+        // MUTATION: building the key without the fallback would panic or key the
+        // value; here the bare instance is the subject.
+        let record = InstanceRecord {
+            credential_ref: "sk-not-a-reference".into(),
+            ..record(vec![requests(5.0)])
+        };
+        let ask = ask_for(&record, None);
+        assert_eq!(key_for("deepseek", &ask), Key::for_instance("deepseek"));
+        let gate = gate(clock());
+        let report = gate.report(&record);
+        assert_eq!(report.limits.len(), 1, "the report still answers");
+        assert!(gate
+            .breaker_state("deepseek", Some("sk-not-a-reference"))
+            .is_none());
+    }
+
     #[test]
     fn a_limit_scoped_to_another_credential_never_pauses_this_one() {
         let gate = gate(clock());
@@ -1156,7 +1284,7 @@ mod tests {
     fn the_breaker_key_is_the_instance_and_the_credential_reference() {
         assert_eq!(
             key_for("deepseek", &ask()),
-            Key::new("deepseek", Some("vault:deepseek".to_string()))
+            Key::new("deepseek", Some("vault:deepseek".to_string())).unwrap()
         );
         assert_eq!(
             key_for("deepseek", &Ask::default()),
