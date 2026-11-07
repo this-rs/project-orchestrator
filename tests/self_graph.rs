@@ -199,16 +199,14 @@ async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
     let Some(e) = env("knows").await else {
         return;
     };
-    // A FRESH subject, not the shared root: this database is reused by every suite, and a
-    // previous run that failed before its cleanup leaves edges behind. What is measured here
-    // is the mechanism, and the mechanism must not depend on a clean database.
-    let self_id = Uuid::new_v4();
+    // The durable self of this store: the only subject it can know anything as. The database
+    // is shared by every suite, so the assertions below are about what THIS test adds.
+    let self_id = e.client.agent_identity_namespace().await.unwrap();
     // As production does (`agent-knows-core`): the subject exists before it is given
     // anything. `link_agent_knows` MATCHes both ends — a missing subject is a silent no-op,
     // which is the trap this line documents.
     e.client.ensure_agent(self_id, None).await.unwrap();
-    let before = e.client.agent_knows(self_id, None, 10).await.unwrap();
-    assert_eq!(before.available, 0, "a fresh subject knows nothing");
+    let before = e.client.agent_knows(self_id, None, 10_000).await.unwrap();
     let prov = rules::Provenance::new("agent-knows-core", "3 portées lues, 3 notes épinglées");
 
     let mut ids = Vec::new();
@@ -236,13 +234,23 @@ async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
 
     let known = e.client.agent_knows(self_id, None, 2).await.unwrap();
     assert_eq!(known.notes.len(), 2, "bounded");
-    assert_eq!(known.available, 3, "and the total is published");
-    assert_eq!(known.withheld(), 1, "« la part lue est dite »");
+    assert_eq!(
+        known.available,
+        before.available + 3,
+        "and the total is published"
+    );
+    assert_eq!(
+        known.withheld(),
+        known.available - 2,
+        "« la part lue est dite »"
+    );
 
     // And the bound is what limits, not luck: unbounded, all three come back.
-    let all = e.client.agent_knows(self_id, None, 10).await.unwrap();
-    assert_eq!(all.notes.len(), 3);
+    let all = e.client.agent_knows(self_id, None, 10_000).await.unwrap();
     assert_eq!(all.withheld(), 0);
+    for id in &ids {
+        assert!(all.notes.contains(id), "{id} is known");
+    }
 
     // The provenance is ON the edge, not in a table beside it.
     let mut rows = e
@@ -265,7 +273,6 @@ async fn what_a_subject_knows_is_bounded_and_carries_its_measure() {
     for id in &ids {
         e.client.delete_note(*id).await.unwrap();
     }
-    drop_nodes(&e, "Agent", &[self_id]).await;
     cleanup(&e).await;
 }
 
@@ -297,7 +304,8 @@ async fn what_a_subject_applies_becomes_a_uses_edge_with_its_provenance() {
     let Some(e) = env("uses").await else {
         return;
     };
-    let agent = Uuid::new_v4();
+    // The durable self: the only agent this store can write for (a foreign id is refused).
+    let agent = e.client.agent_identity_namespace().await.unwrap();
     let persona = Uuid::new_v4();
     e.raw
         .run(query("CREATE (:Persona {id: $id, name: 'Pentest'})").param("id", persona.to_string()))
@@ -349,8 +357,8 @@ async fn what_a_subject_applies_becomes_a_uses_edge_with_its_provenance() {
         "an unusable label is refused, not escaped"
     );
 
+    // The self is shared by the store and stays; the edge goes with the persona.
     drop_nodes(&e, "Persona", &[persona]).await;
-    drop_nodes(&e, "Agent", &[agent]).await;
     cleanup(&e).await;
 }
 
@@ -704,7 +712,7 @@ async fn the_catalog_says_what_the_graph_really_has() {
         return;
     };
     // One edge of a known shape, so the catalog has something true to report.
-    let agent = Uuid::new_v4();
+    let agent = e.client.agent_identity_namespace().await.unwrap();
     let mut note = a_note("api");
     note.project_id = Some(e.project.id);
     e.client.create_note(&note).await.unwrap();
@@ -742,7 +750,6 @@ async fn the_catalog_says_what_the_graph_really_has() {
     }
 
     e.client.delete_note(note.id).await.unwrap();
-    drop_nodes(&e, "Agent", &[agent]).await;
     cleanup(&e).await;
 }
 
@@ -901,11 +908,23 @@ async fn an_agent_that_does_not_exist_is_absent_not_an_error() {
         return;
     };
     assert!(e.client.find_agent(Uuid::new_v4()).await.unwrap().is_none());
-    let known = Uuid::new_v4();
-    e.client.ensure_agent(known, Some("m")).await.unwrap();
-    let found = e.client.find_agent(known).await.unwrap();
-    assert_eq!(found, Some(("model".to_string(), Some("m".to_string()))));
-    drop_nodes(&e, "Agent", &[known]).await;
+    // A foreign id is refused and never becomes a node.
+    let foreign = Uuid::new_v4();
+    assert!(e.client.ensure_agent(foreign, Some("m")).await.is_err());
+    assert!(e.client.find_agent(foreign).await.unwrap().is_none());
+    // The self is made; its model is a dated facet beside it, not the node itself.
+    let root = e.client.agent_identity_namespace().await.unwrap();
+    e.client.ensure_agent(root, Some("m")).await.unwrap();
+    assert_eq!(
+        e.client.find_agent(root).await.unwrap(),
+        Some(("self".to_string(), None))
+    );
+    let facet = project_orchestrator::notes::provenance::model_facet_id(root, "m").unwrap();
+    assert_eq!(
+        e.client.find_agent(facet).await.unwrap(),
+        Some(("model".to_string(), Some("m".to_string())))
+    );
+    drop_nodes(&e, "Agent", &[facet]).await;
     cleanup(&e).await;
 }
 
