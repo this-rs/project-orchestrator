@@ -62,6 +62,7 @@ mod user;
 mod workspace;
 
 pub use agent_execution::{AgentExecutionNode, AgentExecutionStatus};
+pub use chat::{AgentEdgeCount, AgentEdgeMigration, AGENT_SELF_MIGRATION_KEY};
 pub use client::Neo4jClient;
 pub use document::{Document, DocumentChunk, DocumentChunkHit};
 pub use models::*;
