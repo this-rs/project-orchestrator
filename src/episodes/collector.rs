@@ -479,6 +479,18 @@ async fn session_episode(
     }
 
     let journal = read_session_journal(neo4j, session_id).await;
+    // The episode counts what the session counts (T0): the close waits for the counter
+    // write still in flight before it gets here (`chat::drain::count_writes_settled`). A
+    // counter still behind its events lost a write for good (abandoned past its budget, or
+    // failed): it is said, not papered over.
+    if journal.user_messages > session.message_count {
+        tracing::warn!(
+            session_id = %session_id,
+            counted = session.message_count,
+            user_messages = journal.user_messages,
+            "the message counter of a closed session is behind its events: a count write was lost"
+        );
+    }
 
     // The commits this session produced, read from git in the SAME window the enricher
     // uses (`commits_since`, `session.created_at` in `session.cwd`) — one reader, one
@@ -549,9 +561,8 @@ async fn session_episode(
         source_run_id: None,
         session: Some(SessionTrace {
             session_id,
-            // Raised by the persisted events, never lowered: the node's counter can lag the
-            // last messages when it is read at the close.
-            message_count: session.message_count.max(journal.user_messages),
+            // The session's own counter, read after its last write (see above).
+            message_count: session.message_count,
             close_reason: close_reason.to_string(),
             total_cost_usd: session.total_cost_usd,
             agent_id,
@@ -1241,7 +1252,7 @@ mod tests {
     async fn a_session_that_edited_three_files_leaves_an_episode_that_says_so() {
         use crate::neo4j::models::ChatEventRecord;
         let (store, sid, _) = store_with_session(Some("alpha"), Some("edit things")).await;
-        // The node lags: it says 4 messages, the events hold 6 (the 9-versus-13 gap).
+        // The node says 4 messages, the events hold 6: a count write was lost.
         let mut records = Vec::new();
         let mut push = |seq: i64, event_type: &str, data: String| {
             records.push(ChatEventRecord {
@@ -1282,7 +1293,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(episode.outcome.files_modified, 3);
-        assert_eq!(episode.session.unwrap().message_count, 6);
+        // T0: the episode counts what the closed session counts, not a second figure.
+        assert_eq!(episode.session.unwrap().message_count, 4);
     }
 
     #[tokio::test]
@@ -1293,7 +1305,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(episode.outcome.files_modified, 0);
-        // No events: the node's count stands, it is never lowered.
+        // No events: the node's count stands.
         assert_eq!(episode.session.unwrap().message_count, 4);
     }
 
