@@ -1161,6 +1161,73 @@ mod tests {
     }
 
     #[test]
+    fn the_jitter_sources_stay_in_the_unit_interval() {
+        let system = SystemJitter::default();
+        let draws: Vec<f64> = (0..32).map(|_| system.frac()).collect();
+        assert!(draws.iter().all(|f| (0.0..1.0).contains(f)));
+        assert!(
+            draws.windows(2).any(|w| w[0] != w[1]),
+            "a live source is not a constant"
+        );
+        assert!(SystemJitter::new().frac() < 1.0);
+        let seeded = SeededJitter::new(7);
+        let replay = SeededJitter::new(7);
+        assert_eq!(seeded.frac(), replay.frac(), "the same seed replays");
+        assert_eq!(FixedJitter::new(2.0).frac(), 1.0, "clamped");
+        assert_eq!(FixedJitter::new(f64::NAN).frac(), 0.0, "not finite");
+    }
+
+    #[test]
+    fn a_degenerate_policy_cannot_produce_a_nonsense_cooldown() {
+        // MUTATION: dropping the `is_finite` guard lets a NaN ratio reach
+        // `Duration::from_secs_f64`, which panics.
+        let nan_ratio = Policy {
+            jitter_ratio: f64::NAN,
+            ..Policy::default()
+        };
+        let delay = overload_delay(&nan_ratio, 1, None, 0.5);
+        assert_eq!(delay, Duration::ZERO);
+        // A duration chrono cannot hold becomes zero, never a panic.
+        assert_eq!(chrono_d(Duration::MAX), chrono::Duration::zero());
+    }
+
+    #[test]
+    fn decisions_and_transitions_answer_for_both_outcomes() {
+        let f = exact();
+        let allowed = f.breaker.attempt(&key());
+        assert_eq!(allowed.until(), None);
+        let unseen = f.breaker.state(&Key::for_instance("never-seen"));
+        assert_eq!(
+            (unseen.phase, unseen.status),
+            (Phase::Closed, RateLimitStatus::Ok)
+        );
+        assert!(!unseen.is_open());
+        f.open_by_overload(3);
+        let refused = f.breaker.attempt(&key());
+        assert_eq!(refused.status(), RateLimitStatus::Overloaded);
+        assert!(!refused.is_probe());
+        assert_eq!(f.breaker.policy().overload_threshold, 3);
+        let breaker = Breaker::with_defaults(f.clock.clone(), Arc::new(FixedJitter::new(0.0)));
+        assert_eq!(breaker.policy(), &Policy::default());
+    }
+
+    #[test]
+    fn a_half_open_entry_without_a_probe_grants_one() {
+        // The defensive arm: a half-open subject that lost its probe stamp is not
+        // wedged, it hands out the one probe again.
+        let f = exact();
+        f.breaker.lock_entries().insert(
+            key(),
+            Entry {
+                phase: Phase::HalfOpen,
+                ..Entry::default()
+            },
+        );
+        assert!(f.breaker.attempt(&key()).is_probe());
+        assert!(!f.breaker.attempt(&key()).is_allowed());
+    }
+
+    #[test]
     fn an_rl3_reading_maps_to_the_right_signal() {
         // MUTATION: mapping `QuotaExhausted` to an overload signal (so that a
         // spent quota opens a breaker) turns the first assertion red.
