@@ -4697,6 +4697,7 @@ impl ChatManager {
     /// gate would hand out the configured allowance once per session, which is
     /// exactly the waste RL5 exists to prevent.
     pub fn with_provider_limits(mut self, gate: Arc<super::provider::limits::Gate>) -> Self {
+        self.agent_runtime.set_gate(Arc::clone(&gate));
         self.provider_limits = gate;
         self
     }

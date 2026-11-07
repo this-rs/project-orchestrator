@@ -918,6 +918,9 @@ pub struct AgentSessionHandle {
     /// Where what the provider says about its account's limits goes (QUOTA): the registry the
     /// router and the send path read. `None`: nothing is kept.
     quota: Option<Arc<super::provider::quota::QuotaRegistry>>,
+    /// The admission of this session's turns at the process-wide gate (RL5): a turn
+    /// reserves before it leaves and settles when it ends. `None`: nothing is gated.
+    admission: Option<super::turn_admission::TurnAdmission>,
     /// When the session last did something (an event, a message): what the idle
     /// cleanup reads (`ChatManager::start_cleanup_task`).
     last_activity: std::sync::Mutex<Instant>,
@@ -1902,7 +1905,16 @@ impl AgentSessionHandle {
             }
         }
         let input = turn_input(sent, &images);
-        let stream = match self.session.send_turn(input.clone()).await {
+        // RL5: the turn reserves at the gate before it leaves. A refusal is the typed error the
+        // provider would have answered, so it travels the way a failed send always has.
+        if let Some(turns) = &self.admission {
+            turns.admit(self.graph.as_ref(), &self.provider_id).await?;
+        }
+        let sent_turn = self.session.send_turn(input.clone()).await;
+        if sent_turn.is_err() {
+            self.settle_admission(false, None);
+        }
+        let stream = match sent_turn {
             Ok(stream) => stream,
             Err(error) if !images.is_empty() => match image_refusal(&error) {
                 Some(event) => {
@@ -1921,6 +1933,14 @@ impl AgentSessionHandle {
         Ok(Some((stream, input)))
     }
 
+    /// Settles the turn admitted last at the gate (RL5): what it consumed, and the typed
+    /// cause it ended on, which is what opens or closes a pause.
+    fn settle_admission(&self, left: bool, error_code: Option<&str>) {
+        if let Some(turns) = &self.admission {
+            turns.settle(&self.provider_id, left, error_code);
+        }
+    }
+
     /// Plays turns until the queue is empty: the turn given, then each message
     /// queued meanwhile, highest priority first (`drain::pop_next_after_turn`).
     /// `None`: the first turn could not be opened, only the queue is played.
@@ -1929,6 +1949,7 @@ impl AgentSessionHandle {
         loop {
             if let Some((stream, input)) = turn.take() {
                 let (mut outcome, pending_tools) = self.play(stream, input).await;
+                self.settle_admission(true, outcome.error_code.as_deref());
                 outcome.interrupted = self.interrupted.load(Ordering::SeqCst);
                 self.cancel_pending_tools(outcome.interrupted, pending_tools)
                     .await;
@@ -3259,6 +3280,8 @@ pub struct AgentRuntime {
     spill: SpillConfig,
     /// The quota registry handed to every session this runtime adopts (QUOTA).
     quota: std::sync::RwLock<Option<Arc<super::provider::quota::QuotaRegistry>>>,
+    /// The admission gate the sessions' turns go through (RL5).
+    gate: std::sync::RwLock<Option<Arc<super::provider::limits::Gate>>>,
 }
 
 impl AgentRuntime {
@@ -3270,11 +3293,17 @@ impl AgentRuntime {
             read_only_mcp_tools: Vec::new(),
             spill: SpillConfig::from_env(),
             quota: std::sync::RwLock::new(None),
+            gate: std::sync::RwLock::new(None),
         }
     }
 
     /// Sessions adopted from now on report the limits their provider states (and the refusals
     /// that name a reset) to `registry`.
+    /// Hands the sessions opened from now on the admission gate their turns go through (RL5).
+    pub fn set_gate(&self, gate: Arc<super::provider::limits::Gate>) {
+        *self.gate.write().unwrap_or_else(|e| e.into_inner()) = Some(gate);
+    }
+
     pub fn set_quota(&self, registry: Arc<super::provider::quota::QuotaRegistry>) {
         *self.quota.write().unwrap_or_else(|e| e.into_inner()) = Some(registry);
     }
@@ -3490,6 +3519,12 @@ impl AgentRuntime {
             outage: std::sync::Mutex::new(TurnHold::new(provider_id)),
             spill: self.spill,
             quota: self.quota.read().unwrap_or_else(|e| e.into_inner()).clone(),
+            admission: self
+                .gate
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .map(super::turn_admission::TurnAdmission::new),
             last_activity: std::sync::Mutex::new(Instant::now()),
             registry: Arc::downgrade(&self.sessions),
             provider_dead: AtomicBool::new(false),
@@ -7438,6 +7473,170 @@ mod answered_tests {
             .expect("the instance is held out");
         assert_eq!(held.resets_at_ms, reset);
         assert_eq!(held.window.as_deref(), Some("seven_day"));
+    }
+
+    /// RL5: a session whose runtime was given the gate.
+    async fn session_with_gate(
+        gate: Arc<crate::chat::provider::limits::Gate>,
+    ) -> (FakeProvider, Arc<AgentSessionHandle>, Arc<Host>) {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        runtime.set_gate(gate);
+        let provider = FakeProvider::new();
+        let host = Arc::new(Host::default());
+        let handle = runtime
+            .adopt(
+                "not-a-uuid",
+                "local",
+                provider.session(),
+                1,
+                "claude_code",
+                serde_json::json!({}),
+                Some(host.clone() as Arc<dyn TurnServices>),
+            )
+            .await;
+        (provider, handle, host)
+    }
+
+    /// RL5: an instance the quota registry holds exhausted gets NO turn: the send fails with the
+    /// typed rate limit (its reset in it), nothing reached the provider, and the gate wrote
+    /// nothing to the registry. At the reset the same session sends again.
+    #[tokio::test]
+    async fn a_turn_on_an_exhausted_instance_is_refused_at_the_gate_and_never_sent() {
+        use crate::chat::provider::limits::{Gate, ManualClock, MemoryStore, Policy};
+        let clock = Arc::new(ManualClock::at("2026-10-21T10:00:00Z"));
+        let quota =
+            Arc::new(crate::chat::provider::quota::QuotaRegistry::new().with_clock(clock.clone()));
+        let reset = quota.now_ms() + 3_600_000;
+        quota.mark_rate_limited("local", Some(reset), None);
+        let gate = Arc::new(
+            Gate::new(
+                clock.clone(),
+                Arc::new(MemoryStore::new()),
+                Policy::default(),
+            )
+            .with_quota(quota.clone()),
+        );
+        let (provider, handle, _host) = session_with_gate(gate).await;
+        let error = handle.send_message("go").await.unwrap_err();
+        let refusal = error.downcast_ref::<ProviderError>().expect("typed");
+        assert!(matches!(
+            refusal,
+            ProviderError::RateLimited { resets_at_ms: Some(at), .. } if *at == reset
+        ));
+        assert!(
+            provider.state.turns_started.lock().unwrap().is_empty(),
+            "nothing reached the provider"
+        );
+        assert!(
+            !handle.is_streaming.load(Ordering::SeqCst),
+            "the session is idle again"
+        );
+
+        clock.advance(Duration::from_secs(3_601));
+        let seen = play_events(
+            &provider,
+            &handle,
+            vec![vec![text("back"), done(false, None)]],
+        )
+        .await;
+        assert!(
+            !seen.is_empty(),
+            "at the reset the same session sends again"
+        );
+    }
+
+    /// RL5: the cause a turn ends on is what the gate settles it with — an overloaded provider
+    /// opens a pause, and the next turn of that instance is refused with `Overloaded` instead of
+    /// being sent into it.
+    #[tokio::test]
+    async fn an_overloaded_turn_pauses_the_instance_and_the_next_turn_is_refused() {
+        use crate::chat::provider::limits::{Gate, ManualClock, MemoryStore, Policy};
+        use crate::chat::provider::settings as st;
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let record = st::InstanceRecord {
+            id: "local".into(),
+            rate_limit: vec![st::RateLimit {
+                kind: st::RateLimitKind::Requests,
+                window: st::RateLimitWindow::Unit(st::RateLimitUnit::Minute),
+                calendar: None,
+                max: 100.0,
+                scope: st::RateLimitScope::Instance(st::InstanceScope::Instance),
+            }],
+            ..Default::default()
+        };
+        graph
+            .put_llm_setting(
+                st::GLOBAL,
+                &format!("{}local", st::INSTANCE_PREFIX),
+                &serde_json::to_string(&record).unwrap(),
+            )
+            .await
+            .unwrap();
+        let clock = Arc::new(ManualClock::at("2026-10-21T10:00:00Z"));
+        let gate = Arc::new(Gate::new(
+            clock,
+            Arc::new(MemoryStore::new()),
+            Policy {
+                overload_threshold: 1,
+                ..Policy::default()
+            },
+        ));
+        let dyn_graph: Arc<dyn GraphStore> = graph;
+        let runtime = AgentRuntime::new(dyn_graph);
+        runtime.set_gate(gate);
+        let provider = FakeProvider::new();
+        let host = Arc::new(Host::default());
+        let handle = runtime
+            .adopt(
+                "not-a-uuid",
+                "local",
+                provider.session(),
+                1,
+                "claude_code",
+                serde_json::json!({}),
+                Some(host.clone() as Arc<dyn TurnServices>),
+            )
+            .await;
+        handle.configure_retry(RetryConfig {
+            max_attempts: 0,
+            initial_delay_ms: 5,
+            backoff_multiplier: 1.0,
+        });
+        play_events(
+            &provider,
+            &handle,
+            vec![vec![done(true, Some(ProviderError::Overloaded))]],
+        )
+        .await;
+        let error = handle.send_message("again").await.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<ProviderError>(),
+                Some(ProviderError::Overloaded)
+            ),
+            "the pause is open: {error:?}"
+        );
+        assert_eq!(
+            provider.state.turns_started.lock().unwrap().len(),
+            1,
+            "the second turn never reached the provider"
+        );
+    }
+
+    /// RL5: with a gate and no hold, a turn goes out and is settled — the path an operator with
+    /// no configured limit has always had.
+    #[tokio::test]
+    async fn a_turn_through_the_gate_with_nothing_held_is_sent_and_settled() {
+        use crate::chat::provider::limits::Gate;
+        let (provider, handle, host) = session_with_gate(Arc::new(Gate::unlimited())).await;
+        play_events(
+            &provider,
+            &handle,
+            vec![vec![text("hello"), done(false, None)]],
+        )
+        .await;
+        assert_eq!(host.seen(), [true]);
     }
 
     /// QUOTA: a rate limit that names a reset three days away is not run again (it would meet the
