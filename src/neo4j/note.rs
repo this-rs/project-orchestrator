@@ -3024,7 +3024,7 @@ impl Neo4jClient {
         project: Uuid,
         notes: &[Uuid],
         session: Uuid,
-        provenance: &crate::graph::rules::Provenance,
+        provenance: &crate::graph::rules::AccountableProvenance,
     ) -> Result<usize> {
         use super::batch::{bolt_map, BoltMap};
 

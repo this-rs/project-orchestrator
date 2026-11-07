@@ -3021,7 +3021,10 @@ pub trait AnalyticsStore: Send + Sync {
     /// Draws `(:Agent)-[:KNOWS {rule, measure, at}]->(:Note)` — what a subject durably
     /// knows, as opposed to `(Persona)-[:KNOWS]->(File)`, which says what a persona
     /// covers. The provenance is written **on the edge**: an edge whose rule and measure
-    /// cannot be read is indistinguishable from an accident.
+    /// cannot be read is indistinguishable from an accident. That is why the parameter is
+    /// an [`crate::graph::rules::AccountableProvenance`], not a bare `Provenance`: the
+    /// proof that rule, measure and date are named is made BEFORE this is callable, and an
+    /// empty provenance is refused with a typed error instead of becoming an edge.
     ///
     /// A missing target draws nothing (`Ok(false)`), never a dangling edge: a pin naming
     /// a deleted note is a skip, not a failure.
@@ -3035,7 +3038,7 @@ pub trait AnalyticsStore: Send + Sync {
         note_id: Uuid,
         scope: crate::graph::rules::KnowledgeScope,
         project: Option<Uuid>,
-        provenance: &crate::graph::rules::Provenance,
+        provenance: &crate::graph::rules::AccountableProvenance,
     ) -> Result<bool>;
 
     /// Draws `(:Agent)-[:USES {rule, measure, at}]->(:Persona|:Skill|:Protocol)` — what
@@ -3050,7 +3053,7 @@ pub trait AnalyticsStore: Send + Sync {
         agent_id: Uuid,
         label: &str,
         target_id: Uuid,
-        provenance: &crate::graph::rules::Provenance,
+        provenance: &crate::graph::rules::AccountableProvenance,
     ) -> Result<bool>;
 
     /// Reinforces the `SYNAPSE` pairs among `notes` (all pairs, both directions), scoped to
@@ -3064,7 +3067,7 @@ pub trait AnalyticsStore: Send + Sync {
         project: Uuid,
         notes: &[Uuid],
         session: Uuid,
-        provenance: &crate::graph::rules::Provenance,
+        provenance: &crate::graph::rules::AccountableProvenance,
     ) -> Result<usize>;
 
     /// Releases the `KNOWS` edges that a RULE drew to notes that are no longer pinned.

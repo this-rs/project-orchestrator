@@ -3232,7 +3232,7 @@ impl AnalyticsStore for Neo4jClient {
         note_id: Uuid,
         scope: crate::graph::rules::KnowledgeScope,
         project: Option<Uuid>,
-        provenance: &crate::graph::rules::Provenance,
+        provenance: &crate::graph::rules::AccountableProvenance,
     ) -> anyhow::Result<bool> {
         self.link_agent_knows(agent_id, note_id, scope, project, provenance)
             .await
@@ -3243,7 +3243,7 @@ impl AnalyticsStore for Neo4jClient {
         project: Uuid,
         notes: &[Uuid],
         session: Uuid,
-        provenance: &crate::graph::rules::Provenance,
+        provenance: &crate::graph::rules::AccountableProvenance,
     ) -> anyhow::Result<usize> {
         self.coactivate_session(project, notes, session, provenance)
             .await
@@ -3254,7 +3254,7 @@ impl AnalyticsStore for Neo4jClient {
         agent_id: Uuid,
         label: &str,
         target_id: Uuid,
-        provenance: &crate::graph::rules::Provenance,
+        provenance: &crate::graph::rules::AccountableProvenance,
     ) -> anyhow::Result<bool> {
         self.link_agent_uses(agent_id, label, target_id, provenance)
             .await
