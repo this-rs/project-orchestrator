@@ -259,6 +259,11 @@ pub struct MockGraphStore {
     /// Les entités du faux graphe de code, `(kind, name)` — scriptables, pour qu'un test
     /// fasse tenir ou tomber une assertion sans construire un vrai dépôt.
     pub belief_entities: RwLock<std::collections::HashSet<(String, String)>>,
+    /// Le projet auquel chaque entité du faux graphe appartient, quand le test le dit.
+    /// Absent = portée inconnue : l'entité répond à toutes les portées, comme un graphe
+    /// réel où la croyance n'a pas de projet. C'est ce qui rend la portée testable sans
+    /// réécrire les 20 tests existants.
+    pub belief_entity_project: RwLock<std::collections::HashMap<(String, String), Option<Uuid>>>,
     /// Les liens du faux graphe de code.
     pub belief_links: RwLock<std::collections::HashSet<BeliefLink>>,
     /// `coactivate_session`: the pairs it welded, and who welded them — `(project,
@@ -560,6 +565,7 @@ impl MockGraphStore {
             agent_uses: RwLock::new(HashMap::new()),
             synapses: RwLock::new(HashMap::new()),
             belief_entities: RwLock::new(std::collections::HashSet::new()),
+            belief_entity_project: RwLock::new(std::collections::HashMap::new()),
             belief_links: RwLock::new(std::collections::HashSet::new()),
             fail_session_writes: std::sync::atomic::AtomicBool::new(false),
             fail_list_projects: std::sync::atomic::AtomicBool::new(false),
@@ -14064,16 +14070,36 @@ impl AnalyticsStore for MockGraphStore {
             .collect())
     }
 
-    async fn entity_exists(&self, kind: &str, name: &str) -> Result<Option<bool>> {
-        const KNOWN: &[&str] = &["file", "function", "struct", "trait", "enum", "impl"];
+    async fn entity_exists(
+        &self,
+        kind: &str,
+        name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Option<bool>> {
+        const KNOWN: &[&str] = &["file", "function", "struct", "trait", "enum"];
         if !KNOWN.contains(&kind) {
             return Ok(None);
         }
+        if !self
+            .belief_entities
+            .read()
+            .await
+            .contains(&(kind.to_string(), name.to_string()))
+        {
+            return Ok(Some(false));
+        }
+        // La portée est OPTIONNELLE et enregistrée à part : une entité posée sans projet est
+        // « de portée inconnue » et répond à toutes les portées, comme le graphe réel quand
+        // la croyance n'a pas de projet. Une entité posée AVEC un projet ne répond qu'au sien.
+        let owners = self.belief_entity_project.read().await;
         Ok(Some(
-            self.belief_entities
-                .read()
-                .await
-                .contains(&(kind.to_string(), name.to_string())),
+            match (
+                project_id,
+                owners.get(&(kind.to_string(), name.to_string())),
+            ) {
+                (Some(wanted), Some(Some(owner))) => *owner == wanted,
+                _ => true,
+            },
         ))
     }
 
@@ -14084,18 +14110,34 @@ impl AnalyticsStore for MockGraphStore {
         edge: &str,
         to_kind: &str,
         to_name: &str,
+        project_id: Option<Uuid>,
     ) -> Result<Option<bool>> {
-        const KNOWN: &[&str] = &["file", "function", "struct", "trait", "enum", "impl"];
+        const KNOWN: &[&str] = &["file", "function", "struct", "trait", "enum"];
         if !KNOWN.contains(&from_kind) || !KNOWN.contains(&to_kind) {
             return Ok(None);
         }
-        Ok(Some(self.belief_links.read().await.contains(&(
+        let found = self.belief_links.read().await.contains(&(
             from_kind.to_string(),
             from_name.to_string(),
             edge.to_string(),
             to_kind.to_string(),
             to_name.to_string(),
-        ))))
+        ));
+        if !found {
+            return Ok(Some(false));
+        }
+        // Même règle qu'`entity_exists` : les DEUX bouts doivent être dans la portée.
+        let owners = self.belief_entity_project.read().await;
+        let in_scope = |kind: &str, name: &str| match project_id {
+            None => true,
+            Some(wanted) => match owners.get(&(kind.to_string(), name.to_string())) {
+                Some(Some(owner)) => *owner == wanted,
+                _ => true,
+            },
+        };
+        Ok(Some(
+            in_scope(from_kind, from_name) && in_scope(to_kind, to_name),
+        ))
     }
 
     async fn list_assertion_notes(&self, limit: usize) -> Result<Vec<crate::notes::Note>> {

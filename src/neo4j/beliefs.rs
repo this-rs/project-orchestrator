@@ -12,18 +12,47 @@ use uuid::Uuid;
 use crate::neo4j::client::Neo4jClient;
 use crate::notes::models::{AssertionResult, Note, NoteStatus};
 
-/// Le label et la propriété d'un type de cible. `None` = type inconnu, donc invérifiable.
+/// Le label, la propriété qui porte le nom, et celle qui porte le projet.
 ///
-/// Fermé volontairement : ces deux chaînes sont interpolées dans une requête.
-fn label_and_prop(kind: &str) -> Option<(&'static str, &'static str)> {
-    match kind {
-        "file" => Some(("File", "path")),
-        "function" => Some(("Function", "name")),
-        "struct" => Some(("Struct", "name")),
-        "trait" => Some(("Trait", "name")),
-        "enum" => Some(("Enum", "name")),
-        "impl" => Some(("Impl", "name")),
-        _ => None,
+/// `None` = type non interrogeable par nom, donc invérifiable. Fermé volontairement :
+/// ces chaînes sont interpolées dans une requête.
+///
+/// `impl` est ABSENT de cette liste, et c'est un correctif : un `Impl` ne porte pas de
+/// propriété `name` (il a `for_type`, `trait_name`, `stable_key`). L'ancienne table
+/// répondait donc `false` à « cette impl existe » — un faux « absent », c'est-à-dire une
+/// croyance réfutée à tort. Un type qu'on ne sait pas nommer devient **invérifiable**,
+/// ce que le module distingue déjà partout ailleurs.
+struct Target {
+    label: &'static str,
+    name_prop: &'static str,
+    project_prop: Option<&'static str>,
+}
+
+fn target_of(kind: &str) -> Option<Target> {
+    let (label, name_prop) = match kind {
+        "file" => ("File", "path"),
+        "function" => ("Function", "name"),
+        "struct" => ("Struct", "name"),
+        "trait" => ("Trait", "name"),
+        "enum" => ("Enum", "name"),
+        _ => return None,
+    };
+    // Tous les types nommables portent `project_id`, et chacun a son index `*_project_id`.
+    Some(Target {
+        label,
+        name_prop,
+        project_prop: Some("project_id"),
+    })
+}
+
+/// La clause qui borne `alias` au projet demandé, ou ne borne rien quand il n'y en a pas.
+///
+/// Sans elle, `Function.name` est ambigu par nature : deux projets peuvent avoir une
+/// fonction du même nom, et une croyance se vérifierait contre l'homonyme de l'autre.
+fn within_project(alias: &str, target: &Target) -> String {
+    match target.project_prop {
+        Some(prop) => format!("($project IS NULL OR {alias}.{prop} = $project)"),
+        None => format!("($project IS NULL OR {alias}.project_id = $project)"),
     }
 }
 
@@ -32,15 +61,28 @@ const LINK_EDGES: &[&str] = &["CALLS", "IMPLEMENTS_TRAIT", "DEPENDS_ON", "IMPORT
 
 impl Neo4jClient {
     /// See [`crate::neo4j::AnalyticsStore::entity_exists`].
-    pub async fn entity_exists(&self, kind: &str, name: &str) -> Result<Option<bool>> {
-        let Some((label, prop)) = label_and_prop(kind) else {
+    pub async fn entity_exists(
+        &self,
+        kind: &str,
+        name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Option<bool>> {
+        let Some(target) = target_of(kind) else {
             return Ok(None);
         };
-        let statement =
-            format!("MATCH (n:{label}) WHERE n.{prop} = $name RETURN count(n) > 0 AS ok");
+        let statement = format!(
+            "MATCH (n:{label}) WHERE n.{prop} = $name AND {scope} RETURN count(n) > 0 AS ok",
+            label = target.label,
+            prop = target.name_prop,
+            scope = within_project("n", &target)
+        );
         let mut rows = self
             .graph
-            .execute(query(&statement).param("name", name.to_string()))
+            .execute(
+                query(&statement)
+                    .param("name", name.to_string())
+                    .param("project", project_id.map(|p| p.to_string())),
+            )
             .await?;
         Ok(rows
             .next()
@@ -56,6 +98,7 @@ impl Neo4jClient {
         edge: &str,
         to_kind: &str,
         to_name: &str,
+        project_id: Option<Uuid>,
     ) -> Result<Option<bool>> {
         if !LINK_EDGES.contains(&edge) {
             // Une relation inconnue n'est pas une réfutation : c'est une question qu'on ne
@@ -64,22 +107,28 @@ impl Neo4jClient {
             // fautive rendrait muettes toutes les autres. `None` = « je ne sais pas ».
             return Ok(None);
         }
-        let (Some((from_label, from_prop)), Some((to_label, to_prop))) =
-            (label_and_prop(from_kind), label_and_prop(to_kind))
-        else {
+        let (Some(from), Some(to)) = (target_of(from_kind), target_of(to_kind)) else {
             return Ok(None);
         };
         let statement = format!(
             "MATCH (a:{from_label})-[r:{edge}]->(b:{to_label}) \
              WHERE a.{from_prop} = $from AND b.{to_prop} = $to \
-             RETURN count(r) > 0 AS ok"
+               AND {from_scope} AND {to_scope} \
+             RETURN count(r) > 0 AS ok",
+            from_label = from.label,
+            to_label = to.label,
+            from_prop = from.name_prop,
+            to_prop = to.name_prop,
+            from_scope = within_project("a", &from),
+            to_scope = within_project("b", &to)
         );
         let mut rows = self
             .graph
             .execute(
                 query(&statement)
                     .param("from", from_name.to_string())
-                    .param("to", to_name.to_string()),
+                    .param("to", to_name.to_string())
+                    .param("project", project_id.map(|p| p.to_string())),
             )
             .await?;
         Ok(rows

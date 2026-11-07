@@ -3092,10 +3092,25 @@ pub trait AnalyticsStore: Send + Sync {
     /// (`file`, `function`, `struct`, `trait`, `enum`) ; tout autre type est cherché par id.
     ///
     /// C'est ce qui rend `Exists`/`NotExists` vérifiable sans le texte source.
-    async fn entity_exists(&self, kind: &str, name: &str) -> Result<Option<bool>>;
+    ///
+    /// `project_id` borne la recherche au projet de la croyance. Sans lui, `Function.name`
+    /// est **ambigu par nature** : deux projets, deux fichiers, deux fonctions du même nom.
+    /// Une assertion « `helper` existe » se vérifierait alors contre l'homonyme d'un autre
+    /// projet — vrai ici, faux là — et la re-vérification écraserait des croyances justes.
+    /// `None` = pas de portée connue : on répond sur tout le graphe, et c'est dit.
+    async fn entity_exists(
+        &self,
+        kind: &str,
+        name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Option<bool>>;
 
     /// `(from)-[:edge]->(to)` existe-t-il ? Les deux bouts sont nommés `kind:name`.
     /// `edge` est validé contre une liste fermée : il est interpolé dans la requête.
+    ///
+    /// `project_id` borne **les deux bouts** au même projet, pour la même raison que
+    /// [`Self::entity_exists`] : une arête `CALLS` entre l'homonyme d'un projet et celui
+    /// d'un autre n'existe pas, et la lire quand même rendrait un verdict faux.
     async fn entities_linked(
         &self,
         from_kind: &str,
@@ -3103,6 +3118,7 @@ pub trait AnalyticsStore: Send + Sync {
         edge: &str,
         to_kind: &str,
         to_name: &str,
+        project_id: Option<Uuid>,
     ) -> Result<Option<bool>>;
 
     /// Les croyances : les notes qui déclarent une procédure de vérification.

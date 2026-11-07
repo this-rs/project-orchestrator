@@ -35,6 +35,7 @@
 //! documenté plutôt que deviné.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::neo4j::traits::GraphStore;
 use crate::notes::models::{
@@ -107,10 +108,17 @@ pub async fn verify(graph: &dyn GraphStore, note: &Note) -> anyhow::Result<Verdi
             "aucune procédure déclarée : rien à vérifier".into(),
         ));
     };
-    judge(graph, rule).await
+    // La portée de la croyance borne la vérification : `Function.name` est ambigu entre
+    // projets, et se vérifier contre l'homonyme d'un autre projet rendrait un verdict faux
+    // — puis, sous `Block`, effacerait une croyance juste.
+    judge(graph, rule, note.project_id).await
 }
 
-async fn judge(graph: &dyn GraphStore, rule: &AssertionRule) -> anyhow::Result<Verdict> {
+async fn judge(
+    graph: &dyn GraphStore,
+    rule: &AssertionRule,
+    project_id: Option<Uuid>,
+) -> anyhow::Result<Verdict> {
     let params = rule.parameters.clone().unwrap_or(serde_json::Value::Null);
     let Some((kind, name)) = split_target(&rule.target) else {
         return Ok(Verdict::Unverifiable(format!(
@@ -124,7 +132,7 @@ async fn judge(graph: &dyn GraphStore, rule: &AssertionRule) -> anyhow::Result<V
             "une signature demande le texte source, pas le graphe".into(),
         )),
 
-        AssertionCheckType::Exists => match graph.entity_exists(kind, name).await? {
+        AssertionCheckType::Exists => match graph.entity_exists(kind, name, project_id).await? {
             Some(true) => Ok(Verdict::Holds(format!("{kind} « {name} » existe"))),
             Some(false) => Ok(Verdict::Fails(format!(
                 "{kind} « {name} » est absent du graphe"
@@ -134,7 +142,7 @@ async fn judge(graph: &dyn GraphStore, rule: &AssertionRule) -> anyhow::Result<V
             ))),
         },
 
-        AssertionCheckType::NotExists => match graph.entity_exists(kind, name).await? {
+        AssertionCheckType::NotExists => match graph.entity_exists(kind, name, project_id).await? {
             Some(true) => Ok(Verdict::Fails(format!(
                 "{kind} « {name} » existe alors qu'il devrait être absent"
             ))),
@@ -156,7 +164,7 @@ async fn judge(graph: &dyn GraphStore, rule: &AssertionRule) -> anyhow::Result<V
                 )));
             };
             let Some(linked) = graph
-                .entities_linked(kind, name, "CALLS", to_kind, to_name)
+                .entities_linked(kind, name, "CALLS", to_kind, to_name, project_id)
                 .await?
             else {
                 return Ok(Verdict::Unverifiable(format!(
@@ -181,7 +189,14 @@ async fn judge(graph: &dyn GraphStore, rule: &AssertionRule) -> anyhow::Result<V
                 ));
             };
             let Some(linked) = graph
-                .entities_linked(kind, name, "IMPLEMENTS_TRAIT", "trait", trait_name)
+                .entities_linked(
+                    kind,
+                    name,
+                    "IMPLEMENTS_TRAIT",
+                    "trait",
+                    trait_name,
+                    project_id,
+                )
                 .await?
             else {
                 return Ok(Verdict::Unverifiable("type de cible inconnu".into()));
@@ -201,7 +216,7 @@ async fn judge(graph: &dyn GraphStore, rule: &AssertionRule) -> anyhow::Result<V
                 return Ok(Verdict::Unverifiable(format!("cible illisible « {on} »")));
             };
             let Some(linked) = graph
-                .entities_linked(kind, name, "DEPENDS_ON", on_kind, on_name)
+                .entities_linked(kind, name, "DEPENDS_ON", on_kind, on_name, project_id)
                 .await?
             else {
                 return Ok(Verdict::Unverifiable(format!(
@@ -1090,6 +1105,121 @@ mod tests {
             stored.status,
             NoteStatus::Obsolete,
             "une passe ne décide pas de remplacer une croyance révisée"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------
+    // La PORTÉE : `Function.name` est ambigu entre projets.
+    // ---------------------------------------------------------------------------------
+
+    /// Une croyance est jugée DANS SON PROJET. Deux projets peuvent avoir une fonction du
+    /// même nom ; se vérifier contre l'homonyme de l'autre rendrait un verdict faux, et
+    /// sous `Block`, effacerait une croyance juste.
+    #[tokio::test]
+    async fn a_belief_is_judged_within_its_own_project() {
+        let here = Uuid::new_v4();
+        let elsewhere = Uuid::new_v4();
+
+        let mut note = a_belief(
+            AssertionCheckType::Exists,
+            "function:helper",
+            serde_json::Value::Null,
+        );
+        note.project_id = Some(here);
+        let graph = seeded(&note).await;
+        graph
+            .belief_entities
+            .write()
+            .await
+            .insert(("function".into(), "helper".into()));
+
+        // L'homonyme appartient à un AUTRE projet : la croyance est réfutée.
+        graph
+            .belief_entity_project
+            .write()
+            .await
+            .insert(("function".into(), "helper".into()), Some(elsewhere));
+        let verdict = verify(&graph, &note).await.unwrap();
+        assert!(
+            verdict.is_refuted(),
+            "la fonction du même nom est ailleurs, donc elle n'est pas ici : {verdict:?}"
+        );
+
+        // La même entité, dans SON projet : la croyance tient de nouveau.
+        graph
+            .belief_entity_project
+            .write()
+            .await
+            .insert(("function".into(), "helper".into()), Some(here));
+        let verdict = verify(&graph, &note).await.unwrap();
+        assert!(
+            matches!(verdict, Verdict::Holds(_)),
+            "dans son propre projet, elle existe : {verdict:?}"
+        );
+    }
+
+    /// Une croyance SANS projet garde la portée globale : on ne lui invente pas un
+    /// périmètre, et l'entité d'un projet quelconque la satisfait.
+    #[tokio::test]
+    async fn a_belief_without_a_project_stays_global() {
+        let mut note = a_belief(
+            AssertionCheckType::Exists,
+            "function:helper",
+            serde_json::Value::Null,
+        );
+        note.project_id = None;
+        let graph = seeded(&note).await;
+        graph
+            .belief_entities
+            .write()
+            .await
+            .insert(("function".into(), "helper".into()));
+        graph
+            .belief_entity_project
+            .write()
+            .await
+            .insert(("function".into(), "helper".into()), Some(Uuid::new_v4()));
+
+        assert!(
+            matches!(verify(&graph, &note).await.unwrap(), Verdict::Holds(_)),
+            "sans projet connu, la portée est globale"
+        );
+    }
+
+    /// La portée borne aussi les LIENS : une arête entre deux entités de projets différents
+    /// ne répond pas à une croyance d'un troisième projet.
+    #[tokio::test]
+    async fn a_link_is_judged_within_the_project_of_both_ends() {
+        let here = Uuid::new_v4();
+        let mut note = a_belief(
+            AssertionCheckType::Calls,
+            "function:main",
+            serde_json::json!({"to": "function:helper"}),
+        );
+        note.project_id = Some(here);
+        let graph = seeded(&note).await;
+        graph.belief_links.write().await.insert((
+            "function".into(),
+            "main".into(),
+            "CALLS".into(),
+            "function".into(),
+            "helper".into(),
+        ));
+
+        // Les deux bouts sont dans un autre projet : l'arête n'est pas dans le périmètre.
+        graph
+            .belief_entity_project
+            .write()
+            .await
+            .insert(("function".into(), "main".into()), Some(Uuid::new_v4()));
+        graph
+            .belief_entity_project
+            .write()
+            .await
+            .insert(("function".into(), "helper".into()), Some(Uuid::new_v4()));
+        assert!(
+            verify(&graph, &note).await.unwrap().is_refuted(),
+            "une arête d'un autre projet ne prouve rien ici"
         );
     }
 }
