@@ -497,6 +497,43 @@ mod tests {
         assert!(resume.to_markdown().is_empty());
     }
 
+    /// `Recent Knowledge` used to be `status = active`, five newest, nothing
+    /// else — a resumed session opened on whatever a regex had extracted from
+    /// the previous conversation. A heuristic's unconfirmed note is not shown; a
+    /// person's note, and an agent's deliberate one, still are.
+    #[tokio::test]
+    async fn recent_knowledge_hides_an_unconfirmed_heuristic_note() {
+        use crate::notes::models::{Note, NoteAuthorKind, NoteType};
+
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let project = Uuid::new_v4();
+
+        let mut detector = Note::new(
+            Some(project),
+            NoteType::Observation,
+            "**Gotcha**: une phrase arrachée à une conversation.".to_string(),
+            "system/observation-detector".to_string(),
+        )
+        .with_author(NoteAuthorKind::System, "system/observation-detector");
+        detector.tags = vec!["auto-observed".to_string()];
+        graph.create_note(&detector).await.unwrap();
+
+        let human = Note::new(
+            Some(project),
+            NoteType::Gotcha,
+            "Le contrôle des prix se fait en fin de batch.".to_string(),
+            "julien".to_string(),
+        )
+        .with_author(NoteAuthorKind::Human, "julien");
+        graph.create_note(&human).await.unwrap();
+
+        let store: Arc<dyn GraphStore> = graph;
+        let notes = load_recent_notes(&store, project).await.unwrap();
+
+        assert_eq!(notes.len(), 1, "only the note a person answered for");
+        assert_eq!(notes[0].note_id, human.id);
+    }
+
     #[test]
     fn test_resume_with_discussed_entities_has_content() {
         let resume = SessionResume {

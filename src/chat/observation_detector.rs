@@ -728,6 +728,55 @@ mod tests {
     }
 
     #[test]
+    fn rejects_an_excerpt_that_ends_on_a_question() {
+        // The statement opens fine, then turns into an interrogation: a claim
+        // does not end on a question mark.
+        let text = "The root cause was a missing bound in the parser, and adding it fixed the build. Is that clear enough for you to move on?";
+        assert!(!has_statement_shape(text));
+    }
+
+    #[test]
+    fn rejects_a_pipe_or_a_code_fence_inside_a_statement() {
+        let with_pipe = "The root cause was a missing | separator in the parser, and adding it back fixed the whole build again.";
+        assert!(!has_statement_shape(with_pipe));
+
+        let with_fence = "The root cause was a missing bound, as this snippet shows. ```rust let x = 1; ``` and the build passes again.";
+        assert!(!has_statement_shape(with_fence));
+    }
+
+    #[test]
+    fn rejects_a_long_single_sentence() {
+        // Long enough, ends with a full stop — but it is ONE sentence: a remark,
+        // not a reasoning that can stand on its own.
+        let text = "Watch out for the pre-push hook because it runs a very long list of checks that must all pass before anything at all can be pushed anywhere.";
+        assert!(text.chars().count() >= MIN_EXCERPT_CHARS);
+        assert!(!has_statement_shape(text));
+    }
+
+    #[test]
+    fn an_excerpt_after_a_short_opening_sentence_takes_the_next_one() {
+        // The sentence holding the match is too short on its own: the extractor
+        // appends the following ones instead of returning a fragment.
+        let text = "Be careful with hooks. The pre-push hook runs fmt and clippy, and both must pass before anything can be pushed to the remote repository.";
+        let obs = detect_observations(text).expect("a two-sentence statement is captured");
+        assert!(obs.context_excerpt.contains("The pre-push hook runs fmt"));
+    }
+
+    #[test]
+    fn an_excerpt_never_cuts_through_a_multi_byte_character() {
+        // 299 ASCII bytes then 'é' (two bytes): the budget of 300 lands inside
+        // the character, and the extractor must step back instead of panicking.
+        let mut text = String::from("Be careful ");
+        text.push_str(&"a".repeat(284));
+        text.push('é');
+        text.push_str(" et la suite du raisonnement, qui continue encore un peu.");
+
+        let excerpt = extract_context(&text, 0, 11, 300);
+        assert!(!excerpt.is_empty());
+        assert!(excerpt.is_char_boundary(excerpt.len()));
+    }
+
+    #[test]
     fn test_max_one_observation() {
         // Text with multiple patterns — should only return the highest confidence one
         let text = "Watch out for this gotcha: the root cause was that you should always use ?Sized bounds on generics when using dyn traits.";

@@ -193,5 +193,31 @@ mod tests {
         let visible = visibility(&Provenance::of_note(&note));
         assert_eq!(visible.note_type, "guideline");
         assert!(visible.vouched);
+        assert_eq!(visible.reason, "vouched by a person");
+    }
+
+    #[test]
+    fn an_agent_note_is_deliberate_but_not_vouched() {
+        let note = Note::new(
+            None,
+            NoteType::Pattern,
+            "The enrichment stages all follow the same pipeline.".to_string(),
+            "agent:204ce865-d253-4f59-816c-5f9d8f5ff1ac".to_string(),
+        );
+
+        let provenance = Provenance::of_note(&note);
+        let visible = visibility(&provenance);
+
+        assert!(!provenance.is_heuristic(), "an agent is not a heuristic");
+        assert!(!visible.vouched);
+        assert_eq!(
+            visible.note_type, "pattern",
+            "its own word is kept — it is not a machine fragment"
+        );
+        assert_eq!(visible.reason, "deliberate author, no human signature");
+        assert!(
+            !foundational_eligible(&provenance, &visible),
+            "and it is not foundation knowledge until a person says so"
+        );
     }
 }

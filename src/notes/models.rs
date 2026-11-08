@@ -1618,6 +1618,116 @@ mod search_scope_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The author kind is written to the graph and read back as a string: the
+    /// round-trip is the contract between `create_note` and `node_to_note`.
+    #[test]
+    fn an_author_kind_roundtrips_through_its_name() {
+        for kind in [
+            NoteAuthorKind::Human,
+            NoteAuthorKind::Agent,
+            NoteAuthorKind::System,
+        ] {
+            assert_eq!(kind.to_string(), kind.as_str());
+            assert_eq!(
+                kind.as_str().parse::<NoteAuthorKind>().unwrap(),
+                kind,
+                "written {} and read back differently",
+                kind
+            );
+        }
+        assert!(
+            "SYSTEM".parse::<NoteAuthorKind>().is_ok(),
+            "case-insensitive"
+        );
+        assert!(
+            "nobody".parse::<NoteAuthorKind>().is_err(),
+            "an unknown kind is an error, not a default"
+        );
+    }
+
+    /// A note written before the property existed is guessed from the actor
+    /// name: `system/…` is a heuristic, `agent:<uuid>` a model, a name a person
+    /// acting deliberately.
+    #[test]
+    fn a_legacy_author_is_guessed_from_its_name() {
+        assert_eq!(
+            NoteAuthorKind::infer_from_created_by("system/observation-detector"),
+            NoteAuthorKind::System
+        );
+        assert_eq!(
+            NoteAuthorKind::infer_from_created_by("skill-evolution"),
+            NoteAuthorKind::System
+        );
+        assert_eq!(
+            NoteAuthorKind::infer_from_created_by("agent:204ce865-d253-4f59-816c-5f9d8f5ff1ac"),
+            NoteAuthorKind::Agent
+        );
+        assert_eq!(
+            NoteAuthorKind::infer_from_created_by("julien"),
+            NoteAuthorKind::Agent,
+            "a name alone does not claim a person's signature"
+        );
+    }
+
+    #[test]
+    fn a_machine_note_is_born_unsigned() {
+        let note = Note::new(
+            None,
+            NoteType::Observation,
+            "texte".to_string(),
+            "system/observation-detector".to_string(),
+        )
+        .with_author(NoteAuthorKind::System, "system/observation-detector");
+
+        assert!(!note.is_human_confirmed());
+        assert_eq!(note.human_confirmed_by, None);
+        assert_eq!(
+            note.last_confirmed_by, None,
+            "the author is not the confirmer"
+        );
+        assert!(
+            note.last_confirmed_at.is_some(),
+            "the freshness clock is set"
+        );
+    }
+
+    #[test]
+    fn a_persons_note_is_confirmed_by_construction() {
+        let note = Note::new(
+            None,
+            NoteType::Gotcha,
+            "texte".to_string(),
+            "julien".to_string(),
+        )
+        .with_author(NoteAuthorKind::Human, "julien");
+        assert!(note.is_human_confirmed());
+        assert_eq!(note.human_confirmed_by.as_deref(), Some("julien"));
+    }
+
+    #[test]
+    fn confirming_by_a_person_moves_both_the_signature_and_the_clock() {
+        let mut note = Note::new(
+            None,
+            NoteType::Gotcha,
+            "texte".to_string(),
+            "agent:x".to_string(),
+        );
+        assert!(!note.is_human_confirmed());
+
+        let now = Utc::now();
+        note.confirm_by_human("julien", now);
+
+        assert!(note.is_human_confirmed());
+        assert_eq!(note.last_confirmed_at, Some(now));
+        assert!(
+            note.changes
+                .iter()
+                .any(|c| matches!(c.change_type, ChangeType::Confirmed)),
+            "the confirmation is written in the history"
+        );
+    }
+
     #[test]
     fn test_propagation_scope_rule_for_global_and_foreign_notes() {
         let (me, other) = (Uuid::new_v4(), Uuid::new_v4());

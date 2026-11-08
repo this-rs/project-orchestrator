@@ -1965,50 +1965,23 @@ pub async fn heal_scars(
 /// The observation detector wrote notes the graph has no way to recognise as
 /// machine prose (see `notes::visibility`). This reports the shape of that
 /// population and, when `dry_run` is false, ARCHIVES the ones no person has
-/// confirmed. Nothing is ever deleted: an archived note keeps its history and
-/// can come back.
+/// confirmed. Nothing is ever deleted, and `dry_run` defaults to TRUE — an
+/// operator asking a question must not be answered with a write.
 ///
-/// `dry_run` defaults to TRUE — an operator asking a question must not be
-/// answered with a write.
+/// The work is `notes::purge::purge_auto_observed`, so the HTTP route and the
+/// MCP action cannot drift apart; this function is only the wire.
 pub async fn purge_auto_observed(
     State(state): State<OrchestratorState>,
     Json(body): Json<PurgeAutoObservedBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let dry_run = body.dry_run.unwrap_or(true);
-    let neo4j = state.orchestrator.neo4j();
-
-    let before = neo4j
-        .auto_observed_report(body.project_id)
-        .await
-        .map_err(AppError::Internal)?;
-
-    if dry_run {
-        return Ok(Json(serde_json::json!({
-            "dry_run": true,
-            "project_id": body.project_id,
-            "before": before,
-            "archived": 0,
-            "hint": "POST the same body with dry_run=false to archive the unconfirmed ones",
-        })));
-    }
-
-    let archived = neo4j
-        .archive_unconfirmed_auto_observed(body.project_id)
-        .await
-        .map_err(AppError::Internal)?;
-
-    let after = neo4j
-        .auto_observed_report(body.project_id)
-        .await
-        .map_err(AppError::Internal)?;
-
-    Ok(Json(serde_json::json!({
-        "dry_run": false,
-        "project_id": body.project_id,
-        "before": before,
-        "archived": archived,
-        "after": after,
-    })))
+    let report = crate::notes::purge::purge_auto_observed(
+        state.orchestrator.neo4j(),
+        body.project_id,
+        body.dry_run.unwrap_or(true),
+    )
+    .await
+    .map_err(AppError::Internal)?;
+    Ok(Json(report))
 }
 
 /// POST /api/notes/purge-auto-observed body.

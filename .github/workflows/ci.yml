@@ -630,7 +630,7 @@ jobs:
             --test workspace_tests --test neo4j_store_tests --test harness_neo4j \
             --test neo4j_note_consent --test neo4j_decision_project --test neural_routing_indexes \
             --test neo4j_synapse_shadow --test store_conformance --test code_graph_stable_key \
-            --test file_paths --test neural_routing_sampler
+            --test file_paths --test neural_routing_sampler --test note_sweep
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
@@ -920,7 +920,8 @@ jobs:
             --test code_graph_stable_key \
             --test file_paths \
             --test neural_routing_sampler \
-            --test store_conformance
+            --test store_conformance \
+            --test note_sweep
 
       # (4) Merge every run above into one lcov.
       - name: Merge coverage runs into a single lcov

@@ -945,6 +945,127 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
+    // ── What a heuristic is allowed to write ─────────────────────────────
+
+    #[test]
+    fn every_detected_category_becomes_an_observation() {
+        for category in ["gotcha", "guideline", "pattern", "rfc"] {
+            let (note_type, importance, energy, tag) =
+                map_observation(category).expect("a known category");
+            assert_eq!(note_type, NoteType::Observation);
+            assert_eq!(importance, NoteImportance::Low);
+            assert!(energy <= 0.2, "a heuristic starts cool");
+            assert!(
+                tag.ends_with("-candidate"),
+                "{tag} is a claim, not a note type"
+            );
+        }
+        assert!(map_observation("assertion").is_none(), "unknown is refused");
+    }
+
+    #[test]
+    fn truncate_chars_cuts_on_a_character_boundary() {
+        // 100 bytes falls inside the second 'é' of this accented text: the old
+        // `&content[..100]` panicked here.
+        let accented = "é".repeat(150);
+        let cut = truncate_chars(&accented, 100);
+        assert_eq!(cut.chars().count(), 100);
+        assert_eq!(truncate_chars("court", 100), "court");
+    }
+
+    #[tokio::test]
+    async fn a_detected_observation_is_persisted_as_an_unconfirmed_observation() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+
+        let obs = DetectedObservation {
+            note_type: "gotcha".to_string(),
+            confidence: 0.91,
+            trigger_pattern: "root cause was".to_string(),
+            context_excerpt: "the root cause was a missing bound. Adding it fixed the build."
+                .to_string(),
+            suggested_content:
+                "**Gotcha**: the root cause was a missing bound. Adding it fixed the build."
+                    .to_string(),
+            importance: "critical".to_string(),
+        };
+
+        let created = create_observation_note(&obs, &graph, &search, None, None, None).await;
+        assert!(created, "a well-formed observation is persisted");
+
+        let notes = graph
+            .list_notes(None, None, &Default::default())
+            .await
+            .unwrap()
+            .0;
+        let note = notes.first().expect("one note");
+        assert_eq!(note.note_type, NoteType::Observation);
+        assert_eq!(note.importance, NoteImportance::Low);
+        assert_eq!(note.author_kind, NoteAuthorKind::System);
+        assert_eq!(note.confidence, Some(0.91));
+        assert!(note.tags.contains(&"auto-observed".to_string()));
+        assert!(
+            !note.is_human_confirmed(),
+            "nobody answered for this note, and the graph says so"
+        );
+        assert_eq!(
+            note.last_confirmed_by, None,
+            "the detector does not sign its own note"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_observation_twice_creates_one_note() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let search_store = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let search: Arc<dyn SearchStore> = search_store.clone();
+        let obs = DetectedObservation {
+            note_type: "gotcha".to_string(),
+            confidence: 0.9,
+            trigger_pattern: "piège".to_string(),
+            context_excerpt: "attention à ce piège. il coûte cher.".to_string(),
+            suggested_content: "attention à ce piège. il coûte cher.".to_string(),
+            importance: "high".to_string(),
+        };
+
+        // The dedup probe must not panic on accented text, and must not depend on
+        // how many lines the content happens to have.
+        assert!(truncate_chars(&obs.suggested_content, 200).chars().count() > 0);
+        assert!(create_observation_note(&obs, &graph, &search, None, None, None).await);
+
+        // The note is indexed by the note manager, not by the detector: index it
+        // here, the way production does, then the same text must not be captured
+        // twice.
+        search_store
+            .index_note(&crate::meilisearch::indexes::NoteDocument {
+                id: Uuid::new_v4().to_string(),
+                project_id: String::new(),
+                project_slug: String::new(),
+                note_type: "observation".to_string(),
+                status: "active".to_string(),
+                importance: "low".to_string(),
+                scope_type: "project".to_string(),
+                scope_path: String::new(),
+                content: obs.suggested_content.clone(),
+                tags: vec!["auto-observed".to_string()],
+                anchor_entities: vec![],
+                created_at: chrono::Utc::now().timestamp(),
+                created_by: "system/observation-detector".to_string(),
+                staleness_score: 0.0,
+                author_kind: "system".to_string(),
+                human_confirmed: false,
+                memory_horizon: "ephemeral".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            !create_observation_note(&obs, &graph, &search, None, None, None).await,
+            "the same observation, already in the index, is a duplicate"
+        );
+    }
+
     #[tokio::test]
     async fn test_session_cache_dedup() {
         let cache = SessionDiscussedCache::new();
