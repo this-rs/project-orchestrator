@@ -128,16 +128,14 @@ async fn a_regex_does_not_get_to_call_a_sentence_knowledge() {
     assert_eq!(after.active, before.active, "nothing is archived either");
 
     // The history must say what the note used to claim.
-    let history = format!(
-        r#"
+    let history = r#"
         MATCH (n:Note)
         WHERE n.project_id = $p AND n.retyped_auto_observed_at IS NOT NULL
         RETURN count(n) AS retyped,
                count(CASE WHEN n.changes_json CONTAINS 'from_note_type' THEN 1 END) AS with_history,
                count(CASE WHEN n.importance <> 'low' THEN 1 END) AS still_loud,
                count(CASE WHEN n.author_kind <> 'system' THEN 1 END) AS not_system
-        "#
-    );
+        "#;
     let mut r = graph
         .execute(query(&history).param("p", project.as_str()))
         .await
