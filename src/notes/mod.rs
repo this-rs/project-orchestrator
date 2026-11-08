@@ -14,8 +14,10 @@ pub mod hashing;
 pub mod lifecycle;
 pub mod manager;
 pub mod models;
+pub mod purge;
 pub mod retrieval_ledger;
 pub mod retrieval_policy;
+pub mod visibility;
 pub mod witness;
 
 /// Time constant tau (days) of the stored energy decay `exp(-t/tau)` (halves every

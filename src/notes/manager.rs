@@ -393,7 +393,22 @@ impl NoteManager {
 
     /// Create a new note
     pub async fn create_note(&self, input: CreateNoteRequest, created_by: &str) -> Result<Note> {
-        self.create_note_with(input, created_by, NoteExtras::default())
+        let author_kind = crate::notes::NoteAuthorKind::infer_from_created_by(created_by);
+        self.create_note_as_with(input, created_by, author_kind, NoteExtras::default())
+            .await
+    }
+
+    /// Creation by someone who knows who is writing.
+    ///
+    /// The `created_by` string cannot say "a person" — this can, and it is the
+    /// only way a human signature enters a new note (see `Note::with_author`).
+    pub async fn create_note_as(
+        &self,
+        input: CreateNoteRequest,
+        created_by: &str,
+        author_kind: crate::notes::NoteAuthorKind,
+    ) -> Result<Note> {
+        self.create_note_as_with(input, created_by, author_kind, NoteExtras::default())
             .await
     }
 
@@ -404,6 +419,20 @@ impl NoteManager {
         &self,
         input: CreateNoteRequest,
         created_by: &str,
+        extras: NoteExtras,
+    ) -> Result<Note> {
+        let author_kind = crate::notes::NoteAuthorKind::infer_from_created_by(created_by);
+        self.create_note_as_with(input, created_by, author_kind, extras)
+            .await
+    }
+
+    /// The one place a note is built: provenance, secrets scan, throttled energy,
+    /// assertion rule, sharing consent.
+    pub async fn create_note_as_with(
+        &self,
+        input: CreateNoteRequest,
+        created_by: &str,
+        author_kind: crate::notes::NoteAuthorKind,
         extras: NoteExtras,
     ) -> Result<Note> {
         // RFC auto-template: use structured template if content is empty
@@ -430,7 +459,8 @@ impl NoteManager {
             content,
             input.tags.unwrap_or_default(),
             created_by.to_string(),
-        );
+        )
+        .with_author(author_kind, created_by);
         if let Some(consent) = input.sharing_consent {
             note.sharing_consent = consent;
         }
@@ -1759,6 +1789,9 @@ impl NoteManager {
             created_at: note.created_at.timestamp(),
             created_by: note.created_by.clone(),
             staleness_score: note.staleness_score,
+            author_kind: note.author_kind.as_str().to_string(),
+            human_confirmed: note.is_human_confirmed(),
+            memory_horizon: note.memory_horizon.to_string(),
         })
     }
 

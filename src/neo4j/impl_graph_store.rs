@@ -2443,6 +2443,20 @@ impl AnalyticsStore for Neo4jClient {
         self.consolidate_memory().await
     }
 
+    async fn auto_observed_report(
+        &self,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.auto_observed_report(project_id).await
+    }
+
+    async fn archive_unconfirmed_auto_observed(
+        &self,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<usize> {
+        self.archive_unconfirmed_auto_observed(project_id).await
+    }
+
     async fn compute_homeostasis(
         &self,
         project_id: Uuid,

@@ -40,7 +40,7 @@ use crate::events::EventEmitter;
 use crate::meilisearch::SearchStore;
 use crate::neo4j::traits::GraphStore;
 #[allow(unused_imports)]
-use crate::notes::models::{MemoryHorizon, Note, NoteImportance, NoteType};
+use crate::notes::models::{MemoryHorizon, Note, NoteAuthorKind, NoteImportance, NoteType};
 
 // ============================================================================
 // Types
@@ -353,21 +353,43 @@ const NON_RFC_CONFIDENCE_THRESHOLD: f64 = 0.80;
 // ObservationCategory → NoteType mapping
 // ============================================================================
 
-/// Map an observation's `note_type` string to the corresponding `NoteType`,
-/// `NoteImportance`, energy level, and category tag.
-fn map_observation(note_type_str: &str) -> Option<(NoteType, NoteImportance, f64, &'static str)> {
-    match note_type_str {
-        "gotcha" => Some((NoteType::Gotcha, NoteImportance::High, 0.3, "gotcha")),
-        "guideline" => Some((
-            NoteType::Guideline,
-            NoteImportance::Medium,
-            0.3,
-            "convention",
-        )),
-        "pattern" => Some((NoteType::Pattern, NoteImportance::Medium, 0.3, "pattern")),
-        "rfc" => Some((NoteType::Rfc, NoteImportance::High, 0.5, "rfc")),
-        _ => None,
+/// Map an observation's category to what a HEURISTIC is allowed to write.
+///
+/// Returns `(NoteType, NoteImportance, energy, category tag)`.
+///
+/// Every category lands on `Observation`/`Low`, and that is the whole point: the
+/// detector has matched a regex, it has established nothing. Writing
+/// `gotcha`/`guideline`/`pattern`/`rfc` made a fragment of prose inherit a claim
+/// the detector cannot support — and, through `Note::base_decay_days`, a 180- or
+/// 365-day lifetime instead of the 90 days an observation gets. An RFC written
+/// this way also skipped the draft → proposed → accepted FSM, because no
+/// protocol run ever accompanies it: it is a *candidate*, tagged as such.
+fn map_observation(category: &str) -> Option<(NoteType, NoteImportance, f64, &'static str)> {
+    let tag = match category {
+        "gotcha" => "gotcha-candidate",
+        "guideline" => "convention-candidate",
+        "pattern" => "pattern-candidate",
+        "rfc" => "rfc-candidate",
+        _ => return None,
+    };
+    Some((NoteType::Observation, NoteImportance::Low, 0.2, tag))
+}
+
+/// The first `max` characters of `content`, cut at a character boundary.
+///
+/// The byte slice `&content[..100]` used to panic on any accented text whose
+/// 100th byte fell inside a multi-byte character — and the detector's content
+/// is French prose, so this was a live panic, not a theoretical one.
+fn truncate_chars(content: &str, max: usize) -> String {
+    if content.chars().count() <= max {
+        return content.to_string();
     }
+    let end = content
+        .char_indices()
+        .nth(max)
+        .map(|(i, _)| i)
+        .unwrap_or(content.len());
+    content[..end].to_string()
 }
 
 // ============================================================================
@@ -377,17 +399,18 @@ fn map_observation(note_type_str: &str) -> Option<(NoteType, NoteImportance, f64
 /// Check whether a similar note already exists in the search index.
 ///
 /// Returns `true` if a duplicate was found (creation should be skipped).
+///
+/// The probe is the whole extracted excerpt (up to 200 characters), not the
+/// third line of it: `lines().nth(2)` fell back to the full content on the
+/// one-line contents the detector usually produces, so the probe silently
+/// changed shape depending on the input.
 async fn deduplicate_observation(
     search: &Arc<dyn SearchStore>,
     content: &str,
     note_type_filter: &str,
 ) -> bool {
-    let first_line = content.lines().nth(2).unwrap_or(content);
-    let search_query = if first_line.len() > 100 {
-        &first_line[..100]
-    } else {
-        first_line
-    };
+    let probe = truncate_chars(content, 200);
+    let search_query = probe.as_str();
 
     match search
         .search_notes_with_scores(search_query, 3, None, Some(note_type_filter), None, None)
@@ -446,16 +469,20 @@ async fn create_observation_note(
         return false;
     }
 
-    // Create the note — FULLY AUTOMATIC, no needs_review
+    // Create the note — FULLY AUTOMATIC, and says so: a heuristic author, an
+    // observation, low importance, and no human signature anywhere.
+    let author = "system/observation-detector";
     let mut note = Note::new(
         project_id,
         note_type,
         observation.suggested_content.clone(),
-        "system/observation-detector".to_string(),
-    );
+        author.to_string(),
+    )
+    .with_author(NoteAuthorKind::System, author);
     note.importance = importance;
     note.energy = energy;
     note.memory_horizon = MemoryHorizon::Ephemeral;
+    note.confidence = Some(observation.confidence);
     note.tags = vec!["auto-observed".to_string(), category_tag.to_string()];
 
     match graph.create_note(&note).await {
@@ -472,8 +499,8 @@ async fn create_observation_note(
 
             // Emit informational WS notification (NOT approval)
             if let Some(emitter) = event_emitter {
-                let content_preview = if observation.suggested_content.len() > 100 {
-                    format!("{}...", &observation.suggested_content[..100])
+                let content_preview = if observation.suggested_content.chars().count() > 100 {
+                    format!("{}...", truncate_chars(&observation.suggested_content, 100))
                 } else {
                     observation.suggested_content.clone()
                 };
@@ -580,25 +607,31 @@ pub async fn process_rfc_observation(
 
     debug!("[feedback] RFC accumulator triggered, checking for duplicates");
 
-    // Deduplication via shared helper
-    if deduplicate_observation(search, &content, "rfc").await {
+    // Deduplication via shared helper. The probe is `rfc-candidate`, not `rfc`:
+    // the detector no longer writes RFC notes at all (see `map_observation`).
+    if deduplicate_observation(search, &content, "observation").await {
         // Reset accumulator after dedup skip to avoid re-triggering
         let mut acc = accumulator.lock().await;
         acc.reset();
         return false;
     }
 
-    // Create the RFC note
+    // Create the candidate note — an RFC in name only. A real RFC enters through
+    // its protocol FSM (draft → proposed → accepted); this one carries the
+    // excerpt and the tag, and nothing else claims to be an architectural
+    // decision.
+    let author = "system/rfc-detector";
     let mut note = Note::new(
         project_id,
-        NoteType::Rfc,
+        NoteType::Observation,
         content,
-        "system/rfc-detector".to_string(),
-    );
-    note.importance = NoteImportance::High;
-    note.energy = 0.5;
+        author.to_string(),
+    )
+    .with_author(NoteAuthorKind::System, author);
+    note.importance = NoteImportance::Low;
+    note.energy = 0.2;
     note.memory_horizon = MemoryHorizon::Ephemeral;
-    note.tags = vec!["auto-observed".to_string(), "rfc".to_string()];
+    note.tags = vec!["auto-observed".to_string(), "rfc-candidate".to_string()];
 
     match graph.create_note(&note).await {
         Ok(()) => {
@@ -912,6 +945,127 @@ mod tests {
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
 
+    // ── What a heuristic is allowed to write ─────────────────────────────
+
+    #[test]
+    fn every_detected_category_becomes_an_observation() {
+        for category in ["gotcha", "guideline", "pattern", "rfc"] {
+            let (note_type, importance, energy, tag) =
+                map_observation(category).expect("a known category");
+            assert_eq!(note_type, NoteType::Observation);
+            assert_eq!(importance, NoteImportance::Low);
+            assert!(energy <= 0.2, "a heuristic starts cool");
+            assert!(
+                tag.ends_with("-candidate"),
+                "{tag} is a claim, not a note type"
+            );
+        }
+        assert!(map_observation("assertion").is_none(), "unknown is refused");
+    }
+
+    #[test]
+    fn truncate_chars_cuts_on_a_character_boundary() {
+        // 100 bytes falls inside the second 'é' of this accented text: the old
+        // `&content[..100]` panicked here.
+        let accented = "é".repeat(150);
+        let cut = truncate_chars(&accented, 100);
+        assert_eq!(cut.chars().count(), 100);
+        assert_eq!(truncate_chars("court", 100), "court");
+    }
+
+    #[tokio::test]
+    async fn a_detected_observation_is_persisted_as_an_unconfirmed_observation() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let search: Arc<dyn SearchStore> =
+            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+
+        let obs = DetectedObservation {
+            note_type: "gotcha".to_string(),
+            confidence: 0.91,
+            trigger_pattern: "root cause was".to_string(),
+            context_excerpt: "the root cause was a missing bound. Adding it fixed the build."
+                .to_string(),
+            suggested_content:
+                "**Gotcha**: the root cause was a missing bound. Adding it fixed the build."
+                    .to_string(),
+            importance: "critical".to_string(),
+        };
+
+        let created = create_observation_note(&obs, &graph, &search, None, None, None).await;
+        assert!(created, "a well-formed observation is persisted");
+
+        let notes = graph
+            .list_notes(None, None, &Default::default())
+            .await
+            .unwrap()
+            .0;
+        let note = notes.first().expect("one note");
+        assert_eq!(note.note_type, NoteType::Observation);
+        assert_eq!(note.importance, NoteImportance::Low);
+        assert_eq!(note.author_kind, NoteAuthorKind::System);
+        assert_eq!(note.confidence, Some(0.91));
+        assert!(note.tags.contains(&"auto-observed".to_string()));
+        assert!(
+            !note.is_human_confirmed(),
+            "nobody answered for this note, and the graph says so"
+        );
+        assert_eq!(
+            note.last_confirmed_by, None,
+            "the detector does not sign its own note"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_observation_twice_creates_one_note() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let search_store = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let search: Arc<dyn SearchStore> = search_store.clone();
+        let obs = DetectedObservation {
+            note_type: "gotcha".to_string(),
+            confidence: 0.9,
+            trigger_pattern: "piège".to_string(),
+            context_excerpt: "attention à ce piège. il coûte cher.".to_string(),
+            suggested_content: "attention à ce piège. il coûte cher.".to_string(),
+            importance: "high".to_string(),
+        };
+
+        // The dedup probe must not panic on accented text, and must not depend on
+        // how many lines the content happens to have.
+        assert!(truncate_chars(&obs.suggested_content, 200).chars().count() > 0);
+        assert!(create_observation_note(&obs, &graph, &search, None, None, None).await);
+
+        // The note is indexed by the note manager, not by the detector: index it
+        // here, the way production does, then the same text must not be captured
+        // twice.
+        search_store
+            .index_note(&crate::meilisearch::indexes::NoteDocument {
+                id: Uuid::new_v4().to_string(),
+                project_id: String::new(),
+                project_slug: String::new(),
+                note_type: "observation".to_string(),
+                status: "active".to_string(),
+                importance: "low".to_string(),
+                scope_type: "project".to_string(),
+                scope_path: String::new(),
+                content: obs.suggested_content.clone(),
+                tags: vec!["auto-observed".to_string()],
+                anchor_entities: vec![],
+                created_at: chrono::Utc::now().timestamp(),
+                created_by: "system/observation-detector".to_string(),
+                staleness_score: 0.0,
+                author_kind: "system".to_string(),
+                human_confirmed: false,
+                memory_horizon: "ephemeral".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            !create_observation_note(&obs, &graph, &search, None, None, None).await,
+            "the same observation, already in the index, is a duplicate"
+        );
+    }
+
     #[tokio::test]
     async fn test_session_cache_dedup() {
         let cache = SessionDiscussedCache::new();
@@ -1177,12 +1331,17 @@ mod tests {
 
         // Verify the note was created in the graph store
         let notes = mock_graph.notes.read().await;
-        assert_eq!(notes.len(), 1, "Exactly one RFC note should exist");
+        assert_eq!(notes.len(), 1, "Exactly one candidate note should exist");
         let note = notes.values().next().unwrap();
-        assert_eq!(note.note_type, NoteType::Rfc);
-        assert_eq!(note.importance, NoteImportance::High);
+        assert_eq!(
+            note.note_type,
+            NoteType::Observation,
+            "a detected RFC is a candidate: it has no protocol run, so it cannot be an RFC"
+        );
+        assert_eq!(note.importance, NoteImportance::Low);
+        assert_eq!(note.author_kind, crate::notes::NoteAuthorKind::System);
         assert!(note.tags.contains(&"auto-observed".to_string()));
-        assert!(note.tags.contains(&"rfc".to_string()));
+        assert!(note.tags.contains(&"rfc-candidate".to_string()));
         assert!(note.content.contains("## Problem"));
         assert!(note.content.contains("## Proposed Solution"));
 
@@ -1364,7 +1523,11 @@ mod tests {
         let notes = mock_graph.notes.read().await;
         assert_eq!(notes.len(), 1);
         let note = notes.values().next().unwrap();
-        assert_eq!(note.note_type, NoteType::Rfc);
+        assert_eq!(
+            note.note_type,
+            NoteType::Observation,
+            "the detector proposes a candidate; a real RFC enters through its protocol FSM"
+        );
         assert!(note
             .content
             .contains("2 consecutive architectural discussions"));

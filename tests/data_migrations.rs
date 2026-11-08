@@ -1439,6 +1439,78 @@ async fn test_data_migrations_repair_an_upgraded_install() {
     }
 
     // ------------------------------------------------------------------
+    // 5bis. What a heuristic wrote is demoted, with its history; a person's
+    // note is not touched; a second run does nothing.
+    // ------------------------------------------------------------------
+    {
+        use project_orchestrator::neo4j::traits::GraphStore;
+        use project_orchestrator::notes::models::{
+            MemoryHorizon, Note, NoteAuthorKind, NoteImportance, NoteType,
+        };
+
+        let project = Uuid::new_v4();
+        let detector_id = Uuid::new_v4();
+        let human_id = Uuid::new_v4();
+
+        let store: &dyn GraphStore = &client;
+
+        let mut detector = Note::new(
+            Some(project),
+            NoteType::Gotcha,
+            "**Gotcha**: Le contrôle des prix les a tous rattrapés.".to_string(),
+            "system/observation-detector".to_string(),
+        )
+        .with_author(NoteAuthorKind::System, "system/observation-detector");
+        detector.id = detector_id;
+        detector.importance = NoteImportance::High;
+        detector.tags = vec!["auto-observed".to_string(), "gotcha".to_string()];
+        detector.memory_horizon = MemoryHorizon::Consolidated;
+
+        let mut human = Note::new(
+            Some(project),
+            NoteType::Gotcha,
+            "Le contrôle des prix se fait en fin de batch.".to_string(),
+            "julien".to_string(),
+        )
+        .with_author(NoteAuthorKind::Human, "julien");
+        human.id = human_id;
+
+        store.create_note(&detector).await.unwrap();
+        store.create_note(&human).await.unwrap();
+
+        let outcome = client
+            .run_data_migration_scoped("2026-11-retype-auto-observed", project)
+            .await
+            .unwrap();
+        assert!(outcome.completed, "{outcome:?}");
+        assert_eq!(outcome.processed, 1, "only the detector note is demoted");
+
+        let demoted = store.get_note(detector_id).await.unwrap().unwrap();
+        assert_eq!(demoted.note_type, NoteType::Observation);
+        assert_eq!(demoted.importance, NoteImportance::Low);
+        assert_eq!(demoted.memory_horizon, MemoryHorizon::Ephemeral);
+        assert_eq!(demoted.author_kind, NoteAuthorKind::System);
+        assert!(!demoted.is_human_confirmed());
+        assert!(demoted.energy <= 0.3);
+        assert!(
+            format!("{:?}", demoted.changes).contains("from_note_type"),
+            "the history keeps what the note used to claim: {:?}",
+            demoted.changes
+        );
+
+        let untouched = store.get_note(human_id).await.unwrap().unwrap();
+        assert_eq!(untouched.note_type, NoteType::Gotcha);
+        assert_eq!(untouched.importance, NoteImportance::Medium);
+        assert!(untouched.is_human_confirmed());
+
+        let again = client
+            .run_data_migration_scoped("2026-11-retype-auto-observed", project)
+            .await
+            .unwrap();
+        assert_eq!(again.processed, 0, "the stamp makes the second run a no-op");
+    }
+
+    // ------------------------------------------------------------------
     // 6. The startup runner completes every migration once, then skips.
     // ------------------------------------------------------------------
     let first = {

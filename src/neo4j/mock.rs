@@ -13515,6 +13515,72 @@ impl AnalyticsStore for MockGraphStore {
         }
     }
 
+    async fn auto_observed_report(
+        &self,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let notes = self.notes.read().await;
+        let mut counts: std::collections::BTreeMap<(String, String, String), (i64, i64)> =
+            std::collections::BTreeMap::new();
+        for note in notes.values() {
+            if project_id.is_some() && note.project_id != project_id {
+                continue;
+            }
+            // The same predicate as ARCHIVE_UNCONFIRMED_AUTO_OBSERVED: the two
+            // detectors by name, or the tag every detector note carries.
+            let heuristic = note.created_by == "system/observation-detector"
+                || note.created_by == "system/rfc-detector"
+                || note.tags.iter().any(|t| t == "auto-observed");
+            if !heuristic {
+                continue;
+            }
+            let entry = counts
+                .entry((
+                    note.status.to_string(),
+                    note.note_type.to_string(),
+                    note.importance.to_string(),
+                ))
+                .or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += note.content.len() as i64;
+        }
+        Ok(counts
+            .into_iter()
+            .map(|((status, note_type, importance), (notes, total_size))| {
+                serde_json::json!({
+                    "status": status,
+                    "note_type": note_type,
+                    "importance": importance,
+                    "notes": notes,
+                    "avg_size": if notes > 0 { total_size / notes } else { 0 },
+                })
+            })
+            .collect())
+    }
+
+    async fn archive_unconfirmed_auto_observed(&self, project_id: Option<Uuid>) -> Result<usize> {
+        let mut notes = self.notes.write().await;
+        let mut archived = 0;
+        for note in notes.values_mut() {
+            if project_id.is_some() && note.project_id != project_id {
+                continue;
+            }
+            if note.status != crate::notes::NoteStatus::Active || note.is_human_confirmed() {
+                continue;
+            }
+            // The same predicate as ARCHIVE_UNCONFIRMED_AUTO_OBSERVED: the two
+            // detectors by name, or the tag every detector note carries.
+            let heuristic = note.created_by == "system/observation-detector"
+                || note.created_by == "system/rfc-detector"
+                || note.tags.iter().any(|t| t == "auto-observed");
+            if heuristic {
+                note.status = crate::notes::NoteStatus::Archived;
+                archived += 1;
+            }
+        }
+        Ok(archived)
+    }
+
     async fn consolidate_memory(&self) -> Result<(usize, usize)> {
         use crate::notes::lifecycle::NoteLifecycleManager;
         let lifecycle = NoteLifecycleManager::new();

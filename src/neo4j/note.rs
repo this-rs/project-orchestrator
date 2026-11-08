@@ -6,8 +6,8 @@ use super::client::{Neo4jClient, WhereBuilder, WhereParam};
 use super::models::DecisionNode;
 use crate::neurons::forgetting::{DecayPolicy, PassReport};
 use crate::notes::{
-    EntityType, MemoryHorizon, Note, NoteAnchor, NoteChange, NoteFilters, NoteImportance,
-    NoteScope, NoteStatus, NoteType, PropagatedNote,
+    EntityType, MemoryHorizon, Note, NoteAnchor, NoteAuthorKind, NoteChange, NoteFilters,
+    NoteImportance, NoteScope, NoteStatus, NoteType, PropagatedNote,
 };
 use anyhow::{Context, Result};
 use neo4rs::query;
@@ -183,6 +183,10 @@ impl Neo4jClient {
                 tags: $tags,
                 created_at: datetime($created_at),
                 created_by: $created_by,
+                author_kind: $author_kind,
+                confidence: $confidence,
+                human_confirmed_at: CASE WHEN $human_confirmed_at = '' THEN null ELSE datetime($human_confirmed_at) END,
+                human_confirmed_by: $human_confirmed_by,
                 last_confirmed_at: datetime($last_confirmed_at),
                 last_confirmed_by: $last_confirmed_by,
                 staleness_score: $staleness_score,
@@ -211,6 +215,18 @@ impl Neo4jClient {
         .param("tags", note.tags.clone())
         .param("created_at", note.created_at.to_rfc3339())
         .param("created_by", note.created_by.clone())
+        .param("author_kind", note.author_kind.as_str())
+        .param("confidence", note.confidence)
+        .param(
+            "human_confirmed_at",
+            note.human_confirmed_at
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default(),
+        )
+        .param(
+            "human_confirmed_by",
+            note.human_confirmed_by.clone().unwrap_or_default(),
+        )
         .param(
             "last_confirmed_at",
             note.last_confirmed_at
@@ -1988,11 +2004,21 @@ impl Neo4jClient {
 
     /// Confirm a note is still valid
     pub async fn confirm_note(&self, note_id: Uuid, confirmed_by: &str) -> Result<Option<Note>> {
+        // A confirmation is a SIGNATURE only when a person gives it. Agent
+        // sessions are stamped `agent:<uuid>` (see `notes::provenance`), and a
+        // heuristic under `system/`: their confirmation moves the freshness
+        // clock, never the human signature — otherwise the one field that means
+        // "a person answered for this" would be written by a model.
+        let by_human = !confirmed_by.starts_with("agent:")
+            && !confirmed_by.starts_with("system")
+            && !confirmed_by.is_empty();
         let q = query(
             r#"
             MATCH (n:Note {id: $id})
             SET n.last_confirmed_at = datetime(),
                 n.last_confirmed_by = $confirmed_by,
+                n.human_confirmed_at = CASE WHEN $by_human THEN datetime() ELSE n.human_confirmed_at END,
+                n.human_confirmed_by = CASE WHEN $by_human THEN $confirmed_by ELSE n.human_confirmed_by END,
                 n.staleness_score = 0.0,
                 // Confirming a superseded note must not resurrect it: the
                 // newer note that replaced it wins.
@@ -2010,7 +2036,8 @@ impl Neo4jClient {
             "#,
         )
         .param("id", note_id.to_string())
-        .param("confirmed_by", confirmed_by);
+        .param("confirmed_by", confirmed_by)
+        .param("by_human", by_human);
 
         let mut result = self.graph.execute(q).await?;
         if let Some(row) = result.next().await? {
@@ -3607,49 +3634,113 @@ impl Neo4jClient {
     pub async fn consolidate_memory(&self) -> Result<(usize, usize)> {
         use crate::notes::lifecycle::NoteLifecycleManager;
 
+        /// Notes per sweep page.
+        const CONSOLIDATION_BATCH: i64 = 500;
+        /// Hard cap on pages per run, against a cursor that would not advance.
+        const CONSOLIDATION_MAX_PAGES: usize = 500;
+
         let lifecycle = NoteLifecycleManager::new();
         let now = chrono::Utc::now();
 
-        // 1. Fetch all active notes (not just non-consolidated, since we also archive)
-        let q = query(
-            r#"
-            MATCH (n:Note)
-            WHERE n.status = 'active'
-            OPTIONAL MATCH (n)-[s:SYNAPSE]-()
-            RETURN n, count(s) AS synapse_count
-            ORDER BY n.energy DESC
-            LIMIT 500
-            "#,
-        );
-
-        let mut result = self.graph.execute(q).await?;
         let mut promoted = 0usize;
         let mut archived = 0usize;
+        let mut pages = 0usize;
+        // Keyset cursor on (energy, id), ASCENDING.
+        //
+        // The sweep used to be `ORDER BY n.energy DESC LIMIT 500`: the notes with
+        // the LEAST energy — precisely the ones every archival rule targets —
+        // were at the bottom of that page and were never reached on a graph of
+        // more than 500 active notes. The janitor existed and never ran on the
+        // population it was written for.
+        //
+        // The cursor advances past every note it has seen, whether the note was
+        // archived, promoted or left alone, so a page is never served twice.
+        let mut cursor: Option<(f64, String)> = None;
 
-        while let Some(row) = result.next().await? {
-            let node = row.get::<neo4rs::Node>("n")?;
-            let note = self.node_to_note(&node)?;
-            let synapse_count = row.get::<i64>("synapse_count").unwrap_or(0);
-            // Usage signal. `activation_count` is never incremented anywhere
-            // (0 on every note), so the "never activated for 90 days" rule
-            // relied on the synapse-count fallback alone — and once the
-            // SYNAPSE layer was wiped, every note older than 90 days would be
-            // archived as dead. `reactivation_count` is the counter the
-            // activation path actually maintains.
-            let activation_count = note
-                .activation_count
-                .max(note.reactivation_count)
-                .max(synapse_count);
+        loop {
+            if pages >= CONSOLIDATION_MAX_PAGES {
+                tracing::warn!(
+                    pages,
+                    "consolidate_memory stopped on its page cap; the next run resumes from the start"
+                );
+                break;
+            }
+            pages += 1;
 
-            // Check auto-archival (new threshold-based rules)
-            if lifecycle.should_auto_archive(&note, activation_count, now) {
-                let age_days = now.signed_duration_since(note.created_at).num_days();
-                let reason = if activation_count == 0 && age_days > 90 {
-                    "dead_note_no_activations_90d"
-                } else {
-                    "low_energy_60d"
+            let (after_energy, after_id) = match &cursor {
+                Some((energy, id)) => (Some(*energy), Some(id.clone())),
+                None => (None, None),
+            };
+
+            let q = query(
+                r#"
+                MATCH (n:Note)
+                WHERE n.status = 'active'
+                  AND ($after_energy IS NULL
+                       OR coalesce(n.energy, 1.0) > $after_energy
+                       OR (coalesce(n.energy, 1.0) = $after_energy AND n.id > $after_id))
+                OPTIONAL MATCH (n)-[s:SYNAPSE]-()
+                RETURN n, coalesce(n.energy, 1.0) AS sweep_energy, count(s) AS synapse_count
+                ORDER BY coalesce(n.energy, 1.0) ASC, n.id ASC
+                LIMIT $batch
+                "#,
+            )
+            .param("after_energy", after_energy)
+            .param("after_id", after_id)
+            .param("batch", CONSOLIDATION_BATCH);
+
+            let mut result = self.graph.execute(q).await?;
+            let mut seen = 0usize;
+
+            while let Some(row) = result.next().await? {
+                seen += 1;
+                let node = row.get::<neo4rs::Node>("n")?;
+                // A node the reader cannot decode must not stop the sweep: the
+                // janitor walks thousands of notes, and one malformed row used to
+                // abort the whole run (measured: three nodes without `content` in
+                // a test database made `consolidate_memory` fail outright).
+                let note = match self.node_to_note(&node) {
+                    Ok(note) => note,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "consolidate_memory: skipping a Note it cannot decode"
+                        );
+                        continue;
+                    }
                 };
-                let archive_q = query(
+                // Advance BEFORE any `continue`: a note that is left alone must
+                // still move the cursor, or the same page comes back for ever.
+                //
+                // The cursor takes the same coalesced energy the WHERE and the
+                // ORDER BY use. Reading `note.energy` here would default a note
+                // with no energy property to 1.0 and skip everything the query
+                // sorted before it.
+                cursor = Some((
+                    row.get::<f64>("sweep_energy").unwrap_or(1.0),
+                    note.id.to_string(),
+                ));
+                let synapse_count = row.get::<i64>("synapse_count").unwrap_or(0);
+                // Usage signal. `activation_count` is never incremented anywhere
+                // (0 on every note), so the "never activated for 90 days" rule
+                // relied on the synapse-count fallback alone — and once the
+                // SYNAPSE layer was wiped, every note older than 90 days would be
+                // archived as dead. `reactivation_count` is the counter the
+                // activation path actually maintains.
+                let activation_count = note
+                    .activation_count
+                    .max(note.reactivation_count)
+                    .max(synapse_count);
+
+                // Check auto-archival (new threshold-based rules)
+                if lifecycle.should_auto_archive(&note, activation_count, now) {
+                    let age_days = now.signed_duration_since(note.created_at).num_days();
+                    let reason = if activation_count == 0 && age_days > 90 {
+                        "dead_note_no_activations_90d"
+                    } else {
+                        "low_energy_60d"
+                    };
+                    let archive_q = query(
                     r#"
                     MATCH (n:Note {id: $id})
                     SET n.status = 'archived',
@@ -3669,46 +3760,46 @@ impl Neo4jClient {
                         changes
                     })?,
                 );
-                self.graph.run(archive_q).await?;
-                archived += 1;
-                continue;
-            }
+                    self.graph.run(archive_q).await?;
+                    archived += 1;
+                    continue;
+                }
 
-            // Check archival for ephemeral (legacy: >48h idle)
-            if lifecycle.should_archive_ephemeral(&note, now) {
-                let archive_q = query(
-                    r#"
+                // Check archival for ephemeral (legacy: >48h idle)
+                if lifecycle.should_archive_ephemeral(&note, now) {
+                    let archive_q = query(
+                        r#"
                     MATCH (n:Note {id: $id})
                     SET n.status = 'archived',
                         n.changes_json = $changes_json
                     "#,
-                )
-                .param("id", note.id.to_string())
-                .param(
-                    "changes_json",
-                    serde_json::to_string(&{
-                        let mut changes = note.changes.clone();
-                        changes.push(NoteChange::with_details(
+                    )
+                    .param("id", note.id.to_string())
+                    .param(
+                        "changes_json",
+                        serde_json::to_string(&{
+                            let mut changes = note.changes.clone();
+                            changes.push(NoteChange::with_details(
                             crate::notes::ChangeType::StatusChanged,
                             "consolidate_memory".to_string(),
                             serde_json::json!({"reason": "ephemeral_expired", "idle_hours": 48}),
                         ));
-                        changes
-                    })?,
-                );
-                self.graph.run(archive_q).await?;
-                archived += 1;
-                continue;
-            }
+                            changes
+                        })?,
+                    );
+                    self.graph.run(archive_q).await?;
+                    archived += 1;
+                    continue;
+                }
 
-            // Skip already-consolidated notes for promotion
-            if note.memory_horizon == crate::notes::MemoryHorizon::Consolidated {
-                continue;
-            }
+                // Skip already-consolidated notes for promotion
+                if note.memory_horizon == crate::notes::MemoryHorizon::Consolidated {
+                    continue;
+                }
 
-            // Check direct ephemeral -> consolidated promotion (new threshold-based)
-            if lifecycle.should_promote_to_consolidated(&note, activation_count, now) {
-                let promote_q = query(
+                // Check direct ephemeral -> consolidated promotion (new threshold-based)
+                if lifecycle.should_promote_to_consolidated(&note, activation_count, now) {
+                    let promote_q = query(
                     r#"
                     MATCH (n:Note {id: $id})
                     SET n.memory_horizon = 'consolidated',
@@ -3732,45 +3823,104 @@ impl Neo4jClient {
                         changes
                     })?,
                 );
-                self.graph.run(promote_q).await?;
-                promoted += 1;
-                continue;
-            }
+                    self.graph.run(promote_q).await?;
+                    promoted += 1;
+                    continue;
+                }
 
-            // Evaluate existing promotion rules (ephemeral->operational, operational->consolidated)
-            let promo = lifecycle.evaluate_promotion(&note, activation_count as u64);
-            if let Some(new_horizon) = promo.new_horizon {
-                let promote_q = query(
-                    r#"
+                // Evaluate existing promotion rules (ephemeral->operational, operational->consolidated)
+                let promo = lifecycle.evaluate_promotion(&note, activation_count as u64);
+                if let Some(new_horizon) = promo.new_horizon {
+                    let promote_q = query(
+                        r#"
                     MATCH (n:Note {id: $id})
                     SET n.memory_horizon = $new_horizon,
                         n.changes_json = $changes_json
                     "#,
-                )
-                .param("id", note.id.to_string())
-                .param("new_horizon", new_horizon.to_string())
-                .param(
-                    "changes_json",
-                    serde_json::to_string(&{
-                        let mut changes = note.changes.clone();
-                        changes.push(NoteChange::with_details(
-                            crate::notes::ChangeType::Promoted,
-                            "consolidate_memory".to_string(),
-                            serde_json::json!({
-                                "from": promo.current_horizon.to_string(),
-                                "to": new_horizon.to_string(),
-                                "reason": promo.reason
-                            }),
-                        ));
-                        changes
-                    })?,
-                );
-                self.graph.run(promote_q).await?;
-                promoted += 1;
+                    )
+                    .param("id", note.id.to_string())
+                    .param("new_horizon", new_horizon.to_string())
+                    .param(
+                        "changes_json",
+                        serde_json::to_string(&{
+                            let mut changes = note.changes.clone();
+                            changes.push(NoteChange::with_details(
+                                crate::notes::ChangeType::Promoted,
+                                "consolidate_memory".to_string(),
+                                serde_json::json!({
+                                    "from": promo.current_horizon.to_string(),
+                                    "to": new_horizon.to_string(),
+                                    "reason": promo.reason
+                                }),
+                            ));
+                            changes
+                        })?,
+                    );
+                    self.graph.run(promote_q).await?;
+                    promoted += 1;
+                }
+            }
+
+            if seen < CONSOLIDATION_BATCH as usize {
+                break;
             }
         }
 
         Ok((promoted, archived))
+    }
+
+    /// What the heuristic authors wrote, by shape: status × type × importance.
+    ///
+    /// Read-only. The administrator's answer to "how much of my knowledge base is
+    /// a regex's prose?", before touching anything.
+    pub async fn auto_observed_report(
+        &self,
+        project_id: Option<uuid::Uuid>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let q = query(super::data_migrations::COUNT_AUTO_OBSERVED_BY_SHAPE)
+            .param("scope", project_id.map(|p| p.to_string()));
+        let mut result = self.graph.execute(q).await?;
+        let mut rows = Vec::new();
+        while let Some(row) = result.next().await? {
+            rows.push(serde_json::json!({
+                "status": row.get::<String>("status").unwrap_or_default(),
+                "note_type": row.get::<String>("note_type").unwrap_or_default(),
+                "importance": row.get::<String>("importance").unwrap_or_default(),
+                "notes": row.get::<i64>("notes").unwrap_or(0),
+                "avg_size": row.get::<i64>("avg_size").unwrap_or(0),
+            }));
+        }
+        Ok(rows)
+    }
+
+    /// Archive — never delete — the detector notes no person has confirmed.
+    ///
+    /// Bounded batches, so the call is safe on a live instance. Returns how many
+    /// notes moved.
+    pub async fn archive_unconfirmed_auto_observed(
+        &self,
+        project_id: Option<uuid::Uuid>,
+    ) -> Result<usize> {
+        const BATCH: i64 = 2_000;
+        const MAX_PAGES: usize = 500;
+
+        let mut total = 0usize;
+        for _ in 0..MAX_PAGES {
+            let q = query(super::data_migrations::ARCHIVE_UNCONFIRMED_AUTO_OBSERVED)
+                .param("scope", project_id.map(|p| p.to_string()))
+                .param("batch", BATCH);
+            let mut result = self.graph.execute(q).await?;
+            let processed = if let Some(row) = result.next().await? {
+                row.get::<i64>("processed").unwrap_or(0)
+            } else {
+                0
+            };
+            total += processed as usize;
+            if processed == 0 {
+                break;
+            }
+        }
+        Ok(total)
     }
 
     /// Initialize energy for notes that don't have it yet.
@@ -3940,6 +4090,7 @@ impl Neo4jClient {
             serde_json::from_str(&assertion_rule_json).ok()
         };
 
+        let created_by: String = node.get("created_by")?;
         Ok(Note {
             id: node.get::<String>("id")?.parse()?,
             project_id: node.get::<String>("project_id").ok().and_then(|s| {
@@ -3960,12 +4111,33 @@ impl Neo4jClient {
                 .get::<String>("created_at")?
                 .parse()
                 .unwrap_or_else(|_| chrono::Utc::now()),
-            created_by: node.get("created_by")?,
+            created_by: created_by.clone(),
+            // A note written before this property existed is guessed from its
+            // author name: anything under `system/` is a heuristic, not a person.
+            author_kind: node
+                .get::<String>("author_kind")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| NoteAuthorKind::infer_from_created_by(&created_by)),
+            confidence: node.get("confidence").ok(),
+            human_confirmed_at: node
+                .get::<String>("human_confirmed_at")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            human_confirmed_by: node
+                .get::<String>("human_confirmed_by")
+                .ok()
+                .filter(|s| !s.is_empty()),
             last_confirmed_at: node
                 .get::<String>("last_confirmed_at")
                 .ok()
                 .and_then(|s| s.parse().ok()),
-            last_confirmed_by: node.get("last_confirmed_by").ok(),
+            // A freshness clock, not a signature: the author is NOT vouching for
+            // it here. A person's note gets its signature from `with_author`.
+            // Kept as the stored property historically was (an empty string when
+            // nobody signed) — `tests/store_conformance.rs` pins that round-trip,
+            // and `human_confirmed_*` is now the field that answers "who signed".
+            last_confirmed_by: node.get::<String>("last_confirmed_by").ok(),
             staleness_score: node.get("staleness_score").unwrap_or(0.0),
             energy: node.get("energy").unwrap_or(1.0),
             scar_intensity: node.get("scar_intensity").unwrap_or(0.0),

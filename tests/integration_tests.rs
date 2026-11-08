@@ -2319,6 +2319,9 @@ async fn test_meili_filters_escape_payloads_and_stay_valid() {
         created_at: chrono::Utc::now().timestamp(),
         created_by: "test".to_string(),
         staleness_score: 0.0,
+        author_kind: "agent".to_string(),
+        human_confirmed: false,
+        memory_horizon: "operational".to_string(),
     };
     state.meili.index_note(&note).await.unwrap();
     tokio::time::sleep(Duration::from_millis(800)).await;

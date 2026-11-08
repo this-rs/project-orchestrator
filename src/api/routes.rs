@@ -1393,6 +1393,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             "/api/notes/consolidate-memory",
             post(note_handlers::consolidate_memory),
         )
+        .route(
+            "/api/notes/purge-auto-observed",
+            post(note_handlers::purge_auto_observed),
+        )
         // Runner feedback analysis
         .route(
             "/api/admin/analyze-runner-feedback",

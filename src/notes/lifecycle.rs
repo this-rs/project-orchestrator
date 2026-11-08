@@ -739,10 +739,20 @@ pub struct ConsolidationReport {
 impl NoteLifecycleManager {
     /// Evaluate whether a note should be promoted to a higher memory horizon.
     ///
-    /// Promotion rules (inspired by Elun SleepSystem consolidation):
-    /// - Ephemeral → Operational: activations ≥ 3, OR linked to a task, OR energy ≥ 0.5
-    /// - Operational → Consolidated: activations ≥ 10, OR energy ≥ 0.8, OR manually confirmed ≥ 2 times, OR importance = Critical
-    /// - Consolidated: no further promotion
+    /// Two currencies, and they are not interchangeable:
+    ///
+    /// - **Attention** — activations, re-injections, energy. What being READ
+    ///   earns. It promotes `Ephemeral → Operational`, and stops there.
+    /// - **Evidence** — a person's confirmation, a re-verified assertion, a
+    ///   `critical` note declared by someone other than a heuristic. It alone
+    ///   promotes `Operational → Consolidated`.
+    ///
+    /// Why the split: `Consolidated` means permanence — such a note is never
+    /// auto-archived (`should_auto_archive`). The old rule consolidated on
+    /// `energy >= 0.8`, and every note is BORN at `energy = 1.0`, so the ladder
+    /// promoted everything one day after creation. Measured on this instance:
+    /// note 763d0bd6, promoted "activations=0, reactivations=0, energy=1.00,
+    /// confirms=0, critical=false".
     pub fn evaluate_promotion(&self, note: &Note, activation_count: u64) -> PromotionResult {
         let note_id = note.id;
         let current = note.memory_horizon.clone();
@@ -780,21 +790,31 @@ impl NoteLifecycleManager {
                     .filter(|c| matches!(c.change_type, ChangeType::Confirmed))
                     .count();
 
-                // Reactivation count ≥ 5 is a strong consolidation signal
-                if activation_count >= 10
-                    || reactivation_count >= 5
-                    || note.computed_energy() >= 0.8
-                    || confirm_count >= 2
-                    || note.importance == NoteImportance::Critical
-                {
+                let human = note.is_human_confirmed();
+                let assertion_holds = note
+                    .last_assertion_result
+                    .as_ref()
+                    .is_some_and(|r| r.passed);
+                // The same word from a heuristic is a claim, not evidence: a
+                // detector that calls its own fragment `critical` consolidates
+                // nothing.
+                let critical_claim = note.importance == NoteImportance::Critical
+                    && note.author_kind != NoteAuthorKind::System;
+
+                if human || confirm_count >= 2 || assertion_holds || critical_claim {
                     PromotionResult {
                         note_id,
                         current_horizon: current,
                         new_horizon: Some(MemoryHorizon::Consolidated),
                         reason: format!(
-                            "Operational→Consolidated: activations={}, reactivations={}, energy={:.2}, confirms={}, critical={}",
-                            activation_count, reactivation_count, note.computed_energy(), confirm_count,
-                            note.importance == NoteImportance::Critical
+                            "Operational→Consolidated: human={}, confirms={}, assertion={}, critical={} (attention: activations={}, reactivations={}, energy={:.2})",
+                            human,
+                            confirm_count,
+                            assertion_holds,
+                            critical_claim,
+                            activation_count,
+                            reactivation_count,
+                            note.computed_energy()
                         ),
                     }
                 } else {
@@ -802,7 +822,7 @@ impl NoteLifecycleManager {
                         note_id,
                         current_horizon: current,
                         new_horizon: None,
-                        reason: "Below consolidation threshold".to_string(),
+                        reason: "Below consolidation threshold: no evidence (attention alone does not consolidate)".to_string(),
                     }
                 }
             }
@@ -868,13 +888,16 @@ impl NoteLifecycleManager {
 
     /// Check if an ephemeral note should be promoted directly to consolidated.
     ///
-    /// Rules (pure arithmetic, 0 LLM calls):
-    /// - `activation_count > 5 AND age > 14 days AND energy > 0.3`
+    /// Same two currencies as [`Self::evaluate_promotion`], and the short path is
+    /// not an exception to them: **evidence, never attention**. The rule used to
+    /// be `activation_count > 5 AND age > 14 days AND energy > 0.3`, which a
+    /// note born at `energy 1.0` and injected five times meets without anything
+    /// having been established. Attention now only reaches `Operational`.
     pub fn should_promote_to_consolidated(
         &self,
         note: &Note,
-        activation_count: i64,
-        now: DateTime<Utc>,
+        _activation_count: i64,
+        _now: DateTime<Utc>,
     ) -> bool {
         if note.memory_horizon != MemoryHorizon::Ephemeral {
             return false;
@@ -882,8 +905,11 @@ impl NoteLifecycleManager {
         if note.status != NoteStatus::Active {
             return false;
         }
-        let age_days = now.signed_duration_since(note.created_at).num_days();
-        activation_count > 5 && age_days > 14 && note.energy > 0.3
+        let assertion_holds = note
+            .last_assertion_result
+            .as_ref()
+            .is_some_and(|r| r.passed);
+        note.is_human_confirmed() || assertion_holds
     }
 }
 
@@ -1202,7 +1228,16 @@ mod tests {
         note.energy = 0.5;
         note.status = NoteStatus::Active;
 
-        assert!(manager.should_promote_to_consolidated(&note, 8, Utc::now()));
+        assert!(
+            !manager.should_promote_to_consolidated(&note, 8, Utc::now()),
+            "eight activations are attention, not evidence — permanence is not bought by being read"
+        );
+
+        note.confirm_by_human("julien", Utc::now());
+        assert!(
+            manager.should_promote_to_consolidated(&note, 8, Utc::now()),
+            "a person's confirmation is evidence"
+        );
     }
 
     #[test]
@@ -1311,20 +1346,64 @@ mod tests {
             NoteType::Pattern,
             NoteImportance::Medium,
             NoteScope::Project,
-            "Reactivation consolidates operational".to_string(),
+            "Reactivation does not consolidate operational".to_string(),
             vec![],
             "test".to_string(),
         );
         note.memory_horizon = MemoryHorizon::Operational;
         note.energy = 0.4; // Below 0.8 threshold
-        note.reactivation_count = 5; // Meets consolidation threshold (>= 5)
+        note.reactivation_count = 5; // Used to be enough on its own
 
-        let result = manager.evaluate_promotion(&note, 5); // activation_count=5, below 10 threshold
+        let result = manager.evaluate_promotion(&note, 5);
         assert!(
-            result.new_horizon.is_some(),
-            "Reactivation count >= 5 should promote operational to consolidated"
+            result.new_horizon.is_none(),
+            "five re-injections are attention: they promote ephemeral → operational, never to permanence"
         );
-        assert_eq!(result.new_horizon.unwrap(), MemoryHorizon::Consolidated);
+
+        // Evidence, on the other hand, consolidates.
+        note.confirm_by_human("julien", Utc::now());
+        let result = manager.evaluate_promotion(&note, 5);
+        assert_eq!(result.new_horizon, Some(MemoryHorizon::Consolidated));
+    }
+
+    #[test]
+    fn fresh_note_is_not_consolidated_at_birth() {
+        let manager = NoteLifecycleManager::new();
+        // Born at energy 1.0, the way every note is.
+        let mut note = Note::new(
+            Some(Uuid::new_v4()),
+            NoteType::Gotcha,
+            "A note nobody has read yet".to_string(),
+            "agent:00000000-0000-0000-0000-000000000000".to_string(),
+        );
+        note.memory_horizon = MemoryHorizon::Operational;
+
+        // The old rule was `energy >= 0.8`, which every new note meets.
+        let result = manager.evaluate_promotion(&note, 0);
+        assert!(
+            result.new_horizon.is_none(),
+            "energy 1.0 at birth is not evidence: {:?}",
+            result.new_horizon
+        );
+    }
+
+    #[test]
+    fn a_heuristic_calling_itself_critical_does_not_consolidate() {
+        let manager = NoteLifecycleManager::new();
+        let mut note = Note::new(
+            Some(Uuid::new_v4()),
+            NoteType::Gotcha,
+            "**Gotcha**: a fragment the detector called critical".to_string(),
+            "system/observation-detector".to_string(),
+        )
+        .with_author(NoteAuthorKind::System, "system/observation-detector");
+        note.memory_horizon = MemoryHorizon::Operational;
+        note.importance = NoteImportance::Critical;
+
+        assert!(
+            manager.evaluate_promotion(&note, 0).new_horizon.is_none(),
+            "a heuristic's own `critical` is a claim, not evidence"
+        );
     }
 
     #[test]

@@ -284,6 +284,111 @@ RETURN count(n) AS processed
 /// copy edge is deleted in every case, so a branch-only file (no canonical
 /// twin) loses its link but the NOTE survives — the explicit, measured choice,
 /// not a silent `DETACH`.
+/// The notes the observation detector and the RFC detector wrote before they
+/// were taught to describe what they actually are.
+///
+/// They were persisted as `gotcha|guideline|pattern|rfc`, at `high`/`critical`
+/// importance — and the type decides the decay law (`Note::base_decay_days`:
+/// 90 days for an observation, 180 for a gotcha, 365 for a guideline). Measured
+/// on this instance: 30 919 notes, 4 119 of them written by those two detectors,
+/// 1 850 still active.
+///
+/// The SELECT pages by `n.id` and takes only notes not yet stamped, so an
+/// interrupted run resumes and a second start does nothing.
+///
+/// A note a PERSON has confirmed is left alone, whatever wrote it: the demotion
+/// is a correction of an unverified claim, not a verdict on a note somebody has
+/// read and vouched for.
+const SELECT_RETYPE_AUTO_OBSERVED: &str = r#"
+MATCH (n:Note)
+WHERE n.retyped_auto_observed_at IS NULL
+  AND n.human_confirmed_at IS NULL
+  AND n.id > $after
+  AND ($scope IS NULL OR n.project_id = $scope)
+  AND (n.created_by IN ['system/observation-detector', 'system/rfc-detector']
+       OR 'auto-observed' IN coalesce(n.tags, []))
+RETURN elementId(n) AS eid, n.id AS cursor,
+       n.note_type AS note_type,
+       n.importance AS importance,
+       coalesce(n.changes_json, '[]') AS changes_json
+ORDER BY n.id
+LIMIT $batch
+"#;
+
+const WRITE_RETYPE_AUTO_OBSERVED: &str = r#"
+UNWIND $items AS item
+MATCH (n:Note) WHERE elementId(n) = item.eid AND n.human_confirmed_at IS NULL
+SET n.note_type = 'observation',
+    n.importance = 'low',
+    n.memory_horizon = 'ephemeral',
+    n.energy = CASE WHEN coalesce(n.energy, 1.0) > 0.3 THEN 0.3 ELSE n.energy END,
+    n.author_kind = 'system',
+    n.human_confirmed_at = NULL,
+    n.human_confirmed_by = NULL,
+    n.changes_json = item.changes_json,
+    n.retyped_auto_observed_at = datetime()
+RETURN count(n) AS processed
+"#;
+
+/// Build the new properties of one detector note, history included.
+///
+/// The history must not lie: the note keeps a `StatusChanged` entry naming the
+/// type and importance it used to claim, so a reader can see that it was
+/// demoted and why, not merely that it is an observation today.
+fn retype_auto_observed_items(row: &Row) -> Result<HashMap<String, BoltType>> {
+    let eid: String = row.get("eid")?;
+    let from_type: String = row.get("note_type").unwrap_or_default();
+    let from_importance: String = row.get("importance").unwrap_or_default();
+    let changes_json: String = row.get("changes_json").unwrap_or_default();
+
+    let mut changes: Vec<crate::notes::NoteChange> =
+        serde_json::from_str(&changes_json).unwrap_or_default();
+    changes.push(crate::notes::NoteChange::with_details(
+        crate::notes::ChangeType::StatusChanged,
+        "data_migration/2026-11-retype-auto-observed".to_string(),
+        serde_json::json!({
+            "reason": "authored by a heuristic: an observation, not the type it claimed",
+            "from_note_type": from_type,
+            "from_importance": from_importance,
+        }),
+    ));
+
+    let mut m = HashMap::new();
+    m.insert("eid".into(), eid.into());
+    m.insert(
+        "changes_json".into(),
+        serde_json::to_string(&changes)
+            .context("serializing the note history")?
+            .into(),
+    );
+    Ok(m)
+}
+
+/// Same population, counted, for the administrator: what would be archived, and
+/// what it looks like. Read-only.
+pub(crate) const COUNT_AUTO_OBSERVED_BY_SHAPE: &str = r#"
+MATCH (n:Note)
+WHERE ($scope IS NULL OR n.project_id = $scope)
+  AND (n.created_by IN ['system/observation-detector', 'system/rfc-detector']
+       OR 'auto-observed' IN coalesce(n.tags, []))
+RETURN n.status AS status, n.note_type AS note_type, n.importance AS importance,
+       count(n) AS notes, toInteger(coalesce(avg(size(n.content)), 0)) AS avg_size
+ORDER BY notes DESC
+"#;
+
+/// Archive (never delete) the detector notes nobody has confirmed.
+pub(crate) const ARCHIVE_UNCONFIRMED_AUTO_OBSERVED: &str = r#"
+MATCH (n:Note)
+WHERE n.status = 'active'
+  AND ($scope IS NULL OR n.project_id = $scope)
+  AND n.human_confirmed_at IS NULL
+  AND (n.created_by IN ['system/observation-detector', 'system/rfc-detector']
+       OR 'auto-observed' IN coalesce(n.tags, []))
+WITH n LIMIT $batch
+SET n.status = 'archived'
+RETURN count(n) AS processed
+"#;
+
 const REHOME_WORKTREE_KNOWLEDGE: &str = r#"
 MATCH (w)
 WHERE (w:File OR w:Function OR w:Struct OR w:Trait)
@@ -846,6 +951,17 @@ impl Neo4jClient {
                 compute: None,
                 finalize: None,
             },
+            DataMigration {
+                id: "2026-11-retype-auto-observed",
+                description:
+                    "A detected observation is an observation: demote the notes the detectors wrote, with their history",
+                batch: SELECT_RETYPE_AUTO_OBSERVED.to_string(),
+                compute: Some(ComputedBatch {
+                    items: retype_auto_observed_items,
+                    write: WRITE_RETYPE_AUTO_OBSERVED,
+                }),
+                finalize: None,
+            },
         ]
     }
 
@@ -1216,6 +1332,7 @@ mod tests {
                 "2026-10-backfill-stable-key-imports",
                 "2026-10-backfill-file-uid",
                 "2026-10-backfill-file-uid-orphans",
+                "2026-11-retype-auto-observed",
             ]
         );
     }
