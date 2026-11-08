@@ -209,6 +209,84 @@ static OBSERVATION_PATTERNS: LazyLock<Vec<PatternRule>> = LazyLock::new(|| {
 // Minimum confidence threshold for suggestion
 const CONFIDENCE_THRESHOLD: f64 = 0.80;
 
+/// Shortest excerpt that can carry a claim.
+///
+/// Measured on one project before this existed: 70 of 406 detected notes were
+/// under 80 characters, 36 ended without a terminal mark, 81 opened on a torn
+/// list item. None of those is a statement.
+const MIN_EXCERPT_CHARS: usize = 120;
+
+/// Whether an excerpt has the SHAPE of a statement — the write-side guard.
+///
+/// A claim has the shape of at least two finished sentences. Everything else
+/// this returns `false` on was actually observed in the wild: a bullet line
+/// (`- Piège déjoué …`), a table row (`| 3 | Staging … |`), a bolded heading
+/// (`## Le piège …`), a question (`ne jamais supprimer de lien laisse-t-il … ?`),
+/// a quotation, and a sentence cut mid-word by `extract_context`.
+///
+/// This is a filter, not a fix: a complete, grammatical, worthless sentence
+/// passes it. It exists so that the shape is decided here rather than inherited
+/// by every reader downstream.
+fn has_statement_shape(excerpt: &str) -> bool {
+    let text = excerpt.trim();
+
+    if text.chars().count() < MIN_EXCERPT_CHARS {
+        return false;
+    }
+
+    // Fragments that open on a marker rather than on a sentence.
+    let first = text.chars().next().unwrap_or(' ');
+    if matches!(first, '-' | '|' | '*' | '#' | '>' | '«' | '`' | '…') || first.is_ascii_digit() {
+        return false;
+    }
+
+    // A question asks; it does not state.
+    if text.ends_with('?') {
+        return false;
+    }
+
+    // The excerpt opens on the sentence holding the match: if THAT one asks, the
+    // observation is a question, whatever follows it.
+    if first_sentence_is_a_question(text) {
+        return false;
+    }
+
+    // A table row is a fragment of a table, not of a reasoning.
+    if text.contains('|') || text.contains("```") {
+        return false;
+    }
+
+    // A claim ends. A cut extract does not.
+    let terminal = ['.', '!', ':'];
+    if !text.chars().last().is_some_and(|c| terminal.contains(&c)) {
+        return false;
+    }
+
+    // Two sentences: a terminal mark must exist BEFORE the closing one.
+    let body = &text[..text.len() - text.chars().last().map(|c| c.len_utf8()).unwrap_or(1)];
+    if !body.contains(['.', '!', '?', ':']) {
+        return false;
+    }
+
+    true
+}
+
+/// Whether the first sentence of `text` is a question.
+///
+/// A `?` only ends a sentence when it is followed by a space or the end of the
+/// text: `?Sized` is a bound, not an interrogation.
+fn first_sentence_is_a_question(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    for (i, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'?' if bytes.get(i + 1).is_none_or(|c| *c == b' ' || *c == b'\n') => return true,
+            b'.' | b'!' | b'\n' => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
 // ============================================================================
 // Detection
 // ============================================================================
@@ -216,7 +294,8 @@ const CONFIDENCE_THRESHOLD: f64 = 0.80;
 /// Detect observations in an LLM response text.
 ///
 /// Returns at most ONE observation (the highest confidence match),
-/// as per the constraint of max 1 suggestion per response.
+/// as per the constraint of max 1 suggestion per response. The excerpt must
+/// also have the shape of a statement — see [`has_statement_shape`].
 pub fn detect_observations(response_text: &str) -> Option<DetectedObservation> {
     // Skip very short responses (unlikely to contain insights)
     if response_text.len() < 50 {
@@ -243,6 +322,11 @@ pub fn detect_observations(response_text: &str) -> Option<DetectedObservation> {
     // Extract surrounding context (up to 300 chars around match)
     let context_excerpt = extract_context(response_text, matched.start(), matched.end(), 300);
 
+    // The shape gate: an excerpt that is not a statement cannot become a claim.
+    if !has_statement_shape(&context_excerpt) {
+        return None;
+    }
+
     // Build suggested note content
     let suggested_content = build_suggestion(&context_excerpt, rule.category);
 
@@ -256,31 +340,73 @@ pub fn detect_observations(response_text: &str) -> Option<DetectedObservation> {
     })
 }
 
-/// Extract context around a match position, expanding to sentence boundaries.
+/// Extract the STATEMENT around a match: the sentence that holds it, plus the
+/// following sentences, up to `max_len`.
+///
+/// This used to take `max_len / 2` characters on each side and stop at the
+/// nearest `.` or `\n` — which, by construction, could only ever return ONE
+/// sentence, and often a bullet line, because `\n` counted as a boundary. The
+/// result was a fragment of a conversation, presented as a piece of knowledge.
+///
+/// A claim needs at least two sentences: the observation itself and what
+/// surrounds it. When the sentence holding the match is shorter than
+/// [`MIN_EXCERPT_CHARS`], the following sentences are appended until the excerpt
+/// is long enough to say something or the budget is spent.
 fn extract_context(text: &str, start: usize, end: usize, max_len: usize) -> String {
-    let half = max_len / 2;
+    let boundary = |c: char| ['.', '\n', '!', '?', ':'].contains(&c);
 
-    // Expand backwards to sentence boundary
-    let ctx_start = if start > half {
-        let search_from = start - half;
-        text[search_from..start]
-            .rfind(|c: char| ['.', '\n'].contains(&c))
-            .map(|pos| search_from + pos + 1)
-            .unwrap_or(search_from)
-    } else {
-        0
-    };
+    // The sentence holding the match.
+    let mut ctx_start = text[..start].rfind(boundary).map(|i| i + 1).unwrap_or(0);
 
-    // Expand forwards to sentence boundary
-    let ctx_end = {
-        let search_to = (end + half).min(text.len());
-        text[end..search_to]
-            .find(|c: char| ['.', '\n'].contains(&c))
-            .map(|pos| end + pos + 1)
-            .unwrap_or(search_to)
-    };
+    // Its end.
+    let mut ctx_end = text[end..]
+        .find(boundary)
+        .map(|i| end + i + 1)
+        .unwrap_or(text.len());
+
+    // Then one sentence after another, while the excerpt is still too thin.
+    while (ctx_end - ctx_start) < MIN_EXCERPT_CHARS && ctx_end < text.len() {
+        let next = text[ctx_end..]
+            .find(boundary)
+            .map(|i| ctx_end + i + 1)
+            .unwrap_or(text.len());
+        if next <= ctx_end {
+            break;
+        }
+        ctx_end = next;
+    }
+
+    // Then the preceding one: "Never use X." is a maxim only together with the
+    // sentence that says what it is about.
+    let mut guard = ctx_start;
+    while (ctx_end - ctx_start) < MIN_EXCERPT_CHARS && ctx_start > 0 {
+        let before = &text[..ctx_start.saturating_sub(1)];
+        ctx_start = match before.rfind(boundary) {
+            Some(i) => i + 1,
+            None => 0,
+        };
+        if ctx_start == guard {
+            // No sentence boundary before: take the whole beginning, once.
+            ctx_start = 0;
+            break;
+        }
+        guard = ctx_start;
+    }
+
+    // Never past the budget, and never on half a character.
+    let ctx_end = ctx_end.min(ctx_start + max_len);
+    let ctx_end = floor_char_boundary(text, ctx_end);
 
     text[ctx_start..ctx_end].trim().to_string()
+}
+
+/// The largest index `<= i` that is a character boundary.
+fn floor_char_boundary(text: &str, i: usize) -> usize {
+    let mut idx = i.min(text.len());
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
 }
 
 /// Build a suggested note content from the extracted context.
@@ -551,6 +677,54 @@ mod tests {
         let obs = detect_observations(text);
         // Should not detect an RFC
         assert!(obs.is_none() || obs.unwrap().note_type != "rfc");
+    }
+
+    // === Shape gate: the shapes that were actually persisted, measured on one
+    // project before the gate existed (70 of 406 notes under 80 characters, 81
+    // opening on a torn list item, 36 without final punctuation).
+
+    #[test]
+    fn rejects_a_torn_list_item() {
+        // Sample taken verbatim from the audit of issue #1138.
+        let text = "## Le piège qui valait le détour\n\n- Piège déjoué : git rerere a rejoué une résolution périmée qui mettait .\n";
+        assert!(detect_observations(text).is_none());
+    }
+
+    #[test]
+    fn rejects_a_table_row() {
+        let text = "| 3 | Staging : rattrapage repair-withdrawn-dates | |\n\nWatch out: the repair job ran twice on staging and duplicated two rows.";
+        assert!(detect_observations(text).is_none());
+    }
+
+    #[test]
+    fn rejects_a_question() {
+        let text = "Be careful, ne jamais supprimer de lien laisse-t-il de mauvais lieux ? C'est la question qu'on se pose encore après trois jours de debug.";
+        assert!(detect_observations(text).is_none());
+    }
+
+    #[test]
+    fn rejects_a_short_excerpt() {
+        let text = "Attention à ce piège. Rien de plus.";
+        assert!(detect_observations(text).is_none());
+    }
+
+    #[test]
+    fn rejects_an_excerpt_cut_mid_word() {
+        // One long sentence, no terminal mark inside the budget: the excerpt
+        // would end mid-word, which is what a torn note looked like.
+        let mut text = String::from("Watch out for the pre-push hook because ");
+        text.push_str(&"it runs a very long list of checks ".repeat(12));
+        assert!(detect_observations(&text).is_none());
+    }
+
+    #[test]
+    fn accepts_a_two_sentence_statement() {
+        let text = "The root cause was a missing ?Sized bound on the generic parameter. Adding + ?Sized to validate_entities fixed the compilation error.";
+        assert!(
+            has_statement_shape(text),
+            "a real two-sentence claim passes"
+        );
+        assert!(detect_observations(text).is_some());
     }
 
     #[test]

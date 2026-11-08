@@ -86,6 +86,19 @@ pub struct NoteDocument {
     pub created_by: String,
     /// Staleness score (0.0 - 1.0)
     pub staleness_score: f64,
+    /// Who wrote the note (`human` | `agent` | `system`), from `Note::author_kind`.
+    ///
+    /// Empty on a document indexed before the provenance change: `notes::visibility`
+    /// then falls back to the `auto-observed` tag, which every detector note has
+    /// carried since it existed.
+    #[serde(default)]
+    pub author_kind: String,
+    /// Whether a person has vouched for this note (`Note::is_human_confirmed`).
+    #[serde(default)]
+    pub human_confirmed: bool,
+    /// The note's memory horizon (`ephemeral` | `operational` | `consolidated`).
+    #[serde(default)]
+    pub memory_horizon: String,
 }
 
 /// Statistics for a Meilisearch index
@@ -188,6 +201,9 @@ mod tests {
             created_at: 1704067200,
             created_by: "claude".to_string(),
             staleness_score: 0.0,
+            author_kind: "agent".to_string(),
+            human_confirmed: false,
+            memory_horizon: "operational".to_string(),
         };
 
         let json = serde_json::to_string(&doc).unwrap();

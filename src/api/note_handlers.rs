@@ -10,8 +10,8 @@ use crate::graph::algorithms::add_thermal_noise;
 #[allow(unused_imports)]
 use crate::notes::{
     BackfillProgress, CreateAnchorRequest, CreateNoteRequest, EntityType, LinkNoteRequest, Note,
-    NoteContextResponse, NoteFilters, NoteImportance, NoteScope, NoteSearchHit, NoteStatus,
-    NoteType, PropagatedNote, SynapseBackfillProgress, UpdateNoteRequest,
+    NoteAuthorKind, NoteContextResponse, NoteFilters, NoteImportance, NoteScope, NoteSearchHit,
+    NoteStatus, NoteType, PropagatedNote, SynapseBackfillProgress, UpdateNoteRequest,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -519,6 +519,17 @@ pub async fn create_note(
 ) -> Result<(StatusCode, Json<Note>), AppError> {
     let explicit_run_id = body.run_id;
     let project_id = body.project_id;
+    // The one place a person's signature can enter: the route knows whether the
+    // caller is a human (`envelope::identify_caller`) or an agent session — a
+    // session's writes are stamped `agent:<uuid>` upstream.
+    let is_human = matches!(
+        crate::chat::envelope::identify_caller(
+            claims.as_ref().map(|c| &c.0),
+            crate::chat::envelope::session_header(&headers),
+            state.auth_config.is_some(),
+        ),
+        Ok(crate::chat::envelope::SpawnCaller::Human) | Err(_)
+    );
     let request = CreateNoteRequest {
         project_id,
         note_type: body.note_type,
@@ -532,14 +543,26 @@ pub async fn create_note(
         sharing_consent: body.sharing_consent,
     };
 
-    let note = state
-        .orchestrator
-        .note_manager()
-        .create_note(
-            request,
-            &caller_author(&state, claims.as_ref().map(|c| &c.0), &headers, "api").await,
-        )
-        .await?;
+    let author = caller_author(&state, claims.as_ref().map(|c| &c.0), &headers, "api").await;
+    let note = match is_human {
+        // A person wrote it: their word, and their signature.
+        true => {
+            state
+                .orchestrator
+                .note_manager()
+                .create_note_as(request, &author, NoteAuthorKind::Human)
+                .await?
+        }
+        // An agent session, or an unauthenticated caller: the actor string
+        // (`agent:<uuid>`) decides, and it is not a person's word.
+        false => {
+            state
+                .orchestrator
+                .note_manager()
+                .create_note(request, &author)
+                .await?
+        }
+    };
 
     // Resolve run_id: explicit > auto-detect from active run
     let run_id = match explicit_run_id {
@@ -1934,6 +1957,68 @@ pub async fn heal_scars(
         "healed": healed,
         "node_id": body.node_id.to_string(),
     })))
+}
+
+/// POST /api/notes/purge-auto-observed — what a heuristic wrote, and its repair
+///
+/// The observation detector wrote notes the graph has no way to recognise as
+/// machine prose (see `notes::visibility`). This reports the shape of that
+/// population and, when `dry_run` is false, ARCHIVES the ones no person has
+/// confirmed. Nothing is ever deleted: an archived note keeps its history and
+/// can come back.
+///
+/// `dry_run` defaults to TRUE — an operator asking a question must not be
+/// answered with a write.
+pub async fn purge_auto_observed(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<PurgeAutoObservedBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let dry_run = body.dry_run.unwrap_or(true);
+    let neo4j = state.orchestrator.neo4j();
+
+    let before = neo4j
+        .auto_observed_report(body.project_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    if dry_run {
+        return Ok(Json(serde_json::json!({
+            "dry_run": true,
+            "project_id": body.project_id,
+            "before": before,
+            "archived": 0,
+            "hint": "POST the same body with dry_run=false to archive the unconfirmed ones",
+        })));
+    }
+
+    let archived = neo4j
+        .archive_unconfirmed_auto_observed(body.project_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    let after = neo4j
+        .auto_observed_report(body.project_id)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "dry_run": false,
+        "project_id": body.project_id,
+        "before": before,
+        "archived": archived,
+        "after": after,
+    })))
+}
+
+/// POST /api/notes/purge-auto-observed body.
+#[derive(Debug, Default, Deserialize)]
+pub struct PurgeAutoObservedBody {
+    /// Restrict to one project; absent = the whole instance.
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
+    /// `true` (the default) reports and writes nothing.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
 }
 
 /// POST /api/notes/consolidate-memory — Batch memory consolidation

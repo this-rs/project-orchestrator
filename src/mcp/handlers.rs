@@ -687,6 +687,7 @@ pub(crate) const MEGA_TOOL_ACTIONS: &[(&str, &str, &str)] = &[
     ("admin", "reconstruct_knowledge", "reconstruct_knowledge"),
     ("admin", "heal_scars", "heal_scars"),
     ("admin", "consolidate_memory", "consolidate_memory"),
+    ("admin", "purge_auto_observed", "purge_auto_observed"),
     ("admin", "audit_gaps", "audit_gaps"),
     ("admin", "persist_health_report", "persist_health_report"),
     ("admin", "detect_stagnation", "detect_stagnation"),
@@ -3542,6 +3543,21 @@ impl ToolHandler {
             "consolidate_memory" => {
                 let result = http
                     .post("/api/notes/consolidate-memory", &json!({}))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "purge_auto_observed" => {
+                // `dry_run` defaults to true: asking the question must not be
+                // answered with a write.
+                let result = http
+                    .post(
+                        "/api/notes/purge-auto-observed",
+                        &json!({
+                            "project_id": args.get("project_id").cloned(),
+                            "dry_run": args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(true),
+                        }),
+                    )
                     .await?;
                 Ok(Some(result))
             }

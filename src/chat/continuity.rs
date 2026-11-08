@@ -287,17 +287,34 @@ async fn load_recent_notes(
 ) -> Result<Vec<NoteSummary>> {
     let filters = NoteFilters {
         status: Some(vec![NoteStatus::Active]),
-        limit: Some(10),
+        limit: Some(20),
         ..Default::default()
     };
 
     let (notes, _) = graph.list_notes(Some(project_id), None, &filters).await?;
 
-    // Take only notes modified in the last 48h
+    // Take only notes modified in the last 48h.
+    //
+    // And only the ones a reader may present as knowledge: this block used to be
+    // `status = active`, five newest, nothing else — so a resumed session opened
+    // on whatever a regex had extracted from the previous conversation. The gate
+    // is `notes::visibility`, the same one every other injected block uses.
     let cutoff = Utc::now() - chrono::Duration::hours(48);
     let recent: Vec<NoteSummary> = notes
         .into_iter()
         .filter(|n| n.created_at > cutoff)
+        .filter(|n| {
+            let provenance = crate::notes::visibility::Provenance::of_note(n);
+            let visible = crate::notes::visibility::visibility(&provenance);
+            if !visible.vouched {
+                debug!(
+                    note_id = %n.id,
+                    reason = visible.reason,
+                    "recent knowledge: skipping an unvouched note"
+                );
+            }
+            visible.vouched
+        })
         .take(5)
         .map(|n| note_to_summary(&n))
         .collect();

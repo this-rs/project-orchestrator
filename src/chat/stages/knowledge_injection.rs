@@ -4055,6 +4055,9 @@ mod tests {
                     created_at: chrono::Utc::now().timestamp(),
                     created_by: "test".to_string(),
                     staleness_score: 0.0,
+                    author_kind: "agent".to_string(),
+                    human_confirmed: false,
+                    memory_horizon: "operational".to_string(),
                 })
                 .await
                 .unwrap();

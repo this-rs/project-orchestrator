@@ -127,6 +127,83 @@ pub enum NoteImportance {
 }
 
 // ============================================================================
+// Author provenance
+// ============================================================================
+
+/// Who wrote a note — and therefore what its word is worth.
+///
+/// `note_type` and `importance` are CLAIMS the author makes about the content:
+/// calling a sentence a `gotcha|critical` makes the decay law treat it as
+/// knowledge for 180 days (`Note::base_decay_days`). Until this existed, the
+/// only trace of the author was the free-text `created_by` string, which no
+/// index, filter or ranking consulted — so an automatic regex and a person had
+/// exactly the same weight in every prompt.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteAuthorKind {
+    /// A person wrote it: their word alone, and it is already a confirmation.
+    Human,
+    /// A model wrote it deliberately (an MCP tool call, a runner-feedback rule).
+    #[default]
+    Agent,
+    /// An automatic heuristic wrote it (the observation detector, the learned
+    /// pipeline). Nothing has been verified: it stays unconfirmed until a
+    /// person says otherwise.
+    System,
+}
+
+impl NoteAuthorKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+            Self::System => "system",
+        }
+    }
+
+    /// The kind a legacy note most likely had, from its `created_by` string.
+    ///
+    /// Nothing wrote this property before the provenance change: a note with no
+    /// `author_kind` is guessed from the author name the writers already used.
+    /// Anything under `system/` is a heuristic; everything else was written
+    /// deliberately.
+    pub fn infer_from_created_by(created_by: &str) -> Self {
+        let actor = created_by.trim();
+        let heuristic = actor.starts_with("system")
+            || actor.starts_with("auto-")
+            || actor == "import"
+            || actor == "skill-evolution";
+        if heuristic {
+            Self::System
+        } else {
+            // `agent:<uuid>` (see `notes::provenance`) or a name: a deliberate
+            // writer. Deliberate is not the same as human — only
+            // `Note::with_author(Human, …)` says that.
+            Self::Agent
+        }
+    }
+}
+
+impl std::fmt::Display for NoteAuthorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl std::str::FromStr for NoteAuthorKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "human" => Ok(Self::Human),
+            "agent" => Ok(Self::Agent),
+            "system" => Ok(Self::System),
+            _ => Err(format!("Unknown note author kind: {}", s)),
+        }
+    }
+}
+
+// ============================================================================
 // Memory Horizon (biomimicry: Elun SleepSystem consolidation)
 // ============================================================================
 
@@ -747,6 +824,31 @@ pub struct Note {
     pub created_at: DateTime<Utc>,
     /// Who created the note
     pub created_by: String,
+    /// Who wrote this note, and therefore what its word is worth.
+    ///
+    /// Absent on every note written before the provenance change: [`Note::new`]
+    /// defaults it to a deliberate author, and `node_to_note` infers `System`
+    /// from a `system/…` author so a legacy detector note is never mistaken for
+    /// a person's.
+    #[serde(default)]
+    pub author_kind: NoteAuthorKind,
+    /// The confidence the AUTHOR claimed for its own content (0.0–1.0), when the
+    /// author is a heuristic. This is NOT a measure of truth: a detector that
+    /// says 0.9 says only that a regex matched.
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    /// When a PERSON vouched for this note, and who.
+    ///
+    /// Distinct from `last_confirmed_at`, which is a freshness clock set at
+    /// creation and moved by re-verification: that one used to be the only
+    /// trace of confirmation, and it was signed with the author's own name —
+    /// so a machine's note was born "confirmed by the machine". These two are
+    /// `None` until a human actually confirms.
+    #[serde(default)]
+    pub human_confirmed_at: Option<DateTime<Utc>>,
+    /// Who that person was.
+    #[serde(default)]
+    pub human_confirmed_by: Option<String>,
     /// When the note was last confirmed as valid
     pub last_confirmed_at: Option<DateTime<Utc>>,
     /// Who last confirmed the note
@@ -876,6 +978,51 @@ impl Note {
         }
     }
 
+    /// Whether a PERSON vouched for this note.
+    ///
+    /// The only predicate a reader may use to treat a note as vouched-for
+    /// knowledge. `last_confirmed_at` is a freshness clock, not a signature —
+    /// it is set at creation, including for a machine's own notes.
+    pub fn is_human_confirmed(&self) -> bool {
+        self.human_confirmed_at.is_some()
+    }
+
+    /// Declare who wrote this note, and what that author's word is worth.
+    ///
+    /// A `Human` author is a confirmation by construction: the person writing it
+    /// is the person vouching for it. An `Agent` or `System` author signs
+    /// nothing — `last_confirmed_by` stays empty and `human_confirmed_*` stays
+    /// `None` until [`Note::confirm_by_human`] is called.
+    pub fn with_author(mut self, kind: NoteAuthorKind, who: &str) -> Self {
+        self.author_kind = kind;
+        if kind == NoteAuthorKind::Human {
+            self.human_confirmed_at = Some(self.created_at);
+            self.human_confirmed_by = Some(who.to_string());
+            self.last_confirmed_by = Some(who.to_string());
+        } else {
+            self.human_confirmed_at = None;
+            self.human_confirmed_by = None;
+            self.last_confirmed_by = None;
+        }
+        self
+    }
+
+    /// Record that a person vouched for this note, now.
+    ///
+    /// The freshness clock moves too (`last_confirmed_at`), because a person
+    /// reading a note and saying "still true" IS a verification.
+    pub fn confirm_by_human(&mut self, who: &str, now: DateTime<Utc>) {
+        self.human_confirmed_at = Some(now);
+        self.human_confirmed_by = Some(who.to_string());
+        self.last_confirmed_at = Some(now);
+        self.last_confirmed_by = Some(who.to_string());
+        self.changes.push(NoteChange::with_details(
+            ChangeType::Confirmed,
+            who.to_string(),
+            serde_json::json!({ "by": "human", "author_kind": self.author_kind.as_str() }),
+        ));
+    }
+
     /// Create a new note with minimal fields
     pub fn new(
         project_id: Option<Uuid>,
@@ -896,8 +1043,14 @@ impl Note {
             anchors: vec![],
             created_at: now,
             created_by: created_by.clone(),
+            author_kind: NoteAuthorKind::Agent,
+            confidence: None,
+            human_confirmed_at: None,
+            human_confirmed_by: None,
             last_confirmed_at: Some(now),
-            last_confirmed_by: Some(created_by.clone()),
+            // A freshness clock, not a signature: the author is NOT vouching for
+            // it here. A person's note gets its signature from `with_author`.
+            last_confirmed_by: None,
             staleness_score: 0.0,
             energy: 1.0,
             last_activated: Some(now),
@@ -975,8 +1128,13 @@ impl Note {
             anchors: vec![],
             created_at: now,
             created_by: created_by.clone(),
+            author_kind: NoteAuthorKind::Agent,
+            confidence: None,
+            human_confirmed_at: None,
+            human_confirmed_by: None,
             last_confirmed_at: Some(now),
-            last_confirmed_by: Some(created_by.clone()),
+            // A freshness clock, not a signature — see `Note::new`.
+            last_confirmed_by: None,
             staleness_score: 0.0,
             energy: 1.0,
             last_activated: Some(now),

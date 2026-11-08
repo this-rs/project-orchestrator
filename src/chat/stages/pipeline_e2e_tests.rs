@@ -116,6 +116,10 @@ mod tests {
             anchors: anchors.clone(),
             created_at: Utc::now(),
             created_by: "test".to_string(),
+            author_kind: crate::notes::NoteAuthorKind::Agent,
+            confidence: None,
+            human_confirmed_at: None,
+            human_confirmed_by: None,
             last_confirmed_at: None,
             last_confirmed_by: None,
             staleness_score: 0.0,
@@ -161,6 +165,9 @@ mod tests {
             created_at: Utc::now().timestamp(),
             created_by: "test".to_string(),
             staleness_score: 0.0,
+            author_kind: "agent".to_string(),
+            human_confirmed: false,
+            memory_horizon: "operational".to_string(),
         };
         search.index_note(&note_doc).await.unwrap();
 

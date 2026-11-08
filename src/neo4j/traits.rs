@@ -2231,6 +2231,16 @@ pub trait AnalyticsStore: Send + Sync {
     /// Returns (promoted_count, archived_count).
     async fn consolidate_memory(&self) -> Result<(usize, usize)>;
 
+    /// What the heuristic authors (observation detector, RFC detector) wrote,
+    /// by status × type × importance. Read-only.
+    async fn auto_observed_report(
+        &self,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<serde_json::Value>>;
+
+    /// Archive — never delete — the detector notes no person has confirmed.
+    async fn archive_unconfirmed_auto_observed(&self, project_id: Option<Uuid>) -> Result<usize>;
+
     /// Compute homeostasis report: 5 ratios measuring knowledge graph equilibrium.
     async fn compute_homeostasis(
         &self,

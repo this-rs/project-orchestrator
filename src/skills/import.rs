@@ -468,6 +468,12 @@ fn portable_note_to_note(
         anchors: vec![],
         created_at: now,
         created_by: IMPORT_CREATOR.to_string(),
+        // An import is not a person's word: it carries whatever the source
+        // claimed, and no signature.
+        author_kind: crate::notes::NoteAuthorKind::System,
+        confidence: None,
+        human_confirmed_at: None,
+        human_confirmed_by: None,
         last_confirmed_at: None,
         last_confirmed_by: None,
         staleness_score: 0.0,
@@ -533,6 +539,12 @@ fn decision_to_note(
         anchors: vec![],
         created_at: now,
         created_by: IMPORT_CREATOR.to_string(),
+        // An import is not a person's word: it carries whatever the source
+        // claimed, and no signature.
+        author_kind: crate::notes::NoteAuthorKind::System,
+        confidence: None,
+        human_confirmed_at: None,
+        human_confirmed_by: None,
         last_confirmed_at: None,
         last_confirmed_by: None,
         staleness_score: 0.0,
@@ -625,6 +637,12 @@ fn episode_to_note(
         anchors: vec![],
         created_at: now,
         created_by: IMPORT_CREATOR.to_string(),
+        // An import is not a person's word: it carries whatever the source
+        // claimed, and no signature.
+        author_kind: crate::notes::NoteAuthorKind::System,
+        confidence: None,
+        human_confirmed_at: None,
+        human_confirmed_by: None,
         last_confirmed_at: None,
         last_confirmed_by: None,
         staleness_score: 0.0,
@@ -1423,6 +1441,10 @@ mod tests {
             anchors: vec![],
             created_at: Utc::now(),
             created_by: "test".to_string(),
+            author_kind: crate::notes::NoteAuthorKind::Agent,
+            confidence: None,
+            human_confirmed_at: None,
+            human_confirmed_by: None,
             last_confirmed_at: None,
             last_confirmed_by: None,
             staleness_score: 0.0,
