@@ -148,23 +148,33 @@ fn mask_literals(source: &str) -> String {
     out
 }
 
-/// First line (1-based) of the file's trailing test module, or `u32::MAX`.
+/// Les plages (1-based, bornes incluses) de **tous** les modules `#[cfg(test)]` du fichier.
 ///
-/// The patch gate of `src/refs` already refuses to let a module's tests grade
-/// themselves; this tool does the same for the whole diff, because a test line
-/// is executed by construction and would otherwise fill the denominator with
-/// free points.
-fn tests_start(source: &str) -> u32 {
+/// Le portillon ne doit pas laisser du code de test se noter lui-même : une ligne de test
+/// est exécutée par construction quand elle tourne… et **jamais** quand le test est
+/// `#[ignore]`. Or ce dépôt consigne un trouvaille comme un test `#[ignore]` (voir
+/// `src/chat/post_stream.rs`) : avec l'ancienne règle, qui ne coupait que le **dernier**
+/// module du fichier, un trouvaille ajouté dans un module intermédiaire rendait la CI
+/// rouge **par construction**, quelle que soit la qualité du test.
+///
+/// Ce fichier-là a quatre modules `#[cfg(test)]` (aux lignes 1399, 1686, 2460, 2587) :
+/// supposer « un seul, à la fin » était une heuristique, pas une règle.
+fn test_module_ranges(source: &str) -> Vec<(u32, u32)> {
     let masked = mask_literals(source);
     let lines: Vec<&str> = masked.lines().collect();
-    for (i, l) in lines.iter().enumerate() {
-        if l.trim_end() != "#[cfg(test)]" {
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        if lines[i].trim_end() != "#[cfg(test)]" {
+            i += 1;
             continue;
         }
-        let Some(next) = lines[i + 1..].iter().find(|l| !l.trim().is_empty()) else {
-            continue;
+        let Some(next_rel) = lines[i + 1..].iter().position(|l| !l.trim().is_empty()) else {
+            break;
         };
+        let next = lines[i + 1 + next_rel];
         if !(next.starts_with("mod ") || next.starts_with("pub mod ")) {
+            i += 1;
             continue;
         }
         let rest = lines[i + 1..].join("\n");
@@ -183,11 +193,14 @@ fn tests_start(source: &str) -> u32 {
                 _ => {}
             }
         }
-        if end.is_some_and(|e| rest[e..].trim().is_empty()) {
-            return i as u32 + 1;
-        }
+        let Some(end) = end else { break };
+        // `rest` commence à la ligne `i + 2` (1-based) : le nombre de retours à la ligne
+        // avant `end` donne le décalage du `}` fermant.
+        let end_line = i as u32 + 2 + rest[..end].matches('\n').count() as u32;
+        ranges.push((i as u32 + 1, end_line));
+        i = end_line as usize;
     }
-    u32::MAX
+    ranges
 }
 
 fn parse_lcov(text: &str) -> Report {
@@ -283,13 +296,17 @@ struct FileTally {
 }
 
 /// Count, per added line, whether the report instruments it and whether it ran.
-/// `test_from` cuts the file's trailing test module (never counted).
-fn tally_file(record: Option<&Record>, ranges: &[(u32, u32)], test_from: u32) -> (Tally, Vec<u32>) {
+/// `test_ranges` are the file's `#[cfg(test)]` modules (never counted).
+fn tally_file(
+    record: Option<&Record>,
+    ranges: &[(u32, u32)],
+    test_ranges: &[(u32, u32)],
+) -> (Tally, Vec<u32>) {
     let mut t = Tally::default();
     let mut uncovered = Vec::new();
     for (start, end) in ranges {
         for line in *start..=*end {
-            if line >= test_from {
+            if test_ranges.iter().any(|(a, b)| line >= *a && line <= *b) {
                 continue;
             }
             match record.and_then(|r| r.get(&line)) {
@@ -320,8 +337,12 @@ fn gather(
             continue;
         }
         let source = std::fs::read_to_string(format!("{root}/{path}")).unwrap_or_default();
-        let cut = if exclude_tests { tests_start(&source) } else { u32::MAX };
-        let (tally, uncovered) = tally_file(find_record(report, path), ranges, cut);
+        let test_ranges = if exclude_tests {
+            test_module_ranges(&source)
+        } else {
+            Vec::new()
+        };
+        let (tally, uncovered) = tally_file(find_record(report, path), ranges, &test_ranges);
         if tally.instrumented == 0 && tally.unknown == 0 {
             continue;
         }
@@ -548,24 +569,24 @@ new file mode 100644
         let mut record = Record::new();
         record.insert(10, 3);
         record.insert(12, 0);
-        let (tally, uncovered) = tally_file(Some(&record), &[(10, 12)], u32::MAX);
+        let (tally, uncovered) = tally_file(Some(&record), &[(10, 12)], &[]);
         assert_eq!(tally, Tally { covered: 1, instrumented: 2, unknown: 1 });
         assert_eq!(uncovered, vec![12]);
     }
 
     #[test]
     fn a_file_absent_from_the_report_counts_as_unknown_not_covered() {
-        let (tally, uncovered) = tally_file(None, &[(1, 2)], u32::MAX);
+        let (tally, uncovered) = tally_file(None, &[(1, 2)], &[]);
         assert_eq!(tally, Tally { covered: 0, instrumented: 0, unknown: 2 });
         assert!(uncovered.is_empty());
     }
 
     #[test]
-    fn the_trailing_test_module_never_grades_itself() {
+    fn a_test_module_never_grades_itself() {
         let mut record = Record::new();
         record.insert(1, 1);
         record.insert(5, 1);
-        let (tally, _) = tally_file(Some(&record), &[(1, 5)], 4);
+        let (tally, _) = tally_file(Some(&record), &[(1, 5)], &[(4, 5)]);
         assert_eq!(tally.instrumented, 1);
         assert_eq!(tally.covered, 1);
     }
@@ -608,10 +629,52 @@ new file mode 100644
     }
 
     #[test]
-    fn tests_start_finds_only_a_trailing_cfg_test_module() {
+    fn every_cfg_test_module_is_excluded_from_grading() {
         let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn b() {}\n}\n";
-        assert_eq!(tests_start(src), 2);
+        assert_eq!(test_module_ranges(src), vec![(2, 5)]);
+        // Un `#[cfg(test)]` sur une fonction n'est pas un module : il est noté comme le
+        // reste du fichier.
         let mid = "fn a() {}\n#[cfg(test)]\nfn c() {}\n";
-        assert_eq!(tests_start(mid), u32::MAX);
+        assert!(test_module_ranges(mid).is_empty());
+    }
+
+    /// Le cas qui a rendu #1134 rouge : quatre modules, et un test ajouté dans le
+    /// DEUXIÈME. L'ancienne règle ne coupait que le dernier, donc le trouvaille
+    /// `#[ignore]` du module intermédiaire était noté — 0 % de couverture par
+    /// construction, quel que soit le test.
+    #[test]
+    fn a_test_in_an_intermediate_module_is_excluded_too() {
+        let four = "\
+fn prod() {}
+#[cfg(test)]
+mod first {
+    fn one() {}
+}
+fn more_prod() {}
+#[cfg(test)]
+mod second {
+    #[ignore]
+    fn recorded_gap() {}
+}
+fn tail_prod() {}
+#[cfg(test)]
+mod third {
+    fn three() {}
+}
+";
+        let ranges = test_module_ranges(four);
+        assert_eq!(ranges.len(), 3, "trois modules : {ranges:?}");
+        assert_eq!(ranges[0], (2, 5));
+        assert_eq!(ranges[1], (7, 11));
+        assert_eq!(ranges[2], (13, 16));
+        // La ligne du trouvaille (10) tombe dans le module intermédiaire, donc n'est
+        // jamais notée.
+        assert!(
+            ranges.iter().any(|(a, b)| 10 >= *a && 10 <= *b),
+            "le trouvaille du module intermédiaire doit être exclu"
+        );
+        // La production, elle, reste notée.
+        assert!(!ranges.iter().any(|(a, b)| 6 >= *a && 6 <= *b));
+        assert!(!ranges.iter().any(|(a, b)| 12 >= *a && 12 <= *b));
     }
 }
