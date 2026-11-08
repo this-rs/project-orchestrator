@@ -96,7 +96,7 @@ diagrams:
       # (continuity::load_recent_notes). po-knowledge-notes reste `planned`, donc sans
       # propriete : il rejoint po-chat-manager, comme notes/beliefs.rs. A reprendre si
       # po-knowledge-notes est verifie.
-      - "backend:src/notes/visibility.rs"
+      - "backend:src/notes/{visibility,purge}.rs"
   - name: po-spawn-envelope
     owner: theotime
     status: verified
