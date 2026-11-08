@@ -1104,6 +1104,7 @@ Admin operations.
 | reconstruct_knowledge | | Reconstruct missing knowledge links from existing graph signals |
 | heal_scars | `node_id` | Heal neural scars on a note/decision (reset scar_intensity) |
 | consolidate_memory | | Promote ephemeral notes to consolidated (based on age + activation) |
+| purge_auto_observed | `project_id`, `dry_run` (default **true**) | Report what the heuristic authors (detector, RFC detector) wrote, by status × type × importance; `dry_run=false` archives — never deletes — the ones no person confirmed |
 | detect_stagnation | | Detect stagnant graph regions (low energy, no recent activity) |
 | deep_maintenance | | Run full maintenance pipeline (decay + energy + staleness + skills + anchoring + consolidation) |
 | audit_gaps | `project_id` (req) | Audit knowledge graph gaps (orphan notes, decisions without AFFECTS, skills without members) |
