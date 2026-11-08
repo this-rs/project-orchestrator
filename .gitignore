@@ -41,3 +41,19 @@ desktop/dist/
 
 
 .fastembed_cache/
+
+# Worktrees d'agents. Un worktree est une COPIE du dépôt sur une autre branche : il ne
+# contient aucun fichier à nous, seulement les nôtres recopiés. `_wt/` en portait 42 Go le
+# 08/11/2026, et n'était PAS ignoré — un `git add -A` depuis n'importe quel agent aurait
+# tenté d'indexer soixante copies du dépôt. Même famille que le `config.yaml.bak` plus
+# haut : un fichier qu'on n'a jamais voulu suivre, à une commande de l'être.
+# (Ces mêmes segments sont déjà exclus de l'INDEXATION par `IGNORED_PATH_SEGMENTS` —
+# voir PR #1022 — mais l'indexation et git sont deux mécanismes distincts.)
+/_wt/
+/.wt/
+/.rlwt/
+/worktrees/
+
+# Roues Python déposées à la racine par un outil (tiktoken et ses dépendances).
+# Ancrées à la racine : un `*.whl` global masquerait d'éventuelles fixtures de test.
+/*.whl
