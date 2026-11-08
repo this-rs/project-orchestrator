@@ -2445,10 +2445,27 @@ async fn the_belief_reads_tell_unknown_from_absent_and_keep_the_last_verdict() {
     );
     store.create_note(&plain).await.unwrap();
 
+    // Mais une note qui SE DÉCLARE croyance sans porter de procédure est listée quand
+    // même : elle est invérifiable, donc VISIBLE. Mesuré le 07/11 sur l'instance vivante :
+    // 31 notes dans ce cas, qu'aucune passe ne regardait — une croyance qui ne dit pas
+    // comment se vérifier est une dette de rédaction, pas un silence.
+    let dangling = Note::new(
+        None,
+        NoteType::Assertion,
+        format!("t7 dangling {tag}"),
+        "t7".into(),
+    );
+    assert!(dangling.assertion_rule.is_none());
+    store.create_note(&dangling).await.unwrap();
+
     let listed = store.list_assertion_notes(100_000).await.unwrap();
     assert!(
         !listed.iter().any(|n| n.id == plain.id),
-        "une note sans procédure n'est pas une croyance"
+        "une note ordinaire sans procédure n'est pas une croyance"
+    );
+    assert!(
+        listed.iter().any(|n| n.id == dangling.id),
+        "une croyance déclarée sans procédure doit être listée pour être vue"
     );
     let mine = listed
         .iter()
