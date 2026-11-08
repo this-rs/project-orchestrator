@@ -53,6 +53,7 @@ impl HeartbeatCheck for BeliefRevisionCheck {
                     held = report.held,
                     refuted = report.refuted,
                     unverifiable = report.unverifiable,
+                    errored = report.errored,
                     drifted = report.drifted,
                     flagged = report.flagged,
                     unsanctioned = report.unsanctioned,

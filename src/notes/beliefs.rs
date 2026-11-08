@@ -294,6 +294,11 @@ pub struct ReverificationReport {
     pub revised: usize,
     /// Notes seulement SIGNALÉES qui tiennent de nouveau : le doute est levé.
     pub healed: usize,
+    /// Croyances qu'on n'a pas pu vérifier du tout (le graphe a échoué sur celle-là).
+    /// Comptées à part de `unverifiable` : « je ne sais pas trancher » n'est pas « je n'ai
+    /// pas pu demander ». Sans ce compteur, une passe qui s'arrête au premier échec
+    /// ressemble à une passe complète.
+    pub errored: usize,
 }
 
 /// Re-vérifie les croyances, applique la sanction d'une réfutation, et persiste le verdict.
@@ -321,7 +326,22 @@ pub async fn reverify(
 
     for note in notes {
         report.checked += 1;
-        let verdict = verify(graph, &note).await?;
+        // Une lecture en échec ne doit pas rendre MUETTES toutes les croyances suivantes.
+        // Avec un `?` ici, un hoquet du graphe sur la première laissait les 199 autres non
+        // vérifiées, et le rapport avait la forme d'une passe complète. On compte, on nomme,
+        // on continue — et `errored` rend le manque visible.
+        let verdict = match verify(graph, &note).await {
+            Ok(verdict) => verdict,
+            Err(e) => {
+                tracing::warn!(
+                    note = %note.id,
+                    error = %e,
+                    "a belief could not be checked: the pass continues"
+                );
+                report.errored += 1;
+                continue;
+            }
+        };
         let drifted = has_drifted(note.last_assertion_result.as_ref(), &verdict);
 
         let mut status: Option<NoteStatus> = None;
@@ -396,6 +416,7 @@ pub async fn reverify_at_boot(graph: &dyn GraphStore) -> Option<ReverificationRe
                 held = report.held,
                 refuted = report.refuted,
                 unverifiable = report.unverifiable,
+                errored = report.errored,
                 drifted = report.drifted,
                 flagged = report.flagged,
                 "beliefs re-verified"
@@ -1315,6 +1336,72 @@ mod tests {
         assert!(
             verdict.is_refuted(),
             "après synchro, « absent » veut dire « n'existe pas » : {verdict:?}"
+        );
+    }
+
+    /// Une croyance dont la lecture ÉCHOUE ne doit pas rendre muettes les suivantes.
+    /// Avec un `?` dans la boucle, une panne sur la première laissait les autres non
+    /// vérifiées — et le rapport avait la forme d'une passe complète.
+    #[tokio::test]
+    async fn a_belief_that_cannot_be_checked_does_not_silence_the_others() {
+        let fine = a_belief(
+            AssertionCheckType::Exists,
+            "function:fine",
+            serde_json::Value::Null,
+        );
+        let broken = a_belief(
+            AssertionCheckType::Exists,
+            "function:boom",
+            serde_json::Value::Null,
+        );
+        let graph = MockGraphStore::new();
+        graph.create_note(&fine).await.unwrap();
+        graph.create_note(&broken).await.unwrap();
+        graph
+            .belief_entities
+            .write()
+            .await
+            .insert(("function".into(), "fine".into()));
+        // La lecture de celle-ci échoue.
+        graph
+            .fail_belief_entities
+            .write()
+            .await
+            .insert(("function".into(), "boom".into()));
+
+        let report = reverify(&graph, 10).await.unwrap();
+
+        assert_eq!(report.checked, 2, "les deux ont été tentées");
+        assert_eq!(report.errored, 1, "l'échec est compté, pas avalé");
+        assert_eq!(
+            report.held, 1,
+            "la croyance suivante a bien été vérifiée malgré la panne"
+        );
+    }
+
+    /// Une note qui SE DÉCLARE croyance sans porter de procédure est listée quand même :
+    /// elle est invérifiable, donc visible. C'est une dette de rédaction, pas un silence.
+    /// (Mesuré le 07/11 sur l'instance vivante : 31 notes dans ce cas, qu'aucune passe ne
+    /// regardait.)
+    #[tokio::test]
+    async fn a_belief_without_a_procedure_is_listed_and_unverifiable() {
+        let dangling = Note::new(
+            None,
+            NoteType::Assertion,
+            "je crois que le cache est purgé".to_string(),
+            "api".to_string(),
+        );
+        assert!(dangling.assertion_rule.is_none(), "aucune procédure");
+        let graph = seeded(&dangling).await;
+
+        let listed = graph.list_assertion_notes(10).await.unwrap();
+        assert!(
+            listed.iter().any(|n| n.id == dangling.id),
+            "une croyance sans procédure doit être VUE, pas ignorée"
+        );
+        assert!(
+            is_unverifiable(&verify(&graph, &dangling).await.unwrap()),
+            "et son verdict dit qu'aucune procédure n'est déclarée"
         );
     }
 }

@@ -248,6 +248,10 @@ pub struct MockGraphStore {
     pub fail_agent_knows: std::sync::atomic::AtomicBool,
     /// A `agent_knows` slower than the turn's budget (the read times out).
     pub slow_agent_knows: std::sync::Mutex<Option<std::time::Duration>>,
+    /// Les entités `(kind, name)` dont la lecture ÉCHOUE. Sert à prouver qu'une croyance
+    /// invérifiable pour cause de panne ne rend pas muettes les suivantes : la passe doit
+    /// continuer et compter l'échec, pas s'arrêter.
+    pub fail_belief_entities: RwLock<std::collections::HashSet<(String, String)>>,
     /// The model identities made by `ensure_agent`: id, then the last model recorded.
     pub agents: std::sync::Mutex<HashMap<Uuid, Option<String>>>,
     /// `(:Agent)-[:AUTHORED]->(:Note)`, as `(agent, note)`.
@@ -558,6 +562,7 @@ impl MockGraphStore {
             fail_agent_identity: std::sync::atomic::AtomicBool::new(false),
             fail_agent_knows: std::sync::atomic::AtomicBool::new(false),
             slow_agent_knows: std::sync::Mutex::new(None),
+            fail_belief_entities: RwLock::new(std::collections::HashSet::new()),
             agents: std::sync::Mutex::new(HashMap::new()),
             agent_authored: RwLock::new(std::collections::HashSet::new()),
             agent_lived: RwLock::new(std::collections::HashSet::new()),
@@ -14080,6 +14085,14 @@ impl AnalyticsStore for MockGraphStore {
         if !KNOWN.contains(&kind) {
             return Ok(None);
         }
+        if self
+            .fail_belief_entities
+            .read()
+            .await
+            .contains(&(kind.to_string(), name.to_string()))
+        {
+            anyhow::bail!("mock: la lecture de {kind} « {name} » échoue");
+        }
         if !self
             .belief_entities
             .read()
@@ -14153,7 +14166,13 @@ impl AnalyticsStore for MockGraphStore {
         let notes = self.notes.read().await;
         let mut out: Vec<crate::notes::Note> = notes
             .values()
-            .filter(|n| n.assertion_rule.is_some())
+            // Comme le store réel depuis le correctif du 07/11 : une note qui SE DÉCLARE
+            // croyance sans porter de procédure est listée aussi — invérifiable, donc
+            // visible, jamais silencieuse.
+            .filter(|n| {
+                n.assertion_rule.is_some()
+                    || n.note_type == crate::notes::models::NoteType::Assertion
+            })
             .cloned()
             .collect();
         out.sort_by_key(|n| n.created_at);
