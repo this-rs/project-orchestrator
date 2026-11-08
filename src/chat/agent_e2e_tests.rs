@@ -9841,6 +9841,88 @@ mod native_transcripts {
         );
     }
 
+    /// RESUME — what the MODEL sees when a conversation is resumed (the gap the audit of
+    /// 2026-11-08 named: no test read the resumed request's CONTENT, only counts or `contains`).
+    /// Three user turns, a clean close, a resume through `resume_session` (the production
+    /// path), then the request that reaches the endpoint is read message by message: the
+    /// user texts are exactly the four sent, in order, once each, the new one last, and
+    /// every assistant answer sits right after the question it answers.
+    #[tokio::test]
+    async fn a_resumed_native_conversation_shows_the_model_every_turn_in_order_once() {
+        let mut routes = vec![
+            answer("MSG-FOUR"),
+            answer("MSG-THREE"),
+            answer("MSG-TWO"),
+            answer("MSG-ONE"),
+        ];
+        routes.extend(script().as_array().cloned().unwrap());
+        let fake = FakeOpenAi::start(Value::Array(routes));
+        let graph = Arc::new(MockGraphStore::new());
+        store_instance(&graph, &instance(&fake, "none")).await;
+        consent(&graph, "proj", "local", &fake.origin()).await;
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("native-transcripts");
+
+        let before = manager(graph.clone(), true).with_native_transcripts(&root);
+        let mut open = request(Some("local"), Some("proj"), "default");
+        open.message = "MSG-ONE".into();
+        let sid = before.create_session(&open).await.unwrap().session_id;
+        wait_results(&graph, &sid, 1).await;
+        before.send_message(&sid, "MSG-TWO").await.unwrap();
+        wait_results(&graph, &sid, 2).await;
+        before.send_message(&sid, "MSG-THREE").await.unwrap();
+        wait_results(&graph, &sid, 3).await;
+        before.close_session(&sid).await.unwrap();
+        drop(before);
+
+        let after = manager(graph.clone(), true).with_native_transcripts(&root);
+        let claims = crate::auth::jwt::Claims::service_account("e2e");
+        after
+            .resume_session(&sid, "MSG-FOUR", Some(&claims))
+            .await
+            .unwrap_or_else(|e| panic!("resume failed: {e:#}"));
+        wait_results(&graph, &sid, 4).await;
+
+        let resumed = fake
+            .chat_requests()
+            .iter()
+            .map(|r| r["body"].clone())
+            .find(|b| b.to_string().contains("MSG-FOUR"))
+            .and_then(|b| b["messages"].as_array().cloned())
+            .expect("the resumed turn reached the model");
+        let text_of = |m: &Value| match &m["content"] {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let of_role = |role: &str| -> Vec<String> {
+            resumed
+                .iter()
+                .filter(|m| m["role"] == role)
+                .map(text_of)
+                .collect()
+        };
+        assert_eq!(
+            of_role("user"),
+            ["MSG-ONE", "MSG-TWO", "MSG-THREE", "MSG-FOUR"],
+            "the user turns the model sees: all, in order, once, the new one last: {resumed:#?}"
+        );
+        assert_eq!(
+            of_role("assistant"),
+            [
+                "answer to MSG-ONE",
+                "answer to MSG-TWO",
+                "answer to MSG-THREE"
+            ],
+            "each answer is kept once, in order"
+        );
+        let last = resumed.last().expect("messages");
+        assert_eq!(
+            (last["role"].as_str(), text_of(last).as_str()),
+            (Some("user"), "MSG-FOUR"),
+            "the last message is the new user message"
+        );
+    }
+
     /// The `degraded_features` of the session's `system_init`, as persisted.
     async fn degraded_of(graph: &MockGraphStore, sid: &str) -> Vec<String> {
         let uuid = Uuid::parse_str(sid).unwrap();

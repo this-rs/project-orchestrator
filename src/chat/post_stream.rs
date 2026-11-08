@@ -2390,6 +2390,54 @@ mod integration_tests {
         );
     }
 
+    /// RESUME after a compaction under a tight window: the model gets the checkpoint and
+    /// nothing else of the conversation. With three user turns persisted, only the LAST one
+    /// is in it (`last_user_turn_text` scans back to the first `user_message` and stops;
+    /// `bounded_segment_checkpoint` takes segment labels and boundaries, never messages).
+    /// This asserts what a resumed model should still see — the three asks, in order — and
+    /// is kept as a recorded gap (the suite stays green, the fault stays written).
+    #[tokio::test]
+    #[ignore = "trouvaille: le checkpoint post-compaction ne contient que le DERNIER message utilisateur (post_stream.rs:1024 `last_user_turn_text` s'arrête au premier user_message trouvé) et les étiquettes de segments (post_stream.rs:945 `bounded_segment_checkpoint`), jamais les messages précédents; avec une fenêtre étroite, les demandes 1 et 2 sont perdues"]
+    async fn a_checkpoint_after_three_user_turns_keeps_the_three_asks_in_order() {
+        const SID: &str = "00000000-0000-0000-0000-000000000003";
+        let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
+        let (segments, boundaries) = checkpoint_segments();
+        graph.put_segments(SID, &segments).await.unwrap();
+        graph.put_boundaries(SID, &boundaries).await.unwrap();
+        let uuid = Uuid::parse_str(SID).unwrap();
+        let record = |seq: i64, text: &str| ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: uuid,
+            seq,
+            event_type: "user_message".to_string(),
+            data: serde_json::to_string(&ChatEvent::UserMessage {
+                content: text.to_string(),
+            })
+            .unwrap(),
+            created_at: chrono::Utc::now(),
+        };
+        graph
+            .store_chat_events(
+                uuid,
+                vec![
+                    record(1, "ASK-ONE migrate the schema"),
+                    record(2, "ASK-TWO then add the index"),
+                    record(3, "ASK-THREE finally benchmark it"),
+                ],
+            )
+            .await
+            .unwrap();
+        let (hint, _event) = post_compaction_recovery(&graph, SID, None, None, Some(100)).await;
+        let hint = hint.expect("a checkpoint should be injected");
+        assert!(hint.contains("# Conversation Checkpoint"), "{hint}");
+        let at = |needle: &str| hint.find(needle);
+        let (one, two, three) = (at("ASK-ONE"), at("ASK-TWO"), at("ASK-THREE"));
+        assert!(
+            matches!((one, two, three), (Some(a), Some(b), Some(c)) if a < b && b < c),
+            "the checkpoint must carry the three asks in order: {hint}"
+        );
+    }
+
     #[tokio::test]
     async fn a_session_without_segments_keeps_the_existing_recovery_when_the_window_is_tight() {
         const SID: &str = "00000000-0000-0000-0000-000000000002";
