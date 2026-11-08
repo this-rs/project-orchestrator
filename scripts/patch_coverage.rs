@@ -203,6 +203,60 @@ fn test_module_ranges(source: &str) -> Vec<(u32, u32)> {
     ranges
 }
 
+/// Les plages (1-based, bornes incluses) des fonctions de test marquées `#[ignore]`.
+///
+/// Une ligne sous `#[ignore]` ne s'exécute **jamais** : elle est à 0 % de couverture par
+/// construction, et le restera. La noter revient à exiger un test d'un test qu'on a
+/// explicitement décidé de ne pas lancer — mesuré sur #1134 : 38 lignes réclamées pour un
+/// trouvaille consigné (`src/chat/post_stream.rs`, post-compaction qui ne garde que le
+/// dernier message utilisateur).
+///
+/// Ce dépôt consigne ses trouvailles exactement comme ça (le commentaire du test dit
+/// « kept as a recorded gap »). Le portillon doit donc les ignorer, pas les punir.
+///
+/// La plage va de la ligne de l'attribut à l'accolade fermante de la fonction : c'est
+/// délibérément large, pour couvrir aussi un `#[ignore]` posé sur plusieurs lignes.
+fn ignored_test_ranges(source: &str) -> Vec<(u32, u32)> {
+    let masked = mask_literals(source);
+    let lines: Vec<&str> = masked.lines().collect();
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        if !lines[i].trim_start().starts_with("#[ignore") {
+            i += 1;
+            continue;
+        }
+        let start_line = i as u32 + 1;
+        // La fonction suivie : son corps commence à la première `{`.
+        let Some(fn_rel) = lines[i + 1..].iter().position(|l| l.contains("fn ")) else {
+            break;
+        };
+        let fn_idx = i + 1 + fn_rel;
+        let rest = lines[fn_idx..].join("\n");
+        let mut depth = 0usize;
+        let mut end = None;
+        for (at, ch) in rest.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        end = Some(at + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        // `rest` commence à la ligne `fn_idx + 1` (1-based).
+        let end_line = fn_idx as u32 + 1 + rest[..end].matches('\n').count() as u32;
+        out.push((start_line, end_line));
+        i = end_line as usize;
+    }
+    out
+}
+
 fn parse_lcov(text: &str) -> Report {
     let mut report: Report = BTreeMap::new();
     let mut current: Option<String> = None;
@@ -337,11 +391,17 @@ fn gather(
             continue;
         }
         let source = std::fs::read_to_string(format!("{root}/{path}")).unwrap_or_default();
-        let test_ranges = if exclude_tests {
+        let mut test_ranges = if exclude_tests {
             test_module_ranges(&source)
         } else {
             Vec::new()
         };
+        // Les tests `#[ignore]` sont exclus TOUJOURS, indépendamment de `--exclude-tests` :
+        // leurs lignes ne s'exécutent jamais, par définition, donc les noter est un défaut
+        // du portillon, pas un manque de test. Ce dépôt consigne ses trouvailles comme des
+        // tests `#[ignore]` (`src/chat/post_stream.rs`) : sans cette règle, ajouter une
+        // trouvaille rend la CI rouge quoi qu'on fasse.
+        test_ranges.extend(ignored_test_ranges(&source));
         let (tally, uncovered) = tally_file(find_record(report, path), ranges, &test_ranges);
         if tally.instrumented == 0 && tally.unknown == 0 {
             continue;
@@ -589,6 +649,60 @@ new file mode 100644
         let (tally, _) = tally_file(Some(&record), &[(1, 5)], &[(4, 5)]);
         assert_eq!(tally.instrumented, 1);
         assert_eq!(tally.covered, 1);
+    }
+
+    /// Le cas de #1134 : un trouvaille consigné en `#[ignore]`, jamais exécuté, donc à
+    /// 0 % par construction. Ses lignes ne doivent pas être réclamées.
+    #[test]
+    fn an_ignored_test_body_is_never_graded() {
+        let src = "\
+fn prod() {}
+#[cfg(test)]
+mod integration_tests {
+    #[tokio::test]
+    async fn a_normal_test() {
+        assert!(true);
+    }
+
+    #[tokio::test]
+    #[ignore = \"trouvaille: le checkpoint perd les demandes precedentes\"]
+    async fn a_recorded_gap() {
+        assert!(false);
+    }
+}
+";
+        let ranges = ignored_test_ranges(src);
+        assert_eq!(ranges.len(), 1, "un seul test ignoré : {ranges:?}");
+        let (start, end) = ranges[0];
+        assert_eq!(start, 10, "la plage commence à l'attribut `#[ignore]`");
+        assert_eq!(end, 13, "et finit à l'accolade fermante de la fonction");
+        // Le test normal, juste au-dessus, reste noté (ses lignes 4 à 7).
+        for line in 4..=7 {
+            assert!(
+                !(start <= line && line <= end),
+                "la ligne {} du test normal ne doit pas être exclue",
+                line
+            );
+        }
+    }
+
+    /// Un `#[ignore]` posé sur une ligne seule, dans un module de test quelconque : la
+    /// règle ne dépend ni de `--exclude-tests` ni de la position du module dans le
+    /// fichier (c'est ce qui a fait échouer #1134, avec quatre modules).
+    #[test]
+    fn an_ignored_body_is_excluded_even_without_the_exclude_tests_flag() {
+        let mut record = Record::new();
+        for line in 1..=15 {
+            record.insert(line, if line < 10 { 1 } else { 0 });
+        }
+        let ignored = vec![(10, 12)];
+        let (tally, uncovered) = tally_file(Some(&record), &[(1, 15)], &ignored);
+        assert_eq!(
+            tally.instrumented, 12,
+            "les trois lignes ignorées sortent du dénominateur"
+        );
+        assert_eq!(uncovered.len(), 3, "et ne sont pas comptées comme manquantes");
+        assert!(uncovered.iter().all(|l| *l >= 13));
     }
 
     #[test]
