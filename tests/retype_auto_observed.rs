@@ -23,7 +23,8 @@ use uuid::Uuid;
 const MIGRATION: &str = "2026-11-retype-auto-observed";
 
 /// The predicate that defines the population, written once.
-const AUTO_OBSERVED: &str = "(n.created_by IN ['system/observation-detector', 'system/rfc-detector']
+const AUTO_OBSERVED: &str =
+    "(n.created_by IN ['system/observation-detector', 'system/rfc-detector']
      OR 'auto-observed' IN coalesce(n.tags, []))";
 
 #[derive(Debug, PartialEq)]
@@ -45,7 +46,10 @@ async fn shape(graph: &Graph, project: &str) -> Shape {
                count(CASE WHEN n.status = 'active' THEN 1 END) AS active
         "#
     );
-    let mut r = graph.execute(query(&cypher).param("p", project)).await.unwrap();
+    let mut r = graph
+        .execute(query(&cypher).param("p", project))
+        .await
+        .unwrap();
     let row = r.next().await.unwrap().expect("one row");
     Shape {
         notes: row.get("notes").unwrap_or(0),
@@ -102,9 +106,15 @@ async fn a_regex_does_not_get_to_call_a_sentence_knowledge() {
         "the copy must reproduce the defect, otherwise this test proves nothing: {before:?}"
     );
 
-    let outcome = client.run_data_migration_scoped(MIGRATION, scope).await.unwrap();
+    let outcome = client
+        .run_data_migration_scoped(MIGRATION, scope)
+        .await
+        .unwrap();
     assert!(outcome.completed, "{outcome:?}");
-    assert_eq!(outcome.processed as i64, before.notes, "every note of the population");
+    assert_eq!(
+        outcome.processed as i64, before.notes,
+        "every note of the population"
+    );
 
     let after = shape(&graph, &project).await;
     println!("AFTER  {after:?}");
@@ -139,11 +149,17 @@ async fn a_regex_does_not_get_to_call_a_sentence_knowledge() {
     let not_system: i64 = row.get("not_system").unwrap_or(0);
     println!("HISTORY retyped={retyped} with_history={with_history} still_loud={still_loud}");
     assert_eq!(retyped, before.notes);
-    assert_eq!(with_history, retyped, "each demotion is written in the history");
+    assert_eq!(
+        with_history, retyped,
+        "each demotion is written in the history"
+    );
     assert_eq!(still_loud, 0);
     assert_eq!(not_system, 0);
 
     // Idempotent: the stamp makes the second run a no-op.
-    let again = client.run_data_migration_scoped(MIGRATION, scope).await.unwrap();
+    let again = client
+        .run_data_migration_scoped(MIGRATION, scope)
+        .await
+        .unwrap();
     assert_eq!(again.processed, 0, "a second run moves nothing");
 }
