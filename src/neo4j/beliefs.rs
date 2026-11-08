@@ -164,15 +164,24 @@ impl Neo4jClient {
     /// L'ordre fait aussi le TOUR des croyances : `last_checked_at` d'abord (les jamais
     /// vérifiées, puis les plus anciennement vérifiées), sinon `created_at`. Sans ça, une
     /// limite de 200 figerait éternellement le même sous-ensemble.
+    ///
+    /// Le `OR n.note_type = 'assertion'` rend VISIBLE ce qui était muet : une note qui se
+    /// déclare croyance **sans dire comment se vérifier** est invérifiable, et c'est
+    /// précisément ce qu'il faut voir — mesuré le 07/11, **31** notes dans ce cas sur
+    /// l'instance vivante, qu'aucune passe ne regardait. `verify` répond alors
+    /// `Unverifiable("aucune procédure déclarée")`, qui n'est jamais sanctionné mais qui
+    /// est COMPTÉ : la croyance sans procédure devient une dette visible au lieu d'un
+    /// silence.
     pub async fn list_assertion_notes(&self, limit: usize) -> Result<Vec<Note>> {
         let mut rows = self
             .graph
             .execute(
                 query(
                     "MATCH (n:Note) \
-                     WHERE n.assertion_rule_json IS NOT NULL \
-                       AND n.assertion_rule_json <> '' \
-                       AND n.assertion_rule_json <> 'null' \
+                     WHERE (n.assertion_rule_json IS NOT NULL \
+                            AND n.assertion_rule_json <> '' \
+                            AND n.assertion_rule_json <> 'null') \
+                        OR n.note_type = 'assertion' \
                      RETURN n \
                      ORDER BY coalesce(n.last_checked_at, n.created_at) ASC LIMIT $limit",
                 )
