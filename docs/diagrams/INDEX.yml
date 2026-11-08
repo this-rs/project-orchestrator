@@ -91,6 +91,12 @@ diagrams:
       # Meme arbitrage pour son adaptateur Neo4j : sans diagramme de fonctionnalite dedie,
       # il rejoint le diagramme qui l'appelle.
       - "backend:src/neo4j/beliefs.rs"
+      # Arbitrage (PR provenance, #1138) : le portier de lecture decide ce qu'une note a
+      # le droit de dire dans un prompt injecte, et c'est le chat qui l'appelle
+      # (continuity::load_recent_notes). po-knowledge-notes reste `planned`, donc sans
+      # propriete : il rejoint po-chat-manager, comme notes/beliefs.rs. A reprendre si
+      # po-knowledge-notes est verifie.
+      - "backend:src/notes/visibility.rs"
   - name: po-spawn-envelope
     owner: theotime
     status: verified

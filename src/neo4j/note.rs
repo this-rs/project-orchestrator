@@ -3695,7 +3695,20 @@ impl Neo4jClient {
             while let Some(row) = result.next().await? {
                 seen += 1;
                 let node = row.get::<neo4rs::Node>("n")?;
-                let note = self.node_to_note(&node)?;
+                // A node the reader cannot decode must not stop the sweep: the
+                // janitor walks thousands of notes, and one malformed row used to
+                // abort the whole run (measured: three nodes without `content` in
+                // a test database made `consolidate_memory` fail outright).
+                let note = match self.node_to_note(&node) {
+                    Ok(note) => note,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "consolidate_memory: skipping a Note it cannot decode"
+                        );
+                        continue;
+                    }
+                };
                 // Advance BEFORE any `continue`: a note that is left alone must
                 // still move the cursor, or the same page comes back for ever.
                 //
@@ -4119,10 +4132,12 @@ impl Neo4jClient {
                 .get::<String>("last_confirmed_at")
                 .ok()
                 .and_then(|s| s.parse().ok()),
-            last_confirmed_by: node
-                .get::<String>("last_confirmed_by")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            // A freshness clock, not a signature: the author is NOT vouching for
+            // it here. A person's note gets its signature from `with_author`.
+            // Kept as the stored property historically was (an empty string when
+            // nobody signed) — `tests/store_conformance.rs` pins that round-trip,
+            // and `human_confirmed_*` is now the field that answers "who signed".
+            last_confirmed_by: node.get::<String>("last_confirmed_by").ok(),
             staleness_score: node.get("staleness_score").unwrap_or(0.0),
             energy: node.get("energy").unwrap_or(1.0),
             scar_intensity: node.get("scar_intensity").unwrap_or(0.0),
