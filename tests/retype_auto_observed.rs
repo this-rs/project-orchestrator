@@ -137,7 +137,7 @@ async fn a_regex_does_not_get_to_call_a_sentence_knowledge() {
                count(CASE WHEN n.author_kind <> 'system' THEN 1 END) AS not_system
         "#;
     let mut r = graph
-        .execute(query(&history).param("p", project.as_str()))
+        .execute(query(history).param("p", project.as_str()))
         .await
         .unwrap();
     let row = r.next().await.unwrap().unwrap();
