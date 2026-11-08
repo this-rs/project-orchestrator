@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn rejects_a_pipe_or_a_code_fence_inside_a_statement() {
-        let with_pipe = "The root cause was a missing | separator in the parser, and adding it back fixed the whole build again.";
+        let with_pipe = "The root cause was a missing | separator in the parser, and adding it back fixed the whole build again, once and for all.";
         assert!(!has_statement_shape(with_pipe));
 
         let with_fence = "The root cause was a missing bound, as this snippet shows. ```rust let x = 1; ``` and the build passes again.";

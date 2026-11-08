@@ -1974,14 +1974,14 @@ pub async fn purge_auto_observed(
     State(state): State<OrchestratorState>,
     Json(body): Json<PurgeAutoObservedBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let report = crate::notes::purge::purge_auto_observed(
+    crate::notes::purge::purge_auto_observed(
         state.orchestrator.neo4j(),
         body.project_id,
         body.dry_run.unwrap_or(true),
     )
     .await
-    .map_err(AppError::Internal)?;
-    Ok(Json(report))
+    .map(Json)
+    .map_err(AppError::Internal)
 }
 
 /// POST /api/notes/purge-auto-observed body.

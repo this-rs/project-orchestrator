@@ -113,6 +113,31 @@ mod tests {
     async fn archiving_puts_the_unconfirmed_aside_and_keeps_the_persons_note() {
         let (store, detector_id, human_id) = two_notes().await;
 
+        // A note a heuristic wrote and a person then confirmed: the janitor must
+        // leave that one alone too. And one already set aside is not re-counted.
+        let mut confirmed = Note::new(
+            Some(Uuid::new_v4()),
+            NoteType::Observation,
+            "un fragment qu'un humain a lu et validé.".to_string(),
+            "system/observation-detector".to_string(),
+        )
+        .with_author(NoteAuthorKind::System, "system/observation-detector");
+        confirmed.tags = vec!["auto-observed".to_string()];
+        confirmed.confirm_by_human("julien", chrono::Utc::now());
+        let confirmed_id = confirmed.id;
+        store.create_note(&confirmed).await.unwrap();
+
+        let mut already = Note::new(
+            Some(Uuid::new_v4()),
+            NoteType::Observation,
+            "un fragment déjà mis de côté.".to_string(),
+            "system/observation-detector".to_string(),
+        )
+        .with_author(NoteAuthorKind::System, "system/observation-detector");
+        already.tags = vec!["auto-observed".to_string()];
+        already.status = NoteStatus::Archived;
+        store.create_note(&already).await.unwrap();
+
         let report = purge_auto_observed(&store, None, false).await.unwrap();
         assert_eq!(report["dry_run"], false);
         assert_eq!(report["archived"], 1, "exactly one note is a heuristic's");
@@ -127,6 +152,11 @@ mod tests {
             notes[&human_id].status,
             NoteStatus::Active,
             "a person's note is not the janitor's business"
+        );
+        assert_eq!(
+            notes[&confirmed_id].status,
+            NoteStatus::Active,
+            "a person confirmed this one: it stays"
         );
     }
 

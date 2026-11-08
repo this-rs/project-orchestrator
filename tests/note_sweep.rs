@@ -161,13 +161,32 @@ async fn the_sweep_archives_promotes_and_leaves_alone() {
         "nine re-injections are attention, not evidence"
     );
 
-    // The sweep is replayable: a second pass changes nothing.
-    let (promoted, archived) = client.consolidate_memory().await.unwrap();
-    assert_eq!(
-        (promoted, archived),
-        (0, 0),
-        "a second sweep finds nothing left to do"
-    );
+    // The sweep is replayable on this population: a second pass leaves these
+    // six notes exactly where the first one put them.
+    let before = [
+        read(store, dead.id).await,
+        read(store, drained.id).await,
+        read(store, short_lived.id).await,
+        read(store, permanent.id).await,
+        read(store, confirmed.id).await,
+        read(store, attention.id).await,
+    ];
+    client.consolidate_memory().await.unwrap();
+    let after = [
+        read(store, dead.id).await,
+        read(store, drained.id).await,
+        read(store, short_lived.id).await,
+        read(store, permanent.id).await,
+        read(store, confirmed.id).await,
+        read(store, attention.id).await,
+    ];
+    for (b, a) in before.iter().zip(after.iter()) {
+        assert_eq!(
+            (b.status, b.memory_horizon.clone()),
+            (a.status, a.memory_horizon.clone()),
+            "a second sweep moves nothing that was already settled"
+        );
+    }
 }
 
 /// The two janitor methods, through the trait — the same path the HTTP route and
@@ -249,4 +268,89 @@ async fn the_report_and_the_archive_agree_on_who_wrote_what() {
             .unwrap(),
         0
     );
+}
+
+/// Confirming is a signature only when a PERSON gives it, and it never
+/// resurrects a note a newer one superseded.
+#[tokio::test]
+async fn confirming_signs_for_a_person_and_for_nobody_else() {
+    let Some(Env { client, .. }) = env().await else {
+        return;
+    };
+    let store: &dyn GraphStore = &client;
+    let project = Uuid::new_v4();
+
+    let agent_confirmed = Note::new(
+        Some(project),
+        NoteType::Observation,
+        "un fragment confirmé par un agent, pas par un humain.".to_string(),
+        "system/observation-detector".to_string(),
+    )
+    .with_author(NoteAuthorKind::System, "system/observation-detector");
+    let human_confirmed = Note::new(
+        Some(project),
+        NoteType::Gotcha,
+        "une note confirmée par une personne.".to_string(),
+        "agent:x".to_string(),
+    );
+    for note in [&agent_confirmed, &human_confirmed] {
+        store.create_note(note).await.unwrap();
+    }
+
+    // An agent's confirmation moves the freshness clock, never the signature.
+    let after_agent = store
+        .confirm_note(
+            agent_confirmed.id,
+            "agent:204ce865-d253-4f59-816c-5f9d8f5ff1ac",
+        )
+        .await
+        .unwrap()
+        .expect("the note exists");
+    assert!(
+        !after_agent.is_human_confirmed(),
+        "a model does not answer for a note"
+    );
+    assert!(after_agent.last_confirmed_at.is_some());
+
+    // A person's does sign it.
+    let after_human = store
+        .confirm_note(human_confirmed.id, "julien")
+        .await
+        .unwrap()
+        .expect("the note exists");
+    assert!(after_human.is_human_confirmed());
+    assert_eq!(after_human.human_confirmed_by.as_deref(), Some("julien"));
+
+    // A superseded note is not resurrected by a confirmation: newer wins.
+    let older = Note::new(
+        Some(project),
+        NoteType::Context,
+        "une note remplacée par une plus récente.".to_string(),
+        "agent:x".to_string(),
+    );
+    store.create_note(&older).await.unwrap();
+    raw_supersede(&client, older.id).await;
+
+    let after = store
+        .confirm_note(older.id, "julien")
+        .await
+        .unwrap()
+        .expect("the note exists");
+    assert_ne!(
+        after.status,
+        NoteStatus::Active,
+        "confirming a superseded note must not bring it back"
+    );
+}
+
+/// Mark a note as superseded by another, the way `note(supersede)` does.
+async fn raw_supersede(client: &Neo4jClient, id: Uuid) {
+    let replacement = Note::new(
+        None,
+        NoteType::Tip,
+        "la version récente".to_string(),
+        "a".to_string(),
+    );
+    client.create_note(&replacement).await.unwrap();
+    client.supersede_note(id, replacement.id).await.unwrap();
 }
