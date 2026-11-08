@@ -295,9 +295,14 @@ RETURN count(n) AS processed
 ///
 /// The SELECT pages by `n.id` and takes only notes not yet stamped, so an
 /// interrupted run resumes and a second start does nothing.
+///
+/// A note a PERSON has confirmed is left alone, whatever wrote it: the demotion
+/// is a correction of an unverified claim, not a verdict on a note somebody has
+/// read and vouched for.
 const SELECT_RETYPE_AUTO_OBSERVED: &str = r#"
 MATCH (n:Note)
 WHERE n.retyped_auto_observed_at IS NULL
+  AND n.human_confirmed_at IS NULL
   AND n.id > $after
   AND ($scope IS NULL OR n.project_id = $scope)
   AND (n.created_by IN ['system/observation-detector', 'system/rfc-detector']
@@ -312,7 +317,7 @@ LIMIT $batch
 
 const WRITE_RETYPE_AUTO_OBSERVED: &str = r#"
 UNWIND $items AS item
-MATCH (n:Note) WHERE elementId(n) = item.eid
+MATCH (n:Note) WHERE elementId(n) = item.eid AND n.human_confirmed_at IS NULL
 SET n.note_type = 'observation',
     n.importance = 'low',
     n.memory_horizon = 'ephemeral',

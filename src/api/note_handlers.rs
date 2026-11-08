@@ -521,14 +521,15 @@ pub async fn create_note(
     let project_id = body.project_id;
     // The one place a person's signature can enter: the route knows whether the
     // caller is a human (`envelope::identify_caller`) or an agent session — a
-    // session's writes are stamped `agent:<uuid>` upstream.
+    // session's writes are stamped `agent:<uuid>` upstream. Fail-closed: an
+    // unrecognised caller signs nothing.
     let is_human = matches!(
         crate::chat::envelope::identify_caller(
             claims.as_ref().map(|c| &c.0),
             crate::chat::envelope::session_header(&headers),
             state.auth_config.is_some(),
         ),
-        Ok(crate::chat::envelope::SpawnCaller::Human) | Err(_)
+        Ok(crate::chat::envelope::SpawnCaller::Human)
     );
     let request = CreateNoteRequest {
         project_id,

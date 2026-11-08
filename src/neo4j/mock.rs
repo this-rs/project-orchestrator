@@ -13526,7 +13526,10 @@ impl AnalyticsStore for MockGraphStore {
             if project_id.is_some() && note.project_id != project_id {
                 continue;
             }
-            let heuristic = note.author_kind == crate::notes::NoteAuthorKind::System
+            // The same predicate as ARCHIVE_UNCONFIRMED_AUTO_OBSERVED: the two
+            // detectors by name, or the tag every detector note carries.
+            let heuristic = note.created_by == "system/observation-detector"
+                || note.created_by == "system/rfc-detector"
                 || note.tags.iter().any(|t| t == "auto-observed");
             if !heuristic {
                 continue;
@@ -13565,7 +13568,10 @@ impl AnalyticsStore for MockGraphStore {
             if note.status != crate::notes::NoteStatus::Active || note.is_human_confirmed() {
                 continue;
             }
-            let heuristic = note.author_kind == crate::notes::NoteAuthorKind::System
+            // The same predicate as ARCHIVE_UNCONFIRMED_AUTO_OBSERVED: the two
+            // detectors by name, or the tag every detector note carries.
+            let heuristic = note.created_by == "system/observation-detector"
+                || note.created_by == "system/rfc-detector"
                 || note.tags.iter().any(|t| t == "auto-observed");
             if heuristic {
                 note.status = crate::notes::NoteStatus::Archived;

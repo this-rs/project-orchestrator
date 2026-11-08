@@ -2004,11 +2004,21 @@ impl Neo4jClient {
 
     /// Confirm a note is still valid
     pub async fn confirm_note(&self, note_id: Uuid, confirmed_by: &str) -> Result<Option<Note>> {
+        // A confirmation is a SIGNATURE only when a person gives it. Agent
+        // sessions are stamped `agent:<uuid>` (see `notes::provenance`), and a
+        // heuristic under `system/`: their confirmation moves the freshness
+        // clock, never the human signature — otherwise the one field that means
+        // "a person answered for this" would be written by a model.
+        let by_human = !confirmed_by.starts_with("agent:")
+            && !confirmed_by.starts_with("system")
+            && !confirmed_by.is_empty();
         let q = query(
             r#"
             MATCH (n:Note {id: $id})
             SET n.last_confirmed_at = datetime(),
                 n.last_confirmed_by = $confirmed_by,
+                n.human_confirmed_at = CASE WHEN $by_human THEN datetime() ELSE n.human_confirmed_at END,
+                n.human_confirmed_by = CASE WHEN $by_human THEN $confirmed_by ELSE n.human_confirmed_by END,
                 n.staleness_score = 0.0,
                 // Confirming a superseded note must not resurrect it: the
                 // newer note that replaced it wins.
@@ -2026,7 +2036,8 @@ impl Neo4jClient {
             "#,
         )
         .param("id", note_id.to_string())
-        .param("confirmed_by", confirmed_by);
+        .param("confirmed_by", confirmed_by)
+        .param("by_human", by_human);
 
         let mut result = self.graph.execute(q).await?;
         if let Some(row) = result.next().await? {
@@ -3666,11 +3677,11 @@ impl Neo4jClient {
                 MATCH (n:Note)
                 WHERE n.status = 'active'
                   AND ($after_energy IS NULL
-                       OR n.energy > $after_energy
-                       OR (n.energy = $after_energy AND n.id > $after_id))
+                       OR coalesce(n.energy, 1.0) > $after_energy
+                       OR (coalesce(n.energy, 1.0) = $after_energy AND n.id > $after_id))
                 OPTIONAL MATCH (n)-[s:SYNAPSE]-()
-                RETURN n, count(s) AS synapse_count
-                ORDER BY n.energy ASC, n.id ASC
+                RETURN n, coalesce(n.energy, 1.0) AS sweep_energy, count(s) AS synapse_count
+                ORDER BY coalesce(n.energy, 1.0) ASC, n.id ASC
                 LIMIT $batch
                 "#,
             )
@@ -3687,7 +3698,15 @@ impl Neo4jClient {
                 let note = self.node_to_note(&node)?;
                 // Advance BEFORE any `continue`: a note that is left alone must
                 // still move the cursor, or the same page comes back for ever.
-                cursor = Some((note.energy, note.id.to_string()));
+                //
+                // The cursor takes the same coalesced energy the WHERE and the
+                // ORDER BY use. Reading `note.energy` here would default a note
+                // with no energy property to 1.0 and skip everything the query
+                // sorted before it.
+                cursor = Some((
+                    row.get::<f64>("sweep_energy").unwrap_or(1.0),
+                    note.id.to_string(),
+                ));
                 let synapse_count = row.get::<i64>("synapse_count").unwrap_or(0);
                 // Usage signal. `activation_count` is never incremented anywhere
                 // (0 on every note), so the "never activated for 90 days" rule

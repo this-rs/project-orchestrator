@@ -305,15 +305,14 @@ async fn load_recent_notes(
         .filter(|n| n.created_at > cutoff)
         .filter(|n| {
             let provenance = crate::notes::visibility::Provenance::of_note(n);
-            let visible = crate::notes::visibility::visibility(&provenance);
-            if !visible.vouched {
-                debug!(
-                    note_id = %n.id,
-                    reason = visible.reason,
-                    "recent knowledge: skipping an unvouched note"
-                );
+            // What is hidden is a HEURISTIC's unconfirmed note, not everything
+            // no person has signed: an agent's deliberate note is knowledge, it
+            // simply is not vouched for.
+            let hidden = provenance.is_heuristic() && !provenance.is_vouched();
+            if hidden {
+                debug!(note_id = %n.id, "recent knowledge: skipping an unconfirmed heuristic note");
             }
-            visible.vouched
+            !hidden
         })
         .take(5)
         .map(|n| note_to_summary(&n))
