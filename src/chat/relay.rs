@@ -484,6 +484,69 @@ mod tests {
         );
     }
 
+    /// RESUME across providers — the CONTENT the target model receives, not a count: with
+    /// room, every turn is there once, in order, speaker by speaker.
+    #[test]
+    fn a_relay_with_room_carries_every_turn_once_in_order() {
+        let events = vec![
+            user("ASK-ONE migrate the schema"),
+            assistant("DONE-ONE schema migrated"),
+            user("ASK-TWO add the index"),
+            assistant("DONE-TWO index added"),
+            user("ASK-THREE benchmark it"),
+        ];
+        let relay = render_relay(&events, "claude-code", "local", DEFAULT_BUDGET_CHARS);
+        assert_eq!((relay.included, relay.omitted), (5, 0));
+        let turns = [
+            "[user]\nASK-ONE migrate the schema",
+            "[assistant]\nDONE-ONE schema migrated",
+            "[user]\nASK-TWO add the index",
+            "[assistant]\nDONE-TWO index added",
+            "[user]\nASK-THREE benchmark it",
+        ];
+        let mut from = 0;
+        for turn in turns {
+            assert_eq!(relay.text.matches(turn).count(), 1, "{turn} once");
+            let at = relay.text[from..]
+                .find(turn)
+                .unwrap_or_else(|| panic!("{turn} out of order in {}", relay.text));
+            from += at + turn.len();
+        }
+        assert!(relay
+            .text
+            .trim_end()
+            .ends_with(&format!("{}\n</conversation_relay>", turns[4])));
+    }
+
+    /// Over the budget, no older turn is cut in the middle: each one is whole or gone, the
+    /// kept ones are the NEWEST contiguous run, and the first line says how many went.
+    #[test]
+    fn over_budget_a_turn_is_kept_whole_or_dropped_never_cut() {
+        let filler = "w".repeat(900);
+        let events: Vec<ChatEvent> = (0..30)
+            .map(|i| user(&format!("turn-{i:02} {filler} END-{i:02}")))
+            .collect();
+        let relay = render_relay(&events, "a", "b", MIN_BUDGET_CHARS);
+        assert!(relay.omitted > 0 && relay.included > 0);
+        let first_kept = relay.omitted;
+        for i in 0..30 {
+            let whole = format!("[user]\nturn-{i:02} {filler} END-{i:02}");
+            let part = format!("turn-{i:02} ");
+            if i >= first_kept {
+                assert!(relay.text.contains(&whole), "turn {i} must be whole");
+            } else {
+                assert!(
+                    !relay.text.contains(&part),
+                    "turn {i} must be gone, not cut"
+                );
+            }
+        }
+        assert!(relay.text.contains(&format!(
+            "[{} earlier entries of this conversation were left out",
+            relay.omitted
+        )));
+    }
+
     #[test]
     fn a_single_entry_larger_than_the_budget_is_clipped_not_dropped() {
         let relay = render_relay(
