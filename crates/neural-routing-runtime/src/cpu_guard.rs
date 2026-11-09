@@ -85,7 +85,15 @@ impl CpuGuard {
         let notify = self.notify.clone();
 
         tokio::spawn(async move {
-            let mut sys = System::new();
+            // sysinfo 0.40: `System::new()` is fallible. Without a System there is no
+            // CPU reading to act on, so say so loudly and stop this monitor.
+            let mut sys = match System::new() {
+                Ok(sys) => sys,
+                Err(err) => {
+                    tracing::error!(error = %err, "CpuGuard: sysinfo unavailable, CPU monitoring disabled");
+                    return;
+                }
+            };
             loop {
                 tokio::time::sleep(config.poll_interval).await;
 
