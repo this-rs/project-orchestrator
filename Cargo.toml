@@ -323,7 +323,7 @@ nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "5c88ef92f3
 nexus-tools = { git = "https://github.com/this-rs/nexus.git", rev = "5c88ef92f3187a31caf7f7660f5603dbac6ab4de", features = ["test-tools"] }
 # A real WebSocket client, to test the chat handler end to end (already in the lock
 # tree through axum).
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
 
 [[bin]]
 name = "orchestrator"
