@@ -63,7 +63,7 @@ futures = "0.3"
 # and 0.10 ask for ^7.2, 0.11 — the latest — for ^8.6, and only candle's main
 # branch is on 9.1.3. Bump candle and drop the patch when a release carries it.
 candle-core = "0.8"
-candle-nn = "0.8"
+candle-nn = "0.11"
 safetensors = "0.8"
 
 # Cache
