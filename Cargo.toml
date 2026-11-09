@@ -162,7 +162,7 @@ hex = "0.4"
 tempfile = "3.14"
 # Vault (src/vault): Argon2id derives a key from the user's passphrase,
 # XChaCha20-Poly1305 seals each secret, zeroize wipes keys from memory.
-argon2 = "0.5"
+argon2 = "0.6"
 chacha20poly1305 = "0.11"
 zeroize = { version = "1", features = ["derive", "serde"] }
 # Release version comparison (self-update checker)
