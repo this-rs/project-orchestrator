@@ -81,9 +81,6 @@ ignore = [
     "RUSTSEC-2024-0419",
     "RUSTSEC-2024-0420",
 
-    # zip: nothing ignored. The last copy below the fix line (1.1.4, through
-    # candle-core 0.8.4's npz loader) is gone — candle-core reads zip 9.1.3 from
-    # the local copy in vendor/candle-core (see its PATCH.md). RUSTSEC-2026-0367 /
-    # -0368 / -0369 and the October 2026 batch (CVE-2026-115905..909, dependabot
-    # alerts 47 to 51) no longer match anything here.
+    # zip: nothing ignored. candle-core 0.11.1 requires zip ^9.1.3, so no copy
+    # below the fix line is in the tree.
 ]
