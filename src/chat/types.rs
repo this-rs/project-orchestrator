@@ -407,8 +407,10 @@ pub struct ChatRequest {
     #[serde(default)]
     pub project_slug: Option<String>,
     /// What the session may do: `normal` or `read_only`. Absent: `read_only` for a
-    /// session that runs in a neutral directory (no `cwd`), `normal` for a project
-    /// session. A resume never widens it.
+    /// session that belongs to nothing — no `project_slug` and no `workspace_slug`.
+    /// Where it runs does NOT decide it: a `work` project (no source tree) and a
+    /// workspace that holds no project both run in the neutral directory and are
+    /// ordinary sessions. A resume never widens it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access: Option<SessionAccess>,
     /// Model override (default: from ChatConfig)

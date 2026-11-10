@@ -7818,13 +7818,14 @@ impl ChatManager {
         } else {
             super::neutral_place::ExecutionPlace::Project
         };
-        let access = super::provider::policy::SessionAccess::for_open(
-            request.access,
-            matches!(
-                execution_place,
-                super::neutral_place::ExecutionPlace::Neutral
-            ),
-        );
+        // Belonging, not place: a session that names no project and no workspace is
+        // read-only by default, whatever directory it runs in (`SessionAccess::for_open`).
+        let unanchored = matches!(
+            execution_place,
+            super::neutral_place::ExecutionPlace::Neutral
+        ) && request.project_slug.is_none()
+            && request.workspace_slug.is_none();
+        let access = super::provider::policy::SessionAccess::for_open(request.access, unanchored);
         let manager = Arc::clone(self);
         let spawned = request;
         let id = session_id.to_string();
@@ -8159,10 +8160,14 @@ impl ChatManager {
         };
 
         // What the session may do: fixed here, persisted on the node, kept by every resume.
-        let access = super::provider::policy::SessionAccess::for_open(
-            request.access,
-            super::neutral_place::is_neutral_path(&request.cwd),
-        );
+        // Read-only by default only for a session that belongs to NOTHING: no project and no
+        // workspace. Where it runs does not decide it (`neutral_place`: "no tool permission
+        // is derived from it"), so a `work` project — no source tree, so a neutral cwd — and
+        // a workspace that holds no project yet are ordinary sessions and can write.
+        let unanchored = super::neutral_place::is_neutral_path(&request.cwd)
+            && project_slug.is_none()
+            && request.workspace_slug.is_none();
+        let access = super::provider::policy::SessionAccess::for_open(request.access, unanchored);
         // The record both engines keep (`session_record`): the title and preview come
         // from the opening message as typed, and the memory conversation is named
         // here (a relayed session keeps the one it continues).
@@ -29983,6 +29988,61 @@ mod tests {
             SessionAccess::ReadOnly,
             "a resume does not rewrite the access"
         );
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// A `work` project has no source tree, so its conversations run in the neutral
+    /// directory like any session given no folder. They used to come out read-only —
+    /// which made the notes, plans and tasks of that very project unwritable, and left
+    /// a fresh install (where the only project one can create without a repository is
+    /// a `work` one) with an agent that could not write anything.
+    #[tokio::test]
+    async fn a_project_without_a_source_tree_is_an_ordinary_writable_session() {
+        use crate::chat::provider::policy::SessionAccess;
+        let (manager, graph, fake) = agent_manager();
+        let mut req = agent_request("hello");
+        req.cwd = String::new();
+        req.project_slug = Some("notes".into());
+        let created = manager.create_session(&req).await.unwrap();
+        let sid = created.session_id.clone();
+        let id = Uuid::parse_str(&sid).unwrap();
+
+        assert_eq!(created.access, SessionAccess::Normal);
+        let node = graph.get_chat_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            node.execution_place,
+            crate::chat::neutral_place::ExecutionPlace::Neutral,
+            "it still RUNS in the neutral directory"
+        );
+        assert_eq!(node.access, SessionAccess::Normal, "and it may write");
+        let spec = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+        assert!(!spec_refuses_writes(&spec), "the open does not deny writes");
+        assert!(!spec_po_env(&spec).contains_key(crate::auth::tool_profile::TOOL_PROFILE_ENV));
+        manager.close_session(&sid).await.unwrap();
+    }
+
+    /// A workspace that holds no project yet (a fresh install): its conversations run in
+    /// the neutral directory, and they belong to the workspace the person is in — so they
+    /// are ordinary conversations, not read-only ones.
+    #[tokio::test]
+    async fn a_workspace_without_a_project_is_an_ordinary_writable_session() {
+        use crate::chat::provider::policy::SessionAccess;
+        let (manager, graph, fake) = agent_manager();
+        let mut req = agent_request("hello");
+        req.cwd = String::new();
+        req.workspace_slug = Some("personal".into());
+        let created = manager.create_session(&req).await.unwrap();
+        let sid = created.session_id.clone();
+        let id = Uuid::parse_str(&sid).unwrap();
+
+        assert_eq!(created.access, SessionAccess::Normal);
+        assert_eq!(
+            graph.get_chat_session(id).await.unwrap().unwrap().access,
+            SessionAccess::Normal,
+            "stored as normal: every resume keeps it"
+        );
+        let spec = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+        assert!(!spec_refuses_writes(&spec));
         manager.close_session(&sid).await.unwrap();
     }
 

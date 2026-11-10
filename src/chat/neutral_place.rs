@@ -16,7 +16,10 @@
 //! - is removed when the session is closed, and the ones a crash left behind are
 //!   swept at start-up once they are older than [`ORPHAN_MAX_AGE`].
 //!
-//! It says WHERE the session runs. No tool permission is derived from it.
+//! It says WHERE the session runs. No tool permission is derived from it: the
+//! read-only default is for a session that names neither a project nor a workspace
+//! ([`crate::chat::provider::policy::SessionAccess::for_open`]), so a `work` project
+//! and a workspace that holds no project run here as ordinary, writable sessions.
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 

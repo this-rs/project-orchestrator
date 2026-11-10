@@ -128,8 +128,12 @@ pub fn tool_policy(mode: &str, allowed: &[String], disallowed: &[String]) -> Opt
 /// read-only is a deny list on top of a mode and not a mode.
 ///
 /// Where the flag comes from: the request (`access`), or the default of a session
-/// that runs in a neutral directory ([`SessionAccess::for_open`]). It is persisted
-/// on the session and a resume can only keep it or narrow it
+/// that belongs to nothing — no project and no workspace ([`SessionAccess::for_open`]).
+/// Where the session RUNS never decides it: a `work` project has no source tree and
+/// a workspace that holds no project yet both make their conversation run in the
+/// neutral directory ([`crate::chat::neutral_place`], whose contract is that the
+/// place decides no permission), and both belong to something the person chose.
+/// It is persisted on the session and a resume can only keep it or narrow it
 /// ([`SessionAccess::for_resume`]).
 ///
 /// Two layers refuse. This one, by tool NAME (native tools and the mega-tools no
@@ -204,11 +208,19 @@ impl SessionAccess {
     }
 
     /// Access of a session being OPENED. `requested` is what the client asked
-    /// (`None`: nothing). A session that runs in the neutral directory of the host
-    /// (it belongs to no project) is read-only unless the client explicitly asks for
-    /// `normal`; a project session is `normal` unless the client asks for `read_only`.
-    pub fn for_open(requested: Option<Self>, neutral: bool) -> Self {
-        requested.unwrap_or(if neutral {
+    /// (`None`: nothing). A session that belongs to NOTHING — no project and no
+    /// workspace — is read-only unless the client explicitly asks for `normal`; one
+    /// that belongs to a project or a workspace is `normal` unless the client asks
+    /// for `read_only`.
+    ///
+    /// `unanchored` is about BELONGING, never about where the session runs: see the
+    /// type doc. A conversation of a `work` project (no source tree) and one opened
+    /// from a workspace that holds no project both run in the neutral directory, and
+    /// both used to come out read-only — which made the notes of that very project
+    /// unwritable and left a fresh install with no way to have the agent write
+    /// anything.
+    pub fn for_open(requested: Option<Self>, unanchored: bool) -> Self {
+        requested.unwrap_or(if unanchored {
             Self::ReadOnly
         } else {
             Self::Normal
@@ -652,14 +664,17 @@ mod tests {
     }
 
     #[test]
-    fn a_neutral_session_is_read_only_by_default_and_a_project_session_is_normal() {
+    fn a_session_that_belongs_to_nothing_is_read_only_by_default_and_anything_else_is_normal() {
         use SessionAccess::{Normal, ReadOnly};
+        // The argument is BELONGING (no project and no workspace), not the place: the
+        // caller passes `true` for a session that names neither, whatever directory it
+        // runs in.
         assert_eq!(SessionAccess::for_open(None, true), ReadOnly);
         assert_eq!(SessionAccess::for_open(None, false), Normal);
-        // A project session can be opened read-only on request.
+        // A session that belongs to something can be opened read-only on request.
         assert_eq!(SessionAccess::for_open(Some(ReadOnly), false), ReadOnly);
         assert_eq!(SessionAccess::for_open(Some(ReadOnly), true), ReadOnly);
-        // A client that explicitly asks for normal on a neutral session gets it (the
+        // A client that explicitly asks for normal on an unanchored session gets it (the
         // read-only is a default, not a lock).
         assert_eq!(SessionAccess::for_open(Some(Normal), true), Normal);
     }
