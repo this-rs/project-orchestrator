@@ -191,12 +191,12 @@ impl Neo4jClient {
             "MATCH (fg:FeatureGraph {project_id: $pid})
              OPTIONAL MATCH (fg)-[:INCLUDES_ENTITY]->(e)
              RETURN fg, count(e) AS entity_count
-             ORDER BY fg.updated_at DESC"
+             ORDER BY fg.updated_at DESC, fg.id DESC"
         } else {
             "MATCH (fg:FeatureGraph)
              OPTIONAL MATCH (fg)-[:INCLUDES_ENTITY]->(e)
              RETURN fg, count(e) AS entity_count
-             ORDER BY fg.updated_at DESC"
+             ORDER BY fg.updated_at DESC, fg.id DESC"
         };
 
         let q = query(cypher).param(

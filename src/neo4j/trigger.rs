@@ -91,7 +91,7 @@ impl Neo4jClient {
             r#"
             MATCH (t:Trigger {plan_id: $plan_id})
             RETURN t
-            ORDER BY t.created_at DESC
+            ORDER BY t.created_at DESC, t.id DESC
             "#,
         )
         .param("plan_id", plan_id.to_string());
@@ -108,9 +108,9 @@ impl Neo4jClient {
     /// List all triggers, optionally filtered by type.
     pub async fn list_all_triggers_impl(&self, trigger_type: Option<&str>) -> Result<Vec<Trigger>> {
         let cypher = if trigger_type.is_some() {
-            "MATCH (t:Trigger) WHERE t.trigger_type = $trigger_type RETURN t ORDER BY t.created_at DESC"
+            "MATCH (t:Trigger) WHERE t.trigger_type = $trigger_type RETURN t ORDER BY t.created_at DESC, t.id DESC"
         } else {
-            "MATCH (t:Trigger) RETURN t ORDER BY t.created_at DESC"
+            "MATCH (t:Trigger) RETURN t ORDER BY t.created_at DESC, t.id DESC"
         };
 
         // Read-only scan over every Trigger: replayed on a transient error

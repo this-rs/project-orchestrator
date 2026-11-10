@@ -529,7 +529,7 @@ impl Neo4jClient {
             r#"
             MATCH (s:ProtocolState {protocol_id: $protocol_id})
             RETURN s
-            ORDER BY s.state_type, s.name
+            ORDER BY s.state_type, s.name, s.id ASC
             "#,
         )
         .param("protocol_id", protocol_id.to_string());
@@ -1140,7 +1140,7 @@ impl Neo4jClient {
             r#"
             MATCH (child:ProtocolRun)-[:CHILD_OF]->(parent:ProtocolRun {id: $parent_id})
             RETURN child
-            ORDER BY child.started_at ASC
+            ORDER BY child.started_at ASC, child.id ASC
             "#,
         )
         .param("parent_id", parent_run_id.to_string());
@@ -1184,7 +1184,7 @@ impl Neo4jClient {
             WITH root, collect(DISTINCT descendant) AS descendants
             UNWIND ([root] + descendants) AS r
             RETURN DISTINCT r
-            ORDER BY r.depth ASC, r.started_at ASC
+            ORDER BY r.depth ASC, r.started_at ASC, r.id ASC
             "#,
         )
         .param("root_id", root_run_id.to_string());
@@ -1427,7 +1427,7 @@ impl Neo4jClient {
                 e.id AS entity_id,
                 rel.produced_at AS produced_at,
                 CASE WHEN e:Note THEN coalesce(e.content, '') ELSE coalesce(e.description, '') END AS summary
-            ORDER BY rel.produced_at ASC
+            ORDER BY rel.produced_at ASC, e.id ASC
             "#,
         )
         .param("run_id", run_id.to_string());
@@ -1500,7 +1500,7 @@ impl Neo4jClient {
             WHERE r.project_id = $project_id
                OR (r.project_id IS NULL AND p.project_id = $project_id)
             RETURN r.id AS run_id
-            ORDER BY r.started_at DESC
+            ORDER BY r.started_at DESC, r.id DESC
             LIMIT 1
             "#,
         )
@@ -1522,7 +1522,7 @@ impl Neo4jClient {
             r#"
             MATCH (t:PersistedReasoningTree)-[:REASONING_FOR]->(r:ProtocolRun {id: $run_id})
             RETURN t.id AS tree_id
-            ORDER BY t.persisted_at DESC
+            ORDER BY t.persisted_at DESC, t.id DESC
             LIMIT 1
             "#,
         )
@@ -1549,7 +1549,7 @@ impl Neo4jClient {
             WHERE r.project_id = $project_id
                OR (r.project_id IS NULL AND p.project_id = $project_id)
             RETURN r
-            ORDER BY r.completed_at DESC
+            ORDER BY r.completed_at DESC, r.id DESC
             LIMIT $limit
             "#,
         )

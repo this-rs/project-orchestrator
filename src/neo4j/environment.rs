@@ -118,7 +118,7 @@ impl Neo4jClient {
             r#"
             MATCH (p:Project {id: $project_id})-[:HAS_ENVIRONMENT]->(e:Environment)
             RETURN e
-            ORDER BY e.created_at ASC, e.name ASC
+            ORDER BY e.created_at ASC, e.name ASC, e.id ASC
             "#,
         )
         .param("project_id", project_id.to_string());
@@ -390,7 +390,7 @@ impl Neo4jClient {
             WITH e, d ORDER BY d.started_at DESC, d.id DESC
             WITH e, collect(d) AS deployments
             RETURN e, deployments[0..{}] AS recent
-            ORDER BY e.created_at ASC, e.name ASC
+            ORDER BY e.created_at ASC, e.name ASC, e.id ASC
             "#,
             DEPLOYMENT_MATRIX_RECENT
         );

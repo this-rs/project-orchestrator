@@ -363,7 +363,7 @@ impl Neo4jClient {
             UNWIND all_decisions AS d
             WITH DISTINCT d
             RETURN d
-            ORDER BY d.decided_at DESC
+            ORDER BY d.decided_at DESC, d.id DESC
             LIMIT $limit
             "#,
             target_clause, affected_files_clause,
@@ -447,7 +447,7 @@ impl Neo4jClient {
             r#"
             MATCH (t:Task)-[:INFORMED_BY]->(d:Decision)
             RETURN d, t.id AS task_id
-            ORDER BY d.decided_at DESC
+            ORDER BY d.decided_at DESC, d.id DESC
             "#,
         );
 
@@ -579,7 +579,7 @@ impl Neo4jClient {
                 MATCH (d:Decision)-[:AFFECTS]->(e:{}) WHERE e.path ENDS WITH $entity_id
                 AND ($status IS NULL OR d.status = $status)
                 RETURN d
-                ORDER BY d.decided_at DESC
+                ORDER BY d.decided_at DESC, d.id DESC
                 "#,
                 entity_type
             )
@@ -590,7 +590,7 @@ impl Neo4jClient {
                 MATCH (d:Decision)-[:AFFECTS]->(e:{} {{{}: $entity_id}})
                 WHERE ($status IS NULL OR d.status = $status)
                 RETURN d
-                ORDER BY d.decided_at DESC
+                ORDER BY d.decided_at DESC, d.id DESC
                 "#,
                 entity_type, match_field
             )
@@ -879,7 +879,7 @@ impl Neo4jClient {
             WITH d, [n IN nodes(chain) WHERE n <> d | n.id] AS chain_ids
             OPTIONAL MATCH (newer)-[:SUPERSEDES]->(d)
             RETURN d, chain_ids, newer.id AS superseded_by
-            ORDER BY d.decided_at DESC
+            ORDER BY d.decided_at DESC, d.id DESC
             "#,
             where_clause
         );

@@ -492,7 +492,7 @@ impl Neo4jClient {
                    f.path AS file_path,
                    s.visibility AS visibility,
                    s.line_start AS line_start
-            ORDER BY f.path, s.line_start
+            ORDER BY f.path, s.line_start, s.id ASC
             LIMIT $limit
             "#,
         )
@@ -2751,7 +2751,7 @@ impl Neo4jClient {
             RETURN DISTINCT ancestor.name AS name,
                    ancestor.path AS path,
                    depth
-            ORDER BY depth ASC
+            ORDER BY depth ASC, ancestor.path ASC
             "#,
             max_depth
         ))
@@ -2781,7 +2781,7 @@ impl Neo4jClient {
             RETURN DISTINCT descendant.name AS name,
                    descendant.path AS path,
                    depth
-            ORDER BY depth ASC
+            ORDER BY depth ASC, descendant.path ASC
             "#,
             max_depth
         ))
@@ -2818,7 +2818,7 @@ impl Neo4jClient {
             RETURN DISTINCT child.name AS name,
                    child.path AS path,
                    depth
-            ORDER BY depth ASC, name ASC
+            ORDER BY depth ASC, name ASC, child.path ASC
             "#,
         )
         .param("class_name", class_name);
@@ -2851,7 +2851,7 @@ impl Neo4jClient {
             RETURN DISTINCT type.name AS name,
                    type.path AS path,
                    labels(type) AS labels
-            ORDER BY name ASC
+            ORDER BY name ASC, type.path ASC
             "#,
         )
         .param("interface_name", interface_name);
@@ -2886,7 +2886,7 @@ impl Neo4jClient {
                    p.entry_point_id AS entry_point,
                    p.terminal_id AS terminal,
                    step_count
-            ORDER BY step_count DESC
+            ORDER BY step_count DESC, p.id DESC
             "#,
         )
         .param("project_id", project_id.to_string());
@@ -2919,7 +2919,7 @@ impl Neo4jClient {
             MATCH (p:Process {id: $process_id})
             OPTIONAL MATCH (p)-[s:STEP_IN_PROCESS]->(f:Function)
             WITH p, f, s
-            ORDER BY s.order ASC
+            ORDER BY s.order ASC, f.id ASC
             RETURN p.id AS id,
                    p.label AS label,
                    p.process_type AS process_type,
@@ -2990,7 +2990,7 @@ impl Neo4jClient {
                    f.id AS id,
                    in_degree,
                    out_degree
-            ORDER BY out_degree DESC
+            ORDER BY out_degree DESC, f.id DESC
             LIMIT $limit
             "#,
         )
@@ -3044,7 +3044,7 @@ impl Neo4jClient {
             r#"
             MATCH (f:File {path: $path})-[:CONTAINS]->(func:Function)
             RETURN func
-            ORDER BY func.line_start
+            ORDER BY func.line_start, func.id ASC
             "#,
         )
         .param("path", path);
@@ -3096,7 +3096,7 @@ impl Neo4jClient {
             r#"
             MATCH (f:File {path: $path})-[:CONTAINS]->(s:Struct)
             RETURN s
-            ORDER BY s.line_start
+            ORDER BY s.line_start, s.id ASC
             "#,
         )
         .param("path", path);
@@ -3129,7 +3129,7 @@ impl Neo4jClient {
             r#"
             MATCH (f:File {path: $path})-[:CONTAINS]->(i:Import)
             RETURN i.path AS path
-            ORDER BY i.line
+            ORDER BY i.line, i.id ASC
             "#,
         )
         .param("path", path);
@@ -3525,7 +3525,7 @@ impl Neo4jClient {
             r#"
             MATCH (f:File)
             RETURN f.language AS language, count(f) AS count
-            ORDER BY count DESC
+            ORDER BY count DESC, language ASC
             "#,
         );
 
@@ -3556,7 +3556,7 @@ impl Neo4jClient {
             MATCH (f:File)
             WHERE f.project_id = $project_id
             RETURN f.language AS language, count(f) AS count
-            ORDER BY count DESC
+            ORDER BY count DESC, language ASC
             "#,
         )
         .param("project_id", project_id.to_string());
@@ -3584,7 +3584,7 @@ impl Neo4jClient {
             r#"
             MATCH (f:File)<-[:IMPORTS]-(importer:File)
             RETURN f.path AS path, count(importer) AS imports
-            ORDER BY imports DESC
+            ORDER BY imports DESC, f.path ASC
             LIMIT $limit
             "#,
         )
@@ -3616,7 +3616,7 @@ impl Neo4jClient {
             RETURN f.path AS path, imports, dependents, imports + dependents AS connections,
                    f.pagerank AS pagerank, f.betweenness AS betweenness,
                    f.community_label AS community_label, f.community_id AS community_id
-            ORDER BY COALESCE(f.pagerank, 0) DESC, connections DESC
+            ORDER BY COALESCE(f.pagerank, 0) DESC, connections DESC, f.path ASC
             LIMIT $limit
             "#,
         )
@@ -3658,7 +3658,7 @@ impl Neo4jClient {
             RETURN f.path AS path, imports, dependents, imports + dependents AS connections,
                    f.pagerank AS pagerank, f.betweenness AS betweenness,
                    f.community_label AS community_label, f.community_id AS community_id
-            ORDER BY COALESCE(f.pagerank, 0) DESC, connections DESC
+            ORDER BY COALESCE(f.pagerank, 0) DESC, connections DESC, f.path ASC
             LIMIT $limit
             "#,
         )
@@ -4345,14 +4345,14 @@ impl Neo4jClient {
             MATCH (f:File {path: $path})<-[:CONTAINS]-(p:Project {id: $project_id})
             MATCH (f)-[r:CO_CHANGED]-(co:File)
             WHERE EXISTS { MATCH (co)<-[:CONTAINS]-(p) }
-            WITH f, co ORDER BY r.count DESC LIMIT 10
+            WITH f, co ORDER BY r.count DESC, f.path, co.path LIMIT 10
 
             // For each co-changer, find shortest structural path (IMPORTS|CALLS between files)
             OPTIONAL MATCH sp = shortestPath((f)-[:IMPORTS|CALLS*1..5]-(co))
             WITH co.path AS co_path,
                  CASE WHEN sp IS NOT NULL THEN 1.0 / length(sp) ELSE 0.0 END AS proximity
             RETURN co_path, proximity
-            ORDER BY proximity DESC
+            ORDER BY proximity DESC, co_path ASC
             "#,
         )
         .param("path", file_path)
@@ -4521,7 +4521,7 @@ impl Neo4jClient {
             WHERE size(all_files) > 0
             UNWIND all_files AS f
             WITH f, max_pr, max_bt
-            ORDER BY f.cc_pagerank DESC LIMIT 10
+            ORDER BY f.cc_pagerank DESC, f.path DESC LIMIT 10
 
             // Count structural connections (IMPORTS in/out)
             OPTIONAL MATCH (f)-[:IMPORTS]->(imp_out:File)

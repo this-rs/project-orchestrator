@@ -102,7 +102,7 @@ impl Neo4jClient {
             r#"
             MATCH (p:Project)
             RETURN p
-            ORDER BY p.name
+            ORDER BY p.name, p.id ASC
             "#,
         );
 
@@ -648,7 +648,7 @@ impl Neo4jClient {
             r#"
             MATCH (project:Project {id: $project_id})-[:HAS_PLAN]->(p:Plan)-[:HAS_TASK]->(t:Task)
             RETURN t
-            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at
+            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at, t.id ASC
             "#,
         )
         .param("project_id", project_id.to_string());
@@ -703,7 +703,7 @@ impl Neo4jClient {
             MATCH (p:Project)
             {}
             RETURN p
-            ORDER BY {} {}
+            ORDER BY {} {}, p.id
             SKIP {}
             LIMIT {}
             "#,

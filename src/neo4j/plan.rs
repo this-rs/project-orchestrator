@@ -293,7 +293,7 @@ impl Neo4jClient {
             MATCH (p:Plan)
             WHERE p.status IN ['Draft', 'Approved', 'InProgress']
             RETURN p
-            ORDER BY p.priority DESC, p.created_at DESC
+            ORDER BY p.priority DESC, p.created_at DESC, p.id DESC
             "#,
         );
 
@@ -315,7 +315,7 @@ impl Neo4jClient {
             MATCH (project:Project {id: $project_id})-[:HAS_PLAN]->(p:Plan)
             WHERE p.status IN ['Draft', 'Approved', 'InProgress']
             RETURN p
-            ORDER BY p.priority DESC, p.created_at DESC
+            ORDER BY p.priority DESC, p.created_at DESC, p.id DESC
             "#,
         )
         .param("project_id", project_id.to_string());
@@ -385,7 +385,7 @@ impl Neo4jClient {
             MATCH (project:Project {{id: $project_id}})-[:HAS_PLAN]->(p:Plan)
             WHERE true {}
             RETURN p
-            ORDER BY p.priority DESC, p.created_at DESC
+            ORDER BY p.priority DESC, p.created_at DESC, p.id DESC
             SKIP $offset
             LIMIT $limit
             "#,
@@ -1202,7 +1202,7 @@ impl Neo4jClient {
             {}
             {}
             RETURN DISTINCT p
-            ORDER BY {} {}
+            ORDER BY {} {}, p.id
             SKIP {}
             LIMIT {}
             "#,
@@ -1239,7 +1239,7 @@ impl Neo4jClient {
              RETURN p.id AS id, 'plan' AS type, p.title AS label,
                     p.status AS status, p.priority AS priority,
                     null AS target_date, null AS version, null AS description, null AS step_order
-             ORDER BY p.priority DESC
+             ORDER BY p.priority DESC, p.id DESC
              LIMIT $lim
 
              UNION ALL

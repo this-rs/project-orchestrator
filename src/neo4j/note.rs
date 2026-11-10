@@ -1269,7 +1269,7 @@ impl Neo4jClient {
                 WHERE e.{} ENDS WITH $entity_id
                   AND n.status IN ['active', 'needs_review']
                 RETURN n
-                ORDER BY n.importance DESC, n.created_at DESC
+                ORDER BY n.importance DESC, n.created_at DESC, n.id DESC
                 "#,
                 node_label, match_field
             )
@@ -1279,7 +1279,7 @@ impl Neo4jClient {
                 MATCH (n:Note)-[:LINKED_TO]->(e:{} {{{}: $entity_id}})
                 WHERE n.status IN ['active', 'needs_review']
                 RETURN n
-                ORDER BY n.importance DESC, n.created_at DESC
+                ORDER BY n.importance DESC, n.created_at DESC, n.id DESC
                 "#,
                 node_label, match_field
             )
@@ -1953,7 +1953,7 @@ impl Neo4jClient {
             MATCH (n:Note)-[:LINKED_TO]->(w)
             WHERE n.status IN ['active', 'needs_review']
             RETURN n, w.name AS workspace_name
-            ORDER BY n.importance DESC, n.created_at DESC
+            ORDER BY n.importance DESC, n.created_at DESC, n.id DESC
             "#,
         )
         .param("project_id", project_id.to_string());
@@ -2070,7 +2070,7 @@ impl Neo4jClient {
             WHERE n.status IN ['needs_review', 'stale']
             {}
             RETURN n
-            ORDER BY n.staleness_score DESC, n.importance DESC
+            ORDER BY n.staleness_score DESC, n.importance DESC, n.id DESC
             LIMIT 500
             "#,
             scope
