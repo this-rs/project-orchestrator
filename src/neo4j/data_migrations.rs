@@ -180,7 +180,7 @@ UNWIND grp AS s
 WITH p, n, s,
      COUNT {{ (s)<-[:MEMBER_OF|MEMBER_OF_SKILL]-() }} AS members,
      COUNT {{ (s)<-[:{SKILL_REFERENCES}]-() }} + COUNT {{ (pr:Protocol) WHERE pr.skill_id = s.id }} AS refs
-ORDER BY p, n, members DESC, refs DESC, s.created_at ASC
+ORDER BY p, n, members DESC, refs DESC, s.created_at ASC, s.id ASC
 WITH p, n, collect({{skill: s, refs: refs}}) AS ranked
 UNWIND tail(ranked) AS r
 WITH r WHERE r.refs = 0
@@ -373,7 +373,7 @@ WHERE ($scope IS NULL OR n.project_id = $scope)
        OR 'auto-observed' IN coalesce(n.tags, []))
 RETURN n.status AS status, n.note_type AS note_type, n.importance AS importance,
        count(n) AS notes, toInteger(coalesce(avg(size(n.content)), 0)) AS avg_size
-ORDER BY notes DESC
+ORDER BY notes DESC, status, note_type, importance
 "#;
 
 /// Archive (never delete) the detector notes nobody has confirmed.
