@@ -5172,8 +5172,10 @@ mod tests {
 
     #[test]
     fn require_accepts_a_supported_capability() {
-        let mut caps = StoreCapabilities::default();
-        caps.vector_search = true;
+        let caps = StoreCapabilities {
+            vector_search: true,
+            ..Default::default()
+        };
         assert!(
             caps.require("test-backend", Capability::VectorSearch)
                 .is_ok(),
@@ -5188,13 +5190,16 @@ mod tests {
 
     #[test]
     fn supports_mirrors_the_manifest_flags() {
-        let mut caps = StoreCapabilities::default();
-        assert!(!caps.supports(Capability::VectorSearch));
-        assert!(!caps.supports(Capability::CompositeUnique));
-        assert!(!caps.supports(Capability::DatetimeArithmetic));
-        caps.vector_search = true;
-        caps.composite_unique = true;
-        caps.datetime_arithmetic = true;
+        let empty = StoreCapabilities::default();
+        assert!(!empty.supports(Capability::VectorSearch));
+        assert!(!empty.supports(Capability::CompositeUnique));
+        assert!(!empty.supports(Capability::DatetimeArithmetic));
+        let caps = StoreCapabilities {
+            vector_search: true,
+            composite_unique: true,
+            datetime_arithmetic: true,
+            ..Default::default()
+        };
         assert!(caps.supports(Capability::VectorSearch));
         assert!(caps.supports(Capability::CompositeUnique));
         assert!(caps.supports(Capability::DatetimeArithmetic));
