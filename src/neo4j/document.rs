@@ -695,6 +695,8 @@ impl Neo4jClient {
         project_id: Option<Uuid>,
         min_similarity: Option<f64>,
     ) -> Result<Vec<DocumentChunkHit>> {
+        self.capabilities()
+            .require("Neo4j", Capability::VectorSearch)?;
         let embedding_f64: Vec<f64> = embedding.iter().map(|&v| v as f64).collect();
 
         // Over-fetch, since project filtering and the similarity floor are

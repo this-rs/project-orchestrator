@@ -504,6 +504,8 @@ impl Neo4jClient {
         limit: usize,
         project_id: Option<&str>,
     ) -> Result<Vec<(DecisionNode, f64)>> {
+        self.capabilities()
+            .require("Neo4j", Capability::VectorSearch)?;
         let embedding_f64: Vec<f64> = query_embedding.iter().map(|&x| x as f64).collect();
 
         // When filtering by project, overfetch x3 then filter post-query

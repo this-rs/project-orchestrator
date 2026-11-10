@@ -443,6 +443,12 @@ impl Neo4jClient {
 
     /// Initialize the graph schema with constraints and indexes
     async fn init_schema(&self) -> Result<()> {
+        // The composite constraints below (anchor_session_target, day_plan_key,
+        // routing_arm_key, …) only hold if the engine actually enforces them. A
+        // backend without `composite_unique` would accept the schema but allow
+        // duplicate rows silently — fail loud instead.
+        self.capabilities()
+            .require("Neo4j", Capability::CompositeUnique)?;
         let constraints = vec![
             // Project constraints
             "CREATE CONSTRAINT project_id IF NOT EXISTS FOR (p:Project) REQUIRE p.id IS UNIQUE",

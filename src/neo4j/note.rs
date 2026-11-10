@@ -2106,6 +2106,8 @@ impl Neo4jClient {
     /// a half-life of ~20.8 days). This means actively-maintained
     /// code keeps its linked notes fresher.
     pub async fn update_staleness_scores(&self) -> Result<usize> {
+        self.capabilities()
+            .require("Neo4j", Capability::DatetimeArithmetic)?;
         // This updates staleness based on time since last confirmation,
         // with a freshness discount from recent commit touches.
         let q = query(
@@ -2360,6 +2362,8 @@ impl Neo4jClient {
         workspace_slug: Option<&str>,
         min_similarity: Option<f64>,
     ) -> Result<Vec<(Note, f64)>> {
+        self.capabilities()
+            .require("Neo4j", Capability::VectorSearch)?;
         // Convert f32 to f64 for neo4rs
         let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
 
@@ -2567,6 +2571,8 @@ impl Neo4jClient {
         limit: usize,
         project_id: Option<Uuid>,
     ) -> Result<Vec<(String, f64)>> {
+        self.capabilities()
+            .require("Neo4j", Capability::VectorSearch)?;
         let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
         let query_limit = (limit * 3) as i64; // over-fetch for post-filtering
 
@@ -2617,6 +2623,8 @@ impl Neo4jClient {
         limit: usize,
         project_id: Option<Uuid>,
     ) -> Result<Vec<(String, String, f64)>> {
+        self.capabilities()
+            .require("Neo4j", Capability::VectorSearch)?;
         let embedding_f64: Vec<f64> = embedding.iter().map(|&x| x as f64).collect();
         let query_limit = (limit * 3) as i64;
 
@@ -2956,6 +2964,8 @@ impl Neo4jClient {
     /// (its energy is current as of now). Notes decaying below 0.05 are
     /// floored to 0.0 ("dead neuron").
     pub async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
+        self.capabilities()
+            .require("Neo4j", Capability::DatetimeArithmetic)?;
         // Notes of dormant projects are only stamped: their energy is frozen
         // while nobody works on the project, and decay resumes from the
         // moment it is active again (see dormant_project_ids).
@@ -3351,6 +3361,8 @@ impl Neo4jClient {
         scope: Option<String>,
         dormant: Vec<String>,
     ) -> Result<PassReport> {
+        self.capabilities()
+            .require("Neo4j", Capability::DatetimeArithmetic)?;
         // The scope guard, spliced into both queries. A project pass walks only
         // its own notes; the global pass walks everything except the dormant
         // projects.
