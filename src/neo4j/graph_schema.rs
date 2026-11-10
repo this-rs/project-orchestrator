@@ -116,7 +116,7 @@ impl Neo4jClient {
              WITH i, relationships(p)[i] AS r, nodes(p)[i + 1] AS n \
              RETURN i + 1 AS depth, type(r) AS edge, labels(n)[0] AS label, \
                     n.id AS id, coalesce(n.title, n.name, n.slug, n.path) AS title \
-             ORDER BY depth LIMIT 200"
+             ORDER BY depth, n.id ASC LIMIT 200"
         );
         let mut rows = self
             .graph

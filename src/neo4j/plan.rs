@@ -621,8 +621,8 @@ impl Neo4jClient {
             WHERE NOT EXISTS { MATCH (:Task)-[:DEPENDS_ON]->(end) }
             MATCH path = (start)<-[:DEPENDS_ON*0..]-(end)
             WHERE ALL(node IN nodes(path) WHERE (p)-[:HAS_TASK]->(node))
-            WITH path, length(path) AS pathLength
-            ORDER BY pathLength DESC
+            WITH path, length(path) AS pathLength, [n IN nodes(path) | n.id] AS path_ids
+            ORDER BY pathLength DESC, path_ids DESC
             LIMIT 1
             UNWIND nodes(path) AS task
             RETURN DISTINCT task
@@ -720,7 +720,7 @@ impl Neo4jClient {
                    s.description AS description,
                    s.status AS status,
                    s.verification AS verification
-            ORDER BY tid, step_order
+            ORDER BY tid, step_order, s.id ASC
             "#,
         )
         .param("task_ids", task_ids.to_vec());
@@ -795,7 +795,7 @@ impl Neo4jClient {
             RETURN tid,
                    f.path AS file_path,
                    sum(d.mention_count) AS mention_count
-            ORDER BY tid, mention_count DESC
+            ORDER BY tid, mention_count DESC, file_path DESC
             "#,
         )
         .param("task_ids", task_ids.to_vec());
