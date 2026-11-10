@@ -17940,17 +17940,27 @@ mod zombie_cli_real_kill {
     /// 1. while the CLI LIVES, `provider_is_dead()` answers false — nexus answers the probe
     ///    `invalid_request` (no such background task), nothing is signalled and the idle
     ///    session keeps its slot. A session that says nothing is not a session that is gone;
-    /// 2. once the process is SIGKILLed, the same call answers `ProcessExited` — the constat,
-    ///    taken from the transport, with no event involved — and the manager's sweep harvests
-    ///    the session with `process_died`, freeing its slot. Measured below: the time from the
-    ///    kill to the observation, which is what bounds the harvest (the watchdog ticks every
-    ///    `DEAD_CLI_WATCH_INTERVAL` = 5 s).
+    /// 2. once the process is SIGKILLed, the session is harvested with `process_died` and its
+    ///    slot freed, within the watchdog's budget. Measured below: the time from the kill to
+    ///    the harvest (the watchdog ticks every `DEAD_CLI_WATCH_INTERVAL` = 5 s).
     ///
-    /// The announcement path (nexus's own `ProcessExited` frame, read out of turn) is the
-    /// other test's subject. Here the sweep is called DIRECTLY rather than through the
-    /// watchdog, so which of the two paths answered first cannot make the test flaky.
+    /// WHAT THIS TEST DOES NOT PROVE — written here because an independent review (10/11/2026,
+    /// finding 1) showed the first version of this comment was false: a clean `SIGKILL` of an
+    /// idle CLI ends the transport's stream, which fires BOTH paths — the constat this PR adds
+    /// AND the out-of-turn `ProcessExited` announcement that already existed. Either can
+    /// answer, so this test also passes WITHOUT the constat (the pre-existing
+    /// `a_real_cli_killed_while_idle_closes_its_session_and_is_reaped` already covered this
+    /// very scenario). It is an OUTCOME proof — a real CLI, really killed, really harvested —
+    /// not a provenance proof.
+    ///
+    /// PROVENANCE is proven where the announcement is held out of the picture, and those
+    /// tests fail without the constat:
+    /// `agent_runtime::provider_dead_tests::a_process_that_vanished_without_a_word_is_observed_and_not_waited_for`
+    /// (a fake provider with no out-of-turn pump) and the manager's
+    /// `agent_path_a_dead_provider_process_is_harvested_though_no_event_announced_it` (the
+    /// announced flag is held false; the sweep still harvests).
     #[tokio::test]
-    async fn a_real_cli_killed_while_idle_is_observed_dead_rather_than_awaited() {
+    async fn a_real_cli_killed_while_idle_is_harvested_within_the_watchdog_budget() {
         let dir = tempfile::tempdir().unwrap();
         let (manager, _graph, sid, pid, _marker) = an_idle_session_on_a_real_cli(&dir).await;
         let handle = manager

@@ -1361,6 +1361,15 @@ impl AgentSessionHandle {
     ///
     /// Cheap enough to be asked at every tick of the dead-CLI watchdog: a lock on the
     /// session's own state, no I/O, no network, nothing written to the provider.
+    ///
+    /// LIMIT, named rather than left to be discovered: the transport decides a session is dead
+    /// when the CLI's OUTPUT ENDS (EOF of the child's stdout), not by watching the pid — there
+    /// is no `kill(pid, 0)` and no `waitpid` under it. A grandchild that inherited the CLI's
+    /// stdout keeps that EOF from ever arriving (the trap already documented in the note
+    /// « Foreground interrupt ne tue PAS les process-enfants »), and this then answers "not
+    /// dead" while the process is gone. The measured case of 10/11/2026 is the OTHER one — a
+    /// CLI gone whose EOF was seen but whose announcement reached no one — so this fixes that
+    /// and does not pretend to fix the inherited-pipe case.
     pub(crate) async fn provider_is_dead(&self) -> bool {
         if self.provider_death_announced() {
             return true;
