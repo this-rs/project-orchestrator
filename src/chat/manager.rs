@@ -1116,6 +1116,11 @@ pub struct ChatManager {
     pub(crate) event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
     /// Optional NATS emitter for cross-instance chat event publishing
     pub(crate) nats: Option<Arc<crate::events::NatsEmitter>>,
+    /// Chat transport for cross-instance chat-event publish/subscribe, as a
+    /// trait object: NATS-backed when configured, none otherwise. A first
+    /// increment routes only `publish_chat_event`/`subscribe_chat_events`
+    /// through it; the remaining control signals still use `nats`.
+    pub(crate) chat_transport: Option<Arc<dyn crate::events::ChatTransport>>,
     /// Runtime-mutable permission config (updated via REST API)
     pub(crate) permission_config: Arc<RwLock<super::config::PermissionConfig>>,
     /// Path to config.yaml for persisting permission changes (None = no persistence)
@@ -1939,7 +1944,7 @@ pub(crate) struct ManagerTurnServices {
     turn_routing: Arc<super::agent_hooks::TurnRouting>,
     /// Where the images attached to a message are read.
     documents: crate::documents::store::DocumentStore,
-    nats: Option<Arc<crate::events::NatsEmitter>>,
+    nats: Option<Arc<dyn crate::events::ChatTransport>>,
     /// The anchor state of the manager when these services were built.
     anchor: super::anchor_resolver::AnchorSession,
     /// The session's state for the end of its turns, as `ActiveSession` holds it on
@@ -3940,6 +3945,7 @@ impl ChatManager {
             event_emitter: None,
             vault: None,
             nats: None,
+            chat_transport: None,
             permission_config,
             config_yaml_path: None,
             host_home: dirs::home_dir(),
@@ -4060,6 +4066,7 @@ impl ChatManager {
             event_emitter: None,
             vault: None,
             nats: None,
+            chat_transport: None,
             permission_config,
             config_yaml_path: None,
             host_home: dirs::home_dir(),
@@ -4720,6 +4727,8 @@ impl ChatManager {
     /// broadcast channel, enabling multi-instance real-time sync.
     /// Interrupts are also propagated via NATS to all instances.
     pub fn with_nats(mut self, nats: Arc<crate::events::NatsEmitter>) -> Self {
+        let transport: Arc<dyn crate::events::ChatTransport> = nats.clone();
+        self.chat_transport = Some(transport);
         self.nats = Some(nats);
         self
     }
@@ -8782,8 +8791,8 @@ impl ChatManager {
             content: request.message.clone(),
         };
         let _ = events_tx.send(user_msg_event.clone());
-        if let Some(ref nats) = self.nats {
-            nats.publish_chat_event(&session_id.to_string(), user_msg_event);
+        if let Some(ref transport) = self.chat_transport {
+            transport.publish_chat_event(&session_id.to_string(), user_msg_event);
         }
         self.notify_attention(&session_id.to_string(), AttentionReason::UserMessage);
 
@@ -11032,7 +11041,9 @@ impl ChatManager {
             session_uuid,
             active_sessions: active_sessions.clone(),
             events_tx: events_tx.clone(),
-            nats: nats.clone(),
+            chat_transport: nats
+                .clone()
+                .map(|n| n as Arc<dyn crate::events::ChatTransport>),
             next_seq: next_seq.clone(),
             interrupt_flag: interrupt_flag.clone(),
             interrupt_token: interrupt_token.clone(),
@@ -11360,8 +11371,8 @@ impl ChatManager {
             content: message.to_string(),
         };
         let _ = events_tx.send(user_msg_event.clone());
-        if let Some(ref nats) = self.nats {
-            nats.publish_chat_event(session_id, user_msg_event);
+        if let Some(ref transport) = self.chat_transport {
+            transport.publish_chat_event(session_id, user_msg_event);
         }
         self.notify_attention(session_id, AttentionReason::UserMessage);
 
@@ -11653,8 +11664,8 @@ impl ChatManager {
             content: text.to_string(),
         };
         let _ = events_tx.send(team_event.clone());
-        if let Some(ref nats) = self.nats {
-            nats.publish_chat_event(to_session_id, team_event);
+        if let Some(ref transport) = self.chat_transport {
+            transport.publish_chat_event(to_session_id, team_event);
         }
 
         // Spawn stream_response: the team message IS the turn prompt.
@@ -11757,8 +11768,8 @@ impl ChatManager {
     ) {
         let event = ChatEvent::PendingQueue { messages };
         let _ = events_tx.send(event.clone());
-        if let Some(ref nats) = self.nats {
-            nats.publish_chat_event(session_id, event);
+        if let Some(ref transport) = self.chat_transport {
+            transport.publish_chat_event(session_id, event);
         }
     }
 
@@ -12941,8 +12952,8 @@ impl ChatManager {
         if let Some((_, events_tx)) = live {
             let _ = events_tx.send(event.clone());
         }
-        if let Some(nats) = &self.nats {
-            nats.publish_chat_event(session_id, event);
+        if let Some(transport) = &self.chat_transport {
+            transport.publish_chat_event(session_id, event);
         }
     }
 
@@ -14096,8 +14107,8 @@ impl ChatManager {
 
         // Emit the inbound event on local broadcast + NATS
         let _ = events_tx.send(inbound.clone());
-        if let Some(ref nats) = self.nats {
-            nats.publish_chat_event(session_id, inbound);
+        if let Some(ref transport) = self.chat_transport {
+            transport.publish_chat_event(session_id, inbound);
         }
         if team.is_none() {
             self.notify_attention(session_id, AttentionReason::UserMessage);
@@ -15216,8 +15227,8 @@ impl ChatManager {
         // instance holds the session and just did it; publishing it reached this
         // instance's own listener, which signalled the tools a second time and
         // counted the cap twice (review N8).
-        if let Some(ref nats) = self.nats {
-            nats.publish_chat_event(session_id, event);
+        if let Some(ref transport) = self.chat_transport {
+            transport.publish_chat_event(session_id, event);
         }
 
         Ok(CancelToolsResult {
@@ -18325,7 +18336,7 @@ impl ChatManager {
             enrichment_pipeline: self.enrichment_pipeline.clone(),
             turn_routing: Arc::clone(&self.turn_routing),
             documents: self.document_store.clone(),
-            nats: self.nats.clone(),
+            nats: self.chat_transport.clone(),
             anchor: self.anchor_session(),
             session,
             search: self.search.clone(),
@@ -19964,8 +19975,8 @@ impl ChatManager {
                 reason: Some(reason.to_string()),
             };
             let _ = events_tx.send(closed.clone());
-            if let Some(ref nats) = self.nats {
-                nats.publish_chat_event(session_id, closed);
+            if let Some(ref transport) = self.chat_transport {
+                transport.publish_chat_event(session_id, closed);
             }
         }
 

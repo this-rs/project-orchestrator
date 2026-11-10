@@ -76,6 +76,7 @@ pub mod activity;
 pub mod attention;
 pub mod builtin_triggers;
 mod bus;
+pub mod chat_transport;
 pub mod graph;
 mod hybrid;
 pub mod ingestion;
@@ -95,15 +96,14 @@ pub use activity::{
     ACTIVITY_BUFFER_CAPACITY,
 };
 pub use bus::EventBus;
+pub use chat_transport::{ChatTransport, InMemoryChatTransport, RelayFailure, StreamingSnapshot};
 pub use graph::{ActivationTarget, GraphEvent, GraphEventType, GraphLayer};
 pub use hybrid::HybridEmitter;
 pub use ingestion::{
     IngestionCounters, IngestionPhase, IngestionProgress, IngestionReporter, IngestionSummary,
     IngestionSynced, INGESTION_PROGRESS_INTERVAL,
 };
-pub use nats::{
-    connect_nats, ChatRpcRequest, ChatRpcResponse, NatsEmitter, RelayFailure, StreamingSnapshot,
-};
+pub use nats::{connect_nats, ChatRpcRequest, ChatRpcResponse, NatsEmitter};
 #[allow(deprecated)]
 pub use notifier::EventNotifier;
 pub use reactions::register_builtin_reactions;

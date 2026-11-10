@@ -328,7 +328,7 @@ pub(crate) struct PostStreamHandler {
     pub session_uuid: Option<Uuid>,
     pub active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
     pub events_tx: broadcast::Sender<ChatEvent>,
-    pub nats: Option<Arc<crate::events::NatsEmitter>>,
+    pub chat_transport: Option<Arc<dyn crate::events::ChatTransport>>,
     pub next_seq: Arc<AtomicI64>,
     pub interrupt_flag: Arc<AtomicBool>,
     pub interrupt_token: CancellationToken,
@@ -346,8 +346,8 @@ impl PostStreamHandler {
     /// Emit a ChatEvent to local broadcast + NATS (if configured).
     fn emit_chat(&self, event: ChatEvent) {
         let _ = self.events_tx.send(event.clone());
-        if let Some(ref nats) = self.nats {
-            nats.publish_chat_event(&self.session_id, event);
+        if let Some(ref transport) = self.chat_transport {
+            transport.publish_chat_event(&self.session_id, event);
         }
     }
 
@@ -1857,7 +1857,7 @@ mod integration_tests {
             session_uuid: Some(Uuid::new_v4()),
             active_sessions,
             events_tx,
-            nats: None,
+            chat_transport: None,
             next_seq: Arc::new(AtomicI64::new(0)),
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             interrupt_token: CancellationToken::new(),

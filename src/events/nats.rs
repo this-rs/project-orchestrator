@@ -12,6 +12,7 @@ use crate::chat::types::ChatEvent;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use super::chat_transport::{ChatTransport, RelayFailure, StreamingSnapshot};
 use super::transport::{Message, Subject, Subscriber};
 use futures::StreamExt;
 
@@ -47,34 +48,6 @@ pub struct ChatRpcResponse {
 /// provider (the native harness calls `TaskStop` of `nexus-tools`, Claude Code
 /// may wait for the task's process to be identified).
 pub const CANCEL_TASK_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Why a cancel asked of another instance came back without an answer
-/// ([`NatsEmitter::request_cancel`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RelayFailure {
-    /// Nobody subscribes to the subject: no instance holds the session live.
-    NoResponders,
-    /// No answer within the timeout: the owner is there but did not answer.
-    TimedOut,
-    /// The request could not be sent or read.
-    Transport(String),
-}
-
-// ============================================================================
-// Streaming snapshot types
-// ============================================================================
-
-/// Snapshot of a streaming session's current state, used for cross-instance mid-stream join.
-///
-/// When a client connects to a remote instance (one that doesn't own the streaming session),
-/// this struct is returned via NATS request/reply so the client can reconstruct the
-/// in-progress assistant turn.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StreamingSnapshot {
-    pub is_streaming: bool,
-    pub partial_text: String,
-    pub events: Vec<ChatEvent>,
-}
 
 /// NATS event emitter that publishes CrudEvents to NATS subjects.
 ///
@@ -678,6 +651,62 @@ pub async fn connect_nats(url: &str) -> anyhow::Result<async_nats::Client> {
         .map_err(|e| anyhow::anyhow!("Failed to connect to NATS at {}: {}", url, e))?;
     tracing::info!("Connected to NATS at {}", url);
     Ok(client)
+}
+
+// ============================================================================
+// ChatTransport adapter over the existing NATS emitter
+// ============================================================================
+
+/// The chat transport is NATS when NATS is configured: every operation
+/// delegates to the existing `NatsEmitter` method, so the wire behaviour is
+/// byte-for-byte what it was before the trait existed.
+#[async_trait::async_trait]
+impl ChatTransport for NatsEmitter {
+    fn publish_chat_event(&self, session_id: &str, event: ChatEvent) {
+        NatsEmitter::publish_chat_event(self, session_id, event);
+    }
+
+    async fn subscribe_chat_events(&self, session_id: &str) -> anyhow::Result<Subscriber> {
+        NatsEmitter::subscribe_chat_events(self, session_id).await
+    }
+
+    fn publish_chat_interrupt(&self, session_id: &str) {
+        NatsEmitter::publish_interrupt(self, session_id);
+    }
+
+    async fn subscribe_chat_interrupt(&self, session_id: &str) -> anyhow::Result<Subscriber> {
+        NatsEmitter::subscribe_interrupt(self, session_id).await
+    }
+
+    fn publish_cancel_tools(&self, session_id: &str) {
+        NatsEmitter::publish_cancel_tools(self, session_id);
+    }
+
+    async fn subscribe_cancel_tools(&self, session_id: &str) -> anyhow::Result<Subscriber> {
+        NatsEmitter::subscribe_cancel_tools(self, session_id).await
+    }
+
+    async fn request_streaming_snapshot(&self, session_id: &str) -> Option<StreamingSnapshot> {
+        NatsEmitter::request_streaming_snapshot(self, session_id).await
+    }
+
+    async fn subscribe_snapshot_requests(&self, session_id: &str) -> anyhow::Result<Subscriber> {
+        NatsEmitter::subscribe_snapshot_requests(self, session_id).await
+    }
+
+    fn request_cancel<'a>(
+        &'a self,
+        subject: String,
+        payload: serde_json::Value,
+        is_provisional: &'a (dyn Fn(&[u8]) -> bool + Sync),
+        grace: std::time::Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<u8>, RelayFailure>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            NatsEmitter::request_cancel(self, subject, payload, is_provisional, grace).await
+        })
+    }
 }
 
 #[cfg(test)]
