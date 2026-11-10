@@ -365,7 +365,7 @@ impl Neo4jClient {
             r#"
             MATCH (f:TriggerFiring {trigger_id: $trigger_id})
             RETURN f
-            ORDER BY f.fired_at DESC
+            ORDER BY f.fired_at DESC, f.id DESC
             LIMIT $limit
             "#,
         )

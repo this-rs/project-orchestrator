@@ -72,7 +72,7 @@ impl Neo4jClient {
             r#"
             MATCH (e:ExternalEvent {trigger_id: $trigger_id})
             RETURN e
-            ORDER BY e.received_at DESC
+            ORDER BY e.received_at DESC, e.id DESC
             LIMIT $limit
             "#,
         )
