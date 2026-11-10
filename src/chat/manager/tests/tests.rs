@@ -9028,6 +9028,61 @@ async fn a_neutral_session_opens_read_only_persists_it_and_every_resume_keeps_it
     manager.close_session(&sid).await.unwrap();
 }
 
+/// A `work` project has no source tree, so its conversations run in the neutral
+/// directory like any session given no folder. They used to come out read-only —
+/// which made the notes, plans and tasks of that very project unwritable, and left
+/// a fresh install (where the only project one can create without a repository is
+/// a `work` one) with an agent that could not write anything.
+#[tokio::test]
+async fn a_project_without_a_source_tree_is_an_ordinary_writable_session() {
+    use crate::chat::provider::policy::SessionAccess;
+    let (manager, graph, fake) = agent_manager();
+    let mut req = agent_request("hello");
+    req.cwd = String::new();
+    req.project_slug = Some("notes".into());
+    let created = manager.create_session(&req).await.unwrap();
+    let sid = created.session_id.clone();
+    let id = Uuid::parse_str(&sid).unwrap();
+
+    assert_eq!(created.access, SessionAccess::Normal);
+    let node = graph.get_chat_session(id).await.unwrap().unwrap();
+    assert_eq!(
+        node.execution_place,
+        crate::chat::neutral_place::ExecutionPlace::Neutral,
+        "it still RUNS in the neutral directory"
+    );
+    assert_eq!(node.access, SessionAccess::Normal, "and it may write");
+    let spec = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+    assert!(!spec_refuses_writes(&spec), "the open does not deny writes");
+    assert!(!spec_po_env(&spec).contains_key(crate::auth::tool_profile::TOOL_PROFILE_ENV));
+    manager.close_session(&sid).await.unwrap();
+}
+
+/// A workspace that holds no project yet (a fresh install): its conversations run in
+/// the neutral directory, and they belong to the workspace the person is in — so they
+/// are ordinary conversations, not read-only ones.
+#[tokio::test]
+async fn a_workspace_without_a_project_is_an_ordinary_writable_session() {
+    use crate::chat::provider::policy::SessionAccess;
+    let (manager, graph, fake) = agent_manager();
+    let mut req = agent_request("hello");
+    req.cwd = String::new();
+    req.workspace_slug = Some("personal".into());
+    let created = manager.create_session(&req).await.unwrap();
+    let sid = created.session_id.clone();
+    let id = Uuid::parse_str(&sid).unwrap();
+
+    assert_eq!(created.access, SessionAccess::Normal);
+    assert_eq!(
+        graph.get_chat_session(id).await.unwrap().unwrap().access,
+        SessionAccess::Normal,
+        "stored as normal: every resume keeps it"
+    );
+    let spec = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+    assert!(!spec_refuses_writes(&spec));
+    manager.close_session(&sid).await.unwrap();
+}
+
 #[tokio::test]
 async fn a_project_session_is_normal_unless_the_client_asks_for_read_only_and_a_resume_cannot_widen_it(
 ) {
