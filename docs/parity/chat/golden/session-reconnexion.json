@@ -1,0 +1,10 @@
+[
+  {"type": "auth_ok", "user": {"id": "<user-id>", "email": "<email>", "name": "<name>"}, "features": ["refs_v1"]},
+  {"type": "user_message", "content": "Liste les fichiers puis endors-toi.", "seq": 1, "replaying": true, "created_at": "<ts>"},
+  {"type": "tool_use", "id": "<tool-call-1>", "tool": "Bash", "input": {"command": "ls -1; sleep 30"}, "category": "command", "canonical": "bash", "seq": 2, "replaying": true, "created_at": "<ts>"},
+  {"type": "partial_text", "content": "Je liste les fichiers...", "seq": 0, "replaying": true},
+  {"type": "streaming_status", "is_streaming": true},
+  {"type": "pending_queue", "messages": []},
+  {"type": "replay_complete"},
+  {"type": "auto_continue_state_changed", "session_id": "<session>", "enabled": true, "seq": 0}
+]

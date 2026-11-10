@@ -1,0 +1,9 @@
+[
+  {"$client": "user_message", "content": "Liste les fichiers à la racine."},
+  {"type": "user_message", "content": "Liste les fichiers à la racine.", "seq": 0, "created_at": "<ts>"},
+  {"type": "tool_use", "id": "<tool-call-1>", "tool": "Bash", "input": {"command": "ls -1"}, "category": "command", "canonical": "bash", "seq": 0, "created_at": "<ts>"},
+  {"type": "tool_result", "id": "<tool-call-1>", "result": {"stdout": "Cargo.toml\nsrc\n", "stderr": "", "exitCode": 0}, "is_error": false, "seq": 0, "created_at": "<ts>"},
+  {"type": "tool_timing", "id": "<tool-call-1>", "called_at": "<ts>", "started_at": "<ts>", "ended_at": "<ts>", "seq": 0, "created_at": "<ts>"},
+  {"type": "assistant_text", "content": "Cargo.toml et src/", "seq": 0, "created_at": "<ts>"},
+  {"type": "result", "session_id": "<session>", "duration_ms": "<dur>", "cost_usd": "<cost>", "subtype": "success", "is_error": false, "num_turns": 1, "usage": "<usage>", "model": "<model>", "stop_reason": "completed", "seq": 0, "created_at": "<ts>"}
+]
