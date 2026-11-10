@@ -7827,13 +7827,15 @@ impl ChatManager {
         } else {
             super::neutral_place::ExecutionPlace::Project
         };
-        // Belonging, not place: a session that names no project and no workspace is
-        // read-only by default, whatever directory it runs in (`SessionAccess::for_open`).
+        // Belonging AND place: a session that names no project and no workspace, and that
+        // gets the host's neutral directory, is read-only by default (`for_open`). An empty
+        // slug names nothing, as everywhere else (`decide_project` in anchor_resolver reads
+        // `""` as absent).
         let unanchored = matches!(
             execution_place,
             super::neutral_place::ExecutionPlace::Neutral
-        ) && request.project_slug.is_none()
-            && request.workspace_slug.is_none();
+        ) && request.project_slug.as_deref().is_none_or(str::is_empty)
+            && request.workspace_slug.as_deref().is_none_or(str::is_empty);
         let access = super::provider::policy::SessionAccess::for_open(request.access, unanchored);
         let manager = Arc::clone(self);
         let spawned = request;
@@ -8169,13 +8171,14 @@ impl ChatManager {
         };
 
         // What the session may do: fixed here, persisted on the node, kept by every resume.
-        // Read-only by default only for a session that belongs to NOTHING: no project and no
-        // workspace. Where it runs does not decide it (`neutral_place`: "no tool permission
-        // is derived from it"), so a `work` project — no source tree, so a neutral cwd — and
-        // a workspace that holds no project yet are ordinary sessions and can write.
+        // Read-only by default only for one that belongs to NOTHING — no project, no
+        // workspace — AND runs in the neutral directory. Each half alone would be wrong: a
+        // `work` project (no source tree, so a neutral cwd) and a workspace that holds no
+        // project yet belong to something the person chose and must be able to write, while
+        // a session given a real directory keeps the access it always had.
         let unanchored = super::neutral_place::is_neutral_path(&request.cwd)
-            && project_slug.is_none()
-            && request.workspace_slug.is_none();
+            && project_slug.as_deref().is_none_or(str::is_empty)
+            && request.workspace_slug.as_deref().is_none_or(str::is_empty);
         let access = super::provider::policy::SessionAccess::for_open(request.access, unanchored);
         // The record both engines keep (`session_record`): the title and preview come
         // from the opening message as typed, and the memory conversation is named

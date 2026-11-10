@@ -128,11 +128,14 @@ pub fn tool_policy(mode: &str, allowed: &[String], disallowed: &[String]) -> Opt
 /// read-only is a deny list on top of a mode and not a mode.
 ///
 /// Where the flag comes from: the request (`access`), or the default of a session
-/// that belongs to nothing — no project and no workspace ([`SessionAccess::for_open`]).
-/// Where the session RUNS never decides it: a `work` project has no source tree and
-/// a workspace that holds no project yet both make their conversation run in the
-/// neutral directory ([`crate::chat::neutral_place`], whose contract is that the
-/// place decides no permission), and both belong to something the person chose.
+/// that belongs to nothing — no project and no workspace — AND runs in the neutral
+/// directory of the host ([`SessionAccess::for_open`]). Neither half suffices alone:
+/// a session given a real directory keeps the access it always had (there is nothing
+/// to narrow), and a `work` project (no source tree) or a workspace that holds no
+/// project yet names something the person chose, so it is an ordinary session even
+/// though it runs in that neutral directory
+/// ([`crate::chat::neutral_place`], whose contract is that the place decides no
+/// permission by itself).
 /// It is persisted on the session and a resume can only keep it or narrow it
 /// ([`SessionAccess::for_resume`]).
 ///
@@ -208,17 +211,23 @@ impl SessionAccess {
     }
 
     /// Access of a session being OPENED. `requested` is what the client asked
-    /// (`None`: nothing). A session that belongs to NOTHING — no project and no
-    /// workspace — is read-only unless the client explicitly asks for `normal`; one
-    /// that belongs to a project or a workspace is `normal` unless the client asks
-    /// for `read_only`.
+    /// (`None`: nothing). A session that belongs to NOTHING — no project, no
+    /// workspace — and gets the neutral directory of the host is read-only unless the
+    /// client explicitly asks for `normal`; anything else is `normal` unless the client
+    /// asks for `read_only`.
     ///
-    /// `unanchored` is about BELONGING, never about where the session runs: see the
-    /// type doc. A conversation of a `work` project (no source tree) and one opened
-    /// from a workspace that holds no project both run in the neutral directory, and
-    /// both used to come out read-only — which made the notes of that very project
-    /// unwritable and left a fresh install with no way to have the agent write
-    /// anything.
+    /// `unanchored` needs BOTH halves, and each alone would be wrong:
+    ///
+    /// * belonging alone: a `work` project has no source tree and a workspace that
+    ///   holds no project yet neither, so both run in the neutral directory — and both
+    ///   belong to something the person chose. Deciding on the place alone made them
+    ///   read-only, which left the notes of that very project unwritable and a fresh
+    ///   install with no way to have the agent write anything.
+    /// * place alone: a session given a real directory of its own keeps the access it
+    ///   always had; it is not narrowed because no project matched that folder.
+    ///
+    /// An empty slug names nothing (the rest of the host reads `""` as absent, see
+    /// `chat::anchor_resolver::decide_project`).
     pub fn for_open(requested: Option<Self>, unanchored: bool) -> Self {
         requested.unwrap_or(if unanchored {
             Self::ReadOnly

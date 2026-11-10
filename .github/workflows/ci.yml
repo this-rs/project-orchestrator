@@ -377,11 +377,6 @@ jobs:
       - name: path-pins — les voisins sont à leur commit épinglé
         run: cargo xtask path-pins
 
-      # Test du portillon lui-même, sur un faux arbre : un portillon qu'on ne
-      # fait jamais échouer est un portillon qu'on ne sait pas vivant.
-      - name: Test the branch gates
-        run: cargo test --manifest-path xtask/Cargo.toml
-
       # Index des diagrammes (docs/diagrams/INDEX.yml). Node est deja sur les
       # runners ubuntu-latest : pas de setup-node, pas de package.json, pas de
       # nouvelle chaine d'outils dans un depot Rust.

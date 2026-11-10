@@ -9081,6 +9081,39 @@ async fn a_workspace_without_a_project_is_an_ordinary_writable_session() {
     let spec = fake.state.opened_specs.lock().unwrap().pop().unwrap();
     assert!(!spec_refuses_writes(&spec));
     manager.close_session(&sid).await.unwrap();
+
+    // The default is a default, not a lock: a workspace session may still be opened
+    // read-only when the client asks for it, and that is what is stored.
+    let mut ro = agent_request("hello");
+    ro.cwd = String::new();
+    ro.workspace_slug = Some("personal".into());
+    ro.access = Some(SessionAccess::ReadOnly);
+    let ro = manager.create_session(&ro).await.unwrap();
+    assert_eq!(ro.access, SessionAccess::ReadOnly);
+    let spec = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+    assert!(
+        spec_refuses_writes(&spec),
+        "asked read-only, stays read-only"
+    );
+    manager.close_session(&ro.session_id).await.unwrap();
+}
+
+/// An empty slug names nothing: `decide_project` and the enrichment already read `""`
+/// as absent, so the access default must too — otherwise a client sending
+/// `"project_slug": ""` would get a writable session out of one that belongs to nothing.
+#[tokio::test]
+async fn an_empty_slug_names_nothing_for_the_access_default() {
+    use crate::chat::provider::policy::SessionAccess;
+    let (manager, _graph, fake) = agent_manager();
+    let mut req = agent_request("hello");
+    req.cwd = String::new();
+    req.project_slug = Some(String::new());
+    req.workspace_slug = Some(String::new());
+    let created = manager.create_session(&req).await.unwrap();
+    assert_eq!(created.access, SessionAccess::ReadOnly);
+    let spec = fake.state.opened_specs.lock().unwrap().pop().unwrap();
+    assert!(spec_refuses_writes(&spec));
+    manager.close_session(&created.session_id).await.unwrap();
 }
 
 #[tokio::test]
