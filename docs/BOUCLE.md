@@ -139,3 +139,27 @@ ne passe à ✅ que sur une preuve reproductible.
 **Règle de suivi** : à chaque fin de vague, un objectif ne peut changer d'état
 que si la preuve est dans le dépôt. Un ⬜ qui devient 🟡 sans commit n'est pas
 un progrès.
+
+## Surveiller le disque, avant chaque vague
+
+Mesuré une fois à **9,7 Go libres sur 3,6 To** — un agent obrain s'est arrêté
+en plein travail, correctement. La cause n'était pas les `target/` visibles
+mais **106 Go de caches `.cible-*` cachés** dans les worktrees, dont un de
+59 Go.
+
+**Avant de lancer une vague** :
+```sh
+df -h /Users/triviere | tail -1
+du -sh <worktree>/.cible-* <worktree>/target 2>/dev/null | sort -h | tail -5
+```
+- **sous 40 Go** : ne rien lancer, nettoyer d'abord.
+- **sous 20 Go** : les agents doivent s'arrêter, et le dire — pas continuer en
+  espérant.
+
+**Ce qui se nettoie sans risque** : les `target/` et `.cible-*` des worktrees
+dont le travail est **fusionné ou poussé**. Ce qui ne se nettoie pas : le cache
+d'un worktree sur lequel quelqu'un travaille — le supprimer coûte 30 à 40 min
+de reconstruction à cet agent.
+
+**Le piège** : `du -sh dossier/*` ne voit pas les `.quelquechose`. Utiliser
+`du -sh dossier/.[!.]*` en plus, sinon 106 Go restent invisibles.
