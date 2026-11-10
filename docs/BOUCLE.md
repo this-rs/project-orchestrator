@@ -71,3 +71,28 @@ règle avec sa preuve obligatoire.
 Elle ne promet pas de date. Elle garantit qu'aucun lot ne se déclare fini sans
 la preuve qui va avec — et que ce qui est oublié est écrit quelque part plutôt
 que perdu dans une conversation.
+
+## Recette : le conflit `manager.rs` à chaque fois que `main` touche le chat
+
+Arrivé deux fois le 10/11 (#1152, puis #1154). `main` modifie le code de
+production de `manager.rs` ; nous avons retiré ses 20 198 lignes de tests.
+Git ne peut pas aligner : il produit **un** hunk de conflit qui couvre tout.
+
+Procédure qui marche, dans cet ordre :
+
+1. `git checkout --ours src/chat/manager.rs` — garder notre version (tests
+   extraits, 13 déclarations `#[path]`).
+2. `git diff origin/main~1 origin/main -- src/chat/manager.rs > /tmp/mgr.patch`
+   puis `patch -p1 --forward < /tmp/mgr.patch` — applique les hunks de
+   production, laisse un `.rej` pour le bloc de test.
+3. Dans le `.rej` : ne garder que les lignes `+`, retirer le `+`, dé-indenter
+   de 4 espaces, et insérer ce bloc **à la fin du test nommé** dans
+   `src/chat/manager/tests/tests.rs`. Le nom du test est celui qu'on trouve
+   en remontant depuis la ligne du conflit dans la version de `main`.
+4. `rm` le `.rej`, `cargo fmt --all`, puis vérifier qu'il ne reste **aucun**
+   marqueur `<<<<<<<`.
+5. Le critère de réussite n'est pas « ça compile » : c'est que le test importé
+   de `main` s'exécute et passe.
+
+Coût mesuré : ~3 minutes. Ce qui le rend supportable, c'est que le portillon
+`containment` le réclame immédiatement au lieu de laisser la dette s'accumuler.
