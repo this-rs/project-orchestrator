@@ -11,6 +11,7 @@
 mod containment;
 mod git;
 mod in_service;
+mod parity;
 mod path_pins;
 mod pins;
 mod storage_boundary;
@@ -23,6 +24,7 @@ usage: cargo xtask <subcommand> [options]
   containment       does this branch contain the remote's main? (drift guard)
   path-pins         are the sibling checkouts at their pinned commits?
   in-service        is the running backend the current main? (AM-1)
+  parity            is the committed contract inventory still what the source mounts?
   pins              did main of each git-pinned repo reach Cargo.toml? (AM-2)
   storage-boundary  where do the storage drivers leak out of their adapters?
 
@@ -34,6 +36,7 @@ fn main() {
         Some("containment") => containment::run(&args[1..]),
         Some("path-pins") => path_pins::run(&args[1..]),
         Some("in-service") => in_service::run(&args[1..]),
+        Some("parity") => parity::run(&args[1..]),
         Some("pins") => pins::run(&args[1..]),
         Some("storage-boundary") => storage_boundary::run(&args[1..]),
         Some("-h") | Some("--help") | Some("help") => {

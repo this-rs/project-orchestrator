@@ -2,7 +2,12 @@
 
 # `cargo xtask <subcommand>`: the after-merge checks of xtask/ (a standalone
 # std-only crate, excluded from the workspace). Run from the repo root.
-#   cargo xtask in-service   is the running backend the current main? (AM-1)
-#   cargo xtask pins         did main of each git-pinned repo reach Cargo.toml? (AM-2)
+#   cargo xtask containment       does this branch still contain the remote's main?
+#   cargo xtask path-pins         are the sibling checkouts at their pinned commits?
+#   cargo xtask in-service        is the running backend the current main? (AM-1)
+#   cargo xtask parity --check    is docs/parity/inventory.tsv still what
+#                                 src/api/routes.rs + MEGA_TOOL_ACTIONS mount?
+#   cargo xtask pins              did main of each git-pinned repo reach Cargo.toml? (AM-2)
+#   cargo xtask storage-boundary  where do the storage drivers leak out of their adapters?
 [alias]
 xtask = "run --quiet --manifest-path xtask/Cargo.toml --"
