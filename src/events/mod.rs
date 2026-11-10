@@ -96,7 +96,10 @@ pub use activity::{
     ACTIVITY_BUFFER_CAPACITY,
 };
 pub use bus::EventBus;
-pub use chat_transport::{ChatTransport, InMemoryChatTransport, RelayFailure, StreamingSnapshot};
+pub use chat_transport::{
+    ChatTransport, InMemoryChatTransport, JournalEvent, JournalTransport, RelayFailure,
+    ReplayError, StreamingSnapshot, DEFAULT_MAX_EVENTS,
+};
 pub use graph::{ActivationTarget, GraphEvent, GraphEventType, GraphLayer};
 pub use hybrid::HybridEmitter;
 pub use ingestion::{

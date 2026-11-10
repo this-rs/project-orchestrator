@@ -322,3 +322,474 @@ mod tests {
         assert_eq!(outcome, Err(RelayFailure::NoResponders));
     }
 }
+
+// ============================================================================
+// JournalTransport — a persisted, replayable ChatTransport
+// ============================================================================
+
+use std::collections::VecDeque;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+/// Default bound on the number of events retained in the journal.
+///
+/// The journal is append-only and *bounded*: once more than this many events
+/// have been written, the oldest are truncated from the bottom and the bound is
+/// announced ([`JournalTransport::max_events`], [`JournalTransport::oldest_cursor`]).
+/// A client whose last-seen cursor is below the retained window receives
+/// [`ReplayError::CursorTooOld`] — never a silently amputated stream.
+///
+/// Sized for a busy single instance: 100 000 chat events comfortably covers
+/// more than a day of transcripts while keeping the journal small enough to
+/// replay in one read. Callers that need a different bound open the journal
+/// with [`JournalTransport::open`] and pass their own `max_events`.
+pub const DEFAULT_MAX_EVENTS: usize = 100_000;
+
+/// One persisted chat event and its position in the journal.
+///
+/// `cursor` is monotonic and never reused: it starts at 1 and, after a reopen,
+/// continues from `last_cursor + 1` (the journal derives it from what is on
+/// disk, so a restart can never collide).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JournalEvent {
+    pub cursor: u64,
+    pub session_id: String,
+    pub event: ChatEvent,
+}
+
+/// Why a replay could not be served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayError {
+    /// The requested cursor is older than the oldest event still retained: the
+    /// journal has already truncated those events. `oldest` is the first cursor
+    /// still available, `requested` is the `since` the client asked for.
+    CursorTooOld { oldest: u64, requested: u64 },
+}
+
+impl std::fmt::Display for ReplayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReplayError::CursorTooOld { oldest, requested } => write!(
+                f,
+                "replay cursor {requested} is older than the journal's retained window \
+                 (oldest retained cursor {oldest}); a replay would be silently truncated"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReplayError {}
+
+/// A [`ChatTransport`] that persists every chat event to an append-only journal
+/// and can replay them after a restart.
+///
+/// # Storage
+///
+/// The journal is one file, one JSON [`JournalEvent`] per line, written with an
+/// append and a `sync_data` so a process crash does not lose what was already
+/// published. Retention is bounded: when the retained window exceeds
+/// `max_events`, the oldest entries are truncated from the bottom and the file
+/// is rewritten to the surviving window.
+///
+/// # Replay
+///
+/// A live client subscribes as usual ([`ChatTransport::subscribe_chat_events`],
+/// no replay). A returning client calls [`JournalTransport::replay`] with its
+/// last-seen cursor and receives every retained event after it, in order — or a
+/// typed [`ReplayError::CursorTooOld`] if its cursor is below the window (the
+/// loss is visible, never silent). The caller then subscribes for what comes
+/// next; the replay-or-live union is at-least-once.
+#[derive(Clone)]
+pub struct JournalTransport {
+    inner: Arc<JournalInner>,
+}
+
+struct JournalInner {
+    state: Mutex<JournalState>,
+    sessions: Mutex<HashMap<String, tokio::sync::broadcast::Sender<ChatEvent>>>,
+    path: PathBuf,
+    max_events: usize,
+}
+
+struct JournalState {
+    entries: VecDeque<JournalEvent>,
+    next_cursor: u64,
+}
+
+impl JournalTransport {
+    /// Open (or create) the journal at `path`, retaining at most `max_events`.
+    ///
+    /// On an existing file the cursors are read back and continued (no
+    /// collision across restarts), and any excess beyond `max_events` left on
+    /// disk is truncated from the bottom before the transport is handed out.
+    pub fn open(path: impl Into<PathBuf>, max_events: usize) -> anyhow::Result<Self> {
+        if max_events == 0 {
+            anyhow::bail!("journal retention (max_events) must be at least one event");
+        }
+        let path = path.into();
+
+        let mut entries = VecDeque::new();
+        let mut next_cursor = 1u64;
+        if path.exists() {
+            let bytes = std::fs::read(&path)?;
+            for line in bytes.split(|b| *b == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                let entry: JournalEvent = serde_json::from_slice(line).map_err(|e| {
+                    anyhow::anyhow!("corrupt journal entry in {}: {e}", path.display())
+                })?;
+                next_cursor = next_cursor.max(entry.cursor + 1);
+                entries.push_back(entry);
+            }
+        }
+
+        if truncate_to(&mut entries, max_events) > 0 {
+            rewrite_file(&path, &entries)?;
+        }
+
+        Ok(JournalTransport {
+            inner: Arc::new(JournalInner {
+                state: Mutex::new(JournalState {
+                    entries,
+                    next_cursor,
+                }),
+                sessions: Mutex::new(HashMap::new()),
+                path,
+                max_events,
+            }),
+        })
+    }
+
+    /// The retention bound this journal was opened with (announced, never implicit).
+    pub fn max_events(&self) -> usize {
+        self.inner.max_events
+    }
+
+    /// The oldest cursor still retained, if any event has been written yet.
+    pub fn oldest_cursor(&self) -> Option<u64> {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .front()
+            .map(|e| e.cursor)
+    }
+
+    /// The cursor the next published event will receive (monotonic, no reuse).
+    pub fn next_cursor(&self) -> u64 {
+        self.inner.state.lock().unwrap().next_cursor
+    }
+
+    /// Replay every retained event published after `since` (exclusive), in
+    /// order. `since` is the last cursor the caller already holds (0 = none).
+    ///
+    /// Returns [`ReplayError::CursorTooOld`] when `since` is below the retained
+    /// window — i.e. events between `since` and the window were truncated — so
+    /// the loss is explicit instead of a silently amputated stream.
+    pub fn replay(&self, since: u64) -> Result<Vec<JournalEvent>, ReplayError> {
+        let state = self.inner.state.lock().unwrap();
+        match state.entries.front() {
+            None => Ok(Vec::new()),
+            Some(oldest) => {
+                let oldest = oldest.cursor;
+                if since + 1 < oldest {
+                    return Err(ReplayError::CursorTooOld {
+                        oldest,
+                        requested: since,
+                    });
+                }
+                Ok(state
+                    .entries
+                    .iter()
+                    .filter(|e| e.cursor > since)
+                    .cloned()
+                    .collect())
+            }
+        }
+    }
+
+    fn sender(&self, session_id: &str) -> tokio::sync::broadcast::Sender<ChatEvent> {
+        let mut sessions = self.inner.sessions.lock().unwrap();
+        sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| tokio::sync::broadcast::channel(1024).0)
+            .clone()
+    }
+}
+
+/// Drop the oldest entries until `max_events` remain; returns how many dropped.
+fn truncate_to(entries: &mut VecDeque<JournalEvent>, max_events: usize) -> usize {
+    let mut dropped = 0;
+    while entries.len() > max_events {
+        entries.pop_front();
+        dropped += 1;
+    }
+    dropped
+}
+
+/// Append one entry as a JSON line, durably (write + sync).
+fn append_entry(path: &Path, entry: &JournalEvent) -> anyhow::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    serde_json::to_writer(&mut file, entry)?;
+    file.write_all(b"\n")?;
+    file.sync_data()?;
+    Ok(())
+}
+
+/// Rewrite the whole file from the retained window (used when truncating the bottom).
+fn rewrite_file(path: &Path, entries: &VecDeque<JournalEvent>) -> anyhow::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    for entry in entries {
+        serde_json::to_writer(&mut file, entry)?;
+        file.write_all(b"\n")?;
+    }
+    file.sync_data()?;
+    Ok(())
+}
+
+#[async_trait::async_trait]
+impl ChatTransport for JournalTransport {
+    fn publish_chat_event(&self, session_id: &str, event: ChatEvent) {
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            let cursor = state.next_cursor;
+            state.next_cursor += 1;
+            let entry = JournalEvent {
+                cursor,
+                session_id: session_id.to_string(),
+                event: event.clone(),
+            };
+            state.entries.push_back(entry.clone());
+            if let Err(e) = append_entry(&self.inner.path, &entry) {
+                tracing::error!(error = %e, "journal append failed");
+            }
+            if truncate_to(&mut state.entries, self.inner.max_events) > 0 {
+                if let Err(e) = rewrite_file(&self.inner.path, &state.entries) {
+                    tracing::error!(error = %e, "journal compaction failed");
+                }
+            }
+        }
+
+        // Live broadcast (fire-and-forget), after the durable append.
+        let sessions = self.inner.sessions.lock().unwrap();
+        if let Some(tx) = sessions.get(session_id) {
+            let _ = tx.send(event);
+        }
+    }
+
+    async fn subscribe_chat_events(&self, session_id: &str) -> anyhow::Result<Subscriber> {
+        let rx = self.sender(session_id).subscribe();
+        let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
+            .filter_map(|r| async move { r.ok() })
+            .map(|event: ChatEvent| Message {
+                payload: serde_json::to_vec(&event).unwrap_or_default(),
+                reply: None,
+            });
+        Ok(Subscriber::from_stream(stream))
+    }
+
+    fn publish_chat_interrupt(&self, _session_id: &str) {}
+
+    async fn subscribe_chat_interrupt(&self, _session_id: &str) -> anyhow::Result<Subscriber> {
+        Ok(Subscriber::from_stream(
+            futures::stream::pending::<Message>(),
+        ))
+    }
+
+    fn publish_cancel_tools(&self, _session_id: &str) {}
+
+    async fn subscribe_cancel_tools(&self, _session_id: &str) -> anyhow::Result<Subscriber> {
+        Ok(Subscriber::from_stream(
+            futures::stream::pending::<Message>(),
+        ))
+    }
+
+    async fn request_streaming_snapshot(&self, _session_id: &str) -> Option<StreamingSnapshot> {
+        None
+    }
+
+    async fn subscribe_snapshot_requests(&self, _session_id: &str) -> anyhow::Result<Subscriber> {
+        Ok(Subscriber::from_stream(
+            futures::stream::pending::<Message>(),
+        ))
+    }
+
+    async fn publish(&self, _subject: &Subject, _payload: Vec<u8>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn flush(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn transport_state(&self) -> TransportState {
+        TransportState::Unknown
+    }
+
+    fn cancel_tools_subject(&self, session_id: &str) -> String {
+        format!("chat.{}.cancel_tools", session_id)
+    }
+
+    fn cancel_task_subject(&self, session_id: &str) -> String {
+        format!("chat.{}.cancel_task", session_id)
+    }
+
+    async fn subscribe_cancel_task(&self, _session_id: &str) -> anyhow::Result<Subscriber> {
+        Ok(Subscriber::from_stream(
+            futures::stream::pending::<Message>(),
+        ))
+    }
+
+    async fn subscribe_rpc_send(&self, _session_id: &str) -> anyhow::Result<Subscriber> {
+        Ok(Subscriber::from_stream(
+            futures::stream::pending::<Message>(),
+        ))
+    }
+
+    async fn request_send_message(
+        &self,
+        _session_id: &str,
+        _message: &str,
+        _message_type: &str,
+    ) -> Option<ChatRpcResponse> {
+        None
+    }
+
+    fn request_cancel<'a>(
+        &'a self,
+        _subject: String,
+        _payload: serde_json::Value,
+        _is_provisional: &'a (dyn Fn(&[u8]) -> bool + Sync),
+        _grace: Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<u8>, RelayFailure>> + Send + 'a>,
+    > {
+        Box::pin(async move { Err(RelayFailure::NoResponders) })
+    }
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn retention_reports_cursor_too_old_not_amputated() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = JournalTransport::open(dir.path().join("journal.log"), 50).unwrap();
+
+        for i in 0..100u32 {
+            transport.publish_chat_event(
+                "s1",
+                ChatEvent::UserMessage {
+                    content: format!("event-{i}"),
+                },
+            );
+        }
+
+        // Oldest retained = cursor 51: asking for 0 is below the window.
+        assert_eq!(transport.oldest_cursor(), Some(51));
+        assert_eq!(
+            transport.replay(0).unwrap_err(),
+            ReplayError::CursorTooOld {
+                oldest: 51,
+                requested: 0
+            }
+        );
+
+        // Replaying from the exact boundary is complete, never amputated.
+        let events = transport.replay(50).unwrap();
+        assert_eq!(events.len(), 50);
+        assert_eq!(events.first().unwrap().cursor, 51);
+        assert_eq!(events.last().unwrap().cursor, 100);
+    }
+
+    #[tokio::test]
+    async fn reopen_continues_cursors_and_replays_correct_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.log");
+
+        {
+            let transport = JournalTransport::open(&path, 1_000).unwrap();
+            for i in 0..5u32 {
+                transport.publish_chat_event(
+                    "s1",
+                    ChatEvent::UserMessage {
+                        content: format!("first-{i}"),
+                    },
+                );
+            }
+            assert_eq!(transport.next_cursor(), 6);
+        } // dropped == closed
+
+        {
+            let transport = JournalTransport::open(&path, 1_000).unwrap();
+            assert_eq!(transport.next_cursor(), 6, "cursors continue, no collision");
+            transport.publish_chat_event(
+                "s1",
+                ChatEvent::UserMessage {
+                    content: "sixth".into(),
+                },
+            );
+            assert_eq!(transport.next_cursor(), 7);
+
+            let events = transport.replay(0).unwrap();
+            assert_eq!(events.len(), 6);
+            assert_eq!(events[0].cursor, 1);
+            assert_eq!(events[5].cursor, 6);
+            assert_eq!(events[5].session_id, "s1");
+            assert!(
+                matches!(&events[5].event, ChatEvent::UserMessage { content } if content == "sixth")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_subscriber_receives_while_publisher_publishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = JournalTransport::open(dir.path().join("journal.log"), 100).unwrap();
+
+        let mut sub = transport.subscribe_chat_events("s1").await.unwrap();
+        transport.publish_chat_event(
+            "s1",
+            ChatEvent::UserMessage {
+                content: "live-one".into(),
+            },
+        );
+        transport.publish_chat_event(
+            "s1",
+            ChatEvent::UserMessage {
+                content: "live-two".into(),
+            },
+        );
+
+        let first: ChatEvent = serde_json::from_slice(&sub.next().await.unwrap().payload).unwrap();
+        let second: ChatEvent = serde_json::from_slice(&sub.next().await.unwrap().payload).unwrap();
+        assert!(matches!(first, ChatEvent::UserMessage { content } if content == "live-one"));
+        assert!(matches!(second, ChatEvent::UserMessage { content } if content == "live-two"));
+    }
+
+    #[tokio::test]
+    async fn usable_through_the_chat_transport_trait_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport: Box<dyn ChatTransport> =
+            Box::new(JournalTransport::open(dir.path().join("journal.log"), 100).unwrap());
+
+        let mut sub = transport.subscribe_chat_events("s1").await.unwrap();
+        transport.publish_chat_event(
+            "s1",
+            ChatEvent::UserMessage {
+                content: "trait".into(),
+            },
+        );
+
+        let evt: ChatEvent = serde_json::from_slice(&sub.next().await.unwrap().payload).unwrap();
+        assert!(matches!(evt, ChatEvent::UserMessage { content } if content == "trait"));
+        assert_eq!(transport.transport_state(), TransportState::Unknown);
+    }
+}
