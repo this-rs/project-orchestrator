@@ -1034,7 +1034,7 @@
         let m = manager_in(AnchorContextMode::On, &state);
         assert_eq!(m.anchor_session().mode, AnchorContextMode::On);
         // every other call site of the environment reader would be a per-turn read
-        let source = include_str!("manager.rs");
+        let source = include_str!("../../manager.rs");
         let needle = concat!("AnchorContextMode::", "from_env()");
         assert_eq!(
             source.matches(needle).count(),
