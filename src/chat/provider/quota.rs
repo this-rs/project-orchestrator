@@ -409,6 +409,43 @@ impl QuotaRegistry {
         self.mark(instance, None, ExhaustionCause::OutOfCredit);
     }
 
+    /// A turn of `instance` SUCCEEDED: the account answered, so an exhaustion we only GUESSED is
+    /// over. Only a fallback one is lifted — one whose provider named no date
+    /// (`reset_known == false`, the [`FALLBACK_COOLDOWN`] that a 402 or an undated 429 sets).
+    ///
+    /// A DATED exhaustion is left alone. The provider said when its window comes back; a success
+    /// before that date means another window opened (a per-model or per-scope one), which is what
+    /// [`Self::observe`] records from a live snapshot — never evidence that the account as a whole
+    /// is back. Lifting it here would contradict "the newest observation wins".
+    ///
+    /// WHY THIS EXISTS. A 402 (top-up) and an undated 429 held the instance for five fixed minutes
+    /// and NOTHING lifted it: a top-up, or the provider's own window reset, left the conversation
+    /// blocked until the timer ran out. That is exactly what "it did not take my provider reset
+    /// into account" looks like from the screen.
+    ///
+    /// Model-scoped holds are untouched: a success on one model says nothing about another.
+    pub fn confirm_available(&self, instance: &str) {
+        let lifted = {
+            let mut entries = self.lock();
+            match entries.get_mut(instance) {
+                Some(entry) => match entry.exhaustion.take() {
+                    Some(exhaustion) if !exhaustion.reset_known => {
+                        entry.observed_at_ms = self.now_ms();
+                        true
+                    }
+                    taken => {
+                        entry.exhaustion = taken;
+                        false
+                    }
+                },
+                None => false,
+            }
+        };
+        if lifted {
+            self.persist_in_background(instance);
+        }
+    }
+
     /// ONE model of `provider_id` refused with a rate limit (e.g. "you've reached your limit for
     /// this model, switch to another"). Same reset/cooldown arithmetic as
     /// [`Self::mark_rate_limited`], but scoped to that model only: the instance's other models
@@ -857,6 +894,70 @@ mod tests {
         assert_eq!(registry.exhausted("deepseek"), None);
         let view = registry.view("deepseek").unwrap();
         assert_eq!(view.windows[0].utilization, Some(0.4));
+    }
+
+    /// A 402 (top-up) and an undated 429 hold the instance on a GUESSED five minutes. A turn that
+    /// goes through proves the account answers: the guess must not outlive it, or a top-up or the
+    /// provider's own window reset leaves the conversation blocked until the timer runs out.
+    #[test]
+    fn a_successful_turn_lifts_an_exhaustion_whose_reset_was_never_given() {
+        let (_clock, registry) = registry();
+        registry.mark_out_of_credit("claude-code");
+        let held = registry
+            .exhausted("claude-code")
+            .expect("a 402 holds the instance out");
+        assert!(!held.reset_known, "no date was given: a guessed cooldown");
+        assert_eq!(held.cause, ExhaustionCause::OutOfCredit);
+
+        registry.confirm_available("claude-code");
+        assert!(
+            registry.exhausted("claude-code").is_none(),
+            "the account answered: the guessed cooldown is over"
+        );
+
+        // An instance nobody held stays free, and the call is idempotent.
+        registry.confirm_available("other");
+        assert!(registry.exhausted("other").is_none());
+        registry.confirm_available("claude-code");
+        assert!(registry.exhausted("claude-code").is_none());
+    }
+
+    /// The mirror rule: a reset the PROVIDER dated is never shortened by a success. A success
+    /// before that date means another window opened, which only a live snapshot may say
+    /// (`observe`, "the newest observation wins").
+    #[test]
+    fn a_successful_turn_never_shortens_a_dated_reset() {
+        let (_clock, registry) = registry();
+        let reset = ms_of("2026-10-21T15:00:00Z");
+        registry.mark_rate_limited("claude-code", Some(reset), None);
+        assert!(registry.exhausted("claude-code").is_some());
+
+        registry.confirm_available("claude-code");
+        let kept = registry
+            .exhausted("claude-code")
+            .expect("a dated reset survives a successful turn");
+        assert!(kept.reset_known);
+        assert_eq!(kept.resets_at_ms, reset);
+    }
+
+    /// A model-scoped hold is about ONE model: a success elsewhere says nothing about it.
+    #[test]
+    fn a_successful_turn_leaves_a_model_hold_alone() {
+        let (_clock, registry) = registry();
+        registry.mark_model_rate_limited("claude-code", "claude-fable-5-1", None, None);
+        registry.mark_out_of_credit("claude-code");
+
+        registry.confirm_available("claude-code");
+        assert!(
+            registry.exhausted("claude-code").is_none(),
+            "the account-wide guess is gone"
+        );
+        assert!(
+            registry
+                .model_exhausted("claude-code", "claude-fable-5-1")
+                .is_some(),
+            "the model the provider refused stays held"
+        );
     }
 
     /// A store in memory, standing for the graph across a restart.
