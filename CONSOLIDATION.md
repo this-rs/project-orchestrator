@@ -50,3 +50,13 @@ Les deux tournent dans le job « Lint & Format », donc ils sont bloquants par h
 `pins.toml` dit contre QUELS commits on construit. Mettre un `rev` à jour est un acte délibéré, dans le même commit que le besoin qui le motive.
 
 `path-pins` ne fait pas de `git fetch` par défaut : un voisin dont le remote est en ssh bloquerait le portillon. `--fetch` l'active.
+
+## À savoir avant d'écrire une ligne ici : `backend/` est un LIEN
+
+`/Users/triviere/projects/project-orchestrator/backend` est un lien symbolique vers `/Users/triviere/.openclaw/workspace/skills/project-orchestrator`, qui est le **répertoire du service vivant**.
+
+Conséquences, mesurées le 10/11/2026 :
+- La « copie principale » du dépôt n'est pas `backend/` : c'est ce répertoire-là. `git rev-parse --show-toplevel` depuis `backend/` le dit.
+- Éditer `backend/` **c'est** éditer le service vivant. La consigne « ne jamais toucher `~/.openclaw/workspace/skills/project-orchestrator` » est donc impossible à tenir en même temps que « éditer `backend/` » : ce sont les mêmes fichiers (même inode).
+- Le `pre-push` partage `CARGO_TARGET_DIR` avec cette copie principale : un build lancé depuis un worktree écrit dans le `target/` du service vivant.
+- D'où la règle : **tout travail passe par un worktree**, jamais par `backend/`. C'est déjà le cas pour cette branche.
