@@ -226,6 +226,9 @@ pub struct YamlConfig {
     /// Storage backend selection (optional — which adapter builds the stores).
     #[serde(default)]
     pub storage: StorageYamlConfig,
+    /// Event transport section (optional — which transport carries chat events).
+    #[serde(default)]
+    pub events: EventsYamlConfig,
     /// Log file section (optional — persistent, rotated, secret-masked traces).
     #[serde(default)]
     pub log: logging::LogYamlConfig,
@@ -249,6 +252,18 @@ pub struct StorageYamlConfig {
     /// Which storage backend builds the stores. Absent ⇒
     /// [`crate::storage::DEFAULT_BACKEND`].
     pub backend: Option<String>,
+}
+
+/// Event transport selection.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct EventsYamlConfig {
+    /// Which transport carries chat events between instances. Absent => the
+    /// default (`nats`): [`crate::events::chat_transport::DEFAULT_TRANSPORT`].
+    pub transport: Option<String>,
+    /// Journal file path for the `journal` transport. Absent => the default:
+    /// [`crate::events::chat_transport::DEFAULT_JOURNAL_PATH`].
+    pub journal_path: Option<String>,
 }
 
 /// MCP Federation configuration section.
@@ -987,6 +1002,15 @@ pub struct Config {
     /// Priority: env var (STORAGE_BACKEND) > YAML (storage.backend) > default.
     pub storage_backend: String,
 
+    /// Chat transport selection: which transport carries chat events between
+    /// instances. Priority: env var (EVENTS_TRANSPORT) > YAML (events.transport)
+    /// > default ("nats").
+    pub events_transport: String,
+
+    /// Journal file path for the `journal` chat transport. Priority: env var
+    /// (EVENTS_JOURNAL_PATH) > YAML (events.journal_path) > default.
+    pub events_journal_path: Option<String>,
+
     /// Persistent log file (dir, level, retention). Priority: env > YAML `log:` > defaults.
     pub log: logging::LogSettings,
 
@@ -1132,6 +1156,14 @@ impl Config {
                     .backend
                     .unwrap_or_else(|| crate::storage::DEFAULT_BACKEND.to_string())
             }),
+            events_transport: std::env::var("EVENTS_TRANSPORT").unwrap_or_else(|_| {
+                yaml.events
+                    .transport
+                    .unwrap_or_else(|| crate::events::chat_transport::DEFAULT_TRANSPORT.to_string())
+            }),
+            events_journal_path: std::env::var("EVENTS_JOURNAL_PATH")
+                .ok()
+                .or(yaml.events.journal_path),
             // Neural routing config (env var overrides > YAML > defaults)
             neural_routing: {
                 let mut nr = yaml.neural_routing;
@@ -1462,6 +1494,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         .ingress
         .validate()
         .map_err(|e| anyhow::anyhow!("Invalid ingress config: {e}"))?;
+    // Fail-fast: reject an unknown events.transport before any expensive init.
+    let transport_kind = events::chat_transport::select_transport(&config.events_transport)
+        .map_err(|e| anyhow::anyhow!("Invalid events config: {e}"))?;
     if config.ingress.enabled {
         tracing::info!(
             max_body_bytes = config.ingress.max_body_bytes,
@@ -1539,6 +1574,18 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     event_bus.start_nats_bridge();
     // Same for graph events (events.graph): cross-instance graph mutations.
     event_bus.start_graph_nats_bridge();
+
+    // Build the chat transport selected above. The `nats` kind reuses the CRUD
+    // NATS emitter (current behaviour); `journal` and `memory` are single-
+    // instance transports that make the choice explicit and decouple chat from
+    // the CRUD event bus.
+    let chat_transport: Option<Arc<dyn events::ChatTransport>> =
+        events::chat_transport::build_chat_transport(
+            transport_kind,
+            nats_emitter.clone(),
+            config.events_journal_path.as_deref(),
+            events::DEFAULT_MAX_EVENTS,
+        )?;
 
     // Extract neural_router, trajectory_collector, trajectory_store
     // and mcp_registry before state is moved into Orchestrator
@@ -1934,8 +1981,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             // The gate READS the quota registry the router and the sessions share.
             .with_quota(quota_registry.clone()),
         ));
-        if let Some(ref nats) = nats_emitter {
-            cm = cm.with_nats(nats.clone());
+        if let Some(ref transport) = chat_transport {
+            cm = cm.with_nats(transport.clone());
         }
         if let Some(ref tc) = *trajectory_collector.read().unwrap() {
             cm = cm.with_trajectory_collector(tc.clone());
@@ -2394,10 +2441,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         watcher,
         chat_manager,
         event_bus,
-        nats_emitter: nats_emitter.map(|e| {
-            let t: Arc<dyn events::ChatTransport> = e;
-            t
-        }),
+        nats_emitter: chat_transport,
         auth_config: config.auth_config.clone(),
         serve_frontend: config.serve_frontend,
         frontend_path: config.frontend_path.clone(),

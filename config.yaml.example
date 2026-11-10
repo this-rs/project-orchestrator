@@ -81,6 +81,19 @@ meilisearch:
 #   url: "nats://localhost:4222"     # NATS_URL env override
 
 # -----------------------------------------------------------------------------
+# Events — chat transport selection
+# -----------------------------------------------------------------------------
+# Which transport carries chat events between instances (and persists them).
+#   nats     (default) — current behaviour: sync over NATS when nats.url is set,
+#                        local-only otherwise
+#   journal  — append-only file, replayable after a restart, bounded retention
+#   memory   — single instance, in-memory, no persistence
+# An unknown value fails startup (naming the accepted values).
+# events:
+#   transport: "nats"                # EVENTS_TRANSPORT env override (nats|journal|memory)
+#   journal_path: "chat-journal.log" # EVENTS_JOURNAL_PATH env override (journal transport only)
+
+# -----------------------------------------------------------------------------
 # Remote MCP — Streamable HTTP transport + OAuth 2.1 Authorization Server
 # -----------------------------------------------------------------------------
 # Exposes the PO MCP server to remote Claude clients (Claude Code CLI over a

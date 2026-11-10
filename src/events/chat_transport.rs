@@ -15,7 +15,7 @@
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
-use super::nats::ChatRpcResponse;
+use super::nats::{ChatRpcResponse, NatsEmitter};
 use super::transport::{Message, Subject, Subscriber};
 use super::types::TransportState;
 use crate::chat::types::ChatEvent;
@@ -145,6 +145,84 @@ pub trait ChatTransport: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Vec<u8>, RelayFailure>> + Send + 'a>,
     >;
+}
+
+/// Identifier of the chat transport built by default — the NATS-backed adapter
+/// in use today. An unknown `events.transport` is a startup error, so an
+/// operator typo fails loudly instead of silently building another transport.
+pub const DEFAULT_TRANSPORT: &str = "nats";
+
+/// Default journal file name for the `journal` transport when
+/// `events.journal_path` is not set. Relative to the process working directory;
+/// the startup log announces the resolved location.
+pub const DEFAULT_JOURNAL_PATH: &str = "chat-journal.log";
+
+/// Which chat transport to build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    /// The NATS-backed adapter — cross-instance chat sync (current behaviour).
+    Nats,
+    /// The persisted, replayable journal — single instance, chat events survive
+    /// a restart.
+    Journal,
+    /// The in-memory transport — single instance, no persistence.
+    Memory,
+}
+
+/// Resolve the transport to build from its configuration value. Pure selection:
+/// the construction itself lives in [`build_chat_transport`].
+pub fn select_transport(value: &str) -> anyhow::Result<TransportKind> {
+    match value {
+        "nats" => Ok(TransportKind::Nats),
+        "journal" => Ok(TransportKind::Journal),
+        "memory" => Ok(TransportKind::Memory),
+        other => anyhow::bail!(
+            "unknown events.transport '{other}'; accepted values: ['nats', 'journal', 'memory']"
+        ),
+    }
+}
+
+/// Build the [`ChatTransport`] selected by `kind`.
+///
+/// This is the single construction point shared by the boot path and the
+/// integration tests: the boot wiring passes the already connected NATS emitter
+/// for [`TransportKind::Nats`] (returned unchanged), and this function builds
+/// the journal or in-memory transport otherwise. The journal file's parent
+/// directory is created if absent, and the resolved location plus the retention
+/// bound are announced on the startup log.
+pub fn build_chat_transport(
+    kind: TransportKind,
+    nats: Option<Arc<NatsEmitter>>,
+    journal_path: Option<&str>,
+    max_events: usize,
+) -> anyhow::Result<Option<Arc<dyn ChatTransport>>> {
+    match kind {
+        TransportKind::Nats => Ok(nats.map(|e| {
+            let t: Arc<dyn ChatTransport> = e;
+            t
+        })),
+        TransportKind::Memory => {
+            tracing::info!("Chat transport: in-memory (mono-instance, no persistence)");
+            Ok(Some(Arc::new(InMemoryChatTransport::new())))
+        }
+        TransportKind::Journal => {
+            let path = std::path::PathBuf::from(journal_path.unwrap_or(DEFAULT_JOURNAL_PATH));
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        anyhow::anyhow!("cannot create journal directory {}: {e}", parent.display())
+                    })?;
+                }
+            }
+            let journal = JournalTransport::open(&path, max_events)?;
+            tracing::info!(
+                path = %path.display(),
+                max_events = journal.max_events(),
+                "Chat transport: journal — chat events are persisted and replayable"
+            );
+            Ok(Some(Arc::new(journal)))
+        }
+    }
 }
 
 /// In-memory [`ChatTransport`]: chat events stay in this process.
@@ -791,5 +869,97 @@ mod journal_tests {
         let evt: ChatEvent = serde_json::from_slice(&sub.next().await.unwrap().payload).unwrap();
         assert!(matches!(evt, ChatEvent::UserMessage { content } if content == "trait"));
         assert_eq!(transport.transport_state(), TransportState::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn transport_selector_maps_known_values_and_names_rejected_values() {
+        assert_eq!(select_transport("nats").unwrap(), TransportKind::Nats);
+        assert_eq!(select_transport("journal").unwrap(), TransportKind::Journal);
+        assert_eq!(select_transport("memory").unwrap(), TransportKind::Memory);
+
+        let err = select_transport("kafka").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("kafka"),
+            "error must name the rejected value: {msg}"
+        );
+        assert!(
+            msg.contains("nats") && msg.contains("journal") && msg.contains("memory"),
+            "error must name the accepted values: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_transport_from_the_selection_path_persists_and_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nested path exercises the "parent directory is created if absent" path.
+        let path = dir.path().join("nested").join("journal.log");
+        let path_str = path.to_str().unwrap();
+
+        // Same construction path as boot: selector, then builder.
+        let kind = select_transport("journal").unwrap();
+        let transport = build_chat_transport(kind, None, Some(path_str), DEFAULT_MAX_EVENTS)
+            .unwrap()
+            .expect("journal transport is always built");
+
+        transport.publish_chat_event(
+            "s1",
+            ChatEvent::UserMessage {
+                content: "persisted".into(),
+            },
+        );
+
+        // The event is on disk, one JSON line per event.
+        let bytes = std::fs::read(&path).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("\"cursor\":1"), "journal line: {text}");
+        assert!(text.contains("persisted"), "journal line: {text}");
+
+        // A fresh open (simulating a restart / replay client) replays it.
+        let replay_client = JournalTransport::open(&path, DEFAULT_MAX_EVENTS).unwrap();
+        let events = replay_client.replay(0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].cursor, 1);
+        assert!(
+            matches!(&events[0].event, ChatEvent::UserMessage { content } if content == "persisted")
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_transport_reports_cursor_too_old_for_a_truncated_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.log");
+        let path_str = path.to_str().unwrap();
+
+        // Build with a tiny retention bound so truncation happens quickly.
+        let kind = select_transport("journal").unwrap();
+        let transport = build_chat_transport(kind, None, Some(path_str), 5)
+            .unwrap()
+            .expect("journal transport is always built");
+
+        for i in 0..10u32 {
+            transport.publish_chat_event(
+                "s1",
+                ChatEvent::UserMessage {
+                    content: format!("event-{i}"),
+                },
+            );
+        }
+
+        // Cursor 0 is now below the retained window (oldest = 6).
+        let replay_client = JournalTransport::open(&path, 5).unwrap();
+        assert_eq!(replay_client.oldest_cursor(), Some(6));
+        assert_eq!(
+            replay_client.replay(0).unwrap_err(),
+            ReplayError::CursorTooOld {
+                oldest: 6,
+                requested: 0
+            }
+        );
     }
 }

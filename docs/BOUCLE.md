@@ -113,6 +113,7 @@ ne passe à ✅ que sur une preuve reproductible.
 - ✅ Famille A : `gate`, `Recorder`, `specs` retrouvés (PR this-rs #230)
 - ✅ Cœur wasm32 compile (12,19 s) ; `?Send` tranché par thread + LocalSet
 - ✅ `ChatTransport` : plus aucun consommateur ne connaît NATS
+- ✅ Sélecteur `events.transport` (`nats`|`journal`|`memory`) + câblage au boot : le journal est instanciable par configuration (chemin + rétention annoncés au démarrage), NATS reste le défaut
 - ⬜ Journal durable (CDC obrain) puis retrait de NATS
 - ⬜ Transports serveur (nexus, HTTP) en features d'hôte
 

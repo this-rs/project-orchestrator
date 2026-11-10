@@ -97,8 +97,9 @@ pub use activity::{
 };
 pub use bus::EventBus;
 pub use chat_transport::{
-    ChatTransport, InMemoryChatTransport, JournalEvent, JournalTransport, RelayFailure,
-    ReplayError, StreamingSnapshot, DEFAULT_MAX_EVENTS,
+    build_chat_transport, select_transport, ChatTransport, InMemoryChatTransport, JournalEvent,
+    JournalTransport, RelayFailure, ReplayError, StreamingSnapshot, TransportKind,
+    DEFAULT_JOURNAL_PATH, DEFAULT_MAX_EVENTS, DEFAULT_TRANSPORT,
 };
 pub use graph::{ActivationTarget, GraphEvent, GraphEventType, GraphLayer};
 pub use hybrid::HybridEmitter;
