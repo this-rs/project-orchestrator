@@ -42,7 +42,10 @@ pub fn parse_pins(text: &str) -> Result<Vec<Pin>, String> {
         if line.is_empty() {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("[repo.").and_then(|r| r.strip_suffix(']')) {
+        if let Some(rest) = line
+            .strip_prefix("[repo.")
+            .and_then(|r| r.strip_suffix(']'))
+        {
             out.push(Pin {
                 name: rest.trim().to_string(),
                 path: String::new(),
@@ -92,17 +95,25 @@ pub fn path_deps(manifest: &str) -> Vec<String> {
             let word: String = line[i..i + 4].iter().collect();
             let boundary = i == 0 || !(line[i - 1].is_alphanumeric() || line[i - 1] == '_');
             let mut j = i + 4;
-            while j < line.len() && line[j].is_whitespace() { j += 1; }
+            while j < line.len() && line[j].is_whitespace() {
+                j += 1;
+            }
             if word == "path" && boundary && j < line.len() && line[j] == '=' {
                 j += 1;
-                while j < line.len() && line[j].is_whitespace() { j += 1; }
+                while j < line.len() && line[j].is_whitespace() {
+                    j += 1;
+                }
                 if j < line.len() && (line[j] == '"' || line[j] == '\'') {
                     let quote = line[j];
                     j += 1;
                     let start = j;
-                    while j < line.len() && line[j] != quote { j += 1; }
+                    while j < line.len() && line[j] != quote {
+                        j += 1;
+                    }
                     let value: String = line[start..j].iter().collect();
-                    if value.starts_with("..") { out.push(value); }
+                    if value.starts_with("..") {
+                        out.push(value);
+                    }
                 }
             }
             i += 1;
@@ -198,7 +209,10 @@ pub fn run(args: &[String]) -> i32 {
         None => match Repo::discover(&cwd) {
             Some(r) => r.path,
             None => {
-                eprintln!("xtask path-pins: aucun dépôt git au-dessus de {}", cwd.display());
+                eprintln!(
+                    "xtask path-pins: aucun dépôt git au-dessus de {}",
+                    cwd.display()
+                );
                 return 2;
             }
         },
@@ -239,7 +253,10 @@ pub fn run(args: &[String]) -> i32 {
             let _ = repo.fetch("origin");
         }
         let Some(head) = repo.resolve("HEAD") else {
-            eprintln!("xtask path-pins: [repo.{}] HEAD illisible, non vérifiable", pin.name);
+            eprintln!(
+                "xtask path-pins: [repo.{}] HEAD illisible, non vérifiable",
+                pin.name
+            );
             return 2;
         };
         checked += 1;
@@ -280,15 +297,14 @@ pub fn run(args: &[String]) -> i32 {
             // `../neural-routing-core` or `../..`: a path that climbs but stays
             // inside THIS repository is not a neighbour and needs no pin. The
             // toplevel decides, not the shape of the string.
-            let same_repo = std::fs::canonicalize(&repo.path).ok()
-                == std::fs::canonicalize(&root).ok();
+            let same_repo =
+                std::fs::canonicalize(&repo.path).ok() == std::fs::canonicalize(&root).ok();
             if same_repo {
                 continue;
             }
             let target_repo = std::fs::canonicalize(&repo.path).ok();
             let pinned = pins.iter().any(|p| {
-                resolve_pin(&root, &p.path)
-                    .and_then(|d| std::fs::canonicalize(d).ok())
+                resolve_pin(&root, &p.path).and_then(|d| std::fs::canonicalize(d).ok())
                     == target_repo
             });
             if !pinned {
@@ -323,7 +339,10 @@ pub fn run(args: &[String]) -> i32 {
     if unpinned > 0 {
         println!();
         println!("Une dépendance `path` non épinglée ne dit aucun commit : le voisin peut");
-        println!("bouger sans qu'aucun diff ne le montre. Ajouter sa section dans {} :", pins_path.display());
+        println!(
+            "bouger sans qu'aucun diff ne le montre. Ajouter sa section dans {} :",
+            pins_path.display()
+        );
         println!("  [repo.<nom>]");
         println!("  path = \"../<chemin>\"");
         println!("  rev  = \"<sha de 40 caractères>\"");
@@ -363,7 +382,10 @@ rev = "36082d87a70a665325a6ee66450db13e20eb08ff"
     #[test]
     fn a_pin_without_rev_is_an_error_not_a_pass() {
         let bad = "[repo.x]\npath = \"../x\"\n";
-        assert!(parse_pins(bad).is_err(), "un pin sans rev ne doit jamais lire comme vérifié");
+        assert!(
+            parse_pins(bad).is_err(),
+            "un pin sans rev ne doit jamais lire comme vérifié"
+        );
     }
 
     #[test]
@@ -377,7 +399,10 @@ serde = "1"
 "#;
         assert_eq!(
             path_deps(manifest),
-            vec!["../this-rs/this".to_string(), "../../obrain/obrain-db/crates/obrain".to_string()]
+            vec![
+                "../this-rs/this".to_string(),
+                "../../obrain/obrain-db/crates/obrain".to_string()
+            ]
         );
     }
 

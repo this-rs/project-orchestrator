@@ -88,7 +88,10 @@ pub fn run(args: &[String]) -> i32 {
         None => match Repo::discover(&cwd) {
             Some(r) => r,
             None => {
-                eprintln!("xtask containment: aucun dépôt git au-dessus de {}", cwd.display());
+                eprintln!(
+                    "xtask containment: aucun dépôt git au-dessus de {}",
+                    cwd.display()
+                );
                 return 2;
             }
         },
@@ -98,7 +101,9 @@ pub fn run(args: &[String]) -> i32 {
     if fetch {
         if let Err(e) = repo.fetch(&remote) {
             eprintln!("xtask containment: `git fetch {remote}` a échoué : {e}");
-            eprintln!("  (réseau coupé ? relancer avec --no-fetch pour juger sur les refs locales)");
+            eprintln!(
+                "  (réseau coupé ? relancer avec --no-fetch pour juger sur les refs locales)"
+            );
             return 2;
         }
     }
