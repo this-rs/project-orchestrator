@@ -22,6 +22,8 @@ fn test_config() -> Config {
         meilisearch_key: std::env::var("MEILISEARCH_KEY")
             .unwrap_or_else(|_| "orchestrator-meili-key-change-me".into()),
         nats_url: None,
+        events_transport: "nats".into(),
+        events_journal_path: None,
         workspace_path: ".".into(),
         server_port: 8080,
         auth_config: None,
