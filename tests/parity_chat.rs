@@ -146,9 +146,13 @@ fn index_tool_call_ids(frames: &mut [Value]) {
     let mut next = 0usize;
     let mut map: HashMap<String, String> = HashMap::new();
     for frame in frames.iter_mut() {
-        let Some(obj) = frame.as_object_mut() else { continue };
+        let Some(obj) = frame.as_object_mut() else {
+            continue;
+        };
         for key in TOOL_CALL_KEYS {
-            let Some(val) = obj.get_mut(*key) else { continue };
+            let Some(val) = obj.get_mut(*key) else {
+                continue;
+            };
             if let Value::String(s) = val {
                 let raw = s.clone();
                 let marker = map
@@ -246,7 +250,13 @@ fn join_path(prefix: &str, key: &str) -> String {
     }
 }
 
-fn diff_values(expected: &Value, actual: &Value, index: usize, path: &str, out: &mut Vec<Difference>) {
+fn diff_values(
+    expected: &Value,
+    actual: &Value,
+    index: usize,
+    path: &str,
+    out: &mut Vec<Difference>,
+) {
     match (expected, actual) {
         (Value::Object(e), Value::Object(a)) => {
             for (k, ev) in e {
@@ -358,8 +368,7 @@ fn golden_dir() -> PathBuf {
 /// `$client` is refused: it would be compared as an empty server frame and pass
 /// silently, which is exactly the kind of hole a golden must not have.
 fn parse_golden(raw: &str, origin: &str) -> Result<Vec<Value>, String> {
-    let arr: Value =
-        serde_json::from_str(raw).map_err(|e| format!("{origin}: not JSON: {e}"))?;
+    let arr: Value = serde_json::from_str(raw).map_err(|e| format!("{origin}: not JSON: {e}"))?;
     let frames = arr
         .as_array()
         .ok_or_else(|| format!("{origin}: a golden must be a JSON array"))?;
@@ -395,8 +404,7 @@ fn load_all_goldens() -> BTreeMap<String, Vec<Value>> {
             continue;
         }
         let name = path.file_stem().unwrap().to_string_lossy().into_owned();
-        let frames =
-            load_golden_file(&path).unwrap_or_else(|e| panic!("golden `{name}`: {e}"));
+        let frames = load_golden_file(&path).unwrap_or_else(|e| panic!("golden `{name}`: {e}"));
         out.insert(name, frames);
     }
     out
@@ -538,7 +546,10 @@ fn compare_handles_interleaved_client_frames() {
         json!({"type": "tool_cancelled", "id": "a", "seq": 0}),
     ];
     let actual = golden.clone();
-    assert!(compare(&golden, &actual).is_empty(), "identical interleaving");
+    assert!(
+        compare(&golden, &actual).is_empty(),
+        "identical interleaving"
+    );
 
     // A dropped client frame is a difference, exactly where it stood.
     let missing_client = vec![
@@ -597,7 +608,10 @@ fn difference_message_names_rank_field_expected_and_got() {
 #[test]
 fn loader_refuses_a_frame_with_neither_type_nor_client() {
     let err = parse_golden(r#"[{"content": "no discriminant"}]"#, "test").unwrap_err();
-    assert!(err.contains("frame 0 has neither `type` nor `$client`"), "{err}");
+    assert!(
+        err.contains("frame 0 has neither `type` nor `$client`"),
+        "{err}"
+    );
 
     // `type` alone is accepted, `$client` alone is accepted.
     assert!(parse_golden(r#"[{"type": "result"}]"#, "test").is_ok());
@@ -668,7 +682,11 @@ fn write_golden(name: &str, frames: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
-async fn create_session(server: &str, token: Option<&str>, message: &str) -> Result<String, String> {
+async fn create_session(
+    server: &str,
+    token: Option<&str>,
+    message: &str,
+) -> Result<String, String> {
     let client = reqwest::Client::new();
     let mut req = client
         .post(format!("{server}/api/chat/sessions"))
@@ -726,7 +744,9 @@ async fn record() -> Result<(), String> {
     if !message.is_empty() {
         frames.push(json!({"$client": "user_message", "content": message}));
         let body = json!({"type": "user_message", "content": message}).to_string();
-        ws.send(WsMessage::text(body)).await.map_err(|e| e.to_string())?;
+        ws.send(WsMessage::text(body))
+            .await
+            .map_err(|e| e.to_string())?;
     }
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
@@ -739,13 +759,16 @@ async fn record() -> Result<(), String> {
             break;
         }
         match tokio::time::timeout(remaining, ws.next()).await {
-            Err(_) => break, // timeout
+            Err(_) => break,   // timeout
             Ok(None) => break, // socket closed
             Ok(Some(Ok(WsMessage::Text(t)))) => {
                 let v: Value = serde_json::from_str(t.as_str())
                     .map_err(|e| format!("frame is not JSON: {e}"))?;
                 let tag = v.get("type").and_then(Value::as_str);
-                let done = matches!(tag, Some("result") | Some("session_closed") | Some("session_error"));
+                let done = matches!(
+                    tag,
+                    Some("result") | Some("session_closed") | Some("session_error")
+                );
                 frames.push(v);
                 if done {
                     break;
