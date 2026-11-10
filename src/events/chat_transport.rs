@@ -107,6 +107,14 @@ pub trait ChatTransport: Send + Sync {
     /// connected, disconnected, or unknown (a transport with no remote).
     fn transport_state(&self) -> TransportState;
 
+    /// A typed view of this transport as the journal, when it is one. The
+    /// reconnect path uses it to replay persisted events from the journal
+    /// instead of Neo4j; every other transport returns `None` and keeps the
+    /// Neo4j replay path.
+    fn as_journal(&self) -> Option<&JournalTransport> {
+        None
+    }
+
     /// Build the cancel-tools subject for a session.
     fn cancel_tools_subject(&self, session_id: &str) -> String;
 
@@ -707,6 +715,10 @@ impl ChatTransport for JournalTransport {
 
     fn transport_state(&self) -> TransportState {
         TransportState::Unknown
+    }
+
+    fn as_journal(&self) -> Option<&JournalTransport> {
+        Some(self)
     }
 
     fn cancel_tools_subject(&self, session_id: &str) -> String {

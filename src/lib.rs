@@ -264,6 +264,10 @@ pub struct EventsYamlConfig {
     /// Journal file path for the `journal` transport. Absent => the default:
     /// [`crate::events::chat_transport::DEFAULT_JOURNAL_PATH`].
     pub journal_path: Option<String>,
+    /// Journal retention bound for the `journal` transport: how many chat
+    /// events the journal keeps before truncating the oldest. Absent =>
+    /// [`crate::events::chat_transport::DEFAULT_MAX_EVENTS`].
+    pub max_events: Option<usize>,
 }
 
 /// MCP Federation configuration section.
@@ -564,6 +568,32 @@ pub(crate) fn parse_env_flag(value: &str) -> Option<bool> {
 /// ([`parse_env_flag`]): an unknown value falls back to the YAML.
 pub(crate) fn env_flag_over(env: Option<&str>, yaml: Option<bool>) -> Option<bool> {
     env.and_then(parse_env_flag).or(yaml)
+}
+
+/// Resolve the journal retention bound for the `journal` chat transport.
+///
+/// Priority: `EVENTS_MAX_EVENTS` (strict — a set-but-unparseable, negative, or
+/// zero value fails the boot and names the value) > YAML `events.max_events` >
+/// [`crate::events::chat_transport::DEFAULT_MAX_EVENTS`]. The env var is the
+/// only source that can carry a value `usize` cannot represent (a negative or a
+/// non-numeric string), so it is validated here instead of being silently
+/// dropped; the YAML value is typed `Option<usize>` and its zero/negative cases
+/// are rejected at boot in [`start_server`] (negative fails serde first).
+fn resolve_events_max_events(yaml_max: Option<usize>) -> anyhow::Result<usize> {
+    const ACCEPTED: &str = "accepted values: a whole number >= 1 (e.g. 100000)";
+    let raw = match std::env::var("EVENTS_MAX_EVENTS") {
+        Ok(raw) => raw,
+        Err(_) => {
+            return Ok(yaml_max.unwrap_or(crate::events::chat_transport::DEFAULT_MAX_EVENTS));
+        }
+    };
+    let parsed = raw.trim().parse::<usize>().map_err(|_| {
+        anyhow::anyhow!("invalid EVENTS_MAX_EVENTS={raw:?}: not a positive integer ({ACCEPTED})")
+    })?;
+    if parsed == 0 {
+        anyhow::bail!("invalid EVENTS_MAX_EVENTS={raw:?}: must be at least 1 ({ACCEPTED})");
+    }
+    Ok(parsed)
 }
 
 /// The startup warning for a configured Obscura executable (`OBSCURA_BIN` / `chat.obscura_path`)
@@ -1011,6 +1041,12 @@ pub struct Config {
     /// (EVENTS_JOURNAL_PATH) > YAML (events.journal_path) > default.
     pub events_journal_path: Option<String>,
 
+    /// Journal retention bound for the `journal` chat transport: how many chat
+    /// events the journal keeps before truncating the oldest. Priority: env var
+    /// (EVENTS_MAX_EVENTS) > YAML (events.max_events) > default
+    /// ([`crate::events::chat_transport::DEFAULT_MAX_EVENTS`]).
+    pub events_max_events: usize,
+
     /// Persistent log file (dir, level, retention). Priority: env > YAML `log:` > defaults.
     pub log: logging::LogSettings,
 
@@ -1037,6 +1073,13 @@ impl Config {
         let (yaml, resolved_path) = Self::load_yaml_with_path(yaml_path)?;
 
         // 2. Build Config with env var overrides
+
+        // Journal retention bound: the env var is strict (a set-but-unparseable,
+        // negative, or zero value fails the boot naming the value), else YAML,
+        // else the default. Resolved here so `from_yaml_and_env` returns an Err
+        // instead of silently dropping a bad `EVENTS_MAX_EVENTS`.
+        let events_max_events = resolve_events_max_events(yaml.events.max_events)?;
+
         Ok(Self {
             setup_completed: yaml.setup_completed,
             neo4j_uri: std::env::var("NEO4J_URI").unwrap_or(yaml.neo4j.uri),
@@ -1164,6 +1207,7 @@ impl Config {
             events_journal_path: std::env::var("EVENTS_JOURNAL_PATH")
                 .ok()
                 .or(yaml.events.journal_path),
+            events_max_events,
             // Neural routing config (env var overrides > YAML > defaults)
             neural_routing: {
                 let mut nr = yaml.neural_routing;
@@ -1497,6 +1541,19 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // Fail-fast: reject an unknown events.transport before any expensive init.
     let transport_kind = events::chat_transport::select_transport(&config.events_transport)
         .map_err(|e| anyhow::anyhow!("Invalid events config: {e}"))?;
+    // Fail-fast: reject an absurd journal retention (0, or a negative number that
+    // could not even be parsed into `usize`) before any expensive init, naming the
+    // value and the accepted values instead of failing late inside
+    // `JournalTransport::open`. The env var was already validated strictly at
+    // config load; this catches a YAML `events.max_events: 0` (a negative YAML
+    // value fails serde before it ever reaches a `Config`).
+    if config.events_max_events == 0 {
+        anyhow::bail!(
+            "invalid events.max_events={}: must be a whole number >= 1 \
+             (accepted values: a whole number >= 1, e.g. 100000)",
+            config.events_max_events
+        );
+    }
     if config.ingress.enabled {
         tracing::info!(
             max_body_bytes = config.ingress.max_body_bytes,
@@ -1584,7 +1641,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             transport_kind,
             nats_emitter.clone(),
             config.events_journal_path.as_deref(),
-            events::DEFAULT_MAX_EVENTS,
+            config.events_max_events,
         )?;
 
     // Extract neural_router, trajectory_collector, trajectory_store
@@ -3269,6 +3326,40 @@ server:
     // ========================================================================
     // New auth config format tests
     // ========================================================================
+
+    /// The journal retention env var is strict: a set-but-absurd value (0,
+    /// negative, non-numeric) fails the boot naming the value and the accepted
+    /// values, instead of being silently dropped onto the YAML/default.
+    #[test]
+    fn test_events_max_events_resolution_is_strict() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("EVENTS_MAX_EVENTS");
+
+        // Unset: the YAML value wins, else the default.
+        assert_eq!(
+            resolve_events_max_events(None).unwrap(),
+            crate::events::chat_transport::DEFAULT_MAX_EVENTS
+        );
+        assert_eq!(resolve_events_max_events(Some(42)).unwrap(), 42);
+
+        // A valid env var overrides the YAML.
+        std::env::set_var("EVENTS_MAX_EVENTS", "7");
+        assert_eq!(resolve_events_max_events(Some(42)).unwrap(), 7);
+
+        // Absurd values fail, naming the value and the accepted values.
+        for bad in ["0", "-5", "abc", "1.5"] {
+            std::env::set_var("EVENTS_MAX_EVENTS", bad);
+            let msg = resolve_events_max_events(Some(42)).unwrap_err().to_string();
+            assert!(
+                msg.contains("EVENTS_MAX_EVENTS"),
+                "var name missing: {msg:?}"
+            );
+            assert!(msg.contains(bad), "value {bad:?} missing: {msg:?}");
+            assert!(msg.contains(">= 1"), "accepted values missing: {msg:?}");
+        }
+
+        std::env::remove_var("EVENTS_MAX_EVENTS");
+    }
 
     #[test]
     fn test_new_auth_format_root_account_only() {

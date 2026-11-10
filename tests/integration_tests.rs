@@ -25,6 +25,7 @@ fn test_config() -> Config {
         nats_url: None,
         events_transport: "nats".into(),
         events_journal_path: None,
+        events_max_events: project_orchestrator::events::chat_transport::DEFAULT_MAX_EVENTS,
         workspace_path: ".".into(),
         server_port: 8080,
         auth_config: None,
