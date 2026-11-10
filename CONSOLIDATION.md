@@ -37,3 +37,16 @@ Plan PO : `bf3ab074-467e-4b34-b92e-4b19040d8ece` (projet PO Backend).
 | Socle this-rs à côté d'axum | O-THISRS-1 | à faire |
 | Backend obrain derrière la fabrique | O-DOUBLE | à faire |
 | Retrait de NATS | O-NATS-OUT | à faire |
+
+## Les portillons de cette branche (en place)
+
+| Portillon | Ce qu'il empêche | Commande |
+|---|---|---|
+| `containment` | la branche qui dérive de `main` pendant des mois sans que personne ne le voie | `cargo xtask containment` |
+| `path-pins` | un voisin (this, obrain, atelier) qui bouge sous les pieds sans qu'aucun diff ne le montre | `cargo xtask path-pins` |
+
+Les deux tournent dans le job « Lint & Format », donc ils sont bloquants par héritage — sans toucher à la protection de branche de `main`.
+
+`pins.toml` dit contre QUELS commits on construit. Mettre un `rev` à jour est un acte délibéré, dans le même commit que le besoin qui le motive.
+
+`path-pins` ne fait pas de `git fetch` par défaut : un voisin dont le remote est en ssh bloquerait le portillon. `--fetch` l'active.

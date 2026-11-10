@@ -356,6 +356,32 @@ jobs:
       - name: storage-boundary — pilote hors adaptateur
         run: cargo xtask storage-boundary --strict
 
+      # ----------------------------------------------------------------------
+      # Deux portillons de la branche de consolidation. Ils vivent dans le job
+      # « Lint & Format », qui est déjà un check requis sur main : ils sont donc
+      # bloquants par héritage, sans toucher à la protection de branche.
+      #
+      # containment : la branche doit CONTENIR origin/main. C'est la règle 2 de
+      # CONSOLIDATION.md — main redescend dans la branche chaque semaine, jamais
+      # l'inverse. Sans cette étape, une branche de plusieurs mois dérive sans
+      # que personne ne le voie et n'est plus fusible le jour où elle marche :
+      # c'est exactement ce qui est arrivé à `consolidation/obrain`.
+      #
+      # path-pins : les voisins (this, obrain, atelier) sont épinglés dans
+      # pins.toml. En CI ils sont ABSENTS du disque : le portillon le dit et sort
+      # 0. Ce qu'il vérifie ici reste utile — qu'aucune dépendance `path = "..…"`
+      # ne référence un dépôt non épinglé. Il devient pleinement actif sur une
+      # machine de développement, où les voisins existent.
+      - name: containment — la branche contient main
+        run: cargo xtask containment
+      - name: path-pins — les voisins sont à leur commit épinglé
+        run: cargo xtask path-pins
+
+      # Test du portillon lui-même, sur un faux arbre : un portillon qu'on ne
+      # fait jamais échouer est un portillon qu'on ne sait pas vivant.
+      - name: Test the branch gates
+        run: cargo test --manifest-path xtask/Cargo.toml
+
       # Index des diagrammes (docs/diagrams/INDEX.yml). Node est deja sur les
       # runners ubuntu-latest : pas de setup-node, pas de package.json, pas de
       # nouvelle chaine d'outils dans un depot Rust.

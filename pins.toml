@@ -1,0 +1,26 @@
+# The pinned state of the sibling checkouts — the consolidation branch builds
+# against THESE commits, not against "whatever is on the neighbour's disk".
+#
+# Why this file exists: a `path = "../../…"` dependency carries no sha. The
+# neighbour can move under our feet and no diff shows it. `cargo xtask
+# path-pins` compares each pin below with the checkout's real HEAD, and
+# refuses any out-of-repo path dependency that is not pinned here.
+#
+# Updating a pin is a deliberate act: bump the `rev` in the SAME commit that
+# needs the new behaviour, so the reason is in the log.
+version = 1
+
+[repo.this]
+path = "this-rs/this"
+url  = "https://github.com/this-rs/this.git"
+rev  = "3978baf8e2c9046c4c7ed57ceeb2f9824c84c2f4"
+
+[repo.obrain]
+path = "obrain/obrain-db"
+url  = "https://github.com/obrain-db/obrain.git"
+rev  = "36082d87a70a665325a6ee66450db13e20eb08ff"
+
+[repo.atelier]
+path = "this-rs/atelier"
+url  = "https://github.com/this-rs/atelier.git"
+rev  = "261237bcf5dfa8c39a5f92caf8b4118623334a86"
