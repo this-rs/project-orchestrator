@@ -13,12 +13,12 @@ version = 1
 [repo.this]
 path = "this-rs/this"
 url  = "https://github.com/this-rs/this.git"
-rev  = "3978baf8e2c9046c4c7ed57ceeb2f9824c84c2f4"
+rev  = "61040a2c631aa1c2dc97cfc2be02078df74563b5"
 
 [repo.obrain]
 path = "obrain/obrain-db"
 url  = "https://github.com/obrain-db/obrain.git"
-rev  = "36082d87a70a665325a6ee66450db13e20eb08ff"
+rev  = "38faeac4bbbc9f27e77cf3fa42318df5694fd670"
 
 [repo.atelier]
 path = "this-rs/atelier"
