@@ -96,3 +96,46 @@ Procédure qui marche, dans cet ordre :
 
 Coût mesuré : ~3 minutes. Ce qui le rend supportable, c'est que le portillon
 `containment` le réclame immédiatement au lieu de laisser la dette s'accumuler.
+
+## Objectifs suivis (mis à jour à chaque fin de vague)
+
+Cinq objectifs, chacun avec son état mesuré — pas une impression. Un objectif
+ne passe à ✅ que sur une preuve reproductible.
+
+### O1 — Contrat verrouillé sur toute la surface
+- ✅ Inventaire généré (483 `route()`, 629 opérations, 427 actions MCP) + portillon `xtask parity`
+- ✅ Contrat filaire du chat : 41 variantes, 5 scénarios, comparateur positionnel
+- 🟡 Goldens **enregistrés** contre un vrai serveur — le comparateur existe, l'enregistrement reste `#[ignore]`
+- ⬜ DTO TypeScript engendrés — 473 sites d'appel, 507 DTO, **zéro génération** ; 2 bugs vivants trouvés
+- 🔴 Angle mort : le contrat REST n'est gardé nulle part hors chat
+
+### O2 — Harnais à parité
+- ✅ Famille A : `gate`, `Recorder`, `specs` retrouvés (PR this-rs #230)
+- ✅ Cœur wasm32 compile (12,19 s) ; `?Send` tranché par thread + LocalSet
+- ✅ `ChatTransport` : plus aucun consommateur ne connaît NATS
+- ⬜ Journal durable (CDC obrain) puis retrait de NATS
+- ⬜ Transports serveur (nexus, HTTP) en features d'hôte
+
+### O3 — obrain comme stockage par défaut
+- ✅ Vectoriel tranché : balayage exact, recall 1,0000, p95 1,5-3,1 ms
+- ✅ Unicité composite corrigée + bench (PR obrain #99)
+- ✅ `StoreCapabilities` refuse au lieu de se taire
+- ⬜ Migration 4,5 M nœuds, aller-retour vérifié
+- ⬜ Fenêtre de rétention du CDC mesurée
+- ⬜ Bascule du défaut + retour arrière par configuration
+
+### O4 — PO démontre this-rs + obrain
+- ✅ Module `plan` : descripteur + CRUD sans stockage + vues ; **le critère passe** (ajouter un champ ne touche que le descripteur)
+- ⬜ L'adaptateur de stockage `Request/Effect` ↔ neo4j — **le vrai coût, non payé**
+- ⬜ Un écran rendu via this-ui
+- ⬜ La décision du front, une fois la preuve faite (engendrer vs réécrire)
+
+### O5 — Hygiène de branche
+- ✅ `containment` + `path-pins` + `strict: true` sur main
+- ✅ CI de la branche déclenchée au push (`consolidation/**`)
+- 🟡 CI verte : trois rouges successifs, tous sur des règles du dépôt (xtask fmt, clippy de test, plafond de diagrammes)
+- ✅ `main` reversé dans la branche à chaque fois que le portillon l'a exigé (3 fois)
+
+**Règle de suivi** : à chaque fin de vague, un objectif ne peut changer d'état
+que si la preuve est dans le dépôt. Un ⬜ qui devient 🟡 sans commit n'est pas
+un progrès.
