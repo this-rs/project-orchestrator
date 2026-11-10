@@ -36,6 +36,29 @@ mod tests {
         // Tri dynamique des endpoints de liste : id ajouté en départage.
         ("milestone.rs", "ORDER BY {} {}, m.id"),
         ("project.rs", "ORDER BY {} {}, p.id"),
+        // Relations/événements journalisés : id ajouté en départage.
+        ("ingress.rs", "ORDER BY e.received_at DESC, e.id DESC"),
+        ("trigger.rs", "ORDER BY f.fired_at DESC, f.id DESC"),
+        // Score de recherche sémantique (flottant) : id du nœud retourné.
+        ("decision.rs", "ORDER BY score DESC, d.id DESC"),
+        ("document.rs", "ORDER BY score DESC, c.id DESC"),
+        ("note.rs", "ORDER BY score DESC, n.id DESC"),
+        ("note.rs", "ORDER BY score DESC, f.path DESC"),
+        ("note.rs", "ORDER BY score DESC, fn.id DESC"),
+        ("trajectory_store.rs", "ORDER BY score DESC, t.id DESC"),
+        // Poids SYNAPSE : extrémités de l'arête.
+        ("note.rs", "ORDER BY weight DESC, neighbor_id DESC"),
+        ("note.rs", "ORDER BY s.weight DESC, source_id DESC, target_id DESC"),
+        // Agrégats analytics : identifiant du groupe.
+        ("analytics.rs", "ORDER BY SIZE(members) DESC, wl_hash DESC"),
+        ("analytics.rs", "ORDER BY file_count DESC, cid DESC"),
+        ("analytics.rs", "ORDER BY f.churn_score DESC, f.path DESC"),
+        ("data_migrations.rs", "ORDER BY notes DESC, status, note_type, importance"),
+        // Entités hétérogènes : coalesce(id, path) en départage.
+        ("chat.rs", "ORDER BY r.mention_count DESC, COALESCE(e.id, e.path) DESC"),
+        // Chemin critique : liste d'identifiants du chemin.
+        ("plan.rs", "ORDER BY pathLength DESC, path_ids DESC"),
+        ("graph_schema.rs", "ORDER BY depth, n.id ASC LIMIT 200"),
     ];
 
     #[test]
