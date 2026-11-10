@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::chat::provider::cognitive::ProviderRoutingMode;
 use crate::chat::provider::resolver::REMOTE_PREFIX;

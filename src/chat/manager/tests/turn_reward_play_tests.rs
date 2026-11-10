@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::chat::agent_runtime::{fake::FakeProvider, AgentRuntime};
 use crate::chat::provider::cognitive::decision::{CognitiveDecision, Pick};

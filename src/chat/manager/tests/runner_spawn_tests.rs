@@ -1,4 +1,3 @@
-
 use super::is_runner_spawned;
 #[test]
 fn detects_runner_sessions() {

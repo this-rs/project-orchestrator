@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::chat::agent_runtime::{TurnOutcome, TurnServices};
 fn test_config() -> ChatConfig {

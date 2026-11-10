@@ -1,4 +1,3 @@
-
 use super::super::lasting_rules::{LastingRuleStore, LastingScope};
 use super::super::session_grants::{cover, AskedCall, Asker, Cover, SessionGrants};
 use super::super::types::PermissionAnswerScope;

@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// RM-4 — une session finie par un chat relie ses commits à sa tâche.

@@ -1,4 +1,3 @@
-
 use super::server_secrets_to_hide;
 #[test]
 fn only_the_server_secrets_that_exist_are_hidden() {
