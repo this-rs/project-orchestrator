@@ -2394,7 +2394,10 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         watcher,
         chat_manager,
         event_bus,
-        nats_emitter,
+        nats_emitter: nats_emitter.map(|e| {
+            let t: Arc<dyn events::ChatTransport> = e;
+            t
+        }),
         auth_config: config.auth_config.clone(),
         serve_frontend: config.serve_frontend,
         frontend_path: config.frontend_path.clone(),

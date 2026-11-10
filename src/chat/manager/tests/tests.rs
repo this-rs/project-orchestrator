@@ -5719,7 +5719,7 @@ async fn a_cancel_after_the_session_moved_gets_the_new_owners_answer() {
     std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
     let broker = TestBroker::start().await;
     let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
-    let instance = |nats: Arc<NatsEmitter>| {
+    let instance = |nats: Arc<dyn crate::events::ChatTransport>| {
         let dyn_graph: Arc<dyn GraphStore> = graph.clone();
         let state = mock_app_state();
         ChatManager::new_without_memory(dyn_graph, state.meili, test_config()).with_nats(nats)
@@ -16759,7 +16759,7 @@ async fn a_legacy_session_answers_cancels_from_another_instance_over_nats() {
     let owner_nats = Arc::new(NatsEmitter::new(broker.client().await, "events"));
     let state = mock_app_state();
     let owner = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
-        .with_nats(Arc::clone(&owner_nats));
+        .with_nats(owner_nats.clone());
     let (mut session, _) = create_dummy_session(false, "", vec![]);
     session.child_pid = Some(cli_pid);
     session.active_background_tasks.lock().await.insert(

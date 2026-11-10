@@ -15,7 +15,9 @@
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
-use super::transport::{Message, Subscriber};
+use super::nats::ChatRpcResponse;
+use super::transport::{Message, Subject, Subscriber};
+use super::types::TransportState;
 use crate::chat::types::ChatEvent;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -92,6 +94,42 @@ pub trait ChatTransport: Send + Sync {
 
     /// Subscribe to streaming-snapshot requests (the owning instance answers each).
     async fn subscribe_snapshot_requests(&self, session_id: &str) -> anyhow::Result<Subscriber>;
+
+    /// Publish an opaque payload on an opaque reply subject (the reply inbox of
+    /// a request this instance received). Used by the request/reply relays
+    /// (snapshots, RPC, `cancel_relay`) to answer an inbound request.
+    async fn publish(&self, subject: &Subject, payload: Vec<u8>) -> anyhow::Result<()>;
+
+    /// Flush the transport so publishes already queued reach the far side.
+    async fn flush(&self) -> anyhow::Result<()>;
+
+    /// Health of the transport connection, for the status endpoint:
+    /// connected, disconnected, or unknown (a transport with no remote).
+    fn transport_state(&self) -> TransportState;
+
+    /// Build the cancel-tools subject for a session.
+    fn cancel_tools_subject(&self, session_id: &str) -> String;
+
+    /// Build the cancel-task subject for a session.
+    fn cancel_task_subject(&self, session_id: &str) -> String;
+
+    /// Subscribe to cancel-task requests for a session (the owning instance
+    /// answers each on its reply subject).
+    async fn subscribe_cancel_task(&self, session_id: &str) -> anyhow::Result<Subscriber>;
+
+    /// Subscribe to RPC "send a message" requests for a session (the owning
+    /// instance processes each and answers with a `ChatRpcResponse`).
+    async fn subscribe_rpc_send(&self, session_id: &str) -> anyhow::Result<Subscriber>;
+
+    /// Ask the instance that owns a session to send a message to it (the RPC
+    /// "send a message" request), returning its `ChatRpcResponse`, or `None`
+    /// when nobody answers within the timeout.
+    async fn request_send_message(
+        &self,
+        session_id: &str,
+        message: &str,
+        message_type: &str,
+    ) -> Option<ChatRpcResponse>;
 
     /// Ask the instance that owns a session to cancel it, returning its raw
     /// answer or why there is none ([`RelayFailure`]).
@@ -186,6 +224,46 @@ impl ChatTransport for InMemoryChatTransport {
         Ok(Subscriber::from_stream(
             futures::stream::pending::<Message>(),
         ))
+    }
+    async fn publish(&self, _subject: &Subject, _payload: Vec<u8>) -> anyhow::Result<()> {
+        // Mono-instance: no remote reply inbox to deliver to.
+        Ok(())
+    }
+
+    async fn flush(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn transport_state(&self) -> TransportState {
+        TransportState::Unknown
+    }
+
+    fn cancel_tools_subject(&self, session_id: &str) -> String {
+        format!("chat.{}.cancel_tools", session_id)
+    }
+
+    fn cancel_task_subject(&self, session_id: &str) -> String {
+        format!("chat.{}.cancel_task", session_id)
+    }
+
+    async fn subscribe_cancel_task(&self, _session_id: &str) -> anyhow::Result<Subscriber> {
+        Ok(Subscriber::from_stream(
+            futures::stream::pending::<Message>(),
+        ))
+    }
+
+    async fn subscribe_rpc_send(&self, _session_id: &str) -> anyhow::Result<Subscriber> {
+        Ok(Subscriber::from_stream(
+            futures::stream::pending::<Message>(),
+        ))
+    }
+    async fn request_send_message(
+        &self,
+        _session_id: &str,
+        _message: &str,
+        _message_type: &str,
+    ) -> Option<ChatRpcResponse> {
+        None
     }
 
     fn request_cancel<'a>(

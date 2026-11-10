@@ -8014,7 +8014,7 @@ mod legacy_nats_permission {
                 ..Default::default()
             };
             ChatManager::new_without_memory(graph, mock_app_state().meili, config)
-                .with_nats(Arc::clone(&other))
+                .with_nats(other.clone())
         };
 
         let mut req = request(None, None, "default");
@@ -8267,8 +8267,7 @@ mod cancel_tools {
                 max_sessions: 10,
                 ..Default::default()
             };
-            ChatManager::new_without_memory(graph, state.meili, config)
-                .with_nats(Arc::clone(&other))
+            ChatManager::new_without_memory(graph, state.meili, config).with_nats(other.clone())
         };
 
         r.manager.send_message(&r.sid, "slow").await.unwrap();
@@ -11903,7 +11902,7 @@ mod background_tasks {
     /// mode, no opening turn; the manager on NATS when `nats` is given.
     async fn native_session(
         fake: &FakeOpenAi,
-        nats: Option<Arc<NatsEmitter>>,
+        nats: Option<Arc<dyn crate::events::ChatTransport>>,
     ) -> (ChatManager, String, broadcast::Receiver<ChatEvent>) {
         let graph = Arc::new(MockGraphStore::new());
         store_instance(&graph, &instance(fake, "none")).await;
@@ -12031,7 +12030,8 @@ mod background_tasks {
         let broker = TestBroker::start().await;
         let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
         let fake = FakeOpenAi::start(background_sleep_script());
-        let (manager, sid, mut rx) = native_session(&fake, Some(owner)).await;
+        let (manager, sid, mut rx) =
+            native_session(&fake, Some(owner as Arc<dyn crate::events::ChatTransport>)).await;
         let pid = start_background_sleep(&manager, &sid, &mut rx).await;
 
         // The other instance holds no session: its cancel_task goes over NATS and
@@ -12049,7 +12049,7 @@ mod background_tasks {
     }
 
     /// A manager with no session of its own, on NATS.
-    fn far_manager(nats: Arc<NatsEmitter>) -> ChatManager {
+    fn far_manager(nats: Arc<dyn crate::events::ChatTransport>) -> ChatManager {
         let state = mock_app_state();
         let graph: Arc<dyn GraphStore> = Arc::new(MockGraphStore::new());
         let config = super::super::config::ChatConfig {
@@ -12064,7 +12064,7 @@ mod background_tasks {
     /// A Claude Code session that cannot stop a tool (over SSH: `tool_cancel`
     /// absent, background tasks reported), its first turn reporting one task.
     async fn remote_claude_code(
-        nats: Option<Arc<NatsEmitter>>,
+        nats: Option<Arc<dyn crate::events::ChatTransport>>,
     ) -> (ChatManager, String, broadcast::Receiver<ChatEvent>) {
         claude_code_session(false, false, nats).await
     }
@@ -12075,7 +12075,7 @@ mod background_tasks {
     async fn claude_code_session(
         tool_cancel: bool,
         stall: bool,
-        nats: Option<Arc<NatsEmitter>>,
+        nats: Option<Arc<dyn crate::events::ChatTransport>>,
     ) -> (ChatManager, String, broadcast::Receiver<ChatEvent>) {
         let mut capabilities = caps();
         capabilities.tool_cancel = tool_cancel;
@@ -12200,7 +12200,8 @@ mod background_tasks {
     async fn a_cancel_task_refused_by_the_owner_comes_back_typed_over_nats() {
         let broker = TestBroker::start().await;
         let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
-        let (_manager, sid, mut rx) = remote_claude_code(Some(owner)).await;
+        let (_manager, sid, mut rx) =
+            remote_claude_code(Some(owner as Arc<dyn crate::events::ChatTransport>)).await;
         let far = far_manager(Arc::new(NatsEmitter::new(broker.client().await, "events")));
 
         let error = far
@@ -12447,7 +12448,8 @@ mod background_tasks {
     async fn a_cancel_tools_refused_by_the_owner_comes_back_typed_over_nats() {
         let broker = TestBroker::start().await;
         let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
-        let (_manager, sid, mut rx) = remote_claude_code(Some(owner)).await;
+        let (_manager, sid, mut rx) =
+            remote_claude_code(Some(owner as Arc<dyn crate::events::ChatTransport>)).await;
         let far = Arc::new(far_manager(Arc::new(NatsEmitter::new(
             broker.client().await,
             "events",
@@ -12471,7 +12473,12 @@ mod background_tasks {
         use super::super::cancel_relay::OWNER_CANCEL_BOUND;
         let broker = TestBroker::start().await;
         let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
-        let (_manager, sid, _rx) = claude_code_session(true, true, Some(owner)).await;
+        let (_manager, sid, _rx) = claude_code_session(
+            true,
+            true,
+            Some(owner as Arc<dyn crate::events::ChatTransport>),
+        )
+        .await;
         let far = Arc::new(far_manager(Arc::new(NatsEmitter::new(
             broker.client().await,
             "events",
@@ -12571,7 +12578,12 @@ mod background_tasks {
         use futures::StreamExt;
         let broker = TestBroker::start().await;
         let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
-        let (_manager, sid, _rx) = claude_code_session(true, true, Some(owner)).await;
+        let (_manager, sid, _rx) = claude_code_session(
+            true,
+            true,
+            Some(owner as Arc<dyn crate::events::ChatTransport>),
+        )
+        .await;
         let far = Arc::new(far_manager(Arc::new(NatsEmitter::new(
             broker.client().await,
             "events",
@@ -12740,7 +12752,12 @@ mod background_tasks {
     async fn an_older_asker_gets_the_format_it_reads() {
         let broker = TestBroker::start().await;
         let owner = Arc::new(NatsEmitter::new(broker.client().await, "events"));
-        let (_manager, sid, _rx) = claude_code_session(true, false, Some(owner)).await;
+        let (_manager, sid, _rx) = claude_code_session(
+            true,
+            false,
+            Some(owner as Arc<dyn crate::events::ChatTransport>),
+        )
+        .await;
         let old = NatsEmitter::new(broker.client().await, "events");
         let mut reply = None;
         for _ in 0..30 {
@@ -17701,7 +17718,7 @@ mod claude_code_recovery_at_boot {
         let broker = TestBroker::start().await;
         let graph = Arc::new(MockGraphStore::new());
         let fake = super::super::agent_runtime::fake::FakeProvider::new();
-        let instance = |nats: Arc<NatsEmitter>| {
+        let instance = |nats: Arc<dyn crate::events::ChatTransport>| {
             let dyn_graph: Arc<dyn GraphStore> = graph.clone();
             let config = super::super::config::ChatConfig {
                 provider_path: ProviderPath::Agent,

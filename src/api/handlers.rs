@@ -8,7 +8,7 @@ use crate::api::{
 };
 use crate::auth::extractor::AuthUser;
 use crate::chat::ChatManager;
-use crate::events::{EventEmitter, HybridEmitter, NatsEmitter};
+use crate::events::{ChatTransport, EventEmitter, HybridEmitter};
 use crate::graph::algorithms::add_thermal_noise;
 use crate::identity::InstanceIdentity;
 use crate::neo4j::models::{
@@ -43,7 +43,7 @@ pub struct ServerState {
     pub event_bus: Arc<HybridEmitter>,
     /// NATS emitter for inter-process chat events and interrupts.
     /// None when NATS is not configured (local-only mode).
-    pub nats_emitter: Option<Arc<NatsEmitter>>,
+    pub nats_emitter: Option<Arc<dyn ChatTransport>>,
     /// Auth config. `None` means **anonymous/open access**: `require_auth`
     /// injects anonymous claims and lets every request through (no JWT needed).
     /// Only intended for local single-user use; a WARN is logged at startup.

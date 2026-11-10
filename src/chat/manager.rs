@@ -668,7 +668,7 @@ struct OutageSink<'a> {
     session_uuid: Option<Uuid>,
     next_seq: &'a Arc<AtomicI64>,
     events_tx: &'a broadcast::Sender<ChatEvent>,
-    nats: &'a Option<Arc<crate::events::NatsEmitter>>,
+    nats: &'a Option<Arc<dyn crate::events::ChatTransport>>,
     session_id: &'a str,
 }
 
@@ -805,7 +805,7 @@ pub struct PendingPermission {
 struct PermissionAnswer<'a> {
     active_sessions: &'a RwLock<HashMap<String, ActiveSession>>,
     graph: &'a Arc<dyn GraphStore>,
-    nats: Option<&'a Arc<crate::events::NatsEmitter>>,
+    nats: Option<&'a Arc<dyn crate::events::ChatTransport>>,
     event_emitter: &'a Option<Arc<dyn crate::events::EventEmitter>>,
 }
 
@@ -1115,7 +1115,7 @@ pub struct ChatManager {
     /// Event emitter for CRUD events (streaming status changes)
     pub(crate) event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
     /// Optional NATS emitter for cross-instance chat event publishing
-    pub(crate) nats: Option<Arc<crate::events::NatsEmitter>>,
+    pub(crate) nats: Option<Arc<dyn crate::events::ChatTransport>>,
     /// Chat transport for cross-instance chat-event publish/subscribe, as a
     /// trait object: NATS-backed when configured, none otherwise. A first
     /// increment routes only `publish_chat_event`/`subscribe_chat_events`
@@ -1277,7 +1277,7 @@ pub(crate) struct CompactionNotifier {
     /// Broadcast sender for chat events (same channel as stream_response uses)
     events_tx: broadcast::Sender<ChatEvent>,
     /// NATS emitter for cross-instance propagation (None in tests or when NATS is disabled)
-    nats: Option<Arc<crate::events::NatsEmitter>>,
+    nats: Option<Arc<dyn crate::events::ChatTransport>>,
     /// Session ID for NATS subject routing
     session_id: String,
     /// Graph store for building compaction context (None = no custom_instructions)
@@ -1293,7 +1293,7 @@ pub(crate) struct CompactionNotifier {
 impl CompactionNotifier {
     pub fn new(
         events_tx: broadcast::Sender<ChatEvent>,
-        nats: Option<Arc<crate::events::NatsEmitter>>,
+        nats: Option<Arc<dyn crate::events::ChatTransport>>,
         session_id: String,
     ) -> Self {
         Self {
@@ -4726,7 +4726,7 @@ impl ChatManager {
     /// When configured, ChatEvents are published to NATS alongside the local
     /// broadcast channel, enabling multi-instance real-time sync.
     /// Interrupts are also propagated via NATS to all instances.
-    pub fn with_nats(mut self, nats: Arc<crate::events::NatsEmitter>) -> Self {
+    pub fn with_nats(mut self, nats: Arc<dyn crate::events::ChatTransport>) -> Self {
         let transport: Arc<dyn crate::events::ChatTransport> = nats.clone();
         self.chat_transport = Some(transport);
         self.nats = Some(nats);
@@ -5193,7 +5193,7 @@ impl ChatManager {
         let session_id = session_id.to_string();
 
         tokio::spawn(async move {
-            let mut subscriber = match nats.subscribe_interrupt(&session_id).await {
+            let mut subscriber = match nats.subscribe_chat_interrupt(&session_id).await {
                 Ok(sub) => sub,
                 Err(e) => {
                     warn!(
@@ -8908,7 +8908,7 @@ impl ChatManager {
         session_id: &str,
         active_sessions: &Arc<RwLock<HashMap<String, ActiveSession>>>,
         events_tx: &broadcast::Sender<ChatEvent>,
-        nats: &Option<Arc<crate::events::NatsEmitter>>,
+        nats: &Option<Arc<dyn crate::events::ChatTransport>>,
         tool_use_id: &str,
         tool_name: &str,
         input: &serde_json::Value,
@@ -9132,7 +9132,7 @@ impl ChatManager {
         session_id: String,
         active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
         events_tx: broadcast::Sender<ChatEvent>,
-        nats: Option<Arc<crate::events::NatsEmitter>>,
+        nats: Option<Arc<dyn crate::events::ChatTransport>>,
         tool_use_id: String,
         before_pids: Vec<u32>,
     ) {
@@ -9299,7 +9299,7 @@ impl ChatManager {
         session_id: &str,
         active_sessions: &Arc<RwLock<HashMap<String, ActiveSession>>>,
         events_tx: &broadcast::Sender<ChatEvent>,
-        nats: &Option<Arc<crate::events::NatsEmitter>>,
+        nats: &Option<Arc<dyn crate::events::ChatTransport>>,
         correlation_id: Option<&str>,
         source: &str,
     ) -> bool {
@@ -9383,7 +9383,7 @@ impl ChatManager {
         session_id: String,
         active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
         events_tx: broadcast::Sender<ChatEvent>,
-        nats: Option<Arc<crate::events::NatsEmitter>>,
+        nats: Option<Arc<dyn crate::events::ChatTransport>>,
         cancel_token: CancellationToken,
     ) {
         tokio::spawn(async move {
@@ -9434,7 +9434,7 @@ impl ChatManager {
         session_id: &str,
         active_sessions: &Arc<RwLock<HashMap<String, ActiveSession>>>,
         events_tx: &broadcast::Sender<ChatEvent>,
-        nats: &Option<Arc<crate::events::NatsEmitter>>,
+        nats: &Option<Arc<dyn crate::events::ChatTransport>>,
         grace: Duration,
     ) {
         let (tasks_arc, cli_reports_live_tasks, cli_background_tasks_arc, child_pid) = {
@@ -9663,7 +9663,7 @@ impl ChatManager {
         streaming_text: Arc<Mutex<String>>,
         streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
         event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
-        nats: Option<Arc<crate::events::NatsEmitter>>,
+        nats: Option<Arc<dyn crate::events::ChatTransport>>,
         shared_sdk_control_rx: Arc<
             tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<serde_json::Value>>>,
         >,
@@ -9684,7 +9684,7 @@ impl ChatManager {
         // Helper closure: emit a ChatEvent to local broadcast + NATS (if configured)
         let emit_chat = |event: ChatEvent,
                          tx: &broadcast::Sender<ChatEvent>,
-                         nats: &Option<Arc<crate::events::NatsEmitter>>,
+                         nats: &Option<Arc<dyn crate::events::ChatTransport>>,
                          sid: &str| {
             let _ = tx.send(event.clone());
             if let Some(tap) = &mirror_tap {
@@ -14826,7 +14826,7 @@ impl ChatManager {
     pub(crate) async fn abandon_turn_if_stuck(
         active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
         event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
-        nats: Option<Arc<crate::events::NatsEmitter>>,
+        nats: Option<Arc<dyn crate::events::ChatTransport>>,
         session_id: String,
         grace: Duration,
     ) -> bool {
@@ -15081,7 +15081,7 @@ impl ChatManager {
         // Always publish interrupt to NATS so the owning instance (if remote) also stops.
         // This is fire-and-forget — no-op if NATS is not configured.
         if let Some(ref nats) = self.nats {
-            nats.publish_interrupt(session_id);
+            nats.publish_chat_interrupt(session_id);
             if !outcome.delivered {
                 outcome.routed = "nats".to_string();
             }
@@ -15171,7 +15171,7 @@ impl ChatManager {
                 // success it did not report.
                 if let Some(ref nats) = self.nats {
                     return super::cancel_relay::relay(
-                        nats,
+                        nats.as_ref(),
                         nats.cancel_tools_subject(session_id),
                         serde_json::json!({}),
                         super::cancel_relay::CancelKind::Tools,
@@ -15324,7 +15324,7 @@ impl ChatManager {
         // No answer at all is a typed error (`cancel_relay`), never a success.
         if let Some(ref nats) = self.nats {
             return super::cancel_relay::relay(
-                nats,
+                nats.as_ref(),
                 nats.cancel_task_subject(session_id),
                 serde_json::json!({ "task_id": task_id }),
                 super::cancel_relay::CancelKind::Task,
@@ -15347,7 +15347,7 @@ impl ChatManager {
     /// it holds no such session. Callable without the manager (the NATS listener).
     async fn cancel_legacy_task(
         active_sessions: &RwLock<HashMap<String, ActiveSession>>,
-        nats: &Option<Arc<crate::events::NatsEmitter>>,
+        nats: &Option<Arc<dyn crate::events::ChatTransport>>,
         session_id: &str,
         task_id: &str,
     ) -> Option<CancelTaskResult> {
@@ -15614,7 +15614,7 @@ impl ChatManager {
                             // The asker learns it at once, typed (`session_gone`).
                             if let Some(reply_to) = reply_to {
                                 super::cancel_relay::publish(
-                                    &nats,
+                                    nats.as_ref(),
                                     reply_to,
                                     asker_v2,
                                     &super::cancel_relay::CancelReply::<CancelToolsResult>::Gone,
@@ -15654,7 +15654,7 @@ impl ChatManager {
                                 capped,
                             };
                             super::cancel_relay::publish(
-                                &nats,
+                                nats.as_ref(),
                                 reply_to,
                                 asker_v2,
                                 &super::cancel_relay::CancelReply::Result(result),
@@ -15707,7 +15707,7 @@ impl ChatManager {
                         // instance holding the session answers (`GONE_GRACE`).
                         if !active_sessions.read().await.contains_key(&session_id) {
                             super::cancel_relay::publish(
-                                &nats,
+                                nats.as_ref(),
                                 reply_to,
                                 asker_v2,
                                 &super::cancel_relay::CancelReply::<CancelTaskResult>::Gone,
@@ -15725,7 +15725,7 @@ impl ChatManager {
                         );
                         tokio::spawn(async move {
                             super::cancel_relay::answer(
-                                &nats,
+                                nats.as_ref(),
                                 reply_to,
                                 asker_v2,
                                 super::cancel_relay::CancelKind::Task,
@@ -18699,7 +18699,7 @@ impl ChatManager {
         {
             let (nats, handle, sid) = (nats.clone(), Arc::clone(&handle), sid.clone());
             tokio::spawn(async move {
-                let Ok(mut sub) = nats.subscribe_interrupt(&sid).await else {
+                let Ok(mut sub) = nats.subscribe_chat_interrupt(&sid).await else {
                     warn!(session_id = %sid, "agent engine: NATS interrupt subscription failed");
                     return;
                 };
@@ -18737,7 +18737,7 @@ impl ChatManager {
                         let asker_v2 = super::cancel_relay::asker_v2(&msg.payload);
                         match msg.reply {
                             Some(reply_to) => {
-                                super::cancel_relay::answer(&nats, reply_to, asker_v2, kind, work)
+                                super::cancel_relay::answer(nats.as_ref(), reply_to, asker_v2, kind, work)
                                     .await
                             }
                             None => {
@@ -18772,7 +18772,7 @@ impl ChatManager {
                         tokio::spawn(async move {
                             let kind = super::cancel_relay::CancelKind::Task;
                             super::cancel_relay::answer(
-                                &nats,
+                                nats.as_ref(),
                                 reply_to,
                                 super::cancel_relay::asker_v2(&msg.payload),
                                 kind,
@@ -20736,7 +20736,7 @@ mod runner_spawn_tests;
 pub(crate) fn release_unstarted_turn(
     is_streaming: &AtomicBool,
     events_tx: &broadcast::Sender<ChatEvent>,
-    nats: &Option<Arc<crate::events::NatsEmitter>>,
+    nats: &Option<Arc<dyn crate::events::ChatTransport>>,
     session_id: &str,
 ) {
     is_streaming.store(false, Ordering::SeqCst);

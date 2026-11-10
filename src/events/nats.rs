@@ -694,6 +694,46 @@ impl ChatTransport for NatsEmitter {
         NatsEmitter::subscribe_snapshot_requests(self, session_id).await
     }
 
+    async fn publish(&self, subject: &Subject, payload: Vec<u8>) -> anyhow::Result<()> {
+        NatsEmitter::publish(self, subject, payload)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    async fn flush(&self) -> anyhow::Result<()> {
+        NatsEmitter::flush(self)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    fn transport_state(&self) -> TransportState {
+        NatsEmitter::transport_state(self)
+    }
+
+    fn cancel_tools_subject(&self, session_id: &str) -> String {
+        NatsEmitter::cancel_tools_subject(self, session_id)
+    }
+
+    fn cancel_task_subject(&self, session_id: &str) -> String {
+        NatsEmitter::cancel_task_subject(self, session_id)
+    }
+
+    async fn subscribe_cancel_task(&self, session_id: &str) -> anyhow::Result<Subscriber> {
+        NatsEmitter::subscribe_cancel_task(self, session_id).await
+    }
+
+    async fn subscribe_rpc_send(&self, session_id: &str) -> anyhow::Result<Subscriber> {
+        NatsEmitter::subscribe_rpc_send(self, session_id).await
+    }
+    async fn request_send_message(
+        &self,
+        session_id: &str,
+        message: &str,
+        message_type: &str,
+    ) -> Option<ChatRpcResponse> {
+        NatsEmitter::request_send_message(self, session_id, message, message_type).await
+    }
+
     fn request_cancel<'a>(
         &'a self,
         subject: String,

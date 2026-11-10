@@ -134,7 +134,7 @@ pub(crate) async fn drain_pending_messages(
     streaming_text: Arc<Mutex<String>>,
     streaming_events: Arc<Mutex<Vec<ChatEvent>>>,
     event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
-    nats: Option<Arc<crate::events::NatsEmitter>>,
+    nats: Option<Arc<dyn crate::events::ChatTransport>>,
     shared_sdk_control_rx: Arc<
         tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<serde_json::Value>>>,
     >,

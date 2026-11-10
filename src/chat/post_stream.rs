@@ -180,7 +180,7 @@ pub(crate) struct StepBudget {
     pub session_id: String,
     pub budget: Duration,
     pub events_tx: broadcast::Sender<ChatEvent>,
-    pub nats: Option<Arc<crate::events::NatsEmitter>>,
+    pub nats: Option<Arc<dyn crate::events::ChatTransport>>,
 }
 
 impl StepBudget {
