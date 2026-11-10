@@ -1365,6 +1365,13 @@ impl AgentSessionHandle {
                 quota.observe(&self.provider_id, snapshot);
                 return;
             }
+            // A turn the provider ended WITHOUT an error: the account answered, so an exhaustion
+            // we only guessed (a refusal that named no date) is over. A dated one is left alone
+            // (`QuotaRegistry::confirm_available`).
+            AgentEvent::Done { error: None, .. } => {
+                quota.confirm_available(&self.provider_id);
+                return;
+            }
             AgentEvent::Done {
                 error: Some(error), ..
             }
@@ -7487,6 +7494,63 @@ mod answered_tests {
             .expect("the instance is held out");
         assert_eq!(held.resets_at_ms, reset);
         assert_eq!(held.window.as_deref(), Some("seven_day"));
+    }
+
+    /// The other half of QUOTA: a turn the provider ENDS WITHOUT ERROR proves the account answers,
+    /// so an exhaustion we only GUESSED (a 402, an undated 429) is lifted at once — no waiting out
+    /// the five-minute fallback after a top-up or the provider's own window reset.
+    #[tokio::test]
+    async fn a_successful_turn_lifts_the_exhaustion_of_a_refusal_that_named_no_date() {
+        use crate::chat::provider::limits::ManualClock;
+        let clock = Arc::new(ManualClock::at("2026-10-21T10:00:00Z"));
+        let registry =
+            Arc::new(crate::chat::provider::quota::QuotaRegistry::new().with_clock(clock));
+        registry.mark_out_of_credit("local");
+        assert!(
+            registry.exhausted("local").is_some(),
+            "the instance starts held out"
+        );
+
+        let (provider, handle, host) = session_with_quota(registry.clone(), 0).await;
+        play_events(
+            &provider,
+            &handle,
+            vec![vec![text("answered"), done(false, None)]],
+        )
+        .await;
+
+        assert_eq!(host.seen(), [true], "the turn was answered");
+        assert!(
+            registry.exhausted("local").is_none(),
+            "an answered turn ends the guessed cooldown"
+        );
+    }
+
+    /// The mirror rule, on the same wiring: a reset the PROVIDER dated is never shortened by a
+    /// successful turn (only a newer live snapshot may say the window came back).
+    #[tokio::test]
+    async fn a_successful_turn_never_shortens_a_dated_reset() {
+        use crate::chat::provider::limits::ManualClock;
+        let clock = Arc::new(ManualClock::at("2026-10-21T10:00:00Z"));
+        let registry =
+            Arc::new(crate::chat::provider::quota::QuotaRegistry::new().with_clock(clock));
+        let reset = 1_792_836_000_000_u64; // 2026-10-24T10:00:00Z
+        registry.mark_rate_limited("local", Some(reset), None);
+
+        let (provider, handle, host) = session_with_quota(registry.clone(), 0).await;
+        play_events(
+            &provider,
+            &handle,
+            vec![vec![text("answered"), done(false, None)]],
+        )
+        .await;
+
+        assert_eq!(host.seen(), [true]);
+        let kept = registry
+            .exhausted("local")
+            .expect("a dated reset survives a successful turn");
+        assert!(kept.reset_known);
+        assert_eq!(kept.resets_at_ms, reset);
     }
 
     /// RL5: a session whose runtime was given the gate.
