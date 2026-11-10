@@ -356,6 +356,15 @@ jobs:
       - name: storage-boundary — pilote hors adaptateur
         run: cargo xtask storage-boundary --strict
 
+      # ts-dto : le contrat REST front ↔ back (objectif O1). En CI le checkout
+      # frontend est ABSENT du disque (dépôt séparé) : le portillon parse et
+      # engendre quand même les 25 types (garde-fou contre un crash du
+      # parseur) puis sort 0 — comme path-pins. Sur une machine de dev avec le
+      # frontend en vis-à-vis, il compare le généré au commité et sort 1 en
+      # nommant le fichier et le champ qui dérivent.
+      - name: ts-dto — les DTO TypeScript suivent les types serde
+        run: cargo xtask ts-dto --check
+
       # ----------------------------------------------------------------------
       # Deux portillons de la branche de consolidation. Ils vivent dans le job
       # « Lint & Format », qui est déjà un check requis sur main : ils sont donc

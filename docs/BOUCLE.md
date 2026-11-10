@@ -106,7 +106,7 @@ ne passe à ✅ que sur une preuve reproductible.
 - ✅ Inventaire généré (483 `route()`, 629 opérations, 427 actions MCP) + portillon `xtask parity`
 - ✅ Contrat filaire du chat : 41 variantes, 5 scénarios, comparateur positionnel
 - 🟡 Goldens **enregistrés** contre un vrai serveur — le comparateur existe, l'enregistrement reste `#[ignore]`
-- ⬜ DTO TypeScript engendrés — 473 sites d'appel, 507 DTO, **zéro génération** ; 2 bugs vivants trouvés
+- 🟡 DTO TypeScript engendrés — portillon `xtask ts-dto` (premier lot : Note, Task, TaskStatus, Project, Plan + fermeture = 25 types dans `frontend/src/types/generated/`) ; le basculement d'usage et les 502 DTO restants = lots suivants
 - 🔴 Angle mort : le contrat REST n'est gardé nulle part hors chat
 
 ### O2 — Harnais à parité

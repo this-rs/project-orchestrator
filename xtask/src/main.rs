@@ -17,6 +17,7 @@ mod pins;
 mod storage_boundary;
 #[cfg(test)]
 mod testrepo;
+mod ts_dto;
 
 const USAGE: &str = "\
 usage: cargo xtask <subcommand> [options]
@@ -27,6 +28,7 @@ usage: cargo xtask <subcommand> [options]
   parity            is the committed contract inventory still what the source mounts?
   pins              did main of each git-pinned repo reach Cargo.toml? (AM-2)
   storage-boundary  where do the storage drivers leak out of their adapters?
+  ts-dto           are the TypeScript DTOs still what the backend serde types say?
 
 `cargo xtask <subcommand> --help` lists the options of a subcommand.";
 
@@ -39,6 +41,7 @@ fn main() {
         Some("parity") => parity::run(&args[1..]),
         Some("pins") => pins::run(&args[1..]),
         Some("storage-boundary") => storage_boundary::run(&args[1..]),
+        Some("ts-dto") => ts_dto::run(&args[1..]),
         Some("-h") | Some("--help") | Some("help") => {
             println!("{USAGE}");
             0
