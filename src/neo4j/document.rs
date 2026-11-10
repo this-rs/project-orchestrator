@@ -714,7 +714,7 @@ impl Neo4jClient {
             MATCH (d:Document)-[:HAS_CHUNK]->(c)
             WHERE d.project_id = $project_id
             RETURN d.id AS document_id, d.filename AS filename, c, score
-            ORDER BY score DESC
+            ORDER BY score DESC, c.id DESC
             LIMIT $limit
             "#
         } else {
@@ -723,7 +723,7 @@ impl Neo4jClient {
             YIELD node AS c, score
             MATCH (d:Document)-[:HAS_CHUNK]->(c)
             RETURN d.id AS document_id, d.filename AS filename, c, score
-            ORDER BY score DESC
+            ORDER BY score DESC, c.id DESC
             LIMIT $limit
             "#
         };

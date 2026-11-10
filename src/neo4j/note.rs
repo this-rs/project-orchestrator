@@ -1642,7 +1642,7 @@ impl Neo4jClient {
             RETURN DISTINCT n, score, coalesce(source.name, source.path, source.id) AS source_entity,
                    path_names, distance, avg_path_pagerank,
                    tail(rel_types) AS relation_path, path_rel_weight, hop_weights
-            ORDER BY score DESC
+            ORDER BY score DESC, n.id DESC
             LIMIT $limit
             "#,
             target_match, rel_pattern, max_depth
@@ -1761,7 +1761,7 @@ impl Neo4jClient {
                    ['LINKED_TO_TRANSITIVE'] AS relation_path,
                    tw AS path_rel_weight,
                    [] AS hop_weights
-            ORDER BY score DESC
+            ORDER BY score DESC, n.id DESC
             LIMIT $limit
             "#,
             target_match
@@ -2380,7 +2380,7 @@ impl Neo4jClient {
                 WHERE n.status IN ['active', 'needs_review']
                 AND n.project_id = $project_id
                 RETURN n, score
-                ORDER BY score DESC
+                ORDER BY score DESC, n.id DESC
                 LIMIT $limit
             "#;
             (cypher.to_string(), Some(pid.to_string()))
@@ -2397,7 +2397,7 @@ impl Neo4jClient {
                     OR n.project_id = ''
                 )
                 RETURN n, score
-                ORDER BY score DESC
+                ORDER BY score DESC, n.id DESC
                 LIMIT $limit
                 "#;
             (cypher.to_string(), None)
@@ -2408,7 +2408,7 @@ impl Neo4jClient {
                 YIELD node AS n, score
                 WHERE n.status IN ['active', 'needs_review']
                 RETURN n, score
-                ORDER BY score DESC
+                ORDER BY score DESC, n.id DESC
                 LIMIT $limit
             "#;
             (cypher.to_string(), None)
@@ -2582,7 +2582,7 @@ impl Neo4jClient {
             YIELD node AS f, score
             WHERE EXISTS { MATCH (f)<-[:CONTAINS]-(p:Project {id: $project_id}) }
             RETURN f.path AS path, score
-            ORDER BY score DESC
+            ORDER BY score DESC, f.path DESC
             LIMIT $limit
             "#
         } else {
@@ -2590,7 +2590,7 @@ impl Neo4jClient {
             CALL db.index.vector.queryNodes('file_embedding_index', $query_limit, $embedding)
             YIELD node AS f, score
             RETURN f.path AS path, score
-            ORDER BY score DESC
+            ORDER BY score DESC, f.path DESC
             LIMIT $limit
             "#
         };
@@ -2635,7 +2635,7 @@ impl Neo4jClient {
             MATCH (fn)<-[:CONTAINS]-(f:File)
             WHERE EXISTS { MATCH (f)<-[:CONTAINS]-(p:Project {id: $project_id}) }
             RETURN fn.name AS name, f.path AS path, score
-            ORDER BY score DESC
+            ORDER BY score DESC, fn.id DESC
             LIMIT $limit
             "#
         } else {
@@ -2644,7 +2644,7 @@ impl Neo4jClient {
             YIELD node AS fn, score
             MATCH (fn)<-[:CONTAINS]-(f:File)
             RETURN fn.name AS name, f.path AS path, score
-            ORDER BY score DESC
+            ORDER BY score DESC, fn.id DESC
             LIMIT $limit
             "#
         };
@@ -2723,7 +2723,7 @@ impl Neo4jClient {
         let cypher = r#"
             MATCH (n:Note {id: $id})-[s:SYNAPSE]-(neighbor:Note)
             RETURN DISTINCT neighbor.id AS neighbor_id, s.weight AS weight
-            ORDER BY weight DESC
+            ORDER BY weight DESC, neighbor_id DESC
         "#;
 
         let q = query(cypher).param("id", note_id.to_string());
@@ -2830,7 +2830,7 @@ impl Neo4jClient {
             WHERE (n:Note OR n:Decision) AND (neighbor:Note OR neighbor:Decision)
             RETURN DISTINCT neighbor.id AS neighbor_id, s.weight AS weight,
                    CASE WHEN neighbor:Decision THEN 'Decision' ELSE 'Note' END AS entity_type
-            ORDER BY weight DESC
+            ORDER BY weight DESC, neighbor_id DESC
         "#;
 
         let q = query(cypher).param("id", node_id.to_string());
@@ -4267,7 +4267,7 @@ impl Neo4jClient {
             "MATCH (a:Note {project_id: $pid})-[s:SYNAPSE]->(b:Note {project_id: $pid})
              WHERE s.weight >= $min_weight AND a.id < b.id
              RETURN a.id AS source_id, b.id AS target_id, s.weight AS weight
-             ORDER BY s.weight DESC",
+             ORDER BY s.weight DESC, source_id DESC, target_id DESC",
         )
         .param("pid", project_id.to_string())
         .param("min_weight", min_weight);

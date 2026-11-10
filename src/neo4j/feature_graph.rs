@@ -519,7 +519,7 @@ impl Neo4jClient {
             MATCH (peer:File)<-[:CONTAINS]-(p)
             WHERE peer.community_id = cid AND NOT peer.path IN $paths
             WITH cid, peer
-            ORDER BY COALESCE(peer.pagerank, 0.0) DESC
+            ORDER BY COALESCE(peer.pagerank, 0.0) DESC, peer.path DESC
             WITH cid, collect(peer.path)[..$limit] AS top_peers
             UNWIND top_peers AS peer_path
             RETURN DISTINCT peer_path
@@ -1220,7 +1220,7 @@ impl Neo4jClient {
             WITH f, callers + callees AS connections
             WHERE connections > 0
             RETURN f.name AS name
-            ORDER BY connections DESC
+            ORDER BY connections DESC, f.id DESC
             LIMIT $limit
             "#,
         )

@@ -524,7 +524,7 @@ impl Neo4jClient {
             YIELD node AS d, score
             WHERE EXISTS {{ MATCH {DECISION_PROJECT_PATH} WHERE proj.id = $project_id }}
             RETURN d, score
-            ORDER BY score DESC
+            ORDER BY score DESC, d.id DESC
             LIMIT $limit
             "#
             )
@@ -533,7 +533,7 @@ impl Neo4jClient {
             CALL db.index.vector.queryNodes('decision_embedding', $fetch_limit, $embedding)
             YIELD node AS d, score
             RETURN d, score
-            ORDER BY score DESC
+            ORDER BY score DESC, d.id DESC
             "#
             .to_string()
         };

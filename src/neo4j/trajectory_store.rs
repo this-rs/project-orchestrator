@@ -484,7 +484,7 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
             "MATCH (t:Trajectory)
              WHERE {}
              RETURN t
-             ORDER BY t.created_at DESC
+             ORDER BY t.created_at DESC, t.id DESC
              SKIP $offset LIMIT $limit",
             conditions.join(" AND ")
         );
@@ -539,7 +539,7 @@ impl TrajectoryStore for Neo4jTrajectoryStore {
              YIELD node AS t, score
              WHERE score >= $min_similarity
              RETURN t, score
-             ORDER BY score DESC",
+             ORDER BY score DESC, t.id DESC",
         )
         .param("top_k", top_k as i64)
         .param("embedding", query_embedding.to_vec())
