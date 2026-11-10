@@ -74,3 +74,51 @@ de Hilbert sur projection PCA-2D est **à écarter** : recall 0,26 contre 0,99 �
 - Indexation incrémentale, persistance disque, recall@1/@100 (seul recall@10 mesuré).
 - Hilbert n-D (compact/3D+) : le `hilbert.rs` du substrat est 2D (centralité×degré,
 mise en page), pas conçu pour 768-d ; seul un Hilbert sur PCA-2D a été testé.
+
+## Preuve sur les vecteurs réels de PO (ExactVectorIndex, 10/11/2026)
+
+Le banc `vecscan` ci-dessus mesure le *concept* du balayage exact. Cette section
+prouve l'**implémentation obrain** elle-même — `ExactVectorIndex`
+(`crates/obrain-substrate/src/exact.rs`, branche `feat/scan-exact-dim-native`)
+branchée sur le moteur (`create_vector_index`, `vector_search`), dimension native
+768, **sans rembourrage** — sur les **vrais** embeddings PO
+(`note_embeddings.json` 8 131 × 768, `file_embeddings.json` 24 390 × 768).
+
+Protocole : 200 requêtes tirées de l'échantillon (indice `j·N/200`), vecteur
+requêté **exclu** (top-11 demandé puis le soi écarté), recall@10 contre une force
+brute qui réplique bit-à-bit la fonction `cosine` de l'index (même accumulation f32,
+même ordre de boucle, même départage par id croissant). Build `--release`
+(opt-level 3, thin LTO). Machine M4 Max **partagée** : les queues (p99) bougent
+avec la charge des autres agents — le recall, lui, est stable.
+
+| N | recall@10 | ordre exact | p50 | p95 | p99 |
+|---|---|---|---|---|---|
+| 8 131 (notes) | **1,0000** | 200/200 | 0,97 ms | 1,51 ms | 2,08 ms |
+| 24 390 (fichiers) | **1,0000** | 200/200 | 2,25 ms | 3,10 ms | 3,48 ms |
+
+- **Recall = 1,0000 aux deux tailles, ordre exact 200/200.** Plus fort que le
+  rappel : le top-10 rendu est **bit-identique** à la force brute sur les 200
+  requêtes. Aucun plafond 384, aucune quantification f16, aucune projection —
+  l'index stocke les vecteurs à 768 en f32 et balaye exhaustivement (rayon).
+- Latence cohérente avec le balayage exact de `vecscan` (p95 16T ≈ 0,85 ms à
+  8 131 / 1,42 ms à 24 390) : l'écart tient au chemin end-to-end du moteur
+  (clone d'`Arc`, mapping `NodeOffset`→`NodeId`, conversion `1,0−cosinus`) et à
+  la charge de la machine partagée. La queue p99 reste sous ~3,5 ms à 24 390 en
+  régime calme (un pic à 8,5 ms mesuré sous charge).
+
+**Persistance (réouverture par mmap).** L'index est persisté en zone nommée
+`substrate.exact.<xxh3(label,property)>` (ici `substrate.exact.1c247ef0371ed324`,
+64 o d'en-tête + `[u32; n]` + `n×768×4 o` de f32, CRC32). Fermeture → réouverture :
+**recall@10 = 1,0000 identique**. Temps d'ouverture ≈ 6–28 ms ; première recherche
+après réouverture (rechargement mmap de la zone + scan) ≈ 3–17 ms — la zone est
+relue **directement du mmap**, zéro re-balayage des propriétés (c'est le pendant de
+`tier_persist`, étendu à la dimension native).
+
+**Verdict zone orpheline — BUG confirmé.** `drop_vector_index` retire l'entrée du
+registre en mémoire et la déclaration durable (`retirer_declaration_substrat`), mais
+**ne supprime pas** la zone `substrate.exact.*` : elle reste sur disque après le drop
+(mesuré : 1 zone restante). Pire : un `create_vector_index` suivant (même
+label/propriété, même dimension) **recharge la zone orpheline périmée** au lieu de
+reconstruire — un nœud ajouté après le drop n'est pas retrouvé (top-1 = un ancien id,
+pas le nouveau). `drop_vector_index` doit aussi **effacer la zone** (ou invalider son
+CRC) pour que la reconstruction reparte des données vivantes.
