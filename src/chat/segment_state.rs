@@ -284,7 +284,11 @@ pub fn signal_of(event: &ChatEvent) -> Option<Signal> {
             result_text,
             ..
         } => {
-            let how = if stop_reason.as_deref() == Some("interrupted") {
+            // The two spellings the engines use: a `stop_reason` on the result, or a
+            // `subtype` that names the interruption (`error_interrupted`).
+            let how = if stop_reason.as_deref() == Some("interrupted")
+                || subtype.contains("interrupted")
+            {
                 TurnEnd::Interrupted
             } else if *is_error || subtype.starts_with("error") {
                 TurnEnd::Failed
@@ -455,6 +459,13 @@ pub fn classify(
             {
                 open_tool = Some(e);
             }
+            // An interrupted turn closes what it had open: a question it asked never gets its
+            // `tool_result` (measured 10/11/2026: none, and no `tool_cancelled`), so the end
+            // of the turn is the only witness that nobody is waited on any more.
+            Signal::Ended {
+                how: TurnEnd::Interrupted,
+                ..
+            } => break,
             // A question answered as a user turn (a provider without native questions)
             // is closed by that input; nothing before an input is still open.
             Signal::Input => break,
@@ -1160,6 +1171,31 @@ mod tests {
         assert_eq!(events.len(), TAIL_CAP, "the cap keeps the newest");
         assert_eq!(events.last().unwrap().signal, Signal::Input);
         assert_eq!(events.last().unwrap().at_ms, T0 + 100);
+    }
+
+    /// A question the interrupted turn left open is no longer waited on. Measured 10/11/2026
+    /// (session cadfa92b): an `AskUserQuestion` interrupted arrives as `result{interrupted}`
+    /// plus a `background_output` — NEVER as a `tool_result`, and that day no `tool_cancelled`
+    /// at all (0 lines, 1 line naming the tool_call_id). Closed only on a `ToolEnd` of its id,
+    /// the question stayed open for ever and the session read as `waiting_on_person`.
+    #[test]
+    fn an_interrupted_turn_closes_the_question_it_left_open() {
+        let interrupted = vec![
+            input(T0),
+            ev(
+                T0 + 1,
+                "ask_user_question",
+                Signal::QuestionAsked { id: "q".into() },
+            ),
+            end(T0 + 2, TurnEnd::Interrupted, false),
+        ];
+        let got = classify(&interrupted, T0, &idle(), T0 + 3);
+        assert_ne!(
+            got.reason.rule,
+            Rule::QuestionOpen,
+            "the turn that asked it was interrupted: nobody is waited on any more ({:?})",
+            got
+        );
     }
 
     /// A question or a secret closed by its answer is no longer waited on.

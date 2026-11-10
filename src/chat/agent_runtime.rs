@@ -1825,7 +1825,7 @@ impl AgentSessionHandle {
     /// Shows the message of a turn and sends the turn to the provider (`None`: the
     /// turn was stopped before it could be sent).
     async fn open_turn(
-        &self,
+        self: &Arc<Self>,
         kind: PendingMessageKind,
         shown: &str,
         sent: &str,
@@ -1834,6 +1834,9 @@ impl AgentSessionHandle {
         // A new turn: a watchdog armed for the previous one (its Stop, its tail) stands
         // down instead of ending this one — it compares this generation.
         self.turn_generation.fetch_add(1, Ordering::SeqCst);
+        // Every turn gets a watchdog HERE, at the one place a turn begins — never at an exit,
+        // so no exit of the loop of `play` can be left unwatched.
+        self.arm_turn_watchdog(self.turn_generation());
         // A Stop belongs to the turn it stopped: the new turn starts unstopped.
         self.interrupted.store(false, Ordering::SeqCst);
         let from_user = kind == PendingMessageKind::User;
@@ -2069,6 +2072,94 @@ impl AgentSessionHandle {
                         session_id = %me.session_id,
                         silence_ms = me.idle_for().as_millis() as u64,
                         "the tail of a finished turn said nothing past its budget: the turn is abandoned, the session is idle again"
+                    );
+                }
+                return;
+            }
+        });
+    }
+
+    /// Whether the turn has a tool call it announced and no result closed yet: how many it
+    /// has does not matter, only whether it has one.
+    ///
+    /// Read from what the turn already shows (`streaming_events`, cleared by `open_turn`), so
+    /// a tool belongs to the turn that started it and a late result of a previous turn closes
+    /// nothing that is open here. Looking back from the newest event and stopping at the first
+    /// tool still open is what keeps this cheap on the long tails (the measured session had
+    /// 1199 events).
+    async fn a_tool_is_working(&self) -> bool {
+        let events = self.streaming_events.lock().await;
+        let mut closed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for event in events.iter().rev() {
+            match event {
+                ChatEvent::ToolResult { id, .. } | ChatEvent::ToolCancelled { id, .. } => {
+                    closed.insert(id.as_str());
+                }
+                ChatEvent::ToolUse { id, .. } if !closed.contains(id.as_str()) => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Whether a person is being waited on by this turn, and its silence is therefore theirs:
+    /// a permission the provider asked and nobody answered, or a question the turn left open
+    /// as its last word. A watchdog that ended these would cut a session precisely while it
+    /// waits for the human it was built to hand back to.
+    async fn waiting_on_a_person(&self) -> bool {
+        if !self.waiting_permission_ids().is_empty() {
+            return true;
+        }
+        matches!(
+            self.streaming_events.lock().await.last(),
+            Some(ChatEvent::AskUserQuestion { .. } | ChatEvent::PermissionRequest { .. })
+        )
+    }
+
+    /// The watchdog of a TURN, armed by [`Self::open_turn`] — at the one place every turn
+    /// goes through, whichever way its loop ends.
+    ///
+    /// `play`'s loop has six exits and only the terminal one armed anything
+    /// ([`Self::arm_tail_watchdog`]); a turn opened while the previous one's tail stood down
+    /// was watched by nobody and could stay `streaming` for ever (measured: 8 h, session
+    /// cadfa92b, 10/11/2026). This arm is not per exit but per turn, so no exit can be
+    /// forgotten.
+    ///
+    /// Its verdict is one invariant, and the only one a session can decide on its own: a turn
+    /// that has said NOTHING for the whole silence budget AND has no tool of its own in flight
+    /// is dead. A tool legitimately long is exactly the other case — silence that is work —
+    /// and [`Self::a_tool_is_working`] is what tells them apart, so a turn cutting a
+    /// `sleep 300` is never ended.
+    fn arm_turn_watchdog(self: &Arc<Self>, generation: u64) {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                // A short tick, not the whole budget: the verdict is re-read from the activity
+                // clock every time, so it follows a turn that keeps emitting (the tail of a
+                // finished turn, a tool reporting) and can be reached without waiting the whole
+                // grace once the silence is already there.
+                tokio::time::sleep(TAIL_WATCHDOG_MIN_TICK).await;
+                if me.turn_generation.load(Ordering::SeqCst) != generation
+                    || !me.is_streaming.load(Ordering::SeqCst)
+                {
+                    return;
+                }
+                if me.a_tool_is_working().await {
+                    // A tool of this turn is working: its silence is work, not death.
+                    continue;
+                }
+                if me.waiting_on_a_person().await {
+                    // The silence is a human's to break: the turn waits, it is not dead.
+                    continue;
+                }
+                if me.idle_for() < TURN_SILENCE_GRACE {
+                    continue;
+                }
+                if me.abandon_turn(generation).await {
+                    tracing::warn!(
+                        session_id = %me.session_id,
+                        silence_ms = me.idle_for().as_millis() as u64,
+                        "a turn said nothing with no tool in flight: it is dead, the turn is abandoned and the session is idle again"
                     );
                 }
                 return;
@@ -8827,5 +8918,273 @@ mod abandoned_turn_tests {
         }
         assert_eq!(hints, 0, "the watchdog of a finished tail says nothing");
         assert!(!handle.is_streaming.load(Ordering::SeqCst));
+    }
+}
+
+/// The invariant that a turn owes the session: a turn that says NOTHING is over, unless a
+/// tool of its own is still working — the only two facts the session can tell apart.
+///
+/// Measured on 10/11/2026 (session cadfa92b-d71f-4a65-9416-2f4db27ddc67): `is_streaming`
+/// stayed true for eight hours with `partial_text_len` frozen at 843, the composer closed
+/// and Stop without effect. Every turn must have a watchdog, and until this fix only ONE
+/// of the six exits of `play`'s loop armed one — the terminal one.
+#[cfg(test)]
+mod turn_watchdog_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+
+    async fn adopting(runtime: &AgentRuntime, provider: &FakeProvider) -> Arc<AgentSessionHandle> {
+        runtime
+            .adopt(
+                "s",
+                "claude-code",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await
+    }
+
+    /// Without a subscriber `tracing` never even reads an event's fields: the warnings the
+    /// watchdogs write would not run. The server always has a subscriber; this is ours.
+    fn on_the_wire() -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .finish(),
+        )
+    }
+
+    /// THE MEASURED SEQUENCE, reduced to the state it leaves behind.
+    ///
+    /// A turn reaches its terminal event — `Done { stop_reason: Interrupted }` — and `play`
+    /// arms the tail's watchdog for the generation it ran in (agent_runtime.rs:2404). The
+    /// queue then hands the next turn a background output: `open_turn` moves the generation
+    /// and, for that kind, emits nothing at all (the `BackgroundOutput` arm). The provider
+    /// of the new turn never answers.
+    ///
+    /// The tail's watchdog then stood down IN SILENCE at a generation it did not recognise,
+    /// and nothing was watching the turn that had just begun: the session stayed `streaming`
+    /// for ever.
+    #[tokio::test]
+    async fn a_background_output_turn_whose_provider_never_answers_is_abandoned() {
+        let _wire = on_the_wire();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+
+        // The turn that reached `Done { Interrupted }`, its tail already silent past the
+        // budget when the next turn opens.
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        let ended = handle.turn_generation();
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+        handle.arm_tail_watchdog(ended);
+
+        // The queue hands the next turn a background output whose provider says nothing.
+        let opened = handle
+            .open_turn(
+                PendingMessageKind::BackgroundOutput,
+                "a background task ended",
+                "a background task ended",
+            )
+            .await
+            .expect("the background turn is sent to the provider");
+        assert!(opened.is_some(), "a background output opens a turn");
+        assert_ne!(
+            handle.turn_generation(),
+            ended,
+            "the new turn owns the session: it moved the generation"
+        );
+        // It has said nothing since, and no tool of its own is in flight.
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while handle.is_streaming.load(Ordering::SeqCst) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !handle.is_streaming.load(Ordering::SeqCst),
+            "a turn that says nothing with no tool in flight is dead: the session must be idle again"
+        );
+    }
+    /// The false positive this fix must never add: a turn working inside a tool says nothing
+    /// for as long as the tool runs — a `sleep 300`, a build, a fetch. That silence is WORK,
+    /// and the turn cutting it would be the bug the watchdog exists to prevent, made worse.
+    #[tokio::test]
+    async fn a_turn_waiting_on_a_tool_is_never_abandoned() {
+        let _wire = on_the_wire();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        let _opened = handle
+            .open_turn(PendingMessageKind::BackgroundOutput, "go", "go")
+            .await
+            .expect("the turn is sent");
+        // The tool is announced and does not answer: the turn is silent, but busy.
+        handle
+            .emit(ChatEvent::ToolUse {
+                id: "t".into(),
+                tool: "Bash".into(),
+                input: serde_json::json!({ "command": "sleep 300" }),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            })
+            .await;
+        // Silent past the budget, with the tool still in flight.
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+        tokio::time::sleep(TAIL_WATCHDOG_MIN_TICK * 3).await;
+        assert!(
+            handle.is_streaming.load(Ordering::SeqCst),
+            "a turn waiting on a tool of its own is working, not dead: it must not be cut"
+        );
+
+        // The tool answers: the turn is now silent with nothing in flight — and dead.
+        handle
+            .emit(ChatEvent::ToolResult {
+                id: "t".into(),
+                result: serde_json::json!("done"),
+                is_error: false,
+                parent_tool_use_id: None,
+            })
+            .await;
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while handle.is_streaming.load(Ordering::SeqCst) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !handle.is_streaming.load(Ordering::SeqCst),
+            "the tool is in: silence with nothing in flight is death, and the session is freed"
+        );
+    }
+
+    /// The root cause, stated on its own: a turn whose provider never says anything, with no
+    /// tool in flight, is abandoned — the session goes idle, the clients are told, and the
+    /// thread says why. This is what was missing for eight hours on 10/11/2026.
+    #[tokio::test]
+    async fn a_turn_that_never_says_anything_is_abandoned_and_says_why() {
+        let _wire = on_the_wire();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+        let mut events = handle.events_tx.subscribe();
+
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        let _opened = handle
+            .open_turn(PendingMessageKind::BackgroundOutput, "go", "go")
+            .await
+            .expect("the turn is sent");
+        // Its provider never emits, and it has no tool in flight.
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while handle.is_streaming.load(Ordering::SeqCst) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !handle.is_streaming.load(Ordering::SeqCst),
+            "a silent turn with no tool in flight is dead"
+        );
+
+        let mut idle_status = false;
+        let mut explained = false;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                ChatEvent::StreamingStatus {
+                    is_streaming: false,
+                } => idle_status = true,
+                ChatEvent::SystemHint { content } if content.contains("session is free again") => {
+                    explained = true
+                }
+                _ => {}
+            }
+        }
+        assert!(idle_status, "the clients are told the turn is over");
+        assert!(explained, "the thread says why the turn ended");
+    }
+
+    /// The watchdog is armed by `open_turn`, at the ONE place a turn begins — so no exit of
+    /// `play`'s loop can be left unwatched. Every turn therefore has one, whatever it does:
+    /// a turn opened and immediately silent is ended, not left streaming.
+    #[tokio::test]
+    async fn every_turn_is_watched_from_the_moment_it_opens() {
+        let _wire = on_the_wire();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        // One turn per kind that opens one: the witness is the same for all of them.
+        for kind in [
+            PendingMessageKind::BackgroundOutput,
+            PendingMessageKind::SystemHint,
+        ] {
+            let generation = handle.turn_generation();
+            let opened = handle
+                .open_turn(kind.clone(), "go", "go")
+                .await
+                .expect("the turn is sent");
+            assert!(opened.is_some());
+            assert_ne!(
+                handle.turn_generation(),
+                generation,
+                "the turn moved the generation: it is the one being watched"
+            );
+            handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while handle.is_streaming.load(Ordering::SeqCst) && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                !handle.is_streaming.load(Ordering::SeqCst),
+                "{kind:?}: a turn opened with a watchdog cannot stay streaming in silence"
+            );
+            // The next iteration needs the session to look like a running one again.
+            handle.is_streaming.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The silence of a turn waiting on a PERSON is theirs, not death: a question left open as
+    /// the turn's last word must never be abandoned — that is the very session the watchdog
+    /// exists to hand back to someone. (Defect 2's face on the runtime side.)
+    #[tokio::test]
+    async fn a_turn_waiting_on_a_question_is_never_abandoned() {
+        let _wire = on_the_wire();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        let _opened = handle
+            .open_turn(PendingMessageKind::BackgroundOutput, "go", "go")
+            .await
+            .expect("the turn is sent");
+        handle
+            .emit(ChatEvent::AskUserQuestion {
+                id: "r".into(),
+                tool_call_id: "q".into(),
+                questions: serde_json::json!([]),
+                input: serde_json::json!({}),
+                parent_tool_use_id: None,
+                synthetic: None,
+            })
+            .await;
+        // The user takes their time: the turn says nothing at all, past the budget.
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+        tokio::time::sleep(TAIL_WATCHDOG_MIN_TICK * 3).await;
+        assert!(
+            handle.is_streaming.load(Ordering::SeqCst),
+            "a turn waiting for an answer is waiting on a person, not dead"
+        );
     }
 }
