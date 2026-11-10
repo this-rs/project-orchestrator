@@ -174,6 +174,7 @@ diagrams:
       - "backend:src/api/{ws_chat_handler,refs_ws_tests}.rs"
       - "backend:src/chat/wire_contract.rs"
       - "backend:src/events/transport.rs"
+      - "backend:src/events/chat_transport.rs"
   - name: po-p2p-transport
     owner: theotime
     status: planned
