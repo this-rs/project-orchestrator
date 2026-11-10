@@ -2,14 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [main, "integ/**"]
+    branches: [main, "integ/**", "consolidation/**"]
   pull_request:
     # integ/<lot>: integration branches. A lot's PRs merge there after review on the FAST tier
     # (lint, security, unit, integration); the lot reaches main through ONE PR integ/<lot> -> main,
     # which runs everything (build, API, coverage and the parity matrix). See the FULL-tier `if`.
     # ready_for_review: marking a draft PR into main as ready is what starts its FULL tier.
     types: [opened, synchronize, reopened, ready_for_review]
-    branches: [main, "integ/**"]
+    branches: [main, "integ/**", "consolidation/**"]
   # Cold run: nothing restored from any cache (see "Cache policy" below).
   schedule:
     - cron: "17 3 * * *"
