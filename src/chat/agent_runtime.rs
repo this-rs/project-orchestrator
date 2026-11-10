@@ -285,6 +285,13 @@ pub const TURN_SILENCE_GRACE: Duration = Duration::from_secs(4 * 60);
 /// case where it wakes more than once).
 const TAIL_WATCHDOG_MIN_TICK: Duration = Duration::from_secs(1);
 
+/// The background-task id the liveness probe of a session asks to cancel
+/// (`AgentSessionHandle::provider_is_dead`). No provider ever issues this id, so the only
+/// possible answer is "unknown task": the call asks the provider *whether the session is
+/// still usable* and cancels nothing (`nexus` answers `invalid_request` on an unknown id,
+/// without signalling and without touching the turn).
+const LIVENESS_PROBE_TASK: &str = "__provider_liveness_probe__";
+
 /// Whether a provider of `kind` keeps a turn it ended `interrupted` (no error) in its
 /// history, so what `prepare` put in front of it was delivered ([`TurnOutcome::answered`]).
 /// Verified per provider, at the pinned nexus rev (9b5f470b):
@@ -1319,9 +1326,65 @@ impl AgentSessionHandle {
     /// session the manager will resume instead: once it is gone, the next message
     /// takes the resume path. Only this handle is removed — a newer handle that
     /// replaced it stays.
-    /// Whether the provider reported, out of a turn, that its process is gone.
-    pub(crate) fn provider_is_dead(&self) -> bool {
+    /// Whether the provider ANNOUNCED, out of a turn, that its process is gone: the flag an
+    /// `Error { ProcessExited }` on its stream sets ([`emit_out_of_band`]). Fast, and worth
+    /// exactly as much as the reader of that stream — which is the whole defect behind
+    /// [`Self::provider_is_dead`].
+    pub(crate) fn provider_death_announced(&self) -> bool {
         self.provider_dead.load(Ordering::SeqCst)
+    }
+
+    /// Whether this session's provider PROCESS is gone — **observed**, not waited for.
+    ///
+    /// Two sources, and the second is the one that matters. What the provider announced out
+    /// of a turn ([`Self::provider_death_announced`]) is trusted first, but it is only as
+    /// good as whoever reads that stream: a session whose turn is silent announces nothing,
+    /// and this flag stayed false for 8 hours on the session measured on 10/11/2026
+    /// (`cadfa92b`) while its CLI process was gone — so the manager's dead-CLI watchdog,
+    /// whose only question used to be that flag, never harvested it. The verdict is therefore
+    /// completed by ASKING the provider, on the one call of nexus's contract that checks
+    /// whether a session is still usable without changing anything: `cancel_tools` on a task
+    /// id no provider ever issued ([`LIVENESS_PROBE_TASK`]).
+    ///
+    /// - a process that is gone answers [`ProviderError::ProcessExited`]: that is the
+    ///   constat, and the provider makes it on its TRANSPORT (nexus's reader saw the CLI's
+    ///   output end and marked the session dead), never on a frame somebody had to be
+    ///   listening for;
+    /// - a live session answers `invalid_request` ("unknown background task"), having
+    ///   signalled nothing and touched no turn: a session that is merely SILENT — a long
+    ///   tool, a question waiting for its person, a Stop nobody answered — is not disturbed
+    ///   by the question, so this never cuts a turn that is still working;
+    /// - a provider that cannot answer at all answers `unsupported` (ACP, Codex, the native
+    ///   loop that runs inside this very process, a remote CLI with tool cancellation off):
+    ///   the constat is INAPPLICABLE there, and this answers "not dead" — a provider that
+    ///   cannot tell is never turned into a death certificate.
+    ///
+    /// Cheap enough to be asked at every tick of the dead-CLI watchdog: a lock on the
+    /// session's own state, no I/O, no network, nothing written to the provider.
+    pub(crate) async fn provider_is_dead(&self) -> bool {
+        if self.provider_death_announced() {
+            return true;
+        }
+        match self
+            .session
+            .cancel_tools(CancelScope::Task {
+                id: LIVENESS_PROBE_TASK.to_string(),
+            })
+            .await
+        {
+            Err(ProviderError::ProcessExited { code }) => {
+                // Remembered: the rest of the runtime reads the same verdict, and the next
+                // tick does not ask again.
+                self.provider_dead.store(true, Ordering::SeqCst);
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    exit_code = ?code,
+                    "the provider's process is gone (observed: nothing announced it)"
+                );
+                true
+            }
+            _ => false,
+        }
     }
 
     async fn detach_after_process_exit(&self) {
@@ -3899,6 +3962,12 @@ pub(crate) mod fake {
         /// When set, `interrupt` is written but the turn does not end on its own: the
         /// provider never answers the stop (a CLI stuck in a hook or a tool).
         pub ignore_interrupts: AtomicBool,
+        /// What `cancel_tools` answers, for the liveness probe (PROVIDER-DEAD): the shape a
+        /// dead CLI gives (`ProcessExited`), a live one (`invalid`: unknown task), or a
+        /// provider that cannot answer at all (`unsupported`: ACP, the in-process native
+        /// loop). `None`: `Ok`, nothing to cancel — what this fake answered before the probe
+        /// existed.
+        pub cancel_tools_answer: StdMutex<Option<ProviderError>>,
     }
 
     impl FakeState {
@@ -4022,6 +4091,9 @@ pub(crate) mod fake {
             })
         }
         async fn cancel_tools(&self, _scope: CancelScope) -> Result<CancelOutcome, ProviderError> {
+            if let Some(error) = self.state.cancel_tools_answer.lock().unwrap().clone() {
+                return Err(error);
+            }
             Ok(CancelOutcome::default())
         }
         async fn set_model(&self, model: &str) -> Result<(), ProviderError> {
@@ -8676,6 +8748,146 @@ mod stored_interrupted_result_tests {
         assert_eq!(ended["stop_reason"], "interrupted", "{ended}");
         assert_eq!(ended["duration_ms"], 42, "{ended}");
         assert!(ended.get("result_text").is_none(), "{ended}");
+    }
+}
+
+/// Is the provider's process still there? — the verdict the manager's dead-CLI watchdog
+/// asks, and the one it used to only WAIT for (PROVIDER-DEAD).
+///
+/// Measured on 10/11/2026 (session `cadfa92b`, engine `agent`, provider `claude-code`): the
+/// handle was live, no CLI process existed, and `provider_is_dead()` answered false for
+/// eight hours, because the only thing it read was a flag an EVENT of the provider sets. A
+/// session whose stream is mute announces nothing, so the safety net sat waiting for a
+/// signal that could not come. These tests hold the constat in place, and hold back the two
+/// false positives it could create: a session that is merely SILENT, and a provider whose
+/// process is not local by construction.
+#[cfg(test)]
+mod provider_dead_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+
+    async fn adopting(runtime: &AgentRuntime, provider: &FakeProvider) -> Arc<AgentSessionHandle> {
+        runtime
+            .adopt(
+                "s",
+                "claude-code",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await
+    }
+
+    /// A provider process that is gone, and NO event about it: `provider_is_dead` answers
+    /// true anyway — the verdict is taken from the provider, not from a frame.
+    #[tokio::test]
+    async fn a_process_that_vanished_without_a_word_is_observed_and_not_waited_for() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+        // As a dead CLI answers any call that checks whether the session is still usable.
+        *provider.state.cancel_tools_answer.lock().unwrap() =
+            Some(ProviderError::ProcessExited { code: Some(137) });
+
+        assert!(
+            !handle.provider_death_announced(),
+            "nothing announced it: that is the whole point"
+        );
+        assert!(
+            handle.provider_is_dead().await,
+            "the process is gone, and that is observed"
+        );
+        assert!(
+            handle.provider_death_announced(),
+            "the verdict is remembered, so the next tick does not ask again"
+        );
+    }
+
+    /// A session that is merely SILENT is not a dead one. nexus answers the probe on a live
+    /// session with `invalid_request` (no such background task): nothing is signalled, and
+    /// the turn in flight is untouched — a long tool, or a question waiting for its person,
+    /// must never be harvested.
+    #[tokio::test]
+    async fn a_silent_but_living_provider_is_not_declared_dead() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+        *provider.state.cancel_tools_answer.lock().unwrap() = Some(ProviderError::invalid(
+            format!("unknown background task `{LIVENESS_PROBE_TASK}`"),
+        ));
+        handle.is_streaming.store(true, Ordering::SeqCst);
+
+        assert!(
+            !handle.provider_is_dead().await,
+            "a session that says nothing is not a session that is gone"
+        );
+        assert!(
+            handle.is_streaming.load(Ordering::SeqCst),
+            "the probe cut nothing: the turn in flight is untouched"
+        );
+    }
+
+    /// The constat is INAPPLICABLE where the process is not local by construction: ACP,
+    /// Codex, the native loop that runs inside this very process, a remote CLI with tool
+    /// cancellation off — all of them answer `unsupported`. That is "I cannot tell", never a
+    /// death certificate.
+    #[tokio::test]
+    async fn a_provider_that_cannot_tell_is_never_declared_dead() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+        *provider.state.cancel_tools_answer.lock().unwrap() =
+            Some(ProviderError::unsupported("tool_cancel"));
+
+        assert!(
+            !handle.provider_is_dead().await,
+            "a provider that cannot tell is not a dead provider"
+        );
+    }
+
+    /// The harvest and the turn watchdog cannot contradict each other: closing the session
+    /// cancels its token FIRST, so a watchdog armed for the turn it was holding stands down
+    /// instead of writing a second verdict into a session that is gone — no second
+    /// `StreamingStatus { false }`, and no second writer on the turn.
+    #[tokio::test]
+    async fn a_harvested_session_cannot_be_ended_a_second_time_by_the_turn_watchdog() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+        let mut events = handle.events_tx.subscribe();
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        let generation = handle.turn_generation();
+
+        // The dead-CLI watchdog's close, with its own reason.
+        runtime
+            .close_with_reason("s", crate::episodes::models::close_reason::PROCESS_DIED)
+            .await
+            .expect("the harvested session is closed");
+        assert!(!runtime.owns("s").await, "the handle left the live table");
+
+        // The turn's watchdog fires on the turn that session was holding.
+        assert!(
+            !handle.abandon_turn(generation).await,
+            "a closed session is nobody's to end"
+        );
+        let mut idle_statuses = 0;
+        while let Ok(event) = events.try_recv() {
+            if matches!(
+                event,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            ) {
+                idle_statuses += 1;
+            }
+        }
+        assert_eq!(idle_statuses, 0, "one verdict, and the close is the one");
     }
 }
 
