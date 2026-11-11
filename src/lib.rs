@@ -530,6 +530,9 @@ pub struct ChatYamlConfig {
     pub default_model: Option<String>,
     pub max_sessions: Option<usize>,
     pub session_timeout_secs: Option<u64>,
+    /// How long a session may wait on a person before the idle cleanup closes it anyway
+    /// (`ChatConfig::person_wait_cap`, 24 h by default).
+    pub person_wait_cap_secs: Option<u64>,
     pub max_turns: Option<i32>,
     /// Permission configuration (mode + allowed/disallowed tool patterns).
     /// When absent, falls back to env vars or defaults (BypassPermissions).
@@ -959,6 +962,8 @@ pub struct Config {
     pub chat_max_turns: Option<i32>,
     /// Chat session timeout from YAML (if present).
     pub chat_session_timeout_secs: Option<u64>,
+    /// Chat person wait cap from YAML (if present).
+    pub chat_person_wait_cap_secs: Option<u64>,
     /// PATH to inject into the Claude Code subprocess.
     /// Priority: env var (CHAT_PROCESS_PATH) > YAML (chat.process_path) > None (inherit parent).
     pub chat_process_path: Option<String>,
@@ -1136,6 +1141,7 @@ impl Config {
             chat_max_sessions: yaml.chat.max_sessions,
             chat_max_turns: yaml.chat.max_turns,
             chat_session_timeout_secs: yaml.chat.session_timeout_secs,
+            chat_person_wait_cap_secs: yaml.chat.person_wait_cap_secs,
             chat_process_path: std::env::var("CHAT_PROCESS_PATH")
                 .ok()
                 .or(yaml.chat.process_path),
@@ -1992,6 +1998,15 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         }
         if let Some(timeout_secs) = config.chat_session_timeout_secs {
             chat_config.session_timeout = std::time::Duration::from_secs(timeout_secs);
+        }
+        // Priority env > yaml > default, as `config.yaml.example` says: the YAML value applies only
+        // when the environment names none. (The chat keys above let the YAML win over the
+        // environment: a pre-existing inversion, left as it is here.)
+        if let Some(cap_secs) = config.chat_person_wait_cap_secs {
+            if std::env::var_os("CHAT_PERSON_WAIT_CAP_SECS").is_none() {
+                chat_config.person_wait_cap =
+                    chat::config::person_wait_cap_from_secs(cap_secs, "chat.person_wait_cap_secs");
+            }
         }
         // Override PATH / CLI path / auto-update from YAML if present.
         if let Some(ref path) = config.chat_process_path {
