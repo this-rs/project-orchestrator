@@ -309,8 +309,8 @@ fn noeud_lisible(db: &ObrainDB, noeud: NodeId) -> Result<impl Fn(&str) -> Option
 /// blocking pool, before any lock: `canonical_root` resolves links.
 fn trio_de_chemins(racine: String) -> [(&'static str, Value); 3] {
     [
-        ("canonical_path", Value::from(canonical_root(Some(&racine)))),
         ("declared_path", Value::from(declared_root_of(&racine))),
+        ("canonical_path", Value::from(canonical_root(Some(&racine)))),
         ("root_path", Value::from(racine)),
     ]
 }
