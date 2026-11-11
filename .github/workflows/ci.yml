@@ -696,6 +696,46 @@ jobs:
             --test file_paths --test neural_routing_sampler --test note_sweep
 
   # ==========================================================================
+  # Obrain backend — the one job that COMPILES AND RUNS the `obrain-backend`
+  # feature. Without it nothing executes src/obrain/: clippy --all-features
+  # compiles it, nextest runs the default features, and the assertion that counts
+  # the refused methods (tests/obrain_backend.rs) would protect nothing.
+  #
+  # No service: every base is a temporary directory, and the project conformance
+  # checks of the `obrain_project::` module need neither Neo4j nor Meilisearch
+  # (the `mock_project::`/`neo4j_project::` halves run in the jobs that have them).
+  # The kill -9 and inter-process tests re-execute this test binary as their child.
+  # ==========================================================================
+  obrain-backend:
+    name: Obrain backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: ./.github/actions/test-profile
+
+      - uses: ./.github/actions/pinned-toolchain-only
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-obrain-${{ env.CACHE_VERSION }}${{ env.CACHE_FRESH }}"
+          save-if: false
+          cache-workspace-crates: false
+
+      - name: Run the obrain backend tests and its share of the conformance suite
+        run: |
+          cargo test --features obrain-backend --test obrain_backend --test store_conformance \
+            -- obrain_project:: with_the_feature an_unknown
+
+  # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
   # ==========================================================================
   api-tests:
