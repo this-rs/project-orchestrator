@@ -6493,7 +6493,15 @@ impl ProjectStore for MockGraphStore {
         {
             anyhow::bail!("list_projects is set to fail (test)");
         }
-        Ok(self.projects.read().await.values().cloned().collect())
+        // Neo4j: `ORDER BY p.name, p.id ASC` — a total order, where the map
+        // order differed on every run.
+        let mut projects: Vec<ProjectNode> = self.projects.read().await.values().cloned().collect();
+        projects.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+        });
+        Ok(projects)
     }
 
     async fn update_project(
