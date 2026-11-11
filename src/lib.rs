@@ -259,6 +259,10 @@ pub struct StorageYamlConfig {
     /// `obrain` backend refuses to start without it rather than guess a
     /// location (a guessed path is how a test binary once opened a live base).
     pub obrain_path: Option<String>,
+    /// Whether the `obrain` backend may CREATE its base when the directory holds
+    /// none. Absent or false: an absent or empty directory is refused, so that a
+    /// typo in `obrain_path` cannot become a new empty base.
+    pub obrain_create: Option<bool>,
 }
 
 /// Event transport selection.
@@ -1044,6 +1048,10 @@ pub struct Config {
     /// None, in which case that backend refuses to start. Stored unexpanded.
     pub storage_obrain_path: Option<String>,
 
+    /// Whether the obrain backend may create its base. Priority: env var
+    /// (STORAGE_OBRAIN_CREATE=true|1) > YAML (storage.obrain_create) > false.
+    pub storage_obrain_create: bool,
+
     /// Chat transport selection: which transport carries chat events between
     /// instances. Priority: env var (EVENTS_TRANSPORT) > YAML (events.transport)
     /// > default ("nats").
@@ -1215,6 +1223,10 @@ impl Config {
             storage_obrain_path: std::env::var("STORAGE_OBRAIN_PATH")
                 .ok()
                 .or(yaml.storage.obrain_path),
+            storage_obrain_create: match std::env::var("STORAGE_OBRAIN_CREATE") {
+                Ok(v) => v == "true" || v == "1",
+                Err(_) => yaml.storage.obrain_create.unwrap_or(false),
+            },
             events_transport: std::env::var("EVENTS_TRANSPORT").unwrap_or_else(|_| {
                 yaml.events
                     .transport

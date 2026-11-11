@@ -161,7 +161,8 @@ impl StorageBackend {
     ///
     /// The base directory comes from `storage.obrain_path` (or
     /// `STORAGE_OBRAIN_PATH`) and has NO default: without it the backend
-    /// refuses to start instead of guessing a location. Opening takes obrain's
+    /// refuses to start instead of guessing a location. It must be absolute and
+    /// hold a base; creating one needs `storage.obrain_create: true`. Opening takes obrain's
     /// exclusive lock on the directory — PO is the single writer of the base.
     ///
     /// Only the ported domains answer (see `src/obrain/`); the rest of the
@@ -169,7 +170,9 @@ impl StorageBackend {
     /// by name. The startup line says how much that is.
     #[cfg(feature = "obrain-backend")]
     async fn obrain_backend(config: &Config) -> Result<Self> {
-        use crate::obrain::{ObrainGraphStore, ObrainSearchStore, ObrainTrajectoryStore};
+        use crate::obrain::{
+            Creation, ObrainGraphStore, ObrainSearchStore, ObrainTrajectoryStore, RapportOuverture,
+        };
 
         let Some(path) = config
             .storage_obrain_path
@@ -186,11 +189,27 @@ impl StorageBackend {
         let path = std::path::PathBuf::from(crate::expand_tilde(path));
 
         // obrain opens synchronously (mmap, WAL replay, index rebuild).
-        let store = tokio::task::spawn_blocking(move || ObrainGraphStore::open(path)).await??;
+        // Creating a base is a decision, not a side effect of a typo: see
+        // `storage.obrain_create`.
+        let creation = if config.storage_obrain_create {
+            Creation::Permise
+        } else {
+            Creation::Interdite
+        };
+        let store =
+            tokio::task::spawn_blocking(move || ObrainGraphStore::open(path, creation)).await??;
 
+        let rapport = store.rapport_d_ouverture();
+        if *rapport != RapportOuverture::default() {
+            tracing::warn!(
+                ?rapport,
+                "obrain base repaired at open (interrupted writes) — quarantined nodes, if any, \
+                 are left untouched and ignored"
+            );
+        }
         tracing::warn!(
             path = %store.chemin().display(),
-            ported = crate::obrain::methodes_portees().len(),
+            ported = crate::obrain::methodes_qui_servent().len(),
             refused = crate::obrain::methodes_refusees().len(),
             "storage backend: obrain — partially ported: every method outside the ported \
              domains answers the error « non porté sur le backend obrain » (not a production mode)"

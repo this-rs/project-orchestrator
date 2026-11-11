@@ -60,6 +60,7 @@ fn test_config() -> Config {
         documents_storage_dir: None,
         storage_backend: project_orchestrator::storage::DEFAULT_BACKEND.to_string(),
         storage_obrain_path: None,
+        storage_obrain_create: false,
         log: Default::default(),
         neural_routing: Default::default(),
         config_yaml_path: None,

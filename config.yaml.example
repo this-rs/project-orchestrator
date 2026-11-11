@@ -92,7 +92,10 @@ meilisearch:
 # An unknown value fails startup (naming the accepted values).
 # storage:
 #   backend: "default"               # STORAGE_BACKEND env override (default|memory|obrain)
-#   obrain_path: "/var/lib/po/obrain" # STORAGE_OBRAIN_PATH env override (obrain only; no default)
+#   obrain_path: "/var/lib/po/obrain" # STORAGE_OBRAIN_PATH env override (obrain only; absolute; no default)
+#   obrain_create: false             # STORAGE_OBRAIN_CREATE env override; true = create the base if the
+#                                    # directory is absent or empty (otherwise refused, so that a typo
+#                                    # in obrain_path cannot become a new empty base)
 
 # -----------------------------------------------------------------------------
 # Events — chat transport selection
