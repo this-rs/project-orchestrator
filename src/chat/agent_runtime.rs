@@ -285,6 +285,13 @@ pub const TURN_SILENCE_GRACE: Duration = Duration::from_secs(4 * 60);
 /// case where it wakes more than once).
 const TAIL_WATCHDOG_MIN_TICK: Duration = Duration::from_secs(1);
 
+/// The background-task id the liveness probe of a session asks to cancel
+/// (`AgentSessionHandle::provider_is_dead`). No provider ever issues this id, so the only
+/// possible answer is "unknown task": the call asks the provider *whether the session is
+/// still usable* and cancels nothing (`nexus` answers `invalid_request` on an unknown id,
+/// without signalling and without touching the turn).
+const LIVENESS_PROBE_TASK: &str = "__provider_liveness_probe__";
+
 /// Whether a provider of `kind` keeps a turn it ended `interrupted` (no error) in its
 /// history, so what `prepare` put in front of it was delivered ([`TurnOutcome::answered`]).
 /// Verified per provider, at the pinned nexus rev (9b5f470b):
@@ -810,6 +817,11 @@ pub struct AgentSessionHandle {
     /// A turn is being streamed.
     pub is_streaming: AtomicBool,
     /// Text of the turn in progress (mid-stream joins).
+    /// A manual compaction is running: its silence is WORK (the provider is summarising the
+    /// transcript in one awaited call, page 1676-1701 — no event in between), never death.
+    /// Without this, the per-turn watchdog of #1157 cuts a legitimate compaction past
+    /// TURN_SILENCE_GRACE (measured class: a summary of a long transcript takes minutes).
+    pub compaction_in_flight: AtomicBool,
     pub streaming_text: Mutex<String>,
     /// Structured events of the turn in progress (mid-stream joins).
     pub streaming_events: Mutex<Vec<ChatEvent>>,
@@ -1319,9 +1331,74 @@ impl AgentSessionHandle {
     /// session the manager will resume instead: once it is gone, the next message
     /// takes the resume path. Only this handle is removed — a newer handle that
     /// replaced it stays.
-    /// Whether the provider reported, out of a turn, that its process is gone.
-    pub(crate) fn provider_is_dead(&self) -> bool {
+    /// Whether the provider ANNOUNCED, out of a turn, that its process is gone: the flag an
+    /// `Error { ProcessExited }` on its stream sets ([`emit_out_of_band`]). Fast, and worth
+    /// exactly as much as the reader of that stream — which is the whole defect behind
+    /// [`Self::provider_is_dead`].
+    pub(crate) fn provider_death_announced(&self) -> bool {
         self.provider_dead.load(Ordering::SeqCst)
+    }
+
+    /// Whether this session's provider PROCESS is gone — **observed**, not waited for.
+    ///
+    /// Two sources, and the second is the one that matters. What the provider announced out
+    /// of a turn ([`Self::provider_death_announced`]) is trusted first, but it is only as
+    /// good as whoever reads that stream: a session whose turn is silent announces nothing,
+    /// and this flag stayed false for 8 hours on the session measured on 10/11/2026
+    /// (`cadfa92b`) while its CLI process was gone — so the manager's dead-CLI watchdog,
+    /// whose only question used to be that flag, never harvested it. The verdict is therefore
+    /// completed by ASKING the provider, on the one call of nexus's contract that checks
+    /// whether a session is still usable without changing anything: `cancel_tools` on a task
+    /// id no provider ever issued ([`LIVENESS_PROBE_TASK`]).
+    ///
+    /// - a process that is gone answers [`ProviderError::ProcessExited`]: that is the
+    ///   constat, and the provider makes it on its TRANSPORT (nexus's reader saw the CLI's
+    ///   output end and marked the session dead), never on a frame somebody had to be
+    ///   listening for;
+    /// - a live session answers `invalid_request` ("unknown background task"), having
+    ///   signalled nothing and touched no turn: a session that is merely SILENT — a long
+    ///   tool, a question waiting for its person, a Stop nobody answered — is not disturbed
+    ///   by the question, so this never cuts a turn that is still working;
+    /// - a provider that cannot answer at all answers `unsupported` (ACP, Codex, the native
+    ///   loop that runs inside this very process, a remote CLI with tool cancellation off):
+    ///   the constat is INAPPLICABLE there, and this answers "not dead" — a provider that
+    ///   cannot tell is never turned into a death certificate.
+    ///
+    /// Cheap enough to be asked at every tick of the dead-CLI watchdog: a lock on the
+    /// session's own state, no I/O, no network, nothing written to the provider.
+    ///
+    /// LIMIT, named rather than left to be discovered: the transport decides a session is dead
+    /// when the CLI's OUTPUT ENDS (EOF of the child's stdout), not by watching the pid — there
+    /// is no `kill(pid, 0)` and no `waitpid` under it. A grandchild that inherited the CLI's
+    /// stdout keeps that EOF from ever arriving (the trap already documented in the note
+    /// « Foreground interrupt ne tue PAS les process-enfants »), and this then answers "not
+    /// dead" while the process is gone. The measured case of 10/11/2026 is the OTHER one — a
+    /// CLI gone whose EOF was seen but whose announcement reached no one — so this fixes that
+    /// and does not pretend to fix the inherited-pipe case.
+    pub(crate) async fn provider_is_dead(&self) -> bool {
+        if self.provider_death_announced() {
+            return true;
+        }
+        match self
+            .session
+            .cancel_tools(CancelScope::Task {
+                id: LIVENESS_PROBE_TASK.to_string(),
+            })
+            .await
+        {
+            Err(ProviderError::ProcessExited { code }) => {
+                // Remembered: the rest of the runtime reads the same verdict, and the next
+                // tick does not ask again.
+                self.provider_dead.store(true, Ordering::SeqCst);
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    exit_code = ?code,
+                    "the provider's process is gone (observed: nothing announced it)"
+                );
+                true
+            }
+            _ => false,
+        }
     }
 
     async fn detach_after_process_exit(&self) {
@@ -1606,7 +1683,10 @@ impl AgentSessionHandle {
         }
         self.emit(ChatEvent::StreamingStatus { is_streaming: true })
             .await;
-        match self.session.compact(instructions).await {
+        self.compaction_in_flight.store(true, Ordering::SeqCst);
+        let compacted = self.session.compact(instructions).await;
+        self.compaction_in_flight.store(false, Ordering::SeqCst);
+        match compacted {
             Ok(outcome) => {
                 tracing::info!(
                     session_id = %self.session_id,
@@ -1825,7 +1905,7 @@ impl AgentSessionHandle {
     /// Shows the message of a turn and sends the turn to the provider (`None`: the
     /// turn was stopped before it could be sent).
     async fn open_turn(
-        &self,
+        self: &Arc<Self>,
         kind: PendingMessageKind,
         shown: &str,
         sent: &str,
@@ -1834,6 +1914,9 @@ impl AgentSessionHandle {
         // A new turn: a watchdog armed for the previous one (its Stop, its tail) stands
         // down instead of ending this one — it compares this generation.
         self.turn_generation.fetch_add(1, Ordering::SeqCst);
+        // Every turn gets a watchdog HERE, at the one place a turn begins — never at an exit,
+        // so no exit of the loop of `play` can be left unwatched.
+        self.arm_turn_watchdog(self.turn_generation());
         // A Stop belongs to the turn it stopped: the new turn starts unstopped.
         self.interrupted.store(false, Ordering::SeqCst);
         let from_user = kind == PendingMessageKind::User;
@@ -2069,6 +2152,99 @@ impl AgentSessionHandle {
                         session_id = %me.session_id,
                         silence_ms = me.idle_for().as_millis() as u64,
                         "the tail of a finished turn said nothing past its budget: the turn is abandoned, the session is idle again"
+                    );
+                }
+                return;
+            }
+        });
+    }
+
+    /// Whether the turn has a tool call it announced and no result closed yet: how many it
+    /// has does not matter, only whether it has one.
+    ///
+    /// Read from what the turn already shows (`streaming_events`, cleared by `open_turn`), so
+    /// a tool belongs to the turn that started it and a late result of a previous turn closes
+    /// nothing that is open here. Looking back from the newest event and stopping at the first
+    /// tool still open is what keeps this cheap on the long tails (the measured session had
+    /// 1199 events).
+    async fn a_tool_is_working(&self) -> bool {
+        let events = self.streaming_events.lock().await;
+        let mut closed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for event in events.iter().rev() {
+            match event {
+                ChatEvent::ToolResult { id, .. } | ChatEvent::ToolCancelled { id, .. } => {
+                    closed.insert(id.as_str());
+                }
+                ChatEvent::ToolUse { id, .. } if !closed.contains(id.as_str()) => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Whether a person is being waited on by this turn, and its silence is therefore theirs:
+    /// a permission the provider asked and nobody answered, or a question the turn left open
+    /// as its last word. A watchdog that ended these would cut a session precisely while it
+    /// waits for the human it was built to hand back to.
+    async fn waiting_on_a_person(&self) -> bool {
+        if !self.waiting_permission_ids().is_empty() {
+            return true;
+        }
+        matches!(
+            self.streaming_events.lock().await.last(),
+            Some(ChatEvent::AskUserQuestion { .. } | ChatEvent::PermissionRequest { .. })
+        )
+    }
+
+    /// The watchdog of a TURN, armed by [`Self::open_turn`] — at the one place every turn
+    /// goes through, whichever way its loop ends.
+    ///
+    /// `play`'s loop has six exits and only the terminal one armed anything
+    /// ([`Self::arm_tail_watchdog`]); a turn opened while the previous one's tail stood down
+    /// was watched by nobody and could stay `streaming` for ever (measured: 8 h, session
+    /// cadfa92b, 10/11/2026). This arm is not per exit but per turn, so no exit can be
+    /// forgotten.
+    ///
+    /// Its verdict is one invariant, and the only one a session can decide on its own: a turn
+    /// that has said NOTHING for the whole silence budget AND has no tool of its own in flight
+    /// is dead. A tool legitimately long is exactly the other case — silence that is work —
+    /// and [`Self::a_tool_is_working`] is what tells them apart, so a turn cutting a
+    /// `sleep 300` is never ended.
+    fn arm_turn_watchdog(self: &Arc<Self>, generation: u64) {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                // A short tick, not the whole budget: the verdict is re-read from the activity
+                // clock every time, so it follows a turn that keeps emitting (the tail of a
+                // finished turn, a tool reporting) and can be reached without waiting the whole
+                // grace once the silence is already there.
+                tokio::time::sleep(TAIL_WATCHDOG_MIN_TICK).await;
+                if me.turn_generation.load(Ordering::SeqCst) != generation
+                    || !me.is_streaming.load(Ordering::SeqCst)
+                {
+                    return;
+                }
+                if me.a_tool_is_working().await {
+                    // A tool of this turn is working: its silence is work, not death.
+                    continue;
+                }
+                if me.waiting_on_a_person().await {
+                    // The silence is a human's to break: the turn waits, it is not dead.
+                    continue;
+                }
+                if me.compaction_in_flight.load(Ordering::SeqCst) {
+                    // A manual compaction is running: its silence is the provider summarising the
+                    // transcript, not a dead turn.
+                    continue;
+                }
+                if me.idle_for() < TURN_SILENCE_GRACE {
+                    continue;
+                }
+                if me.abandon_turn(generation).await {
+                    tracing::warn!(
+                        session_id = %me.session_id,
+                        silence_ms = me.idle_for().as_millis() as u64,
+                        "a turn said nothing with no tool in flight: it is dead, the turn is abandoned and the session is idle again"
                     );
                 }
                 return;
@@ -3504,6 +3680,7 @@ impl AgentRuntime {
             events_tx,
             is_streaming: AtomicBool::new(false),
             streaming_text: Mutex::new(String::new()),
+            compaction_in_flight: AtomicBool::new(false),
             streaming_events: Mutex::new(Vec::new()),
             provider: serde_json::json!({ "id": provider_id, "kind": provider_kind }),
             tool_policy,
@@ -3808,6 +3985,12 @@ pub(crate) mod fake {
         /// When set, `interrupt` is written but the turn does not end on its own: the
         /// provider never answers the stop (a CLI stuck in a hook or a tool).
         pub ignore_interrupts: AtomicBool,
+        /// What `cancel_tools` answers, for the liveness probe (PROVIDER-DEAD): the shape a
+        /// dead CLI gives (`ProcessExited`), a live one (`invalid`: unknown task), or a
+        /// provider that cannot answer at all (`unsupported`: ACP, the in-process native
+        /// loop). `None`: `Ok`, nothing to cancel — what this fake answered before the probe
+        /// existed.
+        pub cancel_tools_answer: StdMutex<Option<ProviderError>>,
     }
 
     impl FakeState {
@@ -3931,6 +4114,9 @@ pub(crate) mod fake {
             })
         }
         async fn cancel_tools(&self, _scope: CancelScope) -> Result<CancelOutcome, ProviderError> {
+            if let Some(error) = self.state.cancel_tools_answer.lock().unwrap().clone() {
+                return Err(error);
+            }
             Ok(CancelOutcome::default())
         }
         async fn set_model(&self, model: &str) -> Result<(), ProviderError> {
@@ -8588,6 +8774,146 @@ mod stored_interrupted_result_tests {
     }
 }
 
+/// Is the provider's process still there? — the verdict the manager's dead-CLI watchdog
+/// asks, and the one it used to only WAIT for (PROVIDER-DEAD).
+///
+/// Measured on 10/11/2026 (session `cadfa92b`, engine `agent`, provider `claude-code`): the
+/// handle was live, no CLI process existed, and `provider_is_dead()` answered false for
+/// eight hours, because the only thing it read was a flag an EVENT of the provider sets. A
+/// session whose stream is mute announces nothing, so the safety net sat waiting for a
+/// signal that could not come. These tests hold the constat in place, and hold back the two
+/// false positives it could create: a session that is merely SILENT, and a provider whose
+/// process is not local by construction.
+#[cfg(test)]
+mod provider_dead_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+
+    async fn adopting(runtime: &AgentRuntime, provider: &FakeProvider) -> Arc<AgentSessionHandle> {
+        runtime
+            .adopt(
+                "s",
+                "claude-code",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await
+    }
+
+    /// A provider process that is gone, and NO event about it: `provider_is_dead` answers
+    /// true anyway — the verdict is taken from the provider, not from a frame.
+    #[tokio::test]
+    async fn a_process_that_vanished_without_a_word_is_observed_and_not_waited_for() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+        // As a dead CLI answers any call that checks whether the session is still usable.
+        *provider.state.cancel_tools_answer.lock().unwrap() =
+            Some(ProviderError::ProcessExited { code: Some(137) });
+
+        assert!(
+            !handle.provider_death_announced(),
+            "nothing announced it: that is the whole point"
+        );
+        assert!(
+            handle.provider_is_dead().await,
+            "the process is gone, and that is observed"
+        );
+        assert!(
+            handle.provider_death_announced(),
+            "the verdict is remembered, so the next tick does not ask again"
+        );
+    }
+
+    /// A session that is merely SILENT is not a dead one. nexus answers the probe on a live
+    /// session with `invalid_request` (no such background task): nothing is signalled, and
+    /// the turn in flight is untouched — a long tool, or a question waiting for its person,
+    /// must never be harvested.
+    #[tokio::test]
+    async fn a_silent_but_living_provider_is_not_declared_dead() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+        *provider.state.cancel_tools_answer.lock().unwrap() = Some(ProviderError::invalid(
+            format!("unknown background task `{LIVENESS_PROBE_TASK}`"),
+        ));
+        handle.is_streaming.store(true, Ordering::SeqCst);
+
+        assert!(
+            !handle.provider_is_dead().await,
+            "a session that says nothing is not a session that is gone"
+        );
+        assert!(
+            handle.is_streaming.load(Ordering::SeqCst),
+            "the probe cut nothing: the turn in flight is untouched"
+        );
+    }
+
+    /// The constat is INAPPLICABLE where the process is not local by construction: ACP,
+    /// Codex, the native loop that runs inside this very process, a remote CLI with tool
+    /// cancellation off — all of them answer `unsupported`. That is "I cannot tell", never a
+    /// death certificate.
+    #[tokio::test]
+    async fn a_provider_that_cannot_tell_is_never_declared_dead() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+        *provider.state.cancel_tools_answer.lock().unwrap() =
+            Some(ProviderError::unsupported("tool_cancel"));
+
+        assert!(
+            !handle.provider_is_dead().await,
+            "a provider that cannot tell is not a dead provider"
+        );
+    }
+
+    /// The harvest and the turn watchdog cannot contradict each other: closing the session
+    /// cancels its token FIRST, so a watchdog armed for the turn it was holding stands down
+    /// instead of writing a second verdict into a session that is gone — no second
+    /// `StreamingStatus { false }`, and no second writer on the turn.
+    #[tokio::test]
+    async fn a_harvested_session_cannot_be_ended_a_second_time_by_the_turn_watchdog() {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+        let mut events = handle.events_tx.subscribe();
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        let generation = handle.turn_generation();
+
+        // The dead-CLI watchdog's close, with its own reason.
+        runtime
+            .close_with_reason("s", crate::episodes::models::close_reason::PROCESS_DIED)
+            .await
+            .expect("the harvested session is closed");
+        assert!(!runtime.owns("s").await, "the handle left the live table");
+
+        // The turn's watchdog fires on the turn that session was holding.
+        assert!(
+            !handle.abandon_turn(generation).await,
+            "a closed session is nobody's to end"
+        );
+        let mut idle_statuses = 0;
+        while let Ok(event) = events.try_recv() {
+            if matches!(
+                event,
+                ChatEvent::StreamingStatus {
+                    is_streaming: false
+                }
+            ) {
+                idle_statuses += 1;
+            }
+        }
+        assert_eq!(idle_statuses, 0, "one verdict, and the close is the one");
+    }
+}
+
 /// The turn's TAIL, and how a session stops being "streaming".
 ///
 /// The Claude Code engine has had an abandonment for a turn that ignores its stop since
@@ -8827,5 +9153,317 @@ mod abandoned_turn_tests {
         }
         assert_eq!(hints, 0, "the watchdog of a finished tail says nothing");
         assert!(!handle.is_streaming.load(Ordering::SeqCst));
+    }
+}
+
+/// The invariant that a turn owes the session: a turn that says NOTHING is over, unless a
+/// tool of its own is still working — the only two facts the session can tell apart.
+///
+/// Measured on 10/11/2026 (session cadfa92b-d71f-4a65-9416-2f4db27ddc67): `is_streaming`
+/// stayed true for eight hours with `partial_text_len` frozen at 843, the composer closed
+/// and Stop without effect. Every turn must have a watchdog, and until this fix only ONE
+/// of the six exits of `play`'s loop armed one — the terminal one.
+#[cfg(test)]
+mod turn_watchdog_tests {
+    use super::fake::FakeProvider;
+    use super::*;
+
+    async fn adopting(runtime: &AgentRuntime, provider: &FakeProvider) -> Arc<AgentSessionHandle> {
+        runtime
+            .adopt(
+                "s",
+                "claude-code",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await
+    }
+
+    /// Without a subscriber `tracing` never even reads an event's fields: the warnings the
+    /// watchdogs write would not run. The server always has a subscriber; this is ours.
+    fn on_the_wire() -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .finish(),
+        )
+    }
+
+    /// THE MEASURED SEQUENCE, reduced to the state it leaves behind.
+    ///
+    /// A turn reaches its terminal event — `Done { stop_reason: Interrupted }` — and `play`
+    /// arms the tail's watchdog for the generation it ran in (agent_runtime.rs:2404). The
+    /// queue then hands the next turn a background output: `open_turn` moves the generation
+    /// and, for that kind, emits nothing at all (the `BackgroundOutput` arm). The provider
+    /// of the new turn never answers.
+    ///
+    /// The tail's watchdog then stood down IN SILENCE at a generation it did not recognise,
+    /// and nothing was watching the turn that had just begun: the session stayed `streaming`
+    /// for ever.
+    #[tokio::test]
+    async fn a_background_output_turn_whose_provider_never_answers_is_abandoned() {
+        let _wire = on_the_wire();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+
+        // The turn that reached `Done { Interrupted }`, its tail already silent past the
+        // budget when the next turn opens.
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        let ended = handle.turn_generation();
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+        handle.arm_tail_watchdog(ended);
+
+        // The queue hands the next turn a background output whose provider says nothing.
+        let opened = handle
+            .open_turn(
+                PendingMessageKind::BackgroundOutput,
+                "a background task ended",
+                "a background task ended",
+            )
+            .await
+            .expect("the background turn is sent to the provider");
+        assert!(opened.is_some(), "a background output opens a turn");
+        assert_ne!(
+            handle.turn_generation(),
+            ended,
+            "the new turn owns the session: it moved the generation"
+        );
+        // It has said nothing since, and no tool of its own is in flight.
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while handle.is_streaming.load(Ordering::SeqCst) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !handle.is_streaming.load(Ordering::SeqCst),
+            "a turn that says nothing with no tool in flight is dead: the session must be idle again"
+        );
+    }
+    /// The false positive this fix must never add: a turn working inside a tool says nothing
+    /// for as long as the tool runs — a `sleep 300`, a build, a fetch. That silence is WORK,
+    /// and the turn cutting it would be the bug the watchdog exists to prevent, made worse.
+    #[tokio::test]
+    async fn a_turn_waiting_on_a_tool_is_never_abandoned() {
+        let _wire = on_the_wire();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        let _opened = handle
+            .open_turn(PendingMessageKind::BackgroundOutput, "go", "go")
+            .await
+            .expect("the turn is sent");
+        // The tool is announced and does not answer: the turn is silent, but busy.
+        handle
+            .emit(ChatEvent::ToolUse {
+                id: "t".into(),
+                tool: "Bash".into(),
+                input: serde_json::json!({ "command": "sleep 300" }),
+                parent_tool_use_id: None,
+                category: None,
+                canonical: None,
+            })
+            .await;
+        // Silent past the budget, with the tool still in flight.
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+        tokio::time::sleep(TAIL_WATCHDOG_MIN_TICK * 3).await;
+        assert!(
+            handle.is_streaming.load(Ordering::SeqCst),
+            "a turn waiting on a tool of its own is working, not dead: it must not be cut"
+        );
+
+        // The tool answers: the turn is now silent with nothing in flight — and dead.
+        handle
+            .emit(ChatEvent::ToolResult {
+                id: "t".into(),
+                result: serde_json::json!("done"),
+                is_error: false,
+                parent_tool_use_id: None,
+            })
+            .await;
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while handle.is_streaming.load(Ordering::SeqCst) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !handle.is_streaming.load(Ordering::SeqCst),
+            "the tool is in: silence with nothing in flight is death, and the session is freed"
+        );
+    }
+
+    /// The root cause, stated on its own: a turn whose provider never says anything, with no
+    /// tool in flight, is abandoned — the session goes idle, the clients are told, and the
+    /// thread says why. This is what was missing for eight hours on 10/11/2026.
+    #[tokio::test]
+    async fn a_turn_that_never_says_anything_is_abandoned_and_says_why() {
+        let _wire = on_the_wire();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+        let mut events = handle.events_tx.subscribe();
+
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        let _opened = handle
+            .open_turn(PendingMessageKind::BackgroundOutput, "go", "go")
+            .await
+            .expect("the turn is sent");
+        // Its provider never emits, and it has no tool in flight.
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while handle.is_streaming.load(Ordering::SeqCst) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !handle.is_streaming.load(Ordering::SeqCst),
+            "a silent turn with no tool in flight is dead"
+        );
+
+        let mut idle_status = false;
+        let mut explained = false;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                ChatEvent::StreamingStatus {
+                    is_streaming: false,
+                } => idle_status = true,
+                ChatEvent::SystemHint { content } if content.contains("session is free again") => {
+                    explained = true
+                }
+                _ => {}
+            }
+        }
+        assert!(idle_status, "the clients are told the turn is over");
+        assert!(explained, "the thread says why the turn ended");
+    }
+
+    /// The watchdog is armed by `open_turn`, at the ONE place a turn begins — so no exit of
+    /// `play`'s loop can be left unwatched. Every turn therefore has one, whatever it does:
+    /// a turn opened and immediately silent is ended, not left streaming.
+    #[tokio::test]
+    async fn every_turn_is_watched_from_the_moment_it_opens() {
+        let _wire = on_the_wire();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        // One turn per kind that opens one: the witness is the same for all of them.
+        for kind in [
+            PendingMessageKind::BackgroundOutput,
+            PendingMessageKind::SystemHint,
+        ] {
+            let generation = handle.turn_generation();
+            let opened = handle
+                .open_turn(kind.clone(), "go", "go")
+                .await
+                .expect("the turn is sent");
+            assert!(opened.is_some());
+            assert_ne!(
+                handle.turn_generation(),
+                generation,
+                "the turn moved the generation: it is the one being watched"
+            );
+            handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while handle.is_streaming.load(Ordering::SeqCst) && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                !handle.is_streaming.load(Ordering::SeqCst),
+                "{kind:?}: a turn opened with a watchdog cannot stay streaming in silence"
+            );
+            // The next iteration needs the session to look like a running one again.
+            handle.is_streaming.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The silence of a turn waiting on a PERSON is theirs, not death: a question left open as
+    /// the turn's last word must never be abandoned — that is the very session the watchdog
+    /// exists to hand back to someone. (Defect 2's face on the runtime side.)
+    #[tokio::test]
+    async fn a_turn_waiting_on_a_question_is_never_abandoned() {
+        let _wire = on_the_wire();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        let _opened = handle
+            .open_turn(PendingMessageKind::BackgroundOutput, "go", "go")
+            .await
+            .expect("the turn is sent");
+        handle
+            .emit(ChatEvent::AskUserQuestion {
+                id: "r".into(),
+                tool_call_id: "q".into(),
+                questions: serde_json::json!([]),
+                input: serde_json::json!({}),
+                parent_tool_use_id: None,
+                synthetic: None,
+            })
+            .await;
+        // The user takes their time: the turn says nothing at all, past the budget.
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+        tokio::time::sleep(TAIL_WATCHDOG_MIN_TICK * 3).await;
+        assert!(
+            handle.is_streaming.load(Ordering::SeqCst),
+            "a turn waiting for an answer is waiting on a person, not dead"
+        );
+    }
+
+    /// A manual compaction is ONE awaited call (`session.compact`, agent_runtime.rs:1686-1700)
+    /// that emits nothing while it runs: its silence is the provider summarising a long
+    /// transcript, not a dead turn. Measured class: minutes, not seconds. Without the flag the
+    /// per-turn watchdog of #1157 abandons it past `TURN_SILENCE_GRACE` — the very turn it is
+    /// meant to protect, cut in the middle, session freed under a compaction still running.
+    ///
+    /// RED without `compaction_in_flight`: the first assertion below fails (the watchdog
+    /// abandons a compaction in flight).
+    #[tokio::test]
+    async fn a_compaction_in_flight_is_never_abandoned_and_silence_after_it_still_is() {
+        let _wire = on_the_wire();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+
+        // A turn opens (this is what arms the per-turn watchdog on ITS generation)…
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        let _opened = handle
+            .open_turn(PendingMessageKind::User, "compact me", "compact me")
+            .await
+            .expect("the turn is sent");
+        // …and the compaction it holds takes longer than the silence budget.
+        handle.compaction_in_flight.store(true, Ordering::SeqCst);
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+        tokio::time::sleep(TAIL_WATCHDOG_MIN_TICK * 3).await;
+        assert!(
+            handle.is_streaming.load(Ordering::SeqCst),
+            "a compaction in flight is work in flight, not a dead turn: it must not be abandoned"
+        );
+
+        // The compaction returns; the SAME silence is now death, and must still be ended.
+        handle.compaction_in_flight.store(false, Ordering::SeqCst);
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while handle.is_streaming.load(Ordering::SeqCst) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !handle.is_streaming.load(Ordering::SeqCst),
+            "once the compaction is over, silence with nothing in flight is still death"
+        );
     }
 }
