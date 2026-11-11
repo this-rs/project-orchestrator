@@ -37,6 +37,9 @@ pub mod meilisearch;
 pub mod neo4j;
 pub mod neurons;
 pub mod notes;
+/// The obrain storage backend — only with the `obrain-backend` feature.
+#[cfg(feature = "obrain-backend")]
+pub mod obrain;
 pub mod orchestrator;
 pub mod parser;
 pub mod pipeline;
@@ -252,6 +255,10 @@ pub struct StorageYamlConfig {
     /// Which storage backend builds the stores. Absent ⇒
     /// [`crate::storage::DEFAULT_BACKEND`].
     pub backend: Option<String>,
+    /// Directory of the obrain base, for `backend: obrain`. No default: the
+    /// `obrain` backend refuses to start without it rather than guess a
+    /// location (a guessed path is how a test binary once opened a live base).
+    pub obrain_path: Option<String>,
 }
 
 /// Event transport selection.
@@ -1032,6 +1039,11 @@ pub struct Config {
     /// Priority: env var (STORAGE_BACKEND) > YAML (storage.backend) > default.
     pub storage_backend: String,
 
+    /// Directory of the obrain base, read only by the `obrain` storage backend.
+    /// Priority: env var (STORAGE_OBRAIN_PATH) > YAML (storage.obrain_path) >
+    /// None, in which case that backend refuses to start. Stored unexpanded.
+    pub storage_obrain_path: Option<String>,
+
     /// Chat transport selection: which transport carries chat events between
     /// instances. Priority: env var (EVENTS_TRANSPORT) > YAML (events.transport)
     /// > default ("nats").
@@ -1199,6 +1211,10 @@ impl Config {
                     .backend
                     .unwrap_or_else(|| crate::storage::DEFAULT_BACKEND.to_string())
             }),
+            // Obrain base directory (env var > YAML > None ⇒ the obrain backend refuses)
+            storage_obrain_path: std::env::var("STORAGE_OBRAIN_PATH")
+                .ok()
+                .or(yaml.storage.obrain_path),
             events_transport: std::env::var("EVENTS_TRANSPORT").unwrap_or_else(|_| {
                 yaml.events
                     .transport
@@ -1574,9 +1590,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     }
 
     // Initialize application state. Only the default backend actually connects
-    // to Neo4j/Meilisearch here; the in-memory backend touches neither (it says
-    // so itself), so the "Connecting…" lines would lie for `storage.backend=memory`.
-    if config.storage_backend != crate::storage::MEMORY_BACKEND {
+    // to Neo4j/Meilisearch here; the in-memory and obrain backends touch neither
+    // (each says so itself), so the "Connecting…" lines would lie for them.
+    if config.storage_backend == crate::storage::DEFAULT_BACKEND {
         tracing::info!("Connecting to Neo4j at {}...", config.neo4j_uri);
         tracing::info!("Connecting to Meilisearch at {}...", config.meilisearch_url);
     }

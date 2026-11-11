@@ -15,10 +15,13 @@ path = "this-rs/this"
 url  = "https://github.com/this-rs/this.git"
 rev  = "61040a2c631aa1c2dc97cfc2be02078df74563b5"
 
+# Same sha as the `obrain-engine` / `obrain-common` git dependencies of Cargo.toml (feature
+# `obrain-backend`): the build fetches that rev, and the sibling checkout read alongside is
+# expected at it. Bump both together.
 [repo.obrain]
 path = "obrain/obrain-db"
 url  = "https://github.com/obrain-db/obrain.git"
-rev  = "38faeac4bbbc9f27e77cf3fa42318df5694fd670"
+rev  = "c4b6ada9b29707ac329eeebc09850de308f336ff"
 
 [repo.atelier]
 path = "this-rs/atelier"

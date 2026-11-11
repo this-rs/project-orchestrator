@@ -172,6 +172,14 @@ nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "5c88ef92f3
 # left trust exactly as the server would (decision fce98b8a; the same resolver, not a second one
 # that could drift: P11b point 8). Same pin as nexus-claude.
 nexus-tools = { git = "https://github.com/this-rs/nexus.git", rev = "5c88ef92f3187a31caf7f7660f5603dbac6ab4de" }
+
+# The obrain graph engine, for the `obrain` storage backend (src/obrain/). OPTIONAL, behind the
+# `obrain-backend` feature and absent from the default features: a default build neither compiles
+# nor links it. Pinned by git rev like nexus (the repo is public, so cargo fetches it without a
+# sibling checkout); `pins.toml` carries the same sha for the local checkout. `obrain-common` is
+# direct because the adapter names its types (`Value`, `NodeId`).
+obrain-engine = { git = "https://github.com/obrain-db/obrain.git", rev = "c4b6ada9b29707ac329eeebc09850de308f336ff", optional = true }
+obrain-common = { git = "https://github.com/obrain-db/obrain.git", rev = "c4b6ada9b29707ac329eeebc09850de308f336ff", optional = true }
 tokio-stream = { workspace = true }
 
 # Auth
@@ -301,6 +309,17 @@ pdf = ["dep:pdf_oxide", "dep:office_oxide"]
 # Not a shipping feature: the dev-dependency of the crate on itself (below) turns it on for every
 # test build, and nothing else does.
 mock-store = []
+# The obrain storage backend (`storage.backend = "obrain"`, src/obrain/). Off by default: without
+# it, asking for `obrain` is a startup error that says so. The build-dependencies are the generator
+# of the refusals (build.rs reads the store contracts and writes, for every method no domain has
+# ported yet, an implementation that returns a named error).
+obrain-backend = ["dep:obrain-engine", "dep:obrain-common", "dep:syn", "dep:quote", "dep:proc-macro2"]
+
+[build-dependencies]
+# Only for the `obrain-backend` feature (see above): build.rs parses the store contracts.
+syn = { version = "2", features = ["full"], optional = true }
+quote = { version = "1", optional = true }
+proc-macro2 = { version = "1", optional = true }
 
 [dev-dependencies]
 # The crate itself, with the in-memory GraphStore compiled in for the test targets (see the

@@ -458,3 +458,4 @@ diagrams:
       - "backend:src/neo4j/trajectory.rs"
       - "backend:docs/storage/**"
       - "backend:src/neo4j/graph_sampler.rs"
+      - "backend:src/obrain/**"
