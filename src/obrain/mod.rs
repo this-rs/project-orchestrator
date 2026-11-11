@@ -242,7 +242,7 @@ impl Ecriture<'_> {
             Durabilite::Wal => {
                 let wal = self.db.flush_wal();
                 match wal {
-                    Ok(()) if self.flush_complet || n % FLUSH_COMPLET_TOUS_LES == 0 => {
+                    Ok(()) if self.flush_complet || n.is_multiple_of(FLUSH_COMPLET_TOUS_LES) => {
                         self.db.commit_wal()
                     }
                     autre => autre,

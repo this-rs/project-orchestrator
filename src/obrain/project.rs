@@ -184,7 +184,7 @@ impl IndexProjets {
                 _ => {
                     // Not a project this backend can address: ours and
                     // interrupted (marker, or nothing at all), or foreign.
-                    let vide = n.properties.len() == 0;
+                    let vide = n.properties.is_empty();
                     if brouillon || (vide && store.out_degree(noeud) == 0) {
                         db.delete_node(noeud);
                         rapport.brouillons_supprimes += 1;
