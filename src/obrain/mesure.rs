@@ -91,6 +91,21 @@ impl ObrainGraphStore {
         *self.interne.interruption.lock().unwrap() = Some(point);
     }
 
+    /// The raw properties of a project's node as the ENGINE reads them now, for
+    /// a test that must tell "not repaired" from "not written".
+    #[doc(hidden)]
+    pub fn proprietes_brutes(&self, id: uuid::Uuid) -> Option<Vec<(String, String)>> {
+        let noeud = self.interne.etat.read().ok()?.projets.noeud_de(id)?;
+        let n = self.interne.db.get_node(noeud)?;
+        let mut props: Vec<(String, String)> = n
+            .properties
+            .iter()
+            .map(|(k, v)| (k.to_string(), format!("{v:?}")))
+            .collect();
+        props.sort();
+        Some(props)
+    }
+
     /// Fill the base with `noeuds` `Filler` nodes (two properties each) and
     /// `aretes` `FILLS` edges between them, the way a migrated base looks to the
     /// engine, then flush. Returns the time it took.

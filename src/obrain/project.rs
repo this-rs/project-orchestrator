@@ -165,6 +165,11 @@ pub(super) struct IndexProjets {
 }
 
 impl IndexProjets {
+    #[cfg(any(test, feature = "mock-store"))]
+    pub(super) fn noeud_de(&self, id: Uuid) -> Option<NodeId> {
+        self.par_id.get(&id).map(|e| e.noeud)
+    }
+
     /// Rebuild the index from the persisted `Project` nodes, repairing what an
     /// interrupted write left (see the module doc). A scan of the node zone.
     pub(super) fn reconstruire(db: &ObrainDB) -> Result<(Self, RapportOuverture)> {

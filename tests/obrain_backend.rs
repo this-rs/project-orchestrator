@@ -1362,11 +1362,16 @@ mod with_the_feature {
                 store.get_project(p.id).await.unwrap().unwrap().root_path,
                 "/nonexistent/old"
             );
+            let avant_fermeture = store.proprietes_brutes(p.id);
             store.close().await.unwrap();
             drop(store);
 
             let store = open(&base).await;
             let rapport = store.rapport_d_ouverture().clone();
+            let apres_reouverture = store.proprietes_brutes(p.id);
+            eprintln!(
+                "after write {n}: before close {avant_fermeture:?}; after reopen {apres_reouverture:?}; {rapport:?}"
+            );
             let read = store.get_project(p.id).await.unwrap().unwrap();
             let policy = store.path_policy(p.id).await.unwrap();
             let expected_root = if n == 3 {
@@ -1377,7 +1382,8 @@ mod with_the_feature {
             assert_eq!(
                 rapport.chemins_repares,
                 usize::from(n < 3),
-                "after write {n}: a torn trio is repaired, a complete one is not: {rapport:?}"
+                "after write {n}: a torn trio is repaired, a complete one is not: {rapport:?}; \
+                 before close {avant_fermeture:?}; after reopen {apres_reouverture:?}"
             );
             assert_eq!(read.root_path, expected_root, "after write {n}");
             assert_eq!(
