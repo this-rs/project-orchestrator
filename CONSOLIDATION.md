@@ -35,7 +35,7 @@ Plan PO : `bf3ab074-467e-4b34-b92e-4b19040d8ece` (projet PO Backend).
 | Spike exécuté (7 verdicts) | O-SPIKE | à faire |
 | HNSW natif côté obrain | O-HNSW | à faire |
 | Socle this-rs à côté d'axum | O-THISRS-1 | à faire |
-| Backend obrain derrière la fabrique | O-DOUBLE | à faire |
+| Backend obrain derrière la fabrique | O-DOUBLE | en cours — fabrique + `ProjectStore` (9 méthodes) portés ; 748 méthodes refusent par leur nom (`src/obrain/`, feature `obrain-backend`) |
 | Retrait de NATS | O-NATS-OUT | à faire |
 
 ## Les portillons de cette branche (en place)

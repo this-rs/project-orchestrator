@@ -27,6 +27,12 @@ pub const DEFAULT_BACKEND: &str = "default";
 /// production mode.
 pub const MEMORY_BACKEND: &str = "memory";
 
+/// Identifier of the obrain backend — the graph store on an embedded obrain
+/// base (`src/obrain/`), selected via `storage.backend = "obrain"` (or
+/// `STORAGE_BACKEND=obrain`) and built only with the `obrain-backend` feature.
+/// Ported one domain at a time: what is not ported yet answers a named error.
+pub const OBRAIN_BACKEND: &str = "obrain";
+
 /// The assembled storage pieces of the application.
 pub struct StorageBackend {
     /// Knowledge-graph store.
@@ -47,6 +53,8 @@ enum BackendKind {
     /// The in-memory backend — the mock graph/search stores. Ephemeral: no
     /// external service is touched, and nothing survives a restart.
     Memory,
+    /// The obrain backend — an embedded obrain base, PO as its single writer.
+    Obrain,
 }
 
 /// Resolve the backend to build from its configuration value. Pure selection:
@@ -55,8 +63,10 @@ fn select_backend(storage_backend: &str) -> Result<BackendKind> {
     match storage_backend {
         DEFAULT_BACKEND => Ok(BackendKind::Default),
         MEMORY_BACKEND => Ok(BackendKind::Memory),
+        OBRAIN_BACKEND => Ok(BackendKind::Obrain),
         other => bail!(
-            "unknown storage backend '{other}'; accepted values: ['{DEFAULT_BACKEND}', '{MEMORY_BACKEND}']"
+            "unknown storage backend '{other}'; accepted values: \
+             ['{DEFAULT_BACKEND}', '{MEMORY_BACKEND}', '{OBRAIN_BACKEND}']"
         ),
     }
 }
@@ -70,6 +80,7 @@ impl StorageBackend {
         match select_backend(&config.storage_backend)? {
             BackendKind::Default => Self::default_backend(config).await,
             BackendKind::Memory => Self::memory_backend(config).await,
+            BackendKind::Obrain => Self::obrain_backend(config).await,
         }
     }
 
@@ -142,6 +153,68 @@ impl StorageBackend {
         bail!(
             "storage backend 'memory' needs the in-memory stores, which are only compiled \
              for test builds (the `mock-store` feature); build with `--features mock-store`"
+        )
+    }
+
+    /// The obrain backend: the graph store on an embedded obrain base, no
+    /// Neo4j client, no Meilisearch client.
+    ///
+    /// The base directory comes from `storage.obrain_path` (or
+    /// `STORAGE_OBRAIN_PATH`) and has NO default: without it the backend
+    /// refuses to start instead of guessing a location. Opening takes obrain's
+    /// exclusive lock on the directory — PO is the single writer of the base.
+    ///
+    /// Only the ported domains answer (see `src/obrain/`); the rest of the
+    /// graph contract, the whole search store and the trajectory store refuse
+    /// by name. The startup line says how much that is.
+    #[cfg(feature = "obrain-backend")]
+    async fn obrain_backend(config: &Config) -> Result<Self> {
+        use crate::obrain::{ObrainGraphStore, ObrainSearchStore, ObrainTrajectoryStore};
+
+        let Some(path) = config
+            .storage_obrain_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        else {
+            bail!(
+                "storage backend '{OBRAIN_BACKEND}' needs the directory of the obrain base: set \
+                 `storage.obrain_path` in config.yaml (nested under `storage:`) or \
+                 STORAGE_OBRAIN_PATH; there is no default location"
+            );
+        };
+        let path = std::path::PathBuf::from(crate::expand_tilde(path));
+
+        // obrain opens synchronously (mmap, WAL replay, index rebuild).
+        let store = tokio::task::spawn_blocking(move || ObrainGraphStore::open(path)).await??;
+
+        tracing::warn!(
+            path = %store.chemin().display(),
+            ported = crate::obrain::methodes_portees().len(),
+            refused = crate::obrain::methodes_refusees().len(),
+            "storage backend: obrain — partially ported: every method outside the ported \
+             domains answers the error « non porté sur le backend obrain » (not a production mode)"
+        );
+
+        let graph: Arc<dyn GraphStore> = Arc::new(store);
+        let capabilities = graph.capabilities();
+
+        Ok(Self {
+            graph,
+            search: Arc::new(ObrainSearchStore),
+            trajectories: Arc::new(ObrainTrajectoryStore),
+            capabilities,
+        })
+    }
+
+    /// Without the feature, `obrain` cannot be built. The value is *known* (so
+    /// it is not the "unknown backend" error), but this binary does not carry
+    /// the obrain engine.
+    #[cfg(not(feature = "obrain-backend"))]
+    async fn obrain_backend(_config: &Config) -> Result<Self> {
+        bail!(
+            "storage backend '{OBRAIN_BACKEND}' is not compiled into this binary: the obrain \
+             engine is behind the `obrain-backend` feature; build with `--features obrain-backend`"
         )
     }
 }
@@ -233,6 +306,11 @@ mod tests {
     }
 
     #[test]
+    fn obrain_backend_is_selected_for_the_obrain_value() {
+        assert_eq!(select_backend(OBRAIN_BACKEND).unwrap(), BackendKind::Obrain);
+    }
+
+    #[test]
     fn unknown_backend_value_names_the_value_and_the_accepted_values() {
         let err = select_backend("mystery").unwrap_err();
         let msg = err.to_string();
@@ -241,7 +319,9 @@ mod tests {
             "error must name the rejected value: {msg}"
         );
         assert!(
-            msg.contains(DEFAULT_BACKEND) && msg.contains(MEMORY_BACKEND),
+            msg.contains(DEFAULT_BACKEND)
+                && msg.contains(MEMORY_BACKEND)
+                && msg.contains(OBRAIN_BACKEND),
             "error must name the accepted values: {msg}"
         );
     }
