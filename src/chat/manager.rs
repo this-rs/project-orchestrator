@@ -19633,6 +19633,13 @@ impl ChatManager {
                 grace_secs = grace.as_secs(),
                 "a tool result is lost: the turn waited past every budget of that call, ending it"
             );
+            if let Err(e) = self.interrupt(&id.to_string()).await {
+                warn!(session_id = %id, error = %e, "ending a turn stuck on a lost tool result failed");
+                continue;
+            }
+            // The turn is ended now — only then is the user told. Emitting before the
+            // interrupt announced a turn that never ended when the interrupt failed, and the
+            // same message went out again on every tick (the failure was not memorised).
             self.emit_session_event(
                 Some(&id.to_string()),
                 ChatEvent::Error {
@@ -19651,10 +19658,6 @@ impl ChatManager {
                 },
             )
             .await;
-            if let Err(e) = self.interrupt(&id.to_string()).await {
-                warn!(session_id = %id, error = %e, "ending a turn stuck on a lost tool result failed");
-                continue;
-            }
             abandoned.push(id.to_string());
         }
         abandoned
@@ -26393,6 +26396,51 @@ mod tests {
             vec![own.id.to_string()],
             "only PO's own hop is ended; the third-party server keeps the command grace"
         );
+    }
+
+    // issue #1056, correctif B, suite (D5 bis) : l'erreur « résultat perdu » n'est dite
+    // qu'une fois le tour effectivement interrompu. Avant, elle était émise AVANT
+    // l'interruption : un interrupt qui échoue laissait repartir le même message à chaque
+    // tick, en annonçant un tour qui n'avait jamais été interrompu.
+    #[tokio::test]
+    async fn test_a_failed_interrupt_does_not_tell_the_user_the_turn_ended() {
+        use std::sync::atomic::Ordering;
+        let (manager, graph, fake) = agent_manager();
+        let sid = Uuid::new_v4();
+        manager
+            .agent_runtime
+            .adopt(
+                &sid.to_string(),
+                "claude-code",
+                fake.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        let handle = manager.agent_runtime.get(&sid.to_string()).await.unwrap();
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        graph
+            .store_chat_events(
+                sid,
+                vec![tool_use_event(sid, 1, "mcp__project-orchestrator__chat", 11)],
+            )
+            .await
+            .unwrap();
+        *fake.state.fail_interrupt.lock().unwrap() =
+            Some(nexus_claude::agent::ProviderError::unsupported("interrupt"));
+
+        let ended = manager.abandon_turns_whose_tool_result_never_came().await;
+        assert!(ended.is_empty(), "a failed interrupt ends nothing: {ended:?}");
+        let told = graph
+            .chat_events
+            .read()
+            .await
+            .get(&sid)
+            .map(|evs| evs.iter().any(|e| e.data.contains("tool_result_lost")))
+            .unwrap_or(false);
+        assert!(!told, "a failed interrupt must not tell the user the turn ended");
     }
 
     /// A notice with nowhere to go is dropped: never a panic, never another session.

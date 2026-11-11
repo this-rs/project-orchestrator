@@ -3985,6 +3985,9 @@ pub(crate) mod fake {
         /// When set, `interrupt` is written but the turn does not end on its own: the
         /// provider never answers the stop (a CLI stuck in a hook or a tool).
         pub ignore_interrupts: AtomicBool,
+        /// When set, `interrupt` fails with this error (a provider that cannot be reached):
+        /// the manager must not then tell the user the turn ended.
+        pub fail_interrupt: StdMutex<Option<ProviderError>>,
         /// What `cancel_tools` answers, for the liveness probe (PROVIDER-DEAD): the shape a
         /// dead CLI gives (`ProcessExited`), a live one (`invalid`: unknown task), or a
         /// provider that cannot answer at all (`unsupported`: ACP, the in-process native
@@ -4100,6 +4103,9 @@ pub(crate) mod fake {
             scope: InterruptScope,
         ) -> Result<InterruptOutcome, ProviderError> {
             self.state.interrupts.lock().unwrap().push(scope);
+            if let Some(error) = self.state.fail_interrupt.lock().unwrap().clone() {
+                return Err(error);
+            }
             // Report whether a turn was actually running: the manager surfaces
             // this as `InterruptOutcome.delivered` so an idle stop reads false.
             let turn_interrupted = if self.state.ignore_interrupts.load(Ordering::SeqCst) {
