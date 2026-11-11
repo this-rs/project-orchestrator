@@ -121,34 +121,53 @@ fn idle_session_is_kept_while_the_cli_reports_background_work() {
         T * 2,
         T,
         false,
-        tracked.max(cli_reported)
+        tracked.max(cli_reported),
+        false // waiting_on_input
     ));
     // Without the CLI's report, the emptied tracking alone closes it.
-    assert!(session_is_expired(T * 2, T, false, tracked));
+    assert!(session_is_expired(T * 2, T, false, tracked, false));
 }
 
 #[test]
 fn active_session_is_kept() {
-    assert!(!session_is_expired(Duration::from_secs(60), T, false, 0));
+    assert!(!session_is_expired(
+        Duration::from_secs(60),
+        T,
+        false,
+        0,
+        false
+    ));
 }
 
 #[test]
 fn idle_session_without_work_expires() {
-    assert!(session_is_expired(T + Duration::from_secs(1), T, false, 0));
+    assert!(session_is_expired(
+        T + Duration::from_secs(1),
+        T,
+        false,
+        0,
+        false
+    ));
 }
 
 #[test]
 fn idle_session_with_background_work_is_kept() {
     // The failure mode: agent's turn over, sub-agents still running.
-    assert!(!session_is_expired(T * 2, T, false, 3));
+    assert!(!session_is_expired(T * 2, T, false, 3, false));
 }
 
 #[test]
 fn streaming_session_is_kept() {
-    assert!(!session_is_expired(T * 2, T, true, 0));
+    assert!(!session_is_expired(T * 2, T, true, 0, false));
 }
 
 #[test]
 fn stuck_background_work_is_bounded_by_the_hard_cap() {
-    assert!(session_is_expired(T * 9, T, true, 1));
+    assert!(session_is_expired(T * 9, T, true, 1, false));
+}
+
+#[test]
+fn idle_session_waiting_on_input_is_not_expired_even_after_hard_cap() {
+    // D2 FIX: session waiting for user input should not expire after hard cap
+    assert!(!session_is_expired(T * 9, T, false, 0, true));
 }

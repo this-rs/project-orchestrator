@@ -166,11 +166,15 @@ flowchart TD
         QMAN["✅ source MANUELLE — saisie d'une PERSONNE pour un provider qui n'expose rien (source: manual) ;<br/>le mot le PLUS RÉCENT gagne, dans les deux sens : un live postérieur remplace un manuel, et l'inverse<br/>tests : the_newest_word_wins_between_a_person_and_the_provider, a_manual_date_in_the_past_exhausts_nothing"]
         QEXH["✅ exhausted(instance) → None dès que resets_at est passé : l'instance revient SEULE,<br/>personne n'a rien à faire et aucune tâche de fond ne tourne (c'est l'horloge qui décide)<br/>test : an_exhausted_window_holds_the_instance_out_until_its_reset_then_lets_it_back"]
         QPRESS["✅ pressure(instance) = la fenêtre la PLUS pleine ; None (non mesuré) n'est PAS 0 (vide) —<br/>ce que lit le scorer pour sa préférence douce au-delà de QUOTA_NEAR_LIMIT (0,9) : voir po-cognitive-routing<br/>test : the_pressure_is_the_fullest_window_and_an_unmeasured_account_stays_unknown"]
+        QADD["✅ window_scope(kind) — TROIS portées lues dans le NOM de la fenêtre : COMPTE (five_hour, seven_day, requests, credits = 100 % de TOUS les modèles) → exclusion dure ; UNE FAMILLE (seven_day_fable, seven_day_opus) → hold model:&lt;famille&gt;, le compte sert sur les autres (le CLI le dit lui-même « switch to another model ») ; ADD-ON (seven_day_overage_included) → RIEN, la fenêtre reste pour la jauge et pressure<br/>mesuré 10/11 puis 11/11/2026 : seven_day 0,69→0,72 allowed + overage 1,0→1,01 exhausted jusqu'au 14/11, compte exclu 3,7 j alors qu'il a répondu claude-haiku à 14:45:27 et 14:58:17 ; le vrai refus était « You've reached your Fable limit » = FAMILLE<br/>tests : a_windows_name_says_what_it_closes, a_family_window_holds_that_family_and_the_account_keeps_serving, the_10_11_case_keeps_the_account_routable, a_full_serving_window_still_condemns_the_account, a_stored_add_on_exhaustion_is_repaired_on_load"]
+        QSTALE["✅ un mot est une HYPOTHÈSE, un tour servi est une PREUVE — DATED_EXHAUSTION_STALENESS (15 min) : une exclusion DATÉE est réobservée UNE fois passé ce délai, un refus venu du fil réarme ; même règle pour un hold de FAMILLE, sinon le reset provider d'une personne n'atteint jamais un modèle que le routage tient à l'écart ; observed_at_ms est l'âge du HOLD, pas celui de l'entrée<br/>tests : a_dated_exhaustion_is_trusted_until_it_goes_stale_then_reobserved, a_fresh_refusal_rearms_the_staleness_clock, a_model_hold_is_reobserved_once_stale, an_unrelated_snapshot_does_not_make_a_hold_fresh"]
         QREG --> QLIVE
         QREG --> QERR
         QREG --> QMAN
         QREG --> QEXH
         QREG --> QPRESS
+        QREG --> QADD
+        QREG --> QSTALE
     end
     QMSG["✅ errors.rs — un 429 qui connaît son reset NOMME l'heure (quota_exhausted_message) :<br/>en choix explicite on ne bascule JAMAIS en silence, le message dit quand le compte sert à nouveau<br/>test : a_rate_limit_with_a_reset_names_the_hour_and_never_offers_a_silent_switch"]
     NEXUS -.-> QLIVE

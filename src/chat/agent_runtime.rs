@@ -2186,7 +2186,7 @@ impl AgentSessionHandle {
     /// a permission the provider asked and nobody answered, or a question the turn left open
     /// as its last word. A watchdog that ended these would cut a session precisely while it
     /// waits for the human it was built to hand back to.
-    async fn waiting_on_a_person(&self) -> bool {
+    pub async fn waiting_on_a_person(&self) -> bool {
         if !self.waiting_permission_ids().is_empty() {
             return true;
         }

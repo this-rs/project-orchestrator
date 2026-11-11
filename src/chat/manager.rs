@@ -20086,7 +20086,16 @@ impl ChatManager {
                         .await
                         .len()
                         .max(cli_background.load(Ordering::Relaxed));
-                    if session_is_expired(idle, timeout, is_streaming, background_tasks) {
+                    // D2 FIX: Legacy sessions (Claude Code) use the interrupt system rather than
+                    // waiting_on_a_person(), so we pass false here. Agent sessions check this separately.
+                    let waiting_on_input = false;
+                    if session_is_expired(
+                        idle,
+                        timeout,
+                        is_streaming,
+                        background_tasks,
+                        waiting_on_input,
+                    ) {
                         expired.push(id);
                     } else {
                         debug!(
@@ -20237,7 +20246,14 @@ impl ChatManager {
             let idle = handle.idle_for();
             let is_streaming = handle.is_streaming.load(Ordering::SeqCst);
             let background_tasks = handle.active_background_tasks().await.len();
-            if session_is_expired(idle, timeout, is_streaming, background_tasks) {
+            let waiting_on_input = handle.waiting_on_a_person().await;
+            if session_is_expired(
+                idle,
+                timeout,
+                is_streaming,
+                background_tasks,
+                waiting_on_input,
+            ) {
                 expired.push(handle.session_id.clone());
             } else if idle > timeout {
                 debug!(
@@ -20245,6 +20261,7 @@ impl ChatManager {
                     idle_secs = idle.as_secs(),
                     is_streaming,
                     background_tasks,
+                    waiting_on_input,
                     "Idle agent session kept alive: work still in progress"
                 );
             }
@@ -20429,8 +20446,14 @@ pub(crate) fn session_is_expired(
     timeout: Duration,
     is_streaming: bool,
     background_tasks: usize,
+    waiting_on_input: bool,
 ) -> bool {
     if idle <= timeout {
+        return false;
+    }
+    // D2 FIX: Don't expire sessions waiting for user input (permission or question),
+    // even after the hard cap timeout, because the user is actively required.
+    if waiting_on_input {
         return false;
     }
     if idle > timeout * IDLE_HARD_CAP_FACTOR {

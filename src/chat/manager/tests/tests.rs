@@ -12549,6 +12549,127 @@ async fn the_idle_cleanup_keeps_an_agent_session_with_a_background_task_running(
     );
 }
 
+/// D2: an agent session waiting on a person is kept by the idle cleanup however long
+/// it has waited, past the hard cap included; once the question is no longer what
+/// its turn last said, the same idle time closes it.
+#[tokio::test]
+async fn the_idle_cleanup_keeps_an_agent_session_waiting_on_a_person() {
+    let state = mock_app_state();
+    let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+    let timeout = Duration::from_secs(60);
+
+    let asking = idle_agent_session(&manager, timeout * (IDLE_HARD_CAP_FACTOR + 1)).await;
+    asking
+        .streaming_events
+        .lock()
+        .await
+        .push(ChatEvent::AskUserQuestion {
+            id: "req-1".into(),
+            tool_call_id: "toolu_q1".into(),
+            questions: serde_json::json!([]),
+            input: serde_json::json!({}),
+            parent_tool_use_id: None,
+            synthetic: None,
+        });
+    assert!(
+        manager.expired_agent_sessions(timeout).await.is_empty(),
+        "a session waiting on its answer is not closed, even past the hard cap"
+    );
+
+    asking.streaming_events.lock().await.clear();
+    assert_eq!(
+        manager.expired_agent_sessions(timeout).await,
+        vec![asking.session_id.clone()],
+        "with no question left open, the idle session is closed"
+    );
+}
+
+/// Registers a live Claude Code session (no CLI behind it), idle for `idle`.
+async fn idle_legacy_session(manager: &ChatManager, session_id: &str, idle: Duration) {
+    test_support::insert_live_session_without_cli(manager, session_id).await;
+    let mut sessions = manager.active_sessions.write().await;
+    sessions
+        .get_mut(session_id)
+        .expect("registered")
+        .last_activity = Instant::now()
+        .checked_sub(idle)
+        .expect("a representable instant");
+}
+
+/// Waits until the cleanup has closed every session of `ids`.
+async fn closed_by_the_cleanup(manager: &ChatManager, ids: &[&str]) {
+    for _ in 0..1200 {
+        {
+            let sessions = manager.active_sessions.read().await;
+            if ids.iter().all(|id| !sessions.contains_key(*id)) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the idle cleanup never closed {ids:?}");
+}
+
+/// The cleanup loop itself, on Claude Code sessions idle past the timeout: the one
+/// with nothing left to do is closed; a running turn keeps its session, and so does a
+/// background task, whether this server tracks it or the CLI reports it (whichever
+/// knows of more work wins). Past the hard cap, running work no longer keeps it.
+///
+/// A second pass closes a session registered after the first: by then the first pass
+/// is over, closes included, so a session it kept was kept by its verdict and not by
+/// the test reading too early.
+#[tokio::test]
+async fn the_idle_cleanup_closes_a_quiet_claude_code_session_and_keeps_a_working_one() {
+    let state = mock_app_state();
+    let timeout = Duration::from_secs(4);
+    let manager = Arc::new(ChatManager::new_without_memory(
+        state.neo4j,
+        state.meili,
+        ChatConfig {
+            session_timeout: timeout,
+            ..test_config()
+        },
+    ));
+    let idle = timeout + Duration::from_secs(1);
+
+    idle_legacy_session(&manager, "quiet", idle).await;
+    idle_legacy_session(&manager, "streaming", idle).await;
+    idle_legacy_session(&manager, "tracked-task", idle).await;
+    idle_legacy_session(&manager, "cli-task", idle).await;
+    idle_legacy_session(&manager, "stuck", timeout * (IDLE_HARD_CAP_FACTOR + 1)).await;
+    {
+        let sessions = manager.active_sessions.read().await;
+        for id in ["streaming", "stuck"] {
+            sessions[id].is_streaming.store(true, Ordering::SeqCst);
+        }
+        // Tracked by this server, unknown to the CLI's own count.
+        sessions["tracked-task"]
+            .active_background_tasks
+            .lock()
+            .await
+            .insert("tool_W1".into(), a_cli_background_task());
+        // Reported by the CLI, absent from this server's tracking.
+        sessions["cli-task"]
+            .cli_background_tasks
+            .store(2, Ordering::Relaxed);
+    }
+
+    manager.start_cleanup_task();
+    closed_by_the_cleanup(&manager, &["quiet", "stuck"]).await;
+
+    idle_legacy_session(&manager, "quiet-later", idle).await;
+    closed_by_the_cleanup(&manager, &["quiet-later"]).await;
+
+    let sessions = manager.active_sessions.read().await;
+    let mut kept: Vec<&str> = sessions.keys().map(String::as_str).collect();
+    kept.sort_unstable();
+    assert_eq!(
+        kept,
+        ["cli-task", "streaming", "tracked-task"],
+        "a running turn or a background task, tracked here or reported by the CLI, keeps an idle session"
+    );
+}
+
 /// The cockpit's snapshot counts the background tasks an agent session's
 /// provider reports running, by kind, as it does for a Claude Code session.
 #[tokio::test]
