@@ -338,6 +338,44 @@ fn condemned_by_an_add_on(exhaustion: &Exhaustion) -> bool {
             .is_some_and(|kind| window_scope(kind) == WindowScope::AddOn)
 }
 
+/// The account-wide hold of `entry` that is in force at `now`, if any — the ONE rule the router
+/// ([`QuotaRegistry::exhausted`]) and the interface ([`QuotaRegistry::views`]) both obey.
+///
+/// Two things can void a hold here:
+///
+/// * a full ADD-ON window never closes the door: the plan still serves (see [`window_scope`]). The
+///   entry may predate that rule — `load` repairs the stored one — so the verdict is given here too;
+/// * a DATED hold older than [`DATED_EXHAUSTION_STALENESS`] is stale: the reset the provider named
+///   may have been invalidated by a person resetting the account, and no `rate_limit_event`
+///   reflects that. Dropping it admits the next turn as a SINGLE re-observation probe, and a
+///   refusal the provider then answers re-arms the clock, so a genuinely-exhausted account is
+///   probed at most once per window, never hammered. The age is the HOLD's, not the entry's: a
+///   snapshot about another window must not make a dated refusal from last week look fresh.
+fn hold_in_force(entry: &QuotaEntry, now: u64) -> Option<Exhaustion> {
+    let exhaustion = entry.exhaustion.clone().filter(|e| e.resets_at_ms > now)?;
+    if condemned_by_an_add_on(&exhaustion) {
+        return None;
+    }
+    let observed = exhaustion.observed_at_ms.unwrap_or(entry.observed_at_ms);
+    if exhaustion.reset_known
+        && observed.saturating_add(DATED_EXHAUSTION_STALENESS.as_millis() as u64) <= now
+    {
+        return None;
+    }
+    Some(exhaustion)
+}
+
+/// The key under which the hold of `family` is (or will be) stored: one entry per family, whatever
+/// the caller called it. `observe` reads the suffix of a window (`fable`), an adapter can name the
+/// family as the provider worded it (`Fable`), and [`same_family`] already treats them as one — so
+/// the map must too, or a fresh hold can hide behind a stale one.
+fn family_key<'a>(holds: &'a HashMap<String, Exhaustion>, family: &'a str) -> &'a str {
+    holds
+        .keys()
+        .find(|held| same_family(held, family))
+        .map_or(family, String::as_str)
+}
+
 impl QuotaRegistry {
     /// An in-memory registry on the real clock.
     pub fn new() -> Self {
@@ -536,19 +574,12 @@ impl QuotaRegistry {
             // A family the provider now reports full is held — and a reset already known and still
             // ahead is never shortened by it, the same rule as [`Self::mark`].
             for (family, hold) in holds {
-                match new_entry.model_holds.get_mut(&family) {
-                    Some(known)
-                        if known.reset_known
-                            && known.resets_at_ms > now
-                            && known.resets_at_ms >= hold.resets_at_ms =>
-                    {
-                        // The same date, said again: keep it, and re-arm its staleness clock.
-                        known.observed_at_ms = Some(now);
-                    }
-                    _ => {
-                        new_entry.model_holds.insert(family, hold);
-                    }
-                }
+                // A live window report is the provider's NEWEST word on that family, so it
+                // replaces whatever was held — including a date a refusal had set (a refusal never
+                // shortens a known window, but a window report is not a refusal). The key is the
+                // family's, so one family never carries two holds.
+                let key = family_key(&new_entry.model_holds, &family).to_owned();
+                new_entry.model_holds.insert(key, hold);
             }
             entries.insert(instance.to_owned(), new_entry);
         }
@@ -663,7 +694,16 @@ impl QuotaRegistry {
                 .exhaustion
                 .as_ref()
                 .filter(|e| e.reset_known && e.resets_at_ms > now && e.resets_at_ms >= until);
-            if keep.is_none() {
+            if let Some(kept) = keep
+                .is_some()
+                .then_some(entry.exhaustion.as_mut())
+                .flatten()
+            {
+                // A refusal is a fresh observation EVEN when it repeats the same date: re-arm the
+                // hold's own clock, or a genuinely exhausted account would be re-probed at every
+                // turn for ever (the entry's clock no longer decides — the hold's does).
+                kept.observed_at_ms = Some(now);
+            } else {
                 entry.exhaustion = Some(Exhaustion {
                     resets_at_ms: until,
                     reset_known: known,
@@ -672,9 +712,6 @@ impl QuotaRegistry {
                     observed_at_ms: Some(now),
                 });
             }
-            // A refusal is a fresh observation either way: re-arm the staleness clock so a stale
-            // dated exhaustion the provider just re-confirmed is not probed again until the next
-            // staleness window.
             entry.observed_at_ms = now;
         }
         self.persist_in_background(instance);
@@ -711,7 +748,8 @@ impl QuotaRegistry {
                     model_holds: HashMap::new(),
                 });
             use std::collections::hash_map::Entry;
-            match entry.model_holds.entry(model.to_owned()) {
+            let key = family_key(&entry.model_holds, model).to_owned();
+            match entry.model_holds.entry(key) {
                 Entry::Occupied(mut slot) => {
                     // A reset already known and still ahead is never shortened by a refusal — but a
                     // refusal IS a fresh observation, so it re-arms the staleness clock. Without
@@ -815,27 +853,7 @@ impl QuotaRegistry {
         let now = self.now_ms();
         let entries = self.lock();
         let entry = entries.get(instance)?;
-        let exhaustion = entry.exhaustion.clone().filter(|e| e.resets_at_ms > now)?;
-        // A full ADD-ON window never closes the door: the plan still serves (see
-        // [`window_condemns_account`]). The entry may predate that rule — `load` repairs the
-        // stored one — so the same verdict is given here.
-        if condemned_by_an_add_on(&exhaustion) {
-            return None;
-        }
-        // A DATED exhaustion older than DATED_EXHAUSTION_STALENESS is stale: the reset date the
-        // provider named may have been invalidated by a person resetting the account, and no
-        // `rate_limit_event` reflects that. Dropping it admits the next turn as a SINGLE
-        // re-observation probe. A refusal the provider then answers re-arms the entry with a
-        // fresh observation time, so a genuinely-exhausted account is probed at most once per
-        // window, never hammered. The age is the HOLD's, not the entry's: a snapshot about
-        // another window must not make a dated refusal from last week look fresh.
-        let observed = exhaustion.observed_at_ms.unwrap_or(entry.observed_at_ms);
-        if exhaustion.reset_known
-            && observed.saturating_add(DATED_EXHAUSTION_STALENESS.as_millis() as u64) <= now
-        {
-            return None;
-        }
-        Some(exhaustion)
+        hold_in_force(entry, now)
     }
 
     /// The hold on ONE model of `instance` in force NOW, `None` once its reset has passed or when
@@ -907,7 +925,9 @@ impl QuotaRegistry {
                 windows: entry.windows.clone(),
                 source: entry.source,
                 observed_at_ms: entry.observed_at_ms,
-                exhausted: entry.exhaustion.clone().filter(|e| e.resets_at_ms > now),
+                // The SAME rule as the router: an interface must never show an exclusion that
+                // the next turn would not apply (a stale dated hold, or an add-on window).
+                exhausted: hold_in_force(entry, now),
             })
             .collect();
         views.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
@@ -1170,6 +1190,63 @@ mod tests {
             registry.model_exhausted("claude-code", "claude-fable-5-1"),
             None,
             "the hold's age is its own, not the entry's"
+        );
+    }
+
+    /// A refusal that repeats the SAME date is a fresh observation: the hold's own clock must be
+    /// re-armed, or a genuinely exhausted account is re-probed at every single turn for ever. Found
+    /// by the independent review of this change — `mark_model` already did it, `mark` did not, and
+    /// the entry's clock no longer decides once the hold carries its own.
+    #[test]
+    fn a_repeated_refusal_rearms_the_exhaustions_staleness_clock() {
+        let (clock, registry) = registry();
+        let reset = ms_of("2026-10-24T10:00:00Z");
+        registry.mark_rate_limited("claude-code", Some(reset), None);
+        clock.advance(DATED_EXHAUSTION_STALENESS + Duration::from_secs(1));
+        assert_eq!(
+            registry.exhausted("claude-code"),
+            None,
+            "stale: the next turn is admitted as a probe"
+        );
+        // The interface obeys the same rule: no badge for a hold the router would not apply.
+        assert_eq!(registry.view("claude-code").unwrap().exhausted, None);
+        // The probe meets the same refusal, with the same date.
+        registry.mark_rate_limited("claude-code", Some(reset), None);
+        assert!(
+            registry.exhausted("claude-code").is_some(),
+            "re-armed by a refusal that repeats the date"
+        );
+        assert!(registry.view("claude-code").unwrap().exhausted.is_some());
+        clock.advance(DATED_EXHAUSTION_STALENESS - Duration::from_secs(1));
+        assert!(registry.exhausted("claude-code").is_some());
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(registry.exhausted("claude-code"), None);
+    }
+
+    /// One family, one hold: the window suffix (`fable`) and the provider's own word (`Fable`) name
+    /// the same family, so the map must not carry two — a fresh hold hiding behind a stale one under
+    /// another key would make the choice depend on the hash order.
+    #[test]
+    fn one_family_one_key_whatever_its_case() {
+        let holds = HashMap::from([(
+            "Fable".to_owned(),
+            Exhaustion {
+                resets_at_ms: 1,
+                reset_known: true,
+                window: Some("model:Fable".into()),
+                cause: ExhaustionCause::RateLimited,
+                observed_at_ms: None,
+            },
+        )]);
+        assert_eq!(
+            family_key(&holds, "fable"),
+            "Fable",
+            "the existing key is reused"
+        );
+        assert_eq!(
+            family_key(&holds, "opus"),
+            "opus",
+            "a new family keeps its name"
         );
     }
 
