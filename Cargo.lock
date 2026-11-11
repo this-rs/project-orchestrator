@@ -198,6 +198,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
+name = "arcstr"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03918c3dbd7701a85c6b9887732e2921175f26c350b4563841d0958c21d57e6d"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "arg_enum_proc_macro"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -725,6 +734,26 @@ dependencies = [
  "getrandom 0.4.3",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "bincode"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
+dependencies = [
+ "bincode_derive",
+ "serde",
+ "unty",
+]
+
+[[package]]
+name = "bincode_derive"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf95709a440f45e986983918d0e8a1f30a9b1df04918fc828670606804ac3c09"
+dependencies = [
+ "virtue",
 ]
 
 [[package]]
@@ -1566,6 +1595,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e71406cd8807725f7ac2f999a4cdd32e98f829fdf65f528343cebf945e41df1e"
+dependencies = [
+ "crossbeam-channel",
+ "crossbeam-deque",
+ "crossbeam-epoch",
+ "crossbeam-queue",
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-channel"
 version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1589,6 +1631,15 @@ name = "crossbeam-epoch"
 version = "0.9.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-queue"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2656,6 +2707,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -5512,6 +5573,136 @@ dependencies = [
 ]
 
 [[package]]
+name = "obrain-adapters"
+version = "0.0.1"
+source = "git+https://github.com/obrain-db/obrain.git?rev=c4b6ada9b29707ac329eeebc09850de308f336ff#c4b6ada9b29707ac329eeebc09850de308f336ff"
+dependencies = [
+ "arcstr",
+ "bincode",
+ "byteorder",
+ "bytes",
+ "crc32fast",
+ "crossbeam",
+ "hashbrown 0.17.1",
+ "memmap2",
+ "obrain-common",
+ "obrain-core",
+ "obrain-substrate",
+ "parking_lot",
+ "rayon",
+ "serde",
+ "smallvec",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "obrain-common"
+version = "0.0.1"
+source = "git+https://github.com/obrain-db/obrain.git?rev=c4b6ada9b29707ac329eeebc09850de308f336ff#c4b6ada9b29707ac329eeebc09850de308f336ff"
+dependencies = [
+ "arcstr",
+ "bincode",
+ "bumpalo",
+ "byteorder",
+ "bytes",
+ "dashmap",
+ "foldhash 0.2.0",
+ "hashbrown 0.17.1",
+ "indexmap 2.14.2",
+ "parking_lot",
+ "serde",
+ "smallvec",
+ "thiserror 2.0.21",
+ "web-time",
+]
+
+[[package]]
+name = "obrain-core"
+version = "0.0.1"
+source = "git+https://github.com/obrain-db/obrain.git?rev=c4b6ada9b29707ac329eeebc09850de308f336ff#c4b6ada9b29707ac329eeebc09850de308f336ff"
+dependencies = [
+ "arcstr",
+ "byteorder",
+ "bytes",
+ "crossbeam",
+ "dashmap",
+ "foldhash 0.2.0",
+ "getrandom 0.4.3",
+ "hashbrown 0.17.1",
+ "indexmap 2.14.2",
+ "obrain-common",
+ "parking_lot",
+ "rayon",
+ "regex",
+ "serde",
+ "smallvec",
+ "thiserror 2.0.21",
+ "tokio",
+ "unicode-normalization",
+ "web-time",
+]
+
+[[package]]
+name = "obrain-engine"
+version = "0.0.1"
+source = "git+https://github.com/obrain-db/obrain.git?rev=c4b6ada9b29707ac329eeebc09850de308f336ff#c4b6ada9b29707ac329eeebc09850de308f336ff"
+dependencies = [
+ "anyhow",
+ "arcstr",
+ "bincode",
+ "crossbeam",
+ "hashbrown 0.17.1",
+ "indexmap 2.14.2",
+ "libc",
+ "obrain-adapters",
+ "obrain-common",
+ "obrain-core",
+ "obrain-substrate",
+ "parking_lot",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "thiserror 2.0.21",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "obrain-substrate"
+version = "0.0.1"
+source = "git+https://github.com/obrain-db/obrain.git?rev=c4b6ada9b29707ac329eeebc09850de308f336ff#c4b6ada9b29707ac329eeebc09850de308f336ff"
+dependencies = [
+ "arcstr",
+ "bincode",
+ "bytemuck",
+ "byteorder",
+ "crc32fast",
+ "dashmap",
+ "foldhash 0.2.0",
+ "fs2",
+ "libc",
+ "memmap2",
+ "obrain-common",
+ "obrain-core",
+ "parking_lot",
+ "rayon",
+ "serde",
+ "sha2 0.11.1",
+ "smallvec",
+ "thiserror 2.0.21",
+ "tracing",
+ "twox-hash",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-time",
+]
+
+[[package]]
 name = "office_oxide"
 version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6373,14 +6564,18 @@ dependencies = [
  "nexus-claude",
  "nexus-tools",
  "notify",
+ "obrain-common",
+ "obrain-engine",
  "office_oxide",
  "openssl-sys",
  "pasetors",
  "pdf_oxide",
  "petgraph",
+ "proc-macro2",
  "project-orchestrator",
  "proptest",
  "quick-xml 0.42.0",
+ "quote",
  "rag-umap",
  "rand 0.10.3",
  "rand_core 0.6.4",
@@ -6395,6 +6590,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "statrs",
+ "syn 2.0.118",
  "tar",
  "tempfile",
  "thiserror 2.0.21",
@@ -9565,6 +9761,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
+
+[[package]]
 name = "typed-path"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9686,6 +9888,12 @@ name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+
+[[package]]
+name = "unty"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 
 [[package]]
 name = "ureq"
@@ -9825,6 +10033,12 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virtue"
+version = "0.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 
 [[package]]
 name = "vswhom"
