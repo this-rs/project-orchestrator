@@ -301,20 +301,113 @@ mod tests {
         let pdf_bytes = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\nbinary garbage";
         let result = reg.extract(pdf_bytes, Some("report.txt"));
         // What this asserts is that the *text* extractor did not claim the file.
-        // Any of these three outcomes proves that; which one occurs depends on
-        // the build and on whether the stub is a parseable PDF, neither of
-        // which this test is about.
+        // With the `pdf` feature in the default set (guarded by
+        // `pdf_bytes_extract_by_default`), the PDF extractor claims the magic
+        // bytes; the stub is then either parsed or reported malformed — never
+        // "feature disabled".
         match result {
             // Claimed and parsed.
             Ok(out) => assert_eq!(out.format, DocumentFormat::Pdf),
             // Claimed, then found to be the truncated stub it is. Still the PDF
             // extractor's verdict, which is the point.
             Err(ExtractError::Malformed { format, .. }) => assert_eq!(format, "PDF"),
-            // Feature off: the error must say "not compiled in", not "unsupported".
-            Err(ExtractError::FeatureDisabled { format, .. }) => assert_eq!(format, "PDF"),
+            // "Feature disabled" is the regression this suite now guards against:
+            // it used to be accepted here as a success, which is exactly why a
+            // shipped binary could silently lack a PDF extractor. The arm only
+            // EXISTS when the feature is off: in a default build it compiles out,
+            // so the coverage gate never grades a line no test can reach.
+            #[cfg(not(feature = "pdf"))]
+            Err(ExtractError::FeatureDisabled { format, .. }) => {
+                panic!("PDF extractor disabled in a default build (format: {format})")
+            }
             // This is the failure the test exists to catch: nobody recognised
             // the magic bytes, or worse, the text extractor swallowed them.
             Err(other) => panic!("content did not beat extension: {other}"),
+        }
+    }
+
+    /// A minimal but valid single-page PDF with a text layer, hand-written the
+    /// way the PDF extractor's own fixtures are (see `pdf::tests::build_pdf`) so
+    /// this test states exactly what it depends on: one Helvetica page, one
+    /// `Tj` showing "Hello", a proper xref table and trailer.
+    #[cfg(feature = "pdf")]
+    fn minimal_pdf_with_text() -> Vec<u8> {
+        let stream = b"BT /F1 24 Tf 72 700 Td (Hello) Tj ET\n";
+        let mut content = format!("<< /Length {} >>\nstream\n", stream.len()).into_bytes();
+        content.extend_from_slice(stream);
+        content.extend_from_slice(b"endstream");
+        let objects: Vec<(usize, Vec<u8>)> = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [ 4 0 R ] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            ),
+            (
+                4,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                     /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>"
+                    .to_vec(),
+            ),
+            (5, content),
+        ];
+
+        let mut out = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let max_id = 5usize;
+        let mut offsets = vec![0usize; max_id + 1];
+        for (id, body) in &objects {
+            offsets[*id] = out.len();
+            out.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", max_id + 1).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets.iter().skip(1) {
+            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+                max_id + 1
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    #[test]
+    fn pdf_bytes_extract_by_default() {
+        // PDF support lives behind a cargo feature. If `pdf` ever falls out of
+        // the default set, every shipped binary answers 501 FeatureDisabled to a
+        // PDF attachment and nothing signals it. This test is the tripwire: it
+        // must fail unless the feature is compiled in on the default feature set.
+        #[cfg(feature = "pdf")]
+        {
+            let reg = ExtractorRegistry::with_builtins();
+            // `expect` rather than `unwrap_or_else(|| panic!(..))`: the panic path lives in
+            // std, so the coverage gate does not count a line no successful run reaches.
+            let out = reg
+                .extract(&minimal_pdf_with_text(), Some("report.pdf"))
+                .expect("a default-feature build must extract a PDF attachment");
+            assert_eq!(
+                out.format,
+                DocumentFormat::Pdf,
+                "the PDF extractor must claim the bytes as Pdf"
+            );
+            assert!(
+                !out.text.is_empty(),
+                "the extracted PDF must carry its text layer"
+            );
+        }
+
+        #[cfg(not(feature = "pdf"))]
+        {
+            panic!(
+                "the `pdf` feature is missing from the default features — a shipped \
+                 binary would answer FeatureDisabled to every PDF attachment"
+            );
         }
     }
 

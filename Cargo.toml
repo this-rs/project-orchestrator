@@ -286,7 +286,15 @@ office_oxide = { version = "0.1.16", default-features = false, optional = true }
 libc = "0.2"
 
 [features]
-default = ["local-embeddings"]
+# The document extractors are in the default set on purpose: a shipped binary
+# without them answers `501 FeatureDisabled` to a PDF/DOCX/XLSX/PPTX attachment,
+# and nothing in `cargo build --release` (Dockerfile, release.yml) signals it —
+# the extractors are simply never compiled in. Compiling them by default makes
+# the existing CI `Build` job the proof, and a released binary can no longer
+# silently lack an extractor. The macOS legacy build drops them via
+# `--no-default-features` (see `local-embeddings` below), which is acceptable:
+# those binaries target Catalina..Ventura- and lose ONNX embeddings anyway.
+default = ["local-embeddings", "pdf", "docx", "pptx", "xlsx"]
 # Local embeddings via ONNX Runtime (fastembed). Disable (--no-default-features) for the macOS legacy
 # build: libonnxruntime is built for macOS 13.4+, so it cannot load on Catalina..Ventura-.
 local-embeddings = ["dep:fastembed"]
