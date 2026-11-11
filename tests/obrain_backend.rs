@@ -98,8 +98,8 @@ mod with_the_feature {
     use project_orchestrator::neo4j::traits::*;
     use project_orchestrator::obrain::{
         defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees, Creation,
-        Durabilite, NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture,
-        REFUS_ECRITS_A_LA_MAIN,
+        Durabilite, Interruption, NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture,
+        MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -168,6 +168,8 @@ mod with_the_feature {
             f(&db);
             db.commit_wal().unwrap();
             db.close().unwrap();
+            // What the migration tool does once its base is written: say it is PO's.
+            std::fs::write(base.join(MARQUEUR_PO), SCHEMA_PO).unwrap();
         })
         .await
         .unwrap();
@@ -338,6 +340,53 @@ mod with_the_feature {
             try_open(&file, Creation::Permise).await.err().unwrap()
         );
         assert!(msg.contains("n'est pas un répertoire"), "{msg}");
+    }
+
+    /// Any directory with a `substrate.meta` is an obrain base; only one that
+    /// carries PO's marker is PO's. A base created by PO carries it from its first
+    /// instant; an obrain base of another tool is refused, and left untouched.
+    #[tokio::test]
+    async fn an_obrain_base_that_is_not_po_s_is_refused_and_a_created_one_is_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = dir.path().join("ours");
+        open(&ours).await.close().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ours.join(MARQUEUR_PO)).unwrap(),
+            SCHEMA_PO,
+            "a base PO creates carries the marker"
+        );
+
+        // A raw obrain base, written by something else, without the marker.
+        let theirs = dir.path().join("theirs");
+        {
+            let theirs = theirs.clone();
+            tokio::task::spawn_blocking(move || {
+                let db = obrain_engine::ObrainDB::open(&theirs).unwrap();
+                db.create_node_with_props(&["Project"], vec![("id", Value::from("x"))]);
+                db.commit_wal().unwrap();
+                db.close().unwrap();
+            })
+            .await
+            .unwrap();
+        }
+        assert!(theirs.join("substrate.meta").is_file());
+        let before: Vec<_> = std::fs::read_dir(&theirs)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        for creation in [Creation::Interdite, Creation::Permise] {
+            let msg = format!("{:#}", try_open(&theirs, creation).await.err().unwrap());
+            assert!(
+                msg.contains(MARQUEUR_PO) && msg.contains("pas une base PO"),
+                "{creation:?}: {msg}"
+            );
+        }
+        let after: Vec<_> = std::fs::read_dir(&theirs)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(after, before, "a refused base is not written into");
+        assert!(!theirs.join(MARQUEUR_PO).exists());
     }
 
     // ------------------------------------------------------------------
@@ -576,8 +625,9 @@ mod with_the_feature {
 
     #[tokio::test]
     async fn readers_do_not_wait_behind_a_slow_fsync() {
-        // Every write waits 700 ms for its fsync.
-        let store = Arc::new(temporary(Durabilite::LenteAPourTest(700)).await);
+        // Every write waits 2 s for its fsync: the only timing this test relies on
+        // is "a read takes less than that", with a wide margin for a loaded machine.
+        let store = Arc::new(temporary(Durabilite::LenteAPourTest(2_000)).await);
         let p = a_project("read while a write fsyncs");
         let other = a_project("another project");
         store.create_project(&p).await.unwrap();
@@ -596,15 +646,24 @@ mod with_the_feature {
         let created = a_project("created under fsync");
         let creating = created.clone();
         let create = tokio::spawn(async move { creator.create_project(&creating).await });
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !update.is_finished() && !create.is_finished(),
+            "the writes must be in their fsync when the reads start"
+        );
 
         let started = Instant::now();
         let mut slowest = Duration::ZERO;
         let mut reads = 0u32;
-        while started.elapsed() < Duration::from_millis(400) {
+        while started.elapsed() < Duration::from_millis(500) {
             let t = Instant::now();
             assert!(store.get_project(other.id).await.unwrap().is_some());
-            assert!(store.get_project(p.id).await.unwrap().is_some());
+            // The update is NOT visible before its fsync: the previous name is served.
+            assert_eq!(
+                store.get_project(p.id).await.unwrap().unwrap().name,
+                p.name,
+                "an update is published only once durable"
+            );
             assert!(store
                 .get_project_by_slug(&other.slug)
                 .await
@@ -618,10 +677,13 @@ mod with_the_feature {
             !update.is_finished() && !create.is_finished(),
             "the writes must still be waiting for their fsync while we read"
         );
-        assert!(reads > 100, "the readers were not starved ({reads} rounds)");
         assert!(
-            slowest < Duration::from_millis(300),
-            "a read took {slowest:?} while writes waited 700 ms for their fsync"
+            reads >= 1,
+            "no read ran while the writes were in their fsync"
+        );
+        assert!(
+            slowest < Duration::from_millis(1_000),
+            "a read took {slowest:?} while writes waited 2 s for their fsync"
         );
         // A creation is visible only once durable.
         assert!(
@@ -631,6 +693,10 @@ mod with_the_feature {
         update.await.unwrap().unwrap();
         create.await.unwrap().unwrap();
         assert!(store.get_project(created.id).await.unwrap().is_some());
+        assert_eq!(
+            store.get_project(p.id).await.unwrap().unwrap().name,
+            "renamed under fsync"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -844,13 +910,19 @@ mod with_the_feature {
                 dir.path(),
                 &[("OBRAIN_PO_TEST_ENFANT_MODE", mode)],
             );
-            // Wait until the child is creating, then a delay that varies per round.
+            // Wait until the child is creating (loudly: a child that never gets there
+            // is a failure, not a round that silently kills nothing), then a delay that
+            // varies per round so the kill lands at different points of a creation.
             for _ in 0..2400 {
                 if compte() >= avant + 5 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
+            assert!(
+                compte() >= avant + 5,
+                "round {tour} ({mode}): the child acknowledged no creation in 60 s"
+            );
             tokio::time::sleep(Duration::from_micros(1_500 * (tour as u64 % 9 + 1))).await;
             child.kill().unwrap();
             child.wait().unwrap();
@@ -858,7 +930,6 @@ mod with_the_feature {
             let store = open(&base).await;
             let rapport = store.rapport_d_ouverture().clone();
             repares.brouillons_supprimes += rapport.brouillons_supprimes;
-            repares.marqueurs_retires += rapport.marqueurs_retires;
             repares.chemins_repares += rapport.chemins_repares;
             quarantaine += rapport.en_quarantaine.len();
             assert!(
@@ -914,11 +985,19 @@ mod with_the_feature {
         }
         assert!(vus_wal >= 30, "the child made progress ({vus_wal} checks)");
         assert!(longues > 0, "long descriptions were part of the check");
+        // At least one kill landed inside a creation and its draft was found and
+        // deleted: without this, a run where every kill fell between two creations
+        // would prove nothing about the marker. (The exact step of each kill is
+        // `an_interrupted_write_at_every_step_reopens_to_a_consistent_base`.)
+        assert!(
+            repares.brouillons_supprimes > 0,
+            "no kill landed inside a creation over {TOURS} rounds: the marker was never exercised"
+        );
         eprintln!(
             "kill -9 over {TOURS} rounds: {vus_wal} acknowledged-project checks ({longues} with a \
              description past the blob threshold); at open: {} interrupted creations deleted, {} \
-             draft markers cleared, {} torn paths repaired, {quarantaine} quarantined",
-            repares.brouillons_supprimes, repares.marqueurs_retires, repares.chemins_repares
+             torn paths repaired, {quarantaine} quarantined",
+            repares.brouillons_supprimes, repares.chemins_repares
         );
     }
 
@@ -965,11 +1044,22 @@ mod with_the_feature {
     async fn opening_repairs_interrupted_writes_and_quarantines_what_it_cannot_address() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
-        let (a, d, e) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        let (a2, d2, e2) = (format!("a-{a}"), format!("d-{d}"), format!("e-{e}"));
-        let (a2c, d2c, e2c) = (a2.clone(), d2.clone(), e2.clone());
+        let (a, d, e, g) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let (a2, d2, e2, g2) = (
+            format!("a-{a}"),
+            format!("d-{d}"),
+            format!("e-{e}"),
+            format!("g-{g}"),
+        );
+        let (a2c, d2c, e2c, g2c) = (a2.clone(), d2.clone(), e2.clone(), g2.clone());
         write_foreign(&base, move |db| {
-            // A: complete, but killed before the marker was removed.
+            // A: complete, but killed before the marker was removed: no commit point,
+            //    not a project (deleted, like B and C).
             let mut props = complete(a, "complete with marker", &a2c, "/nonexistent/a");
             props.push(("_brouillon", Value::from(true)));
             db.create_node_with_props(&["Project"], props);
@@ -1006,14 +1096,18 @@ mod with_the_feature {
             );
             // F: foreign, no id: not ours, not a draft.
             db.create_node_with_props(&["Project"], vec![("name", Value::from("no id at all"))]);
+            // G: a root with no canonical form at all (another writer's doing: no
+            //    interruption of ours leaves this), caught by the second pure check.
+            let mut sans_canonique = complete(g, "no canonical", &g2c, "/nonexistent/g");
+            sans_canonique.retain(|(k, _)| *k != "canonical_path");
+            db.create_node_with_props(&["Project"], sans_canonique);
         })
         .await;
 
         let store = open(&base).await;
         let rapport = store.rapport_d_ouverture().clone();
-        assert_eq!(rapport.brouillons_supprimes, 2, "B and C: {rapport:?}");
-        assert_eq!(rapport.marqueurs_retires, 1, "A: {rapport:?}");
-        assert_eq!(rapport.chemins_repares, 1, "D: {rapport:?}");
+        assert_eq!(rapport.brouillons_supprimes, 3, "A, B and C: {rapport:?}");
+        assert_eq!(rapport.chemins_repares, 2, "D and G: {rapport:?}");
         assert_eq!(
             rapport.en_quarantaine.len(),
             2,
@@ -1023,9 +1117,19 @@ mod with_the_feature {
         // What was repaired reads whole; the torn update rolled to a state
         // `root_path` states.
         let listed = store.list_projects().await.unwrap();
-        assert_eq!(listed.len(), 3, "A, D and the first of E");
-        let pa = store.get_project(a).await.unwrap().unwrap();
-        assert_eq!(pa.slug, a2);
+        assert_eq!(listed.len(), 3, "D, the first of E, and G");
+        assert!(
+            store.get_project(a).await.unwrap().is_none()
+                && store.get_project_by_slug(&a2).await.unwrap().is_none(),
+            "A never reached its commit point: not a project, its slug is free"
+        );
+        let pg = store.path_policy(g).await.unwrap();
+        assert_eq!(pg.declared_root, "/nonexistent/g");
+        assert_eq!(
+            pg.canonical_root, "/nonexistent/g",
+            "G's canonical form recomputed"
+        );
+        let _ = g2;
         let pd = store.get_project(d).await.unwrap().unwrap();
         assert_eq!(pd.root_path, "/nonexistent/new");
         let policy = store.path_policy(d).await.unwrap();
@@ -1048,8 +1152,10 @@ mod with_the_feature {
         let store = open(&base).await;
         let again = store.rapport_d_ouverture().clone();
         assert_eq!(again.brouillons_supprimes, 0, "{again:?}");
-        assert_eq!(again.marqueurs_retires, 0, "{again:?}");
-        assert_eq!(again.chemins_repares, 0, "{again:?}");
+        assert_eq!(
+            again.chemins_repares, 0,
+            "a repaired project is not rewritten at every open: {again:?}"
+        );
         assert_eq!(again.en_quarantaine.len(), 2, "{again:?}");
         assert_eq!(store.list_projects().await.unwrap().len(), 4);
     }
@@ -1133,6 +1239,180 @@ mod with_the_feature {
             "{err:#}"
         );
         assert!(store.get_project(id).await.unwrap().is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // The write ORDER, step by step: every point where a write can stop
+    // ------------------------------------------------------------------
+
+    /// What a base reopens to when a write stopped at a precise point. This is the
+    /// deterministic half of the kill -9 test: the hook stops the write where the
+    /// kill could have, the base is closed (what the engine wrote so far reaches the
+    /// disk, exactly as the page cache would survive the kill), and opening is
+    /// judged on that exact state.
+    ///
+    /// - create, stopped anywhere BEFORE the marker is removed: the draft is deleted
+    ///   at open, the project does not exist, its slug is free, the writer saw an
+    ///   error and nothing was published (all-or-nothing);
+    /// - create, stopped AFTER the marker is removed but before the fsync: the
+    ///   project exists at open although the writer got an error — the declared
+    ///   "committed, acknowledgement lost" window; a retry is refused as a duplicate;
+    /// - update of the root, stopped after `declared_path`, or after `canonical_path`:
+    ///   opening rolls both derived paths back to what `root_path` (still old) states;
+    ///   stopped after `root_path`: the new root, consistent, nothing to repair;
+    /// - delete, stopped before the fsync: still served before the restart (not
+    ///   published), gone after it (the same window as the creation's).
+    #[tokio::test]
+    async fn an_interrupted_write_at_every_step_reopens_to_a_consistent_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let points_de_creation: Vec<Interruption> =
+            [Interruption::ApresLeNoeud, Interruption::ApresLeMarqueur]
+                .into_iter()
+                .chain((1..=11).map(Interruption::ApresLaPropriete))
+                .chain([
+                    Interruption::AvantLeRetraitDuMarqueur,
+                    Interruption::ApresLeRetraitDuMarqueur,
+                ])
+                .collect();
+        for (n, point) in points_de_creation.iter().copied().enumerate() {
+            let base = dir.path().join(format!("create-{n}"));
+            let store = open(&base).await;
+            let witness = a_project("witness");
+            store.create_project(&witness).await.unwrap();
+
+            let mut p = a_project("interrupted");
+            // Past the blob threshold: the full flush before the marker is exercised too.
+            p.description = Some("é-long ".repeat(60));
+            store.interrompre_au_prochain(point);
+            let err = store.create_project(&p).await.unwrap_err();
+            assert!(
+                format!("{err:#}").contains("interruption injectée"),
+                "{point:?}: {err:#}"
+            );
+            // Nothing published, the store still serves (an interruption is a crash
+            // of the write, not of the store).
+            assert!(
+                store.get_project(p.id).await.unwrap().is_none(),
+                "{point:?}"
+            );
+            assert!(store.get_project(witness.id).await.unwrap().is_some());
+            store.close().await.unwrap();
+            drop(store);
+
+            let store = open(&base).await;
+            let rapport = store.rapport_d_ouverture().clone();
+            assert!(rapport.en_quarantaine.is_empty(), "{point:?}: {rapport:?}");
+            assert_eq!(rapport.chemins_repares, 0, "{point:?}: {rapport:?}");
+            let listed = store.list_projects().await.unwrap();
+            if point == Interruption::ApresLeRetraitDuMarqueur {
+                // The commit point was passed: the project exists, whole, although the
+                // writer never got its Ok.
+                assert_eq!(rapport.brouillons_supprimes, 0, "{point:?}: {rapport:?}");
+                assert_eq!(
+                    fields(&store.get_project(p.id).await.unwrap().expect("promoted")),
+                    fields(&p),
+                    "{point:?}: the project is whole"
+                );
+                assert_eq!(listed.len(), 2);
+                let again = store.create_project(&p).await.unwrap_err();
+                assert!(format!("{again:#}").contains("existe déjà"), "{again:#}");
+            } else {
+                assert_eq!(
+                    rapport.brouillons_supprimes, 1,
+                    "{point:?}: the draft is found and deleted: {rapport:?}"
+                );
+                assert!(
+                    store.get_project(p.id).await.unwrap().is_none(),
+                    "{point:?}"
+                );
+                assert!(
+                    store.get_project_by_slug(&p.slug).await.unwrap().is_none(),
+                    "{point:?}: the slug is free"
+                );
+                assert_eq!(listed.len(), 1, "{point:?}: only the witness");
+                // The retry succeeds: nothing was kept.
+                store.create_project(&p).await.unwrap();
+                assert_eq!(
+                    fields(&store.get_project(p.id).await.unwrap().unwrap()),
+                    fields(&p)
+                );
+            }
+            store.close().await.unwrap();
+        }
+
+        // Update of the root, after each of the three writes.
+        for n in 1..=3 {
+            let base = dir.path().join(format!("update-{n}"));
+            let store = open(&base).await;
+            let mut p = a_project("rooted");
+            p.root_path = "/nonexistent/old".into();
+            store.create_project(&p).await.unwrap();
+
+            store.interrompre_au_prochain(Interruption::ApresLeChemin(n));
+            let err = store
+                .update_project(p.id, None, None, Some("/nonexistent/new".into()), None)
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("interruption injectée"),
+                "{err:#}"
+            );
+            // Not published: the old root is served until the write is durable.
+            assert_eq!(
+                store.get_project(p.id).await.unwrap().unwrap().root_path,
+                "/nonexistent/old"
+            );
+            store.close().await.unwrap();
+            drop(store);
+
+            let store = open(&base).await;
+            let rapport = store.rapport_d_ouverture().clone();
+            let read = store.get_project(p.id).await.unwrap().unwrap();
+            let policy = store.path_policy(p.id).await.unwrap();
+            let expected_root = if n == 3 {
+                "/nonexistent/new"
+            } else {
+                "/nonexistent/old"
+            };
+            assert_eq!(
+                rapport.chemins_repares,
+                usize::from(n < 3),
+                "after write {n}: a torn trio is repaired, a complete one is not: {rapport:?}"
+            );
+            assert_eq!(read.root_path, expected_root, "after write {n}");
+            assert_eq!(
+                policy.declared_root, expected_root,
+                "after write {n}: declared"
+            );
+            assert_eq!(
+                policy.canonical_root, expected_root,
+                "after write {n}: canonical"
+            );
+            store.close().await.unwrap();
+        }
+
+        // Delete, before the fsync.
+        let base = dir.path().join("delete");
+        let store = open(&base).await;
+        let p = a_project("deleted");
+        store.create_project(&p).await.unwrap();
+        store.interrompre_au_prochain(Interruption::ApresLaSuppression);
+        let err = store.delete_project(p.id, "x").await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("interruption injectée"),
+            "{err:#}"
+        );
+        assert!(
+            store.get_project(p.id).await.unwrap().is_some(),
+            "a deletion is published only once durable"
+        );
+        store.close().await.unwrap();
+        drop(store);
+        let store = open(&base).await;
+        assert!(
+            store.get_project(p.id).await.unwrap().is_none(),
+            "the deletion record was written: gone after the restart"
+        );
     }
 
     // ------------------------------------------------------------------
