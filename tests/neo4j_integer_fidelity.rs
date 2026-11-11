@@ -537,6 +537,55 @@ fn the_guard_refuses_the_live_service_and_foreign_hosts() {
     );
     assert!(check_harness_uri("not a uri", true).is_err());
     assert!(check_harness_uri("bolt://localhost:notaport", true).is_err());
+    // An empty variable is said as such, not as an empty host name.
+    assert_eq!(
+        check_harness_uri("", false),
+        Err("the address is unset/empty".to_string())
+    );
+    assert_eq!(
+        check_harness_uri("  ", true),
+        Err("the address is unset/empty".to_string())
+    );
+}
+
+/// The same rule for the Meilisearch `AppState::new` opens and whose index settings
+/// it rewrites: never the live 7700, outside CI only the harness 17700.
+#[test]
+fn the_guard_refuses_the_live_meilisearch_too() {
+    use common::harness::{check_harness_meili_url, meili_target_for, HARNESS_MEILI_PORT};
+    assert_eq!(
+        check_harness_meili_url(&format!("http://localhost:{HARNESS_MEILI_PORT}"), false),
+        Ok(())
+    );
+    assert_eq!(
+        check_harness_meili_url("http://127.0.0.1:17700", false),
+        Ok(())
+    );
+    for live in [
+        "http://localhost:7700",
+        "http://127.0.0.1:7700",
+        "http://[::1]:7700",
+    ] {
+        assert!(check_harness_meili_url(live, false).is_err(), "{live}");
+        assert!(check_harness_meili_url(live, true).is_err(), "{live} in CI");
+    }
+    // No port means the scheme's 80: not a harness.
+    assert!(check_harness_meili_url("http://localhost", false).is_err());
+    assert!(check_harness_meili_url("http://localhost:27700", false).is_err());
+    assert_eq!(
+        check_harness_meili_url("http://localhost:49321", true),
+        Ok(())
+    );
+    assert!(check_harness_meili_url("http://search.example.com:17700", true).is_err());
+    assert!(check_harness_meili_url("", true).is_err());
+    let t = meili_target_for(None, false);
+    assert_eq!(t.url, format!("http://localhost:{HARNESS_MEILI_PORT}"));
+}
+
+#[test]
+#[should_panic(expected = "REFUSED to point a writing test at this Meilisearch")]
+fn a_live_meilisearch_url_is_a_failure_not_a_skip() {
+    let _ = common::harness::meili_target_for(Some("http://localhost:7700".into()), true);
 }
 
 /// `neo4j_target` PANICS on a live URI (a skip would be a green run that tested nothing).

@@ -31,16 +31,18 @@ fn policy() -> project_orchestrator::neurons::forgetting::DecayPolicy {
 struct Env {
     client: Neo4jClient,
     raw: Graph,
+    target: common::harness::Neo4jTarget,
 }
 
 async fn env() -> Option<Env> {
     // `run_data_migrations()` below runs UNSCOPED, on the whole database: the target
     // is the harness or nothing (the guard panics on the live service's port).
+    let target = common::harness::neo4j_target();
     let common::harness::Neo4jTarget {
         uri,
         user,
         password,
-    } = common::harness::neo4j_target();
+    } = target.clone();
     let client = match Neo4jClient::new(&uri, &user, &password).await {
         Ok(c) => c,
         Err(e) => {
@@ -49,8 +51,20 @@ async fn env() -> Option<Env> {
         }
     };
     let raw = Graph::new(&uri, &user, &password).await.ok()?;
-    Some(Env { client, raw })
+    Some(Env {
+        client,
+        raw,
+        target,
+    })
 }
+
+/// Everything a scenario created under one scope id: the nodes that carry it as
+/// `project_id` or `id`, and their neighbours that carry no scope of their own
+/// (the member notes and personas of a skill, created attached to it). The
+/// migration markers (`:DataMigration`) are not fixtures and stay.
+const DELETE_SCOPE: &str = "MATCH (n) WHERE n.project_id = $p OR n.id = $p
+     OPTIONAL MATCH (n)--(m) WHERE m.project_id IS NULL AND NOT m:DataMigration AND NOT m:Project
+     DETACH DELETE n, m";
 
 async fn count(raw: &Graph, cypher: &str, project: &str) -> i64 {
     let mut r = raw
@@ -85,7 +99,7 @@ async fn add_members(raw: &Graph, skill_id: &str, n: i64) {
         query(
             "MATCH (s:Skill {id: $id})
              UNWIND range(1, $n) AS i
-             CREATE (:Note {id: randomUUID()})-[:MEMBER_OF]->(s)",
+             CREATE (:Note {id: randomUUID(), project_id: s.project_id})-[:MEMBER_OF]->(s)",
         )
         .param("id", skill_id)
         .param("n", n),
@@ -176,15 +190,24 @@ async fn write_function(
 
 #[tokio::test]
 async fn test_data_migrations_repair_an_upgraded_install() {
-    let Some(Env { client, raw }) = env().await else {
+    let Some(Env {
+        client,
+        raw,
+        target,
+    }) = env().await
+    else {
         return;
     };
+    // Every scope id below is registered as it is created: the fixtures go at the
+    // end of the test, panic or not.
+    let mut cleanup = common::harness::Cleanup::new(&target);
 
     // ------------------------------------------------------------------
     // 1. Legacy alerts (append-only, no dedup_key) fold into one node per
     //    condition, merging into the node the server already keyed.
     // ------------------------------------------------------------------
     let p = Uuid::new_v4();
+    cleanup.later(DELETE_SCOPE, p.to_string());
     let ps = p.to_string();
     raw.run(
         query(
@@ -259,6 +282,7 @@ async fn test_data_migrations_repair_an_upgraded_install() {
     //    archive the unreferenced rest and detach their members.
     // ------------------------------------------------------------------
     let q = Uuid::new_v4();
+    cleanup.later(DELETE_SCOPE, q.to_string());
     let qs = q.to_string();
     let rich = skill(&raw, &qs, "Toolchain Build Cargo", "emerging", 3).await;
     add_members(&raw, &rich, 5).await;
@@ -392,6 +416,7 @@ async fn test_data_migrations_repair_an_upgraded_install() {
     //    over-decayed active notes, never touch legitimate archivals.
     // ------------------------------------------------------------------
     let r = Uuid::new_v4();
+    cleanup.later(DELETE_SCOPE, r.to_string());
     let rs = r.to_string();
     let note = |status: &'static str, energy: f64, idle_days: i64, changes: &'static str| {
         let raw = &raw;
@@ -546,6 +571,7 @@ async fn test_data_migrations_repair_an_upgraded_install() {
     // reactivated (reactivation_count) is not "never activated" — the old
     // rule only read activation_count, which nothing ever increments.
     let used = Uuid::new_v4().to_string();
+    cleanup.later(DELETE_SCOPE, used.clone());
     raw.run(
         query(
             "CREATE (:Note {id: $id, project_id: $p, status: 'active', energy: 0.9,
@@ -570,6 +596,7 @@ async fn test_data_migrations_repair_an_upgraded_install() {
 
     // Synapse decay is project-scoped: another project's synapses untouched.
     let other = Uuid::new_v4();
+    cleanup.later(DELETE_SCOPE, other.to_string());
     raw.run(
         query(
             "CREATE (:Note {id: randomUUID(), project_id: $p})-[:SYNAPSE {weight: 0.5, source: 'coactivation'}]->(:Note {id: randomUUID(), project_id: $p})
@@ -599,9 +626,12 @@ async fn test_data_migrations_repair_an_upgraded_install() {
     //     frozen — coming back months later must find it intact.
     // ------------------------------------------------------------------
     let d = Uuid::new_v4();
+    cleanup.later(DELETE_SCOPE, d.to_string());
     let ds = d.to_string();
     let frozen = Uuid::new_v4().to_string();
+    cleanup.later(DELETE_SCOPE, frozen.clone());
     let permanent = Uuid::new_v4().to_string();
+    cleanup.later(DELETE_SCOPE, permanent.clone());
     raw.run(
         query(
             "CREATE (:Project {id: $d, slug: 'dormant-' + $d, name: 'dormant', root_path: '/tmp/dormant',
@@ -674,9 +704,12 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         use project_orchestrator::neo4j::traits::GraphStore;
         let store: &dyn GraphStore = &client;
         let k = Uuid::new_v4();
+        cleanup.later(DELETE_SCOPE, k.to_string());
         let ks = k.to_string();
         let current = Uuid::new_v4();
+        cleanup.later(DELETE_SCOPE, current.to_string());
         let old = Uuid::new_v4();
+        cleanup.later(DELETE_SCOPE, old.to_string());
         raw.run(
             query(
                 "CREATE (:Note {id: $cur, project_id: $k, status: 'active', energy: 0.9,
@@ -775,8 +808,11 @@ async fn test_data_migrations_repair_an_upgraded_install() {
     // decays only the project it corrects (both decayed the whole graph).
     {
         let x = Uuid::new_v4();
+        cleanup.later(DELETE_SCOPE, x.to_string());
         let h = Uuid::new_v4();
+        cleanup.later(DELETE_SCOPE, h.to_string());
         let o = Uuid::new_v4();
+        cleanup.later(DELETE_SCOPE, o.to_string());
         raw.run(
             query(
                 "CREATE (:Note {id: $x, project_id: $h})-[:SYNAPSE {weight: 0.5, source: 'coactivation', created_at: datetime() - duration({days: 6})}]->(:Note {id: randomUUID(), project_id: $h})
@@ -866,6 +902,7 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         use project_orchestrator::neo4j::traits::GraphStore;
         let store: &dyn GraphStore = &client;
         let g = Uuid::new_v4();
+        cleanup.later(DELETE_SCOPE, g.to_string());
         let gs = g.to_string();
         raw.run(
             query(
@@ -912,6 +949,7 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         };
 
         let k = Uuid::new_v4();
+        cleanup.later(DELETE_SCOPE, k.to_string());
         let ks = k.to_string();
         let rs = format!("{ks}/src/a.rs");
         let py = format!("{ks}/src/k.py");
@@ -934,7 +972,7 @@ async fn test_data_migrations_repair_an_upgraded_install() {
                          line_start: 7, line_end: 8, project_id: $p})
                  CREATE (f)-[:CONTAINS]->(:Enum {id: $rs + ':E', name: 'E', file_path: $rs,
                          line_start: 9, line_end: 9, project_id: $p})
-                 CREATE (:Trait {id: 'external:trait:std::fmt::Display', name: 'Display',
+                 CREATE (:Trait {id: 'external:trait:std::fmt::Display:' + $p, name: 'Display',
                          full_path: 'std::fmt::Display', is_external: true, file_path: '',
                          line_start: 0, line_end: 0, project_id: $p})
                  CREATE (f)-[:CONTAINS]->(:Impl {id: $rs + ':impl:A:self', for_type: 'A', trait_name: '',
@@ -1159,7 +1197,9 @@ async fn test_data_migrations_repair_an_upgraded_install() {
             (format!("{rs}:E"), stable_type_key(&rs, "E")),
             (format!("{py}:Klass"), stable_type_key(&py, "Klass")),
             (
-                "external:trait:std::fmt::Display".to_string(),
+                // The id is unique per run (a fixed one collided with real data on a
+                // shared instance); the migration keys an external trait by `full_path`.
+                format!("external:trait:std::fmt::Display:{ks}"),
                 stable_external_trait_key("std::fmt::Display"),
             ),
         ] {
@@ -1334,6 +1374,7 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         use project_orchestrator::neo4j::models::{FunctionNode, SymbolOwner, Visibility};
 
         let k = Uuid::new_v4();
+        cleanup.later(DELETE_SCOPE, k.to_string());
         let ks = k.to_string();
         let rs = format!("{ks}/src/stale.rs");
         let br = format!("{ks}/src/broken.rs");
@@ -1458,8 +1499,11 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         };
 
         let project = Uuid::new_v4();
+        cleanup.later(DELETE_SCOPE, project.to_string());
         let detector_id = Uuid::new_v4();
+        cleanup.later(DELETE_SCOPE, detector_id.to_string());
         let human_id = Uuid::new_v4();
+        cleanup.later(DELETE_SCOPE, human_id.to_string());
 
         let store: &dyn GraphStore = &client;
 

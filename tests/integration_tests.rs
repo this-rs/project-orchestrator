@@ -14,17 +14,17 @@ use uuid::Uuid;
 
 /// Get test configuration from environment or use defaults
 fn test_config() -> Config {
-    // The guard refuses the live service's port: this config runs init_schema and writes.
+    // The guards refuse the live services' ports: this config runs init_schema on
+    // the Neo4j and rewrites the index settings of the Meilisearch.
     let neo4j = common::harness::neo4j_target();
+    let meili = common::harness::meili_target();
     Config {
         setup_completed: true,
         neo4j_uri: neo4j.uri,
         neo4j_user: neo4j.user,
         neo4j_password: neo4j.password,
-        meilisearch_url: std::env::var("MEILISEARCH_URL")
-            .unwrap_or_else(|_| "http://localhost:7700".into()),
-        meilisearch_key: std::env::var("MEILISEARCH_KEY")
-            .unwrap_or_else(|_| "orchestrator-meili-key-change-me".into()),
+        meilisearch_url: meili.url,
+        meilisearch_key: meili.key,
         nats_url: None,
         workspace_path: ".".into(),
         server_port: 8080,

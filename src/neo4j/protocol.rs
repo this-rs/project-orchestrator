@@ -467,6 +467,14 @@ impl Neo4jClient {
             // A value merely read then written back (seed_prompt_fragments) is NOT a
             // choice, so it earns no marker: that is what lets the boot repair tell a
             // 255 someone chose from a 255 the driver bug stored (data_migrations.rs).
+            // CORNER CASE, chosen on purpose: a 255 someone CHOOSES on a state that
+            // already holds a phantom 255 is "equal", earns no marker, and is reset
+            // to "no timeout" at the next start. Marking on an equal value would
+            // close it, but would also make every read-then-write of a phantom (an
+            // old binary rewrites 255, a fixed one round-trips it before its next
+            // start) a choice for good — the more frequent of the two while old and
+            // fixed binaries coexist. No path writes `Some(n)` today; the day one
+            // does, choose a value other than the phantom's, or repair first.
             WITH proto, s,
                  CASE
                    WHEN $state_timeout_secs > 0
