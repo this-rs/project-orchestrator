@@ -14,6 +14,13 @@
 //! A refusal is a PANIC with the reason, never a skip: a skipped suite is a green
 //! run that tested nothing.
 //!
+//! WHAT THE GUARD CANNOT SEE. It judges the address, not the database behind it.
+//! Two configurations defeat it: a live service deliberately bound to 17687
+//! (`docker-compose.production.yml` takes `NEO4J_BOLT_PORT`), and `CI` exported in
+//! a developer's shell, which lifts the port rule. Only a probe of the database
+//! itself (a harness marker node, or "empty at first contact") would be independent
+//! of the port; it is not here, so do not bind the service to the harness port.
+//!
 //! [`Cleanup`] is the other half: the Cypher it is given runs when it is dropped,
 //! panic or not, so a failing assertion does not leave test nodes behind.
 

@@ -13,6 +13,8 @@
 #[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
 
+mod common;
+
 use neo4rs::{query, Graph};
 use project_orchestrator::neo4j::client::Neo4jClient;
 use project_orchestrator::neo4j::data_migrations::PHANTOM_STATE_TIMEOUTS_ID;
@@ -32,9 +34,13 @@ struct Env {
 }
 
 async fn env() -> Option<Env> {
-    let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".into());
-    let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
-    let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
+    // `run_data_migrations()` below runs UNSCOPED, on the whole database: the target
+    // is the harness or nothing (the guard panics on the live service's port).
+    let common::harness::Neo4jTarget {
+        uri,
+        user,
+        password,
+    } = common::harness::neo4j_target();
     let client = match Neo4jClient::new(&uri, &user, &password).await {
         Ok(c) => c,
         Err(e) => {
@@ -822,9 +828,11 @@ async fn test_data_migrations_repair_an_upgraded_install() {
             execute_actions, ExecuteContext, HomeostasisAction,
         };
         use project_orchestrator::neo4j::traits::GraphStore;
-        let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".into());
-        let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
-        let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
+        let common::harness::Neo4jTarget {
+            uri,
+            user,
+            password,
+        } = common::harness::neo4j_target();
         let store: std::sync::Arc<dyn GraphStore> =
             std::sync::Arc::new(Neo4jClient::new(&uri, &user, &password).await.unwrap());
         execute_actions(

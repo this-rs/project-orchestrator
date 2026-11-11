@@ -5,18 +5,21 @@
 #[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
 
+mod common;
+
 use project_orchestrator::neo4j::models::*;
 use project_orchestrator::{AppState, Config};
 use uuid::Uuid;
 
 /// Get test configuration from environment or use defaults
 fn test_config() -> Config {
+    // The guard refuses the live service's port: this config runs init_schema and writes.
+    let neo4j = common::harness::neo4j_target();
     Config {
         setup_completed: true,
-        neo4j_uri: std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".into()),
-        neo4j_user: std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into()),
-        neo4j_password: std::env::var("NEO4J_PASSWORD")
-            .unwrap_or_else(|_| "orchestrator123".into()),
+        neo4j_uri: neo4j.uri,
+        neo4j_user: neo4j.user,
+        neo4j_password: neo4j.password,
         meilisearch_url: std::env::var("MEILISEARCH_URL")
             .unwrap_or_else(|_| "http://localhost:7700".into()),
         meilisearch_key: std::env::var("MEILISEARCH_KEY")
