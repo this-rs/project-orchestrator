@@ -466,8 +466,10 @@ required-features = ["local-embeddings"]
 
 
 # Measures of the obrain backend at scale (cost per write, per read, open time, on a base of N
-# nodes): `cargo run --release --features obrain-backend --example obrain_mesures -- <nodes> <edges>`.
-# Writes only into a temporary directory it creates.
+# nodes): `cargo run --release --features obrain-backend,mock-store --example obrain_mesures -- <nodes> <edges>`.
+# Writes only into a temporary directory it creates. It needs the measure hooks of src/obrain/mesure.rs,
+# which exist in test builds only (`mock-store`): without that feature the target is skipped, so
+# `cargo clippy --all-targets` passes with and without `--all-features`.
 [[example]]
 name = "obrain_mesures"
-required-features = ["obrain-backend"]
+required-features = ["obrain-backend", "mock-store"]

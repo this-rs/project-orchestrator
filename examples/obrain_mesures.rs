@@ -2,7 +2,7 @@
 //! claims of `src/obrain/`.
 //!
 //! ```text
-//! cargo run --release --features obrain-backend --example obrain_mesures -- <nodes> <edges> [--herite]
+//! cargo run --release --features obrain-backend,mock-store --example obrain_mesures -- <nodes> <edges> [--herite]
 //! ```
 //!
 //! `--herite` sets `OBRAIN_PROPS_V2=0` before the base is created: the engine

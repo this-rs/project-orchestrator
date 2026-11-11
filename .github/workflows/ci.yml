@@ -733,7 +733,7 @@ jobs:
       - name: Run the obrain backend tests and its share of the conformance suite
         run: |
           cargo test --features obrain-backend --test obrain_backend --test store_conformance \
-            -- obrain_project:: with_the_feature an_unknown
+            --example obrain_mesures -- obrain_project:: with_the_feature an_unknown
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
