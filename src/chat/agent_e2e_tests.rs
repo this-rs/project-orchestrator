@@ -11799,6 +11799,55 @@ mod permission_scopes {
         assert!(!rules.path().join("rules").exists(), "nothing written");
     }
 
+    /// B2, on the REAL native harness: a Stop clicked while the turn waits on a permission
+    /// ends the wait. The harness drops its pending ask when the turn's signal is cancelled
+    /// and tells nobody (no decision, no event about the request), so only the backend can
+    /// forget it: before, the request stayed in the session's `asked_calls` for good, and
+    /// the session read "waiting on a person" for ever — kept by the idle cleanup with it.
+    #[tokio::test]
+    async fn a_stop_during_a_native_permission_leaves_no_wait_behind() {
+        let fake = FakeOpenAi::start(native_script());
+        let graph = stage(&fake).await;
+        let cwd = tempfile::tempdir().unwrap();
+        let manager = native_manager(graph.clone()).await;
+        let sid = open(&manager, cwd.path(), None).await;
+        let handle = manager.agent_runtime.get(&sid).await.unwrap();
+
+        manager.send_message(&sid, "ECHO-ONE").await.unwrap();
+        let id = asked(&graph, &sid, "first-echo", Duration::from_secs(10))
+            .await
+            .expect("the PO write tool is asked");
+        assert!(
+            handle.waiting_on_a_person().await,
+            "the turn waits on its person"
+        );
+        assert_eq!(handle.waiting_permission_ids(), vec![id.clone()]);
+
+        manager.interrupt(&sid).await.unwrap();
+        let mut ended = false;
+        for _ in 0..400 {
+            if !handle
+                .is_streaming
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                ended = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(ended, "the stopped turn ends");
+        assert!(
+            !handle.waiting_on_a_person().await,
+            "nobody is waited on once the turn is stopped"
+        );
+        assert!(
+            handle.waiting_permission_ids().is_empty(),
+            "the stopped turn's request is waiting no more: {:?}",
+            handle.waiting_permission_ids()
+        );
+        manager.close_session(&sid).await.unwrap();
+    }
+
     #[tokio::test]
     async fn read_only_access_wins_over_a_session_grant() {
         let fake = FakeOpenAi::start(native_script());
