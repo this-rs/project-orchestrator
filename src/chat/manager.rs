@@ -96,11 +96,18 @@ const LOST_TOOL_RESULT_GRACE_MCP: Duration = Duration::from_secs(600);
 /// command still running after an hour has outlived every budget this harness gives a turn.
 const LOST_TOOL_RESULT_GRACE_COMMAND: Duration = Duration::from_secs(3600);
 
-/// Whether a tool name belongs to one of PO's own MCP servers (`mcp__<server>__<tool>`) —
-/// i.e. hops this server serves, and whose budgets it therefore knows. The native tools
-/// (`Bash`, `Read`, ...) do not travel through it and keep the command grace.
+/// Whether a tool name belongs to one of PO's own MCP servers — the hops this server
+/// serves, and whose budgets it therefore knows: the project-orchestrator mega-tools and
+/// the nexus-tools native tools. A THIRD PARTY's server (`mcp__acme__...`) has no bound this
+/// server knows, so it keeps the command grace like a `Bash`; only the server name decides,
+/// never the `mcp__` prefix. The native tools (`Bash`, `Read`, ...) do not travel through it
+/// and keep the command grace.
 fn is_own_mcp_tool(tool: &str) -> bool {
-    tool.starts_with("mcp__")
+    tool.strip_prefix("mcp__")
+        .and_then(|rest| rest.split_once("__"))
+        .is_some_and(|(server, _)| {
+            server == PO_MCP_SERVER || server == nexus_claude::providers::native::NEXUS_TOOLS_SERVER
+        })
 }
 
 /// How long the detached write of the episode a closed session leaves may take
@@ -19637,6 +19644,13 @@ impl ChatManager {
                 grace_secs = grace.as_secs(),
                 "a tool result is lost: the turn waited past every budget of that call, ending it"
             );
+            if let Err(e) = self.interrupt(&id.to_string()).await {
+                warn!(session_id = %id, error = %e, "ending a turn stuck on a lost tool result failed");
+                continue;
+            }
+            // The turn is ended now — only then is the user told. Emitting before the
+            // interrupt announced a turn that never ended when the interrupt failed, and the
+            // same message went out again on every tick (the failure was not memorised).
             self.emit_session_event(
                 Some(&id.to_string()),
                 ChatEvent::Error {
@@ -19655,10 +19669,6 @@ impl ChatManager {
                 },
             )
             .await;
-            if let Err(e) = self.interrupt(&id.to_string()).await {
-                warn!(session_id = %id, error = %e, "ending a turn stuck on a lost tool result failed");
-                continue;
-            }
             abandoned.push(id.to_string());
         }
         abandoned

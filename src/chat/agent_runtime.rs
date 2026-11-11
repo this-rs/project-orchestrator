@@ -817,6 +817,11 @@ pub struct AgentSessionHandle {
     /// A turn is being streamed.
     pub is_streaming: AtomicBool,
     /// Text of the turn in progress (mid-stream joins).
+    /// A manual compaction is running: its silence is WORK (the provider is summarising the
+    /// transcript in one awaited call, page 1676-1701 — no event in between), never death.
+    /// Without this, the per-turn watchdog of #1157 cuts a legitimate compaction past
+    /// TURN_SILENCE_GRACE (measured class: a summary of a long transcript takes minutes).
+    pub compaction_in_flight: AtomicBool,
     pub streaming_text: Mutex<String>,
     /// Structured events of the turn in progress (mid-stream joins).
     pub streaming_events: Mutex<Vec<ChatEvent>>,
@@ -1678,7 +1683,10 @@ impl AgentSessionHandle {
         }
         self.emit(ChatEvent::StreamingStatus { is_streaming: true })
             .await;
-        match self.session.compact(instructions).await {
+        self.compaction_in_flight.store(true, Ordering::SeqCst);
+        let compacted = self.session.compact(instructions).await;
+        self.compaction_in_flight.store(false, Ordering::SeqCst);
+        match compacted {
             Ok(outcome) => {
                 tracing::info!(
                     session_id = %self.session_id,
@@ -2222,6 +2230,11 @@ impl AgentSessionHandle {
                 }
                 if me.waiting_on_a_person().await {
                     // The silence is a human's to break: the turn waits, it is not dead.
+                    continue;
+                }
+                if me.compaction_in_flight.load(Ordering::SeqCst) {
+                    // A manual compaction is running: its silence is the provider summarising the
+                    // transcript, not a dead turn.
                     continue;
                 }
                 if me.idle_for() < TURN_SILENCE_GRACE {
@@ -3667,6 +3680,7 @@ impl AgentRuntime {
             events_tx,
             is_streaming: AtomicBool::new(false),
             streaming_text: Mutex::new(String::new()),
+            compaction_in_flight: AtomicBool::new(false),
             streaming_events: Mutex::new(Vec::new()),
             provider: serde_json::json!({ "id": provider_id, "kind": provider_kind }),
             tool_policy,
@@ -3971,6 +3985,9 @@ pub(crate) mod fake {
         /// When set, `interrupt` is written but the turn does not end on its own: the
         /// provider never answers the stop (a CLI stuck in a hook or a tool).
         pub ignore_interrupts: AtomicBool,
+        /// When set, `interrupt` fails with this error (a provider that cannot be reached):
+        /// the manager must not then tell the user the turn ended.
+        pub fail_interrupt: StdMutex<Option<ProviderError>>,
         /// What `cancel_tools` answers, for the liveness probe (PROVIDER-DEAD): the shape a
         /// dead CLI gives (`ProcessExited`), a live one (`invalid`: unknown task), or a
         /// provider that cannot answer at all (`unsupported`: ACP, the in-process native
@@ -4086,6 +4103,9 @@ pub(crate) mod fake {
             scope: InterruptScope,
         ) -> Result<InterruptOutcome, ProviderError> {
             self.state.interrupts.lock().unwrap().push(scope);
+            if let Some(error) = self.state.fail_interrupt.lock().unwrap().clone() {
+                return Err(error);
+            }
             // Report whether a turn was actually running: the manager surfaces
             // this as `InterruptOutcome.delivered` so an idle stop reads false.
             let turn_interrupted = if self.state.ignore_interrupts.load(Ordering::SeqCst) {
@@ -9406,6 +9426,50 @@ mod turn_watchdog_tests {
         assert!(
             handle.is_streaming.load(Ordering::SeqCst),
             "a turn waiting for an answer is waiting on a person, not dead"
+        );
+    }
+
+    /// A manual compaction is ONE awaited call (`session.compact`, agent_runtime.rs:1686-1700)
+    /// that emits nothing while it runs: its silence is the provider summarising a long
+    /// transcript, not a dead turn. Measured class: minutes, not seconds. Without the flag the
+    /// per-turn watchdog of #1157 abandons it past `TURN_SILENCE_GRACE` — the very turn it is
+    /// meant to protect, cut in the middle, session freed under a compaction still running.
+    ///
+    /// RED without `compaction_in_flight`: the first assertion below fails (the watchdog
+    /// abandons a compaction in flight).
+    #[tokio::test]
+    async fn a_compaction_in_flight_is_never_abandoned_and_silence_after_it_still_is() {
+        let _wire = on_the_wire();
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = adopting(&runtime, &provider).await;
+
+        // A turn opens (this is what arms the per-turn watchdog on ITS generation)…
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        let _opened = handle
+            .open_turn(PendingMessageKind::User, "compact me", "compact me")
+            .await
+            .expect("the turn is sent");
+        // …and the compaction it holds takes longer than the silence budget.
+        handle.compaction_in_flight.store(true, Ordering::SeqCst);
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+        tokio::time::sleep(TAIL_WATCHDOG_MIN_TICK * 3).await;
+        assert!(
+            handle.is_streaming.load(Ordering::SeqCst),
+            "a compaction in flight is work in flight, not a dead turn: it must not be abandoned"
+        );
+
+        // The compaction returns; the SAME silence is now death, and must still be ended.
+        handle.compaction_in_flight.store(false, Ordering::SeqCst);
+        handle.backdate_activity(TURN_SILENCE_GRACE + Duration::from_secs(1));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while handle.is_streaming.load(Ordering::SeqCst) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !handle.is_streaming.load(Ordering::SeqCst),
+            "once the compaction is over, silence with nothing in flight is still death"
         );
     }
 }

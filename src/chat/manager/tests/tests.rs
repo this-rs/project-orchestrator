@@ -5238,6 +5238,11 @@ async fn test_the_lost_tool_result_rule_reads_an_unanswered_call_and_never_a_fin
         is_own_mcp_tool(&tool),
         "PO's own hop: the short grace applies"
     );
+    // The server name decides, never the `mcp__` prefix (D5): a third party's hop
+    // keeps the command grace; PO's two servers get the short one.
+    assert!(!is_own_mcp_tool("mcp__acme__long_task"));
+    assert!(!is_own_mcp_tool("Bash"));
+    assert!(is_own_mcp_tool("mcp__nexus__Bash"));
 
     // The result arrives: the turn is not waiting any more.
     graph
@@ -5392,6 +5397,97 @@ async fn test_the_watchdog_leaves_a_recent_call_and_a_command_alone() {
             .await
             .is_empty(),
         "neither a slow call nor a long command is a lost result"
+    );
+}
+
+// issue #1056, correctif B, suite (D5) : un outil MCP d'un serveur TIERS n'a pas la
+// borne courte des hops de PO — ce serveur n'est pas servi par PO, son budget est
+// inconnu, et un appel légitimement long n'y est pas coupé à 10 min. Seul un hop de
+// PO (project-orchestrator / nexus) reçoit le budget court.
+#[tokio::test]
+async fn test_the_watchdog_leaves_a_third_party_mcp_tool_alone() {
+    let (manager, graph) = manager_with_mock();
+    let manager = Arc::new(manager);
+    let third_party = crate::test_helpers::test_chat_session(None);
+    let own = crate::test_helpers::test_chat_session(None);
+    for (node, tool) in [
+        (&third_party, "mcp__acme__long_task"),
+        (&own, "mcp__project-orchestrator__chat"),
+    ] {
+        graph.create_chat_session(node).await.unwrap();
+        graph
+            .store_chat_events(node.id, vec![tool_use_event(node.id, 1, tool, 11)])
+            .await
+            .unwrap();
+        let (dummy, _pending) = create_dummy_session(true, "", Vec::new());
+        manager
+            .active_sessions
+            .write()
+            .await
+            .insert(node.id.to_string(), dummy);
+    }
+
+    let ended = manager.abandon_turns_whose_tool_result_never_came().await;
+    assert_eq!(
+        ended,
+        vec![own.id.to_string()],
+        "only PO's own hop is ended; the third-party server keeps the command grace"
+    );
+}
+
+// issue #1056, correctif B, suite (D5 bis) : l'erreur « résultat perdu » n'est dite
+// qu'une fois le tour effectivement interrompu. Avant, elle était émise AVANT
+// l'interruption : un interrupt qui échoue laissait repartir le même message à chaque
+// tick, en annonçant un tour qui n'avait jamais été interrompu.
+#[tokio::test]
+async fn test_a_failed_interrupt_does_not_tell_the_user_the_turn_ended() {
+    use std::sync::atomic::Ordering;
+    let (manager, graph, fake) = agent_manager();
+    let sid = Uuid::new_v4();
+    manager
+        .agent_runtime
+        .adopt(
+            &sid.to_string(),
+            "claude-code",
+            fake.session(),
+            1,
+            "native",
+            serde_json::json!({}),
+            None,
+        )
+        .await;
+    let handle = manager.agent_runtime.get(&sid.to_string()).await.unwrap();
+    handle.is_streaming.store(true, Ordering::SeqCst);
+    graph
+        .store_chat_events(
+            sid,
+            vec![tool_use_event(
+                sid,
+                1,
+                "mcp__project-orchestrator__chat",
+                11,
+            )],
+        )
+        .await
+        .unwrap();
+    *fake.state.fail_interrupt.lock().unwrap() =
+        Some(nexus_claude::agent::ProviderError::unsupported("interrupt"));
+
+    let ended = manager.abandon_turns_whose_tool_result_never_came().await;
+    assert!(
+        ended.is_empty(),
+        "a failed interrupt ends nothing: {ended:?}"
+    );
+    let told = graph
+        .chat_events
+        .read()
+        .await
+        .get(&sid)
+        .map(|evs| evs.iter().any(|e| e.data.contains("tool_result_lost")))
+        .unwrap_or(false);
+    assert!(
+        !told,
+        "a failed interrupt must not tell the user the turn ended"
     );
 }
 

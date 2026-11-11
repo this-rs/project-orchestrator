@@ -47,6 +47,22 @@ pub const QUOTA_PREFIX: &str = "quota:";
 /// (0 disables it); this is only where the slope starts.
 pub const QUOTA_NEAR_LIMIT: f64 = 0.9;
 
+/// How long a DATED exhaustion (the provider named its reset) is trusted before it is re-observed.
+///
+/// A `rate_limit_event` names the instant its window resets, and that date is reliable for an
+/// account that is genuinely out. But it cannot see a person resetting it by hand — a top-up, a
+/// plan change, a console refresh — which makes the dated event stale while it still claims the
+/// account is out for days. This is the 10/11/2026 case: `seven_day` served at 69 % while
+/// `seven_day_overage_included` was dated `exhausted` until 2026-11-14, and the exclusion held for
+/// 3.7 days with no turn ever allowed to re-observe it.
+///
+/// Once an observation is this old, [`QuotaRegistry::exhausted`] drops it so the next turn is
+/// admitted as a SINGLE re-observation probe. If the account truly still refuses, the fresh
+/// refusal re-arms the entry with a new observation time, so a genuinely-exhausted account is
+/// probed at most once per window — never hammered — and the exclusion stays effective until the
+/// provider proves otherwise.
+pub const DATED_EXHAUSTION_STALENESS: Duration = Duration::from_secs(15 * 60);
+
 /// Why an instance is exhausted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -500,8 +516,11 @@ impl QuotaRegistry {
                     window: None,
                     cause,
                 });
-                entry.observed_at_ms = now;
             }
+            // A refusal is a fresh observation either way: re-arm the staleness clock so a stale
+            // dated exhaustion the provider just re-confirmed is not probed again until the next
+            // staleness window.
+            entry.observed_at_ms = now;
         }
         self.persist_in_background(instance);
     }
@@ -631,11 +650,24 @@ impl QuotaRegistry {
     /// is back without anyone doing anything.
     pub fn exhausted(&self, instance: &str) -> Option<Exhaustion> {
         let now = self.now_ms();
-        self.lock()
-            .get(instance)?
-            .exhaustion
-            .clone()
-            .filter(|e| e.resets_at_ms > now)
+        let entries = self.lock();
+        let entry = entries.get(instance)?;
+        let exhaustion = entry.exhaustion.clone().filter(|e| e.resets_at_ms > now)?;
+        // A DATED exhaustion older than DATED_EXHAUSTION_STALENESS is stale: the reset date the
+        // provider named may have been invalidated by a person resetting the account, and no
+        // `rate_limit_event` reflects that. Dropping it admits the next turn as a SINGLE
+        // re-observation probe. A refusal the provider then answers re-arms the entry with a
+        // fresh observation time, so a genuinely-exhausted account is probed at most once per
+        // window, never hammered.
+        if exhaustion.reset_known
+            && entry
+                .observed_at_ms
+                .saturating_add(DATED_EXHAUSTION_STALENESS.as_millis() as u64)
+                <= now
+        {
+            return None;
+        }
+        Some(exhaustion)
     }
 
     /// The hold on ONE model of `instance` in force NOW, `None` once its reset has passed or when
@@ -739,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exhausted_window_holds_the_instance_out_until_its_reset_then_lets_it_back() {
+    fn a_dated_exhaustion_is_trusted_until_it_goes_stale_then_reobserved() {
         let (clock, registry) = registry();
         let reset = ms_of("2026-10-24T10:00:00Z");
         registry.observe(
@@ -757,11 +789,89 @@ mod tests {
         assert_eq!(held.resets_at_ms, reset);
         assert_eq!(held.window.as_deref(), Some("seven_day"));
         assert!(held.reset_known);
-        // Three days later, a second before the reset: still out.
-        clock.advance(Duration::from_secs(3 * 86_400 - 1));
+        // Within the trust window the dated word holds the instance out.
+        clock.advance(DATED_EXHAUSTION_STALENESS - Duration::from_secs(1));
         assert!(registry.exhausted("claude-code").is_some());
-        // At the reset: back, nobody did anything.
-        clock.advance(Duration::from_secs(1));
+        // Past the trust window, still before the reset: the observation is stale, so the next
+        // turn is admitted as a re-observation probe instead of being held out for days.
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(
+            registry.exhausted("claude-code"),
+            None,
+            "a stale dated exhaustion is dropped, nobody had to do anything"
+        );
+    }
+
+    /// The 10/11/2026 case, replayed: `seven_day` served at 69 % while
+    /// `seven_day_overage_included` was dated `exhausted` until 2026-11-14. The exclusion is
+    /// justified (the CLI said `rejected`) but must not hold for 3.7 days with no way out: once
+    /// the observation goes stale the account is routable again without a human.
+    #[test]
+    fn the_10_11_case_is_excluded_then_reobserved_once_stale() {
+        let (clock, registry) = registry();
+        let reset = ms_of("2026-11-14T08:00:00Z");
+        registry.observe(
+            "claude-code",
+            &QuotaSnapshot::live(vec![
+                QuotaWindow {
+                    kind: "seven_day".into(),
+                    utilization: Some(0.69),
+                    resets_at_ms: None,
+                    status: QuotaStatus::Allowed,
+                },
+                QuotaWindow {
+                    kind: "seven_day_overage_included".into(),
+                    utilization: Some(1.0),
+                    resets_at_ms: Some(reset),
+                    status: QuotaStatus::Exhausted,
+                },
+            ]),
+        );
+        // The exclusion is in force, and it names the overage window the provider refused on.
+        let held = registry
+            .exhausted("claude-code")
+            .expect("excluded at first");
+        assert_eq!(held.window.as_deref(), Some("seven_day_overage_included"));
+        assert_eq!(held.resets_at_ms, reset);
+        clock.advance(DATED_EXHAUSTION_STALENESS + Duration::from_secs(1));
+        assert_eq!(
+            registry.exhausted("claude-code"),
+            None,
+            "the stale exclusion is dropped and the account is routable again"
+        );
+    }
+
+    /// A genuinely-exhausted account is not hammered: each re-observation probe that gets refused
+    /// re-arms the staleness clock, so the next probe is a full window away.
+    #[test]
+    fn a_fresh_refusal_rearms_the_staleness_clock() {
+        let (clock, registry) = registry();
+        let reset = ms_of("2026-10-24T10:00:00Z");
+        registry.observe(
+            "claude-code",
+            &QuotaSnapshot::live(vec![window(
+                "seven_day",
+                QuotaStatus::Exhausted,
+                Some(reset),
+            )]),
+        );
+        // Go stale: the next turn is admitted as a probe.
+        clock.advance(DATED_EXHAUSTION_STALENESS + Duration::from_secs(1));
+        assert_eq!(registry.exhausted("claude-code"), None);
+        // The probe meets the same refusal: a fresh observation re-arms the exclusion.
+        registry.observe(
+            "claude-code",
+            &QuotaSnapshot::live(vec![window(
+                "seven_day",
+                QuotaStatus::Exhausted,
+                Some(reset),
+            )]),
+        );
+        assert!(registry.exhausted("claude-code").is_some(), "re-armed");
+        // The fresh observation is trusted for a full window: not stale again until then.
+        clock.advance(DATED_EXHAUSTION_STALENESS - Duration::from_secs(1));
+        assert!(registry.exhausted("claude-code").is_some());
+        clock.advance(Duration::from_secs(2));
         assert_eq!(registry.exhausted("claude-code"), None);
     }
 
@@ -1105,6 +1215,42 @@ mod tests {
         assert_eq!(after.exhausted("deepseek"), None, "nothing before the load");
         assert_eq!(after.load().await.unwrap(), 1);
         assert_eq!(after.exhausted("deepseek").unwrap().resets_at_ms, until);
+    }
+
+    /// A person's reset survives a restart: after `clear` + `persist`, a registry reloaded from
+    /// the same store finds nothing, so the instance is a candidate again and no stale exclusion
+    /// resurrects it.
+    #[tokio::test]
+    async fn clearing_a_quota_survives_a_restart() {
+        let store = Arc::new(MemStore::default());
+        let clock = Arc::new(ManualClock::at(T0));
+        let before = QuotaRegistry::new()
+            .with_clock(clock.clone())
+            .with_store(store.clone());
+        let until = ms_of("2026-11-14T08:00:00Z");
+        before.set_manual(
+            "claude-code",
+            &ManualQuota {
+                exhausted_until_ms: Some(until),
+                utilization: Some(1.0),
+                resets_at_ms: Some(until),
+                window: Some("seven_day_overage_included".into()),
+            },
+            "me",
+        );
+        before.persist("claude-code").await.unwrap();
+        // The person clears it: the entry is forgotten and the deletion is persisted.
+        before.clear("claude-code");
+        before.persist("claude-code").await.unwrap();
+
+        let after = QuotaRegistry::new().with_clock(clock).with_store(store);
+        assert_eq!(after.load().await.unwrap(), 0, "nothing reloaded");
+        assert_eq!(
+            after.exhausted("claude-code"),
+            None,
+            "the instance is a candidate again"
+        );
+        assert_eq!(after.view("claude-code"), None);
     }
 
     #[tokio::test]
