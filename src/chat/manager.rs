@@ -20075,7 +20075,16 @@ impl ChatManager {
                         .await
                         .len()
                         .max(cli_background.load(Ordering::Relaxed));
-                    if session_is_expired(idle, timeout, is_streaming, background_tasks) {
+                    // D2 FIX: Legacy sessions (Claude Code) use the interrupt system rather than
+                    // waiting_on_a_person(), so we pass false here. Agent sessions check this separately.
+                    let waiting_on_input = false;
+                    if session_is_expired(
+                        idle,
+                        timeout,
+                        is_streaming,
+                        background_tasks,
+                        waiting_on_input,
+                    ) {
                         expired.push(id);
                     } else {
                         debug!(
@@ -20226,7 +20235,14 @@ impl ChatManager {
             let idle = handle.idle_for();
             let is_streaming = handle.is_streaming.load(Ordering::SeqCst);
             let background_tasks = handle.active_background_tasks().await.len();
-            if session_is_expired(idle, timeout, is_streaming, background_tasks) {
+            let waiting_on_input = handle.waiting_on_a_person().await;
+            if session_is_expired(
+                idle,
+                timeout,
+                is_streaming,
+                background_tasks,
+                waiting_on_input,
+            ) {
                 expired.push(handle.session_id.clone());
             } else if idle > timeout {
                 debug!(
@@ -20234,6 +20250,7 @@ impl ChatManager {
                     idle_secs = idle.as_secs(),
                     is_streaming,
                     background_tasks,
+                    waiting_on_input,
                     "Idle agent session kept alive: work still in progress"
                 );
             }
@@ -20418,8 +20435,14 @@ pub(crate) fn session_is_expired(
     timeout: Duration,
     is_streaming: bool,
     background_tasks: usize,
+    waiting_on_input: bool,
 ) -> bool {
     if idle <= timeout {
+        return false;
+    }
+    // D2 FIX: Don't expire sessions waiting for user input (permission or question),
+    // even after the hard cap timeout, because the user is actively required.
+    if waiting_on_input {
         return false;
     }
     if idle > timeout * IDLE_HARD_CAP_FACTOR {
@@ -20553,36 +20576,55 @@ mod idle_expiry_tests {
             T * 2,
             T,
             false,
-            tracked.max(cli_reported)
+            tracked.max(cli_reported),
+            false // waiting_on_input
         ));
         // Without the CLI's report, the emptied tracking alone closes it.
-        assert!(session_is_expired(T * 2, T, false, tracked));
+        assert!(session_is_expired(T * 2, T, false, tracked, false));
     }
 
     #[test]
     fn active_session_is_kept() {
-        assert!(!session_is_expired(Duration::from_secs(60), T, false, 0));
+        assert!(!session_is_expired(
+            Duration::from_secs(60),
+            T,
+            false,
+            0,
+            false
+        ));
     }
 
     #[test]
     fn idle_session_without_work_expires() {
-        assert!(session_is_expired(T + Duration::from_secs(1), T, false, 0));
+        assert!(session_is_expired(
+            T + Duration::from_secs(1),
+            T,
+            false,
+            0,
+            false
+        ));
     }
 
     #[test]
     fn idle_session_with_background_work_is_kept() {
         // The failure mode: agent's turn over, sub-agents still running.
-        assert!(!session_is_expired(T * 2, T, false, 3));
+        assert!(!session_is_expired(T * 2, T, false, 3, false));
     }
 
     #[test]
     fn streaming_session_is_kept() {
-        assert!(!session_is_expired(T * 2, T, true, 0));
+        assert!(!session_is_expired(T * 2, T, true, 0, false));
     }
 
     #[test]
     fn stuck_background_work_is_bounded_by_the_hard_cap() {
-        assert!(session_is_expired(T * 9, T, true, 1));
+        assert!(session_is_expired(T * 9, T, true, 1, false));
+    }
+
+    #[test]
+    fn idle_session_waiting_on_input_is_not_expired_even_after_hard_cap() {
+        // D2 FIX: session waiting for user input should not expire after hard cap
+        assert!(!session_is_expired(T * 9, T, false, 0, true));
     }
 }
 
