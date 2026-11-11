@@ -705,6 +705,37 @@ mod anchors {
         }
     }
 
+    /// A `ChatSession` node carrying `project_slug` but NO `id` — written by another test, or by
+    /// an older writer — must not abort the sweep. Measured on CI (job Integration Tests,
+    /// 11/11/2026): the backfill died on `The property does not exist` and took the whole
+    /// `harness_neo4j` binary down with it, because one neighbour's malformed node was enough.
+    #[tokio::test]
+    async fn a_malformed_session_is_skipped_by_the_backfill_instead_of_aborting_it() {
+        let Some(e) = env().await else { return };
+        let store: &dyn GraphStore = &e.client;
+        let slug = format!("backfill-malformed-{}", Uuid::new_v4());
+        e.raw
+            .execute(
+                query("CREATE (:ChatSession {project_slug: $slug})").param("slug", slug.clone()),
+            )
+            .await
+            .unwrap();
+        store
+            .backfill_project_anchors()
+            .await
+            .expect("a session without `id` must be skipped, never abort the sweep");
+        e.raw
+            .execute(
+                query(
+                    "MATCH (s:ChatSession) WHERE s.project_slug = $slug AND s.id IS NULL \
+                     DETACH DELETE s",
+                )
+                .param("slug", slug),
+            )
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn backfill_is_idempotent_and_revert_removes_only_its_anchors() {
         let Some(e) = env().await else { return };
