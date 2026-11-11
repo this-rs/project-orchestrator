@@ -780,19 +780,22 @@ mod anchors {
     /// project) and not yet added its own anchors; B's sweep must not anchor A's session, or
     /// A's `add_anchor` on the same project answers "already anchored" (measured on CI,
     /// `anchor_scope::shadow_cost_of_a_turn…`, 11/11/2026), and B's revert must not delete the
-    /// anchors A went on to add.
+    /// INFERRED anchor A's own backfill went on to add (the revert only ever removes inferred
+    /// anchors: a user anchor surviving it would prove nothing).
     #[tokio::test]
     async fn a_neighbours_sweep_never_touches_my_sessions() {
         let Some(e) = env().await else { return };
         let store: &dyn GraphStore = &e.client;
-        // A: a project and a session carrying its slug, nothing anchored yet
+        // A: a project and two sessions carrying its slug, nothing anchored yet
         let slug_a = format!("anchor-proj-a-{}", Uuid::new_v4().simple());
         let a = project_node(&slug_a);
         store.create_project(&a).await.unwrap();
-        let sid_a = Uuid::new_v4();
-        let mut na = node(sid_a);
-        na.project_slug = Some(slug_a.clone());
-        store.create_chat_session(&na).await.unwrap();
+        let (sid_a, sid_a2) = (Uuid::new_v4(), Uuid::new_v4());
+        for sid in [sid_a, sid_a2] {
+            let mut na = node(sid);
+            na.project_slug = Some(slug_a.clone());
+            store.create_chat_session(&na).await.unwrap();
+        }
         // B: its own project and session, and its own sweep
         let slug_b = format!("anchor-proj-b-{}", Uuid::new_v4().simple());
         let b = project_node(&slug_b);
@@ -816,13 +819,30 @@ mod anchors {
             )
             .await
             .expect("B's sweep must not have anchored A's session");
-        // B reverts: A's anchor is none of its business
-        sweep_revert(&e, &[sid_b]).await;
+        // A's own backfill: `sid_a` is already anchored on the project (by A), `sid_a2`
+        // gets the inferred anchor — the one B's revert must leave alone
+        let report = sweep_backfill(&e, std::slice::from_ref(&slug_a)).await;
+        assert_eq!(
+            (report.created, report.already_present),
+            (1, 1),
+            "{report:?}"
+        );
+        let inferred = store.list_session_anchors(sid_a2).await.unwrap();
+        assert_eq!(inferred.len(), 1);
+        assert!(inferred[0].inferred && inferred[0].by == AnchorActor::System);
+
+        // B reverts: exactly its own inferred anchor, A's are none of its business
+        assert_eq!(sweep_revert(&e, &[sid_b]).await, 1);
         assert!(store.list_session_anchors(sid_b).await.unwrap().is_empty());
         let left = store.list_session_anchors(sid_a).await.unwrap();
         assert_eq!(left.iter().map(|x| x.id).collect::<Vec<_>>(), vec![mine.id]);
+        assert_eq!(
+            store.list_session_anchors(sid_a2).await.unwrap(),
+            inferred,
+            "A's inferred anchor survives B's revert"
+        );
 
-        for sid in [sid_a, sid_b] {
+        for sid in [sid_a, sid_a2, sid_b] {
             store.delete_chat_session(sid).await.unwrap();
         }
         store.delete_project(a.id, &slug_a).await.unwrap();
