@@ -101,24 +101,37 @@ async fn reset_phantom_state_timeouts(
     graph: Arc<Graph>,
     scope: Option<String>,
 ) -> MigrationOutcome {
+    repair_until_empty(|| {
+        let (graph, scope) = (graph.clone(), scope.clone());
+        async move {
+            let mut rows = graph
+                .execute(
+                    query(RESET_PHANTOM_STATE_TIMEOUTS)
+                        .param("scope", scope)
+                        .param("batch", BATCH),
+                )
+                .await?;
+            let row = rows.next().await?.context("the repair returned no row")?;
+            Ok(row.get::<i64>("processed").unwrap_or(0))
+        }
+    })
+    .await
+}
+
+/// Run `batch` (one bounded statement, returning how many states it repaired)
+/// until it repairs none. A failing statement stops the loop with its error (the
+/// next start retries); one that never stops repairing is reported, not looped on.
+async fn repair_until_empty<F, Fut>(mut batch: F) -> MigrationOutcome
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<i64>>,
+{
     let mut outcome = MigrationOutcome {
         id: PHANTOM_STATE_TIMEOUTS_ID.to_string(),
         ..Default::default()
     };
     for _ in 0..MAX_BATCHES {
-        let step = async {
-            let mut rows = graph
-                .execute(
-                    query(RESET_PHANTOM_STATE_TIMEOUTS)
-                        .param("scope", scope.clone())
-                        .param("batch", BATCH),
-                )
-                .await?;
-            let row = rows.next().await?.context("the repair returned no row")?;
-            Ok::<i64, anyhow::Error>(row.get::<i64>("processed").unwrap_or(0))
-        }
-        .await;
-        match step {
+        match batch().await {
             Ok(0) => {
                 outcome.completed = true;
                 return outcome;
@@ -135,6 +148,15 @@ async fn reset_phantom_state_timeouts(
     }
     outcome.error = Some(format!("did not converge within {MAX_BATCHES} batches"));
     outcome
+}
+
+/// The outcome reported when the spawned repair task panicked or was cancelled.
+fn repair_task_died(e: impl std::fmt::Display) -> MigrationOutcome {
+    MigrationOutcome {
+        id: PHANTOM_STATE_TIMEOUTS_ID.to_string(),
+        error: Some(format!("the repair task died: {e}")),
+        ..Default::default()
+    }
 }
 
 /// Relationships that make a skill referenced by something other than its
@@ -1076,11 +1098,7 @@ impl Neo4jClient {
             self.graph.clone(),
             scope.map(|s| s.to_string()),
         ));
-        let outcome = handle.await.unwrap_or_else(|e| MigrationOutcome {
-            id: PHANTOM_STATE_TIMEOUTS_ID.to_string(),
-            error: Some(format!("the repair task died: {e}")),
-            ..Default::default()
-        });
+        let outcome = handle.await.unwrap_or_else(repair_task_died);
         if outcome.processed > 0 {
             warn!(
                 id = PHANTOM_STATE_TIMEOUTS_ID,
@@ -1679,6 +1697,47 @@ mod tests {
                 .all(|r| r.id != PHANTOM_STATE_TIMEOUTS_ID),
             "a registered migration is skipped once marked: the repair must replay"
         );
+    }
+
+    #[tokio::test]
+    async fn the_repair_loop_stops_on_an_empty_batch_and_counts_what_it_repaired() {
+        let mut script = vec![Ok(2), Ok(1), Ok(0)].into_iter();
+        let out = repair_until_empty(|| std::future::ready(script.next().unwrap())).await;
+        assert_eq!((out.processed, out.batches, out.completed), (3, 2, true));
+        assert!(out.error.is_none());
+        assert_eq!(out.id, PHANTOM_STATE_TIMEOUTS_ID);
+    }
+
+    #[tokio::test]
+    async fn the_repair_loop_reports_a_failing_batch_and_stops() {
+        let mut script = vec![Ok(5), Err(anyhow::anyhow!("lock conflict"))].into_iter();
+        let out = repair_until_empty(|| std::future::ready(script.next().unwrap())).await;
+        assert_eq!((out.processed, out.completed), (5, false));
+        assert_eq!(out.error.as_deref(), Some("lock conflict"));
+    }
+
+    #[tokio::test]
+    async fn the_repair_loop_does_not_run_forever_on_a_batch_that_never_empties() {
+        let mut calls = 0u32;
+        let out = repair_until_empty(|| {
+            calls += 1;
+            std::future::ready(Ok(1))
+        })
+        .await;
+        assert_eq!(calls, MAX_BATCHES);
+        assert!(!out.completed);
+        assert!(out.error.unwrap().contains("did not converge"));
+    }
+
+    #[test]
+    fn a_dead_repair_task_is_an_error_outcome_not_a_panic() {
+        let out = repair_task_died("cancelled");
+        assert_eq!(out.id, PHANTOM_STATE_TIMEOUTS_ID);
+        assert_eq!(
+            out.error.as_deref(),
+            Some("the repair task died: cancelled")
+        );
+        assert!(!out.completed && out.processed == 0);
     }
 
     #[test]

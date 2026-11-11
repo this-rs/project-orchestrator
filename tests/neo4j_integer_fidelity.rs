@@ -432,6 +432,25 @@ async fn a_negative_stored_count_is_read_as_zero_not_as_a_huge_number() {
         (0, 0, 0, 0, 0),
         "context card"
     );
+    // The batch reader of the same cards is a second reader of the same columns.
+    let batch = e
+        .client
+        .get_context_cards_batch(&[path], &project.to_string())
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 1);
+    let c = &batch[0];
+    assert_eq!(
+        (
+            c.cc_community_id,
+            c.cc_imports_out,
+            c.cc_imports_in,
+            c.cc_calls_out,
+            c.cc_calls_in
+        ),
+        (0, 0, 0, 0, 0),
+        "context cards, batch"
+    );
 }
 
 /// The guard of the target: the live service is refused whatever the shell
