@@ -11,7 +11,6 @@
 //! stabilité sur données réelles (insertion d'égalités volontaires) exigerait le
 //! binaire Neo4j ; elle est décrite dans le document de cartographie.
 
-#[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::Path;

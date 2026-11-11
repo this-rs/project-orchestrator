@@ -74,7 +74,7 @@ volontaire.
 
 ## Test
 
-`src/neo4j/order_tiebreak.rs` — garde-fou statique (tourne **sans** Neo4j) qui
+`tests/order_tiebreak.rs` — garde-fou statique (tourne **sans** Neo4j) qui
 relit les sources, extrait les `ORDER BY` des fichiers corrigés et vérifie que
 chaque clause se termine par une clé totale. La liste `CASES` couvre désormais,
 en plus des tris nom/priorité/énergie, les nouvelles formes : score de

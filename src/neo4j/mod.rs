@@ -80,6 +80,3 @@ pub use traits::{
 // of the crate on itself enables for every test build and no binary.
 #[cfg(any(test, feature = "mock-store"))]
 pub mod mock;
-
-#[cfg(test)]
-mod order_tiebreak;
