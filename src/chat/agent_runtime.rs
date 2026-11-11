@@ -2260,7 +2260,7 @@ impl AgentSessionHandle {
     /// writes run in tasks of their own (`post_stream::spawn_write`). What it held and never
     /// emitted is lost, which is the trade the Claude Code engine's `abandon_turn_if_stuck`
     /// makes too: a session stuck for good is the alternative.
-    pub async fn abandon_turn(self: &Arc<Self>, generation: u64) -> bool {
+    pub async fn abandon_turn(&self, generation: u64) -> bool {
         if self.turn_generation.load(Ordering::SeqCst) != generation {
             return false;
         }
@@ -2294,7 +2294,6 @@ impl AgentSessionHandle {
                 .to_string(),
         })
         .await;
-
         true
     }
 
