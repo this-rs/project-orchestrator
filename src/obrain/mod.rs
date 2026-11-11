@@ -50,17 +50,20 @@
 //!
 //! Two levels, so that nobody reads behind an fsync:
 //! - `ecrivain` serializes WRITERS from validation to fsync;
-//! - `etat` (the `Uuid → NodeId` indexes) is write-locked only around the
-//!   in-memory mutations, never around disk or fsync. A reader waits, at
-//!   worst, for a handful of in-memory operations.
+//! - `etat` (the indexes, which hold the decoded projects) is write-locked only
+//!   to publish a write — AFTER its fsync — never around disk or fsync. A reader
+//!   waits, at worst, for a handful of in-memory operations, and is served the
+//!   previous state until the write is durable (create, update, delete alike).
 //!
 //! Reads are served inline (obrain reads are mmap and hash lookups); writes run
 //! on the blocking pool.
 
+#[cfg(any(test, feature = "mock-store"))]
 mod mesure;
 mod project;
 
-pub use mesure::Durabilite;
+#[cfg(any(test, feature = "mock-store"))]
+pub use mesure::{Durabilite, Interruption};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -132,6 +135,25 @@ pub const SEUIL_COLONNE_BLOB: usize = 256;
 /// WAL fsync: it bounds how much WAL a restart has to replay.
 pub const FLUSH_COMPLET_TOUS_LES: u64 = 256;
 
+/// What makes a write durable, once per write. In a production build only the WAL
+/// fsync exists; the test builds add the measures' and the tests' variants
+/// (`mesure.rs`).
+#[cfg(not(any(test, feature = "mock-store")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durabilite {
+    /// The WAL fsync (`flush_wal`), and a full flush every
+    /// [`FLUSH_COMPLET_TOUS_LES`] writes.
+    Wal,
+}
+
+/// The file that says a base is PO's: written when PO creates the base (or by the
+/// migration that produces one), required at open. Any directory with a
+/// `substrate.meta` is an obrain base; only one with this file is a PO base.
+pub const MARQUEUR_PO: &str = "po-obrain-base";
+/// Its content: the schema of what PO writes in the base. Bumped by a lot that
+/// changes the shape of a node this backend writes.
+pub const SCHEMA_PO: &str = "schema = 1\n";
+
 /// Whether opening may create the base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Creation {
@@ -145,11 +167,10 @@ pub enum Creation {
 /// logged by the factory and readable by the caller.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RapportOuverture {
-    /// `Project` nodes of a creation interrupted by a crash (draft, or empty):
-    /// deleted.
+    /// `Project` nodes of a creation that never reached its commit point (the
+    /// draft marker still there, or nothing on the node): deleted, whatever they
+    /// held (`project.rs`, "Atomicity").
     pub brouillons_supprimes: usize,
-    /// Complete projects whose draft marker was left behind: marker removed.
-    pub marqueurs_retires: usize,
     /// Projects whose path trio (`root_path`, `declared_path`,
     /// `canonical_path`) was torn by an interrupted update: recomputed from
     /// `root_path`, which is written last.
@@ -178,6 +199,9 @@ struct Interne {
     ecritures: AtomicU64,
     durabilite: Durabilite,
     rapport: RapportOuverture,
+    /// A test hook: the point where the next write stops (`mesure.rs`).
+    #[cfg(any(test, feature = "mock-store"))]
+    interruption: Mutex<Option<Interruption>>,
     /// The directory itself, when the base is a throwaway one
     /// ([`ObrainGraphStore::open_temporary`]). Declared LAST: fields drop in
     /// order, so the base is closed before its directory is removed.
@@ -217,6 +241,37 @@ impl Ecriture<'_> {
             .map_err(|_| anyhow!("verrou de l'état obrain empoisonné"))
     }
 
+    /// A test hook, compiled for test builds only: stop here if the test armed
+    /// this point. Nothing is durable, nothing is published — what a crash at
+    /// this instant leaves is what the engine has written so far.
+    #[cfg(any(test, feature = "mock-store"))]
+    fn point(&mut self, point: Interruption) -> Result<()> {
+        let mut arme = self
+            .interne
+            .interruption
+            .lock()
+            .map_err(|_| anyhow!("verrou du point d'interruption empoisonné"))?;
+        if *arme == Some(point) {
+            *arme = None;
+            bail!("interruption injectée par le test : {point:?}");
+        }
+        Ok(())
+    }
+
+    /// A failure AFTER the engine was written to (decoding what was just written)
+    /// leaves the base and the index disagreeing: the store is indeterminate
+    /// until a restart rebuilds the index from the base.
+    fn apres_ecriture<T>(&self, resultat: Result<T>) -> Result<T> {
+        resultat.map_err(|e| {
+            self.interne.indetermine.store(true, Ordering::Release);
+            e.context(format!(
+                "base obrain {} : écriture appliquée mais non relisible ; l'index et la base \
+                 divergent. Tout est refusé jusqu'au redémarrage, qui reconstruit l'index",
+                self.interne.chemin.display()
+            ))
+        })
+    }
+
     /// For a creation that carries a blob-sized value: run the FULL flush now, before
     /// the draft marker is removed. A crash before the flush completes then leaves a
     /// draft (its description lost with the blob, so it reads incomplete and is
@@ -248,12 +303,16 @@ impl Ecriture<'_> {
                     autre => autre,
                 }
             }
+            #[cfg(any(test, feature = "mock-store"))]
             Durabilite::Complet => self.db.commit_wal(),
+            #[cfg(any(test, feature = "mock-store"))]
             Durabilite::Aucune => Ok(()),
+            #[cfg(any(test, feature = "mock-store"))]
             Durabilite::LenteAPourTest(ms) => {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
                 self.db.flush_wal()
             }
+            #[cfg(any(test, feature = "mock-store"))]
             Durabilite::EchoueAPourTest => Err(obrain_common::utils::error::Error::Internal(
                 "échec injecté par le test".into(),
             )),
@@ -280,6 +339,7 @@ impl ObrainGraphStore {
     /// - the path must be ABSOLUTE;
     /// - a directory that holds files but no `substrate.meta` is refused (the
     ///   engine would write its own files into it, over what is there);
+    /// - an obrain base that is not PO's (no [`MARQUEUR_PO`]) is refused;
     /// - an absent or empty directory is a new base only with
     ///   [`Creation::Permise`]: a base is created on purpose, never by accident.
     ///
@@ -287,38 +347,23 @@ impl ObrainGraphStore {
     /// another one. That refusal is obrain's, and it is what makes PO the
     /// single writer.
     pub fn open(chemin: impl AsRef<Path>, creation: Creation) -> Result<Self> {
-        Self::open_avec(chemin, creation, Durabilite::Wal)
-    }
-
-    /// [`ObrainGraphStore::open`] with an explicit durability step: for the
-    /// measures and the tests of the durability itself.
-    #[doc(hidden)]
-    pub fn open_avec(
-        chemin: impl AsRef<Path>,
-        creation: Creation,
-        durabilite: Durabilite,
-    ) -> Result<Self> {
         let chemin = chemin.as_ref().to_path_buf();
-        Self::garde_fou_d_ouverture(&chemin, creation)?;
-        Self::ouvrir(chemin, durabilite, None)
+        let creer = Self::garde_fou_d_ouverture(&chemin, creation)?;
+        Self::ouvrir(chemin, Durabilite::Wal, creer, None)
     }
 
     /// A base in a fresh temporary directory, removed when the store is
     /// dropped. For tests and conformance runs: nothing outlives the store.
     pub fn open_temporary() -> Result<Self> {
-        Self::open_temporary_avec(Durabilite::Wal)
-    }
-
-    #[doc(hidden)]
-    pub fn open_temporary_avec(durabilite: Durabilite) -> Result<Self> {
         let dir = tempfile::Builder::new()
             .prefix("po-obrain-")
             .tempdir()
             .context("création du répertoire temporaire de la base obrain")?;
-        Self::ouvrir(dir.path().to_path_buf(), durabilite, Some(dir))
+        Self::ouvrir(dir.path().to_path_buf(), Durabilite::Wal, true, Some(dir))
     }
 
-    fn garde_fou_d_ouverture(chemin: &Path, creation: Creation) -> Result<()> {
+    /// `Ok(true)` when the directory holds no base and one may be created there.
+    fn garde_fou_d_ouverture(chemin: &Path, creation: Creation) -> Result<bool> {
         if !chemin.is_absolute() {
             bail!(
                 "chemin de base obrain relatif refusé : « {} » (il dépendrait du répertoire de \
@@ -327,9 +372,18 @@ impl ObrainGraphStore {
             );
         }
         if chemin.join("substrate.meta").is_file() {
-            return Ok(());
+            if !chemin.join(MARQUEUR_PO).is_file() {
+                bail!(
+                    "{} est une base obrain mais pas une base PO : le fichier `{MARQUEUR_PO}` \
+                     manque. Une base d'un autre outil ne s'ouvre pas ici ; une base migrée le \
+                     porte. Rien n'a été touché",
+                    chemin.display()
+                );
+            }
+            return Ok(false);
         }
-        let existe = match std::fs::symlink_metadata(chemin) {
+        // `metadata` follows a link: a link to a directory is that directory.
+        let existe = match std::fs::metadata(chemin) {
             Ok(m) if m.is_dir() => true,
             Ok(_) => bail!(
                 "« {} » existe et n'est pas un répertoire : pas une base obrain",
@@ -355,7 +409,7 @@ impl ObrainGraphStore {
             }
         }
         match creation {
-            Creation::Permise => Ok(()),
+            Creation::Permise => Ok(true),
             Creation::Interdite => bail!(
                 "aucune base obrain dans {} ({}) et la création n'est pas demandée : une faute \
                  de frappe dans `storage.obrain_path` donnerait sinon une base vide, servie comme \
@@ -374,10 +428,21 @@ impl ObrainGraphStore {
     fn ouvrir(
         chemin: PathBuf,
         durabilite: Durabilite,
+        creer: bool,
         jetable: Option<tempfile::TempDir>,
     ) -> Result<Self> {
         let db = ObrainDB::open(&chemin)
             .map_err(|e| anyhow!("ouverture de la base obrain {} : {e}", chemin.display()))?;
+        if creer {
+            // The base is PO's from its first instant: the marker is written before
+            // anything else, and a failure here is an open failure.
+            std::fs::write(chemin.join(MARQUEUR_PO), SCHEMA_PO).with_context(|| {
+                format!(
+                    "écriture du marqueur {MARQUEUR_PO} dans {}",
+                    chemin.display()
+                )
+            })?;
+        }
         let (etat, rapport) = project::IndexProjets::reconstruire(&db)
             .map(|(projets, rapport)| (Etat { projets }, rapport))
             .with_context(|| {
@@ -397,6 +462,8 @@ impl ObrainGraphStore {
                 ecritures: AtomicU64::new(0),
                 durabilite,
                 rapport,
+                #[cfg(any(test, feature = "mock-store"))]
+                interruption: Mutex::new(None),
                 _jetable: jetable,
             }),
         };
@@ -484,16 +551,22 @@ impl ObrainGraphStore {
     /// Run a mutation on the blocking pool, as the one writer, and make it
     /// durable before answering.
     ///
-    /// The closure must validate BEFORE it writes (obrain's direct API has no
-    /// rollback, so an `Err` has to mean "nothing was written"), and must hold
-    /// the write lock of the indexes for in-memory work only.
-    async fn ecrire<R, F>(&self, f: F) -> Result<R>
+    /// `preparer` runs first, on the blocking pool but BEFORE the writer lock: the
+    /// place for what touches the filesystem (resolving a root) without holding
+    /// anyone. The closure must validate BEFORE it writes (obrain's direct API has
+    /// no rollback, so an `Err` has to mean "nothing was written"), must publish to
+    /// the index only after its durability step, and must hold the write lock of
+    /// the indexes for in-memory work only.
+    async fn ecrire<P, R, Prep, F>(&self, preparer: Prep, f: F) -> Result<R>
     where
+        P: Send + 'static,
         R: Send + 'static,
-        F: FnOnce(&mut Ecriture<'_>) -> Result<R> + Send + 'static,
+        Prep: FnOnce() -> P + Send + 'static,
+        F: FnOnce(P, &mut Ecriture<'_>) -> Result<R> + Send + 'static,
     {
         let interne = self.interne.clone();
         tokio::task::spawn_blocking(move || {
+            let prepare = preparer();
             let _ecrivain = interne
                 .ecrivain
                 .lock()
@@ -518,7 +591,7 @@ impl ObrainGraphStore {
                 rendu_durable: false,
                 flush_complet: false,
             };
-            let rendu = f(&mut ecriture)?;
+            let rendu = f(prepare, &mut ecriture)?;
             if !ecriture.rendu_durable {
                 ecriture.rendre_durable()?;
             }

@@ -31,14 +31,18 @@
 //! the id compares as a `Uuid`, which is the order of its canonical string
 //! (fixed-width lowercase hex, same positions for the hyphens).
 //!
-//! # Reads are served from memory
+//! # Reads are served from memory, and a write is visible once durable
 //!
 //! The decoded `ProjectNode` and its `PathPolicy` are held in the index, decoded
-//! once (at open, and again after each write to the node, under the same write
-//! lock): a read is a hash lookup and a clone, with no engine call and no disk,
-//! whatever the size of the base. That is sound because this backend is the single
-//! writer of the base — the one thing that could change a node behind the index —
-//! and the index is rebuilt from the base at every open.
+//! once (at open, and again after each write to the node): a read is a hash
+//! lookup and a clone, with no engine call and no disk, whatever the size of the
+//! base. That is sound because this backend is the single writer of the base —
+//! the one thing that could change a node behind the index — and the index is
+//! rebuilt from the base at every open.
+//!
+//! Every write (create, update, timestamp, delete) is published to the index
+//! AFTER its durability step: a reader never sees a value, nor an absence, that
+//! a restart could take back. Until then it is served the previous state.
 //!
 //! # Atomicity, built by ordering
 //!
@@ -52,26 +56,36 @@
 //!   value in a blob column is not in the WAL: when the creation carries one, the
 //!   full flush runs BEFORE the marker is removed (measured: a killed creation
 //!   otherwise reopened as a project that looked whole and had lost its description).
-//! - **update**: `root_path` is written LAST, after `canonical_path` and
-//!   `declared_path`, which are pure functions of it.
-//! - **opening** repairs, and never fails on what it repairs: a draft or an
-//!   empty `Project` node is deleted; a complete project that kept its marker
-//!   loses it; a project whose `declared_path` disagrees with its `root_path`
-//!   has both derived paths recomputed (rolling a torn update back or
-//!   forward, to a state `root_path` states). What it cannot address (foreign
-//!   data without `id`/`name`/`slug`/`created_at`, a duplicated id or slug) is
-//!   quarantined: left untouched, ignored, and named in
+//!   **The removal of the marker is the commit point**, and the fsync that
+//!   follows is the acknowledgement. A crash between the two leaves a complete,
+//!   unmarked project that opening PROMOTES although the caller never got its
+//!   `Ok`: the "committed, acknowledgement lost" window every journaled store
+//!   has. A crash before the removal leaves a draft that opening DELETES, whatever
+//!   it holds — even all eleven properties: without the commit point, it is not a
+//!   project (all-or-nothing, like Neo4j's transaction).
+//! - **update of the root**: `declared_path` is written FIRST, `canonical_path`
+//!   second, `root_path` LAST. Both derived paths are pure functions of
+//!   `root_path`; `declared_root_of` has no side effect and `canonical_root`
+//!   resolves links. Any interruption therefore leaves `declared_path` disagreeing
+//!   with `declared_root_of(root_path)` — the one pure check opening makes — and
+//!   opening recomputes both derived paths from `root_path`. No reachable
+//!   interruption leaves `canonical_path` alone out of step (it is never written
+//!   before `declared_path`); a base from another writer that does is caught by the
+//!   second pure check: an empty `canonical_path` on a project with a root.
+//! - **opening** repairs, and never fails on what it repairs. What it cannot
+//!   address (foreign data without `id`/`name`/`slug`/`created_at`, a duplicated id
+//!   or slug) is quarantined: left untouched, ignored, and named in
 //!   [`RapportOuverture`](super::RapportOuverture).
 //!
 //! What this does NOT give: an UPDATE of a blob-sized value (a string above 256
 //! bytes) killed before its full flush may lose that property altogether — neither
 //! the old value nor the new — because obrain's blob columns are not WAL-covered
 //! (an obrain lot: log blob writes, or persist the column registry with each
-//! write). And the properties of ONE update land one by one, so
-//! after a crash a reader of the file could see `name` new and `description`
-//! old. Each state is a valid project, and the reopened base is one of them.
-//! A real transactional multi-property write is an obrain lot (the `Session`
-//! has `create_node_with_props` but no transactional `set_node_property`).
+//! write). And the properties of ONE update land one by one, so after a crash the
+//! base can hold `name` new and `description` old. Each state is a valid project,
+//! and the reopened base is one of them. A real transactional multi-property write
+//! is an obrain lot (the `Session` has `create_node_with_props` but no
+//! transactional `set_node_property`).
 
 use std::collections::HashMap;
 
@@ -82,6 +96,8 @@ use obrain_common::types::{NodeId, Value};
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
+#[cfg(any(test, feature = "mock-store"))]
+use super::Interruption;
 use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
 use crate::neo4j::file_uid::{canonical_root, declared_root_of, PathPolicy};
 use crate::neo4j::models::{ProjectNode, ProjectProfile};
@@ -149,14 +165,6 @@ pub(super) struct IndexProjets {
 }
 
 impl IndexProjets {
-    /// Decode the project again from the base, after a write to its node.
-    fn rafraichir(&mut self, db: &ObrainDB, id: Uuid) -> Result<()> {
-        if let Some(e) = self.par_id.get_mut(&id) {
-            *e = Entree::decoder(db, e.noeud)?;
-        }
-        Ok(())
-    }
-
     /// Rebuild the index from the persisted `Project` nodes, repairing what an
     /// interrupted write left (see the module doc). A scan of the node zone.
     pub(super) fn reconstruire(db: &ObrainDB) -> Result<(Self, RapportOuverture)> {
@@ -175,26 +183,21 @@ impl IndexProjets {
                     .filter(|v| !matches!(v, Value::Null))
                     .cloned()
             };
-            let brouillon = get(BROUILLON).is_some();
-            let complet = CLES_DE_CREATION.iter().all(|k| get(k).is_some());
-            let projet = lire_projet(&get);
-
-            let projet = match projet {
-                Ok(p) if !brouillon || complet => p,
-                _ => {
-                    // Not a project this backend can address: ours and
-                    // interrupted (marker, or nothing at all), or foreign.
-                    let vide = n.properties.is_empty();
-                    if brouillon || (vide && store.out_degree(noeud) == 0) {
-                        db.delete_node(noeud);
-                        rapport.brouillons_supprimes += 1;
-                    } else {
-                        rapport.en_quarantaine.push(format!(
-                            "nœud Project {noeud:?} : id/name/slug/created_at illisibles"
-                        ));
-                    }
-                    continue;
-                }
+            // A draft is a creation that never reached its commit point: deleted,
+            // whatever it holds (module doc). An empty node is the same creation,
+            // killed even earlier.
+            if get(BROUILLON).is_some() || (n.properties.is_empty() && store.out_degree(noeud) == 0)
+            {
+                db.delete_node(noeud);
+                rapport.brouillons_supprimes += 1;
+                continue;
+            }
+            let Ok(projet) = lire_projet(&get) else {
+                // Not ours: no marker, and not addressable.
+                rapport.en_quarantaine.push(format!(
+                    "nœud Project {noeud:?} : id/name/slug/created_at illisibles"
+                ));
+                continue;
             };
 
             if index.par_id.contains_key(&projet.id) {
@@ -212,23 +215,23 @@ impl IndexProjets {
                 continue;
             }
 
-            if brouillon {
-                db.remove_node_property(noeud, BROUILLON);
-                rapport.marqueurs_retires += 1;
-            }
-            // A torn path trio: `root_path` is the commit point of an update.
-            if let Some(declare) = get("declared_path").and_then(|v| v.as_str().map(str::to_string))
-            {
-                let attendu = declared_root_of(&projet.root_path);
-                if declare != attendu {
-                    db.set_node_property(
-                        noeud,
-                        "canonical_path",
-                        Value::from(canonical_root(Some(&projet.root_path))),
-                    );
-                    db.set_node_property(noeud, "declared_path", Value::from(attendu));
-                    rapport.chemins_repares += 1;
-                }
+            // A torn path trio. `root_path` is the commit point of an update, and
+            // `declared_path` the first thing an update writes: any interruption
+            // leaves them disagreeing. Both checks are pure (no filesystem).
+            let declare = get("declared_path").and_then(|v| v.as_str().map(str::to_string));
+            let canonique = get("canonical_path").and_then(|v| v.as_str().map(str::to_string));
+            let attendu = declared_root_of(&projet.root_path);
+            let dechire = declare.as_deref() != Some(attendu.as_str())
+                || (!attendu.is_empty() && canonique.as_deref().unwrap_or("").is_empty());
+            if dechire {
+                // Recomputed from `root_path`: the one value every state agrees on.
+                db.set_node_property(
+                    noeud,
+                    "canonical_path",
+                    Value::from(canonical_root(Some(&projet.root_path))),
+                );
+                db.set_node_property(noeud, "declared_path", Value::from(attendu));
+                rapport.chemins_repares += 1;
             }
             // Decoded AFTER the repairs: what is served is what the base now says.
             index.par_id.insert(projet.id, Entree::decoder(db, noeud)?);
@@ -296,78 +299,106 @@ fn noeud_lisible(db: &ObrainDB, noeud: NodeId) -> Result<impl Fn(&str) -> Option
     })
 }
 
+/// The three path values of a root, in the order an update writes them:
+/// `declared_path`, `canonical_path`, `root_path` (module doc). Computed on the
+/// blocking pool, before any lock: `canonical_root` resolves links.
+fn trio_de_chemins(racine: String) -> [(&'static str, Value); 3] {
+    [
+        ("canonical_path", Value::from(canonical_root(Some(&racine)))),
+        ("declared_path", Value::from(declared_root_of(&racine))),
+        ("root_path", Value::from(racine)),
+    ]
+}
+
 #[async_trait]
 impl ProjectStore for ObrainGraphStore {
     async fn create_project(&self, project: &ProjectNode) -> Result<()> {
         let p = project.clone();
-        // The filesystem is consulted HERE, before any lock: `canonical_root`
-        // resolves links.
-        let proprietes: Vec<(&'static str, Value)> = vec![
-            ("id", Value::from(p.id.to_string())),
-            ("name", Value::from(p.name.clone())),
-            ("slug", Value::from(p.slug.clone())),
-            ("root_path", Value::from(p.root_path.clone())),
-            (
-                "canonical_path",
-                Value::from(canonical_root(Some(&p.root_path))),
-            ),
-            ("declared_path", Value::from(declared_root_of(&p.root_path))),
-            ("paths_declared", Value::from(true)),
-            (
-                "description",
-                Value::from(p.description.clone().unwrap_or_default()),
-            ),
-            ("created_at", Value::from(p.created_at.to_rfc3339())),
-            ("watch_enabled", Value::from(p.watch_enabled)),
-            ("profile", Value::from(p.profile.as_str())),
-        ];
-        debug_assert!(proprietes
-            .iter()
-            .map(|(k, _)| *k)
-            .eq(CLES_DE_CREATION.iter().copied()));
-        self.ecrire(move |w: &mut Ecriture<'_>| {
-            // Validate first: nothing is written when one of these refuses.
-            // The writer lock is ours, so the answer cannot change under us.
-            {
-                let etat = w.index()?;
-                if etat.projets.par_id.contains_key(&p.id) {
-                    bail!(
-                        "un projet d'id {} existe déjà (unicité de Project.id)",
-                        p.id
-                    );
+        self.ecrire(
+            // Prepared on the blocking pool, before the writer lock: the filesystem
+            // is consulted here (`canonical_root` resolves links).
+            move || {
+                let proprietes: Vec<(&'static str, Value)> = vec![
+                    ("id", Value::from(p.id.to_string())),
+                    ("name", Value::from(p.name.clone())),
+                    ("slug", Value::from(p.slug.clone())),
+                    ("root_path", Value::from(p.root_path.clone())),
+                    (
+                        "canonical_path",
+                        Value::from(canonical_root(Some(&p.root_path))),
+                    ),
+                    ("declared_path", Value::from(declared_root_of(&p.root_path))),
+                    ("paths_declared", Value::from(true)),
+                    (
+                        "description",
+                        Value::from(p.description.clone().unwrap_or_default()),
+                    ),
+                    ("created_at", Value::from(p.created_at.to_rfc3339())),
+                    ("watch_enabled", Value::from(p.watch_enabled)),
+                    ("profile", Value::from(p.profile.as_str())),
+                ];
+                debug_assert!(proprietes
+                    .iter()
+                    .map(|(k, _)| *k)
+                    .eq(CLES_DE_CREATION.iter().copied()));
+                (p, proprietes)
+            },
+            move |(p, proprietes), w: &mut Ecriture<'_>| {
+                // Validate first: nothing is written when one of these refuses.
+                // The writer lock is ours, so the answer cannot change under us.
+                {
+                    let etat = w.index()?;
+                    if etat.projets.par_id.contains_key(&p.id) {
+                        bail!(
+                            "un projet d'id {} existe déjà (unicité de Project.id)",
+                            p.id
+                        );
+                    }
+                    if let Some(autre) = etat.projets.par_slug.get(&p.slug) {
+                        bail!(
+                            "le slug « {} » est déjà celui du projet {autre} (unicité de \
+                             Project.slug)",
+                            p.slug
+                        );
+                    }
                 }
-                if let Some(autre) = etat.projets.par_slug.get(&p.slug) {
-                    bail!(
-                        "le slug « {} » est déjà celui du projet {autre} (unicité de Project.slug)",
-                        p.slug
-                    );
+                w.flush_complet = proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
+                let noeud = w.db.create_node(&[LABEL]);
+                #[cfg(any(test, feature = "mock-store"))]
+                w.point(Interruption::ApresLeNoeud)?;
+                w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+                #[cfg(any(test, feature = "mock-store"))]
+                w.point(Interruption::ApresLeMarqueur)?;
+                for (n, (cle, valeur)) in proprietes.into_iter().enumerate() {
+                    w.db.set_node_property(noeud, cle, valeur);
+                    #[cfg(any(test, feature = "mock-store"))]
+                    w.point(Interruption::ApresLaPropriete(n + 1))?;
                 }
-            }
-            w.flush_complet = proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
-            let noeud = w.db.create_node(&[LABEL]);
-            w.db.set_node_property(noeud, BROUILLON, Value::from(true));
-            for (cle, valeur) in proprietes {
-                w.db.set_node_property(noeud, cle, valeur);
-            }
-            // A value in a blob column is only recovered by the full flush: it must be
-            // on disk BEFORE the marker says the project is complete.
-            w.rendre_durable_avant_le_marqueur()?;
-            w.db.remove_node_property(noeud, BROUILLON);
-            // What the readers will be served is what the base now says.
-            let entree = Entree::decoder(w.db, noeud)?;
-            // Durable BEFORE it is visible: a reader never sees a project that
-            // a restart could lose.
-            w.rendre_durable()?;
-            let mut etat = w.index_mut()?;
-            etat.projets.par_slug.insert(p.slug, p.id);
-            etat.projets.par_id.insert(p.id, entree);
-            Ok(())
-        })
+                // A value in a blob column is only recovered by the full flush: it
+                // must be on disk BEFORE the marker says the project is complete.
+                w.rendre_durable_avant_le_marqueur()?;
+                #[cfg(any(test, feature = "mock-store"))]
+                w.point(Interruption::AvantLeRetraitDuMarqueur)?;
+                // The commit point.
+                w.db.remove_node_property(noeud, BROUILLON);
+                #[cfg(any(test, feature = "mock-store"))]
+                w.point(Interruption::ApresLeRetraitDuMarqueur)?;
+                // What the readers will be served is what the base now says.
+                let entree = w.apres_ecriture(Entree::decoder(w.db, noeud))?;
+                // Durable BEFORE it is visible: a reader never sees a project that
+                // a restart could lose.
+                w.rendre_durable()?;
+                let mut etat = w.index_mut()?;
+                etat.projets.par_slug.insert(p.slug, p.id);
+                etat.projets.par_id.insert(p.id, entree);
+                Ok(())
+            },
+        )
         .await
     }
 
     // The reads below touch no disk and no engine: the decoded project is held in
-    // the index, written through by every write (this backend is the single
+    // the index, published by every write once durable (this backend is the single
     // writer of the base, and the index is rebuilt from it at open).
 
     async fn get_project(&self, id: Uuid) -> Result<Option<ProjectNode>> {
@@ -419,73 +450,70 @@ impl ProjectStore for ObrainGraphStore {
         root_path: Option<String>,
         profile: Option<ProjectProfile>,
     ) -> Result<()> {
-        // The filesystem is consulted before any lock.
-        let chemins = root_path.map(|racine| {
-            (
-                Value::from(canonical_root(Some(&racine))),
-                Value::from(declared_root_of(&racine)),
-                Value::from(racine),
-            )
-        });
-        self.ecrire(move |w: &mut Ecriture<'_>| {
-            let (noeud, ancien_en_blob) = {
-                let etat = w.index()?;
-                let Some(e) = etat.projets.par_id.get(&id) else {
-                    return Ok(());
+        self.ecrire(
+            // The filesystem is consulted on the blocking pool, before any lock.
+            move || root_path.map(trio_de_chemins),
+            move |chemins, w: &mut Ecriture<'_>| {
+                let (noeud, ancien_en_blob) = {
+                    let etat = w.index()?;
+                    let Some(e) = etat.projets.par_id.get(&id) else {
+                        return Ok(());
+                    };
+                    // Replacing a value that WAS in a blob column clears that slot,
+                    // which the WAL does not recover either: the old value counts too.
+                    let ancien = (name.is_some() && e.projet.name.len() > SEUIL_COLONNE_BLOB)
+                        || (description.is_some()
+                            && e.projet
+                                .description
+                                .as_ref()
+                                .is_some_and(|d| d.len() > SEUIL_COLONNE_BLOB))
+                        || (chemins.is_some()
+                            && [
+                                e.projet.root_path.as_str(),
+                                e.politique.declared_root.as_str(),
+                                e.politique.canonical_root.as_str(),
+                            ]
+                            .iter()
+                            .any(|c| c.len() > SEUIL_COLONNE_BLOB));
+                    (e.noeud, ancien)
                 };
-                // Replacing a value that WAS in a blob column clears that slot, which the
-                // WAL does not recover either: the old value counts too.
-                let ancien = (name.is_some() && e.projet.name.len() > SEUIL_COLONNE_BLOB)
-                    || (description.is_some()
-                        && e.projet
-                            .description
-                            .as_ref()
-                            .is_some_and(|d| d.len() > SEUIL_COLONNE_BLOB))
-                    || (chemins.is_some()
-                        && [
-                            e.projet.root_path.as_str(),
-                            e.politique.declared_root.as_str(),
-                            e.politique.canonical_root.as_str(),
-                        ]
+                w.flush_complet = ancien_en_blob
+                    || name.iter().any(|n| n.len() > SEUIL_COLONNE_BLOB)
+                    || description
                         .iter()
-                        .any(|c| c.len() > SEUIL_COLONNE_BLOB));
-                (e.noeud, ancien)
-            };
-            w.flush_complet = ancien_en_blob
-                || name.iter().any(|n| n.len() > SEUIL_COLONNE_BLOB)
-                || description
-                    .iter()
-                    .flatten()
-                    .any(|d| d.len() > SEUIL_COLONNE_BLOB)
-                || chemins.iter().any(|(c, d, r)| {
-                    va_en_colonne_blob(c) || va_en_colonne_blob(d) || va_en_colonne_blob(r)
-                });
-            // In-memory work under the write lock, so a reader never sees half an
-            // update; the fsync comes after, outside it.
-            let mut etat = w.index_mut()?;
-            if let Some(name) = name {
-                w.db.set_node_property(noeud, "name", Value::from(name));
-            }
-            if let Some(description) = description {
-                w.db.set_node_property(
-                    noeud,
-                    "description",
-                    Value::from(description.unwrap_or_default()),
-                );
-            }
-            if let Some(profile) = profile {
-                w.db.set_node_property(noeud, "profile", Value::from(profile.as_str()));
-            }
-            if let Some((canonique, declare, racine)) = chemins {
-                // The declared root changed: so do its canonical and normalized
-                // forms. `root_path` goes LAST: it is what an interrupted update is
-                // recomputed from at open.
-                w.db.set_node_property(noeud, "canonical_path", canonique);
-                w.db.set_node_property(noeud, "declared_path", declare);
-                w.db.set_node_property(noeud, "root_path", racine);
-            }
-            etat.projets.rafraichir(w.db, id)
-        })
+                        .flatten()
+                        .any(|d| d.len() > SEUIL_COLONNE_BLOB)
+                    || chemins.iter().flatten().any(|(_, v)| va_en_colonne_blob(v));
+                // The engine writes: readers keep being served the previous value
+                // from the index until this write is durable.
+                if let Some(name) = name {
+                    w.db.set_node_property(noeud, "name", Value::from(name));
+                }
+                if let Some(description) = description {
+                    w.db.set_node_property(
+                        noeud,
+                        "description",
+                        Value::from(description.unwrap_or_default()),
+                    );
+                }
+                if let Some(profile) = profile {
+                    w.db.set_node_property(noeud, "profile", Value::from(profile.as_str()));
+                }
+                if let Some(trio) = chemins {
+                    // `declared_path`, `canonical_path`, then `root_path` LAST: the
+                    // commit point an interrupted update is recomputed from at open.
+                    for (n, (cle, valeur)) in trio.into_iter().enumerate() {
+                        w.db.set_node_property(noeud, cle, valeur);
+                        #[cfg(any(test, feature = "mock-store"))]
+                        w.point(Interruption::ApresLeChemin(n + 1))?;
+                    }
+                }
+                let entree = w.apres_ecriture(Entree::decoder(w.db, noeud))?;
+                w.rendre_durable()?;
+                w.index_mut()?.projets.par_id.insert(id, entree);
+                Ok(())
+            },
+        )
         .await
     }
 
@@ -498,40 +526,46 @@ impl ProjectStore for ObrainGraphStore {
     }
 
     async fn delete_project(&self, id: Uuid, _project_name: &str) -> Result<()> {
-        self.ecrire(move |w: &mut Ecriture<'_>| {
-            let (noeud, slug, projets) = {
-                let etat = w.index()?;
-                let Some(e) = etat.projets.par_id.get(&id) else {
-                    return Ok(());
+        self.ecrire(
+            || (),
+            move |(), w: &mut Ecriture<'_>| {
+                let (noeud, slug, projets) = {
+                    let etat = w.index()?;
+                    let Some(e) = etat.projets.par_id.get(&id) else {
+                        return Ok(());
+                    };
+                    (e.noeud, e.projet.slug.clone(), etat.projets.par_id.len())
                 };
-                (e.noeud, e.projet.slug.clone(), etat.projets.par_id.len())
-            };
-            // One counter, no scan: every live node of the base against the projects
-            // this backend addresses. `project_name` only tags the notes and
-            // decisions the cascade archives: part of what is refused.
-            let noeuds = w.db.store().node_count();
-            if noeuds != projets {
-                return Err(
-                    anyhow::Error::new(NonPorte("ProjectStore::delete_project (cascade)")).context(
-                        format!(
-                    "la base contient {} nœud(s) hors des {projets} projet(s) que ce backend \
-                     adresse : des données écrites hors de lui (plans, tâches, notes, fichiers, \
-                     graphes de fonctionnalités, commits…) que la suppression en cascade devrait \
-                     atteindre, par relation ou par `project_id`. Elle attend le portage des \
-                     domaines concernés",
-                    noeuds.saturating_sub(projets)
-                ),
-                    ),
-                );
-            }
-            let mut etat = w.index_mut()?;
-            if !w.db.delete_node(noeud) {
-                bail!("obrain a refusé la suppression du nœud {noeud:?} (projet {id})");
-            }
-            etat.projets.par_id.remove(&id);
-            etat.projets.par_slug.remove(&slug);
-            Ok(())
-        })
+                // One counter, no scan: every live node of the base against the
+                // projects this backend addresses. `project_name` only tags the notes
+                // and decisions the cascade archives: part of what is refused.
+                let noeuds = w.db.store().node_count();
+                if noeuds != projets {
+                    return Err(anyhow::Error::new(NonPorte(
+                        "ProjectStore::delete_project (cascade)",
+                    ))
+                    .context(format!(
+                        "la base contient {} nœud(s) hors des {projets} projet(s) que ce \
+                         backend adresse : des données écrites hors de lui (plans, tâches, \
+                         notes, fichiers, graphes de fonctionnalités, commits…) que la \
+                         suppression en cascade devrait atteindre, par relation ou par \
+                         `project_id`. Elle attend le portage des domaines concernés",
+                        noeuds.saturating_sub(projets)
+                    )));
+                }
+                if !w.db.delete_node(noeud) {
+                    bail!("obrain a refusé la suppression du nœud {noeud:?} (projet {id})");
+                }
+                #[cfg(any(test, feature = "mock-store"))]
+                w.point(Interruption::ApresLaSuppression)?;
+                // Gone for the readers once the deletion is durable, not before.
+                w.rendre_durable()?;
+                let mut etat = w.index_mut()?;
+                etat.projets.par_id.remove(&id);
+                etat.projets.par_slug.remove(&slug);
+                Ok(())
+            },
+        )
         .await
     }
 }
@@ -539,14 +573,19 @@ impl ProjectStore for ObrainGraphStore {
 impl ObrainGraphStore {
     /// Set `cle` to now on the project, if it exists.
     async fn horodater(&self, id: Uuid, cle: &'static str) -> Result<()> {
-        self.ecrire(move |w: &mut Ecriture<'_>| {
-            let Some(noeud) = w.index()?.projets.par_id.get(&id).map(|e| e.noeud) else {
-                return Ok(());
-            };
-            let mut etat = w.index_mut()?;
-            w.db.set_node_property(noeud, cle, Value::from(Utc::now().to_rfc3339()));
-            etat.projets.rafraichir(w.db, id)
-        })
+        self.ecrire(
+            || (),
+            move |(), w: &mut Ecriture<'_>| {
+                let Some(noeud) = w.index()?.projets.par_id.get(&id).map(|e| e.noeud) else {
+                    return Ok(());
+                };
+                w.db.set_node_property(noeud, cle, Value::from(Utc::now().to_rfc3339()));
+                let entree = w.apres_ecriture(Entree::decoder(w.db, noeud))?;
+                w.rendre_durable()?;
+                w.index_mut()?.projets.par_id.insert(id, entree);
+                Ok(())
+            },
+        )
         .await
     }
 }

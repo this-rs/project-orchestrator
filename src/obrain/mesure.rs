@@ -3,14 +3,46 @@
 //! and nowhere else, so `examples/obrain_mesures.rs` and the tests go through
 //! these hooks rather than naming `obrain_engine`.
 //!
-//! Nothing here is part of the backend's contract (`doc(hidden)` throughout).
+//! Nothing here is part of the backend's contract, and none of it exists in a
+//! production build: the whole module is compiled for test builds only
+//! (`cfg(test)` or the `mock-store` feature, which the dev-dependency of the
+//! crate on itself turns on for every test and example target and no binary).
 
 use anyhow::{anyhow, Result};
 use obrain_common::types::Value;
 
 use super::ObrainGraphStore;
 
-/// What makes a write durable, once per write.
+/// Where a write can be interrupted, for the tests of the write ORDER: the
+/// write stops right there with an error, as a crash would, and the test then
+/// closes and reopens the base to see what opening makes of that exact state.
+/// Armed once with [`ObrainGraphStore::interrompre_au_prochain`], consumed by the
+/// first write that reaches the point.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interruption {
+    /// `create_project`: the node exists, nothing on it.
+    ApresLeNoeud,
+    /// `create_project`: the draft marker is set, no property yet.
+    ApresLeMarqueur,
+    /// `create_project`: after the n-th of the eleven properties (1-based).
+    ApresLaPropriete(usize),
+    /// `create_project`: every property written (and a blob-carrying one flushed),
+    /// the marker still there.
+    AvantLeRetraitDuMarqueur,
+    /// `create_project`: the marker removed (the commit point), before the fsync
+    /// that acknowledges.
+    ApresLeRetraitDuMarqueur,
+    /// `update_project` with a root: after the n-th of `declared_path`,
+    /// `canonical_path`, `root_path` (1-based).
+    ApresLeChemin(usize),
+    /// `delete_project`: the node deleted, before the fsync.
+    ApresLaSuppression,
+}
+
+/// What makes a write durable, once per write. Only `Wal` exists in production
+/// (see `ObrainGraphStore::open`); the variants here are the measures' and the
+/// tests'.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durabilite {
@@ -31,6 +63,34 @@ pub enum Durabilite {
 }
 
 impl ObrainGraphStore {
+    /// [`ObrainGraphStore::open`] with an explicit durability step.
+    #[doc(hidden)]
+    pub fn open_avec(
+        chemin: impl AsRef<std::path::Path>,
+        creation: super::Creation,
+        durabilite: Durabilite,
+    ) -> Result<Self> {
+        let chemin = chemin.as_ref().to_path_buf();
+        let creer = Self::garde_fou_d_ouverture(&chemin, creation)?;
+        Self::ouvrir(chemin, durabilite, creer, None)
+    }
+
+    /// A throwaway base with an explicit durability step.
+    #[doc(hidden)]
+    pub fn open_temporary_avec(durabilite: Durabilite) -> Result<Self> {
+        let dir = tempfile::Builder::new()
+            .prefix("po-obrain-")
+            .tempdir()
+            .map_err(|e| anyhow!("création du répertoire temporaire de la base obrain : {e}"))?;
+        Self::ouvrir(dir.path().to_path_buf(), durabilite, true, Some(dir))
+    }
+
+    /// Arm an [`Interruption`]: the next write that reaches that point stops there.
+    #[doc(hidden)]
+    pub fn interrompre_au_prochain(&self, point: Interruption) {
+        *self.interne.interruption.lock().unwrap() = Some(point);
+    }
+
     /// Fill the base with `noeuds` `Filler` nodes (two properties each) and
     /// `aretes` `FILLS` edges between them, the way a migrated base looks to the
     /// engine, then flush. Returns the time it took.
