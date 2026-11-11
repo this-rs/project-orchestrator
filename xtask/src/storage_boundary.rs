@@ -532,6 +532,12 @@ fn collect_rs_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
             if SKIPPED_DIRS.contains(&name.as_str()) || name.starts_with("target-") {
                 continue;
             }
+            // `vendor/` at the root holds the third-party drivers themselves
+            // (vendor/neo4rs, see its PATCH.md): the driver's own code is not a use
+            // of the driver. Only the root one: a `vendor` inside the product is scanned.
+            if path.parent() == Some(root) && name == "vendor" {
+                continue;
+            }
             collect_rs_files(root, &path, out);
         } else if name.ends_with(".rs") {
             let rel = path.strip_prefix(root).unwrap_or(&path);
@@ -656,6 +662,31 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `vendor/` holds the third-party drivers themselves (`vendor/neo4rs`): their
+    /// own `use neo4rs` is not a leak of the driver into the product, and counting
+    /// it made the gate red on the first vendored copy. Only the TOP-LEVEL
+    /// `vendor/` is skipped: a `vendor` directory inside the product is still scanned.
+    #[test]
+    fn collect_rs_files_skips_the_top_level_vendor_directory_only() {
+        let dir = std::env::temp_dir().join(format!("xtask-sb-vendor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for f in [
+            "src/a.rs",
+            "src/vendor/b.rs",
+            "vendor/neo4rs/src/node.rs",
+            "vendor/neo4rs/src/types/path.rs",
+        ] {
+            let p = dir.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "use neo4rs::Node;\n").unwrap();
+        }
+        let mut out = Vec::new();
+        collect_rs_files(&dir, &dir, &mut out);
+        out.sort();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(out, ["src/a.rs", "src/vendor/b.rs"]);
+    }
 
     #[test]
     fn is_adapter_file_recognizes_only_the_three_modules() {
