@@ -775,6 +775,20 @@ pub trait ProviderSource: Send + Sync {
     }
 }
 
+/// A permission request still waiting: the call it asks for, and the turn that asked it.
+#[derive(Clone)]
+struct AskedRequest {
+    /// What a `session` grant is derived from.
+    call: super::session_grants::AskedCall,
+    /// The generation of the turn running when it was asked (`None`: asked out of any turn,
+    /// on the out-of-band stream). A request asked by a turn dies with it: whatever ends the
+    /// turn — its end, a Stop, an abandon, the next turn — forgets it
+    /// ([`AgentSessionHandle::forget_turn_asks`]), since the provider no longer waits on it
+    /// (the native harness drops its pending ask when the turn's signal is cancelled, and
+    /// says nothing about it).
+    turn: Option<u64>,
+}
+
 /// How many answered request ids a session keeps ([`AgentSessionHandle::answers_itself`]).
 const ANSWERED_KEPT: usize = 1024;
 
@@ -881,9 +895,10 @@ pub struct AgentSessionHandle {
     /// answers itself the later requests of THIS session they cover ([`Self::emit`]);
     /// never handed to the provider.
     session_grants: std::sync::Mutex<super::session_grants::SessionGrants>,
-    /// The call each permission request still waiting asks for (request id -> call):
-    /// what a `session` grant is derived from.
-    asked_calls: std::sync::Mutex<HashMap<String, super::session_grants::AskedCall>>,
+    /// The call each permission request still waiting asks for (request id -> call), and
+    /// the turn that asked it: what a `session` grant is derived from, and what the idle
+    /// cleanup reads to know a person is waited on ([`Self::waiting_on_a_person`]).
+    asked_calls: std::sync::Mutex<HashMap<String, AskedRequest>>,
     /// The permission requests a grant of this session or a lasting rule of its person
     /// covers: decided in [`Self::emit_one`] BEFORE the request is broadcast, so whoever
     /// sees the request can know at once that the backend answers it itself (a sub-agent's
@@ -1212,10 +1227,15 @@ impl AgentSessionHandle {
                     .unwrap_or_else(|p| p.into_inner())
                     .insert(id.clone());
             }
+            // The turn it belongs to: one asked while a turn runs dies with that turn.
+            let turn = self
+                .is_streaming
+                .load(Ordering::SeqCst)
+                .then(|| self.turn_generation());
             self.asked_calls
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .insert(id.clone(), call);
+                .insert(id.clone(), AskedRequest { call, turn });
         }
         match &event {
             ChatEvent::StreamDelta { text, .. } => self.streaming_text.lock().await.push_str(text),
@@ -1529,6 +1549,13 @@ impl AgentSessionHandle {
             .elapsed()
     }
 
+    /// Tests: another turn is now the session's (its generation moves on), and nothing else:
+    /// what an earlier turn left is not forgotten here.
+    #[cfg(test)]
+    pub(crate) fn advance_turn_for_tests(&self) {
+        self.turn_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Tests: the session last did something `ago` before now.
     #[cfg(test)]
     pub(crate) fn backdate_activity(&self, ago: Duration) {
@@ -1824,6 +1851,8 @@ impl AgentSessionHandle {
     /// end-of-turn steps) only means it waits for those steps, never that it is lost.
     async fn interrupt_for_the_queue(&self) {
         self.interrupted.store(true, Ordering::SeqCst);
+        // Stopped, the turn's requests are waited on no more (as for a Stop).
+        self.forget_turn_asks();
         match self.session.interrupt(InterruptScope::TurnAndTools).await {
             Ok(outcome) if outcome.turn_interrupted => {
                 tracing::info!(
@@ -1914,6 +1943,8 @@ impl AgentSessionHandle {
         // A new turn: a watchdog armed for the previous one (its Stop, its tail) stands
         // down instead of ending this one — it compares this generation.
         self.turn_generation.fetch_add(1, Ordering::SeqCst);
+        // What the previous turn asked died with it.
+        self.forget_turn_asks();
         // Every turn gets a watchdog HERE, at the one place a turn begins — never at an exit,
         // so no exit of the loop of `play` can be left unwatched.
         self.arm_turn_watchdog(self.turn_generation());
@@ -2044,6 +2075,8 @@ impl AgentSessionHandle {
                     .as_ref()
                     .map(|turns| turns.guard(&self.provider_id));
                 let (mut outcome, pending_tools) = self.play(stream, input).await;
+                // The turn is over: nothing it asked is waited on any more.
+                self.forget_turn_asks();
                 if let Some(guard) = guard {
                     guard.settle(if self.interrupted.load(Ordering::SeqCst) {
                         super::turn_admission::Ending::Interrupted
@@ -2186,14 +2219,44 @@ impl AgentSessionHandle {
     /// a permission the provider asked and nobody answered, or a question the turn left open
     /// as its last word. A watchdog that ended these would cut a session precisely while it
     /// waits for the human it was built to hand back to.
+    ///
+    /// Only a turn that is really running waits: a request whose turn is over (ended,
+    /// stopped, abandoned) waits on nothing — its provider dropped it — so a session is never
+    /// held for a request left behind ([`Self::forget_turn_asks`]).
     pub async fn waiting_on_a_person(&self) -> bool {
-        if !self.waiting_permission_ids().is_empty() {
+        // A stopped turn waits on nobody: it is ending.
+        if !self.is_streaming.load(Ordering::SeqCst) || self.interrupted.load(Ordering::SeqCst) {
+            return false;
+        }
+        let turn = self.turn_generation();
+        let asked_by_this_turn = self
+            .asked_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .any(|asked| asked.turn == Some(turn));
+        if asked_by_this_turn {
             return true;
         }
         matches!(
             self.streaming_events.lock().await.last(),
-            Some(ChatEvent::AskUserQuestion { .. } | ChatEvent::PermissionRequest { .. })
+            Some(ChatEvent::AskUserQuestion { .. })
         )
+    }
+
+    /// Forgets the permission requests a turn asked: the turn is over (or another begins),
+    /// and its provider no longer waits on them — the native harness drops its pending ask
+    /// when the turn's signal is cancelled, without a word. Kept, they held the session
+    /// "waiting on a person" for good after a Stop clicked during a permission. A request
+    /// asked out of any turn (`turn: None`) is left: nothing here ended it.
+    ///
+    /// A request whose automatic answer failed (`emit`) stays until then: the user is asked,
+    /// it is a real wait, and the end of its turn bounds it like any other.
+    fn forget_turn_asks(&self) {
+        self.asked_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|_, asked| asked.turn.is_none());
     }
 
     /// The watchdog of a TURN, armed by [`Self::open_turn`] — at the one place every turn
@@ -2273,6 +2336,8 @@ impl AgentSessionHandle {
             return false;
         }
         self.is_streaming.store(false, Ordering::SeqCst);
+        // The abandoned turn's requests go with it.
+        self.forget_turn_asks();
         if let Some(task) = self
             .turn_task
             .lock()
@@ -2331,6 +2396,7 @@ impl AgentSessionHandle {
             self.emit(ChatEvent::PendingQueue { messages }).await;
         }
         if next.is_none() {
+            self.forget_turn_asks();
             self.streaming_text.lock().await.clear();
             self.streaming_events.lock().await.clear();
             self.emit(ChatEvent::StreamingStatus {
@@ -2966,7 +3032,7 @@ impl AgentSessionHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(request_id)
-            .cloned();
+            .map(|asked| asked.call.clone());
         // Is this ask about a DESTINATION (N23b)? The gate of the session
         // (`nexus_tools::ToolAccessHooks`) raised a `HookVerdict::RequireConsent` about what
         // this call would reach, and names the subject with the very function read here: the
@@ -3230,6 +3296,10 @@ impl AgentSessionHandle {
         scope: InterruptScope,
     ) -> Result<nexus_claude::agent::InterruptOutcome> {
         self.interrupted.store(true, Ordering::SeqCst);
+        // A Stop ends the turn's requests with it: the native harness drops its pending ask
+        // when the turn's signal is cancelled and says nothing, so the session would
+        // otherwise go on "waiting on a person" for a question nobody can answer.
+        self.forget_turn_asks();
         self.session
             .interrupt(scope)
             .await
