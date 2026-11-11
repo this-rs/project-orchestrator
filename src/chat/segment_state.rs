@@ -359,8 +359,20 @@ impl Tail {
             event: event.event_type(),
             signal,
         });
+        self.trim();
+    }
+
+    /// Keeps the tail at [`TAIL_CAP`], evicting the oldest entries — but never the most
+    /// recent [`Signal::Input`]: it is the proof a turn opened, and a turn longer than the
+    /// cap would otherwise lose it (and `classify` would answer `NoProvenEnd` for want of
+    /// it). When that Input is the front entry, the entry just after it is dropped instead.
+    fn trim(&mut self) {
         while self.events.len() > TAIL_CAP {
-            self.events.pop_front();
+            if self.events.iter().rposition(|e| e.signal == Signal::Input) == Some(0) {
+                let _ = self.events.remove(1);
+            } else {
+                self.events.pop_front();
+            }
         }
     }
 
@@ -376,9 +388,7 @@ impl Tail {
             }
         }
         seeded.events.extend(self.events.drain(..));
-        while seeded.events.len() > TAIL_CAP {
-            seeded.events.pop_front();
-        }
+        seeded.trim();
         self.events = seeded.events;
     }
 
@@ -1008,6 +1018,67 @@ mod tests {
             );
         }
         assert_eq!(tail.events().len(), TAIL_CAP);
+    }
+
+    /// The cap is tested above (it bounds the queue); this tests its CONSEQUENCE.
+    /// A turn longer than the cap evicts the `Input` that opened it — the proof a
+    /// turn began — and `classify` then answers `Reporting/NoProvenEnd` for want of
+    /// it, so a long delegated child is never released as `Done` (only the 30-min
+    /// expiration frees it). The opening `Input` must survive the cap.
+    #[test]
+    fn a_turn_longer_than_the_cap_still_releases_as_done() {
+        let mut tail = Tail::starting_at(T0);
+        tail.record(
+            &ChatEvent::UserMessage {
+                content: "go".into(),
+            },
+            T0,
+        );
+        // 66 tool calls: each is a ToolStart + a ToolEnd, 132 entries — past TAIL_CAP.
+        for i in 0..66 {
+            let id = format!("call_{i}");
+            tail.record(
+                &ChatEvent::ToolUse {
+                    id: id.clone(),
+                    tool: "Bash".into(),
+                    input: serde_json::Value::Null,
+                    parent_tool_use_id: None,
+                    category: None,
+                    canonical: None,
+                },
+                T0 + 1 + i,
+            );
+            tail.record(
+                &ChatEvent::ToolResult {
+                    id,
+                    result: serde_json::Value::Null,
+                    is_error: false,
+                    parent_tool_use_id: None,
+                },
+                T0 + 2 + i,
+            );
+        }
+        tail.record(
+            &ChatEvent::Result {
+                session_id: "s".into(),
+                duration_ms: 0,
+                cost_usd: None,
+                subtype: "success".into(),
+                is_error: false,
+                num_turns: None,
+                result_text: None,
+                cost: None,
+                usage: None,
+                model: None,
+                stop_reason: None,
+                error_code: None,
+                error_message: None,
+            },
+            T0 + 200,
+        );
+
+        let got = tail.classify(&spawned(), T0 + 200 + SETTLE_MS);
+        assert_eq!(got.state, SessionState::Done, "{got:?}");
     }
 
     #[test]
