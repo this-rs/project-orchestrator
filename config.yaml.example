@@ -221,6 +221,7 @@ chat:
   default_model: "claude-opus-4-7"    # CHAT_DEFAULT_MODEL env override (Claude Code only)
   max_sessions: 10                     # CHAT_MAX_SESSIONS env override
   session_timeout_secs: 1800           # CHAT_SESSION_TIMEOUT_SECS env override
+  person_wait_cap_secs: 86400          # CHAT_PERSON_WAIT_CAP_SECS env override (env > yaml): how long a session may wait on a person (a permission) before the idle cleanup closes it anyway; never below 8 x session_timeout, at most 7 days
   max_turns: 50                        # CHAT_MAX_TURNS env override
   prompt_builder_model: "claude-opus-4-7"  # PROMPT_BUILDER_MODEL env override
   # Obscura (dsh-obscura-nav), the keyless search engine "obscura" of native sessions
