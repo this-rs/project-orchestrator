@@ -1074,6 +1074,7 @@ mod tests {
             reset_known: true,
             window: Some("seven_day".into()),
             cause: crate::chat::provider::quota::ExhaustionCause::Window,
+            observed_at_ms: None,
         };
         let refusal = refusal_of_quota("deepseek", &held);
         assert_eq!(refusal.kind, RefusalKind::Quota);
