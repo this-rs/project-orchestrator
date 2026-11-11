@@ -369,6 +369,12 @@ pub struct LiveSessionSnapshot {
 #[cfg(test)]
 pub(crate) type ReleaseHook = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// A test seam of the idle cleanup (see `ChatManager::idle_close_hook`).
+#[cfg(test)]
+pub(crate) type IdleCloseHook = Arc<
+    dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+
 /// A peer's message that resumes a released session (`inject_team_message`).
 pub(crate) struct TeamInbound {
     pub from_session_id: Uuid,
@@ -1246,6 +1252,10 @@ pub struct ChatManager {
     /// recheck, so a test can make a session busy at exactly that point.
     #[cfg(test)]
     pub(crate) release_hook: std::sync::Mutex<Option<ReleaseHook>>,
+    /// Test seam: runs in the idle cleanup between a session's first verdict and the one
+    /// read just before it is closed, so a test can make it wait or work at exactly that point.
+    #[cfg(test)]
+    pub(crate) idle_close_hook: std::sync::Mutex<Option<IdleCloseHook>>,
     /// RL5: the ONE door a provider call goes through — RL2's counters and RL4's
     /// breakers behind a single gate. Shared by every session: the boot injects the
     /// process-wide instance with [`ChatManager::with_provider_limits`]. The default
@@ -3994,6 +4004,8 @@ impl ChatManager {
             released_done: Default::default(),
             #[cfg(test)]
             release_hook: Default::default(),
+            #[cfg(test)]
+            idle_close_hook: Default::default(),
             codex: Default::default(),
             provider_limits: Arc::new(super::provider::limits::Gate::unlimited()),
         }
@@ -4115,6 +4127,8 @@ impl ChatManager {
             released_done: Default::default(),
             #[cfg(test)]
             release_hook: Default::default(),
+            #[cfg(test)]
+            idle_close_hook: Default::default(),
             codex: Default::default(),
             provider_limits: Arc::new(super::provider::limits::Gate::unlimited()),
         }
@@ -9939,6 +9953,11 @@ impl ChatManager {
             }
         };
 
+        // A request the CLI asked belongs to the turn that asked it: whatever a previous turn
+        // left (a Stop during a `can_use_tool`, a turn abandoned) is waited on by nobody, and
+        // would hold this session "waiting on a person" for the idle cleanup.
+        pending_perm_inputs.lock().await.clear();
+
         // Extract hook callbacks registry BEFORE taking the long-lived client lock.
         // This Arc<RwLock<>> allows dispatching hook_callbacks inside the select! loop
         // without needing to re-lock the client (which is held by the stream).
@@ -10247,7 +10266,7 @@ impl ChatManager {
                                                 // A regular permission is pending BEFORE anyone sees it.
                                                 if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
                                                     if !id.is_empty() {
-                                                        store_pending_perm_input(&pending_perm_inputs, id, input, tool).await;
+                                                        store_pending_perm_input(&pending_perm_inputs, id, input, tool, &active_sessions, &session_id).await;
                                                     }
                                                 }
                                                 announce_control_event(&evt);
@@ -10315,7 +10334,7 @@ impl ChatManager {
                                                     // Pending before anyone sees it (same as above).
                                                     if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
                                                         if !id.is_empty() {
-                                                            store_pending_perm_input(&pending_perm_inputs, id, input, tool).await;
+                                                            store_pending_perm_input(&pending_perm_inputs, id, input, tool, &active_sessions, &session_id).await;
                                                         }
                                                     }
                                                     announce_control_event(&evt);
@@ -11119,6 +11138,8 @@ impl ChatManager {
         if let Some(tap) = &mirror_tap {
             tap.turn_ended();
         }
+        // The turn is over: the CLI waits on none of its requests any more.
+        pending_perm_inputs.lock().await.clear();
         // 5. Streaming status update (a lock, nothing remote: never bounded)
         let has_pending = post_handler.finalize_streaming_status().await;
 
@@ -14864,7 +14885,7 @@ impl ChatManager {
             }
         }
 
-        let (task, events_tx, streaming_text, streaming_events) = {
+        let (task, events_tx, streaming_text, streaming_events, permissions) = {
             let sessions = active_sessions.read().await;
             let Some(session) = sessions.get(&session_id) else {
                 return false;
@@ -14884,6 +14905,7 @@ impl ChatManager {
                 session.events_tx.clone(),
                 session.streaming_text.clone(),
                 session.streaming_events.clone(),
+                session.pending_permission_inputs.clone(),
             )
         };
         let task_aborted = task.map(|handle| handle.abort()).is_some();
@@ -14895,6 +14917,8 @@ impl ChatManager {
         );
 
         is_streaming.store(false, Ordering::SeqCst);
+        // The abandoned turn's requests go with it.
+        permissions.lock().await.clear();
         streaming_text.lock().await.clear();
         streaming_events.lock().await.clear();
         for event in [
@@ -20055,68 +20079,207 @@ impl ChatManager {
             let mut ticker = tokio::time::interval(interval);
             loop {
                 ticker.tick().await;
-
-                // Candidates by idle time first, under the read lock; the
-                // busy checks below take other (async) locks, so they run
-                // after it is released.
-                let candidates: Vec<_> = {
-                    let sessions = manager.active_sessions.read().await;
-                    sessions
-                        .iter()
-                        .filter(|(_, s)| s.last_activity.elapsed() > timeout)
-                        .map(|(id, s)| {
-                            (
-                                id.clone(),
-                                s.last_activity.elapsed(),
-                                s.is_streaming.clone(),
-                                s.active_background_tasks.clone(),
-                                s.cli_background_tasks.clone(),
-                            )
-                        })
-                        .collect()
-                };
-
-                let mut expired = Vec::new();
-                for (id, idle, streaming, background, cli_background) in candidates {
-                    let is_streaming = streaming.load(Ordering::Relaxed);
-                    // Whichever knows of more work wins: this server's own
-                    // tracking, or what the CLI reports about itself.
-                    let background_tasks = background
-                        .lock()
-                        .await
-                        .len()
-                        .max(cli_background.load(Ordering::Relaxed));
-                    // D2 FIX: Legacy sessions (Claude Code) use the interrupt system rather than
-                    // waiting_on_a_person(), so we pass false here. Agent sessions check this separately.
-                    let waiting_on_input = false;
-                    if session_is_expired(
-                        idle,
-                        timeout,
-                        is_streaming,
-                        background_tasks,
-                        waiting_on_input,
-                    ) {
-                        expired.push(id);
-                    } else {
-                        debug!(
-                            session_id = %id,
-                            idle_secs = idle.as_secs(),
-                            is_streaming,
-                            background_tasks,
-                            "Idle session kept alive: work still in progress"
-                        );
-                    }
-                }
-                expired.extend(manager.expired_agent_sessions(timeout).await);
-
-                for id in expired {
-                    info!("Cleaning up timed-out session {}", id);
-                    if let Err(e) = manager.close_session(&id).await {
-                        warn!("Failed to close timed-out session {}: {}", id, e);
-                    }
-                }
+                manager.idle_cleanup_pass(timeout).await;
             }
         });
+    }
+
+    /// One pass of the idle cleanup ([`Self::start_cleanup_task`]), on both engines: the
+    /// sessions [`idle_verdict`] says are expired are closed, each one judged a second time
+    /// on its fresh state just before it is closed ([`Self::close_if_still_expired`]), so a
+    /// session whose wait or work began in between is kept. Returns the sessions closed.
+    pub(crate) async fn idle_cleanup_pass(&self, timeout: Duration) -> Vec<String> {
+        let mut closed = Vec::new();
+        for (id, _) in self.expired_sessions(timeout).await {
+            if self.close_if_still_expired(&id, timeout).await {
+                closed.push(id);
+            }
+        }
+        closed
+    }
+
+    /// The live sessions of both engines [`idle_verdict`] closes when the ordinary idle
+    /// delay is `patience` (the session timeout for the cleanup, a short grace for
+    /// [`Self::reclaim_idle_slot`]), with how long each has been idle. A session kept
+    /// though idle past `patience` says why, in the debug log.
+    async fn expired_sessions(&self, patience: Duration) -> Vec<(String, Duration)> {
+        let mut ids: Vec<String> = self.active_sessions.read().await.keys().cloned().collect();
+        ids.extend(
+            self.agent_runtime
+                .handles()
+                .await
+                .into_iter()
+                .map(|h| h.session_id.clone()),
+        );
+        let mut expired = Vec::new();
+        for id in ids {
+            let Some(facts) = self.idle_facts(&id, patience).await else {
+                continue;
+            };
+            match self.idle_limits(patience).verdict(facts) {
+                IdleVerdict::Expired => expired.push((id, facts.idle)),
+                IdleVerdict::Recent => {}
+                kept => tracing::trace!(
+                    session_id = %id,
+                    idle_secs = facts.idle.as_secs(),
+                    is_streaming = facts.is_streaming,
+                    background_tasks = facts.background_tasks,
+                    waiting_on_a_person = facts.waiting_on_a_person,
+                    "{}",
+                    kept.why_kept()
+                ),
+            }
+        }
+        expired
+    }
+
+    /// The limits [`idle_verdict`] applies when the ordinary idle delay is `patience`.
+    fn idle_limits(&self, patience: Duration) -> IdleLimits {
+        IdleLimits {
+            patience,
+            timeout: self.config.session_timeout,
+            person_wait_cap: self.config.person_wait_cap,
+        }
+    }
+
+    /// What [`idle_verdict`] reads of `session_id`, on whichever engine holds it, read now.
+    /// `None`: the session is not live here.
+    async fn idle_facts(&self, session_id: &str, patience: Duration) -> Option<IdleFacts> {
+        let mut facts = if let Some(handle) = self.agent_runtime.get(session_id).await {
+            IdleFacts {
+                idle: handle.idle_for(),
+                is_streaming: handle.is_streaming.load(Ordering::SeqCst),
+                background_tasks: handle.active_background_tasks().await.len(),
+                waiting_on_a_person: handle.waiting_on_a_person().await,
+                a_person_can_answer: false,
+            }
+        } else {
+            let (idle, streaming, background, cli_background, permissions) = {
+                let sessions = self.active_sessions.read().await;
+                let s = sessions.get(session_id)?;
+                (
+                    s.last_activity.elapsed(),
+                    s.is_streaming.clone(),
+                    s.active_background_tasks.clone(),
+                    s.cli_background_tasks.clone(),
+                    s.pending_permission_inputs.clone(),
+                )
+            };
+            let is_streaming = streaming.load(Ordering::SeqCst);
+            let tracked = background.lock().await.len();
+            let waiting = !permissions.lock().await.is_empty();
+            IdleFacts {
+                idle,
+                is_streaming,
+                // Whichever knows of more work wins: this server's own tracking, or what
+                // the CLI reports about itself.
+                background_tasks: tracked.max(cli_background.load(Ordering::SeqCst)),
+                // A `can_use_tool` the CLI waits on. The table is emptied when a turn begins,
+                // ends or is abandoned (`stream_response`, `abandon_turn_if_stuck`), so an entry
+                // is a request the CLI really waits on — in its turn, or out of any turn of
+                // this server (the CLI woke up on its own): both count, until the answer.
+                waiting_on_a_person: waiting,
+                a_person_can_answer: false,
+            }
+        };
+        // Read only when it matters: one graph read, for the few sessions that wait past
+        // the ordinary delay.
+        if facts.waiting_on_a_person && facts.idle > patience {
+            facts.a_person_can_answer = self.a_person_can_answer(session_id).await;
+        }
+        Some(facts)
+    }
+
+    /// Whether a PERSON can answer what `session_id` asks: every session but the two whose
+    /// request nobody answers by a proven mechanism ([`nobody_answers_spawned`]). A record
+    /// that cannot be read counts as a person's: the person wait cap still bounds it.
+    async fn a_person_can_answer(&self, session_id: &str) -> bool {
+        let Ok(uuid) = Uuid::parse_str(session_id) else {
+            return true;
+        };
+        match self.graph.get_chat_session(uuid).await {
+            Ok(Some(node)) => !nobody_answers_spawned(node.spawned_by.as_deref()),
+            _ => true,
+        }
+    }
+
+    /// Closes `session_id` if [`idle_verdict`] still says it is expired on its state read
+    /// NOW, the step before the close: a permission asked, a message received or a task
+    /// started since the first verdict refreshes the session (its activity, its wait) and
+    /// keeps it. Returns whether it was closed.
+    async fn close_if_still_expired(&self, session_id: &str, patience: Duration) -> bool {
+        #[cfg(test)]
+        {
+            let hook = self
+                .idle_close_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(hook) = hook {
+                hook(session_id).await;
+            }
+        }
+        let Some(facts) = self.idle_facts(session_id, patience).await else {
+            return false;
+        };
+        let verdict = self.idle_limits(patience).verdict(facts);
+        if verdict != IdleVerdict::Expired {
+            info!(
+                session_id = %session_id,
+                "Idle session not closed: its state changed before the close ({})",
+                verdict.why_kept()
+            );
+            return false;
+        }
+        if facts.waiting_on_a_person {
+            // Its person never answered: the requests are REFUSED on the thread BEFORE the
+            // close — through the path a user's answer takes (`deny_waiting_permissions`), so
+            // each gets its `permission_decision` and the provider is told — and the thread
+            // says why the session closed. Closed with the requests still asked, a late answer
+            // would only meet "session not found", with nothing on the thread to explain it.
+            let hours = facts.idle.as_secs() / 3600;
+            info!(
+                session_id = %session_id,
+                idle_hours = hours,
+                "Idle session closed at the person wait cap: its requests are refused first"
+            );
+            self.deny_waiting_permissions(session_id).await;
+            self.emit_on_session(
+                session_id,
+                ChatEvent::SystemHint {
+                    content: format!(
+                        "This session waited {hours} h for an answer to a permission request \
+                         nobody gave: the request was refused and the session was closed for \
+                         inactivity. Nothing of the conversation is lost: your next message \
+                         continues it."
+                    ),
+                },
+            )
+            .await;
+        } else {
+            info!(
+                session_id = %session_id,
+                idle_secs = facts.idle.as_secs(),
+                "Cleaning up timed-out session"
+            );
+        }
+        // The reason names the cleanup, not a person: `session_closed` and the episode say
+        // `idle_timeout`, never `user_closed`.
+        let closed = self
+            .close_session_because(
+                session_id,
+                crate::episodes::models::close_reason::IDLE_TIMEOUT,
+            )
+            .await;
+        // The neutral directory goes with the session, as on every close (`close_session`).
+        super::neutral_place::remove_for(session_id);
+        match closed {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Failed to close timed-out session {}: {}", session_id, e);
+                false
+            }
+        }
     }
 
     /// Runs [`Self::release_done_sessions`] every [`DONE_RELEASE_INTERVAL`].
@@ -20237,94 +20400,26 @@ impl ChatManager {
         }
     }
 
-    /// The agent engine's sessions the idle cleanup closes, by the rule of the
-    /// Claude Code engine ([`session_is_expired`]): a running turn or a background
-    /// task its provider still reports running (P4) keeps an idle session.
-    async fn expired_agent_sessions(&self, timeout: Duration) -> Vec<String> {
-        let mut expired = Vec::new();
-        for handle in self.agent_runtime.handles().await {
-            let idle = handle.idle_for();
-            let is_streaming = handle.is_streaming.load(Ordering::SeqCst);
-            let background_tasks = handle.active_background_tasks().await.len();
-            let waiting_on_input = handle.waiting_on_a_person().await;
-            if session_is_expired(
-                idle,
-                timeout,
-                is_streaming,
-                background_tasks,
-                waiting_on_input,
-            ) {
-                expired.push(handle.session_id.clone());
-            } else if idle > timeout {
-                debug!(
-                    session_id = %handle.session_id,
-                    idle_secs = idle.as_secs(),
-                    is_streaming,
-                    background_tasks,
-                    waiting_on_input,
-                    "Idle agent session kept alive: work still in progress"
-                );
-            }
-        }
-        expired
-    }
-
-    /// Closes the most idle session that is doing nothing (no running turn, no background
-    /// task) and has been for `grace`, on either engine, to make room for a
-    /// new one. Closing is what the idle cleanup does half an hour later: the session stays
-    /// in the graph and resumes on the next message. Returns whether a slot was freed.
+    /// Closes the most idle session [`idle_verdict`] says is expired when the ordinary idle
+    /// delay is only `grace`, on either engine, to make room for a new one. The SAME rule as
+    /// the idle cleanup, only sooner: a running turn or a background task keeps a session
+    /// (until the hard cap), and so does a person it waits on (until the person wait cap) —
+    /// the two paths can no longer disagree about a session. Closing is what the idle
+    /// cleanup does half an hour later: the session stays in the graph and resumes on the
+    /// next message. Returns whether a slot was freed.
     pub(crate) async fn reclaim_idle_slot(&self, grace: Duration) -> bool {
-        let mut best: Option<(Duration, String)> = None;
-        let mut consider = |idle: Duration, id: &str| {
-            if idle >= grace && best.as_ref().is_none_or(|(b, _)| idle > *b) {
-                best = Some((idle, id.to_string()));
-            }
-        };
-        let legacy: Vec<_> = {
-            let sessions = self.active_sessions.read().await;
-            sessions
-                .iter()
-                .map(|(id, s)| {
-                    (
-                        id.clone(),
-                        s.last_activity.elapsed(),
-                        s.is_streaming.clone(),
-                        s.active_background_tasks.clone(),
-                        s.cli_background_tasks.clone(),
-                    )
-                })
-                .collect()
-        };
-        for (id, idle, streaming, background, cli_background) in legacy {
-            let busy = streaming.load(Ordering::Relaxed)
-                || background
-                    .lock()
-                    .await
-                    .len()
-                    .max(cli_background.load(Ordering::Relaxed))
-                    > 0;
-            if !busy {
-                consider(idle, &id);
+        let mut candidates = self.expired_sessions(grace).await;
+        // The most idle first. Each is judged again on its fresh state before its close, and
+        // one kept then (its wait or its work began meanwhile) does not stop the next from
+        // freeing the slot.
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        for (id, idle) in candidates {
+            info!(session_id = %id, idle_secs = idle.as_secs(), "Session table full: closing the most idle session");
+            if self.close_if_still_expired(&id, grace).await {
+                return true;
             }
         }
-        for handle in self.agent_runtime.handles().await {
-            let busy = handle.is_streaming.load(Ordering::SeqCst)
-                || !handle.active_background_tasks().await.is_empty();
-            if !busy {
-                consider(handle.idle_for(), &handle.session_id);
-            }
-        }
-        let Some((idle, id)) = best else {
-            return false;
-        };
-        info!(session_id = %id, idle_secs = idle.as_secs(), "Session table full: closing the most idle session");
-        match self.close_session(&id).await {
-            Ok(()) => true,
-            Err(e) => {
-                warn!("Failed to reclaim idle session {}: {}", id, e);
-                false
-            }
-        }
+        false
     }
 
     /// Get the number of currently active sessions, on both engines.
@@ -20427,12 +20522,135 @@ pub(crate) fn background_task_is_idle_dead(
     }
 }
 
+/// Whether NOBODY can answer a permission request of the session `spawned_by` describes —
+/// the two cases where it is proven, and only those:
+///
+/// - an `Agent` sub-agent (`conversation`): its parent's call fails on the first request it
+///   asks, the request is refused and the child closed (`subagents.rs`, the call's end);
+/// - a plan run (`runner`, `pipeline`, `gate`: [`super::attachment::PLAN_RUN_SPAWN_TYPES`]):
+///   opened in `bypassPermissions` (`runner.rs`), it never asks.
+///
+/// Every other session — a person's, a delegation, a protocol run, an unknown shape — may have
+/// its request shown to a person: the cockpit's attention lists the undecided requests of every
+/// session, spawned or not (`chat::attachment`, `chat::attention`). Their wait counts, bounded
+/// by the person wait cap. (The first version of this rule treated every spawned session as
+/// unanswerable, on the strength of `place_confirmation::person_in_front` — which governs
+/// worktree placements only; review of #1173, d.)
+pub(crate) fn nobody_answers_spawned(spawned_by: Option<&str>) -> bool {
+    let Some(kind) = spawned_by
+        .filter(|s| !s.trim().is_empty())
+        .and_then(parse_spawned_by)
+        .map(|c| c.spawn_type)
+    else {
+        return false;
+    };
+    kind == "conversation" || super::attachment::PLAN_RUN_SPAWN_TYPES.contains(&kind.as_str())
+}
+
+#[cfg(test)]
+mod spawned_answerers_tests {
+    use super::nobody_answers_spawned;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
+    /// Review of #1173 (d): only the proven cases have nobody to answer.
+    #[test]
+    fn only_a_subagent_and_a_plan_run_have_nobody_to_answer() {
+        for kind in ["conversation", "runner", "pipeline", "gate"] {
+            let spawned = format!(r#"{{"type":"{kind}","parent_session_id":"p","run_id":"r"}}"#);
+            assert!(nobody_answers_spawned(Some(&spawned)), "{kind}");
+        }
+        for kind in ["delegation", "protocol_runner", "team", "whatever"] {
+            let spawned = format!(r#"{{"type":"{kind}","parent_session_id":"p"}}"#);
+            assert!(
+                !nobody_answers_spawned(Some(&spawned)),
+                "{kind}: a person may answer"
+            );
+        }
+        assert!(!nobody_answers_spawned(None));
+        assert!(!nobody_answers_spawned(Some("  ")));
+        assert!(!nobody_answers_spawned(Some("not json")));
+    }
+}
+
 /// Multiple of the idle timeout after which a session is closed even if it
 /// still looks busy — a background task that never reports completion must not
 /// pin a CLI subprocess forever.
 const IDLE_HARD_CAP_FACTOR: u32 = 8;
 
-/// Should an idle session be closed?
+/// How long a session a PERSON can answer may wait on that person (a permission its running
+/// turn asked) before the idle cleanup closes it anyway: 24 hours, the default of
+/// `ChatConfig::person_wait_cap` (`chat.person_wait_cap_secs`, `CHAT_PERSON_WAIT_CAP_SECS`).
+///
+/// Waiting on a person PROLONGS a session's life, it never makes it eternal: a prompt
+/// nobody comes back to must not hold a slot of `max_sessions` (and the turn's provider)
+/// until the server restarts. A day covers "I answer tomorrow morning" — the point of the
+/// protection — and is three times the ordinary hard cap (8 × 30 min = 4 h). The cap never
+/// shortens a session's life: below the hard cap, the hard cap applies.
+pub(crate) const PERSON_WAIT_CAP: Duration = Duration::from_secs(24 * 3600);
+
+/// What [`idle_verdict`] knows of one session (`ChatManager::idle_facts`), read at once.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct IdleFacts {
+    /// How long the session has done nothing.
+    pub idle: Duration,
+    /// A turn is running.
+    pub is_streaming: bool,
+    /// Background tasks still running (sub-agents, background Bash, Monitor).
+    pub background_tasks: usize,
+    /// The running turn waits on a person: a permission it asked, nobody answered yet.
+    pub waiting_on_a_person: bool,
+    /// A person can answer it: every session but an `Agent` sub-agent or a plan run
+    /// (`nobody_answers_spawned`).
+    pub a_person_can_answer: bool,
+}
+
+/// The limits [`idle_verdict`] applies.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IdleLimits {
+    /// The ordinary idle delay: the session timeout for the idle cleanup, a short grace for
+    /// `reclaim_idle_slot` when the session table is full.
+    pub patience: Duration,
+    /// The session timeout, which the hard cap is a multiple of.
+    pub timeout: Duration,
+    /// How long a session may wait on a person ([`PERSON_WAIT_CAP`] by default).
+    pub person_wait_cap: Duration,
+}
+
+/// Why [`idle_verdict`] keeps a session, or that it does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleVerdict {
+    /// Idle for no longer than the ordinary delay.
+    Recent,
+    /// A running turn or a background task, short of the hard cap.
+    Working,
+    /// Its running turn waits on a person who can answer, short of the person wait cap.
+    WaitingOnAPerson,
+    /// To be closed.
+    Expired,
+}
+
+impl IdleVerdict {
+    /// What the log says of a session kept.
+    pub(crate) fn why_kept(self) -> &'static str {
+        match self {
+            Self::Recent => "idle session kept: not idle long enough",
+            Self::Working => "idle session kept: work still in progress",
+            Self::WaitingOnAPerson => "idle session kept: its turn waits on a person's answer",
+            Self::Expired => "idle session expired",
+        }
+    }
+}
+
+impl IdleLimits {
+    /// [`idle_verdict`] under these limits.
+    pub(crate) fn verdict(self, facts: IdleFacts) -> IdleVerdict {
+        idle_verdict(facts, self)
+    }
+}
+
+/// Should an idle session be closed? The ONE rule of the idle cleanup and of
+/// `reclaim_idle_slot`, on both engines.
 ///
 /// Idle time alone used to decide, and "activity" was only refreshed during
 /// turns. A session whose agent had finished its turn but still had
@@ -20440,26 +20658,34 @@ const IDLE_HARD_CAP_FACTOR: u32 = 8;
 /// and was closed after `session_timeout` — killing the CLI subprocess, the
 /// background work with it, and the completion notification that would have
 /// woken the agent to report back. Busy sessions are now kept, up to a hard
-/// cap.
-pub(crate) fn session_is_expired(
-    idle: Duration,
-    timeout: Duration,
-    is_streaming: bool,
-    background_tasks: usize,
-    waiting_on_input: bool,
-) -> bool {
-    if idle <= timeout {
-        return false;
+/// cap (`IDLE_HARD_CAP_FACTOR` × the timeout).
+///
+/// A session whose running turn waits on a PERSON (a permission nobody answered yet) was
+/// closed at the hard cap like a stuck one — under the eyes of whoever was about to answer.
+/// It is now kept past the ordinary delay and the hard cap, up to the person wait cap, and
+/// closed past it: waiting prolongs a session, it never makes it eternal. Only a session a
+/// person can answer is protected: a spawned session's requests are refused without a
+/// prompt, so for it waiting is the ordinary case.
+pub(crate) fn idle_verdict(facts: IdleFacts, limits: IdleLimits) -> IdleVerdict {
+    if facts.idle <= limits.patience {
+        return IdleVerdict::Recent;
     }
-    // D2 FIX: Don't expire sessions waiting for user input (permission or question),
-    // even after the hard cap timeout, because the user is actively required.
-    if waiting_on_input {
-        return false;
+    let hard_cap = limits.timeout * IDLE_HARD_CAP_FACTOR;
+    if facts.waiting_on_a_person && facts.a_person_can_answer {
+        return if facts.idle > limits.person_wait_cap.max(hard_cap) {
+            IdleVerdict::Expired
+        } else {
+            IdleVerdict::WaitingOnAPerson
+        };
     }
-    if idle > timeout * IDLE_HARD_CAP_FACTOR {
-        return true;
+    if facts.idle > hard_cap {
+        return IdleVerdict::Expired;
     }
-    !is_streaming && background_tasks == 0
+    if facts.is_streaming || facts.background_tasks > 0 {
+        IdleVerdict::Working
+    } else {
+        IdleVerdict::Expired
+    }
 }
 
 #[cfg(test)]
@@ -20558,6 +20784,8 @@ async fn store_pending_perm_input(
     id: &str,
     input: &serde_json::Value,
     tool: &str,
+    active_sessions: &RwLock<HashMap<String, ActiveSession>>,
+    session_id: &str,
 ) {
     map.lock().await.insert(
         id.to_string(),
@@ -20566,6 +20794,12 @@ async fn store_pending_perm_input(
             tool: tool.to_string(),
         },
     );
+    // Asking is activity: the person's wait starts NOW, not at the turn's last event — a
+    // three-hour turn ending on a request would otherwise eat three hours of the wait cap
+    // (the agent engine touches on every event it emits; review of #1173, c).
+    if let Some(session) = active_sessions.write().await.get_mut(session_id) {
+        session.last_activity = Instant::now();
+    }
 }
 
 /// A permission request of the CLI the session's grants cover (`chat::session_grants`):

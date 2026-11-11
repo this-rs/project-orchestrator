@@ -57,13 +57,19 @@ L'attente est la **nanoseconde sur des millions de nœuds**, pas la centaine de 
 | Périmètre des traits : ce que Neo4j / Meilisearch / NATS font vraiment | O-PERIMETRE | `docs/cartographie/14-perimetre-traits.md` |
 | Garde-fou des tris non totaux | O-TRI (partiel) | `tests/order_tiebreak.rs` |
 | Cartographie (19 documents) | — | `docs/cartographie/` |
+| Premier lot du backend obrain : `BackendKind::Obrain`, `ProjectStore` (9 méthodes), 748 refus nommés générés (`build/refus_obrain.rs`), job CI « Obrain backend » | O-DOUBLE | **#1165 fusionnée** (11/11 15:28Z, avant ses corrections → suite #1171) |
+| Serveur réel démarré sur obrain sans Neo4j ni Meilisearch : `POST`/`GET /api/projects/<slug>` par les vrais handlers, donnée survivant à SIGTERM + redémarrage | O-DOUBLE | mesuré le 11/11 (#1171) |
+| Descente de `main` (#1161 #1167 #1168 #1169 #1170) avec le conflit `manager.rs` résolu, relecture de fidélité (530 tests → 530, zéro perte/doublon) | O-BRANCHE | **#1174 fusionnée** (fast-forward, `origin/main` contenu) |
+| Test instable des ancres : les balayages `backfill_*`/`revert_*` étaient globaux ; bornés par slug/session/id, binaire `anchor_sweeps_unscoped` pour le chemin non borné | — | **#1172 fusionnée dans main** (`f0dbe001`) |
 
 ### En cours
 
 | Lot | Tâche PO | Où |
 |---|---|---|
-| Backend obrain derrière la fabrique : `BackendKind::Obrain`, un premier domaine, refus nommé pour le reste, conformité croisée | O-DOUBLE | branche `consolidation/o-double` |
-| Mode Auto du harnais porté dans `this-harness` (cœur de décision pur, compatible wasm) | O-HARNESS-PARITE | this-rs, branche `feat/harness-mode-auto` |
+| Suite de #1165 : création atomique au crash (marqueur `_brouillon`), un fsync WAL par écriture ≤ 256 o, compteur O(1) pour la suppression, garde-fou d'ouverture (`storage.obrain_create`) | O-DOUBLE | **#1171** (draft) ; relecture : mise à jour déchirée non réparée, test kill -9 non probant, update/delete visibles avant fsync — en correction |
+| Mode Auto du harnais porté dans `this-harness` (cœur de décision pur, compatible wasm) | O-HARNESS-PARITE | this-rs **#249, #251, #252 fusionnées** (avant corrections) ; **#254** = corrections (consultatif ne bouge rien, réparation survit à un `settle` qui pend, paire jamais atteinte oubliée, JSON seulement) — relecture finale : fusionnable après retouche de doc |
+| Suite de #1161 (fusionnée avant corrections) : `idle_verdict` unique, plafond d'attente humaine 24 h, `AskedRequest.turn`, Claude Code via `can_use_tool` | — | **#1173** (draft) ; relecture : demande orpheline à la fermeture, demande hors tour non protégée — en correction |
+| neo4rs 0.8.0 : entiers négatifs lus de travers (65 `state_timeout_secs = 255` fantômes) : vendor patché, migration au boot, garde d'hôte | — | **#1166** (draft) ; relecture : `tests/data_migrations.rs` visait encore la base VIVANTE (7687) — bloquant en correction |
 | Module `plan` : descripteur, CRUD sans base, adaptateur, écran dérivé | O-MODULE-PLAN | this-rs `main` (#234, #235, #236) ; PO ne le consomme pas encore |
 | Référence de migration et copie figée | plan 250c63fb | PR #1163 (`docs/cartographie/20`, `21`, `22`) |
 | Spike du migrateur : débits de lecture et d'import, fidélité par type et par propriété | plan 250c63fb | hors dépôt (`worktrees/spike-migrateur`) |
@@ -81,15 +87,21 @@ Hors chemin critique : **O-THISRS-1** (socle this-rs monté sous `/_this` à cô
 
 ## Ce dont PO dépend dans obrain (dépôt `obrain-db/obrain`)
 
-Aucune de ces PR n'est fusionnée au moment où ce fichier est écrit.
+État au 11/11 au soir. Ordre de fusion prévu : #99 → #101 → #117 ; #119 → #121 ; #113 ; #115 → #118. Toute PR reste en **brouillon** jusqu'au verdict du portillon (sept fusions prématurées ce jour : this #249/#251/#252, obrain #108/#110/#114, PO #1165/#1161).
 
 | PR | Sujet | État |
 |---|---|---|
-| #99 | `UNIQUE (a, b)` porte sur le tuple ; contraintes persistées | CI verte ; revue : cœur juste, trois défauts introduits (contraintes qui s'accumulent à chaque redéclaration, `DROP CONSTRAINT` sans effet, régression sur `MERGE … ON CREATE SET`) — en correction |
-| #101 | Recherche par la propriété la plus sélective ; clé d'index cohérente avec l'égalité (`5` = `5.0`) | deux revues ; justesse corrigée ; ne tient pas encore la barre de performance (reconstruction d'index à la migration, décompte non constant) — en correction |
-| #108 | Un agrégat dans `WITH` ne rend plus la clé de groupement invisible (104 requêtes de PO) | bloquée : étend à `WITH` un résultat faux sur deux clés calculées — en correction, avec quatre autres résultats faux Cypher/GQL et `duration.between` |
-| #110 | Les tests n'ouvrent plus les bases réelles sous `$HOME` | objectif tenu ; revue : le mode « lecture seule » du moteur écrit — les lecteurs passent par une copie, en correction |
-| (à venir) | Mode lecture seule réel ; unicité vérifiée sur `SET`, `MERGE … ON MATCH`, ajout de label, insertion concurrente, import en masse | en cours |
+| #110 | Les tests n'ouvrent plus les bases réelles sous `$HOME` | **fusionnée** (`e871411c`) ; suite #113 (garde contournable, copie sans détection d'écrivain vivant, cibles jamais exécutées) en draft, CI 9/11 verts |
+| #114 | Un `WITH` groupé ne pose plus de projection inutile | **fusionnée** |
+| #108 | Un agrégat dans `WITH` ne rend plus la clé de groupement invisible (104 requêtes de PO) | **fusionnée** avant corrections ; suites **#119** (MATCH à cible liée, `WITH` GQL, FOREACH) et **#121** (`duration.between`, `push_value`) en draft — relecture EXÉCUTÉE : #119 rend encore un produit cartésien silencieux en GQL sur clé de groupe aliasée (`WITH f AS g … MATCH (…)->(g)` : 18 lignes au lieu de 6) et une erreur sur ancre `UNWIND`/alias en Cypher ; #121 calcule le calendrier en UTC et rend NULL sur `ns[0].sha` — en correction |
+| #99 | `UNIQUE (a, b)` porte sur le tuple ; DDL ; types implicites ; persistance | corrigée (`c9e20441` : SET / MERGE ON MATCH SET contrôlés, verrou DDL) ; re-relecture avec sondes : la réparation du catalogue à l'ouverture RÉÉCRIT le fichier en lecture seule, `SET n:T` écrit un doublon sans erreur, `CREATE CONSTRAINT` sur données en doublon répond « Created », contrôle asymétrique 5/5.0, coût O(n/cardinalité de la PREMIÈRE colonne) (744 µs vs 25 µs selon l'ordre) — en correction |
+| #101 | Index d'égalité canonique (`5` = `5.0`, instants i128 ns), migration v1→v2 | quatre tours ; barre 100 ns NON atteinte (0,8–1,3 µs à 1 M : revérification par relecture, sondes mmap, hachage — refonte d'index en suite) ; dernière relecture : la récolte des instants longs est annulable (index partiel marqué complet) et une écriture blob n'a aucune trace durable (régression après kill) → règle « une clé à colonne blob n'est jamais crue sur la zone persistée, reconstruite au premier usage (0,83 s à 1 M) » — en correction |
+| #117 | Unicité sur tous les chemins (SET, MERGE, label, concurrence, import), EMPILÉE sur #99 + #101 | rebasée (`7bef83b2`) ; `UNIQUE` sur flottant non entier = O(label) : **237 ms par écriture à 1 M** → clé d'index canonique puis index unique avec réservation jusqu'au commit |
+| #115 | Lecture seule réelle (`open_read_only` n'écrit plus) | régression d'ouverture corrigée ; écart résiduel +5 %/+9 % réfuté comme « défauts de page » ; lint Linux corrigé ; CI en file |
+| #118 | Ouverture O(1) en lecture seule, empilée sur #115 : vérification des compteurs au premier lecteur, sonde de 512 emplacements au-delà du filigrane | **8,3 → 0,7 ms à 1 M, 39 → 3,7 ms à 5 M**, RSS 107 → 4 Mo ; CI en file |
+| **issue #120** | **Durabilité : une valeur > 256 octets est hors WAL, peut contaminer un autre nœud après SIGKILL, et le flush complet est O(base)** (34 ms vide → 2,6 s à 5 M hérité) | ouverte le 11/11 ; **bloque le portage de Chat (75), Code (85), Analytics (145)** |
+
+Mesuré sur le premier lot (#1171, bases 0 / 1 M / 5 M, opt-level 3) : `get_project` 128–185 ns indépendant de N ; `create_project` ≤ 256 o = 4–5 ms p50 (fsync WAL) ; `create_project` avec valeur > 256 o = 128 ms → 2,8 s (paie le flush complet) ; ouverture 5 ms (vide), 37 ms (1 M neuf), 1,0 s (1 M hérité), 91 ms (5 M neuf), 5,6 s (5 M hérité) — le format hérité coûte ×10 à ×60. Unicité (#99/#117) : `UNIQUE` entier 22–47 µs/écriture de 100 k à 5 M ; composite 23–42 µs ; flottant non entier 26 ms (100 k) → 237 ms (1 M).
 
 Mesuré sur `main` d'obrain (`c4b6ada9`) : `MATCH (n) WITH n.p AS p, count(*) AS c RETURN p, c` échoue en Cypher (`Undefined variable 'p'`) et passe en GQL ; un second `MATCH` dont la cible est déjà liée rend 36 lignes au lieu de 14 en Cypher. Tant que #108 et ses suites ne sont pas fusionnées, le backend obrain de PO passe par l'API Rust ou par des requêtes simples.
 
@@ -115,6 +127,10 @@ Compté dans le code : 724 méthodes à porter, dont 198 dures (agrégats dans `
 Les domaines d'une vague se portent en parallèle à condition d'écrire un fichier par sous-trait côté obrain. **Premier jalon visible : un chat de bout en bout sur obrain = 44 méthodes** (Project 4, Chat 40), toutes en V1 ; +17 si l'authentification est active (estimation par graphe d'appels, pas par exécution).
 
 Trois risques chiffrés : `AnalyticsStore` n'est pas un domaine (145 méthodes sur 21 fichiers, lit 14 domaines, écrit chez 9) ; 78 fonctions enchaînent au moins deux écritures sans transaction, et `init_schema` pose 189 instructions dont 7 contraintes composites ; ~1 960 sites de décodage `neo4rs`, avec des dates stockées tantôt en type temporel, tantôt en chaîne.
+
+**Ordre retenu après le premier lot (mesuré le 11/11)** : **Workspace (45) puis Release (41)** — sans Release, `GET /api/projects` rend 500, car il passe par `ReleaseStore::list_projects_filtered` et non par `ProjectStore`. Puis Plan (54) et Note (41), qui lèvent le refus de `delete_project`. Chat (75), Code (85) et Analytics (145) seulement après obrain #120 (défauts 1–3) : leurs propriétés dépassent couramment 256 octets et chaque écriture paierait le flush complet proportionnel à la base.
+
+Défaut de justesse trouvé en passant, côté PO et indépendant du backend : `update_staleness_scores` lit `duration.between(...).days` comme une ancienneté, or `.days` est le reste après les mois (sémantique Neo4j reprise par obrain) — faux au-delà d'un mois (tâche O-STALENESS-DAYS).
 
 ## Sécurité des données (incidents du 11/11)
 
