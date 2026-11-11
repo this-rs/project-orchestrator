@@ -5,7 +5,8 @@
 //! the backend. A [`StoreFactory`] opens a store; the [`conformance_suite!`]
 //! macro instantiates every check once per factory, so the same tests run
 //! against the in-memory [`MockGraphStore`] and against a real [`Neo4jClient`]
-//! (and, later, against an obrain store: one more factory, one more macro call).
+//! (and against an obrain store, for the domains it has ported: one more factory,
+//! one more macro call — see `ObrainFactory` and `project_checks!`).
 //! Only methods already in the trait (src/neo4j/traits.rs) are exercised. The
 //! twelve subjects of P0.1 are fifteen checks: the CAS and the sorting each
 //! have their race (concurrent creation, paging across a tie) as a check of
@@ -51,9 +52,10 @@ pub mod conformance {
     use chrono::{DateTime, Duration, TimeZone, Utc};
     use futures::future::join_all;
     use project_orchestrator::ingress::{ExternalEvent, IngressOutcome};
+    use project_orchestrator::neo4j::file_uid::PathPolicy;
     use project_orchestrator::neo4j::models::{
-        AlertNode, AlertSeverity, FileNode, PlanNode, PlanStatus, ProjectNode, StepNode,
-        StepStatus, TaskNode, TaskStatus,
+        AlertNode, AlertSeverity, FileNode, PlanNode, PlanStatus, ProjectNode, ProjectProfile,
+        StepNode, StepStatus, TaskNode, TaskStatus,
     };
     use project_orchestrator::neo4j::GraphStore;
     use project_orchestrator::notes::{Note, NoteFilters, NoteStatus, NoteType};
@@ -1942,6 +1944,522 @@ pub mod conformance {
             walks[0]
         );
     }
+
+    // ------------------------------------------------------------------
+    // The project domain (`ProjectStore`), on its own.
+    //
+    // These checks call nothing but `ProjectStore`, so they are the suite a
+    // backend ported one domain at a time can run first (obrain: see
+    // `ObrainFactory`). They state what the Neo4j adapter does, including where
+    // it is lossy, and compare whole values: every serialized field of
+    // `ProjectNode`, not a chosen few.
+    // ------------------------------------------------------------------
+
+    /// Every serialized field of a project, for whole-value comparisons.
+    fn fields(p: &ProjectNode) -> serde_json::Value {
+        serde_json::to_value(p).unwrap()
+    }
+
+    async fn stored(store: &dyn GraphStore, id: Uuid) -> ProjectNode {
+        store
+            .get_project(id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("project {id} must be readable"))
+    }
+
+    /// A root that resolves to nothing on any machine, so its canonical form
+    /// is its declared form everywhere.
+    fn a_missing_root() -> String {
+        format!("/nonexistent/conformance-{}", Uuid::new_v4())
+    }
+
+    /// What is created reads back identical, by id and by slug, down to the
+    /// nanosecond of `created_at`; what was never created reads as absent.
+    pub async fn check_project_roundtrip(store: &dyn GraphStore) {
+        let mut work = a_project("roundtrip-work");
+        work.description = Some("a description — with an accent: é".to_string());
+        work.created_at = at(7) + Duration::nanoseconds(123_456_789);
+        work.watch_enabled = true;
+        work.profile = ProjectProfile::Work;
+
+        let mut software = a_project("roundtrip-software");
+        software.description = Some("another".to_string());
+        software.root_path = a_missing_root();
+        software.created_at = at(8);
+
+        for p in [&work, &software] {
+            store.create_project(p).await.unwrap();
+        }
+        for p in [&work, &software] {
+            let by_id = stored(store, p.id).await;
+            assert_eq!(fields(&by_id), fields(p), "read by id");
+            assert_eq!(by_id.created_at, p.created_at, "created_at, exactly");
+            let by_slug = store
+                .get_project_by_slug(&p.slug)
+                .await
+                .unwrap()
+                .expect("read by slug");
+            assert_eq!(fields(&by_slug), fields(p), "read by slug");
+        }
+
+        assert!(store.get_project(Uuid::new_v4()).await.unwrap().is_none());
+        assert!(store
+            .get_project_by_slug(&format!("conformance-absent-{}", Uuid::new_v4()))
+            .await
+            .unwrap()
+            .is_none());
+
+        for p in [&work, &software] {
+            store.delete_project(p.id, &p.name).await.unwrap();
+        }
+    }
+
+    /// `list_projects` is ordered by name then id, ascending — a TOTAL order:
+    /// three projects sharing one name come out by id, the same way on every
+    /// call. Names compare by code point (upper case before lower case,
+    /// accented letters after `z`).
+    pub async fn check_project_list_order(store: &dyn GraphStore) {
+        let tag = Uuid::new_v4();
+        let named = |name: &str| {
+            let mut p = a_project("order");
+            p.name = format!("conformance order {tag} {name}");
+            p.description = Some(String::new());
+            p
+        };
+        let mut projects = [
+            named("same"),
+            named("élan"),
+            named("same"),
+            named("alpha"),
+            named("same"),
+            named("Zeta"),
+        ];
+        for p in &projects {
+            store.create_project(p).await.unwrap();
+        }
+        // The stated order, computed here: name, then the id as a string.
+        projects.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+        });
+        let expected = ids(&projects, |p| p.id);
+        let suffixes: Vec<&str> = projects
+            .iter()
+            .map(|p| p.name.rsplit(' ').next().unwrap())
+            .collect();
+        assert_eq!(
+            suffixes,
+            ["Zeta", "alpha", "same", "same", "same", "élan"],
+            "the fixture itself: code-point order of the names"
+        );
+
+        let mine: HashSet<Uuid> = expected.iter().copied().collect();
+        for pass in 0..3 {
+            let listed: Vec<Uuid> = store
+                .list_projects()
+                .await
+                .unwrap()
+                .iter()
+                .map(|p| p.id)
+                .filter(|id| mine.contains(id))
+                .collect();
+            assert_eq!(
+                listed, expected,
+                "pass {pass}: list_projects must order by name then id (a tie on the name is \
+                 broken by the id, identically on every call)"
+            );
+        }
+        // And the values listed are the values stored.
+        let listed = store.list_projects().await.unwrap();
+        for p in &projects {
+            let l = listed.iter().find(|l| l.id == p.id).unwrap();
+            assert_eq!(fields(l), fields(p), "a listed project is the stored one");
+        }
+
+        for p in &projects {
+            store.delete_project(p.id, &p.name).await.unwrap();
+        }
+    }
+
+    /// `update_project` changes exactly the fields it is given; an update with
+    /// nothing to change, or on an unknown project, changes nothing and is not
+    /// an error (and does not create the project).
+    pub async fn check_project_update(store: &dyn GraphStore) {
+        let mut p = a_project("update");
+        p.description = Some("before".to_string());
+        store.create_project(&p).await.unwrap();
+        let mut witness = a_project("update-witness");
+        witness.description = Some("untouched".to_string());
+        store.create_project(&witness).await.unwrap();
+
+        p.name = format!("conformance renamed {}", p.id);
+        store
+            .update_project(p.id, Some(p.name.clone()), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(fields(&stored(store, p.id).await), fields(&p), "name only");
+
+        p.description = Some("after".to_string());
+        store
+            .update_project(p.id, None, Some(p.description.clone()), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fields(&stored(store, p.id).await),
+            fields(&p),
+            "description only"
+        );
+
+        p.profile = ProjectProfile::Work;
+        store
+            .update_project(p.id, None, None, None, Some(p.profile))
+            .await
+            .unwrap();
+        assert_eq!(
+            fields(&stored(store, p.id).await),
+            fields(&p),
+            "profile only"
+        );
+
+        p.root_path = a_missing_root();
+        store
+            .update_project(p.id, None, None, Some(p.root_path.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(fields(&stored(store, p.id).await), fields(&p), "root only");
+
+        // `Some("")` clears the root.
+        p.root_path = String::new();
+        store
+            .update_project(p.id, None, None, Some(String::new()), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fields(&stored(store, p.id).await),
+            fields(&p),
+            "root cleared"
+        );
+
+        // All four at once.
+        p.name = format!("conformance renamed twice {}", p.id);
+        p.description = Some("all at once".to_string());
+        p.root_path = a_missing_root();
+        p.profile = ProjectProfile::Software;
+        store
+            .update_project(
+                p.id,
+                Some(p.name.clone()),
+                Some(p.description.clone()),
+                Some(p.root_path.clone()),
+                Some(p.profile),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fields(&stored(store, p.id).await), fields(&p), "all four");
+
+        store
+            .update_project(p.id, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(fields(&stored(store, p.id).await), fields(&p), "nothing");
+
+        let unknown = Uuid::new_v4();
+        store
+            .update_project(unknown, Some("ghost".to_string()), None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            store.get_project(unknown).await.unwrap().is_none(),
+            "an update never creates a project"
+        );
+        assert_eq!(
+            fields(&stored(store, witness.id).await),
+            fields(&witness),
+            "another project is never touched"
+        );
+        // The slug is not updatable: the project still answers to it.
+        assert_eq!(
+            store
+                .get_project_by_slug(&p.slug)
+                .await
+                .unwrap()
+                .map(|f| f.id),
+            Some(p.id)
+        );
+
+        store.delete_project(p.id, &p.name).await.unwrap();
+        store
+            .delete_project(witness.id, &witness.name)
+            .await
+            .unwrap();
+    }
+
+    /// Neo4j keeps no absent description: a project created without one, or
+    /// whose description is cleared, reads back `Some("")`.
+    pub async fn check_project_absent_description_reads_empty(store: &dyn GraphStore) {
+        let created_without = a_project("no-description");
+        assert!(created_without.description.is_none(), "the fixture");
+        store.create_project(&created_without).await.unwrap();
+        assert_eq!(
+            stored(store, created_without.id).await.description,
+            Some(String::new()),
+            "created with no description"
+        );
+
+        let mut cleared = a_project("cleared-description");
+        cleared.description = Some("to be cleared".to_string());
+        store.create_project(&cleared).await.unwrap();
+        store
+            .update_project(cleared.id, None, Some(None), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored(store, cleared.id).await.description,
+            Some(String::new()),
+            "description cleared by an update"
+        );
+
+        for p in [&created_without, &cleared] {
+            store.delete_project(p.id, &p.name).await.unwrap();
+        }
+    }
+
+    /// `create_project` stores the creation fields and nothing else: the sync,
+    /// analytics and co-change instants, the note energy and the scaffolding
+    /// override are written by their own setters, and a value passed at
+    /// creation is not kept.
+    pub async fn check_project_creation_keeps_only_creation_fields(store: &dyn GraphStore) {
+        let mut p = a_project("creation-fields");
+        p.description = Some("kept".to_string());
+        p.last_synced = Some(at(1));
+        p.analytics_computed_at = Some(at(2));
+        p.last_co_change_computed_at = Some(at(3));
+        p.default_note_energy = Some(0.5);
+        p.scaffolding_override = Some(2);
+        store.create_project(&p).await.unwrap();
+
+        let mut expected = p.clone();
+        expected.last_synced = None;
+        expected.analytics_computed_at = None;
+        expected.last_co_change_computed_at = None;
+        expected.default_note_energy = None;
+        expected.scaffolding_override = None;
+        assert_eq!(fields(&stored(store, p.id).await), fields(&expected));
+
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    /// The two timestamps of the trait are set to the instant of the call,
+    /// each on its own, and neither is an error (nor a creation) on an
+    /// unknown project.
+    pub async fn check_project_timestamps(store: &dyn GraphStore) {
+        let mut p = a_project("timestamps");
+        p.description = Some("timestamps".to_string());
+        store.create_project(&p).await.unwrap();
+        let before = stored(store, p.id).await;
+        assert!(before.last_synced.is_none() && before.analytics_computed_at.is_none());
+
+        let slack = Duration::seconds(2);
+        let t0 = Utc::now();
+        store.update_project_synced(p.id).await.unwrap();
+        let t1 = Utc::now();
+        let synced = stored(store, p.id).await;
+        let at_sync = synced.last_synced.expect("last_synced is set");
+        assert!(
+            at_sync >= t0 - slack && at_sync <= t1 + slack,
+            "last_synced {at_sync} is the instant of the call ({t0} .. {t1})"
+        );
+        assert!(
+            synced.analytics_computed_at.is_none(),
+            "the sync timestamp does not set the analytics one"
+        );
+
+        let t2 = Utc::now();
+        store
+            .update_project_analytics_timestamp(p.id)
+            .await
+            .unwrap();
+        let t3 = Utc::now();
+        let analysed = stored(store, p.id).await;
+        let at_analytics = analysed.analytics_computed_at.expect("analytics is set");
+        assert!(
+            at_analytics >= t2 - slack && at_analytics <= t3 + slack,
+            "analytics_computed_at {at_analytics} is the instant of the call ({t2} .. {t3})"
+        );
+        assert_eq!(
+            analysed.last_synced,
+            Some(at_sync),
+            "the analytics timestamp leaves last_synced as it was"
+        );
+
+        // Nothing else moved.
+        let mut expected = p.clone();
+        expected.last_synced = analysed.last_synced;
+        expected.analytics_computed_at = analysed.analytics_computed_at;
+        assert_eq!(fields(&analysed), fields(&expected));
+
+        let unknown = Uuid::new_v4();
+        store.update_project_synced(unknown).await.unwrap();
+        store
+            .update_project_analytics_timestamp(unknown)
+            .await
+            .unwrap();
+        assert!(store.get_project(unknown).await.unwrap().is_none());
+
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    /// A deleted project is gone by id, by slug and from the list, its slug is
+    /// free again, the others are untouched; deleting twice, or deleting what
+    /// never existed, is not an error.
+    pub async fn check_project_delete(store: &dyn GraphStore) {
+        let mut gone = a_project("delete-gone");
+        gone.description = Some("gone".to_string());
+        let mut kept = a_project("delete-kept");
+        kept.description = Some("kept".to_string());
+        store.create_project(&gone).await.unwrap();
+        store.create_project(&kept).await.unwrap();
+
+        store.delete_project(gone.id, &gone.name).await.unwrap();
+        assert!(store.get_project(gone.id).await.unwrap().is_none());
+        assert!(store
+            .get_project_by_slug(&gone.slug)
+            .await
+            .unwrap()
+            .is_none());
+        let listed = id_set(&store.list_projects().await.unwrap(), |p| p.id);
+        assert!(
+            !listed.contains(&gone.id),
+            "a deleted project is not listed"
+        );
+        assert!(listed.contains(&kept.id));
+        assert_eq!(fields(&stored(store, kept.id).await), fields(&kept));
+
+        store.delete_project(gone.id, &gone.name).await.unwrap();
+        store
+            .delete_project(Uuid::new_v4(), "never existed")
+            .await
+            .unwrap();
+
+        // The slug is free again, and now names the new project.
+        let mut reborn = a_project("delete-reborn");
+        reborn.slug = gone.slug.clone();
+        reborn.description = Some("reborn".to_string());
+        store.create_project(&reborn).await.unwrap();
+        assert_eq!(
+            store
+                .get_project_by_slug(&gone.slug)
+                .await
+                .unwrap()
+                .map(|p| p.id),
+            Some(reborn.id)
+        );
+
+        for p in [&kept, &reborn] {
+            store.delete_project(p.id, &p.name).await.unwrap();
+        }
+    }
+
+    /// `Project.id` and `Project.slug` are unique: a second project with a
+    /// taken id or a taken slug is refused, and the first one is left as it was.
+    pub async fn check_project_unique_id_and_slug(store: &dyn GraphStore) {
+        let mut first = a_project("unique-first");
+        first.description = Some("first".to_string());
+        store.create_project(&first).await.unwrap();
+
+        let mut same_id = a_project("unique-same-id");
+        same_id.id = first.id;
+        assert!(
+            store.create_project(&same_id).await.is_err(),
+            "a second project with a taken id must be refused"
+        );
+        assert_eq!(fields(&stored(store, first.id).await), fields(&first));
+        assert!(store
+            .get_project_by_slug(&same_id.slug)
+            .await
+            .unwrap()
+            .is_none());
+
+        let mut same_slug = a_project("unique-same-slug");
+        same_slug.slug = first.slug.clone();
+        assert!(
+            store.create_project(&same_slug).await.is_err(),
+            "a second project with a taken slug must be refused"
+        );
+        assert!(store.get_project(same_slug.id).await.unwrap().is_none());
+        assert_eq!(
+            store
+                .get_project_by_slug(&first.slug)
+                .await
+                .unwrap()
+                .map(|p| p.id),
+            Some(first.id)
+        );
+
+        store.delete_project(first.id, &first.name).await.unwrap();
+        // Whatever a non-conforming backend let through.
+        store
+            .delete_project(same_slug.id, &same_slug.name)
+            .await
+            .unwrap();
+    }
+
+    /// The path policy of a project: none for an unknown project; declared
+    /// from creation; its root normalized (no trailing `/`) and following an
+    /// update of the root.
+    pub async fn check_project_path_policy(store: &dyn GraphStore) {
+        assert_eq!(
+            store.path_policy(Uuid::new_v4()).await.unwrap(),
+            PathPolicy::none(),
+            "an unknown project has no vocabulary"
+        );
+
+        let rootless = a_project("policy-rootless");
+        store.create_project(&rootless).await.unwrap();
+        assert_eq!(
+            store.path_policy(rootless.id).await.unwrap(),
+            PathPolicy {
+                declared_root: String::new(),
+                canonical_root: String::new(),
+                declared: true,
+            }
+        );
+
+        let root = a_missing_root();
+        let mut rooted = a_project("policy-rooted");
+        rooted.root_path = format!("{root}/");
+        store.create_project(&rooted).await.unwrap();
+        assert_eq!(
+            store.path_policy(rooted.id).await.unwrap(),
+            PathPolicy {
+                declared_root: root.clone(),
+                canonical_root: root.clone(),
+                declared: true,
+            },
+            "the trailing `/` of the root is not part of the policy"
+        );
+
+        let moved = a_missing_root();
+        store
+            .update_project(rooted.id, None, None, Some(moved.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.path_policy(rooted.id).await.unwrap(),
+            PathPolicy {
+                declared_root: moved.clone(),
+                canonical_root: moved,
+                declared: true,
+            },
+            "the policy follows the root"
+        );
+
+        for p in [&rootless, &rooted] {
+            store.delete_project(p.id, &p.name).await.unwrap();
+        }
+    }
 }
 
 // ======================================================================
@@ -1993,6 +2511,30 @@ impl StoreFactory for Neo4jFactory {
                 None
             }
         }
+    }
+}
+
+/// A fresh obrain base per check, in a temporary directory removed with the
+/// store (never a configured path: a conformance run opens nothing that
+/// exists). Only the ported domains are instantiated for it — see
+/// `project_checks!` below.
+#[cfg(feature = "obrain-backend")]
+pub struct ObrainFactory;
+
+#[cfg(feature = "obrain-backend")]
+#[async_trait]
+impl StoreFactory for ObrainFactory {
+    fn backend(&self) -> &'static str {
+        "obrain"
+    }
+    async fn open(&self) -> Option<Arc<dyn GraphStore>> {
+        let store = tokio::task::spawn_blocking(
+            project_orchestrator::obrain::ObrainGraphStore::open_temporary,
+        )
+        .await
+        .expect("the blocking open ran")
+        .expect("a temporary obrain base opens");
+        Some(Arc::new(store))
     }
 }
 
@@ -2071,6 +2613,21 @@ const EXPECTED_DIVERGENCES: &[Divergence] = &[
         "check_null_vs_empty_and_timestamp_roundtrip",
         "the mock stores what it is given: Project.description None reads None (Neo4j: Some(\"\")), and the same for Task.title \"\" (Neo4j: None), \
          Note.last_confirmed_at None (Neo4j: created_at) and Note.last_confirmed_by None (Neo4j: Some(\"\"))",
+    ),
+    mock(
+        "check_project_absent_description_reads_empty",
+        "the mock stores the description it is given: None at creation reads None, and update_project(description: Some(None)) \
+         reads None, where Neo4j stores and reads \"\" in both cases",
+    ),
+    mock(
+        "check_project_creation_keeps_only_creation_fields",
+        "create_project keeps the whole ProjectNode (last_synced, analytics_computed_at, last_co_change_computed_at, \
+         default_note_energy, scaffolding_override) where Neo4j stores only the creation fields",
+    ),
+    mock(
+        "check_project_unique_id_and_slug",
+        "create_project inserts by id with no uniqueness check: a taken id overwrites the first project and a taken slug is \
+         accepted, where Neo4j refuses both (constraints project_id and project_slug)",
     ),
     mock(
         "check_vector_ranking_with_project_filter",
@@ -2187,3 +2744,34 @@ macro_rules! all_checks {
 
 all_checks!(mock, MockFactory);
 all_checks!(neo4j, Neo4jFactory);
+
+/// The project domain on its own: the checks that call nothing but
+/// `ProjectStore`. Instantiated per backend like the suite above, in modules
+/// of their own — and it is the suite a backend ported one domain at a time
+/// runs first: `obrain_project::*` (feature `obrain-backend`) runs the SAME
+/// checks, on the same fixtures, as `mock_project::*` and `neo4j_project::*`.
+/// The next ported domain adds its checks here, not a second suite.
+macro_rules! project_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [
+                check_project_roundtrip,
+                check_project_list_order,
+                check_project_update,
+                check_project_absent_description_reads_empty,
+                check_project_creation_keeps_only_creation_fields,
+                check_project_timestamps,
+                check_project_delete,
+                check_project_unique_id_and_slug,
+                check_project_path_policy,
+            ]
+        );
+    };
+}
+
+project_checks!(mock_project, MockFactory);
+project_checks!(neo4j_project, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+project_checks!(obrain_project, ObrainFactory);
