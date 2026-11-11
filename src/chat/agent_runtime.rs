@@ -2295,15 +2295,6 @@ impl AgentSessionHandle {
         })
         .await;
 
-        // D1 FIX: If there are queued messages, start processing them instead of leaving
-        // them orphaned. Check if there are pending messages and spawn drive() to process them.
-        let has_queued = self.pending.lock().await.len() > 0;
-        if has_queued {
-            let me = Arc::clone(self);
-            let run = tokio::spawn(async move { me.drive(None).await });
-            self.track_turn_task(run.abort_handle());
-        }
-
         true
     }
 
