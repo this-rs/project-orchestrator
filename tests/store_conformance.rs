@@ -1983,15 +1983,21 @@ pub mod conformance {
         work.watch_enabled = true;
         work.profile = ProjectProfile::Work;
 
+        // Above the 256-byte threshold where obrain moves a string to its blob column,
+        // multi-byte on purpose (a byte cut inside a character would not read back).
+        let mut long = a_project("roundtrip-long");
+        long.description = Some("é-long ".repeat(300));
+        long.created_at = at(9);
+
         let mut software = a_project("roundtrip-software");
         software.description = Some("another".to_string());
         software.root_path = a_missing_root();
         software.created_at = at(8);
 
-        for p in [&work, &software] {
+        for p in [&work, &software, &long] {
             store.create_project(p).await.unwrap();
         }
-        for p in [&work, &software] {
+        for p in [&work, &software, &long] {
             let by_id = stored(store, p.id).await;
             assert_eq!(fields(&by_id), fields(p), "read by id");
             assert_eq!(by_id.created_at, p.created_at, "created_at, exactly");
@@ -2010,7 +2016,7 @@ pub mod conformance {
             .unwrap()
             .is_none());
 
-        for p in [&work, &software] {
+        for p in [&work, &software, &long] {
             store.delete_project(p.id, &p.name).await.unwrap();
         }
     }
@@ -2128,6 +2134,22 @@ pub mod conformance {
             fields(&p),
             "description only"
         );
+
+        // Short -> long (past the blob threshold) -> short again: the value that
+        // replaces a blob must be the value read, whichever way the size goes.
+        for description in ["é-long ".repeat(3_000), "short again".to_string()] {
+            p.description = Some(description);
+            store
+                .update_project(p.id, None, Some(p.description.clone()), None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                fields(&stored(store, p.id).await),
+                fields(&p),
+                "description crossing the blob threshold ({} bytes)",
+                p.description.as_ref().unwrap().len()
+            );
+        }
 
         p.profile = ProjectProfile::Work;
         store
@@ -2255,6 +2277,8 @@ pub mod conformance {
         p.last_co_change_computed_at = Some(at(3));
         p.default_note_energy = Some(0.5);
         p.scaffolding_override = Some(2);
+        p.sharing_policy =
+            Some(project_orchestrator::episodes::distill_models::SharingPolicy::default());
         store.create_project(&p).await.unwrap();
 
         let mut expected = p.clone();
@@ -2263,6 +2287,7 @@ pub mod conformance {
         expected.last_co_change_computed_at = None;
         expected.default_note_energy = None;
         expected.scaffolding_override = None;
+        expected.sharing_policy = None;
         assert_eq!(fields(&stored(store, p.id).await), fields(&expected));
 
         store.delete_project(p.id, &p.name).await.unwrap();
@@ -2416,6 +2441,55 @@ pub mod conformance {
             .delete_project(same_slug.id, &same_slug.name)
             .await
             .unwrap();
+    }
+
+    /// Eight concurrent creations of ONE slug (eight ids): exactly one wins, and
+    /// the others leave nothing behind. The uniqueness of the slug holds under
+    /// concurrency, not only in sequence.
+    pub async fn check_project_concurrent_same_slug(store: &dyn GraphStore) {
+        let slug = format!("conformance-race-{}", Uuid::new_v4());
+        let contenders: Vec<ProjectNode> = (0..8)
+            .map(|i| {
+                let mut p = a_project(&format!("race-{i}"));
+                p.slug = slug.clone();
+                p.description = Some(format!("contender {i}"));
+                p
+            })
+            .collect();
+        let results = join_all(contenders.iter().map(|p| store.create_project(p))).await;
+        let winners: Vec<usize> = results
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.is_ok())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one creation of a slug wins, got {} ({results:?})",
+            winners.len()
+        );
+        let winner = &contenders[winners[0]];
+        assert_eq!(
+            store
+                .get_project_by_slug(&slug)
+                .await
+                .unwrap()
+                .map(|p| fields(&p)),
+            Some(fields(winner)),
+            "the slug names the winner, whole"
+        );
+        for (i, p) in contenders.iter().enumerate() {
+            if i != winners[0] {
+                assert!(
+                    store.get_project(p.id).await.unwrap().is_none(),
+                    "a refused creation leaves no project (contender {i})"
+                );
+            }
+        }
+        for p in &contenders {
+            store.delete_project(p.id, &p.name).await.unwrap();
+        }
     }
 
     /// The path policy of a project: none for an unknown project; declared
@@ -2637,6 +2711,10 @@ const EXPECTED_DIVERGENCES: &[Divergence] = &[
          default_note_energy, scaffolding_override) where Neo4j stores only the creation fields",
     ),
     mock(
+        "check_project_concurrent_same_slug",
+        "create_project has no uniqueness check, so all eight concurrent creations of one slug succeed (same gap as check_project_unique_id_and_slug)",
+    ),
+    mock(
         "check_project_unique_id_and_slug",
         "create_project inserts by id with no uniqueness check: a taken id overwrites the first project and a taken slug is \
          accepted, where Neo4j refuses both (constraints project_id and project_slug)",
@@ -2786,6 +2864,7 @@ macro_rules! project_checks {
                 check_project_timestamps,
                 check_project_delete,
                 check_project_unique_id_and_slug,
+                check_project_concurrent_same_slug,
                 check_project_path_policy,
             ]
         );
