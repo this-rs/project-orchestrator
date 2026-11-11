@@ -714,7 +714,8 @@ mod anchors {
         let Some(e) = env().await else { return };
         let store: &dyn GraphStore = &e.client;
         let slug = format!("backfill-malformed-{}", Uuid::new_v4());
-        e.raw
+        let _ = e
+            .raw
             .execute(
                 query("CREATE (:ChatSession {project_slug: $slug})").param("slug", slug.clone()),
             )
@@ -724,7 +725,8 @@ mod anchors {
             .backfill_project_anchors()
             .await
             .expect("a session without `id` must be skipped, never abort the sweep");
-        e.raw
+        let _ = e
+            .raw
             .execute(
                 query(
                     "MATCH (s:ChatSession) WHERE s.project_slug = $slug AND s.id IS NULL \
