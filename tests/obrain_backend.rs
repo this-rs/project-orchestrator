@@ -930,7 +930,7 @@ mod with_the_feature {
     /// defect, see the PR). `aucune` rounds exist to be killed inside a creation, not
     /// to exercise that.
     fn description_du_test(id: Uuid, i: u32, avec_blob: bool) -> String {
-        if !avec_blob || i % 3 == 0 {
+        if !avec_blob || i.is_multiple_of(3) {
             format!("short {id}")
         } else {
             format!("{id} é-long ").repeat(12 + (i as usize % 5))
