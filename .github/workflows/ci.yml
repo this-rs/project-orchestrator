@@ -449,6 +449,18 @@ jobs:
             sudo systemctl restart systemd-resolved
             sleep 2
           fi
+          # Second visage de la même panne (mesuré le 11/11 à 16:54 UTC, #1161) : le nom se
+          # résout mais le miroir Azure ne répond plus en HTTP (« Ign: » sur chaque index),
+          # alors que https://archive.ubuntu.com et security.ubuntu.com répondent. Si le
+          # miroir ne rend pas son InRelease en 15 s, les sources passent sur le miroir
+          # principal, en HTTPS.
+          if ! timeout 15 curl -fsS -o /dev/null http://azure.archive.ubuntu.com/ubuntu/dists/noble/InRelease; then
+            echo "::warning::Miroir Azure injoignable, repli sur https://archive.ubuntu.com"
+            sudo sed -i -E 's#https?://azure\.archive\.ubuntu\.com/ubuntu/?#https://archive.ubuntu.com/ubuntu/#g' \
+              /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
+            sudo sed -i -E 's#mirror\+file:/etc/apt/apt-mirrors\.txt#https://archive.ubuntu.com/ubuntu/#g' \
+              /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
+          fi
           apt_opts="-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
           sudo -E timeout 240 apt-get $apt_opts update
           sudo -E timeout 400 apt-get $apt_opts install -y --no-install-recommends \
