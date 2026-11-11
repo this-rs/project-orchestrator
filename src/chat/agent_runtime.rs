@@ -1049,6 +1049,8 @@ impl AgentSessionHandle {
         match answered {
             Ok(()) => {
                 self.mark_answered(&covered);
+                // Activity before the request stops counting as a wait (as for a user's answer).
+                self.touch();
                 // Answered: it waits no more, and the set of the requests the backend
                 // answers itself forgets it — it used to keep every one for the session's
                 // whole life (lot review of #721, finding 2c). `answers_itself` still says
@@ -2220,22 +2222,30 @@ impl AgentSessionHandle {
     /// as its last word. A watchdog that ended these would cut a session precisely while it
     /// waits for the human it was built to hand back to.
     ///
-    /// Only a turn that is really running waits: a request whose turn is over (ended,
-    /// stopped, abandoned) waits on nothing — its provider dropped it — so a session is never
-    /// held for a request left behind ([`Self::forget_turn_asks`]).
+    /// A request asked OUT of any turn — the provider woke up on its own (a background task's
+    /// end, `emit_out_of_band`, which opens no turn here and leaves `is_streaming` false) —
+    /// waits on its person for as long as it is asked: until its answer or the close of the
+    /// session, the person wait cap bounding it. A request asked BY a turn waits only while
+    /// that turn really runs: once the turn is over (ended, stopped, abandoned) its provider
+    /// dropped it, so a session is never held for a request left behind
+    /// ([`Self::forget_turn_asks`]).
     pub async fn waiting_on_a_person(&self) -> bool {
+        let turn = self.turn_generation();
+        let (out_of_turn, by_this_turn) = {
+            let asked = self.asked_calls.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                asked.values().any(|asked| asked.turn.is_none()),
+                asked.values().any(|asked| asked.turn == Some(turn)),
+            )
+        };
+        if out_of_turn {
+            return true;
+        }
         // A stopped turn waits on nobody: it is ending.
         if !self.is_streaming.load(Ordering::SeqCst) || self.interrupted.load(Ordering::SeqCst) {
             return false;
         }
-        let turn = self.turn_generation();
-        let asked_by_this_turn = self
-            .asked_calls
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .values()
-            .any(|asked| asked.turn == Some(turn));
-        if asked_by_this_turn {
+        if by_this_turn {
             return true;
         }
         matches!(
@@ -3211,6 +3221,10 @@ impl AgentSessionHandle {
             (None, _, _) => {}
         }
         pending.disarm();
+        // Activity BEFORE the request stops counting as a wait: in between, the idle cleanup
+        // could read "not waiting, idle since the ask" and close the session its answer just
+        // reached (the decision's emit touches too, but only after).
+        self.touch();
         self.asked_calls
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -9541,5 +9555,136 @@ mod turn_watchdog_tests {
             !handle.is_streaming.load(Ordering::SeqCst),
             "once the compaction is over, silence with nothing in flight is still death"
         );
+    }
+}
+
+/// The permission requests a turn asked die with it, on EVERY path that ends or replaces a
+/// turn — one test per path, so none can be dropped unnoticed (review of #1173, g). A request
+/// asked OUT of any turn survives them all: only its answer or the close of the session ends
+/// it, and it keeps the session waiting on its person meanwhile.
+#[cfg(test)]
+mod forget_path_tests {
+    use super::fake::FakeProvider;
+    use super::{AgentRuntime, AgentSessionHandle, PendingMessageKind};
+    use crate::chat::types::ChatEvent;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+    use crate::neo4j::GraphStore;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    async fn a_handle() -> (FakeProvider, Arc<AgentSessionHandle>) {
+        let graph: Arc<dyn GraphStore> = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let runtime = AgentRuntime::new(graph);
+        let provider = FakeProvider::new();
+        let handle = runtime
+            .adopt(
+                &uuid::Uuid::new_v4().to_string(),
+                "local",
+                provider.session(),
+                1,
+                "native",
+                serde_json::json!({}),
+                None,
+            )
+            .await;
+        (provider, handle)
+    }
+
+    fn ask(id: &str) -> ChatEvent {
+        ChatEvent::PermissionRequest {
+            id: id.into(),
+            tool: "Bash".into(),
+            input: serde_json::json!({ "command": "make" }),
+            parent_tool_use_id: None,
+            category: None,
+            canonical: Some("Bash".into()),
+            tool_use_id: None,
+            always: None,
+            consent: None,
+        }
+    }
+
+    /// One request asked out of any turn, then one asked by the running turn.
+    async fn asked_in_and_out_of_turn(handle: &AgentSessionHandle) {
+        handle.emit(ask("out-of-turn")).await;
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        handle.emit(ask("of-the-turn")).await;
+        let mut ids = handle.waiting_permission_ids();
+        ids.sort();
+        assert_eq!(ids, ["of-the-turn", "out-of-turn"]);
+        assert!(handle.waiting_on_a_person().await);
+    }
+
+    async fn only_the_out_of_turn_one_is_left(handle: &AgentSessionHandle) {
+        assert_eq!(
+            handle.waiting_permission_ids(),
+            vec!["out-of-turn".to_string()],
+            "the turn's request is forgotten, the out-of-turn one stays"
+        );
+        assert!(
+            handle.waiting_on_a_person().await,
+            "the out-of-turn request still waits on its person, turn or no turn"
+        );
+    }
+
+    /// `next_queued`: the run ends with nothing queued.
+    #[tokio::test]
+    async fn the_end_of_the_run_forgets_the_turns_requests() {
+        let (_provider, handle) = a_handle().await;
+        asked_in_and_out_of_turn(&handle).await;
+        assert!(
+            handle.next_queued().await.is_none(),
+            "nothing queued: the run ends"
+        );
+        assert!(!handle.is_streaming.load(Ordering::SeqCst));
+        only_the_out_of_turn_one_is_left(&handle).await;
+    }
+
+    /// `interrupt_for_the_queue`: a queued message interrupts the turn.
+    #[tokio::test]
+    async fn an_interrupt_for_the_queue_forgets_the_turns_requests() {
+        let (_provider, handle) = a_handle().await;
+        asked_in_and_out_of_turn(&handle).await;
+        handle.interrupt_for_the_queue().await;
+        assert!(
+            handle.is_streaming.load(Ordering::SeqCst),
+            "the turn has not ended yet: the forget does not wait for it"
+        );
+        only_the_out_of_turn_one_is_left(&handle).await;
+    }
+
+    /// `interrupt_scoped`: a Stop of the user — forgotten BEFORE the turn ends.
+    #[tokio::test]
+    async fn a_stop_forgets_the_turns_requests_before_the_turn_ends() {
+        let (_provider, handle) = a_handle().await;
+        asked_in_and_out_of_turn(&handle).await;
+        handle.interrupt().await.unwrap();
+        assert!(handle.is_streaming.load(Ordering::SeqCst));
+        only_the_out_of_turn_one_is_left(&handle).await;
+    }
+
+    /// `abandon_turn`: the watchdog ends a turn that answers nobody.
+    #[tokio::test]
+    async fn an_abandon_forgets_the_turns_requests() {
+        let (_provider, handle) = a_handle().await;
+        asked_in_and_out_of_turn(&handle).await;
+        assert!(handle.abandon_turn(handle.turn_generation()).await);
+        only_the_out_of_turn_one_is_left(&handle).await;
+    }
+
+    /// `open_turn`: the next turn never inherits the previous one's requests, even when that
+    /// one ended without forgetting them (a run aborted from outside).
+    #[tokio::test]
+    async fn the_next_turn_forgets_the_previous_turns_requests() {
+        let (_provider, handle) = a_handle().await;
+        asked_in_and_out_of_turn(&handle).await;
+        handle.is_streaming.store(false, Ordering::SeqCst);
+        let opened = handle
+            .open_turn(PendingMessageKind::User, "next", "next")
+            .await
+            .expect("the fake provider takes the turn");
+        assert!(opened.is_some(), "the turn was sent");
+        only_the_out_of_turn_one_is_left(&handle).await;
     }
 }

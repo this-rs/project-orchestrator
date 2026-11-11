@@ -271,6 +271,46 @@ pub const NEXUS_TOOLS_PATH_VAR: &str = "NEXUS_TOOLS_PATH";
 /// else none when nexus-tools embeds Obscura (`embedded`: the engine runs in that process,
 /// `--search-engine obscura`); else `dsh-obscura-nav` on the `PATH` (`on_path`, held to the
 /// same `runnable` rule). The embedded engine is the default, the `PATH` only a fallback (OBS-R).
+/// The most `ChatConfig::person_wait_cap` may be set to: seven days. Past it the cap would be
+/// the eternal wait it exists to prevent (`u64::MAX` in a configuration reads as "never").
+pub const MAX_PERSON_WAIT_CAP: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// The person wait cap a configured number of seconds yields: bounded by
+/// [`MAX_PERSON_WAIT_CAP`], with a warning naming `source` when the value is cut.
+pub fn person_wait_cap_from_secs(secs: u64, source: &str) -> Duration {
+    let cap = Duration::from_secs(secs);
+    if cap > MAX_PERSON_WAIT_CAP {
+        tracing::warn!(
+            source,
+            configured_secs = secs,
+            max_secs = MAX_PERSON_WAIT_CAP.as_secs(),
+            "person wait cap above its maximum: bounded to seven days (a wait is never eternal)"
+        );
+        return MAX_PERSON_WAIT_CAP;
+    }
+    cap
+}
+
+/// The person wait cap the value of `CHAT_PERSON_WAIT_CAP_SECS` yields: the default when the
+/// variable is unset; a value that is not a whole number of seconds (negative, not a number)
+/// is refused WITH a warning and the default applies, never silently; a value above the
+/// maximum is bounded.
+pub fn person_wait_cap_from_env_value(value: Option<&str>) -> Duration {
+    let Some(raw) = value else {
+        return super::manager::PERSON_WAIT_CAP;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(secs) => person_wait_cap_from_secs(secs, "CHAT_PERSON_WAIT_CAP_SECS"),
+        Err(_) => {
+            tracing::warn!(
+                value = raw,
+                "CHAT_PERSON_WAIT_CAP_SECS is not a whole number of seconds: the default person wait cap applies"
+            );
+            super::manager::PERSON_WAIT_CAP
+        }
+    }
+}
+
 pub fn obscura_engine_program(
     configured: Option<&std::path::Path>,
     embedded: bool,
@@ -376,10 +416,9 @@ impl ChatConfig {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(1800), // 30 minutes
             ),
-            person_wait_cap: std::env::var("CHAT_PERSON_WAIT_CAP_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .map_or(super::manager::PERSON_WAIT_CAP, Duration::from_secs),
+            person_wait_cap: person_wait_cap_from_env_value(
+                std::env::var("CHAT_PERSON_WAIT_CAP_SECS").ok().as_deref(),
+            ),
             neo4j_uri: std::env::var("NEO4J_URI")
                 .unwrap_or_else(|_| "bolt://localhost:7687".into()),
             neo4j_user: std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into()),
@@ -651,6 +690,35 @@ mod tests {
                  mcp____x,mcp__nexus__Bash,Bash,acme__list,mcp__a__b c"
             )),
             vec!["mcp__acme__list", "mcp__docs-srv__search_docs"]
+        );
+    }
+
+    /// Review of #1173 (e): the wait cap is bounded — `u64::MAX` would be the eternal wait it
+    /// exists to prevent — and an unreadable value falls back to the default, never silently.
+    #[test]
+    fn the_person_wait_cap_is_bounded_and_an_unreadable_value_falls_back() {
+        use super::{
+            person_wait_cap_from_env_value, person_wait_cap_from_secs, MAX_PERSON_WAIT_CAP,
+        };
+        let default = crate::chat::manager::PERSON_WAIT_CAP;
+        assert_eq!(
+            person_wait_cap_from_secs(u64::MAX, "test"),
+            MAX_PERSON_WAIT_CAP
+        );
+        assert_eq!(
+            person_wait_cap_from_secs(3600, "test"),
+            Duration::from_secs(3600)
+        );
+        assert_eq!(person_wait_cap_from_env_value(None), default);
+        assert_eq!(person_wait_cap_from_env_value(Some("-5")), default);
+        assert_eq!(person_wait_cap_from_env_value(Some("abc")), default);
+        assert_eq!(
+            person_wait_cap_from_env_value(Some("18446744073709551615")),
+            MAX_PERSON_WAIT_CAP
+        );
+        assert_eq!(
+            person_wait_cap_from_env_value(Some(" 7200 ")),
+            Duration::from_secs(7200)
         );
     }
 

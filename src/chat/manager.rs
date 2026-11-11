@@ -10257,7 +10257,7 @@ impl ChatManager {
                                                 // A regular permission is pending BEFORE anyone sees it.
                                                 if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
                                                     if !id.is_empty() {
-                                                        store_pending_perm_input(&pending_perm_inputs, id, input, tool).await;
+                                                        store_pending_perm_input(&pending_perm_inputs, id, input, tool, &active_sessions, &session_id).await;
                                                     }
                                                 }
                                                 announce_control_event(&evt);
@@ -10325,7 +10325,7 @@ impl ChatManager {
                                                     // Pending before anyone sees it (same as above).
                                                     if let ChatEvent::PermissionRequest { ref id, ref input, ref tool, .. } = evt {
                                                         if !id.is_empty() {
-                                                            store_pending_perm_input(&pending_perm_inputs, id, input, tool).await;
+                                                            store_pending_perm_input(&pending_perm_inputs, id, input, tool, &active_sessions, &session_id).await;
                                                         }
                                                     }
                                                     announce_control_event(&evt);
@@ -20108,7 +20108,7 @@ impl ChatManager {
             match self.idle_limits(patience).verdict(facts) {
                 IdleVerdict::Expired => expired.push((id, facts.idle)),
                 IdleVerdict::Recent => {}
-                kept => debug!(
+                kept => tracing::trace!(
                     session_id = %id,
                     idle_secs = facts.idle.as_secs(),
                     is_streaming = facts.is_streaming,
@@ -20156,16 +20156,17 @@ impl ChatManager {
             };
             let is_streaming = streaming.load(Ordering::SeqCst);
             let tracked = background.lock().await.len();
-            let waiting = is_streaming && !permissions.lock().await.is_empty();
+            let waiting = !permissions.lock().await.is_empty();
             IdleFacts {
                 idle,
                 is_streaming,
                 // Whichever knows of more work wins: this server's own tracking, or what
                 // the CLI reports about itself.
                 background_tasks: tracked.max(cli_background.load(Ordering::SeqCst)),
-                // A `can_use_tool` the CLI waits on, in the turn that runs: the CLI waits
-                // on a request inside its turn only, and the requests of a turn are forgotten
-                // when the next one begins (`stream_response`) or this one ends.
+                // A `can_use_tool` the CLI waits on. The table is emptied when a turn begins,
+                // ends or is abandoned (`stream_response`, `abandon_turn_if_stuck`), so an entry
+                // is a request the CLI really waits on — in its turn, or out of any turn of
+                // this server (the CLI woke up on its own): both count, until the answer.
                 waiting_on_a_person: waiting,
                 a_person_can_answer: false,
             }
@@ -20178,21 +20179,15 @@ impl ChatManager {
         Some(facts)
     }
 
-    /// Whether a PERSON can answer what `session_id` asks: a session nothing spawned. A
-    /// delegated task, an `Agent` sub-agent, a runner or a protocol run (`spawned_by` set) has
-    /// nobody in front of it — its requests are refused without a prompt by design
-    /// (`place_confirmation::person_in_front`, `with_person_in_front`) — so waiting on a
-    /// person protects it from nothing. A record that cannot be read counts as a person's:
-    /// the person wait cap still bounds it.
+    /// Whether a PERSON can answer what `session_id` asks: every session but the two whose
+    /// request nobody answers by a proven mechanism ([`nobody_answers_spawned`]). A record
+    /// that cannot be read counts as a person's: the person wait cap still bounds it.
     async fn a_person_can_answer(&self, session_id: &str) -> bool {
         let Ok(uuid) = Uuid::parse_str(session_id) else {
             return true;
         };
         match self.graph.get_chat_session(uuid).await {
-            Ok(Some(node)) => node
-                .spawned_by
-                .as_deref()
-                .is_none_or(|s| s.trim().is_empty()),
+            Ok(Some(node)) => !nobody_answers_spawned(node.spawned_by.as_deref()),
             _ => true,
         }
     }
@@ -20225,12 +20220,49 @@ impl ChatManager {
             );
             return false;
         }
-        info!(
-            session_id = %session_id,
-            idle_secs = facts.idle.as_secs(),
-            "Cleaning up timed-out session"
-        );
-        match self.close_session(session_id).await {
+        if facts.waiting_on_a_person {
+            // Its person never answered: the requests are REFUSED on the thread BEFORE the
+            // close — through the path a user's answer takes (`deny_waiting_permissions`), so
+            // each gets its `permission_decision` and the provider is told — and the thread
+            // says why the session closed. Closed with the requests still asked, a late answer
+            // would only meet "session not found", with nothing on the thread to explain it.
+            let hours = facts.idle.as_secs() / 3600;
+            info!(
+                session_id = %session_id,
+                idle_hours = hours,
+                "Idle session closed at the person wait cap: its requests are refused first"
+            );
+            self.deny_waiting_permissions(session_id).await;
+            self.emit_on_session(
+                session_id,
+                ChatEvent::SystemHint {
+                    content: format!(
+                        "This session waited {hours} h for an answer to a permission request \
+                         nobody gave: the request was refused and the session was closed for \
+                         inactivity. Nothing of the conversation is lost: your next message \
+                         continues it."
+                    ),
+                },
+            )
+            .await;
+        } else {
+            info!(
+                session_id = %session_id,
+                idle_secs = facts.idle.as_secs(),
+                "Cleaning up timed-out session"
+            );
+        }
+        // The reason names the cleanup, not a person: `session_closed` and the episode say
+        // `idle_timeout`, never `user_closed`.
+        let closed = self
+            .close_session_because(
+                session_id,
+                crate::episodes::models::close_reason::IDLE_TIMEOUT,
+            )
+            .await;
+        // The neutral directory goes with the session, as on every close (`close_session`).
+        super::neutral_place::remove_for(session_id);
+        match closed {
             Ok(()) => true,
             Err(e) => {
                 warn!("Failed to close timed-out session {}: {}", session_id, e);
@@ -20365,16 +20397,18 @@ impl ChatManager {
     /// cleanup does half an hour later: the session stays in the graph and resumes on the
     /// next message. Returns whether a slot was freed.
     pub(crate) async fn reclaim_idle_slot(&self, grace: Duration) -> bool {
-        let best = self
-            .expired_sessions(grace)
-            .await
-            .into_iter()
-            .max_by_key(|(_, idle)| *idle);
-        let Some((id, idle)) = best else {
-            return false;
-        };
-        info!(session_id = %id, idle_secs = idle.as_secs(), "Session table full: closing the most idle session");
-        self.close_if_still_expired(&id, grace).await
+        let mut candidates = self.expired_sessions(grace).await;
+        // The most idle first. Each is judged again on its fresh state before its close, and
+        // one kept then (its wait or its work began meanwhile) does not stop the next from
+        // freeing the slot.
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        for (id, idle) in candidates {
+            info!(session_id = %id, idle_secs = idle.as_secs(), "Session table full: closing the most idle session");
+            if self.close_if_still_expired(&id, grace).await {
+                return true;
+            }
+        }
+        false
     }
 
     /// Get the number of currently active sessions, on both engines.
@@ -20477,6 +20511,57 @@ pub(crate) fn background_task_is_idle_dead(
     }
 }
 
+/// Whether NOBODY can answer a permission request of the session `spawned_by` describes —
+/// the two cases where it is proven, and only those:
+///
+/// - an `Agent` sub-agent (`conversation`): its parent's call fails on the first request it
+///   asks, the request is refused and the child closed (`subagents.rs`, the call's end);
+/// - a plan run (`runner`, `pipeline`, `gate`: [`super::attachment::PLAN_RUN_SPAWN_TYPES`]):
+///   opened in `bypassPermissions` (`runner.rs`), it never asks.
+///
+/// Every other session — a person's, a delegation, a protocol run, an unknown shape — may have
+/// its request shown to a person: the cockpit's attention lists the undecided requests of every
+/// session, spawned or not (`chat::attachment`, `chat::attention`). Their wait counts, bounded
+/// by the person wait cap. (The first version of this rule treated every spawned session as
+/// unanswerable, on the strength of `place_confirmation::person_in_front` — which governs
+/// worktree placements only; review of #1173, d.)
+pub(crate) fn nobody_answers_spawned(spawned_by: Option<&str>) -> bool {
+    let Some(kind) = spawned_by
+        .filter(|s| !s.trim().is_empty())
+        .and_then(parse_spawned_by)
+        .map(|c| c.spawn_type)
+    else {
+        return false;
+    };
+    kind == "conversation" || super::attachment::PLAN_RUN_SPAWN_TYPES.contains(&kind.as_str())
+}
+
+#[cfg(test)]
+mod spawned_answerers_tests {
+    use super::nobody_answers_spawned;
+    #[allow(unused_imports)]
+    use crate::neo4j::traits::*;
+
+    /// Review of #1173 (d): only the proven cases have nobody to answer.
+    #[test]
+    fn only_a_subagent_and_a_plan_run_have_nobody_to_answer() {
+        for kind in ["conversation", "runner", "pipeline", "gate"] {
+            let spawned = format!(r#"{{"type":"{kind}","parent_session_id":"p","run_id":"r"}}"#);
+            assert!(nobody_answers_spawned(Some(&spawned)), "{kind}");
+        }
+        for kind in ["delegation", "protocol_runner", "team", "whatever"] {
+            let spawned = format!(r#"{{"type":"{kind}","parent_session_id":"p"}}"#);
+            assert!(
+                !nobody_answers_spawned(Some(&spawned)),
+                "{kind}: a person may answer"
+            );
+        }
+        assert!(!nobody_answers_spawned(None));
+        assert!(!nobody_answers_spawned(Some("  ")));
+        assert!(!nobody_answers_spawned(Some("not json")));
+    }
+}
+
 /// Multiple of the idle timeout after which a session is closed even if it
 /// still looks busy — a background task that never reports completion must not
 /// pin a CLI subprocess forever.
@@ -20504,7 +20589,8 @@ pub(crate) struct IdleFacts {
     pub background_tasks: usize,
     /// The running turn waits on a person: a permission it asked, nobody answered yet.
     pub waiting_on_a_person: bool,
-    /// A person can answer it: a session nothing spawned (`ChatManager::a_person_can_answer`).
+    /// A person can answer it: every session but an `Agent` sub-agent or a plan run
+    /// (`nobody_answers_spawned`).
     pub a_person_can_answer: bool,
 }
 
@@ -20973,6 +21059,8 @@ async fn store_pending_perm_input(
     id: &str,
     input: &serde_json::Value,
     tool: &str,
+    active_sessions: &RwLock<HashMap<String, ActiveSession>>,
+    session_id: &str,
 ) {
     map.lock().await.insert(
         id.to_string(),
@@ -20981,6 +21069,12 @@ async fn store_pending_perm_input(
             tool: tool.to_string(),
         },
     );
+    // Asking is activity: the person's wait starts NOW, not at the turn's last event — a
+    // three-hour turn ending on a request would otherwise eat three hours of the wait cap
+    // (the agent engine touches on every event it emits; review of #1173, c).
+    if let Some(session) = active_sessions.write().await.get_mut(session_id) {
+        session.last_activity = Instant::now();
+    }
 }
 
 /// A permission request of the CLI the session's grants cover (`chat::session_grants`):
@@ -34035,9 +34129,10 @@ mod tests {
         assert!(!manager.agent_runtime.owns(&waiting.session_id).await);
     }
 
-    /// B1: a spawned session (here a delegated task) is never answered by a person — its
-    /// requests are refused without a prompt — so its waiting protects it from nothing: the
-    /// ordinary rules apply, kept while its turn runs, closed at the hard cap.
+    /// B1, review (d): an `Agent` sub-agent (`conversation`) is never answered by a person —
+    /// its parent's call fails on its first request and the child is closed (`subagents.rs`) —
+    /// so its waiting protects it from nothing: the ordinary rules apply, kept while its turn
+    /// runs, closed at the hard cap.
     #[tokio::test]
     async fn a_spawned_session_waiting_on_a_permission_follows_the_ordinary_rules() {
         let timeout = Duration::from_secs(60);
@@ -34045,7 +34140,7 @@ mod tests {
         let waiting = agent_session_waiting(&manager, timeout * 2).await;
         let mut node = crate::test_helpers::test_chat_session(None);
         node.id = Uuid::parse_str(&waiting.session_id).unwrap();
-        node.spawned_by = Some(r#"{"type":"delegation","parent_session_id":"p"}"#.into());
+        node.spawned_by = Some(r#"{"type":"conversation","parent_session_id":"p"}"#.into());
         manager.graph.create_chat_session(&node).await.unwrap();
 
         assert!(
@@ -34134,19 +34229,21 @@ mod tests {
     /// C3: the Claude Code engine reads a person's wait too — a `can_use_tool` its running
     /// turn waits on — with the same rule: kept past the hard cap, closed past the wait cap.
     /// It used to be judged "not waiting" whatever it waited on, and closed at the hard cap.
-    /// A request left in the map by a turn that is not running counts for nothing.
+    /// A request in the table out of any turn of this server (the CLI woke up on its own)
+    /// counts too: the table is emptied at each turn's start, end and abandon, so an entry is a
+    /// request the CLI really waits on (review of #1173, point 2).
     #[tokio::test]
     async fn a_claude_code_session_waiting_on_a_permission_follows_the_same_rule() {
         let timeout = Duration::from_secs(60);
         let manager = idle_manager(timeout);
         idle_legacy_session(&manager, "asking", timeout * (IDLE_HARD_CAP_FACTOR + 1)).await;
-        idle_legacy_session(&manager, "left", timeout * 2).await;
+        idle_legacy_session(&manager, "between-turns", timeout * 2).await;
         {
             let sessions = manager.active_sessions.read().await;
             sessions["asking"]
                 .is_streaming
                 .store(true, Ordering::SeqCst);
-            for id in ["asking", "left"] {
+            for id in ["asking", "between-turns"] {
                 sessions[id].pending_permission_inputs.lock().await.insert(
                     "req-1".into(),
                     PendingPermission {
@@ -34156,25 +34253,26 @@ mod tests {
                 );
             }
         }
-        assert_eq!(
-            expired_ids(&manager, timeout).await,
-            vec!["left".to_string()],
-            "the waiting turn is kept past the hard cap; a request out of any turn keeps nothing"
+        assert!(
+            expired_ids(&manager, timeout).await.is_empty(),
+            "the waiting turn is kept past the hard cap; a request out of any turn keeps too"
         );
 
-        manager
-            .active_sessions
-            .write()
-            .await
-            .get_mut("asking")
-            .unwrap()
-            .last_activity = Instant::now()
-            .checked_sub(manager.config.person_wait_cap + Duration::from_secs(1))
-            .unwrap();
+        for id in ["asking", "between-turns"] {
+            manager
+                .active_sessions
+                .write()
+                .await
+                .get_mut(id)
+                .unwrap()
+                .last_activity = Instant::now()
+                .checked_sub(manager.config.person_wait_cap + Duration::from_secs(1))
+                .unwrap();
+        }
         assert_eq!(
             expired_ids(&manager, timeout).await,
-            vec!["asking".to_string(), "left".to_string()],
-            "past the person wait cap, it is closed all the same"
+            vec!["asking".to_string(), "between-turns".to_string()],
+            "past the person wait cap, both are closed all the same"
         );
     }
 
@@ -34206,6 +34304,168 @@ mod tests {
             "its wait began before the close: kept"
         );
         assert!(manager.agent_runtime.owns(&quiet.session_id).await);
+    }
+
+    /// Review of #1173 (d): a delegated session's request is shown to a person (the cockpit's
+    /// attention lists it), so its wait counts like a person's: kept past the hard cap, closed
+    /// past the wait cap.
+    #[tokio::test]
+    async fn a_delegated_session_waiting_on_a_permission_is_protected_like_a_persons() {
+        let timeout = Duration::from_secs(60);
+        let manager = idle_manager(timeout);
+        let waiting = agent_session_waiting(&manager, timeout * (IDLE_HARD_CAP_FACTOR + 1)).await;
+        let mut node = crate::test_helpers::test_chat_session(None);
+        node.id = Uuid::parse_str(&waiting.session_id).unwrap();
+        node.spawned_by =
+            Some(r#"{"type":"delegation","parent_session_id":"p","task_id":"t"}"#.into());
+        manager.graph.create_chat_session(&node).await.unwrap();
+        assert!(
+            expired_ids(&manager, timeout).await.is_empty(),
+            "a delegation waiting on a person is kept past the hard cap"
+        );
+        waiting.backdate_activity(manager.config.person_wait_cap + Duration::from_secs(1));
+        assert_eq!(
+            expired_ids(&manager, timeout).await,
+            vec![waiting.session_id.clone()]
+        );
+    }
+
+    /// Review of #1173, point 2: a request asked OUT of any turn — the provider woke up on
+    /// its own (a background task's end, `emit_out_of_band`, which opens no turn and leaves
+    /// `is_streaming` false) — keeps the session waiting on its person for as long as it is
+    /// asked: past the ordinary delay and the hard cap, up to the wait cap. It used to count
+    /// for nothing: the modal was visible, the session closed under it at the timeout.
+    #[tokio::test]
+    async fn an_out_of_turn_permission_keeps_the_session_until_the_wait_cap() {
+        let timeout = Duration::from_secs(60);
+        let manager = idle_manager(timeout);
+        let woken = idle_agent_session(&manager, Duration::ZERO).await;
+        assert!(!woken.is_streaming.load(Ordering::SeqCst), "no turn runs");
+        woken.emit(bash_permission("oob-1")).await;
+        assert!(woken.waiting_on_a_person().await);
+        woken.backdate_activity(timeout * (IDLE_HARD_CAP_FACTOR + 1));
+        assert!(
+            expired_ids(&manager, timeout).await.is_empty(),
+            "an out-of-turn request keeps the session, past the hard cap included"
+        );
+        woken.backdate_activity(manager.config.person_wait_cap + Duration::from_secs(1));
+        assert_eq!(
+            expired_ids(&manager, timeout).await,
+            vec![woken.session_id.clone()],
+            "and the wait cap bounds it"
+        );
+    }
+
+    /// Review of #1173, point 1: a session closed at the person wait cap leaves no request
+    /// orphaned. The request is REFUSED first — its `permission_decision` reaches the thread
+    /// and the provider — the thread says why, and the close carries the reason
+    /// `idle_timeout`, not `user_closed`.
+    #[tokio::test]
+    async fn a_close_at_the_wait_cap_refuses_the_request_and_says_why() {
+        let timeout = Duration::from_secs(60);
+        let manager = idle_manager(timeout);
+        let waiting = agent_session_waiting(
+            &manager,
+            manager.config.person_wait_cap + Duration::from_secs(1),
+        )
+        .await;
+        let mut events = waiting.events_tx.subscribe();
+        assert_eq!(
+            manager.idle_cleanup_pass(timeout).await,
+            vec![waiting.session_id.clone()]
+        );
+        let mut refused = false;
+        let mut explained = false;
+        let mut reason = None;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                ChatEvent::PermissionDecision { id, allow, .. } if id == "perm-1" => {
+                    assert!(!allow, "the request is refused, not allowed");
+                    refused = true;
+                }
+                ChatEvent::SystemHint { content } if content.contains("refused") => {
+                    explained = true;
+                }
+                ChatEvent::SessionClosed { reason: r, .. } => reason = r,
+                _ => {}
+            }
+        }
+        assert!(refused, "the waiting request got its permission_decision");
+        assert!(explained, "the thread says why the session closed");
+        assert_eq!(
+            reason.as_deref(),
+            Some(crate::episodes::models::close_reason::IDLE_TIMEOUT),
+            "the close names the cleanup, not a person"
+        );
+        assert!(
+            waiting.waiting_permission_ids().is_empty(),
+            "nothing is left asked"
+        );
+    }
+
+    /// Review of #1173 (f): `reclaim_idle_slot` does not give up on its first candidate. The
+    /// most idle session, found expired, starts waiting on a person before its close (the
+    /// re-read keeps it): the next candidate frees the slot.
+    #[tokio::test]
+    async fn reclaim_idle_slot_goes_on_to_the_next_candidate_when_the_first_is_kept() {
+        let timeout = Duration::from_secs(60);
+        let manager = idle_manager(timeout);
+        let most_idle = idle_agent_session(&manager, Duration::from_secs(600)).await;
+        let next = idle_agent_session(&manager, Duration::from_secs(300)).await;
+        let first = Arc::clone(&most_idle);
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *manager
+            .idle_close_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Arc::new(move |id: &str| {
+                let first = Arc::clone(&first);
+                let fired = Arc::clone(&fired);
+                let id = id.to_string();
+                Box::pin(async move {
+                    if !fired.swap(true, Ordering::SeqCst) {
+                        assert_eq!(id, first.session_id, "the most idle session is tried first");
+                        first.is_streaming.store(true, Ordering::SeqCst);
+                        first.emit(bash_permission("late")).await;
+                    }
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            }));
+        assert!(
+            manager.reclaim_idle_slot(Duration::from_secs(1)).await,
+            "a slot is freed by the next candidate"
+        );
+        assert!(
+            manager.agent_runtime.owns(&most_idle.session_id).await,
+            "the session whose wait began meanwhile is kept"
+        );
+        assert!(!manager.agent_runtime.owns(&next.session_id).await);
+    }
+
+    /// Review of #1173 (c): on the Claude Code engine, asking a permission is activity — the
+    /// person's wait starts at the ask, not at the turn's last event before it.
+    #[tokio::test]
+    async fn asking_a_permission_is_activity_for_a_claude_code_session() {
+        let manager = idle_manager(Duration::from_secs(60));
+        idle_legacy_session(&manager, "cli", Duration::from_secs(3 * 3600)).await;
+        let map = manager.active_sessions.read().await["cli"]
+            .pending_permission_inputs
+            .clone();
+        store_pending_perm_input(
+            &map,
+            "req-1",
+            &serde_json::json!({ "command": "make" }),
+            "Bash",
+            &manager.active_sessions,
+            "cli",
+        )
+        .await;
+        let sessions = manager.active_sessions.read().await;
+        assert!(
+            sessions["cli"].last_activity.elapsed() < Duration::from_secs(5),
+            "asking is activity: the wait starts now"
+        );
+        assert!(map.lock().await.contains_key("req-1"));
     }
 
     /// Registers a live Claude Code session (no CLI behind it), idle for `idle`.

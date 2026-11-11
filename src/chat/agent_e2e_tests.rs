@@ -11824,6 +11824,13 @@ mod permission_scopes {
         assert_eq!(handle.waiting_permission_ids(), vec![id.clone()]);
 
         manager.interrupt(&sid).await.unwrap();
+        // Forgotten by the Stop itself, BEFORE the turn ends (the end of the turn forgets too,
+        // which alone would make the assertions below pass; review of #1173, g).
+        assert!(
+            handle.waiting_permission_ids().is_empty(),
+            "the Stop ends the wait at once: {:?}",
+            handle.waiting_permission_ids()
+        );
         let mut ended = false;
         for _ in 0..400 {
             if !handle

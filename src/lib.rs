@@ -1875,8 +1875,14 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         if let Some(timeout_secs) = config.chat_session_timeout_secs {
             chat_config.session_timeout = std::time::Duration::from_secs(timeout_secs);
         }
+        // Priority env > yaml > default, as `config.yaml.example` says: the YAML value applies only
+        // when the environment names none. (The chat keys above let the YAML win over the
+        // environment: a pre-existing inversion, left as it is here.)
         if let Some(cap_secs) = config.chat_person_wait_cap_secs {
-            chat_config.person_wait_cap = std::time::Duration::from_secs(cap_secs);
+            if std::env::var_os("CHAT_PERSON_WAIT_CAP_SECS").is_none() {
+                chat_config.person_wait_cap =
+                    chat::config::person_wait_cap_from_secs(cap_secs, "chat.person_wait_cap_secs");
+            }
         }
         // Override PATH / CLI path / auto-update from YAML if present.
         if let Some(ref path) = config.chat_process_path {
