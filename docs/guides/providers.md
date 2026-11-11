@@ -320,6 +320,39 @@ replaces an older manual entry, and a manual entry made after the last report re
   it invented.
 - **manual** — what a person types for a provider that exposes nothing.
 
+### Three scopes: the account, one family, an add-on
+
+The provider names its windows, and a full window closes exactly one of three things
+(`window_scope`, `chat/provider/quota.rs`). Confusing them is what makes a serving account look
+dead:
+
+| Window | Closes | Effect |
+|---|---|---|
+| `five_hour`, `seven_day`, `requests`, `credits` | **the account** — 100 % of all models | hard exclusion of the instance until the reset |
+| `seven_day_fable`, `seven_day_opus` | **one family** | hold `model:<family>`: that family is out, every other model serves |
+| `seven_day_overage_included` | **nothing** — the add-on allowance | kept for the gauge and `pressure`; never a hold |
+
+The last two rows were measured the hard way. **10/11/2026, again 11/11/2026**: `seven_day` sat at
+0,69–0,72 `allowed` while `seven_day_overage_included` was `exhausted` at 1,0–1,01 until 14/11, and
+the registry held the whole instance out for 3,7 days — while the same account answered
+`claude-haiku` at 14:45:27 and 14:58:17. The actual refusal was *Fable*'s: "You've reached your
+Fable limit. Switch to another model" — a family limit, which the provider words itself. So a family
+window, or a refusal that names a family, holds that family (`window: "model:fable"`) and nothing
+else; a full overage window holds nothing at all.
+
+### A word is a hypothesis, a served turn is a proof
+
+An exclusion the provider **dated** is trusted for `DATED_EXHAUSTION_STALENESS` (15 min). Past that
+it is re-observed **once**, by the next turn: if the account truly still refuses, the fresh refusal
+re-arms the exclusion for another window; if it serves, the exclusion is gone. The same rule applies
+to a family hold, and it is the only path by which a person's provider reset (a top-up, a plan
+change, a console refresh) reaches a model that routing keeps out: nothing can prove a model is back
+while routing keeps it out, so the hold has to lapse and be tested. `exhausted.observed_at_ms` dates
+the **hold**, not the entry — a snapshot about another window never makes an old refusal look fresh.
+
+A stored hold written by an older build on an add-on window is dropped **on load**, and the store is
+rewritten: a lock nobody can clear from the screen must not survive a restart.
+
 ### Routes
 
 | Route | Who |
@@ -343,11 +376,18 @@ One entry of `quotas` (and the `quota` of the single-instance route):
   ],
   "source": "live",
   "observed_at_ms": 1792500000000,
-  "exhausted": { "resets_at_ms": 1792828800000, "reset_known": true, "window": "seven_day", "cause": "window" }
+  "exhausted": {
+    "resets_at_ms": 1792828800000,
+    "reset_known": true,
+    "window": "seven_day",
+    "cause": "window",
+    "observed_at_ms": 1792500000000
+  }
 }
 ```
 
-`exhausted` is absent when the account serves (and disappears on its own once the reset has passed —
+`exhausted` is absent when the account serves (and disappears on its own once the reset has passed,
+or once `observed_at_ms` is older than `DATED_EXHAUSTION_STALENESS` and the next turn re-observes it —
 nothing runs in the background; the registry simply compares against its clock). `cause` is one of
 `window`, `rate_limited`, `out_of_credit`, `manual`. `now_ms` is the server's clock, so an interface
 shows the reset in the viewer's time zone without trusting its own.
@@ -364,10 +404,13 @@ is refused with its reason.
 
 ### What Auto does with it
 
-- **Exhausted is a hard exclusion**, until the reset: the candidate is rejected with
+- **Exhausted is a hard exclusion**, until the reset (or until the dated word goes stale and is
+  re-observed) — for the ACCOUNT's own windows only. The candidate is rejected with
   `quota_exhausted` carrying `resets_at_ms` and the window, and the routing reason says it in
   words. The exclusion is tested **before** health, because "unhealthy" could not say until when.
-  The instance becomes eligible again at its reset with nobody doing anything.
+  The instance becomes eligible again at its reset with nobody doing anything. A full **add-on**
+  window never reaches this branch, and a full **family** window becomes a model hold: Auto then
+  rejects only that family (`quota_exhausted_model`) and keeps the account for the others.
 - **Near the limit is a soft preference**, not an exclusion: past `QUOTA_NEAR_LIMIT` (0.9 of a
   window) the utility drops by `quota_weight` × how far past it is (full window = the whole
   weight). `quota_weight` lives in the routing settings beside `cost_weight` and `latency_weight`
@@ -383,8 +426,9 @@ is refused with its reason.
 ### Not verified here
 
 The windows and resets were exercised against a **recorded** `rate_limit_event` of the Claude Code
-CLI 2.1.296 and against fake providers, with a simulated clock — never against a real account that
-had actually run out. The Codex and HTTP-header mappings are nexus's and are covered there, not by
+CLI 2.1.296 and against fake providers, with a simulated clock. Since 11/11/2026 they also rest on a
+**real** account that had run out: the Fable refusal and the `seven_day_overage_included` window are
+in the tests, with what the same account answered afterwards. The Codex and HTTP-header mappings are nexus's and are covered there, not by
 the backend suite.
 
 ## Server settings
