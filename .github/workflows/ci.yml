@@ -661,12 +661,16 @@ jobs:
           # (mock AND this Neo4j); REQUIRED, so its neo4j:: half never skips silently.
           # anchor_sweeps_unscoped: the UNSCOPED anchor sweeps through the trait, one test
           # alone in its binary (they write to every session: no parallel neighbour allowed).
+          # neo4j_integer_fidelity: what the server holds is what the driver reads (the
+          # integers -16..=-1 were read 240..=255, see vendor/neo4rs/PATCH.md) and a state
+          # without timeout stays without one. The only place the vendored driver is tested.
           HARNESS_NEO4J_REQUIRED=1 cargo test --test integration_tests --test data_migrations \
             --test workspace_tests --test neo4j_store_tests --test harness_neo4j \
             --test anchor_sweeps_unscoped \
             --test neo4j_note_consent --test neo4j_decision_project --test neural_routing_indexes \
             --test neo4j_synapse_shadow --test store_conformance --test code_graph_stable_key \
-            --test file_paths --test neural_routing_sampler --test note_sweep
+            --test file_paths --test neural_routing_sampler --test note_sweep \
+            --test neo4j_integer_fidelity
 
   # ==========================================================================
   # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
@@ -958,7 +962,8 @@ jobs:
             --test file_paths \
             --test neural_routing_sampler \
             --test store_conformance \
-            --test note_sweep
+            --test note_sweep \
+            --test neo4j_integer_fidelity
 
       # (4) Merge every run above into one lcov.
       - name: Merge coverage runs into a single lcov

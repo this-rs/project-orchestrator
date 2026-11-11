@@ -5,4 +5,5 @@
 #[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
 
+pub mod harness;
 pub mod metamorphic;
