@@ -1068,12 +1068,13 @@ mod tests {
 
     /// QUOTA — the test that fails without the change: a pool {A, B} where A has a quota used up
     /// until T. Auto never picks A, and the alternative A says `quota_exhausted` with T (before the
-    /// change it said `unhealthy`, or A stayed a candidate when only the 429 text was known). At
-    /// T + 1 s, on the same registry and the same clock, A is eligible again: nobody did anything.
+    /// change it said `unhealthy`, or A stayed a candidate when only the 429 text was known). Within
+    /// the trust window A stays out; once the observation goes stale (before T) A is re-observed
+    /// and eligible again — nobody did anything.
     #[tokio::test]
     async fn a_provider_whose_quota_is_used_up_is_excluded_until_its_reset_then_back() {
         use crate::chat::provider::limits::ManualClock;
-        use crate::chat::provider::quota::QuotaRegistry;
+        use crate::chat::provider::quota::{QuotaRegistry, DATED_EXHAUSTION_STALENESS};
         use nexus_claude::agent::{QuotaSnapshot, QuotaStatus, QuotaWindow};
 
         let clock = Arc::new(ManualClock::at("2026-10-21T10:00:00Z"));
@@ -1115,8 +1116,10 @@ mod tests {
             }
         );
 
-        // A second before the reset it is still out; one second after, it is back.
-        clock.advance(std::time::Duration::from_secs(3 * 86_400 - 1));
+        // Within the trust window the dated word still holds it out; once the observation goes
+        // stale (before the reset) the next turn re-observes it: eligible again, nobody did
+        // anything.
+        clock.advance(DATED_EXHAUSTION_STALENESS - std::time::Duration::from_secs(1));
         req.pool = pool_at();
         assert!(req.pool[0].quota_exhausted.is_some());
         clock.advance(std::time::Duration::from_secs(2));
