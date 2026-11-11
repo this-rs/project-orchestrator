@@ -3716,7 +3716,13 @@ impl Neo4jClient {
         let mut result = self
             .graph
             .execute(query(
-                "MATCH (s:ChatSession) WHERE s.project_slug IS NOT NULL AND s.project_slug <> '' \
+                // `s.id IS NOT NULL` too: a session node created by something else (a test, an
+                // older writer) may carry `project_slug` without `id`, and reading a missing
+                // property ABORTS the whole backfill ("The property does not exist", measured on
+                // CI 11/11/2026, job Integration Tests). A malformed node is skipped and counted,
+                // never a reason to fail the sweep.
+                "MATCH (s:ChatSession) WHERE s.id IS NOT NULL \
+                 AND s.project_slug IS NOT NULL AND s.project_slug <> '' \
                  RETURN s.id AS id, s.project_slug AS slug ORDER BY s.id",
             ))
             .await?;
