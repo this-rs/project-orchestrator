@@ -150,6 +150,24 @@ pub struct ManualQuota {
     pub window: Option<String>,
 }
 
+/// A hold in force on ONE family of models, as an interface shows it.
+///
+/// The account-wide `exhausted` cannot say this: a provider refuses a FAMILY ("You've reached
+/// your Fable limit") while the account serves on the others, and an interface that only knew
+/// `exhausted` could not tell a person which model is out — nor offer to forget it (measured
+/// 11/11/2026: the Fable hold was invisible, and the person read it as "PO no longer uses Fable").
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ModelHoldView {
+    /// The family (or the exact model id) the provider refused: `Fable`, `opus`.
+    pub model: String,
+    /// Until when that family is out (epoch ms).
+    pub resets_at_ms: u64,
+    /// Whether the provider (or a person) named that instant; `false` is the fallback cooldown.
+    pub reset_known: bool,
+    /// When the hold was last CONFIRMED (epoch ms) — the age a person needs to judge it.
+    pub observed_at_ms: u64,
+}
+
 /// An entry as the API shows it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct QuotaView {
@@ -163,6 +181,10 @@ pub struct QuotaView {
     pub observed_at_ms: u64,
     /// The exhaustion in force NOW, if any.
     pub exhausted: Option<Exhaustion>,
+    /// The holds in force NOW on single families of models (`Fable`), empty when the account
+    /// serves everywhere. Filtered by the SAME rule the router applies ([`Self::model_exhausted`]),
+    /// so an interface never offers to forget something the next turn would not have honoured.
+    pub model_holds: Vec<ModelHoldView>,
 }
 
 /// Where the entries survive a restart.
@@ -326,6 +348,25 @@ fn model_of_window(kind: &str) -> Option<&str> {
         .map(|_| family)
 }
 
+/// Whether a hold on ONE family of models is in force at `now` — the ONE rule the router
+/// ([`QuotaRegistry::model_exhausted`]) and the interface ([`QuotaRegistry::views`]) both obey.
+///
+/// Two things void it: its reset has passed (the provider's counter reset by itself), or it is a
+/// DATED hold nobody re-confirmed for one [`DATED_EXHAUSTION_STALENESS`] window — the re-observation
+/// that lets a person's provider reset reach a model routing keeps out (measured 11/11/2026: the
+/// Fable hold was dated 3.7 days out and no turn could try it again to prove the reset had landed).
+/// The age is the HOLD's, not the entry's: a snapshot about another window must not make an old
+/// refusal look fresh.
+fn family_hold_in_force(hold: &Exhaustion, entry: &QuotaEntry, now: u64) -> bool {
+    hold.resets_at_ms > now
+        && (!hold.reset_known
+            || hold
+                .observed_at_ms
+                .unwrap_or(entry.observed_at_ms)
+                .saturating_add(DATED_EXHAUSTION_STALENESS.as_millis() as u64)
+                > now)
+}
+
 /// Whether a stored hold can never exclude the account: a LIVE window report about an add-on
 /// allowance ([`WindowScope::AddOn`]). The 10/11 and 11/11 shapes were both this, and the entry
 /// survived a restart: dropping it on load repairs the store instead of waiting for a refusal that
@@ -336,6 +377,24 @@ fn condemned_by_an_add_on(exhaustion: &Exhaustion) -> bool {
             .window
             .as_deref()
             .is_some_and(|kind| window_scope(kind) == WindowScope::AddOn)
+}
+
+/// The family holds of `entry` that are in force at `now`, sorted by name so the answer does not
+/// depend on the order of a `HashMap`.
+fn family_holds_in_force(entry: &QuotaEntry, now: u64) -> Vec<ModelHoldView> {
+    let mut holds: Vec<ModelHoldView> = entry
+        .model_holds
+        .iter()
+        .filter(|(_, hold)| family_hold_in_force(hold, entry, now))
+        .map(|(model, hold)| ModelHoldView {
+            model: model.clone(),
+            resets_at_ms: hold.resets_at_ms,
+            reset_known: hold.reset_known,
+            observed_at_ms: hold.observed_at_ms.unwrap_or(entry.observed_at_ms),
+        })
+        .collect();
+    holds.sort_by(|a, b| a.model.cmp(&b.model));
+    holds
 }
 
 /// The account-wide hold of `entry` that is in force at `now`, if any — the ONE rule the router
@@ -877,20 +936,8 @@ impl QuotaRegistry {
                     .find(|(held, _)| same_family(held, model))
                     .map(|(_, held)| held)
             })
+            .filter(|e| family_hold_in_force(e, entry, now))
             .cloned()
-            .filter(|e| e.resets_at_ms > now)
-            // A hold nobody re-confirmed for DATED_EXHAUSTION_STALENESS is re-observed instead of
-            // lasting for the window's date: the same rule as the account-wide one, and the only
-            // way a person's provider reset reaches a model that routing keeps out (measured
-            // 11/11/2026: the Fable hold was dated 3.7 days out and no turn could try it again
-            // to prove the reset had landed).
-            .filter(|e| {
-                !e.reset_known
-                    || e.observed_at_ms
-                        .unwrap_or(entry.observed_at_ms)
-                        .saturating_add(DATED_EXHAUSTION_STALENESS.as_millis() as u64)
-                        > now
-            })
     }
 
     /// How full the FULLEST window of `instance` is (`0.0..=1.0`): what the scorer turns into a
@@ -928,6 +975,7 @@ impl QuotaRegistry {
                 // The SAME rule as the router: an interface must never show an exclusion that
                 // the next turn would not apply (a stale dated hold, or an add-on window).
                 exhausted: hold_in_force(entry, now),
+                model_holds: family_holds_in_force(entry, now),
             })
             .collect();
         views.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
@@ -1039,6 +1087,68 @@ mod tests {
         assert_eq!(view.windows.len(), 2);
         assert_eq!(view.windows[1].status, QuotaStatus::Exhausted);
         assert_eq!(registry.pressure("claude-code"), Some(1.0));
+    }
+
+    /// An interface must be able to SAY which family is out — `exhausted` alone cannot, and a
+    /// person reading only that concluded "PO no longer uses Fable" (measured 11/11/2026) while the
+    /// router was rejecting it with `quota_exhausted_model`.
+    #[test]
+    fn the_view_names_the_family_a_hold_keeps_out() {
+        let (_clock, registry) = registry();
+        let reset = ms_of("2026-11-14T08:00:00Z");
+        registry.mark_model_rate_limited("claude-code", "Fable", Some(reset), None);
+        let view = registry.view("claude-code").expect("known");
+        assert_eq!(
+            view.exhausted, None,
+            "the ACCOUNT serves: only a family is out"
+        );
+        assert_eq!(
+            view.model_holds,
+            vec![ModelHoldView {
+                model: "Fable".into(),
+                resets_at_ms: reset,
+                reset_known: true,
+                observed_at_ms: registry.now_ms(),
+            }]
+        );
+    }
+
+    /// …and it must not outlive the rule the router applies: once a dated hold is re-observable,
+    /// the interface stops claiming it (no button to forget something already forgotten).
+    #[test]
+    fn a_stale_family_hold_leaves_the_view() {
+        let (clock, registry) = registry();
+        let reset = ms_of("2026-11-14T08:00:00Z");
+        registry.mark_model_rate_limited("claude-code", "Fable", Some(reset), None);
+        clock.advance(DATED_EXHAUSTION_STALENESS + Duration::from_secs(1));
+        assert!(registry
+            .view("claude-code")
+            .expect("known")
+            .model_holds
+            .is_empty());
+        assert_eq!(
+            registry.model_exhausted("claude-code", "claude-fable-5-1"),
+            None,
+            "the router and the view agree"
+        );
+    }
+
+    /// A serving account shows no holds at all: the menu must have nothing to offer.
+    #[test]
+    fn a_serving_account_shows_no_family_holds() {
+        let (_clock, registry) = registry();
+        registry.observe(
+            "claude-code",
+            &QuotaSnapshot::live(vec![QuotaWindow {
+                kind: "seven_day".into(),
+                utilization: Some(0.38),
+                resets_at_ms: Some(ms_of("2026-11-14T08:00:00Z")),
+                status: QuotaStatus::Allowed,
+            }]),
+        );
+        let view = registry.view("claude-code").expect("observed");
+        assert_eq!(view.exhausted, None);
+        assert!(view.model_holds.is_empty());
     }
 
     /// The distinction the whole rule rests on, asserted straight on the helper: a window's NAME

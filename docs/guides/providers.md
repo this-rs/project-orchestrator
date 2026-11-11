@@ -382,9 +382,18 @@ One entry of `quotas` (and the `quota` of the single-instance route):
     "window": "seven_day",
     "cause": "window",
     "observed_at_ms": 1792500000000
-  }
+  },
+  "model_holds": [
+    { "model": "Fable", "resets_at_ms": 1794643200000, "reset_known": true, "observed_at_ms": 1792500000000 }
+  ]
 }
 ```
+
+`model_holds` names the families that are out while the ACCOUNT serves (see the three scopes above) —
+it is what lets a screen say "Fable jusqu'au 14/11" instead of leaving a person to conclude that PO
+no longer uses that model. It is empty when the account serves everywhere, and it follows the same
+rule as the router: a hold whose reset has passed, or that nobody re-confirmed for
+`DATED_EXHAUSTION_STALENESS`, is not listed.
 
 `exhausted` is absent when the account serves (and disappears on its own once the reset has passed,
 or once `observed_at_ms` is older than `DATED_EXHAUSTION_STALENESS` and the next turn re-observes it —
