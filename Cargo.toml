@@ -464,3 +464,10 @@ name = "mem_embed"
 required-features = ["local-embeddings"]
 
 
+
+# Measures of the obrain backend at scale (cost per write, per read, open time, on a base of N
+# nodes): `cargo run --release --features obrain-backend --example obrain_mesures -- <nodes> <edges>`.
+# Writes only into a temporary directory it creates.
+[[example]]
+name = "obrain_mesures"
+required-features = ["obrain-backend"]
