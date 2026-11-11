@@ -4,20 +4,41 @@
 //! What the cross-backend conformance suite (`tests/store_conformance.rs`,
 //! `obrain_project::*`) cannot say, because it is specific to this backend:
 //! how it is selected and configured, that it survives a close and a reopen,
-//! that it is the single writer of its base, and that everything it has not
-//! ported refuses by name.
+//! that a crash in the middle of a write leaves a base that opens, that it is
+//! the single writer of its base, that readers do not wait behind an fsync, and
+//! that everything it has not ported refuses by name.
 //!
 //! Every base opened here lives in a temporary directory created by the test.
 //! No test reads a configured location: the configuration itself is a YAML
-//! file written in that same temporary directory.
+//! file written in that same temporary directory, and a test that would be
+//! overridden by the environment FAILS naming the variable (it never passes
+//! without having checked).
 
 use project_orchestrator::storage::StorageBackend;
 use project_orchestrator::Config;
 use std::path::Path;
 
+/// The variables that would override the YAML of these tests. A test that
+/// loads a configuration refuses to run if one is set: passing silently would
+/// be a test that verified nothing.
+fn env_propre() {
+    for v in [
+        "STORAGE_BACKEND",
+        "STORAGE_OBRAIN_PATH",
+        "STORAGE_OBRAIN_CREATE",
+    ] {
+        assert!(
+            std::env::var_os(v).is_none(),
+            "{v} is set in the environment of this test and would override the YAML it loads: \
+             run it with `env -u {v} cargo test …`"
+        );
+    }
+}
+
 /// A configuration loaded the way the server loads it — from a YAML file with
 /// its NESTED keys — pointing at nothing outside `dir`.
 fn config_from_yaml(dir: &Path, storage_section: &str) -> Config {
+    env_propre();
     let file = dir.join("config.yaml");
     std::fs::write(&file, format!("setup_completed: true\n{storage_section}")).unwrap();
     Config::from_yaml_and_env(Some(&file)).unwrap()
@@ -35,11 +56,7 @@ async fn refusal(config: &Config) -> String {
 async fn an_unknown_backend_names_itself_and_the_three_accepted_values() {
     let dir = tempfile::tempdir().unwrap();
     let config = config_from_yaml(dir.path(), "storage:\n  backend: mystery\n");
-    if config.storage_backend != "mystery" {
-        // STORAGE_BACKEND is set in this shell and wins over the file.
-        eprintln!("skipped: STORAGE_BACKEND overrides the YAML of this test");
-        return;
-    }
+    assert_eq!(config.storage_backend, "mystery");
     let msg = refusal(&config).await;
     for expected in ["mystery", "'default'", "'memory'", "'obrain'"] {
         assert!(msg.contains(expected), "« {expected} » missing from: {msg}");
@@ -54,14 +71,11 @@ async fn without_the_feature_obrain_is_refused_at_startup_and_says_why() {
     let config = config_from_yaml(
         dir.path(),
         &format!(
-            "storage:\n  backend: obrain\n  obrain_path: \"{}\"\n",
+            "storage:\n  backend: obrain\n  obrain_path: \"{}\"\n  obrain_create: true\n",
             base.display()
         ),
     );
-    if config.storage_backend != "obrain" {
-        eprintln!("skipped: STORAGE_BACKEND overrides the YAML of this test");
-        return;
-    }
+    assert_eq!(config.storage_backend, "obrain");
     let msg = refusal(&config).await;
     assert!(
         msg.contains("obrain") && msg.contains("obrain-backend"),
@@ -83,9 +97,12 @@ mod with_the_feature {
     use project_orchestrator::neo4j::models::{ProgressKind, ProjectNode, ProjectProfile};
     use project_orchestrator::neo4j::traits::*;
     use project_orchestrator::obrain::{
-        defauts_conserves, methodes_portees, methodes_refusees, NonPorte, ObrainGraphStore,
-        ObrainSearchStore, ObrainTrajectoryStore,
+        defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees, Creation,
+        Durabilite, NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture,
+        REFUS_ECRITS_A_LA_MAIN,
     };
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
     use uuid::Uuid;
 
     fn a_project(name: &str) -> ProjectNode {
@@ -114,7 +131,21 @@ mod with_the_feature {
 
     async fn open(path: &Path) -> ObrainGraphStore {
         let path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || ObrainGraphStore::open(path))
+        tokio::task::spawn_blocking(move || ObrainGraphStore::open(path, Creation::Permise))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn try_open(path: &Path, creation: Creation) -> anyhow::Result<ObrainGraphStore> {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || ObrainGraphStore::open(path, creation))
+            .await
+            .unwrap()
+    }
+
+    async fn temporary(durabilite: Durabilite) -> ObrainGraphStore {
+        tokio::task::spawn_blocking(move || ObrainGraphStore::open_temporary_avec(durabilite))
             .await
             .unwrap()
             .unwrap()
@@ -127,8 +158,23 @@ mod with_the_feature {
             .unwrap_or_else(|| panic!("expected a NonPorte, got: {err:#}"))
     }
 
+    /// Write straight into a base through the engine, the way another writer
+    /// (a migration, a crash) would leave it: `f` runs, the WAL is committed,
+    /// the base is closed.
+    async fn write_foreign(base: &Path, f: impl FnOnce(&obrain_engine::ObrainDB) + Send + 'static) {
+        let base = base.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let db = obrain_engine::ObrainDB::open(&base).unwrap();
+            f(&db);
+            db.commit_wal().unwrap();
+            db.close().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
     // ------------------------------------------------------------------
-    // Selection and configuration
+    // Selection, configuration, and the guards of opening
     // ------------------------------------------------------------------
 
     #[tokio::test]
@@ -138,18 +184,16 @@ mod with_the_feature {
         let config = config_from_yaml(
             dir.path(),
             &format!(
-                "storage:\n  backend: obrain\n  obrain_path: \"{}\"\n",
+                "storage:\n  backend: obrain\n  obrain_path: \"{}\"\n  obrain_create: true\n",
                 base.display()
             ),
         );
-        if config.storage_backend != "obrain"
-            || config.storage_obrain_path.as_deref() != Some(base.to_str().unwrap())
-        {
-            // An environment override would send the factory elsewhere than
-            // this temporary directory: never follow it.
-            eprintln!("skipped: STORAGE_BACKEND / STORAGE_OBRAIN_PATH override the YAML");
-            return;
-        }
+        assert_eq!(config.storage_backend, "obrain");
+        assert_eq!(
+            config.storage_obrain_path.as_deref(),
+            Some(base.to_str().unwrap())
+        );
+        assert!(config.storage_obrain_create);
 
         // Neither Neo4j nor Meilisearch is configured to anything reachable
         // from this test: the obrain backend must not need them.
@@ -188,15 +232,112 @@ mod with_the_feature {
     async fn obrain_without_a_path_is_refused_and_names_both_keys() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_from_yaml(dir.path(), "storage:\n  backend: obrain\n");
-        if config.storage_backend != "obrain" || config.storage_obrain_path.is_some() {
-            eprintln!("skipped: STORAGE_BACKEND / STORAGE_OBRAIN_PATH override the YAML");
-            return;
-        }
+        assert_eq!(config.storage_backend, "obrain");
+        assert!(config.storage_obrain_path.is_none());
         let msg = refusal(&config).await;
         assert!(
             msg.contains("storage.obrain_path") && msg.contains("STORAGE_OBRAIN_PATH"),
             "the refusal names the YAML key and the variable: {msg}"
         );
+    }
+
+    /// A relative path depends on where the process happens to start.
+    #[tokio::test]
+    async fn a_relative_path_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_from_yaml(
+            dir.path(),
+            "storage:\n  backend: obrain\n  obrain_path: \"data/obrain\"\n  obrain_create: true\n",
+        );
+        let msg = refusal(&config).await;
+        assert!(
+            msg.contains("relatif") && msg.contains("absolu"),
+            "names the problem and the fix: {msg}"
+        );
+        assert!(
+            !Path::new("data/obrain").exists(),
+            "nothing was created relative to the working directory"
+        );
+    }
+
+    /// A typo in the path would otherwise be a brand-new empty base that PO
+    /// then serves, with zero projects, as if nothing were wrong.
+    #[tokio::test]
+    async fn a_missing_or_empty_directory_is_not_a_base_unless_creation_is_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = |path: &Path, create: bool| {
+            config_from_yaml(
+                dir.path(),
+                &format!(
+                    "storage:\n  backend: obrain\n  obrain_path: \"{}\"\n  obrain_create: {create}\n",
+                    path.display()
+                ),
+            )
+        };
+
+        let typo = dir.path().join("obrian");
+        let msg = refusal(&config(&typo, false)).await;
+        assert!(
+            msg.contains("storage.obrain_create") && msg.contains("répertoire absent"),
+            "{msg}"
+        );
+        assert!(!typo.exists(), "a refused open creates nothing");
+
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let msg = refusal(&config(&empty, false)).await;
+        assert!(msg.contains("répertoire vide"), "{msg}");
+        assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
+
+        // Creation is a decision, and then it works — once; the next start
+        // needs no flag (the base exists).
+        let created = dir.path().join("created");
+        StorageBackend::from_config(&config(&created, true))
+            .await
+            .unwrap();
+        assert!(created.join("substrate.meta").is_file());
+        // The first start's store is dropped, so the base is free again.
+        StorageBackend::from_config(&config(&created, false))
+            .await
+            .expect("an existing base opens without the creation flag");
+    }
+
+    /// The engine writes its own files into a directory it is given; over a
+    /// directory that is something else, that is destruction.
+    #[tokio::test]
+    async fn a_directory_that_is_not_a_base_is_never_written_into() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("somebody-elses-data");
+        std::fs::create_dir(&other).unwrap();
+        let precious: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        // The name of an engine file, without the `substrate.meta` that makes a
+        // directory a base: the case where the engine would create over it.
+        std::fs::write(other.join("substrate.nodes"), &precious).unwrap();
+        std::fs::write(other.join("notes.txt"), b"keep me").unwrap();
+
+        for creation in [Creation::Interdite, Creation::Permise] {
+            let err = try_open(&other, creation).await.err().unwrap();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("n'est pas vide") && msg.contains("Rien n'a été touché"),
+                "{creation:?}: {msg}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(other.join("substrate.nodes")).unwrap(),
+            precious
+        );
+        assert_eq!(std::fs::read(other.join("notes.txt")).unwrap(), b"keep me");
+        assert_eq!(std::fs::read_dir(&other).unwrap().count(), 2);
+
+        // A plain file is not a base either.
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        let msg = format!(
+            "{:#}",
+            try_open(&file, Creation::Permise).await.err().unwrap()
+        );
+        assert!(msg.contains("n'est pas un répertoire"), "{msg}");
     }
 
     // ------------------------------------------------------------------
@@ -249,6 +390,11 @@ mod with_the_feature {
         drop(store);
 
         let store = open(&base).await;
+        assert_eq!(
+            *store.rapport_d_ouverture(),
+            RapportOuverture::default(),
+            "a clean close leaves nothing to repair"
+        );
         let after = store.list_projects().await.unwrap();
         assert_eq!(
             after.iter().map(fields).collect::<Vec<_>>(),
@@ -282,10 +428,12 @@ mod with_the_feature {
                 Some(p.id)
             );
         }
-        let renamed = store
-            .get_project(projects_id(&before, "persist renamed"))
-            .await;
-        let renamed = renamed.unwrap().unwrap();
+        let renamed = before
+            .iter()
+            .find(|p| p.name == "persist renamed")
+            .unwrap()
+            .id;
+        let renamed = store.get_project(renamed).await.unwrap().unwrap();
         assert_eq!(renamed.description, Some(String::new()));
         assert_eq!(renamed.root_path, "/nonexistent/obrain-persist");
         assert_eq!(renamed.profile, ProjectProfile::Work);
@@ -310,51 +458,216 @@ mod with_the_feature {
         assert_eq!(store.list_projects().await.unwrap().len(), 4);
     }
 
-    fn projects_id(projects: &[ProjectNode], name: &str) -> Uuid {
-        projects.iter().find(|p| p.name == name).unwrap().id
+    // ------------------------------------------------------------------
+    // Durability: the fsync, proved by obrain's own oracle
+    // ------------------------------------------------------------------
+
+    /// obrain's oracle counts the fsyncs the WAL has REALLY run. Between two
+    /// acknowledgements of the single writer it must have grown: every
+    /// acknowledged write ran a fsync before it answered.
+    #[tokio::test]
+    async fn every_acknowledged_write_ran_a_wal_fsync() {
+        let store = temporary(Durabilite::Wal).await;
+        let last = std::cell::Cell::new(store.fsyncs_du_wal().expect("a persistent base"));
+        let ran = |quoi: &str| {
+            let n = store.fsyncs_du_wal().unwrap();
+            assert!(
+                n > last.get(),
+                "{quoi}: no WAL fsync ran since the previous acknowledgement ({} → {n})",
+                last.get()
+            );
+            last.set(n);
+        };
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let p = a_project(&format!("durable {i}"));
+            store.create_project(&p).await.unwrap();
+            ran("create_project");
+            ids.push(p);
+        }
+        store
+            .update_project(ids[0].id, Some("durable renamed".into()), None, None, None)
+            .await
+            .unwrap();
+        ran("update_project");
+        store.update_project_synced(ids[1].id).await.unwrap();
+        ran("update_project_synced");
+        store
+            .update_project_analytics_timestamp(ids[2].id)
+            .await
+            .unwrap();
+        ran("update_project_analytics_timestamp");
+        // Delete is refused while other data lives in the base; here only projects do.
+        store.delete_project(ids[3].id, "x").await.unwrap();
+        ran("delete_project");
     }
 
-    /// A write does not wait for a clean close: the files as they are right
-    /// after the acknowledgement, copied while the base is still open, reopen
-    /// with the write in them. This is the PROCESS-crash model (what the OS
-    /// holds survives); it says nothing of a power cut. Measured: the test
-    /// passes just the same with `commit_wal()` removed from the adapter, so
-    /// it does not prove the fsync — only that nothing waits for `close`.
+    /// The same check, without the fsync: it must go RED. A durability test that
+    /// cannot fail proves nothing (the first version of this file had one).
     #[tokio::test]
-    async fn an_acknowledged_write_survives_without_a_clean_close() {
+    async fn without_the_fsync_the_oracle_sees_none() {
+        let store = temporary(Durabilite::Aucune).await;
+        let before = store.fsyncs_du_wal().unwrap();
+        for i in 0..10 {
+            store
+                .create_project(&a_project(&format!("not durable {i}")))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.fsyncs_du_wal().unwrap(),
+            before,
+            "with no durability step, no fsync runs — the check above would fail"
+        );
+    }
+
+    /// A value past the blob threshold is not recovered by the WAL: the write
+    /// that carries it must run the full flush too (measured: lost after SIGKILL
+    /// otherwise, see `SEUIL_COLONNE_BLOB`). Observed through the engine's own
+    /// counter of fsyncs: a flush runs more of them than the WAL fsync alone.
+    #[tokio::test]
+    async fn a_write_past_the_blob_threshold_pays_the_full_flush() {
+        let store = temporary(Durabilite::Wal).await;
+        let fsyncs = || store.fsyncs_du_wal().unwrap();
+        let mut small = a_project("small");
+        small.description = Some("x".repeat(256));
+        let t0 = fsyncs();
+        store.create_project(&small).await.unwrap();
+        let small_cost = fsyncs() - t0;
+        let mut big = a_project("big");
+        big.description = Some("x".repeat(257));
+        let t1 = fsyncs();
+        store.create_project(&big).await.unwrap();
+        let big_cost = fsyncs() - t1;
+        assert!(small_cost >= 1, "256 bytes: the WAL fsync ran");
+        assert!(
+            big_cost > small_cost,
+            "257 bytes: the full flush too ({big_cost} fsyncs against {small_cost})"
+        );
+    }
+
+    /// If the fsync fails, the write is applied in memory and the disk is in an
+    /// unknown state. The store says so, and stops: nothing is read or written
+    /// on a base whose durability is unknown, until a restart replays the log.
+    #[tokio::test]
+    async fn a_failed_fsync_makes_the_store_refuse_everything_and_says_why() {
+        let store = temporary(Durabilite::EchoueAPourTest).await;
+        let p = a_project("fsync fails");
+        let err = store.create_project(&p).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("INDÉTERMINÉ") && msg.contains("durabilité"),
+            "the error says the state is unknown: {msg}"
+        );
+        // Nothing is served, nothing more is accepted.
+        for refus in [
+            store.get_project(p.id).await.map(|_| ()),
+            store.list_projects().await.map(|_| ()),
+            store.create_project(&a_project("after")).await,
+        ] {
+            let msg = format!("{:#}", refus.unwrap_err());
+            assert!(msg.contains("indéterminé"), "{msg}");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Locks: readers do not wait behind an fsync
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn readers_do_not_wait_behind_a_slow_fsync() {
+        // Every write waits 700 ms for its fsync.
+        let store = Arc::new(temporary(Durabilite::LenteAPourTest(700)).await);
+        let p = a_project("read while a write fsyncs");
+        let other = a_project("another project");
+        store.create_project(&p).await.unwrap();
+        store.create_project(&other).await.unwrap();
+
+        // An UPDATE in flight (in-memory part done, fsync running) and a
+        // CREATION in flight (fsync running before it is published).
+        let writer = store.clone();
+        let id = p.id;
+        let update = tokio::spawn(async move {
+            writer
+                .update_project(id, Some("renamed under fsync".into()), None, None, None)
+                .await
+        });
+        let creator = store.clone();
+        let created = a_project("created under fsync");
+        let creating = created.clone();
+        let create = tokio::spawn(async move { creator.create_project(&creating).await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let started = Instant::now();
+        let mut slowest = Duration::ZERO;
+        let mut reads = 0u32;
+        while started.elapsed() < Duration::from_millis(400) {
+            let t = Instant::now();
+            assert!(store.get_project(other.id).await.unwrap().is_some());
+            assert!(store.get_project(p.id).await.unwrap().is_some());
+            assert!(store
+                .get_project_by_slug(&other.slug)
+                .await
+                .unwrap()
+                .is_some());
+            store.list_projects().await.unwrap();
+            slowest = slowest.max(t.elapsed());
+            reads += 1;
+        }
+        assert!(
+            !update.is_finished() && !create.is_finished(),
+            "the writes must still be waiting for their fsync while we read"
+        );
+        assert!(reads > 100, "the readers were not starved ({reads} rounds)");
+        assert!(
+            slowest < Duration::from_millis(300),
+            "a read took {slowest:?} while writes waited 700 ms for their fsync"
+        );
+        // A creation is visible only once durable.
+        assert!(
+            store.get_project(created.id).await.unwrap().is_none(),
+            "a project is not visible before its fsync"
+        );
+        update.await.unwrap().unwrap();
+        create.await.unwrap().unwrap();
+        assert!(store.get_project(created.id).await.unwrap().is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // Close
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_closed_store_refuses_every_operation_and_the_base_opens_again() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
-        let copy = dir.path().join("copy");
-
         let store = open(&base).await;
-        let p = a_project("durable");
+        let p = a_project("closed");
         store.create_project(&p).await.unwrap();
-        store.update_project_synced(p.id).await.unwrap();
-        let written = store.get_project(p.id).await.unwrap().unwrap();
+        store.close().await.unwrap();
+        store.close().await.unwrap(); // idempotent
 
-        // The files as they are on disk NOW, while the base is still open and
-        // nothing has closed it: what a crash at this instant would leave.
-        copy_dir(&base, &copy);
-
-        let reopened = open(&copy).await;
-        assert_eq!(
-            fields(&reopened.get_project(p.id).await.unwrap().unwrap()),
-            fields(&written)
-        );
-        drop(store);
-    }
-
-    fn copy_dir(from: &Path, to: &Path) {
-        std::fs::create_dir_all(to).unwrap();
-        for entry in std::fs::read_dir(from).unwrap() {
-            let entry = entry.unwrap();
-            let target = to.join(entry.file_name());
-            if entry.file_type().unwrap().is_dir() {
-                copy_dir(&entry.path(), &target);
-            } else {
-                std::fs::copy(entry.path(), target).unwrap();
-            }
+        let refused = [
+            store.get_project(p.id).await.map(|_| ()),
+            store.get_project_by_slug(&p.slug).await.map(|_| ()),
+            store.path_policy(p.id).await.map(|_| ()),
+            store.list_projects().await.map(|_| ()),
+            store.create_project(&a_project("after close")).await,
+            store
+                .update_project(p.id, Some("x".into()), None, None, None)
+                .await,
+            store.update_project_synced(p.id).await,
+            store.update_project_analytics_timestamp(p.id).await,
+            store.delete_project(p.id, "closed").await,
+        ];
+        assert_eq!(refused.len(), 9, "every method of ProjectStore");
+        for r in refused {
+            let msg = format!("{:#}", r.unwrap_err());
+            assert!(msg.contains("fermée"), "{msg}");
         }
+        drop(store);
+        let reopened = open(&base).await;
+        assert!(reopened.get_project(p.id).await.unwrap().is_some());
     }
 
     // ------------------------------------------------------------------
@@ -367,10 +680,7 @@ mod with_the_feature {
         let base = dir.path().join("base");
         let first = open(&base).await;
 
-        let again = base.clone();
-        let second = tokio::task::spawn_blocking(move || ObrainGraphStore::open(again))
-            .await
-            .unwrap();
+        let second = try_open(&base, Creation::Interdite).await;
         assert!(
             second.is_err(),
             "a second writable handle on the same base must be refused"
@@ -386,34 +696,366 @@ mod with_the_feature {
     }
 
     // ------------------------------------------------------------------
-    // A base this backend did not write (what a migration will produce)
+    // Other PROCESSES: the exclusive lock, and kill -9
+    //
+    // The test re-executes its own binary as the child (`--exact`, with the
+    // directory in the environment). The same function is parent and child, so
+    // it is one test that always runs — never a child case that passes when
+    // run alone.
     // ------------------------------------------------------------------
 
-    /// A `Project` node written straight through obrain, with a relationship
-    /// to a node of a domain this backend has not ported.
-    fn write_foreign_base(base: &Path, id: Uuid, slug: &str) {
-        let db = obrain_engine::ObrainDB::open(base).unwrap();
-        let project = db.create_node_with_props(
-            &["Project"],
-            vec![
-                ("id", Value::from(id.to_string())),
-                ("name", Value::from("migrated")),
-                ("slug", Value::from(slug)),
-                (
-                    "created_at",
-                    Value::from("2026-01-02T03:04:05.123456789+00:00"),
-                ),
-                ("default_note_energy", Value::from(0.25)),
-                ("scaffolding_override", Value::from(3_i64)),
-                ("last_synced", Value::from("2026-02-03T04:05:06+00:00")),
-            ],
-        );
-        let plan = db.create_node_with_props(&["Plan"], vec![("id", Value::from("p1"))]);
-        db.create_edge(project, plan, "HAS_PLAN");
-        db.commit_wal().unwrap();
-        db.close().unwrap();
+    const ENV_VERROU: &str = "OBRAIN_PO_TEST_ENFANT_VERROU";
+    const ENV_KILL9: &str = "OBRAIN_PO_TEST_ENFANT_KILL9";
+
+    fn lancer_enfant(
+        cas: &str,
+        env: &str,
+        dir: &Path,
+        autres: &[(&str, &str)],
+    ) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([cas, "--exact", "--nocapture", "--test-threads=1"])
+            .env(env, dir)
+            .envs(autres.iter().copied())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the child")
     }
 
+    async fn attendre(marqueur: &Path, quoi: &str) {
+        for _ in 0..1200 {
+            if marqueur.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the child never wrote {quoi}");
+    }
+
+    /// The exclusive lock is obrain's, and it is what makes PO the single writer
+    /// ACROSS processes. A second process is refused; when the first one dies
+    /// (kill -9, no close) the lock is released by the system.
+    #[tokio::test]
+    async fn another_process_cannot_open_the_base_and_a_dead_one_releases_it() {
+        if let Ok(dir) = std::env::var(ENV_VERROU) {
+            let dir = std::path::PathBuf::from(dir);
+            let store = open(&dir.join("base")).await;
+            let p = a_project("held by the child");
+            store.create_project(&p).await.unwrap();
+            std::fs::write(dir.join("pret"), p.id.to_string()).unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = lancer_enfant(
+            "with_the_feature::another_process_cannot_open_the_base_and_a_dead_one_releases_it",
+            ENV_VERROU,
+            dir.path(),
+            &[],
+        );
+        attendre(&dir.path().join("pret"), "its marker").await;
+        let held_id: Uuid = std::fs::read_to_string(dir.path().join("pret"))
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        let refused = try_open(&dir.path().join("base"), Creation::Interdite).await;
+        let msg = match refused {
+            Ok(_) => {
+                child.kill().ok();
+                panic!("a second PROCESS opened a base held for writing")
+            }
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(msg.contains("ouverture de la base obrain"), "{msg}");
+
+        child.kill().unwrap(); // SIGKILL: no close, no flush
+        child.wait().unwrap();
+        let store = open(&dir.path().join("base")).await;
+        assert!(
+            store.get_project(held_id).await.unwrap().is_some(),
+            "what the dead holder acknowledged is there"
+        );
+    }
+
+    /// A process killed with SIGKILL in the middle of creating projects, over and
+    /// over. Two kinds of rounds, alternating:
+    ///
+    /// - `wal` (production durability): every project the child ACKNOWLEDGED is
+    ///   there, whole, after the kill — long descriptions (blob column) and short
+    ///   ones alike;
+    /// - `aucune` (no fsync, no flush: the child is mostly INSIDE a creation when
+    ///   the kill lands): nothing acknowledged is promised, but the base must
+    ///   reopen, repair what was interrupted, quarantine nothing, and list.
+    ///
+    /// This is the process-crash model (the page cache survives). What a power cut
+    /// does is obrain's guarantee.
+    #[tokio::test]
+    async fn kill9_during_creations_loses_no_acknowledged_project_and_never_blocks_the_reopen() {
+        if let Ok(dir) = std::env::var(ENV_KILL9) {
+            let dir = std::path::PathBuf::from(dir);
+            let mode = std::env::var("OBRAIN_PO_TEST_ENFANT_MODE").unwrap();
+            let durabilite = if mode == "wal" {
+                Durabilite::Wal
+            } else {
+                Durabilite::Aucune
+            };
+            let store = {
+                let base = dir.join("base");
+                tokio::task::spawn_blocking(move || {
+                    ObrainGraphStore::open_avec(base, Creation::Permise, durabilite)
+                })
+                .await
+                .unwrap()
+                .unwrap()
+            };
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(format!("acquittes-{mode}")))
+                .unwrap();
+            let mut i = 0u32;
+            loop {
+                let mut p = a_project("kill9");
+                p.name = format!("kill9 {}", p.id);
+                p.description = Some(description_du_test(p.id, i, mode == "wal"));
+                i += 1;
+                store.create_project(&p).await.unwrap();
+                use std::io::Write as _;
+                writeln!(log, "{}\t{}", p.id, i - 1).unwrap();
+            }
+        }
+
+        const TOURS: usize = 12;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let (mut repares, mut quarantaine) = (RapportOuverture::default(), 0usize);
+        let (mut vus_wal, mut longues) = (0usize, 0usize);
+        for tour in 0..TOURS {
+            let mode = if tour % 2 == 0 { "wal" } else { "aucune" };
+            let acquittes = dir.path().join(format!("acquittes-{mode}"));
+            let compte = || std::fs::read_to_string(&acquittes).map_or(0, |s| s.lines().count());
+            let avant = compte();
+            let mut child = lancer_enfant(
+                "with_the_feature::kill9_during_creations_loses_no_acknowledged_project_and_never_blocks_the_reopen",
+                ENV_KILL9,
+                dir.path(),
+                &[("OBRAIN_PO_TEST_ENFANT_MODE", mode)],
+            );
+            // Wait until the child is creating, then a delay that varies per round.
+            for _ in 0..2400 {
+                if compte() >= avant + 5 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            tokio::time::sleep(Duration::from_micros(1_500 * (tour as u64 % 9 + 1))).await;
+            child.kill().unwrap();
+            child.wait().unwrap();
+
+            let store = open(&base).await;
+            let rapport = store.rapport_d_ouverture().clone();
+            repares.brouillons_supprimes += rapport.brouillons_supprimes;
+            repares.marqueurs_retires += rapport.marqueurs_retires;
+            repares.chemins_repares += rapport.chemins_repares;
+            quarantaine += rapport.en_quarantaine.len();
+            assert!(
+                rapport.en_quarantaine.is_empty(),
+                "round {tour} ({mode}): a creation killed half-way must be REPAIRED, never \
+                 quarantined: {rapport:?}"
+            );
+
+            if mode == "wal" {
+                let log = std::fs::read_to_string(&acquittes).unwrap();
+                for ligne in log.lines() {
+                    let (id, i) = ligne.split_once('\t').unwrap();
+                    let (id, i): (Uuid, u32) = (id.parse().unwrap(), i.parse().unwrap());
+                    let p = store.get_project(id).await.unwrap().unwrap_or_else(|| {
+                        panic!("round {tour}: acknowledged project {id} is gone")
+                    });
+                    assert_eq!(p.name, format!("kill9 {id}"));
+                    assert_eq!(p.slug, format!("obrain-{id}"));
+                    let attendue = description_du_test(id, i, true);
+                    longues += usize::from(attendue.len() > 256);
+                    assert_eq!(
+                        p.description.as_deref(),
+                        Some(attendue.as_str()),
+                        "round {tour}: description of {id} ({} bytes) must survive the kill",
+                        attendue.len()
+                    );
+                    vus_wal += 1;
+                }
+            }
+            // Whatever the round was, every project the base lists is WHOLE: a creation
+            // killed after its ninth property would still decode (the last two fields have
+            // defaults), with `watch_enabled` true where the child wrote false.
+            for p in store.list_projects().await.unwrap() {
+                let id = p.id;
+                assert_eq!(p.name, format!("kill9 {id}"), "round {tour} ({mode})");
+                assert_eq!(p.slug, format!("obrain-{id}"), "round {tour} ({mode})");
+                assert!(
+                    !p.watch_enabled && p.profile == ProjectProfile::Software && p.root_path.is_empty(),
+                    "round {tour} ({mode}): project {id} is torn (defaults where the child wrote values): {p:?}"
+                );
+                // Without durability (`aucune`) a blob-sized value may legitimately be gone;
+                // what is there must still be the child's.
+                match (mode, p.description.as_deref()) {
+                    (_, Some(d)) => assert!(
+                        d.contains(&id.to_string()),
+                        "round {tour} ({mode}): project {id} carries another description"
+                    ),
+                    ("aucune", None) => {}
+                    (_, None) => panic!("round {tour} ({mode}): project {id} lost its description"),
+                }
+            }
+            store.close().await.unwrap();
+        }
+        assert!(vus_wal >= 30, "the child made progress ({vus_wal} checks)");
+        assert!(longues > 0, "long descriptions were part of the check");
+        eprintln!(
+            "kill -9 over {TOURS} rounds: {vus_wal} acknowledged-project checks ({longues} with a \
+             description past the blob threshold); at open: {} interrupted creations deleted, {} \
+             draft markers cleared, {} torn paths repaired, {quarantaine} quarantined",
+            repares.brouillons_supprimes, repares.marqueurs_retires, repares.chemins_repares
+        );
+    }
+
+    /// Short, then long (multi-byte, past the 256-byte blob threshold), in turn. The
+    /// `aucune` rounds only ever write SHORT values: a blob-sized write that is never
+    /// flushed leaves an index row in the page cache pointing past the data the engine
+    /// recovers, and a LATER write reuses that space — the first project then reads
+    /// another project's description (measured, round 2 of this very test; an obrain
+    /// defect, see the PR). `aucune` rounds exist to be killed inside a creation, not
+    /// to exercise that.
+    fn description_du_test(id: Uuid, i: u32, avec_blob: bool) -> String {
+        if !avec_blob || i % 3 == 0 {
+            format!("short {id}")
+        } else {
+            format!("{id} é-long ").repeat(12 + (i as usize % 5))
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // A base this backend did not write, or left half-written
+    // ------------------------------------------------------------------
+
+    /// The eleven properties a creation writes, with a root that exists on no
+    /// machine (its canonical form is its declared form).
+    fn complete(id: Uuid, name: &str, slug: &str, root: &str) -> Vec<(&'static str, Value)> {
+        vec![
+            ("id", Value::from(id.to_string())),
+            ("name", Value::from(name)),
+            ("slug", Value::from(slug)),
+            ("root_path", Value::from(root)),
+            ("canonical_path", Value::from(root)),
+            ("declared_path", Value::from(root)),
+            ("paths_declared", Value::from(true)),
+            ("description", Value::from("d")),
+            ("created_at", Value::from("2026-01-02T03:04:05+00:00")),
+            ("watch_enabled", Value::from(false)),
+            ("profile", Value::from("software")),
+        ]
+    }
+
+    /// Every way a base can come to this backend not clean, in one base: opening
+    /// repairs what is ours, quarantines what is not, and never fails.
+    #[tokio::test]
+    async fn opening_repairs_interrupted_writes_and_quarantines_what_it_cannot_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let (a, d, e) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (a2, d2, e2) = (format!("a-{a}"), format!("d-{d}"), format!("e-{e}"));
+        let (a2c, d2c, e2c) = (a2.clone(), d2.clone(), e2.clone());
+        write_foreign(&base, move |db| {
+            // A: complete, but killed before the marker was removed.
+            let mut props = complete(a, "complete with marker", &a2c, "/nonexistent/a");
+            props.push(("_brouillon", Value::from(true)));
+            db.create_node_with_props(&["Project"], props);
+            // B: a creation killed after two properties (draft).
+            db.create_node_with_props(
+                &["Project"],
+                vec![
+                    ("_brouillon", Value::from(true)),
+                    ("id", Value::from(Uuid::new_v4().to_string())),
+                    ("name", Value::from("half written")),
+                ],
+            );
+            // C: a creation killed right after the node was created.
+            db.create_node(&["Project"]);
+            // D: an update killed after the derived paths, before `root_path`:
+            //    the declared root says old, root_path says new... or the reverse.
+            let mut torn = complete(d, "torn update", &d2c, "/nonexistent/new");
+            for (k, v) in torn.iter_mut() {
+                if *k == "declared_path" || *k == "canonical_path" {
+                    *v = Value::from("/nonexistent/old");
+                }
+            }
+            db.create_node_with_props(&["Project"], torn);
+            // E: two nodes claiming one id (foreign data).
+            db.create_node_with_props(&["Project"], complete(e, "first", &e2c, "/nonexistent/e"));
+            db.create_node_with_props(
+                &["Project"],
+                complete(
+                    e,
+                    "second, same id",
+                    &format!("{e2c}-bis"),
+                    "/nonexistent/e",
+                ),
+            );
+            // F: foreign, no id: not ours, not a draft.
+            db.create_node_with_props(&["Project"], vec![("name", Value::from("no id at all"))]);
+        })
+        .await;
+
+        let store = open(&base).await;
+        let rapport = store.rapport_d_ouverture().clone();
+        assert_eq!(rapport.brouillons_supprimes, 2, "B and C: {rapport:?}");
+        assert_eq!(rapport.marqueurs_retires, 1, "A: {rapport:?}");
+        assert_eq!(rapport.chemins_repares, 1, "D: {rapport:?}");
+        assert_eq!(
+            rapport.en_quarantaine.len(),
+            2,
+            "E's duplicate and F: {rapport:?}"
+        );
+
+        // What was repaired reads whole; the torn update rolled to a state
+        // `root_path` states.
+        let listed = store.list_projects().await.unwrap();
+        assert_eq!(listed.len(), 3, "A, D and the first of E");
+        let pa = store.get_project(a).await.unwrap().unwrap();
+        assert_eq!(pa.slug, a2);
+        let pd = store.get_project(d).await.unwrap().unwrap();
+        assert_eq!(pd.root_path, "/nonexistent/new");
+        let policy = store.path_policy(d).await.unwrap();
+        assert_eq!(policy.declared_root, "/nonexistent/new");
+        assert_eq!(policy.canonical_root, "/nonexistent/new");
+        assert_eq!(store.get_project(e).await.unwrap().unwrap().name, "first");
+        assert_eq!(
+            store.get_project_by_slug(&d2).await.unwrap().map(|p| p.id),
+            Some(d)
+        );
+        let _ = e2;
+        // The store works on top of that.
+        let p = a_project("after the repairs");
+        store.create_project(&p).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+
+        // The repairs were durable: a second open has nothing left to repair,
+        // and the two foreign nodes are still quarantined, untouched.
+        let store = open(&base).await;
+        let again = store.rapport_d_ouverture().clone();
+        assert_eq!(again.brouillons_supprimes, 0, "{again:?}");
+        assert_eq!(again.marqueurs_retires, 0, "{again:?}");
+        assert_eq!(again.chemins_repares, 0, "{again:?}");
+        assert_eq!(again.en_quarantaine.len(), 2, "{again:?}");
+        assert_eq!(store.list_projects().await.unwrap().len(), 4);
+    }
+
+    /// A `Project` node written straight through obrain, with a relationship to
+    /// a node of a domain this backend has not ported.
     #[tokio::test]
     async fn a_project_written_outside_is_read_and_its_cascade_delete_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -421,10 +1063,32 @@ mod with_the_feature {
         let id = Uuid::new_v4();
         let slug = format!("migrated-{id}");
         {
-            let (base, slug) = (base.clone(), slug.clone());
-            tokio::task::spawn_blocking(move || write_foreign_base(&base, id, &slug))
-                .await
-                .unwrap();
+            let slug = slug.clone();
+            write_foreign(&base, move |db| {
+                let project = db.create_node_with_props(
+                    &["Project"],
+                    vec![
+                        ("id", Value::from(id.to_string())),
+                        ("name", Value::from("migrated")),
+                        ("slug", Value::from(slug)),
+                        (
+                            "created_at",
+                            Value::from("2026-01-02T03:04:05.123456789+00:00"),
+                        ),
+                        ("default_note_energy", Value::from(0.25)),
+                        ("scaffolding_override", Value::from(3_i64)),
+                        ("last_synced", Value::from("2026-02-03T04:05:06+00:00")),
+                    ],
+                );
+                let plan = db.create_node_with_props(&["Plan"], vec![("id", Value::from("p1"))]);
+                db.create_edge(project, plan, "HAS_PLAN");
+                // Linked by a property, not an edge: what the cascade also reaches.
+                db.create_node_with_props(
+                    &["Commit"],
+                    vec![("project_id", Value::from(id.to_string()))],
+                );
+            })
+            .await;
         }
 
         let store = open(&base).await;
@@ -456,42 +1120,19 @@ mod with_the_feature {
             Some(id)
         );
 
-        // It carries a relationship this backend cannot cascade: refused by
-        // name, and nothing is deleted.
+        // The base holds nodes this backend did not write — by edge (Plan) AND
+        // by property (Commit): refused by name, and nothing is deleted.
         let err = store.delete_project(id, "migrated").await.unwrap_err();
         assert_eq!(
             err.downcast_ref::<NonPorte>(),
             Some(&NonPorte("ProjectStore::delete_project (cascade)")),
             "{err:#}"
         );
-        assert!(format!("{err:#}").contains("1 relation"), "{err:#}");
-        assert!(store.get_project(id).await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn a_project_node_without_an_id_fails_the_open_instead_of_being_skipped() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("base");
-        {
-            let base = base.clone();
-            tokio::task::spawn_blocking(move || {
-                let db = obrain_engine::ObrainDB::open(&base).unwrap();
-                db.create_node_with_props(&["Project"], vec![("name", Value::from("orphan"))]);
-                db.commit_wal().unwrap();
-                db.close().unwrap();
-            })
-            .await
-            .unwrap();
-        }
-        let err = tokio::task::spawn_blocking(move || ObrainGraphStore::open(base))
-            .await
-            .unwrap()
-            .err()
-            .expect("an unaddressable Project node must fail the open");
         assert!(
-            format!("{err:#}").contains("sans propriété `id`"),
+            format!("{err:#}").contains("2 nœud(s) hors des 1 projet"),
             "{err:#}"
         );
+        assert!(store.get_project(id).await.unwrap().is_some());
     }
 
     // ------------------------------------------------------------------
@@ -500,14 +1141,10 @@ mod with_the_feature {
 
     /// One method per kind of signature and per corner of the contract: first
     /// and last trait of `GraphStore`, a method the contract defaults to a
-    /// silent `Ok`, the search store, and the default of `GraphStore` itself,
-    /// which reaches a refused method.
+    /// silent `Ok`, the search store, and the default of `GraphStore` itself.
     #[tokio::test]
     async fn what_is_not_ported_refuses_by_name_and_never_answers_empty() {
-        let store = tokio::task::spawn_blocking(ObrainGraphStore::open_temporary)
-            .await
-            .unwrap()
-            .unwrap();
+        let store = temporary(Durabilite::Wal).await;
         let id = Uuid::new_v4();
 
         assert_eq!(
@@ -531,17 +1168,21 @@ mod with_the_feature {
             not_ported(store.ensure_project_canonical_paths().await),
             NonPorte("AnalyticsStore::ensure_project_canonical_paths")
         );
-        // The default of `GraphStore` loops over a refused getter: with an id
-        // to look up it refuses, by the name of that getter.
+        // The default of `GraphStore` answers `Ok({})` for an empty `ids` — the
+        // silent empty result this backend must never give. It is written by
+        // hand and refuses, with an empty list as with any other.
+        assert_eq!(
+            not_ported(store.get_progress_batch(ProgressKind::Project, &[]).await),
+            NonPorte("GraphStore::get_progress_batch")
+        );
         assert_eq!(
             not_ported(store.get_progress_batch(ProgressKind::Project, &[id]).await),
-            NonPorte("ReleaseStore::get_project_tasks")
+            NonPorte("GraphStore::get_progress_batch")
         );
         assert_eq!(
             not_ported(ObrainSearchStore.delete_code("x").await),
             NonPorte("SearchStore::delete_code")
         );
-        let _ = ObrainTrajectoryStore;
 
         // The message is the stated one.
         let msg = store.list_workspaces().await.unwrap_err().to_string();
@@ -552,8 +1193,9 @@ mod with_the_feature {
     }
 
     /// The generator skips nothing: every `async fn` of the two contracts is
-    /// either refused, or in a trait implemented by hand, or one of the few
-    /// that cannot refuse and keep the contract's default.
+    /// either refused, or written by hand (and the build has checked that it IS
+    /// written), or one of the few that cannot refuse and keep the contract's
+    /// default.
     #[test]
     fn every_method_of_the_contracts_is_accounted_for() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -570,49 +1212,51 @@ mod with_the_feature {
             async_fns("src/neo4j/traits.rs") + async_fns("src/meilisearch/traits.rs");
 
         let refused = methodes_refusees();
-        let ported = methodes_portees();
+        let written = methodes_portees();
         let kept = defauts_conserves();
-        // `GraphStore::capabilities` is the one method that is not `async`.
-        let ported_async = ported
+        // `GraphStore::capabilities` is the one written method that is not `async`.
+        let written_async = written
             .iter()
             .filter(|m| **m != "GraphStore::capabilities")
             .count();
         assert_eq!(
-            refused.len() + ported_async + kept.len(),
+            refused.len() + written_async + kept.len(),
             in_contracts,
-            "refused {} + ported {} + kept {} must be the {} async fn of the contracts",
+            "refused {} + written {} + kept {} must be the {} async fn of the contracts",
             refused.len(),
-            ported_async,
+            written_async,
             kept.len(),
             in_contracts
         );
 
-        // This lot: exactly ProjectStore (and GraphStore's own two methods).
-        let mut domains: Vec<&str> = ported
+        // This lot: ProjectStore's nine methods, plus the two of GraphStore.
+        let domains: std::collections::BTreeSet<&str> = written
             .iter()
             .map(|m| m.split("::").next().unwrap())
             .collect();
-        domains.dedup();
-        assert_eq!(domains, ["GraphStore", "ProjectStore"]);
         assert_eq!(
-            ported
-                .iter()
-                .filter(|m| m.starts_with("ProjectStore::"))
-                .count(),
-            9
+            domains.into_iter().collect::<Vec<_>>(),
+            ["GraphStore", "ProjectStore"]
         );
+        let servent = methodes_qui_servent();
+        assert_eq!(servent.len(), 9, "{servent:?}");
+        assert!(servent.iter().all(|m| m.starts_with("ProjectStore::")));
+        // The written refusals are written, and are not counted as serving.
+        assert_eq!(REFUS_ECRITS_A_LA_MAIN, ["GraphStore::get_progress_batch"]);
+        assert!(REFUS_ECRITS_A_LA_MAIN.iter().all(|m| written.contains(m)));
         // What keeps a default is known and justified where it is declared.
         assert_eq!(kept, ["AnalyticsStore::run_data_migrations"]);
         // No name twice, no ported method refused.
-        let mut all: Vec<&str> = refused.iter().chain(ported).chain(kept).copied().collect();
+        let mut all: Vec<&str> = refused.iter().chain(written).chain(kept).copied().collect();
         let total = all.len();
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), total, "a method is listed twice");
         eprintln!(
-            "obrain backend: {} methods refused by name, {} ported, {} keeping the contract's default",
+            "obrain backend: {} methods refused by name, {} written by hand ({} serve), {} keeping the contract's default",
             refused.len(),
-            ported.len(),
+            written.len(),
+            servent.len(),
             kept.len()
         );
     }
