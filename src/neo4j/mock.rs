@@ -6496,11 +6496,8 @@ impl ProjectStore for MockGraphStore {
         // Neo4j: `ORDER BY p.name, p.id ASC` — a total order, where the map
         // order differed on every run.
         let mut projects: Vec<ProjectNode> = self.projects.read().await.values().cloned().collect();
-        projects.sort_by(|a, b| {
-            a.name
-                .cmp(&b.name)
-                .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
-        });
+        // `Uuid` order is the order of its canonical string (fixed-width lowercase hex).
+        projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
         Ok(projects)
     }
 
