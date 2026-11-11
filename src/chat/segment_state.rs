@@ -1028,7 +1028,12 @@ mod tests {
     #[test]
     fn a_turn_longer_than_the_cap_still_releases_as_done() {
         let mut tail = Tail::starting_at(T0);
-        tail.record(&ChatEvent::UserMessage { content: "go".into() }, T0);
+        tail.record(
+            &ChatEvent::UserMessage {
+                content: "go".into(),
+            },
+            T0,
+        );
         // 66 tool calls: each is a ToolStart + a ToolEnd, 132 entries — past TAIL_CAP.
         for i in 0..66 {
             let id = format!("call_{i}");

@@ -26424,7 +26424,12 @@ mod tests {
         graph
             .store_chat_events(
                 sid,
-                vec![tool_use_event(sid, 1, "mcp__project-orchestrator__chat", 11)],
+                vec![tool_use_event(
+                    sid,
+                    1,
+                    "mcp__project-orchestrator__chat",
+                    11,
+                )],
             )
             .await
             .unwrap();
@@ -26432,7 +26437,10 @@ mod tests {
             Some(nexus_claude::agent::ProviderError::unsupported("interrupt"));
 
         let ended = manager.abandon_turns_whose_tool_result_never_came().await;
-        assert!(ended.is_empty(), "a failed interrupt ends nothing: {ended:?}");
+        assert!(
+            ended.is_empty(),
+            "a failed interrupt ends nothing: {ended:?}"
+        );
         let told = graph
             .chat_events
             .read()
@@ -26440,7 +26448,10 @@ mod tests {
             .get(&sid)
             .map(|evs| evs.iter().any(|e| e.data.contains("tool_result_lost")))
             .unwrap_or(false);
-        assert!(!told, "a failed interrupt must not tell the user the turn ended");
+        assert!(
+            !told,
+            "a failed interrupt must not tell the user the turn ended"
+        );
     }
 
     /// A notice with nowhere to go is dropped: never a panic, never another session.
