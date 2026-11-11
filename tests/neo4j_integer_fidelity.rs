@@ -320,9 +320,14 @@ async fn the_phantom_255_timeouts_are_reset_on_every_start() {
     cleanup_protocol(&mut cleanup, protocol.id);
     let mut real = ProtocolState::terminal(protocol.id, "end");
     real.state_timeout_secs = Some(300);
+    // A 255 someone CHOSE (what a handler exposing the field would write): the
+    // write path marks it, the repair must leave it.
+    let mut chosen = ProtocolState::new(protocol.id, "chosen 255");
+    chosen.state_timeout_secs = Some(255);
     e.client.upsert_protocol(&protocol).await.unwrap();
     e.client.upsert_protocol_state(&start).await.unwrap();
     e.client.upsert_protocol_state(&real).await.unwrap();
+    e.client.upsert_protocol_state(&chosen).await.unwrap();
     // What the driver bug left in the graph: a state without timeout stored 255.
     let plant = |id: Uuid| {
         query("MATCH (s:ProtocolState {id: $id}) SET s.state_timeout_secs = 255")
@@ -334,6 +339,12 @@ async fn the_phantom_255_timeouts_are_reset_on_every_start() {
         "255",
         "the ghost is there"
     );
+    // The FIXED binary reads the ghost as a real 255 and writes it back
+    // (seed_prompt_fragments does that): a value carried over is not a choice,
+    // so the ghost earns no marker and is still repaired below.
+    for state in e.client.get_protocol_states(protocol.id).await.unwrap() {
+        e.client.upsert_protocol_state(&state).await.unwrap();
+    }
 
     let first = e.client.repair_phantom_state_timeouts(Some(project)).await;
     assert_eq!(
@@ -347,6 +358,11 @@ async fn the_phantom_255_timeouts_are_reset_on_every_start() {
         "300",
         "what is not 255 is untouched"
     );
+    assert_eq!(
+        stored_timeout(&e.raw, chosen.id).await,
+        "255",
+        "a 255 someone chose is kept"
+    );
     let states = e.client.get_protocol_states(protocol.id).await.unwrap();
     let read = |id: Uuid| {
         states
@@ -355,7 +371,10 @@ async fn the_phantom_255_timeouts_are_reset_on_every_start() {
             .unwrap()
             .state_timeout_secs
     };
-    assert_eq!((read(start.id), read(real.id)), (None, Some(300)));
+    assert_eq!(
+        (read(start.id), read(real.id), read(chosen.id)),
+        (None, Some(300), Some(255))
+    );
 
     let second = e.client.repair_phantom_state_timeouts(Some(project)).await;
     assert_eq!(
@@ -450,6 +469,40 @@ async fn a_negative_stored_count_is_read_as_zero_not_as_a_huge_number() {
         ),
         (0, 0, 0, 0, 0),
         "context cards, batch"
+    );
+
+    // A step's position and a run's depth and version: the readers of task.rs /
+    // step.rs and protocol.rs. -17 is OUTSIDE the range the driver bug touched:
+    // the reader's own `as u32` would make it 4 294 967 279.
+    let (step, prun) = (Uuid::new_v4(), Uuid::new_v4());
+    cleanup.later("MATCH (n:Step {id: $p}) DETACH DELETE n", step.to_string());
+    cleanup.later(
+        "MATCH (n:ProtocolRun {id: $p}) DETACH DELETE n",
+        prun.to_string(),
+    );
+    e.raw
+        .run(
+            query(
+                "CREATE (:Step {id: $step, order: -17, description: 'neg', status: 'pending',
+                                created_at: '2026-01-01T00:00:00Z'})
+                 CREATE (:ProtocolRun {id: $run, protocol_id: $proto, current_state: $state,
+                                       status: 'running', started_at: '2026-01-01T00:00:00Z',
+                                       states_visited_json: '[]', depth: -17, version: -1})",
+            )
+            .param("step", step.to_string())
+            .param("run", prun.to_string())
+            .param("proto", Uuid::new_v4().to_string())
+            .param("state", Uuid::new_v4().to_string()),
+        )
+        .await
+        .unwrap();
+    let s = e.client.get_step(step).await.unwrap().unwrap();
+    assert_eq!(s.order, 0, "step order");
+    let r = e.client.get_protocol_run(prun).await.unwrap().unwrap();
+    assert_eq!(
+        (r.depth, r.version),
+        (0, 0),
+        "protocol run depth and version"
     );
 }
 

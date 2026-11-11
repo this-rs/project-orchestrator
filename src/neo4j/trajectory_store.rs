@@ -2,7 +2,7 @@
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
-use super::unsigned::unsigned;
+use super::unsigned::{unsigned, unsigned_opt};
 use async_trait::async_trait;
 use neo4rs::{query, Graph};
 use std::sync::Arc;
@@ -253,7 +253,10 @@ impl Neo4jTrajectoryStore {
                 tool_name: row.get("tool_name").unwrap_or_default(),
                 action: row.get("action").unwrap_or_default(),
                 params_hash: row.get("params_hash").unwrap_or_default(),
-                duration_ms: row.get::<i64>("duration_ms").ok().map(|v| v as u64),
+                duration_ms: row
+                    .get::<i64>("duration_ms")
+                    .ok()
+                    .and_then(unsigned_opt::<u64>),
                 success: row.get("success").unwrap_or(true),
             });
         }

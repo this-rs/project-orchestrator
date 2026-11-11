@@ -2,6 +2,7 @@
 //!
 //! Implements CRUD operations for Protocol, ProtocolState, and ProtocolTransition
 //! entities on the Neo4j graph.
+use super::unsigned::unsigned;
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
@@ -461,6 +462,18 @@ impl Neo4jClient {
             r#"
             MATCH (proto:Protocol {id: $protocol_id})
             MERGE (s:ProtocolState {id: $id})
+            // `state_timeout_explicit`: this write SET a real timeout the state did not
+            // have (true), or it carries one over (kept), or it writes none (removed).
+            // A value merely read then written back (seed_prompt_fragments) is NOT a
+            // choice, so it earns no marker: that is what lets the boot repair tell a
+            // 255 someone chose from a 255 the driver bug stored (data_migrations.rs).
+            WITH proto, s,
+                 CASE
+                   WHEN $state_timeout_secs > 0
+                        AND coalesce(s.state_timeout_secs, -1) <> $state_timeout_secs THEN true
+                   WHEN $state_timeout_secs > 0 THEN s.state_timeout_explicit
+                   ELSE null
+                 END AS timeout_explicit
             SET s.protocol_id = $protocol_id,
                 s.name = $name,
                 s.description = $description,
@@ -473,7 +486,8 @@ impl Neo4jClient {
                 s.prompt_fragment = $prompt_fragment,
                 s.available_tools_json = $available_tools_json,
                 s.forbidden_actions_json = $forbidden_actions_json,
-                s.state_timeout_secs = $state_timeout_secs
+                s.state_timeout_secs = $state_timeout_secs,
+                s.state_timeout_explicit = timeout_explicit
             MERGE (proto)-[:HAS_STATE]->(s)
             "#,
         )
@@ -790,8 +804,8 @@ impl Neo4jClient {
             triggered_by: node
                 .get::<String>("triggered_by")
                 .unwrap_or_else(|_| "manual".to_string()),
-            depth: node.get::<i64>("depth").unwrap_or(0) as u32,
-            version: node.get::<i64>("version").unwrap_or(0) as u64,
+            depth: unsigned(node.get::<i64>("depth").unwrap_or(0), u32::MAX),
+            version: unsigned(node.get::<i64>("version").unwrap_or(0), u64::MAX),
             runner_managed: node.get::<bool>("runner_managed").unwrap_or(false),
         })
     }
@@ -1279,7 +1293,7 @@ impl Neo4jClient {
             run_id: node.get::<String>("run_id")?.parse()?,
             generated_by: node.get::<String>("generated_by")?.parse()?,
             name: node.get("name")?,
-            index: node.get::<i64>("index").unwrap_or(0) as u32,
+            index: unsigned(node.get::<i64>("index").unwrap_or(0), u32::MAX),
             sub_protocol_id: node
                 .get::<String>("sub_protocol_id")
                 .ok()

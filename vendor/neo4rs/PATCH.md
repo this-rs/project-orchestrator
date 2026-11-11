@@ -40,10 +40,12 @@ So: **every old binary must be stopped** (service, Docker container, desktop app
 same database) — the replay repairs what one wrote, it cannot stop it writing. If it
 logs "an older binary is still connected" start after start, one is. The replay costs a
 label scan of `ProtocolState` (hundreds of nodes) and writes nothing when there is
-nothing to repair. Remove the replay when a write path for a real `Some(n)` is
-introduced (a 255 could then be legitimate); today none exists (13 constructors at
+nothing to repair. A 255 someone CHOOSES is safe from it: the write path marks a
+positive timeout written on a state that did not hold it (`state_timeout_explicit`),
+a value merely read and written back earns no marker, and the repair touches only a
+255 without the marker. Today no write path sets `Some(n)` at all (13 constructors at
 `None`, `PortableState` does not carry the field, no API body deserialises a
-`ProtocolState`).
+`ProtocolState`); the day one does, it is already covered.
 
 There is no upstream release to move to without changing the backend:
 

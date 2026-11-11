@@ -74,6 +74,14 @@ pub const AGENT_SELF_BATCH: usize = 500;
 /// held only `-1` (89), `255` (65, all the states of 13 `session-lifecycle`
 /// protocols) and nothing (273).
 ///
+/// WHAT MAKES A 255 A GHOST, TOMORROW. The write path marks a timeout someone CHOSE
+/// (`upsert_protocol_state`: `state_timeout_explicit = true` when a positive value is
+/// written on a state that did not hold it; a value read and written back earns no
+/// marker). This repair touches only a 255 WITHOUT that marker. So a handler that one
+/// day lets a user set 255 s writes it with the marker, and the repair leaves it; a 255
+/// an old binary rewrote from a `-1` has none, and is repaired. The test
+/// `the_phantom_255_timeouts_are_reset_on_every_start` pins both.
+///
 /// REPLAYED ON EVERY START, not marked complete (see
 /// [`Neo4jClient::repair_phantom_state_timeouts`]): an OLD binary still connected to
 /// the same database re-reads `-1` as 255 and rewrites it at its next
@@ -84,6 +92,7 @@ pub const AGENT_SELF_BATCH: usize = 500;
 const RESET_PHANTOM_STATE_TIMEOUTS: &str = r#"
 MATCH (s:ProtocolState)
 WHERE s.state_timeout_secs = 255
+  AND coalesce(s.state_timeout_explicit, false) = false
   AND ($scope IS NULL
        OR EXISTS { MATCH (p:Protocol {id: s.protocol_id}) WHERE p.project_id = $scope })
 WITH s LIMIT $batch
@@ -1681,16 +1690,12 @@ mod tests {
         }
     }
 
-    /// The phantom-timeout repair is replayed on every start, so it must be bounded,
-    /// scoped, convergent (it removes what it selects) and NOT in the registry
-    /// (a completion marker would let an older binary's 255 survive).
+    /// The one invariant of the repair that no Neo4j test can state: it is NOT in
+    /// the registry (a completion marker would let an older binary's 255 survive).
+    /// What the query does is pinned against a real Neo4j by
+    /// `the_phantom_255_timeouts_are_reset_on_every_start` (tests/neo4j_integer_fidelity.rs).
     #[test]
-    fn test_phantom_timeout_repair_is_bounded_scoped_convergent_and_replayed() {
-        let q = RESET_PHANTOM_STATE_TIMEOUTS;
-        assert!(q.contains("$scope") && q.contains("$batch"));
-        assert!(q.contains("AS processed"));
-        assert!(q.contains("WHERE s.state_timeout_secs = 255"));
-        assert!(q.contains("SET s.state_timeout_secs = -1"));
+    fn the_phantom_timeout_repair_is_never_registered_so_it_replays() {
         assert!(
             Neo4jClient::data_migrations()
                 .iter()
@@ -1729,8 +1734,9 @@ mod tests {
         assert!(out.error.unwrap().contains("did not converge"));
     }
 
+    /// Coverage of the error shape only: no invariant beyond "an error, not a panic".
     #[test]
-    fn a_dead_repair_task_is_an_error_outcome_not_a_panic() {
+    fn coverage_a_dead_repair_task_is_an_error_outcome_not_a_panic() {
         let out = repair_task_died("cancelled");
         assert_eq!(out.id, PHANTOM_STATE_TIMEOUTS_ID);
         assert_eq!(

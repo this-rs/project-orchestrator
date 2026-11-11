@@ -11,6 +11,20 @@ use anyhow::Result;
 use neo4rs::query;
 use uuid::Uuid;
 
+/// A stored scaffolding level is a `u8`. A negative or an overflow is NOT a level
+/// — but it IS a configuration someone wrote, so losing it is said, not silent.
+fn scaffolding_override_from_stored(raw: i64, node: &neo4rs::Node) -> Option<u8> {
+    let level = super::unsigned::unsigned_opt::<u8>(raw);
+    if level.is_none() {
+        tracing::warn!(
+            project = %node.get::<String>("id").unwrap_or_default(),
+            stored = raw,
+            "scaffolding_override out of 0..=255: ignored, the default scaffolding applies"
+        );
+    }
+    level
+}
+
 impl Neo4jClient {
     // ========================================================================
     // Project operations
@@ -569,7 +583,7 @@ impl Neo4jClient {
             scaffolding_override: node
                 .get::<i64>("scaffolding_override")
                 .ok()
-                .and_then(super::unsigned::unsigned_opt::<u8>),
+                .and_then(|raw| scaffolding_override_from_stored(raw, node)),
             sharing_policy: node
                 .get::<String>("sharing_policy")
                 .ok()
@@ -757,5 +771,32 @@ impl Neo4jClient {
             )
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scaffolding_override_from_stored;
+    use neo4rs::{BoltInteger, BoltList, BoltNode, BoltString, BoltType};
+
+    fn node() -> neo4rs::Node {
+        neo4rs::Node::new(BoltNode::new(
+            BoltInteger::new(1),
+            BoltList::new(),
+            [(BoltString::new("id"), BoltType::from("p"))]
+                .into_iter()
+                .collect(),
+        ))
+    }
+
+    /// A level in 0..=255 is the level; a negative (the graph's "none") or an
+    /// overflow is no level — and is logged, since it is a configuration someone wrote.
+    #[test]
+    fn a_scaffolding_level_out_of_range_is_none_and_logged() {
+        let n = node();
+        assert_eq!(scaffolding_override_from_stored(0, &n), Some(0));
+        assert_eq!(scaffolding_override_from_stored(255, &n), Some(255));
+        assert_eq!(scaffolding_override_from_stored(-1, &n), None);
+        assert_eq!(scaffolding_override_from_stored(256, &n), None);
     }
 }

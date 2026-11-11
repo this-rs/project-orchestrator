@@ -1,4 +1,5 @@
 //! Neo4j Chat Session and Event operations
+use super::unsigned::unsigned;
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
@@ -3357,7 +3358,7 @@ fn anchor_from_node(node: &neo4rs::Node) -> Result<crate::chat::anchor::Anchor> 
         snapshot_path: anchor_opt(s("snapshot_path")),
         snapshot_type: anchor_opt(s("snapshot_type")),
         rev: anchor_opt(s("rev")),
-        version: node.get::<i64>("version").unwrap_or(1).max(1) as u64,
+        version: unsigned(node.get::<i64>("version").unwrap_or(1), u64::MAX).max(1),
         created_at: parse_ts(&s("created_at"))?,
         updated_at: parse_ts(&s("updated_at"))?,
     })
@@ -3370,7 +3371,7 @@ fn anchor_event_from_node(node: &neo4rs::Node) -> Result<crate::chat::anchor::An
     let json = |k: &str| anchor_opt(s(k)).and_then(|j| serde_json::from_str(&j).ok());
     Ok(AnchorEvent {
         id: s("id").parse()?,
-        seq: node.get::<i64>("seq").unwrap_or(0).max(0) as u64,
+        seq: unsigned(node.get::<i64>("seq").unwrap_or(0), u64::MAX),
         session_id: s("session_id").parse()?,
         anchor_id: s("anchor_id").parse()?,
         kind: AnchorEventKind::parse(&s("kind")).ok_or_else(|| bad("kind"))?,
@@ -3440,7 +3441,7 @@ impl Neo4jClient {
             // The number this operation takes IF it writes an event (otherwise the
             // transaction is rolled back below, so the number is not consumed:
             // no gap). The lock above serializes writers, hence no duplicate.
-            let seq = locked.get::<i64>("seq")?.max(0) as u64;
+            let seq = unsigned(locked.get::<i64>("seq")?, u64::MAX);
             // The version the set had before this operation.
             let current = seq.saturating_sub(1);
             if let Some(expected) = if_match.filter(|v| *v != current) {
@@ -3592,7 +3593,7 @@ impl Neo4jClient {
         let Some(row) = result.next().await? else {
             return Ok(None);
         };
-        let version = row.get::<i64>("version")?.max(0) as u64;
+        let version = unsigned(row.get::<i64>("version")?, u64::MAX);
         let nodes: Vec<neo4rs::Node> = row.get("anchors")?;
         let anchors = nodes
             .iter()
