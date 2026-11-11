@@ -221,6 +221,10 @@ pub struct ServiceHealthStatus {
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+    /// Which storage backend built the stores (`storage.backend`): `default`
+    /// or `memory`. Read by the setup/health probes to tell an ephemeral,
+    /// in-memory instance from a Neo4j/Meili-backed one.
+    pub storage_backend: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub services: Option<ServiceHealthStatus>,
     /// Manifest of the storage engine capabilities (see `StoreCapabilities`).
@@ -274,6 +278,7 @@ pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json
         Json(HealthResponse {
             status: status.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            storage_backend: state.orchestrator.config().storage_backend.clone(),
             services: Some(ServiceHealthStatus {
                 neo4j: if neo4j_ok {
                     "connected".to_string()
@@ -8508,7 +8513,13 @@ pub(crate) mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let obj = json.as_object().expect("health payload is an object");
 
-        for key in ["status", "version", "services", "storage_capabilities"] {
+        for key in [
+            "status",
+            "version",
+            "storage_backend",
+            "services",
+            "storage_capabilities",
+        ] {
             assert!(obj.contains_key(key), "missing top-level key `{key}`");
         }
 

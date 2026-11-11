@@ -81,3 +81,31 @@ target/debug/orchestrator --config /tmp/po-test/config.yaml serve --port 18080 -
 - `max_events` (rétention) est **codé en dur** à `DEFAULT_MAX_EVENTS=100000` au boot (`lib.rs:1587`) : pas de config `events.max_events` ; la rétention minuscule du point 4 ne se pilote donc pas en instance, seulement via `JournalTransport::open` (tests `chat_transport.rs:898/934` + la sonde).
 - Le rejeu du WS (`ws_chat_handler.rs`) lit l'historique depuis **Neo4j** (`get_events_since`), pas depuis `JournalTransport::replay` — le `replay()` du journal n'est consommé par aucune route aujourd'hui.
 - Nettoyage fait : conteneurs `po-test-neo4j`/`po-test-meili` stoppés+supprimés, `/tmp/po-test` effacé.
+
+---
+
+## PO sans aucun service externe : `storage.backend = memory` (12/11/2026)
+
+`StorageBackend::from_config` n'acceptait que `default`, qui construit Neo4j + Meili + le magasin de trajectoires avant tout choix de transport (le blocage mesuré plus haut). Le sélecteur accepte maintenant aussi `memory` : le graphe et la recherche sont les stores en mémoire du dépôt (`src/neo4j/mock.rs`, `src/meilisearch/mock.rs`), aucun client Neo4j/Meili, aucun magasin de trajectoires (un no-op). Le mode `memory` est éphémère — une ligne WARN le dit au démarrage, il n'est jamais présenté comme un mode de production.
+
+Le mode `memory` exige le build `--features mock-store` : les stores en mémoire ne sont compilés que pour les tests, jamais dans un binaire de prod sans la feature.
+
+### Recette (sans Docker, sans Neo4j/Meili/NATS)
+```bash
+# 1. Config minimale (setup_completed lisible UNIQUEMENT en YAML, src/lib.rs:1041)
+mkdir -p /tmp/po-test/workspace
+cat > /tmp/po-test/config.yaml <<'YAML'
+setup_completed: true
+server: { port: 18080, workspace_path: /tmp/po-test/workspace, serve_frontend: false }
+YAML
+
+# 2. Build avec les stores en mémoire, puis lancement SANS aucune variable externe
+cargo build --bin orchestrator --features mock-store
+STORAGE_BACKEND=memory EVENTS_TRANSPORT=memory WORKSPACE_PATH=/tmp/po-test/workspace \
+target/debug/orchestrator --config /tmp/po-test/config.yaml serve --port 18080 --no-frontend
+```
+
+### Verdict
+- `/health` → `{"status":"ok","storage_backend":"memory", ...}` : les stores en mémoire répondent `health_check=true`, donc le statut est `ok` sans qu'aucun service externe existe.
+- Log de démarrage : `storage backend: memory — ephemeral, all data is lost at shutdown (not a production mode)`.
+- Aucun `NEO4J_URI`/`MEILISEARCH_URL`/`NATS_URL` requis, aucun conteneur.

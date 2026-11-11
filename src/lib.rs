@@ -1573,9 +1573,13 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         tracing::info!("Remote MCP transport disabled (opt-in) — /mcp routes not mounted");
     }
 
-    // Initialize application state
-    tracing::info!("Connecting to Neo4j at {}...", config.neo4j_uri);
-    tracing::info!("Connecting to Meilisearch at {}...", config.meilisearch_url);
+    // Initialize application state. Only the default backend actually connects
+    // to Neo4j/Meilisearch here; the in-memory backend touches neither (it says
+    // so itself), so the "Connecting…" lines would lie for `storage.backend=memory`.
+    if config.storage_backend != crate::storage::MEMORY_BACKEND {
+        tracing::info!("Connecting to Neo4j at {}...", config.neo4j_uri);
+        tracing::info!("Connecting to Meilisearch at {}...", config.meilisearch_url);
+    }
 
     boot.start("databases");
     let state = AppState::new(config.clone()).await.inspect_err(|e| {

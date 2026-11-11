@@ -59,7 +59,7 @@ règle avec sa preuve obligatoire.
 ### Ce qui n'est dans aucun plan — à ne pas perdre
 9. **~2 300 sites de décodage `BoltType`** : le coût caché le plus lourd de la migration.
 10. **282 `ORDER BY` avec tri départagé** : non spécifié, casse une UI en silence.
-11. **Trajectory store ouvert en dur** dans la fabrique, hors sélecteur de backend.
+11. **Trajectory store ouvert en dur** dans la fabrique, hors sélecteur de backend — réglé pour `storage.backend=memory` (no-op, aucun Neo4j) ; reste vrai pour `default` (Neo4j obligatoire, toujours pas d'échec net quand il est injoignable).
 12. **Chien de garde inactif en wasm** (`Clock::sleep` rend `None`).
 13. **Lint de liste noire wasm** : sans lui, une dépendance de plateforme rentre en trois semaines.
 14. **`DROP CONSTRAINT` no-op** dans obrain.
@@ -96,6 +96,27 @@ Procédure qui marche, dans cet ordre :
 
 Coût mesuré : ~3 minutes. Ce qui le rend supportable, c'est que le portillon
 `containment` le réclame immédiatement au lieu de laisser la dette s'accumuler.
+
+## Recette : PO sans aucun service externe (`storage.backend=memory`)
+
+`StorageBackend::from_config` accepte `default` et `memory`. `memory` monte les
+stores en mémoire du dépôt (graphe + recherche), aucun Neo4j/Meili/NATS, et un
+magasin de trajectoires no-op — éphémère, une ligne WARN le dit au démarrage.
+Il faut le build `--features mock-store` (les stores en mémoire ne sont jamais
+compilés dans un binaire de prod sans la feature). Recette complète dans
+`docs/cartographie/19-journal-runtime.md`.
+
+```bash
+cargo build --bin orchestrator --features mock-store
+mkdir -p /tmp/po-test/workspace
+cat > /tmp/po-test/config.yaml <<'YAML'
+setup_completed: true
+server: { port: 18080, workspace_path: /tmp/po-test/workspace, serve_frontend: false }
+YAML
+STORAGE_BACKEND=memory EVENTS_TRANSPORT=memory WORKSPACE_PATH=/tmp/po-test/workspace \
+target/debug/orchestrator --config /tmp/po-test/config.yaml serve --port 18080 --no-frontend
+# /health → {"status":"ok","storage_backend":"memory", ...}
+```
 
 ## Objectifs suivis (mis à jour à chaque fin de vague)
 
