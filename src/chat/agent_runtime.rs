@@ -2260,7 +2260,7 @@ impl AgentSessionHandle {
     /// writes run in tasks of their own (`post_stream::spawn_write`). What it held and never
     /// emitted is lost, which is the trade the Claude Code engine's `abandon_turn_if_stuck`
     /// makes too: a session stuck for good is the alternative.
-    pub async fn abandon_turn(&self, generation: u64) -> bool {
+    pub async fn abandon_turn(self: &Arc<Self>, generation: u64) -> bool {
         if self.turn_generation.load(Ordering::SeqCst) != generation {
             return false;
         }
@@ -2294,6 +2294,16 @@ impl AgentSessionHandle {
                 .to_string(),
         })
         .await;
+
+        // D1 FIX: If there are queued messages, start processing them instead of leaving
+        // them orphaned. Check if there are pending messages and spawn drive() to process them.
+        let has_queued = self.pending.lock().await.len() > 0;
+        if has_queued {
+            let me = Arc::clone(self);
+            let run = tokio::spawn(async move { me.drive(None).await });
+            self.track_turn_task(run.abort_handle());
+        }
+
         true
     }
 
