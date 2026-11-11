@@ -415,6 +415,47 @@ mod anchors {
         e.downcast::<AnchorError>().expect("a typed AnchorError")
     }
 
+    fn project_node(slug: &str) -> project_orchestrator::neo4j::models::ProjectNode {
+        project_orchestrator::neo4j::models::ProjectNode {
+            id: Uuid::new_v4(),
+            name: slug.to_string(),
+            slug: slug.to_string(),
+            root_path: "/tmp/anchor-harness".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+            watch_enabled: false,
+            profile: Default::default(),
+        }
+    }
+
+    /// The backfill as a TEST runs it. `backfill_project_anchors` sweeps EVERY session of the
+    /// database; the harness database is shared by all the tests of the binary, which run in
+    /// parallel, so a test that sweeps globally anchors (and later un-anchors) the sessions its
+    /// neighbours are in the middle of building. A test sweeps only what it created.
+    async fn sweep_backfill(
+        e: &Env,
+        slugs: &[String],
+    ) -> project_orchestrator::chat::anchor::BackfillReport {
+        e.client
+            .backfill_project_anchors_for(Some(slugs))
+            .await
+            .unwrap()
+    }
+
+    /// The revert as a test runs it: only the anchors of the sessions it created.
+    async fn sweep_revert(e: &Env, sessions: &[Uuid]) -> usize {
+        e.client
+            .revert_inferred_anchors_for(Some(sessions))
+            .await
+            .unwrap()
+    }
+
     fn user(t: AnchorTargetType, id: &str, roles: &[AnchorRole]) -> NewAnchor {
         NewAnchor::new(t, id, roles.iter().copied(), AnchorActor::User, "harness")
     }
@@ -712,7 +753,6 @@ mod anchors {
     #[tokio::test]
     async fn a_malformed_session_is_skipped_by_the_backfill_instead_of_aborting_it() {
         let Some(e) = env().await else { return };
-        let store: &dyn GraphStore = &e.client;
         let slug = format!("backfill-malformed-{}", Uuid::new_v4());
         let _ = e
             .raw
@@ -721,10 +761,7 @@ mod anchors {
             )
             .await
             .unwrap();
-        store
-            .backfill_project_anchors()
-            .await
-            .expect("a session without `id` must be skipped, never abort the sweep");
+        sweep_backfill(&e, std::slice::from_ref(&slug)).await;
         let _ = e
             .raw
             .execute(
@@ -738,36 +775,75 @@ mod anchors {
             .unwrap();
     }
 
+    /// The interference, replayed in a fixed order instead of waiting for the scheduler to
+    /// produce it. Test B runs its backfill while test A has created its session (with a
+    /// project) and not yet added its own anchors; B's sweep must not anchor A's session, or
+    /// A's `add_anchor` on the same project answers "already anchored" (measured on CI,
+    /// `anchor_scope::shadow_cost_of_a_turn…`, 11/11/2026), and B's revert must not delete the
+    /// anchors A went on to add.
+    #[tokio::test]
+    async fn a_neighbours_sweep_never_touches_my_sessions() {
+        let Some(e) = env().await else { return };
+        let store: &dyn GraphStore = &e.client;
+        // A: a project and a session carrying its slug, nothing anchored yet
+        let slug_a = format!("anchor-proj-a-{}", Uuid::new_v4().simple());
+        let a = project_node(&slug_a);
+        store.create_project(&a).await.unwrap();
+        let sid_a = Uuid::new_v4();
+        let mut na = node(sid_a);
+        na.project_slug = Some(slug_a.clone());
+        store.create_chat_session(&na).await.unwrap();
+        // B: its own project and session, and its own sweep
+        let slug_b = format!("anchor-proj-b-{}", Uuid::new_v4().simple());
+        let b = project_node(&slug_b);
+        store.create_project(&b).await.unwrap();
+        let sid_b = Uuid::new_v4();
+        let mut nb = node(sid_b);
+        nb.project_slug = Some(slug_b.clone());
+        store.create_chat_session(&nb).await.unwrap();
+        sweep_backfill(&e, std::slice::from_ref(&slug_b)).await;
+        assert_eq!(store.list_session_anchors(sid_b).await.unwrap().len(), 1);
+
+        // A resumes: its session is still empty, so its own anchor on its project goes in
+        let mine = store
+            .add_anchor(
+                sid_a,
+                user(
+                    AnchorTargetType::Project,
+                    &a.id.to_string(),
+                    &[AnchorRole::Mention],
+                ),
+            )
+            .await
+            .expect("B's sweep must not have anchored A's session");
+        // B reverts: A's anchor is none of its business
+        sweep_revert(&e, &[sid_b]).await;
+        assert!(store.list_session_anchors(sid_b).await.unwrap().is_empty());
+        let left = store.list_session_anchors(sid_a).await.unwrap();
+        assert_eq!(left.iter().map(|x| x.id).collect::<Vec<_>>(), vec![mine.id]);
+
+        for sid in [sid_a, sid_b] {
+            store.delete_chat_session(sid).await.unwrap();
+        }
+        store.delete_project(a.id, &slug_a).await.unwrap();
+        store.delete_project(b.id, &slug_b).await.unwrap();
+    }
+
     #[tokio::test]
     async fn backfill_is_idempotent_and_revert_removes_only_its_anchors() {
         let Some(e) = env().await else { return };
         let store: &dyn GraphStore = &e.client;
         let slug = format!("anchor-proj-{}", Uuid::new_v4().simple());
-        let project = project_orchestrator::neo4j::models::ProjectNode {
-            id: Uuid::new_v4(),
-            name: slug.clone(),
-            slug: slug.clone(),
-            root_path: "/tmp/anchor-harness".to_string(),
-            description: None,
-            created_at: Utc::now(),
-            last_synced: None,
-            analytics_computed_at: None,
-            last_co_change_computed_at: None,
-            default_note_energy: None,
-            scaffolding_override: None,
-            sharing_policy: None,
-            watch_enabled: false,
-            profile: Default::default(),
-        };
+        let project = project_node(&slug);
         store.create_project(&project).await.unwrap();
         let sid = Uuid::new_v4();
         let mut n = node(sid);
         n.project_slug = Some(slug.clone());
         store.create_chat_session(&n).await.unwrap();
 
-        store.backfill_project_anchors().await.unwrap();
+        sweep_backfill(&e, std::slice::from_ref(&slug)).await;
         let first = store.list_session_anchors(sid).await.unwrap();
-        store.backfill_project_anchors().await.unwrap();
+        sweep_backfill(&e, std::slice::from_ref(&slug)).await;
         let second = store.list_session_anchors(sid).await.unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(first, second, "two runs = same state");
@@ -775,7 +851,7 @@ mod anchors {
         assert_eq!(first[0].target_id, project.id.to_string());
         assert_eq!(store.list_anchor_events(sid).await.unwrap().len(), 1);
 
-        assert!(store.revert_inferred_anchors().await.unwrap() >= 1);
+        assert!(sweep_revert(&e, &[sid]).await >= 1);
         assert!(store.list_session_anchors(sid).await.unwrap().is_empty());
         assert!(store.list_anchor_events(sid).await.unwrap().is_empty());
         store.delete_chat_session(sid).await.unwrap();
@@ -1355,12 +1431,22 @@ mod anchor_followups {
             )
         }
         assert_eq!(state(&e, [child, orphan]).await.0, 0);
-        let first = store.backfill_spawned_by_edges().await.unwrap();
+        // only the sessions this test created: the unscoped sweep would give a neighbour's
+        // legacy child (the lineage test above reads one on purpose) its edge
+        let mine = [parent, child, orphan];
+        let first = e
+            .client
+            .backfill_spawned_by_edges_for(Some(&mine))
+            .await
+            .unwrap();
         assert!(first >= 1, "the legacy child gets its edge");
         let after_first = state(&e, [child, orphan]).await;
         assert_eq!((after_first.0, after_first.1), (1, 2));
         assert_eq!(edge_count(&e, child, parent).await, 1);
-        store.backfill_spawned_by_edges().await.unwrap();
+        e.client
+            .backfill_spawned_by_edges_for(Some(&mine))
+            .await
+            .unwrap();
         assert_eq!(
             state(&e, [child, orphan]).await,
             after_first,
