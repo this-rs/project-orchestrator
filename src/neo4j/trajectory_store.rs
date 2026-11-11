@@ -2,6 +2,7 @@
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
+use super::unsigned::unsigned;
 use async_trait::async_trait;
 use neo4rs::{query, Graph};
 use std::sync::Arc;
@@ -897,8 +898,8 @@ fn parse_trajectory(node: &neo4rs::Node, nodes: Vec<TrajectoryNode>) -> Result<T
         session_id: node.get("session_id").unwrap_or_default(),
         query_embedding: node.get("query_embedding").unwrap_or_default(),
         total_reward: node.get("total_reward").unwrap_or(0.0),
-        step_count: node.get::<i64>("step_count").unwrap_or(0) as usize,
-        duration_ms: node.get::<i64>("duration_ms").unwrap_or(0) as u64,
+        step_count: unsigned(node.get::<i64>("step_count").unwrap_or(0), usize::MAX),
+        duration_ms: unsigned(node.get::<i64>("duration_ms").unwrap_or(0), u64::MAX),
         nodes,
         created_at: {
             // Parse ISO 8601 datetime string stored via datetime($created_at)
@@ -931,12 +932,79 @@ fn parse_trajectory_node(node: &neo4rs::Node) -> Result<TrajectoryNode> {
         context_embedding: node.get("context_embedding").unwrap_or_default(),
         action_type: node.get("action_type").unwrap_or_default(),
         action_params,
-        alternatives_count: node.get::<i64>("alternatives_count").unwrap_or(0) as usize,
-        chosen_index: node.get::<i64>("chosen_index").unwrap_or(0) as usize,
+        alternatives_count: unsigned(
+            node.get::<i64>("alternatives_count").unwrap_or(0),
+            usize::MAX,
+        ),
+        chosen_index: unsigned(node.get::<i64>("chosen_index").unwrap_or(0), usize::MAX),
         confidence: node.get("confidence").unwrap_or(0.0),
         local_reward: node.get("local_reward").unwrap_or(0.0),
         cumulative_reward: node.get("cumulative_reward").unwrap_or(0.0),
-        delta_ms: node.get::<i64>("delta_ms").unwrap_or(0) as u64,
-        order: node.get::<i64>("order_idx").unwrap_or(0) as usize,
+        delta_ms: unsigned(node.get::<i64>("delta_ms").unwrap_or(0), u64::MAX),
+        order: unsigned(node.get::<i64>("order_idx").unwrap_or(0), usize::MAX),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neo4rs::{BoltInteger, BoltList, BoltNode, BoltString, BoltType};
+
+    fn node(props: &[(&str, BoltType)]) -> neo4rs::Node {
+        neo4rs::Node::new(BoltNode::new(
+            BoltInteger::new(1),
+            BoltList::new(),
+            props
+                .iter()
+                .map(|(k, v)| (BoltString::new(k), v.clone()))
+                .collect(),
+        ))
+    }
+
+    fn int(v: i64) -> BoltType {
+        BoltType::from(v)
+    }
+
+    /// -1 is the graph's "none"; `-1 as usize` / `as u64` is a number no one meant.
+    #[test]
+    fn a_negative_stored_count_or_duration_is_zero() {
+        let id = BoltType::from(Uuid::new_v4().to_string());
+        let n = node(&[
+            ("id", id.clone()),
+            ("alternatives_count", int(-1)),
+            ("chosen_index", int(-1)),
+            ("delta_ms", int(-16)),
+            ("order_idx", int(-1)),
+        ]);
+        let parsed = parse_trajectory_node(&n).unwrap();
+        assert_eq!(
+            (
+                parsed.alternatives_count,
+                parsed.chosen_index,
+                parsed.delta_ms,
+                parsed.order
+            ),
+            (0, 0, 0, 0)
+        );
+
+        let t = node(&[
+            ("id", id),
+            ("step_count", int(-1)),
+            ("duration_ms", int(-1)),
+        ]);
+        let parsed = parse_trajectory(&t, vec![]).unwrap();
+        assert_eq!((parsed.step_count, parsed.duration_ms), (0, 0));
+    }
+
+    #[test]
+    fn a_stored_count_is_read_as_it_is() {
+        let id = BoltType::from(Uuid::new_v4().to_string());
+        let t = node(&[
+            ("id", id),
+            ("step_count", int(7)),
+            ("duration_ms", int(1500)),
+        ]);
+        let parsed = parse_trajectory(&t, vec![]).unwrap();
+        assert_eq!((parsed.step_count, parsed.duration_ms), (7, 1500));
+    }
 }

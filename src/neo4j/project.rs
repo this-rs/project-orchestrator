@@ -569,7 +569,7 @@ impl Neo4jClient {
             scaffolding_override: node
                 .get::<i64>("scaffolding_override")
                 .ok()
-                .map(|v| v as u8),
+                .and_then(super::unsigned::unsigned_opt::<u8>),
             sharing_policy: node
                 .get::<String>("sharing_policy")
                 .ok()

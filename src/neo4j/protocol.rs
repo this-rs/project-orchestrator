@@ -15,6 +15,25 @@ use neo4rs::query;
 use tracing::warn;
 use uuid::Uuid;
 
+/// The timeout of a state as the graph stores it: seconds, or `-1` for "no
+/// timeout" (what [`stored_timeout`] writes). Read back as `None`, and the
+/// runner's default applies — never `v as u64` (`-1` would be `u64::MAX`
+/// seconds), and never `Some(0)` (a zero timeout expires the state on the
+/// spot: 0 is "no timeout" too, on both sides).
+fn stored_timeout_secs(stored: i64) -> Option<u64> {
+    u64::try_from(stored).ok().filter(|&s| s > 0)
+}
+
+/// The inverse: what is written for a state's timeout. `None` and `0` are `-1`;
+/// a duration above `i64::MAX` seconds saturates there instead of wrapping to a
+/// negative (`v as i64`), which the reader would take for "no timeout".
+fn stored_timeout(timeout: Option<u64>) -> i64 {
+    match timeout {
+        None | Some(0) => -1,
+        Some(v) => i64::try_from(v).unwrap_or(i64::MAX),
+    }
+}
+
 impl Neo4jClient {
     // ========================================================================
     // Conversion helpers
@@ -129,7 +148,10 @@ impl Neo4jClient {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .and_then(|s| serde_json::from_str(&s).ok()),
-            state_timeout_secs: node.get::<i64>("state_timeout_secs").ok().map(|v| v as u64),
+            state_timeout_secs: node
+                .get::<i64>("state_timeout_secs")
+                .ok()
+                .and_then(stored_timeout_secs),
         })
     }
 
@@ -512,7 +534,7 @@ impl Neo4jClient {
         )
         .param(
             "state_timeout_secs",
-            state.state_timeout_secs.map(|v| v as i64).unwrap_or(-1),
+            stored_timeout(state.state_timeout_secs),
         );
 
         self.graph
@@ -1644,4 +1666,36 @@ pub struct ProducedArtefact {
     pub produced_at: chrono::DateTime<chrono::Utc>,
     /// Content preview (first 200 chars)
     pub summary: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{stored_timeout, stored_timeout_secs};
+
+    #[test]
+    fn a_negative_stored_timeout_is_no_timeout() {
+        assert_eq!(stored_timeout_secs(-1), None);
+        assert_eq!(stored_timeout_secs(i64::MIN), None);
+        assert_eq!(stored_timeout_secs(255), Some(255));
+        assert_eq!(stored_timeout_secs(i64::MAX), Some(i64::MAX as u64));
+    }
+
+    #[test]
+    fn a_zero_timeout_is_no_timeout_on_both_sides() {
+        // Read: 0 would expire the state at once (`Duration::from_secs(0)`).
+        assert_eq!(stored_timeout_secs(0), None);
+        // Write: normalised to the sentinel, so the graph never holds a 0.
+        assert_eq!(stored_timeout(Some(0)), -1);
+    }
+
+    #[test]
+    fn a_timeout_is_written_as_is_and_never_wraps_negative() {
+        assert_eq!(stored_timeout(None), -1);
+        assert_eq!(stored_timeout(Some(1)), 1);
+        assert_eq!(stored_timeout(Some(255)), 255);
+        assert_eq!(stored_timeout(Some(i64::MAX as u64)), i64::MAX);
+        // `u64::MAX as i64` is -1: it would be read back as "no timeout".
+        assert_eq!(stored_timeout(Some(i64::MAX as u64 + 1)), i64::MAX);
+        assert_eq!(stored_timeout(Some(u64::MAX)), i64::MAX);
+    }
 }

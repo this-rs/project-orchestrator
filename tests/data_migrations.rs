@@ -15,6 +15,7 @@ use project_orchestrator::neo4j::traits::*;
 
 use neo4rs::{query, Graph};
 use project_orchestrator::neo4j::client::Neo4jClient;
+use project_orchestrator::neo4j::data_migrations::PHANTOM_STATE_TIMEOUTS_ID;
 use project_orchestrator::neo4j::AGENT_SELF_MIGRATION_KEY;
 use uuid::Uuid;
 
@@ -1529,6 +1530,8 @@ async fn test_data_migrations_repair_an_upgraded_install() {
         .map(|m| m.id.to_string())
         .collect();
     expected_ids.push(AGENT_SELF_MIGRATION_KEY.to_string());
+    // The 255-timeout repair is the last replayable step (see PATCH.md of the driver).
+    expected_ids.push(PHANTOM_STATE_TIMEOUTS_ID.to_string());
     let ran_ids: Vec<String> = first.iter().map(|o| o.id.clone()).collect();
     assert_eq!(ran_ids, expected_ids, "{first:?}");
     assert!(
@@ -1539,7 +1542,7 @@ async fn test_data_migrations_repair_an_upgraded_install() {
     // Every registered migration is skipped on the second start; the identity
     // one is replayed by design and moves nothing.
     for o in &second {
-        if o.id == AGENT_SELF_MIGRATION_KEY {
+        if o.id == AGENT_SELF_MIGRATION_KEY || o.id == PHANTOM_STATE_TIMEOUTS_ID {
             assert!(o.completed && o.error.is_none(), "{o:?}");
             assert_eq!(o.processed, 0, "a replay moves nothing: {o:?}");
         } else {
