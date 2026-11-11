@@ -19535,12 +19535,15 @@ impl ChatManager {
                 .map(|(id, _)| id.clone())
                 .collect()
         };
-        // The agent engine (the default): the provider said, out of a turn, that its process is
-        // gone. A turn in flight would have noticed and detached the handle by itself; an idle
-        // session never did, and held its child slot.
+        // The agent engine (the default): the provider's PROCESS is gone — observed by
+        // asking it, or announced by it out of a turn (`provider_is_dead`). A turn in flight
+        // would have noticed and detached the handle by itself; an idle or SILENT session
+        // never did, and held its child slot. The constat matters as much as the
+        // announcement: a session whose stream is mute announces nothing at all, which is how
+        // the session measured on 10/11 (`cadfa92b`) held a dead handle for 8 hours.
         let mut dead = dead;
         for handle in self.agent_runtime.handles().await {
-            if handle.provider_is_dead() && !dead.contains(&handle.session_id) {
+            if handle.provider_is_dead().await && !dead.contains(&handle.session_id) {
                 dead.push(handle.session_id.clone());
             }
         }

@@ -9553,7 +9553,7 @@ async fn agent_path_an_idle_session_whose_provider_died_is_closed_with_process_d
     // The pump is asynchronous: wait for the handle to carry the verdict.
     let handle = manager.agent_runtime.get(&sid).await.expect("registered");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !handle.provider_is_dead() {
+        while !handle.provider_death_announced() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
@@ -9642,7 +9642,7 @@ async fn a_delegation_refused_by_a_dead_child_succeeds_again_after_the_watchdog_
     });
     let handle = manager.agent_runtime.get(&child).await.expect("registered");
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !handle.provider_is_dead() {
+        while !handle.provider_death_announced() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -17924,4 +17924,111 @@ async fn the_envelope_asks_the_manager_who_is_working() {
     assert!(!LiveSessions::is_working(&manager, "s-answered").await);
     assert!(LiveSessions::is_working(&manager, "s-streaming").await);
     assert!(!LiveSessions::is_working(&manager, "s-nowhere").await);
+}
+
+/// PROVIDER-DEAD (the third defect of the 10/11 plan). The watchdog used to know only
+/// what the provider had ANNOUNCED out of a turn: an `Error { ProcessExited }` on its
+/// stream. A session whose process is gone but whose stream is silent announces
+/// nothing — that is exactly the state the session measured on 10/11 (cadfa92b) sat in
+/// for 8 hours: handle live, `provider_is_dead()` false, no CLI process. The verdict is
+/// OBSERVED now, by asking the provider, so the same state is harvested within one
+/// watchdog interval and its slot is freed.
+#[tokio::test]
+async fn agent_path_a_dead_provider_process_is_harvested_though_no_event_announced_it() {
+    use nexus_claude::agent::ProviderError;
+    let (manager, _graph, fake) = agent_manager();
+    let sid = manager
+        .create_session(&agent_request("go"))
+        .await
+        .unwrap()
+        .session_id;
+    // The process is gone. NOTHING says so: no event, no out-of-band frame — only the
+    // session's own answer to a call that checks whether it is still usable.
+    *fake.state.cancel_tools_answer.lock().unwrap() =
+        Some(ProviderError::ProcessExited { code: None });
+
+    let mut rx = manager.subscribe(&sid).await.unwrap();
+    let closed = manager.close_sessions_of_dead_clis().await;
+    assert_eq!(
+        closed,
+        vec![sid.clone()],
+        "the session whose provider process is gone is harvested"
+    );
+    assert!(
+        !manager.is_session_active(&sid).await,
+        "a closed session holds no envelope slot"
+    );
+    assert!(
+        !manager.agent_runtime.owns(&sid).await,
+        "the handle left the live table with the session"
+    );
+    let event = next_matching(
+        &mut rx,
+        |e| matches!(e, ChatEvent::SessionClosed { reason: Some(r), .. } if r == "process_died"),
+    )
+    .await;
+    assert!(matches!(event, ChatEvent::SessionClosed { .. }));
+}
+
+/// PROVIDER-DEAD, the other half: the constat must not create the false positive it
+/// risks. A session whose provider is ALIVE but silent — a long tool, a question waiting
+/// for its person — answers the probe the way nexus answers a live session
+/// (`invalid_request`: no such background task). Nothing is harvested, and the turn in
+/// flight keeps streaming.
+#[tokio::test]
+async fn agent_path_a_silent_but_living_provider_is_not_harvested() {
+    use nexus_claude::agent::ProviderError;
+    let (manager, _graph, fake) = agent_manager();
+    let sid = manager
+        .create_session(&agent_request("go"))
+        .await
+        .unwrap()
+        .session_id;
+    *fake.state.cancel_tools_answer.lock().unwrap() = Some(ProviderError::invalid(
+        "unknown background task `__provider_liveness_probe__`",
+    ));
+
+    assert!(
+        manager.close_sessions_of_dead_clis().await.is_empty(),
+        "a session that says nothing is not a session that is gone"
+    );
+    assert!(
+        manager.is_session_active(&sid).await,
+        "the silent session keeps its slot"
+    );
+    let handle = manager.agent_runtime.get(&sid).await.expect("registered");
+    assert!(
+        handle
+            .is_streaming
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the turn in flight was not cut by the question"
+    );
+    manager.close_session(&sid).await.ok();
+}
+
+/// PROVIDER-DEAD, the remote half: where the provider's process is not local by
+/// construction (ACP, Codex, the in-process native loop, a remote CLI with tool
+/// cancellation off) the probe is answered `unsupported`. That is "I cannot tell", and it
+/// must never be read as "it is dead".
+#[tokio::test]
+async fn agent_path_a_provider_that_cannot_tell_is_not_harvested() {
+    use nexus_claude::agent::ProviderError;
+    let (manager, _graph, fake) = agent_manager();
+    let sid = manager
+        .create_session(&agent_request("go"))
+        .await
+        .unwrap()
+        .session_id;
+    *fake.state.cancel_tools_answer.lock().unwrap() =
+        Some(ProviderError::unsupported("tool_cancel"));
+
+    assert!(
+        manager.close_sessions_of_dead_clis().await.is_empty(),
+        "a provider that cannot tell is left alone"
+    );
+    assert!(
+        manager.is_session_active(&sid).await,
+        "the session keeps its slot"
+    );
+    manager.close_session(&sid).await.ok();
 }

@@ -17793,9 +17793,14 @@ mod zombie_cli_real_kill {
             .collect()
     }
 
-    #[tokio::test]
-    async fn a_real_cli_killed_while_idle_closes_its_session_and_is_reaped() {
-        let dir = tempfile::tempdir().unwrap();
+    /// One session on a REAL `fake_claude`, its first turn answered: the CLI is now IDLE,
+    /// waiting for its next message. Returns the manager, the graph, the session id, the pid
+    /// of OUR CLI (the only child this session started) and the marker that tells it apart
+    /// from the CLIs of the tests running in parallel.
+    #[allow(clippy::type_complexity)]
+    async fn an_idle_session_on_a_real_cli(
+        dir: &tempfile::TempDir,
+    ) -> (Arc<ChatManager>, Arc<MockGraphStore>, String, i32, String) {
         let transcript = dir.path().join("transcript.jsonl");
         let stdin_out = dir.path().join("stdin.jsonl");
         let lines = [
@@ -17896,6 +17901,13 @@ mod zombie_cli_real_kill {
             .collect();
         assert_eq!(cli.len(), 1, "exactly one CLI for this session: {cli:?}");
         let pid = cli[0];
+        (manager, graph, sid, pid, marker)
+    }
+
+    #[tokio::test]
+    async fn a_real_cli_killed_while_idle_closes_its_session_and_is_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, _graph, sid, pid, _marker) = an_idle_session_on_a_real_cli(&dir).await;
 
         // Production timing: the same watchdog the server starts.
         manager.start_dead_cli_watchdog();
@@ -17935,5 +17947,87 @@ mod zombie_cli_real_kill {
             "a closed session holds no envelope slot"
         );
         eprintln!("ZOMBIE-CLI real kill: session closed in {closed_in:?}, pid {pid} reaped");
+    }
+
+    /// PROVIDER-DEAD, on a REAL process: the same CLI, killed while idle — but here the
+    /// verdict is ASKED for, not waited for. This is the state the session measured on
+    /// 10/11 (`cadfa92b`) sat in for 8 hours: handle live, no CLI process.
+    ///
+    /// What it proves, on the real transport and not on a fake:
+    /// 1. while the CLI LIVES, `provider_is_dead()` answers false — nexus answers the probe
+    ///    `invalid_request` (no such background task), nothing is signalled and the idle
+    ///    session keeps its slot. A session that says nothing is not a session that is gone;
+    /// 2. once the process is SIGKILLed, the session is harvested with `process_died` and its
+    ///    slot freed, within the watchdog's budget. Measured below: the time from the kill to
+    ///    the harvest (the watchdog ticks every `DEAD_CLI_WATCH_INTERVAL` = 5 s).
+    ///
+    /// WHAT THIS TEST DOES NOT PROVE — written here because an independent review (10/11/2026,
+    /// finding 1) showed the first version of this comment was false: a clean `SIGKILL` of an
+    /// idle CLI ends the transport's stream, which fires BOTH paths — the constat this PR adds
+    /// AND the out-of-turn `ProcessExited` announcement that already existed. Either can
+    /// answer, so this test also passes WITHOUT the constat (the pre-existing
+    /// `a_real_cli_killed_while_idle_closes_its_session_and_is_reaped` already covered this
+    /// very scenario). It is an OUTCOME proof — a real CLI, really killed, really harvested —
+    /// not a provenance proof.
+    ///
+    /// PROVENANCE is proven where the announcement is held out of the picture, and those
+    /// tests fail without the constat:
+    /// `agent_runtime::provider_dead_tests::a_process_that_vanished_without_a_word_is_observed_and_not_waited_for`
+    /// (a fake provider with no out-of-turn pump) and the manager's
+    /// `agent_path_a_dead_provider_process_is_harvested_though_no_event_announced_it` (the
+    /// announced flag is held false; the sweep still harvests).
+    #[tokio::test]
+    async fn a_real_cli_killed_while_idle_is_harvested_within_the_watchdog_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, _graph, sid, pid, _marker) = an_idle_session_on_a_real_cli(&dir).await;
+        let handle = manager
+            .agent_runtime
+            .get(&sid)
+            .await
+            .expect("the session is live");
+
+        assert!(
+            !handle.provider_death_announced(),
+            "a live CLI announced nothing"
+        );
+        assert!(
+            !handle.provider_is_dead().await,
+            "a LIVING provider is never declared dead by the probe"
+        );
+        assert!(
+            manager.close_sessions_of_dead_clis().await.is_empty(),
+            "and the watchdog leaves its session alone"
+        );
+
+        let started = std::time::Instant::now();
+        // SAFETY: a plain signal to the child pid we just found, not a group.
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGKILL) },
+            0,
+            "SIGKILL delivered"
+        );
+        let deadline = started + Duration::from_secs(30);
+        while !handle.provider_is_dead().await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the death of a real CLI must be observed within 30 s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let observed_in = started.elapsed();
+
+        let closed = manager.close_sessions_of_dead_clis().await;
+        assert_eq!(
+            closed,
+            vec![sid.clone()],
+            "the session whose process is gone is harvested"
+        );
+        assert!(
+            !manager.is_session_active(&sid).await,
+            "a closed session holds no envelope slot"
+        );
+        eprintln!(
+            "PROVIDER-DEAD real kill: death observed in {observed_in:?}, session {sid} closed, pid {pid}"
+        );
     }
 }
