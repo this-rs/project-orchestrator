@@ -182,6 +182,12 @@ pub struct ChatConfig {
     pub max_sessions: usize,
     /// Timeout after which inactive sessions are closed (subprocess freed)
     pub session_timeout: Duration,
+    /// How long a session a person can answer may wait on that person (a permission its
+    /// running turn asked) before the idle cleanup closes it anyway: waiting prolongs a
+    /// session past `session_timeout` and its hard cap, never for ever
+    /// (`manager::PERSON_WAIT_CAP`, 24 h by default; `CHAT_PERSON_WAIT_CAP_SECS`,
+    /// `chat.person_wait_cap_secs`). Never shorter than the hard cap.
+    pub person_wait_cap: Duration,
     /// Neo4j connection details for MCP server env
     pub neo4j_uri: String,
     pub neo4j_user: String,
@@ -370,6 +376,10 @@ impl ChatConfig {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(1800), // 30 minutes
             ),
+            person_wait_cap: std::env::var("CHAT_PERSON_WAIT_CAP_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .map_or(super::manager::PERSON_WAIT_CAP, Duration::from_secs),
             neo4j_uri: std::env::var("NEO4J_URI")
                 .unwrap_or_else(|_| "bolt://localhost:7687".into()),
             neo4j_user: std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into()),
@@ -655,6 +665,7 @@ mod tests {
             default_model: "claude-sonnet-4-6".into(),
             max_sessions: 10,
             session_timeout: Duration::from_secs(1800),
+            person_wait_cap: crate::chat::manager::PERSON_WAIT_CAP,
             neo4j_uri: "bolt://localhost:7687".into(),
             neo4j_user: "neo4j".into(),
             neo4j_password: "test".into(),
