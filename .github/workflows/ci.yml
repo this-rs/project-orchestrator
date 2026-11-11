@@ -413,6 +413,8 @@ jobs:
     name: Desktop (Tauri)
     if: (github.base_ref == 'main' && !github.event.pull_request.draft) || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # Un job figé ne doit pas tenir un lanceur 6 h (défaut GitHub).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
@@ -428,10 +430,29 @@ jobs:
           save-if: ${{ env.CACHE_SAVE == 'true' && env.CACHE_FRESH == '' }}
           cache-workspace-crates: true
 
+      # Le 11/11/2026 à partir de 14h UTC, le DNS des lanceurs (127.0.0.53, résolveur
+      # d'Azure) ne résolvait plus AUCUN miroir Ubuntu alors que github.com et crates.io
+      # passaient : « Temporary failure resolving 'azure.archive.ubuntu.com' ». Chaque
+      # paquet échouait après 20 s ; sans borne, l'étape tenait le lanceur une heure (même
+      # panne mesurée sur this-rs/atelier, PR 80). Avec 1.1.1.1 / 9.9.9.9, apt update
+      # prend 21 s et l'installation 50 s. Le repli ne s'active que si la résolution
+      # échoue : un jour normal, rien ne change.
       - name: Install Tauri system dependencies
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libssl-dev
+          if ! timeout 10 getent hosts azure.archive.ubuntu.com >/dev/null; then
+            echo "::warning::DNS des lanceurs : les miroirs Ubuntu ne se résolvent pas, repli sur 1.1.1.1 / 9.9.9.9"
+            sudo mkdir -p /etc/systemd/resolved.conf.d
+            printf '[Resolve]\nDNS=1.1.1.1 9.9.9.9\n' | sudo tee /etc/systemd/resolved.conf.d/99-repli.conf >/dev/null
+            sudo systemctl restart systemd-resolved
+            sleep 2
+          fi
+          apt_opts="-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+          sudo -E timeout 240 apt-get $apt_opts update
+          sudo -E timeout 400 apt-get $apt_opts install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libssl-dev
 
       # build.rs refuses to build without desktop/dist/index.html, and tauri-build checks
       # that every bundle resource exists (target/release/mcp_server). Placeholders: this
