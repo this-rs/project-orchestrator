@@ -1,14 +1,15 @@
 //! `cargo xtask storage-boundary` — where do the storage drivers leak out of
 //! their adapters? (garde-fou of the storage abstraction)
 //!
-//! Three pilot drivers — `neo4rs`, `meilisearch_sdk`, `async_nats` — are each
-//! owned by one adapter module (`src/neo4j/`, `src/meilisearch/`,
-//! `src/events/nats.rs`). Anywhere else, a reference to one of them crosses
+//! The pilot drivers — `neo4rs`, `meilisearch_sdk`, `async_nats`, and the obrain
+//! engine (`obrain_engine`, `obrain_common`) — are each owned by one adapter
+//! module (`src/neo4j/`, `src/meilisearch/`, `src/events/nats.rs`,
+//! `src/obrain/`). Anywhere else, a reference to one of them crosses
 //! the storage boundary. This subcommand REPORTS those references; it never
 //! rewrites anything.
 //!
 //! What is scanned:
-//! - every `*.rs` file outside the three adapter modules, for a CODE PATH to a
+//! - every `*.rs` file outside the adapter modules, for a CODE PATH to a
 //!   driver (`use …`, a `::` path, a type name) — never a bare substring of a
 //!   string literal (regular or raw) or a comment, and never a variable that
 //!   merely borrows the driver's name. `src/architecture/*` cites the three
@@ -88,6 +89,16 @@ pub const DRIVERS: &[Driver] = &[
         cargo_name: "async-nats",
         adapter: "src/events/nats.rs",
     },
+    Driver {
+        rust_name: "obrain_engine",
+        cargo_name: "obrain-engine",
+        adapter: "src/obrain/",
+    },
+    Driver {
+        rust_name: "obrain_common",
+        cargo_name: "obrain-common",
+        adapter: "src/obrain/",
+    },
 ];
 
 /// A driver reference found outside its adapter.
@@ -116,10 +127,11 @@ pub struct Exception {
     pub line: usize,
 }
 
-/// Is `path` (relative, `/`-separated) one of the three adapter modules?
+/// Is `path` (relative, `/`-separated) one of the adapter modules?
 pub fn is_adapter_file(path: &str) -> bool {
     path.starts_with("src/neo4j/")
         || path.starts_with("src/meilisearch/")
+        || path.starts_with("src/obrain/")
         || path == "src/events/nats.rs"
 }
 
@@ -658,7 +670,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_adapter_file_recognizes_only_the_three_modules() {
+    fn is_adapter_file_recognizes_only_the_adapter_modules() {
+        assert!(is_adapter_file("src/obrain/project.rs"));
+        assert!(!is_adapter_file("src/obrains/x.rs"));
+        assert!(!is_adapter_file("src/storage.rs"));
         assert!(is_adapter_file("src/neo4j/client.rs"));
         assert!(is_adapter_file("src/meilisearch/client.rs"));
         assert!(is_adapter_file("src/events/nats.rs"));
