@@ -17,6 +17,18 @@
 //! [`RejectReason::QuotaExhausted`](super::cognitive::candidates::RejectReason), never through
 //! `healthy` nor through the breaker (which may read this registry, not the other way round).
 //!
+//! NOT EVERY FULL WINDOW REFUSES THE ACCOUNT. A provider also reports the allowance it sells ON TOP
+//! of the plan (extra usage: Claude Code's `seven_day_overage_included`). Such a window being full
+//! says what the ADD-ON has left, not what the account has left; condemning the instance for it
+//! takes a serving account out of routing for as long as that window's date. Measured twice
+//! (10/11 and 11/11/2026, see [`window_condemns_account`]): the account answered on another model
+//! minutes after the overage window was reported `exhausted`. The window is kept — it feeds
+//! [`QuotaRegistry::pressure`] and [`QuotaView`] — and it never closes the door.
+//!
+//! A word from the provider is a HYPOTHESIS; a served turn is PROOF. Every hold is therefore
+//! re-observed after [`DATED_EXHAUSTION_STALENESS`] without a human, and a refusal that comes back
+//! re-arms it: nobody has to clear an entry after resetting an account by hand.
+//!
 //! The clock is injected ([`Clock`]): the exclusion and the re-admission at the reset are
 //! asserted with a clock a test drives by hand.
 #[allow(unused_imports)]
@@ -89,6 +101,12 @@ pub struct Exhaustion {
     pub window: Option<String>,
     /// What made the instance exhausted.
     pub cause: ExhaustionCause,
+    /// When this hold was last CONFIRMED (epoch ms, the registry's clock), so that its age is its
+    /// own and not the entry's: an unrelated snapshot arriving must not make a refusal from three
+    /// days ago look fresh. `None` on an entry stored before this field existed — the entry's own
+    /// observation time decides then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<u64>,
 }
 
 /// What is stored for one instance.
@@ -255,6 +273,71 @@ fn same_family(held: &str, model: &str) -> bool {
     held.len() >= 4 && model.contains(&held)
 }
 
+/// What a rate-limit window of the provider, being `Exhausted`, actually CLOSES. The provider
+/// names its windows, so the answer is read from the name — and there are exactly three:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowScope<'a> {
+    /// Every model of the account: `five_hour`, `seven_day`, `requests`, `credits`… This is the
+    /// "100 % of all models" limit, and it is the ONLY one that excludes the instance.
+    Account,
+    /// ONE family: `seven_day_fable`, `seven_day_opus`. The account serves on the other families,
+    /// and the provider says so itself ("switch to another model") — the FAMILY comes back here so
+    /// the hold lands on it (`model:<family>`), never on the account.
+    Model(&'a str),
+    /// An allowance bought ON TOP of the plan: `seven_day_overage_included`. Full, it says what
+    /// the add-on has left, not what the account has left.
+    AddOn,
+}
+
+/// Which scope an exhausted window of that name closes (see [`WindowScope`]).
+///
+/// The three-way answer is the whole rule, and each arm rests on something measured:
+///
+/// * **AddOn** — 10/11/2026, found again 11/11/2026: `seven_day` at 0,69→0,72 `allowed` beside
+///   `seven_day_overage_included` at 1,0→1,01 `exhausted` until 14/11. The registry held the whole
+///   instance out for 3,7 days, and the same account answered `claude-haiku` at 14:45:27 and
+///   14:58:17 with that entry in place. The overage window excludes nothing by itself.
+/// * **Model** — the CLI's refusal "You've reached your Fable limit. Switch to another model" is a
+///   family limit; confusing it with the account's is what made a served account look dead.
+/// * **Account** — `five_hour`/`seven_day` full is the account refusing every model.
+pub fn window_scope(kind: &str) -> WindowScope<'_> {
+    if kind.to_ascii_lowercase().contains("overage") {
+        return WindowScope::AddOn;
+    }
+    match model_of_window(kind) {
+        Some(family) => WindowScope::Model(family),
+        None => WindowScope::Account,
+    }
+}
+
+/// The family a per-model window belongs to, when it belongs to one: `seven_day_opus` → `opus`,
+/// `seven_day_fable` → `fable`.
+///
+/// The same five names nexus uses to tell a host which windows it can move away from
+/// (`claude-code/map_events.rs::model_of_window`): the two lists must agree, and this one is here
+/// because the DECISION — hold a family or hold the account — is the registry's, not the SDK's.
+/// A window whose suffix is not a family is the account's own (`seven_day`, `five_hour`).
+fn model_of_window(kind: &str) -> Option<&str> {
+    const FAMILIES: &[&str] = &["opus", "sonnet", "haiku", "fable", "mythos"];
+    let family = kind.rsplit('_').next()?;
+    FAMILIES
+        .iter()
+        .find(|known| family.eq_ignore_ascii_case(known))
+        .map(|_| family)
+}
+
+/// Whether a stored hold can never exclude the account: a LIVE window report about an add-on
+/// allowance ([`WindowScope::AddOn`]). The 10/11 and 11/11 shapes were both this, and the entry
+/// survived a restart: dropping it on load repairs the store instead of waiting for a refusal that
+/// will never come. A hold a PERSON typed is left alone: that is a different axis.
+fn condemned_by_an_add_on(exhaustion: &Exhaustion) -> bool {
+    exhaustion.cause == ExhaustionCause::Window
+        && exhaustion
+            .window
+            .as_deref()
+            .is_some_and(|kind| window_scope(kind) == WindowScope::AddOn)
+}
+
 impl QuotaRegistry {
     /// An in-memory registry on the real clock.
     pub fn new() -> Self {
@@ -291,9 +374,34 @@ impl QuotaRegistry {
         };
         let loaded = store.load_all().await?;
         let count = loaded.len();
-        let mut entries = self.lock();
-        for (instance, entry) in loaded {
-            entries.insert(instance, entry);
+        let mut repaired: Vec<String> = Vec::new();
+        {
+            let mut entries = self.lock();
+            for (instance, mut entry) in loaded {
+                // A hold that could never exclude the account is dropped, and the store is
+                // rewritten: the alternative is a dated exclusion on the screen for days, which
+                // nobody can clear and no turn can disprove (10/11 and 11/11/2026).
+                if entry
+                    .exhaustion
+                    .as_ref()
+                    .is_some_and(condemned_by_an_add_on)
+                {
+                    tracing::info!(
+                        %instance,
+                        "dropping a stored exhaustion on an add-on window: it never excluded the account"
+                    );
+                    entry.exhaustion = None;
+                    repaired.push(instance.clone());
+                }
+                entries.insert(instance, entry);
+            }
+        }
+        for instance in repaired {
+            // Awaited: the repair must be in the store before the first turn can re-observe it,
+            // and a test must be able to see it without racing a background task.
+            if let Err(error) = self.persist(&instance).await {
+                tracing::warn!(%instance, %error, "repairing a stored quota failed");
+            }
         }
         Ok(count)
     }
@@ -365,18 +473,47 @@ impl QuotaRegistry {
     /// entry with a past timestamp) cannot overwrite a newer manual or live entry.
     pub fn observe(&self, instance: &str, snapshot: &QuotaSnapshot) {
         let now = self.now_ms();
-        let exhaustion = snapshot.is_exhausted().then(|| {
-            let until = snapshot.exhausted_until_ms();
+        // Each exhausted window is read at ITS scope ([`window_scope`]): the account's own windows
+        // condemn the instance, a family's window holds that family, an add-on window does
+        // neither. Fable's limit is not the account's 100 %, and neither is a full overage.
+        let mut holds: Vec<(String, Exhaustion)> = Vec::new();
+        let mut condemning: Vec<&QuotaWindow> = Vec::new();
+        for window in &snapshot.windows {
+            if window.status != QuotaStatus::Exhausted {
+                continue;
+            }
+            match window_scope(&window.kind) {
+                WindowScope::AddOn => tracing::info!(
+                    %instance,
+                    kind = %window.kind,
+                    "a full add-on window is not a refusal: the plan still serves"
+                ),
+                WindowScope::Model(family) => holds.push((
+                    family.to_owned(),
+                    Exhaustion {
+                        resets_at_ms: window
+                            .resets_at_ms
+                            .unwrap_or(now + FALLBACK_COOLDOWN.as_millis() as u64),
+                        reset_known: window.resets_at_ms.is_some(),
+                        window: Some(format!("model:{family}")),
+                        cause: ExhaustionCause::Window,
+                        observed_at_ms: Some(now),
+                    },
+                )),
+                WindowScope::Account => condemning.push(window),
+            }
+        }
+        let exhaustion = (!condemning.is_empty()).then(|| {
+            let until = condemning.iter().filter_map(|w| w.resets_at_ms).max();
             Exhaustion {
                 resets_at_ms: until.unwrap_or(now + FALLBACK_COOLDOWN.as_millis() as u64),
                 reset_known: until.is_some(),
-                window: snapshot
-                    .windows
+                window: condemning
                     .iter()
-                    .filter(|w| w.status == QuotaStatus::Exhausted)
                     .max_by_key(|w| w.resets_at_ms)
                     .map(|w| w.kind.clone()),
                 cause: ExhaustionCause::Window,
+                observed_at_ms: Some(now),
             }
         });
         let mut new_entry = QuotaEntry {
@@ -395,6 +532,23 @@ impl QuotaRegistry {
                 }
                 // A live account snapshot says nothing about a single model: carry the holds.
                 new_entry.model_holds = existing.model_holds.clone();
+            }
+            // A family the provider now reports full is held — and a reset already known and still
+            // ahead is never shortened by it, the same rule as [`Self::mark`].
+            for (family, hold) in holds {
+                match new_entry.model_holds.get_mut(&family) {
+                    Some(known)
+                        if known.reset_known
+                            && known.resets_at_ms > now
+                            && known.resets_at_ms >= hold.resets_at_ms =>
+                    {
+                        // The same date, said again: keep it, and re-arm its staleness clock.
+                        known.observed_at_ms = Some(now);
+                    }
+                    _ => {
+                        new_entry.model_holds.insert(family, hold);
+                    }
+                }
             }
             entries.insert(instance.to_owned(), new_entry);
         }
@@ -515,6 +669,7 @@ impl QuotaRegistry {
                     reset_known: known,
                     window: None,
                     cause,
+                    observed_at_ms: Some(now),
                 });
             }
             // A refusal is a fresh observation either way: re-arm the staleness clock so a stale
@@ -558,19 +713,25 @@ impl QuotaRegistry {
             use std::collections::hash_map::Entry;
             match entry.model_holds.entry(model.to_owned()) {
                 Entry::Occupied(mut slot) => {
-                    // A reset already known and still ahead is never shortened by a refusal.
+                    // A reset already known and still ahead is never shortened by a refusal — but a
+                    // refusal IS a fresh observation, so it re-arms the staleness clock. Without
+                    // this, a hold the provider keeps confirming (the same date every time) would
+                    // look abandoned and be re-probed every window.
                     let keep = slot.get().reset_known
                         && slot.get().resets_at_ms > now
                         && slot.get().resets_at_ms >= until;
-                    if !keep {
+                    if keep {
+                        slot.get_mut().observed_at_ms = Some(now);
+                    } else {
                         slot.insert(Exhaustion {
                             resets_at_ms: until,
                             reset_known: known,
                             window: Some(format!("model:{model}")),
                             cause,
+                            observed_at_ms: Some(now),
                         });
-                        entry.observed_at_ms = now;
                     }
+                    entry.observed_at_ms = now;
                 }
                 Entry::Vacant(slot) => {
                     slot.insert(Exhaustion {
@@ -578,6 +739,7 @@ impl QuotaRegistry {
                         reset_known: known,
                         window: Some(format!("model:{model}")),
                         cause,
+                        observed_at_ms: Some(now),
                     });
                     entry.observed_at_ms = now;
                 }
@@ -619,6 +781,7 @@ impl QuotaRegistry {
                 reset_known: true,
                 window: Some(kind),
                 cause: ExhaustionCause::Manual,
+                observed_at_ms: Some(now),
             }),
             model_holds: HashMap::new(),
         };
@@ -653,17 +816,22 @@ impl QuotaRegistry {
         let entries = self.lock();
         let entry = entries.get(instance)?;
         let exhaustion = entry.exhaustion.clone().filter(|e| e.resets_at_ms > now)?;
+        // A full ADD-ON window never closes the door: the plan still serves (see
+        // [`window_condemns_account`]). The entry may predate that rule — `load` repairs the
+        // stored one — so the same verdict is given here.
+        if condemned_by_an_add_on(&exhaustion) {
+            return None;
+        }
         // A DATED exhaustion older than DATED_EXHAUSTION_STALENESS is stale: the reset date the
         // provider named may have been invalidated by a person resetting the account, and no
         // `rate_limit_event` reflects that. Dropping it admits the next turn as a SINGLE
         // re-observation probe. A refusal the provider then answers re-arms the entry with a
         // fresh observation time, so a genuinely-exhausted account is probed at most once per
-        // window, never hammered.
+        // window, never hammered. The age is the HOLD's, not the entry's: a snapshot about
+        // another window must not make a dated refusal from last week look fresh.
+        let observed = exhaustion.observed_at_ms.unwrap_or(entry.observed_at_ms);
         if exhaustion.reset_known
-            && entry
-                .observed_at_ms
-                .saturating_add(DATED_EXHAUSTION_STALENESS.as_millis() as u64)
-                <= now
+            && observed.saturating_add(DATED_EXHAUSTION_STALENESS.as_millis() as u64) <= now
         {
             return None;
         }
@@ -693,6 +861,18 @@ impl QuotaRegistry {
             })
             .cloned()
             .filter(|e| e.resets_at_ms > now)
+            // A hold nobody re-confirmed for DATED_EXHAUSTION_STALENESS is re-observed instead of
+            // lasting for the window's date: the same rule as the account-wide one, and the only
+            // way a person's provider reset reaches a model that routing keeps out (measured
+            // 11/11/2026: the Fable hold was dated 3.7 days out and no turn could try it again
+            // to prove the reset had landed).
+            .filter(|e| {
+                !e.reset_known
+                    || e.observed_at_ms
+                        .unwrap_or(entry.observed_at_ms)
+                        .saturating_add(DATED_EXHAUSTION_STALENESS.as_millis() as u64)
+                        > now
+            })
     }
 
     /// How full the FULLEST window of `instance` is (`0.0..=1.0`): what the scorer turns into a
@@ -802,13 +982,15 @@ mod tests {
         );
     }
 
-    /// The 10/11/2026 case, replayed: `seven_day` served at 69 % while
-    /// `seven_day_overage_included` was dated `exhausted` until 2026-11-14. The exclusion is
-    /// justified (the CLI said `rejected`) but must not hold for 3.7 days with no way out: once
-    /// the observation goes stale the account is routable again without a human.
+    /// The 10/11/2026 case, replayed — and found again on 11/11/2026. `seven_day` served at 69 %
+    /// while `seven_day_overage_included` was dated `exhausted` until 14/11. The registry held the
+    /// WHOLE instance out for 3.7 days, and no turn was allowed to disprove it: the account
+    /// answered `claude-haiku` at 14:45:27 and 14:58:17 with that entry in place. An add-on window
+    /// never condemns the account: it is kept for the gauge and for `pressure`, the door stays
+    /// open.
     #[test]
-    fn the_10_11_case_is_excluded_then_reobserved_once_stale() {
-        let (clock, registry) = registry();
+    fn the_10_11_case_keeps_the_account_routable() {
+        let (_clock, registry) = registry();
         let reset = ms_of("2026-11-14T08:00:00Z");
         registry.observe(
             "claude-code",
@@ -816,7 +998,7 @@ mod tests {
                 QuotaWindow {
                     kind: "seven_day".into(),
                     utilization: Some(0.69),
-                    resets_at_ms: None,
+                    resets_at_ms: Some(reset),
                     status: QuotaStatus::Allowed,
                 },
                 QuotaWindow {
@@ -827,17 +1009,167 @@ mod tests {
                 },
             ]),
         );
-        // The exclusion is in force, and it names the overage window the provider refused on.
-        let held = registry
-            .exhausted("claude-code")
-            .expect("excluded at first");
-        assert_eq!(held.window.as_deref(), Some("seven_day_overage_included"));
-        assert_eq!(held.resets_at_ms, reset);
-        clock.advance(DATED_EXHAUSTION_STALENESS + Duration::from_secs(1));
         assert_eq!(
             registry.exhausted("claude-code"),
             None,
-            "the stale exclusion is dropped and the account is routable again"
+            "the plan serves: a full add-on window is not a refusal of the account"
+        );
+        // The fact is not lost: the gauge keeps both windows, and the account still presses.
+        let view = registry.view("claude-code").expect("observed");
+        assert_eq!(view.windows.len(), 2);
+        assert_eq!(view.windows[1].status, QuotaStatus::Exhausted);
+        assert_eq!(registry.pressure("claude-code"), Some(1.0));
+    }
+
+    /// The distinction the whole rule rests on, asserted straight on the helper: a window's NAME
+    /// says what it closes. Fable's window is not the account's 100 %, and neither is an overage.
+    #[test]
+    fn a_windows_name_says_what_it_closes() {
+        assert_eq!(window_scope("five_hour"), WindowScope::Account);
+        assert_eq!(window_scope("seven_day"), WindowScope::Account);
+        assert_eq!(window_scope("requests"), WindowScope::Account);
+        assert_eq!(window_scope("credits"), WindowScope::Account);
+        assert_eq!(window_scope("seven_day_fable"), WindowScope::Model("fable"));
+        assert_eq!(window_scope("seven_day_opus"), WindowScope::Model("opus"));
+        // Order matters: `overage_included` is not a family, and it is not the account either.
+        assert_eq!(
+            window_scope("seven_day_overage_included"),
+            WindowScope::AddOn
+        );
+    }
+
+    /// A FAMILY limit is not the account's 100 %. The provider reports it on its own window
+    /// (`seven_day_fable`) or in its own words ("You've reached your Fable limit — switch to
+    /// another model"): the family is held, every other model keeps serving, and the instance is
+    /// never excluded. Measured 11/11/2026, when the two were conflated.
+    #[test]
+    fn a_family_window_holds_that_family_and_the_account_keeps_serving() {
+        let (_clock, registry) = registry();
+        let reset = ms_of("2026-11-14T08:00:00Z");
+        registry.observe(
+            "claude-code",
+            &QuotaSnapshot::live(vec![
+                QuotaWindow {
+                    kind: "seven_day".into(),
+                    utilization: Some(0.72),
+                    resets_at_ms: Some(reset),
+                    status: QuotaStatus::Allowed,
+                },
+                QuotaWindow {
+                    kind: "seven_day_fable".into(),
+                    utilization: Some(1.0),
+                    resets_at_ms: Some(reset),
+                    status: QuotaStatus::Exhausted,
+                },
+            ]),
+        );
+        assert_eq!(
+            registry.exhausted("claude-code"),
+            None,
+            "a family limit is not the account's 100 %"
+        );
+        let held = registry
+            .model_exhausted("claude-code", "claude-fable-5-1")
+            .expect("Fable is out until its reset");
+        assert_eq!(held.window.as_deref(), Some("model:fable"));
+        assert_eq!(held.resets_at_ms, reset);
+        assert_eq!(
+            registry.model_exhausted("claude-code", "claude-opus-5-5"),
+            None,
+            "the other families carry no hold"
+        );
+    }
+
+    /// The other half of the rule: when the window that GOVERNS the account is full, the instance
+    /// is excluded as before. The add-on exception must never disarm a real refusal.
+    #[test]
+    fn a_full_serving_window_still_condemns_the_account() {
+        let (_clock, registry) = registry();
+        let reset = ms_of("2026-11-14T08:00:00Z");
+        registry.observe(
+            "claude-code",
+            &QuotaSnapshot::live(vec![
+                QuotaWindow {
+                    kind: "seven_day".into(),
+                    utilization: Some(1.0),
+                    resets_at_ms: Some(reset),
+                    status: QuotaStatus::Exhausted,
+                },
+                QuotaWindow {
+                    kind: "seven_day_overage_included".into(),
+                    utilization: Some(1.0),
+                    resets_at_ms: Some(reset),
+                    status: QuotaStatus::Exhausted,
+                },
+            ]),
+        );
+        let held = registry.exhausted("claude-code").expect("excluded");
+        assert_eq!(held.window.as_deref(), Some("seven_day"));
+        assert_eq!(held.resets_at_ms, reset);
+    }
+
+    /// A model hold lives on the same clock as the account-wide one. A person's provider reset
+    /// cannot reach a held model by itself: routing keeps the model out, so no turn can prove
+    /// anything — that is how the Fable hold was dated 3.7 days out on 11/11/2026. Past the trust
+    /// window the hold is re-observed ONCE, and a refusal that comes back re-arms it.
+    #[test]
+    fn a_model_hold_is_reobserved_once_stale() {
+        let (clock, registry) = registry();
+        let reset = ms_of("2026-11-14T08:00:00Z");
+        registry.mark_model_rate_limited("claude-code", "Fable", Some(reset), None);
+        assert!(registry
+            .model_exhausted("claude-code", "claude-fable-5-1")
+            .is_some());
+        clock.advance(DATED_EXHAUSTION_STALENESS - Duration::from_secs(1));
+        assert!(
+            registry
+                .model_exhausted("claude-code", "claude-fable-5-1")
+                .is_some(),
+            "trusted for the whole window"
+        );
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(
+            registry.model_exhausted("claude-code", "claude-fable-5-1"),
+            None,
+            "a hold nobody re-confirmed is re-observed, not kept for three days"
+        );
+        // The probe meets the same refusal: a fresh observation re-arms the hold.
+        registry.mark_model_rate_limited("claude-code", "Fable", Some(reset), None);
+        assert!(registry
+            .model_exhausted("claude-code", "claude-fable-5-1")
+            .is_some());
+        clock.advance(DATED_EXHAUSTION_STALENESS - Duration::from_secs(1));
+        assert!(registry
+            .model_exhausted("claude-code", "claude-fable-5-1")
+            .is_some());
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(
+            registry.model_exhausted("claude-code", "claude-fable-5-1"),
+            None
+        );
+    }
+
+    /// The age of a hold is its OWN: a live snapshot about another window arrives all the time and
+    /// must not make a dated refusal look fresh — otherwise the re-observation above never fires.
+    #[test]
+    fn an_unrelated_snapshot_does_not_make_a_hold_fresh() {
+        let (clock, registry) = registry();
+        let reset = ms_of("2026-11-14T08:00:00Z");
+        registry.mark_model_rate_limited("claude-code", "Fable", Some(reset), None);
+        clock.advance(DATED_EXHAUSTION_STALENESS / 2);
+        registry.observe(
+            "claude-code",
+            &QuotaSnapshot::live(vec![window(
+                "five_hour",
+                QuotaStatus::Allowed,
+                Some(ms_of("2026-10-21T15:00:00Z")),
+            )]),
+        );
+        clock.advance(DATED_EXHAUSTION_STALENESS / 2 + Duration::from_secs(1));
+        assert_eq!(
+            registry.model_exhausted("claude-code", "claude-fable-5-1"),
+            None,
+            "the hold's age is its own, not the entry's"
         );
     }
 
@@ -1217,6 +1549,53 @@ mod tests {
         assert_eq!(after.exhausted("deepseek").unwrap().resets_at_ms, until);
     }
 
+    /// The stored shape of 11/11/2026, exactly as it was found in the graph: an account-wide hold
+    /// on `seven_day_overage_included` until 14/11, written by a build that did not know an add-on
+    /// window is not a refusal. The account answered `claude-haiku` at 14:45:27 and 14:58:17 with
+    /// that entry in place. A restart repairs the entry AND the store, instead of resurrecting a
+    /// lock nobody can clear from the screen.
+    #[tokio::test]
+    async fn a_stored_add_on_exhaustion_is_repaired_on_load() {
+        let store = Arc::new(MemStore::default());
+        let until = ms_of("2026-11-14T08:00:00Z");
+        store.0.lock().unwrap().insert(
+            "claude-code".into(),
+            QuotaEntry {
+                windows: vec![QuotaWindow {
+                    kind: "seven_day_overage_included".into(),
+                    utilization: Some(1.01),
+                    resets_at_ms: Some(until),
+                    status: QuotaStatus::Exhausted,
+                }],
+                source: QuotaSource::Live,
+                observed_at_ms: ms_of("2026-11-11T14:46:16Z"),
+                set_by: None,
+                exhaustion: Some(Exhaustion {
+                    resets_at_ms: until,
+                    reset_known: true,
+                    window: Some("seven_day_overage_included".into()),
+                    cause: ExhaustionCause::Window,
+                    observed_at_ms: None,
+                }),
+                model_holds: HashMap::new(),
+            },
+        );
+        let clock = Arc::new(ManualClock::at("2026-11-11T15:00:00Z"));
+        let registry = QuotaRegistry::new()
+            .with_clock(clock)
+            .with_store(store.clone());
+        assert_eq!(registry.load().await.unwrap(), 1);
+        assert_eq!(
+            registry.exhausted("claude-code"),
+            None,
+            "the stored lock cannot outlive the rule that wrote it"
+        );
+        // The repair reached the store: a second boot finds nothing either.
+        let stored = store.0.lock().unwrap().get("claude-code").cloned().unwrap();
+        assert_eq!(stored.exhaustion, None);
+        assert_eq!(stored.windows.len(), 1, "the gauge keeps its window");
+    }
+
     /// A person's reset survives a restart: after `clear` + `persist`, a registry reloaded from
     /// the same store finds nothing, so the instance is a candidate again and no stale exclusion
     /// resurrects it.
@@ -1267,6 +1646,7 @@ mod tests {
                 reset_known: true,
                 window: Some("seven_day".into()),
                 cause: ExhaustionCause::Window,
+                observed_at_ms: None,
             }),
             // A per-model hold rides the SAME document and round-trips with it.
             model_holds: HashMap::from([(
@@ -1276,6 +1656,7 @@ mod tests {
                     reset_known: true,
                     window: Some("model:claude-fable-5-1".into()),
                     cause: ExhaustionCause::RateLimited,
+                    observed_at_ms: None,
                 },
             )]),
         };
