@@ -881,6 +881,10 @@ pub struct AgentSessionHandle {
     /// The running turn was stopped (by the user, or for a message sent now):
     /// the automated entries of the queue are dropped when it ends.
     interrupted: AtomicBool,
+    /// The session asked a question nobody has answered yet. The turn that asked it ends ON the
+    /// question, so this outlives the turn: it is cleared by the user's next message (the
+    /// answer) and read by [`AgentSessionHandle::waiting_on_a_person`].
+    question_open: AtomicBool,
     /// Cancelled when the session closes: ends what listens on its behalf (NATS).
     pub closed: tokio_util::sync::CancellationToken,
     /// Continue a turn that stopped on its turn limit: set when the session opens
@@ -1251,6 +1255,9 @@ impl AgentSessionHandle {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .insert(id.clone(), AskedRequest { call, turn });
+        }
+        if matches!(event, ChatEvent::AskUserQuestion { .. }) {
+            self.question_open.store(true, Ordering::SeqCst);
         }
         match &event {
             ChatEvent::StreamDelta { text, .. } => self.streaming_text.lock().await.push_str(text),
@@ -2062,6 +2069,11 @@ impl AgentSessionHandle {
             },
             Err(error) => return Err(error),
         };
+        // A user's message the provider accepted is the answer to the question left open, if
+        // any. Not before: a turn stopped or failed before it was sent delivered no answer.
+        if from_user {
+            self.question_open.store(false, Ordering::SeqCst);
+        }
         self.streaming_text.lock().await.clear();
         self.streaming_events.lock().await.clear();
         self.emit(ChatEvent::StreamingStatus { is_streaming: true })
@@ -2255,7 +2267,15 @@ impl AgentSessionHandle {
             return true;
         }
         // A stopped turn waits on nobody: it is ending.
-        if !self.is_streaming.load(Ordering::SeqCst) || self.interrupted.load(Ordering::SeqCst) {
+        if self.interrupted.load(Ordering::SeqCst) {
+            return false;
+        }
+        // A question left open waits on its person past the end of the turn that asked it,
+        // until their answer (`question_open` cleared by the next user turn) or a Stop.
+        if self.question_open.load(Ordering::SeqCst) {
+            return true;
+        }
+        if !self.is_streaming.load(Ordering::SeqCst) {
             return false;
         }
         if by_this_turn {
@@ -3329,6 +3349,9 @@ impl AgentSessionHandle {
         scope: InterruptScope,
     ) -> Result<nexus_claude::agent::InterruptOutcome> {
         self.interrupted.store(true, Ordering::SeqCst);
+        // A Stop closes the question left open (as `segment_state` does for the verdict): the
+        // `interrupted` flag alone is reset by the next turn, even one no person sent.
+        self.question_open.store(false, Ordering::SeqCst);
         // A Stop ends the turn's requests with it: the native harness drops its pending ask
         // when the turn's signal is cancelled and says nothing, so the session would
         // otherwise go on "waiting on a person" for a question nobody can answer.
@@ -3796,6 +3819,7 @@ impl AgentRuntime {
             pending: Mutex::new(std::collections::VecDeque::new()),
             announced_background: std::sync::Mutex::new(Default::default()),
             interrupted: AtomicBool::new(false),
+            question_open: AtomicBool::new(false),
             closed: tokio_util::sync::CancellationToken::new(),
             auto_continue: AtomicBool::new(false),
             auto_continue_count: std::sync::atomic::AtomicU32::new(0),
@@ -9750,7 +9774,7 @@ mod turn_watchdog_tests {
 #[cfg(test)]
 mod forget_path_tests {
     use super::fake::FakeProvider;
-    use super::{AgentRuntime, AgentSessionHandle, PendingMessageKind};
+    use super::{AgentRuntime, AgentSessionHandle, PendingMessageKind, ProviderError};
     use crate::chat::types::ChatEvent;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
@@ -9810,6 +9834,111 @@ mod forget_path_tests {
         assert!(
             handle.waiting_on_a_person().await,
             "the out-of-turn request still waits on its person, turn or no turn"
+        );
+    }
+
+    /// An unanswered question is a wait on its person, as a permission is. The engine ends the
+    /// turn ON the question (the answer is the next turn), so once the turn is over nothing
+    /// streams and no permission is pending: before the fix, `waiting_on_a_person` was false
+    /// here and the idle cleanup closed the session after the session timeout, cutting the
+    /// question that nobody had answered yet.
+    #[tokio::test]
+    async fn an_unanswered_question_keeps_its_session_waiting_once_the_turn_ended() {
+        let (_provider, handle) = a_handle().await;
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        handle
+            .emit(ChatEvent::AskUserQuestion {
+                id: "q1".into(),
+                tool_call_id: "tool-1".into(),
+                questions: serde_json::json!([{ "question": "Which?", "options": [{ "label": "A" }] }]),
+                input: serde_json::json!({}),
+                parent_tool_use_id: None,
+                synthetic: None,
+            })
+            .await;
+        // The turn ends on the question: nothing streams any more, and the event buffer of the
+        // turn is cleared with it, as `next_queued` does when the queue is empty.
+        handle.is_streaming.store(false, Ordering::SeqCst);
+        handle.streaming_events.lock().await.clear();
+        assert!(
+            handle.waiting_on_a_person().await,
+            "a question nobody answered is still waited on after its turn ended"
+        );
+    }
+
+    /// A turn asks a question and ends on it, as the engine does.
+    async fn a_question_left_open(handle: &AgentSessionHandle) {
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        handle
+            .emit(ChatEvent::AskUserQuestion {
+                id: "q1".into(),
+                tool_call_id: "tool-1".into(),
+                questions: serde_json::json!([{ "question": "Which?", "options": [{ "label": "A" }] }]),
+                input: serde_json::json!({}),
+                parent_tool_use_id: None,
+                synthetic: None,
+            })
+            .await;
+        handle.is_streaming.store(false, Ordering::SeqCst);
+        handle.streaming_events.lock().await.clear();
+        assert!(handle.waiting_on_a_person().await, "the question waits");
+    }
+
+    /// A Stop closes the question for good. `interrupted` alone is reset by the next turn,
+    /// even one no person sent (a background output): the question then held the session
+    /// "waiting on a person" up to the person wait cap.
+    #[tokio::test]
+    async fn a_stop_closes_the_question_even_after_a_later_background_turn() {
+        let (_provider, handle) = a_handle().await;
+        a_question_left_open(&handle).await;
+        handle.interrupt().await.unwrap();
+        assert!(
+            !handle.waiting_on_a_person().await,
+            "stopped: nobody waited"
+        );
+        let opened = handle
+            .open_turn(PendingMessageKind::BackgroundOutput, "bg done", "bg done")
+            .await
+            .unwrap();
+        assert!(opened.is_some(), "the background turn is sent");
+        handle.is_streaming.store(false, Ordering::SeqCst);
+        assert!(
+            !handle.waiting_on_a_person().await,
+            "the stopped question is not waited on again after a background turn"
+        );
+    }
+
+    /// A user's message that never reached the provider answered nothing: the question
+    /// still waits on its person.
+    #[tokio::test]
+    async fn an_answer_that_failed_to_send_leaves_the_question_open() {
+        let (provider, handle) = a_handle().await;
+        a_question_left_open(&handle).await;
+        *provider.state.fail_next_turn.lock().unwrap() = Some(ProviderError::EndpointUnreachable {
+            detail: "down for a moment".into(),
+        });
+        let sent = handle.open_turn(PendingMessageKind::User, "A", "A").await;
+        assert!(sent.is_err(), "the answer was not sent");
+        assert!(
+            handle.waiting_on_a_person().await,
+            "a failed answer leaves the question open"
+        );
+    }
+
+    /// The user's answer, sent, closes the question.
+    #[tokio::test]
+    async fn an_answer_sent_closes_the_question() {
+        let (_provider, handle) = a_handle().await;
+        a_question_left_open(&handle).await;
+        let sent = handle
+            .open_turn(PendingMessageKind::User, "A", "A")
+            .await
+            .unwrap();
+        assert!(sent.is_some(), "the answer is sent");
+        handle.is_streaming.store(false, Ordering::SeqCst);
+        assert!(
+            !handle.waiting_on_a_person().await,
+            "the answered question is waited on no more"
         );
     }
 
