@@ -160,7 +160,8 @@
             "builtin": "boolean",
             "is_default": "boolean",
             "allowed_for_project": "boolean (sans project_slug : consentement des chats hors projet, GET /api/chat/llm-consents ; claude-code toujours true) | null (entree construite hors route)",
-            "endpoint_origin": "string | null (jamais d'identifiant ; origine seule)",
+            "endpoint_origin": "string | null (jamais d'identifiant ; origine seule ; null pour un kind process)",
+            "origin": "string? (kind process seulement : identité que le consentement lie, process:codex | process:acp:<preset> ; absent sinon ; additif)",
             "credential": "string (vault:<nom> | env:<VAR> | none) — la référence, jamais la valeur",
             "remote": "object? (claude_code_remote seulement) {host, ssh_user?, ssh_port, host_key_fingerprint ('SHA256:...'), remote_cwd?, allow_trust} — jamais la clé privée ni la clé d'hôte brute",
             "health": {
