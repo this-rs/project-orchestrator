@@ -2721,9 +2721,7 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
         // de cache comprises) — la meilleure estimation du préfixe lu en cache du tour suivant
         // pour un fournisseur qui ne renseigne jamais `TurnContext::context_tokens` (Claude Code).
         if let Some(router) = self.turn_routing.get(session_id) {
-            if let Some(prompt_tokens) = outcome.prompt_tokens {
-                router.note_prefix_tokens(prompt_tokens);
-            }
+            router.remember_turn_prefix(outcome.prompt_tokens);
         }
         // Gap 2: feed the bandit the outcome of the turn it routed. Only for the
         // OPEN decision of a turn that reached a terminal `done`; an overridden

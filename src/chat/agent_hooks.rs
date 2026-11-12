@@ -940,6 +940,14 @@ impl TurnRouter {
         self.last_prefix_tokens.store(tokens, Ordering::SeqCst);
     }
 
+    /// Mémorise le préfixe d'un tour terminé. `None` (le tour n'en a pas rapporté) ne touche
+    /// pas la mémoire : une bonne valeur n'est jamais écrasée par l'absence de mesure.
+    pub(crate) fn remember_turn_prefix(&self, prefix: Option<u64>) {
+        if let Some(tokens) = prefix {
+            self.note_prefix_tokens(tokens);
+        }
+    }
+
     /// Le préfixe facturé au tour précédent, `None` quand jamais mesuré (`0` = inconnu).
     pub(crate) fn prefix_tokens(&self) -> Option<u64> {
         match self.last_prefix_tokens.load(Ordering::SeqCst) {
@@ -2752,6 +2760,20 @@ mod provider_move_tests {
 
     /// PREFIX-CC : la mesure du moteur natif (`context_tokens`) reste l'autorité ; la mémoire
     /// du routeur ne comble que le trou laissé par Claude Code (`context_tokens` à `None`).
+    #[test]
+    fn a_turn_without_a_prefix_does_not_overwrite_the_remembered_one() {
+        let router = full_auto(Fake::picking("local", 0.9, 0.5));
+        router.remember_turn_prefix(Some(60_000));
+        router.remember_turn_prefix(None);
+        assert_eq!(
+            router.prefix_tokens(),
+            Some(60_000),
+            "None leaves the memory alone"
+        );
+        router.remember_turn_prefix(Some(70_000));
+        assert_eq!(router.prefix_tokens(), Some(70_000));
+    }
+
     #[tokio::test]
     async fn the_prefix_memory_fills_the_gap_the_provider_leaves() {
         let decider = Fake::picking("local", 0.9, 0.5);

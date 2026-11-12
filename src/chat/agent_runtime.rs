@@ -691,6 +691,23 @@ fn billed_prompt_tokens(usage: &nexus_claude::agent::Usage) -> Option<u64> {
     })
 }
 
+/// Le préfixe d'un tour pour la mémoire du routeur. Tout fournisseur non natif rapporte
+/// `context_tokens` = le préfixe du DERNIER appel (Claude Code, Codex, ACP : nexus le renseigne)
+/// et jamais la somme des appels du tour. Le natif garde la somme de ses lectures/écritures de
+/// cache, mais seulement quand il a rapporté un préfixe : après une compaction (`None`), le
+/// tour ne fournit aucun préfixe, la somme ne doit pas le remplacer.
+fn prefix_of_turn(
+    asker: super::session_grants::Asker,
+    usage: &nexus_claude::agent::Usage,
+) -> Option<u64> {
+    match asker {
+        super::session_grants::Asker::Native => usage
+            .context_tokens
+            .and_then(|_| billed_prompt_tokens(usage)),
+        _ => usage.context_tokens,
+    }
+}
+
 /// What the host asks of the session after a turn: events to emit, then system
 /// hints to queue (played as the next turns, as the Claude Code engine's queue).
 #[derive(Debug, Default)]
@@ -2655,12 +2672,7 @@ impl AgentSessionHandle {
                     // somme les appels du tour dans `usage` : son préfixe est celui du DERNIER
                     // appel, que nexus rend en `context_tokens`. Le natif garde la somme de
                     // ses lectures et écritures de cache (`input_tokens` garde la somme).
-                    outcome.prompt_tokens =
-                        if self.asker == super::session_grants::Asker::ClaudeCode {
-                            usage.context_tokens
-                        } else {
-                            billed_prompt_tokens(usage)
-                        };
+                    outcome.prompt_tokens = prefix_of_turn(self.asker, usage);
                 }
                 let event = mask_agent_event(event);
                 // The harness' advisories (credentials_locked, model_retry, ...) are what
@@ -7482,6 +7494,9 @@ mod answered_tests {
                 input_tokens: Some(1_000),
                 cache_read_tokens: Some(50_000),
                 cache_creation_tokens: Some(9_000),
+                // The native engine reports the prompt of its last call: that is what makes
+                // its sum a prefix (no compaction since).
+                context_tokens: Some(60_000),
                 ..Default::default()
             })],
         )
@@ -7507,6 +7522,57 @@ mod answered_tests {
     /// PREFIX-CC : un tour Claude Code de TROIS appels d'outil porte un `usage` qui somme les
     /// trois (3 × ~11 000 de lectures de cache). Le préfixe mémorisé est celui du DERNIER appel
     /// (`context_tokens`, 11 051), jamais la somme (33 753).
+    #[tokio::test]
+    async fn a_three_call_codex_turn_remembers_its_last_call_not_the_sum() {
+        let (provider, handle, host) = session_of("codex", 0).await;
+        play(&provider, &handle, vec![three_call_done(Some(11_051))]).await;
+        assert_eq!(host.seen_outcome()[0].prompt_tokens, Some(11_051));
+    }
+
+    /// Un fournisseur qui ne rapporte pas le préfixe de son dernier appel ne fournit rien :
+    /// la somme du tour ne le remplace pas (Claude Code).
+    #[tokio::test]
+    async fn a_claude_code_turn_without_its_prefix_remembers_nothing() {
+        let (provider, handle, host) = session_of("claude_code", 0).await;
+        play(&provider, &handle, vec![three_call_done(None)]).await;
+        assert_eq!(host.seen_outcome()[0].prompt_tokens, None);
+    }
+
+    /// Après une compaction native, le tour n'a pas de préfixe : la somme ne doit pas
+    /// être stockée à la place.
+    #[tokio::test]
+    async fn a_native_turn_after_compaction_remembers_nothing() {
+        let (provider, handle, host) = session(0).await;
+        play(&provider, &handle, vec![three_call_done(None)]).await;
+        assert_eq!(host.seen_outcome()[0].prompt_tokens, None);
+    }
+
+    /// Le `done` d'un tour de trois appels : `usage` somme les appels, `context_tokens` est
+    /// le préfixe du dernier (ou `None`).
+    fn three_call_done(context: Option<u64>) -> AgentEvent {
+        AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Completed,
+            subtype: None,
+            is_error: false,
+            result_text: None,
+            usage: nexus_claude::agent::Usage {
+                input_tokens: Some(3),
+                cache_read_tokens: Some(31_500),
+                cache_creation_tokens: Some(250),
+                context_tokens: context,
+                ..Default::default()
+            },
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 3,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        }
+    }
+
     #[tokio::test]
     async fn a_three_call_claude_code_turn_remembers_its_last_call_not_the_sum() {
         let (provider, handle, host) = session_of("claude_code", 0).await;
