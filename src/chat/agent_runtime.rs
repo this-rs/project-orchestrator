@@ -2669,10 +2669,8 @@ impl AgentSessionHandle {
                             .code
                             .to_string()
                     });
-                    // PREFIX-CC : le préfixe du tour, pour la mémoire du routeur. Claude Code
-                    // somme les appels du tour dans `usage` : son préfixe est celui du DERNIER
-                    // appel, que nexus rend en `context_tokens`. Le natif garde la somme de
-                    // ses lectures et écritures de cache (`input_tokens` garde la somme).
+                    // PREFIX-CC : le préfixe du tour, pour la mémoire du routeur, vient de `context_tokens`
+                    // (le DERNIER appel, tous moteurs). `usage` somme les appels du tour : jamais lu pour le préfixe.
                     outcome.prompt_tokens = prefix_of_turn(usage);
                 }
                 let event = mask_agent_event(event);
