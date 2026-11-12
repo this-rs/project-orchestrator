@@ -210,6 +210,10 @@ fn expected_gain_per_turn(challenger: &Scored, incumbent: &Scored) -> Option<f64
 /// Écart de probabilité de succès au-delà duquel un challenger est retenu pour sa QUALITÉ et
 /// non pour son prix. La règle de cache ne s'applique alors pas : changer de modèle pour
 /// réussir vaut la réécriture d'un préfixe, c'est la raison d'être du routage.
+///
+/// 5 points est un CHOIX DE PRODUIT, pas une mesure : c'est l'ordre de grandeur du bruit
+/// d'une moyenne a posteriori sur quelques observations, et un écart plus petit ne justifie
+/// pas de payer une réécriture de préfixe. À revoir si la mesure contredit ce choix.
 pub const CACHE_QUALITY_MARGIN: f64 = 0.05;
 
 /// Le challenger est-il nettement plus susceptible de RÉUSSIR que le modèle en force ? Les
@@ -467,6 +471,10 @@ fn decide_free(
                         ) {
                             let stay = scored.remove(index);
                             scored.insert(0, stay);
+                            // Le rejeu (`replay.rs`) recalcule l'utilité « avant l'hystérésis »,
+                            // donc avant cette branche : une décision retenue ici se rejoue sur
+                            // le challenger. Même approximation que l'hystérésis, et
+                            // `prefix_tokens` n'est pas dans le snapshot — assumé, documenté.
                             // `kept` reste faux À DESSEIN : `reason_of` dirait « kept
                             // because no challenger is clearly better », ce qui est faux ici
                             // (le challenger est justement meilleur, c'est son prix qui ne
@@ -1803,6 +1811,17 @@ mod tests {
         req.prefix_tokens = Some(485_106);
         req.not_selectable = Some(COMPACTION_MODEL_NOT_SELECTABLE);
         let d = decide_with(id, Utc::now(), &req, &arms, &PriorHints::new());
+        // Contrôle POSITIF : sans la contrainte, le MÊME id et le MÊME préfixe auraient été
+        // retenus. Sans lui, le test passerait aussi si la règle ne s'appliquait jamais.
+        let mut uncontrolled = req.clone();
+        uncontrolled.not_selectable = None;
+        let held = decide_with(id, Utc::now(), &uncontrolled, &arms, &PriorHints::new());
+        assert_eq!(
+            held.chosen,
+            Some(Pick::new("glm", "big")),
+            "{}",
+            held.reason
+        );
         // La décision garde son choix (appliquée nulle part, `used` = le modèle en force),
         // et la règle de cache ne l'a pas retenu.
         assert_eq!(d.chosen, Some(Pick::new("deepseek", "v4")), "{}", d.reason);
