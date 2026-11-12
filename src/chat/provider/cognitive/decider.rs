@@ -162,20 +162,30 @@ pub fn decide_with(
     decision
 }
 
-/// Coût en USD de réécrire le préfixe quand on change de modèle : le challenger écrit le
-/// préfixe (`write`), l'ancien cache est perdu, et les lectures de cache que chacun aurait
-/// faites sont perdues : `prefix × (write(chal) + write(inc) − read(chal) − read(inc)) / 1e6`.
-/// `None` dès qu'un prix de cache manque (jamais de prix inventé).
+/// Nombre de tours sur lesquels une bascule doit se rembourser.
+///
+/// Mesuré le 12/11/2026 sur 762 sessions : 2,8 messages par session. Une bascule n'a donc
+/// que deux ou trois tours pour payer la réécriture du préfixe ; si elle ne se rembourse
+/// pas là, elle ne se rembourse jamais. Trois tours : le dernier tour où le paiement peut
+/// encore être rentable, sans faire d'une conversation longue un prétexte à basculer.
+pub const SWITCH_PAYBACK_TURNS: f64 = 3.0;
+
+/// Coût en USD, sur [`SWITCH_PAYBACK_TURNS`] tours, de réécrire le préfixe en changeant de
+/// modèle : le challenger ÉCRIT le préfixe une fois (`write(chal)`), puis le lit à chaque
+/// tour suivant (`(H−1) × read(chal)`), au lieu de le lire à chaque tour chez le modèle en
+/// force (`H × read(inc)`). Négatif quand basculer coûte moins cher que rester — la valeur
+/// n'est pas ramenée à zéro, c'est l'appelant qui décide. `None` dès qu'un prix de cache
+/// manque : aucun prix inventé.
 pub fn switch_cost_usd(
     prefix_tokens: u64,
     challenger: &ModelFacts,
     incumbent: &ModelFacts,
 ) -> Option<f64> {
     let (c, i) = (challenger.price?, incumbent.price?);
-    let per_mtok = c.cache_write_per_mtok? + i.cache_write_per_mtok?
-        - c.cache_read_per_mtok?
-        - i.cache_read_per_mtok?;
-    Some((prefix_tokens as f64 * per_mtok.max(0.0)) / 1_000_000.0)
+    let horizon = SWITCH_PAYBACK_TURNS;
+    let per_mtok = c.cache_write_per_mtok? + (horizon - 1.0) * c.cache_read_per_mtok?
+        - horizon * i.cache_read_per_mtok?;
+    Some((prefix_tokens as f64 * per_mtok) / 1_000_000.0)
 }
 
 /// Gain attendu par tour d'un challenger MOINS CHER que le modèle en force, dans la même
@@ -189,20 +199,25 @@ fn expected_gain_per_turn(challenger: &Scored, incumbent: &Scored) -> Option<f64
     (gain.is_finite() && gain > 0.0).then_some(gain)
 }
 
-/// `Some(gain − coût de bascule)` (négatif) quand garder le modèle en force vaut mieux que
-/// de basculer ; `None` quand la règle ne s'applique pas ou que la bascule se rembourse.
+/// Le coût de bascule et ce que le challenger rapporte sur l'horizon de remboursement,
+/// quand garder le modèle en force vaut mieux que de basculer. `None` quand la règle ne
+/// s'applique pas ou que la bascule se rembourse.
+///
 /// Ne s'applique que si le préfixe est connu (`prefix_tokens`), les prix de cache aussi, et
-/// que le challenger est une économie : un challenger plus cher est choisi pour sa qualité,
+/// que le challenger est une ÉCONOMIE : un challenger plus cher est choisi pour sa qualité,
 /// pas pour un gain d'argent que la bascule annulerait.
 fn switch_cache_shortfall(
     challenger: &Scored,
     incumbent: &Scored,
     prefix_tokens: Option<u64>,
-) -> Option<f64> {
+) -> Option<(f64, f64)> {
     let prefix = prefix_tokens?;
     let cost = switch_cost_usd(prefix, &challenger.candidate, &incumbent.candidate)?;
     let gain = expected_gain_per_turn(challenger, incumbent)?;
-    (gain <= cost).then_some(gain - cost)
+    // Le gain est PAR TOUR : c'est sur l'horizon de remboursement qu'il doit couvrir la
+    // réécriture, jamais sur un seul tour (qui rendrait toute bascule perdante).
+    let covered = gain * SWITCH_PAYBACK_TURNS;
+    (covered <= cost).then_some((cost, covered))
 }
 
 /// The utility of a scored pair with its posterior MEAN in place of its Thompson draw.
@@ -417,7 +432,7 @@ fn decide_free(
                     } else if request.not_selectable.is_none() {
                         // Coût de cache d'une bascule : le challenger gagne sur l'utilité,
                         // mais changer de modèle réécrit tout le préfixe.
-                        if let Some(shortfall) = switch_cache_shortfall(
+                        if let Some((cost, covered)) = switch_cache_shortfall(
                             &scored[0],
                             &scored[index],
                             request.prefix_tokens,
@@ -426,7 +441,8 @@ fn decide_free(
                             scored.insert(0, stay);
                             kept = true;
                             cache_note = Some(format!(
-                                "switch_costs_more_than_it_saves({shortfall:.2} USD)"
+                                "switch_costs_more_than_it_saves(rewrites {cost:.2} USD, \
+                                 saves {covered:.2} USD over {SWITCH_PAYBACK_TURNS:.0} turns)"
                             ));
                         }
                     }
@@ -1714,10 +1730,12 @@ mod tests {
         let big = run(&req);
         assert_eq!(big.chosen, Some(Pick::new("glm", "big")), "{}", big.reason);
         assert!(
-            big.reason.contains("switch_costs_more_than_it_saves(-"),
+            big.reason
+                .contains("switch_costs_more_than_it_saves(rewrites "),
             "{}",
             big.reason
         );
+        assert!(big.reason.contains("saves "), "{}", big.reason);
     }
 
     #[test]
