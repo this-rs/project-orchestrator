@@ -3517,6 +3517,7 @@ async fn test_build_options_no_session_id_no_env() {
 fn test_message_to_events_assistant_text() {
     let msg = Message::Assistant {
         message: AssistantMessage {
+            usage: None,
             content: vec![ContentBlock::Text(TextContent {
                 text: "Hello!".into(),
             })],
@@ -3533,6 +3534,7 @@ fn test_message_to_events_assistant_text() {
 fn test_message_to_events_thinking() {
     let msg = Message::Assistant {
         message: AssistantMessage {
+            usage: None,
             content: vec![ContentBlock::Thinking(ThinkingContent {
                 thinking: "Let me think...".into(),
                 signature: "sig".into(),
@@ -3552,6 +3554,7 @@ fn test_message_to_events_thinking() {
 fn test_message_to_events_tool_use() {
     let msg = Message::Assistant {
         message: AssistantMessage {
+            usage: None,
             content: vec![ContentBlock::ToolUse(ToolUseContent {
                 id: "tool-1".into(),
                 name: "create_plan".into(),
@@ -3571,6 +3574,7 @@ fn test_message_to_events_tool_use() {
 fn test_message_to_events_tool_result() {
     let msg = Message::Assistant {
         message: AssistantMessage {
+            usage: None,
             content: vec![ContentBlock::ToolResult(ToolResultContent {
                 tool_use_id: "tool-1".into(),
                 content: Some(ContentValue::Text("Success".into())),
@@ -3592,6 +3596,7 @@ fn test_message_to_events_tool_result() {
 fn test_message_to_events_tool_result_error() {
     let msg = Message::Assistant {
         message: AssistantMessage {
+            usage: None,
             content: vec![ContentBlock::ToolResult(ToolResultContent {
                 tool_use_id: "tool-2".into(),
                 content: Some(ContentValue::Text("Not found".into())),
@@ -3611,6 +3616,7 @@ fn test_message_to_events_tool_result_never_carries_a_live_citation() {
     const ID: &str = "57cf05c9-25b6-495d-ab07-de4b11d64736";
     let msg = Message::Assistant {
         message: AssistantMessage {
+            usage: None,
             content: vec![ContentBlock::ToolResult(ToolResultContent {
                 tool_use_id: "tool-1".into(),
                 content: Some(ContentValue::Text(format!("voir #plan:{ID}\n"))),
@@ -3792,6 +3798,7 @@ fn test_message_to_events_result_error_during_execution() {
 fn test_message_to_events_multiple_blocks() {
     let msg = Message::Assistant {
         message: AssistantMessage {
+            usage: None,
             content: vec![
                 ContentBlock::Thinking(ThinkingContent {
                     thinking: "hmm...".into(),
@@ -4125,6 +4132,7 @@ fn test_message_to_events_stream_message_delta() {
 fn test_message_to_events_tool_result_structured() {
     let msg = Message::Assistant {
         message: AssistantMessage {
+            usage: None,
             content: vec![ContentBlock::ToolResult(ToolResultContent {
                 tool_use_id: "tool-3".into(),
                 content: Some(ContentValue::Structured(vec![
@@ -4159,6 +4167,7 @@ fn test_message_to_events_tool_result_structured() {
 fn test_message_to_events_tool_result_none_content() {
     let msg = Message::Assistant {
         message: AssistantMessage {
+            usage: None,
             content: vec![ContentBlock::ToolResult(ToolResultContent {
                 tool_use_id: "tool-4".into(),
                 content: None,

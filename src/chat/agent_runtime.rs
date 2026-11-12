@@ -674,6 +674,19 @@ pub struct TurnOutcome {
     /// the instance is out for a while, which says nothing of how well the model works. The
     /// bandit is not fed it as a failure of the arm (`decision::turn_reward`).
     pub quota_refusal: bool,
+    /// Le préfixe du tour : la taille du prompt que le modèle a lu en dernier, lectures de cache
+    /// comprises. Pour Claude Code, c'est le dernier appel du tour (jamais la somme des appels).
+    /// `None` quand le fournisseur ne l'a pas rapporté ; jamais un zéro inventé. La mémoire du
+    /// routeur s'en sert pour le tour suivant.
+    pub prompt_tokens: Option<u64>,
+}
+
+/// Le préfixe d'un tour pour la mémoire du routeur : `context_tokens`, le préfixe du DERNIER
+/// appel, pour tous les moteurs (nexus le renseigne pour Claude Code, Codex, ACP et natif).
+/// Jamais la somme des appels du tour, résumé de compaction compris : `None` quand le
+/// moteur n'a pas de préfixe (après une compaction, sans appel ensuite).
+fn prefix_of_turn(usage: &nexus_claude::agent::Usage) -> Option<u64> {
+    usage.context_tokens
 }
 
 /// What the host asks of the session after a turn: events to emit, then system
@@ -868,6 +881,10 @@ pub struct AgentSessionHandle {
     /// The running turn was stopped (by the user, or for a message sent now):
     /// the automated entries of the queue are dropped when it ends.
     interrupted: AtomicBool,
+    /// The session asked a question nobody has answered yet. The turn that asked it ends ON the
+    /// question, so this outlives the turn: it is cleared by the user's next message (the
+    /// answer) and read by [`AgentSessionHandle::waiting_on_a_person`].
+    question_open: AtomicBool,
     /// Cancelled when the session closes: ends what listens on its behalf (NATS).
     pub closed: tokio_util::sync::CancellationToken,
     /// Continue a turn that stopped on its turn limit: set when the session opens
@@ -1238,6 +1255,9 @@ impl AgentSessionHandle {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .insert(id.clone(), AskedRequest { call, turn });
+        }
+        if matches!(event, ChatEvent::AskUserQuestion { .. }) {
+            self.question_open.store(true, Ordering::SeqCst);
         }
         match &event {
             ChatEvent::StreamDelta { text, .. } => self.streaming_text.lock().await.push_str(text),
@@ -2049,6 +2069,11 @@ impl AgentSessionHandle {
             },
             Err(error) => return Err(error),
         };
+        // A user's message the provider accepted is the answer to the question left open, if
+        // any. Not before: a turn stopped or failed before it was sent delivered no answer.
+        if from_user {
+            self.question_open.store(false, Ordering::SeqCst);
+        }
         self.streaming_text.lock().await.clear();
         self.streaming_events.lock().await.clear();
         self.emit(ChatEvent::StreamingStatus { is_streaming: true })
@@ -2242,7 +2267,15 @@ impl AgentSessionHandle {
             return true;
         }
         // A stopped turn waits on nobody: it is ending.
-        if !self.is_streaming.load(Ordering::SeqCst) || self.interrupted.load(Ordering::SeqCst) {
+        if self.interrupted.load(Ordering::SeqCst) {
+            return false;
+        }
+        // A question left open waits on its person past the end of the turn that asked it,
+        // until their answer (`question_open` cleared by the next user turn) or a Stop.
+        if self.question_open.load(Ordering::SeqCst) {
+            return true;
+        }
+        if !self.is_streaming.load(Ordering::SeqCst) {
             return false;
         }
         if by_this_turn {
@@ -2608,6 +2641,7 @@ impl AgentSessionHandle {
                     stop_reason,
                     subtype,
                     error,
+                    usage,
                     ..
                 } = &event
                 {
@@ -2635,6 +2669,9 @@ impl AgentSessionHandle {
                             .code
                             .to_string()
                     });
+                    // PREFIX-CC : le préfixe du tour, pour la mémoire du routeur, vient de `context_tokens`
+                    // (le DERNIER appel, tous moteurs). `usage` somme les appels du tour : jamais lu pour le préfixe.
+                    outcome.prompt_tokens = prefix_of_turn(usage);
                 }
                 let event = mask_agent_event(event);
                 // The harness' advisories (credentials_locked, model_retry, ...) are what
@@ -3310,6 +3347,9 @@ impl AgentSessionHandle {
         scope: InterruptScope,
     ) -> Result<nexus_claude::agent::InterruptOutcome> {
         self.interrupted.store(true, Ordering::SeqCst);
+        // A Stop closes the question left open (as `segment_state` does for the verdict): the
+        // `interrupted` flag alone is reset by the next turn, even one no person sent.
+        self.question_open.store(false, Ordering::SeqCst);
         // A Stop ends the turn's requests with it: the native harness drops its pending ask
         // when the turn's signal is cancelled and says nothing, so the session would
         // otherwise go on "waiting on a person" for a question nobody can answer.
@@ -3777,6 +3817,7 @@ impl AgentRuntime {
             pending: Mutex::new(std::collections::VecDeque::new()),
             announced_background: std::sync::Mutex::new(Default::default()),
             interrupted: AtomicBool::new(false),
+            question_open: AtomicBool::new(false),
             closed: tokio_util::sync::CancellationToken::new(),
             auto_continue: AtomicBool::new(false),
             auto_continue_count: std::sync::atomic::AtomicU32::new(0),
@@ -7263,6 +7304,7 @@ mod answered_tests {
         subtype: String,
         is_error: bool,
         error_code: Option<String>,
+        prompt_tokens: Option<u64>,
     }
 
     /// The `answered` of each turn the host saw end, plus its terminal result.
@@ -7299,6 +7341,7 @@ mod answered_tests {
                 subtype: outcome.subtype.clone(),
                 is_error: outcome.is_error,
                 error_code: outcome.error_code.clone(),
+                prompt_tokens: outcome.prompt_tokens,
             });
             AfterTurn::default()
         }
@@ -7424,6 +7467,170 @@ mod answered_tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(ends.next().is_none(), "every attempt was played");
+    }
+
+    /// PREFIX-CC : le préfixe facturé est capturé du `done` (entrée + lectures/écritures de
+    /// cache), et reste `None` quand l'entrée n'est pas rapportée (jamais 0, jamais l'entrée
+    /// seule).
+    #[tokio::test]
+    async fn the_turn_outcome_carries_the_billed_prefix() {
+        let (provider, handle, host) = session(0).await;
+        let done = |usage: nexus_claude::agent::Usage| AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Completed,
+            subtype: None,
+            is_error: false,
+            result_text: None,
+            usage,
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        };
+        play(
+            &provider,
+            &handle,
+            vec![done(nexus_claude::agent::Usage {
+                input_tokens: Some(1_000),
+                cache_read_tokens: Some(50_000),
+                cache_creation_tokens: Some(9_000),
+                // The native engine reports the prompt of its last call: that is what makes
+                // its sum a prefix (no compaction since).
+                context_tokens: Some(60_000),
+                ..Default::default()
+            })],
+        )
+        .await;
+        assert_eq!(host.seen_outcome()[0].prompt_tokens, Some(60_000));
+
+        // Une entrée non rapportée ne donne pas de préfixe : la somme est gardée par
+        // `input_tokens`, les chiffres de cache seuls sont ignorés.
+        play(
+            &provider,
+            &handle,
+            vec![done(nexus_claude::agent::Usage {
+                input_tokens: None,
+                cache_read_tokens: Some(50_000),
+                cache_creation_tokens: Some(9_000),
+                ..Default::default()
+            })],
+        )
+        .await;
+        assert_eq!(host.seen_outcome()[1].prompt_tokens, None);
+    }
+
+    /// PREFIX-CC : un tour Claude Code de TROIS appels d'outil porte un `usage` qui somme les
+    /// trois (3 × ~11 000 de lectures de cache). Le préfixe mémorisé est celui du DERNIER appel
+    /// (`context_tokens`, 11 051), jamais la somme (33 753).
+    #[tokio::test]
+    async fn a_three_call_codex_turn_remembers_its_last_call_not_the_sum() {
+        let (provider, handle, host) = session_of("codex", 0).await;
+        play(&provider, &handle, vec![three_call_done(Some(11_051))]).await;
+        assert_eq!(host.seen_outcome()[0].prompt_tokens, Some(11_051));
+    }
+
+    /// Un fournisseur qui ne rapporte pas le préfixe de son dernier appel ne fournit rien :
+    /// la somme du tour ne le remplace pas (Claude Code).
+    #[tokio::test]
+    async fn a_claude_code_turn_without_its_prefix_remembers_nothing() {
+        let (provider, handle, host) = session_of("claude_code", 0).await;
+        play(&provider, &handle, vec![three_call_done(None)]).await;
+        assert_eq!(host.seen_outcome()[0].prompt_tokens, None);
+    }
+
+    /// Compaction native au milieu d'un tour, puis un appel : le préfixe mémorisé est celui
+    /// du DERNIER appel (21 000), jamais la somme des appels, résumé compris (300 000).
+    #[tokio::test]
+    async fn a_native_turn_that_compacts_then_calls_remembers_the_last_call_not_the_sum() {
+        let (provider, handle, host) = session(0).await;
+        let done = AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Completed,
+            subtype: None,
+            is_error: false,
+            result_text: None,
+            usage: nexus_claude::agent::Usage {
+                input_tokens: Some(3),
+                cache_read_tokens: Some(300_000),
+                context_tokens: Some(21_000),
+                ..Default::default()
+            },
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 2,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        };
+        play(&provider, &handle, vec![done]).await;
+        assert_eq!(host.seen_outcome()[0].prompt_tokens, Some(21_000));
+    }
+
+    /// Après une compaction native, le tour n'a pas de préfixe : la somme ne doit pas
+    /// être stockée à la place.
+    #[tokio::test]
+    async fn a_native_turn_after_compaction_remembers_nothing() {
+        let (provider, handle, host) = session(0).await;
+        play(&provider, &handle, vec![three_call_done(None)]).await;
+        assert_eq!(host.seen_outcome()[0].prompt_tokens, None);
+    }
+
+    /// Le `done` d'un tour de trois appels : `usage` somme les appels, `context_tokens` est
+    /// le préfixe du dernier (ou `None`).
+    fn three_call_done(context: Option<u64>) -> AgentEvent {
+        AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Completed,
+            subtype: None,
+            is_error: false,
+            result_text: None,
+            usage: nexus_claude::agent::Usage {
+                input_tokens: Some(3),
+                cache_read_tokens: Some(31_500),
+                cache_creation_tokens: Some(250),
+                context_tokens: context,
+                ..Default::default()
+            },
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 3,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_three_call_claude_code_turn_remembers_its_last_call_not_the_sum() {
+        let (provider, handle, host) = session_of("claude_code", 0).await;
+        let event = AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Completed,
+            subtype: None,
+            is_error: false,
+            result_text: None,
+            usage: nexus_claude::agent::Usage {
+                input_tokens: Some(3),
+                cache_read_tokens: Some(31_500),
+                cache_creation_tokens: Some(250),
+                context_tokens: Some(11_051),
+                ..Default::default()
+            },
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 3,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        };
+        play(&provider, &handle, vec![event]).await;
+        assert_eq!(host.seen_outcome()[0].prompt_tokens, Some(11_051));
     }
 
     #[tokio::test]
@@ -9565,7 +9772,7 @@ mod turn_watchdog_tests {
 #[cfg(test)]
 mod forget_path_tests {
     use super::fake::FakeProvider;
-    use super::{AgentRuntime, AgentSessionHandle, PendingMessageKind};
+    use super::{AgentRuntime, AgentSessionHandle, PendingMessageKind, ProviderError};
     use crate::chat::types::ChatEvent;
     #[allow(unused_imports)]
     use crate::neo4j::traits::*;
@@ -9625,6 +9832,111 @@ mod forget_path_tests {
         assert!(
             handle.waiting_on_a_person().await,
             "the out-of-turn request still waits on its person, turn or no turn"
+        );
+    }
+
+    /// An unanswered question is a wait on its person, as a permission is. The engine ends the
+    /// turn ON the question (the answer is the next turn), so once the turn is over nothing
+    /// streams and no permission is pending: before the fix, `waiting_on_a_person` was false
+    /// here and the idle cleanup closed the session after the session timeout, cutting the
+    /// question that nobody had answered yet.
+    #[tokio::test]
+    async fn an_unanswered_question_keeps_its_session_waiting_once_the_turn_ended() {
+        let (_provider, handle) = a_handle().await;
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        handle
+            .emit(ChatEvent::AskUserQuestion {
+                id: "q1".into(),
+                tool_call_id: "tool-1".into(),
+                questions: serde_json::json!([{ "question": "Which?", "options": [{ "label": "A" }] }]),
+                input: serde_json::json!({}),
+                parent_tool_use_id: None,
+                synthetic: None,
+            })
+            .await;
+        // The turn ends on the question: nothing streams any more, and the event buffer of the
+        // turn is cleared with it, as `next_queued` does when the queue is empty.
+        handle.is_streaming.store(false, Ordering::SeqCst);
+        handle.streaming_events.lock().await.clear();
+        assert!(
+            handle.waiting_on_a_person().await,
+            "a question nobody answered is still waited on after its turn ended"
+        );
+    }
+
+    /// A turn asks a question and ends on it, as the engine does.
+    async fn a_question_left_open(handle: &AgentSessionHandle) {
+        handle.is_streaming.store(true, Ordering::SeqCst);
+        handle
+            .emit(ChatEvent::AskUserQuestion {
+                id: "q1".into(),
+                tool_call_id: "tool-1".into(),
+                questions: serde_json::json!([{ "question": "Which?", "options": [{ "label": "A" }] }]),
+                input: serde_json::json!({}),
+                parent_tool_use_id: None,
+                synthetic: None,
+            })
+            .await;
+        handle.is_streaming.store(false, Ordering::SeqCst);
+        handle.streaming_events.lock().await.clear();
+        assert!(handle.waiting_on_a_person().await, "the question waits");
+    }
+
+    /// A Stop closes the question for good. `interrupted` alone is reset by the next turn,
+    /// even one no person sent (a background output): the question then held the session
+    /// "waiting on a person" up to the person wait cap.
+    #[tokio::test]
+    async fn a_stop_closes_the_question_even_after_a_later_background_turn() {
+        let (_provider, handle) = a_handle().await;
+        a_question_left_open(&handle).await;
+        handle.interrupt().await.unwrap();
+        assert!(
+            !handle.waiting_on_a_person().await,
+            "stopped: nobody waited"
+        );
+        let opened = handle
+            .open_turn(PendingMessageKind::BackgroundOutput, "bg done", "bg done")
+            .await
+            .unwrap();
+        assert!(opened.is_some(), "the background turn is sent");
+        handle.is_streaming.store(false, Ordering::SeqCst);
+        assert!(
+            !handle.waiting_on_a_person().await,
+            "the stopped question is not waited on again after a background turn"
+        );
+    }
+
+    /// A user's message that never reached the provider answered nothing: the question
+    /// still waits on its person.
+    #[tokio::test]
+    async fn an_answer_that_failed_to_send_leaves_the_question_open() {
+        let (provider, handle) = a_handle().await;
+        a_question_left_open(&handle).await;
+        *provider.state.fail_next_turn.lock().unwrap() = Some(ProviderError::EndpointUnreachable {
+            detail: "down for a moment".into(),
+        });
+        let sent = handle.open_turn(PendingMessageKind::User, "A", "A").await;
+        assert!(sent.is_err(), "the answer was not sent");
+        assert!(
+            handle.waiting_on_a_person().await,
+            "a failed answer leaves the question open"
+        );
+    }
+
+    /// The user's answer, sent, closes the question.
+    #[tokio::test]
+    async fn an_answer_sent_closes_the_question() {
+        let (_provider, handle) = a_handle().await;
+        a_question_left_open(&handle).await;
+        let sent = handle
+            .open_turn(PendingMessageKind::User, "A", "A")
+            .await
+            .unwrap();
+        assert!(sent.is_some(), "the answer is sent");
+        handle.is_streaming.store(false, Ordering::SeqCst);
+        assert!(
+            !handle.waiting_on_a_person().await,
+            "the answered question is waited on no more"
         );
     }
 
