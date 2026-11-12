@@ -674,18 +674,17 @@ pub struct TurnOutcome {
     /// the instance is out for a while, which says nothing of how well the model works. The
     /// bandit is not fed it as a failure of the arm (`decision::turn_reward`).
     pub quota_refusal: bool,
-    /// Le préfixe facturé au tour — l'entrée réellement envoyée au modèle, lectures de cache
-    /// comprises (la plus grosse part du préfixe d'une session Claude Code). `None` quand le
-    /// fournisseur ne l'a pas rapporté ; jamais un zéro inventé. La mémoire du routeur s'en
-    /// sert pour combler le trou des fournisseurs dont `TurnContext::context_tokens` n'est
-    /// jamais renseigné (Claude Code).
+    /// Le préfixe du tour : la taille du prompt que le modèle a lu en dernier, lectures de cache
+    /// comprises. Pour Claude Code, c'est le dernier appel du tour (jamais la somme des appels).
+    /// `None` quand le fournisseur ne l'a pas rapporté ; jamais un zéro inventé. La mémoire du
+    /// routeur s'en sert pour le tour suivant.
     pub prompt_tokens: Option<u64>,
 }
 
-/// Le préfixe qu'un tour a été facturé : l'entrée réellement envoyée au modèle plus les
-/// lectures et écritures de cache — les lectures de cache sont la plus grosse part du préfixe
-/// d'une session Claude Code. Gardé par `input_tokens` : sans lui les chiffres de cache n'ont
-/// pas de base, et la valeur reste `None` (jamais un zéro inventé, jamais l'entrée seule).
+/// Le préfixe facturé d'un tour du moteur natif : l'entrée réellement envoyée au modèle plus
+/// les lectures et écritures de cache. Gardé par `input_tokens` : sans lui les chiffres de
+/// cache n'ont pas de base, et la valeur reste `None` (jamais un zéro inventé, jamais l'entrée
+/// seule). Claude Code n'utilise pas cette somme : son `usage` additionne les appels du tour.
 fn billed_prompt_tokens(usage: &nexus_claude::agent::Usage) -> Option<u64> {
     usage.input_tokens.map(|input| {
         input + usage.cache_read_tokens.unwrap_or(0) + usage.cache_creation_tokens.unwrap_or(0)
@@ -2652,9 +2651,16 @@ impl AgentSessionHandle {
                             .code
                             .to_string()
                     });
-                    // PREFIX-CC : le préfixe facturé au tour (lectures de cache comprises),
-                    // pour la mémoire du routeur. `input_tokens` garde la somme.
-                    outcome.prompt_tokens = billed_prompt_tokens(usage);
+                    // PREFIX-CC : le préfixe du tour, pour la mémoire du routeur. Claude Code
+                    // somme les appels du tour dans `usage` : son préfixe est celui du DERNIER
+                    // appel, que nexus rend en `context_tokens`. Le natif garde la somme de
+                    // ses lectures et écritures de cache (`input_tokens` garde la somme).
+                    outcome.prompt_tokens =
+                        if self.asker == super::session_grants::Asker::ClaudeCode {
+                            usage.context_tokens
+                        } else {
+                            billed_prompt_tokens(usage)
+                        };
                 }
                 let event = mask_agent_event(event);
                 // The harness' advisories (credentials_locked, model_retry, ...) are what
@@ -7496,6 +7502,37 @@ mod answered_tests {
         )
         .await;
         assert_eq!(host.seen_outcome()[1].prompt_tokens, None);
+    }
+
+    /// PREFIX-CC : un tour Claude Code de TROIS appels d'outil porte un `usage` qui somme les
+    /// trois (3 × ~11 000 de lectures de cache). Le préfixe mémorisé est celui du DERNIER appel
+    /// (`context_tokens`, 11 051), jamais la somme (33 753).
+    #[tokio::test]
+    async fn a_three_call_claude_code_turn_remembers_its_last_call_not_the_sum() {
+        let (provider, handle, host) = session_of("claude_code", 0).await;
+        let event = AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Completed,
+            subtype: None,
+            is_error: false,
+            result_text: None,
+            usage: nexus_claude::agent::Usage {
+                input_tokens: Some(3),
+                cache_read_tokens: Some(31_500),
+                cache_creation_tokens: Some(250),
+                context_tokens: Some(11_051),
+                ..Default::default()
+            },
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 3,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        };
+        play(&provider, &handle, vec![event]).await;
+        assert_eq!(host.seen_outcome()[0].prompt_tokens, Some(11_051));
     }
 
     #[tokio::test]

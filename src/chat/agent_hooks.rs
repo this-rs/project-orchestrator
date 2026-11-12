@@ -666,11 +666,11 @@ pub(crate) struct TurnRouter {
     /// The next turn carries an image (`set_turn_input`): its decision excludes the models
     /// that cannot read one (`needs_images`, `RejectReason::NoImages`).
     last_has_images: AtomicBool,
-    /// Le préfixe facturé au tour précédent (jetons d'entrée, lectures de cache comprises),
-    /// mémorisé par [`TurnRouter::note_prefix_tokens`]. `0` = jamais mesuré. Le fournisseur
-    /// qui renseigne `TurnContext::context_tokens` reste l'autorité ; cette mémoire ne comble
-    /// que le trou des fournisseurs qui ne le renseignent jamais (Claude Code) : le préfixe du
-    /// tour précédent est la meilleure estimation du préfixe lu en cache du tour suivant.
+    /// Le préfixe du dernier appel du tour précédent (jetons d'entrée, lectures de cache
+    /// comprises), mémorisé par [`TurnRouter::note_prefix_tokens`]. `0` = jamais mesuré. Le
+    /// fournisseur qui renseigne `TurnContext::context_tokens` reste l'autorité ; cette mémoire
+    /// ne comble que le trou des fournisseurs qui ne le renseignent pas. Jamais la somme des
+    /// appels d'un tour : elle surestimerait le préfixe d'un facteur ~N.
     /// Pas de purge explicite quand l'historique est réécrit : un relais (mouvement de
     /// fournisseur) ouvre un routeur neuf (`0`), une compaction auto rafraîchit la valeur au
     /// `done` suivant ; seule une compaction manuelle laisse une valeur périmée un tour —
@@ -933,10 +933,9 @@ impl TurnRouter {
         self.manual.store(true, Ordering::SeqCst);
     }
 
-    /// Mémorise le préfixe facturé au tour (entrée + lectures/écritures de cache), rapporté
-    /// par le `done` terminal du fournisseur. C'est l'estimation du préfixe lu en cache du
-    /// tour suivant pour un fournisseur qui ne renseigne jamais `TurnContext::context_tokens`
-    /// (Claude Code).
+    /// Mémorise le préfixe du dernier appel du tour, rapporté par le `done` terminal du
+    /// fournisseur. C'est l'estimation du préfixe lu en cache du tour suivant pour un
+    /// fournisseur qui ne renseigne pas `TurnContext::context_tokens`.
     pub(crate) fn note_prefix_tokens(&self, tokens: u64) {
         self.last_prefix_tokens.store(tokens, Ordering::SeqCst);
     }

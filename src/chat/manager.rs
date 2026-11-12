@@ -24878,6 +24878,7 @@ mod tests {
     fn test_message_to_events_assistant_text() {
         let msg = Message::Assistant {
             message: AssistantMessage {
+                usage: None,
                 content: vec![ContentBlock::Text(TextContent {
                     text: "Hello!".into(),
                 })],
@@ -24896,6 +24897,7 @@ mod tests {
     fn test_message_to_events_thinking() {
         let msg = Message::Assistant {
             message: AssistantMessage {
+                usage: None,
                 content: vec![ContentBlock::Thinking(ThinkingContent {
                     thinking: "Let me think...".into(),
                     signature: "sig".into(),
@@ -24915,6 +24917,7 @@ mod tests {
     fn test_message_to_events_tool_use() {
         let msg = Message::Assistant {
             message: AssistantMessage {
+                usage: None,
                 content: vec![ContentBlock::ToolUse(ToolUseContent {
                     id: "tool-1".into(),
                     name: "create_plan".into(),
@@ -24934,6 +24937,7 @@ mod tests {
     fn test_message_to_events_tool_result() {
         let msg = Message::Assistant {
             message: AssistantMessage {
+                usage: None,
                 content: vec![ContentBlock::ToolResult(ToolResultContent {
                     tool_use_id: "tool-1".into(),
                     content: Some(ContentValue::Text("Success".into())),
@@ -24955,6 +24959,7 @@ mod tests {
     fn test_message_to_events_tool_result_error() {
         let msg = Message::Assistant {
             message: AssistantMessage {
+                usage: None,
                 content: vec![ContentBlock::ToolResult(ToolResultContent {
                     tool_use_id: "tool-2".into(),
                     content: Some(ContentValue::Text("Not found".into())),
@@ -24974,6 +24979,7 @@ mod tests {
         const ID: &str = "57cf05c9-25b6-495d-ab07-de4b11d64736";
         let msg = Message::Assistant {
             message: AssistantMessage {
+                usage: None,
                 content: vec![ContentBlock::ToolResult(ToolResultContent {
                     tool_use_id: "tool-1".into(),
                     content: Some(ContentValue::Text(format!("voir #plan:{ID}\n"))),
@@ -25155,6 +25161,7 @@ mod tests {
     fn test_message_to_events_multiple_blocks() {
         let msg = Message::Assistant {
             message: AssistantMessage {
+                usage: None,
                 content: vec![
                     ContentBlock::Thinking(ThinkingContent {
                         thinking: "hmm...".into(),
@@ -25488,6 +25495,7 @@ mod tests {
     fn test_message_to_events_tool_result_structured() {
         let msg = Message::Assistant {
             message: AssistantMessage {
+                usage: None,
                 content: vec![ContentBlock::ToolResult(ToolResultContent {
                     tool_use_id: "tool-3".into(),
                     content: Some(ContentValue::Structured(vec![
@@ -25522,6 +25530,7 @@ mod tests {
     fn test_message_to_events_tool_result_none_content() {
         let msg = Message::Assistant {
             message: AssistantMessage {
+                usage: None,
                 content: vec![ContentBlock::ToolResult(ToolResultContent {
                     tool_use_id: "tool-4".into(),
                     content: None,

@@ -254,6 +254,7 @@ mod tests {
         vec![
             Message::Assistant {
                 message: AssistantMessage {
+                    usage: None,
                     content: vec![
                         ContentBlock::Text(TextContent {
                             text: format!("the key is {v}"),
