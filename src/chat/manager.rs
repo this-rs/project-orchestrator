@@ -16857,7 +16857,13 @@ impl ChatManager {
                         &id,
                         &snapshot,
                         |model| provider.capabilities(Some(model)),
-                        |model| prices.get(model).copied().flatten(),
+                        |model| {
+                            // Catalogue Anthropic : les prix de cache se déduisent du prix
+                            // d'entrée publié (0,1× lecture, 1,25× écriture), jamais inventés.
+                            prices.get(model).copied().flatten().map(
+                                super::provider::cognitive::candidates::with_anthropic_cache_prices,
+                            )
+                        },
                         Some(healthy),
                         allowed,
                     ) {
