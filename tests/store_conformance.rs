@@ -33,8 +33,10 @@
 //! delete in the trait and are left behind (scoped to deleted projects).
 //!
 //! ```text
-//! NEO4J_URI=bolt://127.0.0.1:27687 NEO4J_PASSWORD=... cargo test --test store_conformance
+//! NEO4J_URI=bolt://127.0.0.1:17687 NEO4J_PASSWORD=... cargo test --test store_conformance
 //! ```
+mod common;
+
 #[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
 
@@ -1979,9 +1981,11 @@ impl StoreFactory for Neo4jFactory {
         "neo4j"
     }
     async fn open(&self) -> Option<Arc<dyn GraphStore>> {
-        let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:17687".into());
-        let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
-        let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
+        let common::harness::Neo4jTarget {
+            uri,
+            user,
+            password,
+        } = common::harness::neo4j_target();
         match Neo4jClient::new(&uri, &user, &password).await {
             Ok(client) => Some(Arc::new(client)),
             Err(err) => {
