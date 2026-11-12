@@ -97,9 +97,9 @@ mod with_the_feature {
     use project_orchestrator::neo4j::models::{ProgressKind, ProjectNode, ProjectProfile};
     use project_orchestrator::neo4j::traits::*;
     use project_orchestrator::obrain::{
-        defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees, Creation,
-        Durabilite, Interruption, NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture,
-        MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
+        defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees,
+        refusees_note, Creation, Durabilite, Interruption, NonPorte, ObrainGraphStore,
+        ObrainSearchStore, RapportOuverture, MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1446,8 +1446,8 @@ mod with_the_feature {
             NonPorte("CodeStore::list_project_files")
         );
         assert_eq!(
-            not_ported(store.delete_note(id).await),
-            NonPorte("NoteStore::delete_note")
+            not_ported(store.propagate_structural_links(id).await),
+            NonPorte("NoteStore::propagate_structural_links")
         );
         // Defaulted by the contract to `Ok((0, 0))`: refused all the same.
         assert_eq!(
@@ -1476,6 +1476,227 @@ mod with_the_feature {
             msg,
             "non porté sur le backend obrain : WorkspaceStore::list_workspaces"
         );
+    }
+
+    /// A note with a project, a link to the project and to another note, a
+    /// succession and a confirmation: all of it survives a close and a reopen, with
+    /// the same values, the same links and the same order.
+    #[tokio::test]
+    async fn notes_survive_a_close_and_a_reopen_with_links_and_states() {
+        use project_orchestrator::neo4j::traits::NoteStore;
+        use project_orchestrator::notes::{EntityType, Note, NoteFilters, NoteType};
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project("notes-reopen");
+        store.create_project(&p).await.unwrap();
+        let mut n = Note::new(
+            Some(p.id),
+            NoteType::Gotcha,
+            format!(
+                "une note longue, au-delà du seuil de colonne : {}",
+                "é".repeat(200)
+            ),
+            "alice".to_string(),
+        );
+        n.tags = vec!["a".into(), "b".into()];
+        let m = Note::new(
+            None,
+            NoteType::Tip,
+            "globale".to_string(),
+            "system/x".to_string(),
+        );
+        store.create_note(&n).await.unwrap();
+        store.create_note(&m).await.unwrap();
+        store
+            .link_note_to_entity(
+                n.id,
+                &EntityType::Project,
+                &p.id.to_string(),
+                Some("sig"),
+                Some("body"),
+            )
+            .await
+            .unwrap();
+        store
+            .link_note_to_entity(n.id, &EntityType::Note, &m.id.to_string(), None, None)
+            .await
+            .unwrap();
+        store.supersede_note(m.id, n.id).await.unwrap();
+        let confirmee = store.confirm_note(n.id, "alice").await.unwrap().unwrap();
+        let avant_n = store.get_note(n.id).await.unwrap().unwrap();
+        let avant_m = store.get_note(m.id).await.unwrap().unwrap();
+        let avant_liste = store
+            .list_notes(Some(p.id), None, &NoteFilters::default())
+            .await
+            .unwrap();
+        let avant_anchors = store.get_note_anchors(n.id).await.unwrap();
+        assert_eq!(avant_n.human_confirmed_by.as_deref(), Some("alice"));
+        assert_eq!(avant_n.human_confirmed_by, confirmee.human_confirmed_by);
+        assert_eq!(
+            avant_m.status,
+            project_orchestrator::notes::NoteStatus::Archived
+        );
+        assert_eq!(avant_anchors.len(), 2);
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = open(&base).await;
+        assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
+        assert_eq!(
+            store.get_note(n.id).await.unwrap().unwrap().content,
+            avant_n.content
+        );
+        assert_eq!(
+            store.get_note(n.id).await.unwrap().unwrap().tags,
+            avant_n.tags
+        );
+        assert_eq!(
+            store.get_note(m.id).await.unwrap().unwrap().superseded_by,
+            Some(n.id)
+        );
+        let liste = store
+            .list_notes(Some(p.id), None, &NoteFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(liste.0.len(), avant_liste.0.len());
+        assert_eq!(
+            liste.0.iter().map(|x| x.id).collect::<Vec<_>>(),
+            avant_liste.0.iter().map(|x| x.id).collect::<Vec<_>>()
+        );
+        assert_eq!(store.get_note_anchors(n.id).await.unwrap().len(), 2);
+        assert_eq!(
+            store
+                .get_notes_for_entity(&EntityType::Note, &m.id.to_string())
+                .await
+                .unwrap()
+                .iter()
+                .map(|x| x.id)
+                .collect::<Vec<_>>(),
+            vec![n.id]
+        );
+    }
+
+    /// A creation of a note interrupted at every step reopens to a consistent base:
+    /// the draft is deleted with its edges, or the note is whole when the commit
+    /// point was passed. Nothing is quarantined.
+    #[tokio::test]
+    async fn an_interrupted_note_creation_reopens_consistently() {
+        use project_orchestrator::neo4j::traits::NoteStore;
+        use project_orchestrator::notes::{Note, NoteType};
+        let dir = tempfile::tempdir().unwrap();
+        let mut points = vec![Interruption::ApresLeNoeud, Interruption::ApresLeMarqueur];
+        points.extend((1..=40).map(Interruption::ApresLaPropriete));
+        points.extend([
+            Interruption::AvantLeRetraitDuMarqueur,
+            Interruption::ApresLeRetraitDuMarqueur,
+        ]);
+        let mut touches = 0;
+        for (k, point) in points.iter().copied().enumerate() {
+            let base = dir.path().join(format!("note-{k}"));
+            let store = open(&base).await;
+            let p = a_project("note-interrupted");
+            store.create_project(&p).await.unwrap();
+            let n = Note::new(
+                Some(p.id),
+                NoteType::Tip,
+                "interrompue".to_string(),
+                "alice".to_string(),
+            );
+            store.interrompre_au_prochain(point);
+            let issue = store.create_note(&n).await;
+            if issue.is_ok() {
+                // The creation finished before this point: the point is not on its path.
+                store.close().await.unwrap();
+                continue;
+            }
+            touches += 1;
+            assert!(store.get_note(n.id).await.unwrap().is_none(), "{point:?}");
+            store.close().await.unwrap();
+            drop(store);
+
+            let store = open(&base).await;
+            let rapport = store.rapport_d_ouverture().clone();
+            assert!(rapport.en_quarantaine.is_empty(), "{point:?}: {rapport:?}");
+            if point == Interruption::ApresLeRetraitDuMarqueur {
+                assert!(store.get_note(n.id).await.unwrap().is_some(), "{point:?}");
+            } else {
+                assert_eq!(rapport.brouillons_supprimes, 1, "{point:?}: {rapport:?}");
+                assert!(store.get_note(n.id).await.unwrap().is_none(), "{point:?}");
+                assert!(store
+                    .list_notes(Some(p.id), None, &Default::default())
+                    .await
+                    .unwrap()
+                    .0
+                    .is_empty());
+                store.create_note(&n).await.unwrap();
+            }
+            store.close().await.unwrap();
+        }
+        // Every creation step is on the path: the properties, the marker, the commit point.
+        assert!(touches >= 28, "the points were reached: {touches}");
+    }
+
+    /// What the note domain refuses, refuses by name and before any write: an
+    /// agent author, a workspace filter, a link to an entity of another domain.
+    #[tokio::test]
+    async fn note_refusals_are_named_and_write_nothing() {
+        use project_orchestrator::neo4j::traits::NoteStore;
+        use project_orchestrator::notes::{EntityType, Note, NoteFilters, NoteType};
+        let store = temporary(Durabilite::Wal).await;
+        let p = a_project("note-refus");
+        store.create_project(&p).await.unwrap();
+
+        let agent = Note::new(
+            Some(p.id),
+            NoteType::Tip,
+            "écrite par un agent".to_string(),
+            format!("agent:{}", Uuid::new_v4()),
+        );
+        let err = store.create_note(&agent).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<NonPorte>(),
+            Some(&NonPorte("NoteStore::create_note"))
+        );
+        assert!(store.get_note(agent.id).await.unwrap().is_none());
+
+        let f = NoteFilters::default();
+        assert_eq!(
+            not_ported(store.list_notes(None, Some("ws"), &f).await),
+            NonPorte("NoteStore::list_notes")
+        );
+        assert_eq!(
+            not_ported(store.get_notes_needing_review(None, Some("ws")).await),
+            NonPorte("NoteStore::get_notes_needing_review")
+        );
+        let n = Note::new(
+            Some(p.id),
+            NoteType::Tip,
+            "ok".to_string(),
+            "alice".to_string(),
+        );
+        store.create_note(&n).await.unwrap();
+        assert_eq!(
+            not_ported(
+                store
+                    .link_note_to_entity(n.id, &EntityType::File, "src/lib.rs", None, None)
+                    .await
+            ),
+            NonPorte("NoteStore::link_note_to_entity")
+        );
+        assert!(store.get_note_anchors(n.id).await.unwrap().is_empty());
+        // A link to a project this backend does not hold is a no-op, as in Neo4j.
+        store
+            .link_note_to_entity(
+                n.id,
+                &EntityType::Project,
+                &Uuid::new_v4().to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(store.get_note_anchors(n.id).await.unwrap().is_empty());
     }
 
     /// The generator skips nothing: every `async fn` of the two contracts is
@@ -1515,20 +1736,26 @@ mod with_the_feature {
             in_contracts
         );
 
-        // This lot: ProjectStore's nine methods, plus the two of GraphStore.
+        // ProjectStore's nine methods, the 41 of NoteStore (13 ported, 28 refused by
+        // name), plus the two of GraphStore.
         let domains: std::collections::BTreeSet<&str> = written
             .iter()
             .map(|m| m.split("::").next().unwrap())
             .collect();
         assert_eq!(
             domains.into_iter().collect::<Vec<_>>(),
-            ["GraphStore", "ProjectStore"]
+            ["GraphStore", "NoteStore", "ProjectStore"]
         );
         let servent = methodes_qui_servent();
-        assert_eq!(servent.len(), 9, "{servent:?}");
-        assert!(servent.iter().all(|m| m.starts_with("ProjectStore::")));
+        // ProjectStore's nine, and the thirteen ported NoteStore methods.
+        assert_eq!(servent.len(), 22, "{servent:?}");
+        assert!(servent
+            .iter()
+            .all(|m| m.starts_with("ProjectStore::") || m.starts_with("NoteStore::")));
         // The written refusals are written, and are not counted as serving.
         assert_eq!(REFUS_ECRITS_A_LA_MAIN, ["GraphStore::get_progress_batch"]);
+        assert_eq!(refusees_note().len(), 28);
+        assert!(refusees_note().iter().all(|m| written.contains(m)));
         assert!(REFUS_ECRITS_A_LA_MAIN.iter().all(|m| written.contains(m)));
         // What keeps a default is known and justified where it is declared.
         assert_eq!(kept, ["AnalyticsStore::run_data_migrations"]);

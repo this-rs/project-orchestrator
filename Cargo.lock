@@ -6563,6 +6563,7 @@ dependencies = [
  "nexus-tools",
  "notify",
  "obrain-common",
+ "obrain-core",
  "obrain-engine",
  "office_oxide",
  "openssl-sys",
