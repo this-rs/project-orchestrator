@@ -3043,6 +3043,8 @@ mod tests {
             entry["endpoint_origin"].is_null(),
             "a process has no endpoint"
         );
+        // ...but the consent screen needs the identity the consent binds to.
+        assert_eq!(entry["origin"], "process:codex");
         // Consent is tied to the process identity.
         let (status, _) = call_json(
             &app,
