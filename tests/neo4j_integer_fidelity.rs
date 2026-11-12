@@ -32,6 +32,7 @@ use project_orchestrator::neo4j::traits::*;
 use common::harness::{neo4j_target, Cleanup, Neo4jTarget};
 use neo4rs::{query, Graph, Node, Query, Row};
 use project_orchestrator::neo4j::client::Neo4jClient;
+use project_orchestrator::neo4j::trajectory_store::Neo4jTrajectoryStore;
 use project_orchestrator::protocol::{Protocol, ProtocolState};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -593,4 +594,221 @@ fn a_live_meilisearch_url_is_a_failure_not_a_skip() {
 #[should_panic(expected = "REFUSED to point a writing test at this Neo4j")]
 fn a_live_uri_in_the_environment_is_a_failure_not_a_skip() {
     let _ = common::harness::target_for(Some("bolt://localhost:7687".into()), false);
+}
+
+// ---------------------------------------------------------------------------
+// The same invariant, on the readers the first pass did not reach.
+//
+// Every site below is a `node.get::<i64>(...)` followed by a cast. A stored -1
+// is this backend's "not computed" sentinel; read as unsigned it became
+// u64::MAX / u32::MAX / usize::MAX, and a count of 18 446 744 073 709 551 615
+// sorts and renders as if it were real. One entity per test, so that a failure
+// in one reader does not hide the others.
+// ---------------------------------------------------------------------------
+
+/// `Document` and `DocumentChunk`: a size, a page count, a chunk count, two byte
+/// offsets and a position. All six were cast, all six must read 0.
+#[tokio::test]
+async fn a_negative_stored_document_size_and_position_is_read_as_zero() {
+    let Some(e) = env().await else { return };
+    let (doc, chunk) = (Uuid::new_v4(), Uuid::new_v4());
+    let mut cleanup = Cleanup::new(&e.target);
+    cleanup.later(
+        "MATCH (d:Document {id: $p}) OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:DocumentChunk) \
+         DETACH DELETE d, c",
+        doc.to_string(),
+    );
+    e.raw
+        .run(
+            query(
+                "CREATE (d:Document {id: $d, filename: 'negative.pdf',
+                                     size_bytes: -1, page_count: -1, chunk_count: -1})
+                 CREATE (d)-[:HAS_CHUNK]->(:DocumentChunk {id: $c, text: 'x',
+                                     start_byte: -1, end_byte: -1, ordinal: -1})",
+            )
+            .param("d", doc.to_string())
+            .param("c", chunk.to_string()),
+        )
+        .await
+        .unwrap();
+
+    let d = e.client.get_document(doc).await.unwrap().unwrap();
+    assert_eq!(
+        (d.size_bytes, d.page_count, d.chunk_count),
+        (0, 0, 0),
+        "size/page/chunk counts: a negative is zero, not u64::MAX / usize::MAX"
+    );
+
+    let chunks = e.client.get_document_chunks(doc).await.unwrap();
+    assert_eq!(chunks.len(), 1, "the chunk written above is read back");
+    let c = &chunks[0];
+    assert_eq!(
+        (c.start_byte, c.end_byte, c.ordinal),
+        (0, 0, 0),
+        "byte offsets and position: a negative is zero"
+    );
+}
+
+/// `UserProfile.interaction_count` and a persisted reasoning tree's `node_count`
+/// and `depth`. Both are counters a UI displays; a negative must not become the
+/// largest number the type can hold.
+#[tokio::test]
+async fn a_negative_stored_profile_and_tree_count_is_read_as_zero() {
+    let Some(e) = env().await else { return };
+    let (project, tree, profile) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let user = format!("negative-fidelity-{profile}");
+    let mut cleanup = Cleanup::new(&e.target);
+    cleanup.later(
+        "MATCH (n:UserProfile {user_id: $p}) DETACH DELETE n",
+        user.clone(),
+    );
+    cleanup.later(
+        "MATCH (n:PersistedReasoningTree {project_id: $p}) DETACH DELETE n",
+        project.to_string(),
+    );
+    e.raw
+        .run(
+            query(
+                "CREATE (:UserProfile {id: $profile, user_id: $user, interaction_count: -1})
+                 CREATE (:PersistedReasoningTree {id: $tree, request: 'negative',
+                                     confidence: 0.5, node_count: -1, depth: -1,
+                                     project_id: $project,
+                                     created_at: '2026-01-01T00:00:00Z',
+                                     persisted_at: '2026-01-01T00:00:00Z'})",
+            )
+            .param("profile", profile.to_string())
+            .param("user", user.clone())
+            .param("tree", tree.to_string())
+            .param("project", project.to_string()),
+        )
+        .await
+        .unwrap();
+
+    let p = e.client.get_user_profile(&user).await.unwrap().unwrap();
+    assert_eq!(
+        p.interaction_count, 0,
+        "an interaction count: a negative is zero"
+    );
+
+    let trees = e
+        .client
+        .list_persisted_reasoning_trees(Some(project), 10)
+        .await
+        .unwrap();
+    assert_eq!(trees.len(), 1, "the tree written above is listed");
+    assert_eq!(
+        (trees[0].node_count, trees[0].depth),
+        (0, 0),
+        "node count and depth: a negative is zero"
+    );
+}
+
+/// A routing arm's four counters and a feature graph's `build_depth`. The arm is
+/// read on the path the router takes at every turn; the depth decides a build
+/// order, so neither may silently become `u64::MAX`.
+#[tokio::test]
+async fn a_negative_stored_routing_counter_is_read_as_zero() {
+    let Some(e) = env().await else { return };
+    let (project, graph) = (Uuid::new_v4(), Uuid::new_v4());
+    let class = format!("negative-fidelity-{project}");
+    let mut cleanup = Cleanup::new(&e.target);
+    cleanup.later(
+        "MATCH (a:RoutingArm {class: $p}) DETACH DELETE a",
+        class.clone(),
+    );
+    cleanup.later(
+        "MATCH (n:FeatureGraph {project_id: $p}) DETACH DELETE n",
+        project.to_string(),
+    );
+    e.raw
+        .run(
+            query(
+                "CREATE (:RoutingArm {class: $class, provider_id: 'negative', model: 'negative',
+                              alpha: 1.0, beta: 1.0, n: -1, cost_sum_usd: 0.0, cost_n: -1,
+                              latency_sum_ms: -1, latency_n: -1,
+                              updated_at: '2026-01-01T00:00:00Z'})
+                 CREATE (:FeatureGraph {id: $graph, name: 'negative', project_id: $project,
+                              created_at: '2026-01-01T00:00:00Z',
+                              updated_at: '2026-01-01T00:00:00Z', build_depth: -1})",
+            )
+            .param("class", class.clone())
+            .param("graph", graph.to_string())
+            .param("project", project.to_string()),
+        )
+        .await
+        .unwrap();
+
+    let arms = e.client.list_routing_arms_impl(&class).await.unwrap();
+    assert_eq!(arms.len(), 1, "the arm written above is listed");
+    let arm = &arms[0];
+    assert_eq!(
+        (arm.n, arm.cost_n, arm.latency_sum_ms, arm.latency_n),
+        (0, 0, 0, 0),
+        "routing counters: a negative is zero"
+    );
+
+    let g = e.client.get_feature_graph(graph).await.unwrap().unwrap();
+    assert_eq!(
+        g.build_depth, None,
+        "a negative depth is not a depth: the default applies"
+    );
+}
+
+/// A recorded tool usage's duration, read off a relationship. `-1` there meant
+/// "this tool never reported a duration"; as a `u64` it becomes 584 million
+/// years, and a latency average built from it is meaningless.
+#[tokio::test]
+async fn a_negative_stored_tool_duration_is_none() {
+    let Some(e) = env().await else { return };
+    let node = Uuid::new_v4();
+    // A tool name of our own: a shared `bash`/`run` would be the node a MERGE of
+    // the production path reuses, and this test must not touch it.
+    let tool = format!("negative-fidelity-{node}");
+    let mut cleanup = Cleanup::new(&e.target);
+    cleanup.later(
+        "MATCH (tn:TrajectoryNode {id: $p}) DETACH DELETE tn",
+        node.to_string(),
+    );
+    cleanup.later(
+        "MATCH (t:ToolNode {tool_name: $p}) DETACH DELETE t",
+        tool.clone(),
+    );
+    e.raw
+        .run(
+            query(
+                "CREATE (tn:TrajectoryNode {id: $id})
+                 CREATE (tn)-[:USED_TOOL {params_hash: 'negative', duration_ms: -1,
+                                          success: true}]->(:ToolNode {tool_name: $tool,
+                                          action: 'run'})
+                 CREATE (tn)-[:USED_TOOL {params_hash: 'known', duration_ms: 42,
+                                          success: true}]->(:ToolNode {tool_name: $tool,
+                                          action: 'run'})",
+            )
+            .param("id", node.to_string())
+            .param("tool", tool.clone()),
+        )
+        .await
+        .unwrap();
+
+    // `get_node_tool_usages` lives on the trajectory store, not on the client.
+    let store = Neo4jTrajectoryStore::new(std::sync::Arc::new(e.raw.clone()));
+    let usages = store.get_node_tool_usages(&node).await.unwrap();
+    assert_eq!(usages.len(), 2, "both usages are read back");
+    // Read by hash, not by position: the query has no ORDER BY.
+    let by_hash = |h: &str| {
+        usages
+            .iter()
+            .find(|u| u.params_hash == h)
+            .unwrap_or_else(|| panic!("no usage with params_hash {h}"))
+    };
+    assert_eq!(
+        by_hash("negative").duration_ms,
+        None,
+        "a negative duration is not a duration"
+    );
+    assert_eq!(
+        by_hash("known").duration_ms,
+        Some(42),
+        "a real duration is kept as it was stored"
+    );
 }
