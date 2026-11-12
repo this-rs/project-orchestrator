@@ -812,3 +812,105 @@ async fn a_negative_stored_tool_duration_is_none() {
         "a real duration is kept as it was stored"
     );
 }
+
+/// The FULL tree reader, not just its metadata list: `get_persisted_reasoning_tree`
+/// sits on another code path with its own copy of the same two fields.
+#[tokio::test]
+async fn a_negative_stored_tree_depth_is_read_as_zero_on_the_full_tree() {
+    let Some(e) = env().await else { return };
+    let tree = Uuid::new_v4();
+    let mut cleanup = Cleanup::new(&e.target);
+    cleanup.later(
+        "MATCH (n:PersistedReasoningTree {id: $p}) DETACH DELETE n",
+        tree.to_string(),
+    );
+    e.raw
+        .run(
+            query(
+                "CREATE (:PersistedReasoningTree {id: $id, request: 'negative',
+                                     serialized_tree: '[]', confidence: 0.25,
+                                     node_count: -1, depth: -1,
+                                     created_at: '2026-01-01T00:00:00Z'})",
+            )
+            .param("id", tree.to_string()),
+        )
+        .await
+        .unwrap();
+
+    let t = e
+        .client
+        .get_persisted_reasoning_tree(tree)
+        .await
+        .unwrap()
+        .expect("the tree written above is read back");
+    assert_eq!(
+        (t.node_count, t.depth),
+        (0, 0),
+        "the full-tree reader maps a negative to zero as well"
+    );
+    assert!(t.roots.is_empty(), "an empty serialized tree has no root");
+    assert_eq!(t.confidence, 0.25, "a real confidence is kept");
+}
+
+/// Two code-intelligence readers that both report a line number: the
+/// trait-implementor list and the per-type impl blocks. A stored `-1` there is a
+/// missing position, and a `u32::MAX` line number sorts and renders as real.
+#[tokio::test]
+async fn a_negative_stored_impl_position_is_read_as_zero() {
+    let Some(e) = env().await else { return };
+    let tag = Uuid::new_v4();
+    let (type_name, trait_name) = (format!("NegativeType{tag}"), format!("NegativeTrait{tag}"));
+    let path = format!("/integer-fidelity/{tag}.rs");
+    let mut cleanup = Cleanup::new(&e.target);
+    cleanup.later(
+        "MATCH (i:Impl {file_path: $p}) DETACH DELETE i",
+        path.clone(),
+    );
+    cleanup.later(
+        "MATCH (t:Trait {name: $p}) DETACH DELETE t",
+        trait_name.clone(),
+    );
+    cleanup.later(
+        "MATCH (s:Struct {name: $p}) DETACH DELETE s",
+        type_name.clone(),
+    );
+    e.raw
+        .run(
+            query(
+                "CREATE (t:Trait {name: $trait})
+                 CREATE (s:Struct {name: $type})
+                 CREATE (i:Impl {file_path: $path, line_start: -1, line_end: -1,
+                                 trait_name: $trait})
+                 CREATE (i)-[:IMPLEMENTS_TRAIT]->(t)
+                 CREATE (i)-[:IMPLEMENTS_FOR]->(s)",
+            )
+            .param("trait", trait_name.clone())
+            .param("type", type_name.clone())
+            .param("path", path.clone()),
+        )
+        .await
+        .unwrap();
+
+    let implementors = e
+        .client
+        .get_trait_implementors_detailed(&trait_name)
+        .await
+        .unwrap();
+    assert_eq!(implementors.len(), 1, "the implementor written above");
+    assert_eq!(
+        implementors[0].line, 0,
+        "a negative impl start is line zero, not u32::MAX"
+    );
+
+    let blocks = e
+        .client
+        .get_type_impl_blocks_detailed(&type_name)
+        .await
+        .unwrap();
+    assert_eq!(blocks.len(), 1, "the block written above");
+    assert_eq!(
+        (blocks[0].line_start, blocks[0].line_end),
+        (0, 0),
+        "a negative impl span is zero on both ends"
+    );
+}
