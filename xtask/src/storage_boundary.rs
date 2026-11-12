@@ -528,7 +528,37 @@ const SKIPPED_DIRS: [&str; 9] = [
     "xtask",
 ];
 
-fn collect_rs_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
+/// The directories of the local crates a `[patch.<registry>]` table of the root
+/// `Cargo.toml` substitutes for a published one (`vendor/neo4rs`, see its PATCH.md).
+/// Such a copy IS the driver: its own `use neo4rs` is not a use of the driver by the
+/// product, so the scan skips exactly those directories and nothing else under
+/// `vendor/` or elsewhere.
+fn patched_crate_dirs(root: &Path) -> Vec<PathBuf> {
+    let Ok(manifest) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    let mut in_patch = false;
+    let mut dirs = Vec::new();
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_patch = line.starts_with("[patch.");
+            continue;
+        }
+        if !in_patch {
+            continue;
+        }
+        // `name = { path = "vendor/x" }` — the first `path = "…"` of the line.
+        if let Some(rest) = line.split("path = \"").nth(1) {
+            if let Some((dir, _)) = rest.split_once('"') {
+                dirs.push(root.join(dir));
+            }
+        }
+    }
+    dirs
+}
+
+fn collect_rs_files(root: &Path, dir: &Path, skip: &[PathBuf], out: &mut Vec<String>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -544,7 +574,10 @@ fn collect_rs_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
             if SKIPPED_DIRS.contains(&name.as_str()) || name.starts_with("target-") {
                 continue;
             }
-            collect_rs_files(root, &path, out);
+            if skip.iter().any(|s| s == &path) {
+                continue;
+            }
+            collect_rs_files(root, &path, skip, out);
         } else if name.ends_with(".rs") {
             let rel = path.strip_prefix(root).unwrap_or(&path);
             out.push(rel.to_string_lossy().replace('\\', "/"));
@@ -618,7 +651,8 @@ pub fn run(args: &[String]) -> i32 {
     let mut refs = Vec::new();
 
     let mut rs_files = Vec::new();
-    collect_rs_files(&root, &root, &mut rs_files);
+    let patched = patched_crate_dirs(&root);
+    collect_rs_files(&root, &root, &patched, &mut rs_files);
     for file in &rs_files {
         if is_adapter_file(file) {
             continue;
@@ -668,6 +702,58 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `[patch.crates-io]` target (`vendor/neo4rs`) IS the driver: its own
+    /// `use neo4rs` is not a leak of the driver into the product, and counting it
+    /// made the gate red on the first vendored copy. Only the patched directories
+    /// are skipped: another `vendor/` crate, or a `vendor` inside the product, is
+    /// still scanned.
+    #[test]
+    fn collect_rs_files_skips_the_patched_crates_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("xtask-sb-vendor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\".\"]\n\n[dependencies]\nneo4rs = { path = \"not/a/patch\" }\n\n[patch.crates-io]\nneo4rs = { path = \"vendor/neo4rs\" }\n",
+        )
+        .unwrap();
+        for f in [
+            "src/a.rs",
+            "src/vendor/b.rs",
+            "vendor/other/src/lib.rs",
+            "vendor/neo4rs/src/node.rs",
+            "vendor/neo4rs/src/types/path.rs",
+        ] {
+            let p = dir.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "use neo4rs::Node;\n").unwrap();
+        }
+        assert_eq!(patched_crate_dirs(&dir), [dir.join("vendor/neo4rs")]);
+        let mut out = Vec::new();
+        collect_rs_files(&dir, &dir, &patched_crate_dirs(&dir), &mut out);
+        out.sort();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            out,
+            ["src/a.rs", "src/vendor/b.rs", "vendor/other/src/lib.rs"]
+        );
+    }
+
+    #[test]
+    fn a_manifest_without_patch_table_skips_nothing() {
+        let dir = std::env::temp_dir().join(format!("xtask-sb-nopatch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[dependencies]\nx = { path = \"vendor/x\" }\n",
+        )
+        .unwrap();
+        assert!(patched_crate_dirs(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(patched_crate_dirs(Path::new("/nonexistent/for/xtask")).is_empty());
+    }
 
     #[test]
     fn is_adapter_file_recognizes_only_the_adapter_modules() {

@@ -33,6 +33,7 @@
 //! `vector_search_notes` do. The HNSW index is `document_chunk_embeddings`,
 //! declared next to the others in `init_schema` (see `client.rs`) — this project
 //! keeps its schema there, `migrations/` holds one-off data conversions only.
+use super::unsigned::unsigned;
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
@@ -777,9 +778,9 @@ impl Neo4jClient {
             filename: node.get("filename").unwrap_or_default(),
             format: format_from_str(&format_str),
             sha256: node.get("sha256").unwrap_or_default(),
-            size_bytes: node.get::<i64>("size_bytes").unwrap_or(0).max(0) as u64,
-            page_count: node.get::<i64>("page_count").unwrap_or(0).max(0) as usize,
-            chunk_count: node.get::<i64>("chunk_count").unwrap_or(0).max(0) as usize,
+            size_bytes: unsigned(node.get::<i64>("size_bytes").unwrap_or(0), u64::MAX),
+            page_count: unsigned(node.get::<i64>("page_count").unwrap_or(0), usize::MAX),
+            chunk_count: unsigned(node.get::<i64>("chunk_count").unwrap_or(0), usize::MAX),
             warnings: node.get("warnings").unwrap_or_default(),
             created_at: node
                 .get::<String>("created_at")
@@ -805,14 +806,14 @@ impl Neo4jClient {
         Ok(DocumentChunk {
             id: node.get::<String>("id")?.parse()?,
             text: node.get("text").unwrap_or_default(),
-            start_byte: node.get::<i64>("start_byte").unwrap_or(0).max(0) as usize,
-            end_byte: node.get::<i64>("end_byte").unwrap_or(0).max(0) as usize,
+            start_byte: unsigned(node.get::<i64>("start_byte").unwrap_or(0), usize::MAX),
+            end_byte: unsigned(node.get::<i64>("end_byte").unwrap_or(0), usize::MAX),
             page: node
                 .get::<i64>("page")
                 .ok()
                 .filter(|p| *p > 0)
                 .map(|p| p as usize),
-            ordinal: node.get::<i64>("ordinal").unwrap_or(0).max(0) as usize,
+            ordinal: unsigned(node.get::<i64>("ordinal").unwrap_or(0), usize::MAX),
             embedding: node
                 .get::<Vec<f64>>("embedding")
                 .ok()

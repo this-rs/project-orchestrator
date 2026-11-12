@@ -670,6 +670,15 @@ jobs:
           timeout 60 bash -c 'until curl -sf http://localhost:${{ job.services.meilisearch.ports['7700'] }}/health > /dev/null 2>&1; do sleep 2; done'
           echo "All services are ready!"
 
+      # The marker of a TEST database: the writing suites refuse a Neo4j without it
+      # (tests/common/harness.rs), whatever port the service got. Written by the
+      # workflow that provisions the database, never by a test.
+      - name: Mark the Neo4j service as a test database
+        run: |
+          curl -sf -u neo4j:testpassword -H 'Content-Type: application/json' \
+            -X POST "http://localhost:${{ job.services.neo4j.ports['7474'] }}/db/neo4j/tx/commit" \
+            -d '{"statements":[{"statement":"MERGE (:__Harnais {name: \"ci\"})"}]}' > /dev/null
+
       - name: Run integration tests
         env:
           NEO4J_URI: bolt://localhost:${{ job.services.neo4j.ports['7687'] }}
@@ -691,12 +700,16 @@ jobs:
           # (mock AND this Neo4j); REQUIRED, so its neo4j:: half never skips silently.
           # anchor_sweeps_unscoped: the UNSCOPED anchor sweeps through the trait, one test
           # alone in its binary (they write to every session: no parallel neighbour allowed).
+          # neo4j_integer_fidelity: what the server holds is what the driver reads (the
+          # integers -16..=-1 were read 240..=255, see vendor/neo4rs/PATCH.md) and a state
+          # without timeout stays without one. The only place the vendored driver is tested.
           HARNESS_NEO4J_REQUIRED=1 cargo test --test integration_tests --test data_migrations \
             --test workspace_tests --test neo4j_store_tests --test harness_neo4j \
             --test anchor_sweeps_unscoped \
             --test neo4j_note_consent --test neo4j_decision_project --test neural_routing_indexes \
             --test neo4j_synapse_shadow --test store_conformance --test code_graph_stable_key \
-            --test file_paths --test neural_routing_sampler --test note_sweep
+            --test file_paths --test neural_routing_sampler --test note_sweep \
+            --test neo4j_integer_fidelity
 
   # ==========================================================================
   # Obrain backend — the one job that COMPILES AND RUNS the `obrain-backend`
@@ -948,6 +961,13 @@ jobs:
           timeout 60 bash -c 'until curl -sf http://localhost:${{ job.services.meilisearch.ports['7700'] }}/health > /dev/null 2>&1; do sleep 2; done'
           echo "Neo4j + Meilisearch ready"
 
+      # The marker of a TEST database (tests/common/harness.rs): see the integration job.
+      - name: Mark the Neo4j service as a test database
+        run: |
+          curl -sf -u neo4j:testpassword -H 'Content-Type: application/json' \
+            -X POST "http://localhost:${{ job.services.neo4j.ports['7474'] }}/db/neo4j/tx/commit" \
+            -d '{"statements":[{"statement":"MERGE (:__Harnais {name: \"ci\"})"}]}' > /dev/null
+
       # Coverage is collected in SEVERAL runs whose profraw data is then MERGED
       # into a single lcov (`--no-report` accumulates, `llvm-cov report` merges).
       # One run cannot do it: the unit tests span the whole workspace while the
@@ -1028,7 +1048,8 @@ jobs:
             --test file_paths \
             --test neural_routing_sampler \
             --test store_conformance \
-            --test note_sweep
+            --test note_sweep \
+            --test neo4j_integer_fidelity
 
       # (4) Merge every run above into one lcov.
       - name: Merge coverage runs into a single lcov

@@ -4902,8 +4902,6 @@ dependencies = [
 [[package]]
 name = "neo4rs"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43dd99fe7dbc68f754759874d83ec2ca43a61ab7d51c10353d024094805382be"
 dependencies = [
  "async-trait",
  "backoff",

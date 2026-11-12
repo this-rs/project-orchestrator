@@ -3,6 +3,7 @@
 //! CRUD for:
 //! - **Analysis profiles**: weight edge types for contextual analytics.
 //! - **User profiles**: adaptive behavioral profiles learned from implicit signals.
+use super::unsigned::unsigned;
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
@@ -233,7 +234,10 @@ impl Neo4jClient {
             commit_style: node.get("commit_style").unwrap_or(0.5),
             language: node.get("language").unwrap_or_else(|_| "en".to_string()),
             expertise_level: node.get("expertise_level").unwrap_or(0.5),
-            interaction_count: node.get::<i64>("interaction_count").unwrap_or(0) as u64,
+            interaction_count: unsigned(
+                node.get::<i64>("interaction_count").unwrap_or(0),
+                u64::MAX,
+            ),
             created_at: DateTime::parse_from_rfc3339(&created_at)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now()),

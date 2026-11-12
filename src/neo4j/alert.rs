@@ -1,4 +1,5 @@
 //! Neo4j Alert operations (Heartbeat Engine)
+use super::unsigned::unsigned;
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
@@ -277,7 +278,8 @@ impl Neo4jClient {
         };
         let first_seen = parse_ts("first_seen").or(Some(created_at));
         let last_seen = parse_ts("last_seen").or(Some(created_at));
-        let occurrence_count = node.get::<i64>("occurrence_count").unwrap_or(1).max(1) as u64;
+        let occurrence_count =
+            unsigned(node.get::<i64>("occurrence_count").unwrap_or(1), u64::MAX).max(1);
         let dedup_key = node.get::<String>("dedup_key").unwrap_or_default();
         let priority = node.get::<f64>("priority").unwrap_or_else(|_| {
             AlertNode::compute_priority(

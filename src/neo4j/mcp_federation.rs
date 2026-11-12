@@ -3,6 +3,7 @@
 //! Stores external MCP server registrations and their discovered tools
 //! in the knowledge graph, enabling relationship tracking (EXPOSES,
 //! SIMILAR_TO, CO_ACTIVATED_WITH, OFTEN_FOLLOWS).
+use super::unsigned::unsigned;
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
@@ -397,7 +398,7 @@ impl Neo4jClient {
                 .get("server_name")
                 .ok()
                 .filter(|s: &String| !s.is_empty()),
-            tool_count: node.get::<i64>("tool_count").unwrap_or(0) as usize,
+            tool_count: unsigned(node.get::<i64>("tool_count").unwrap_or(0), usize::MAX),
             created_at: DateTime::parse_from_rfc3339(&created_at_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now()),

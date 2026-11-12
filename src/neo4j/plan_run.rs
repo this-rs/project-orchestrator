@@ -3,6 +3,7 @@
 use crate::neo4j::traits::*;
 
 use super::client::Neo4jClient;
+use super::unsigned::unsigned;
 use crate::runner::{PlanRunStatus, RunnerState, TriggerSource};
 use anyhow::Result;
 use neo4rs::query;
@@ -318,8 +319,8 @@ impl Neo4jClient {
         Ok(RunnerState {
             run_id: run_id.parse()?,
             plan_id: plan_id.parse()?,
-            total_tasks: node.get::<i64>("total_tasks").unwrap_or(0) as usize,
-            current_wave: node.get::<i64>("current_wave").unwrap_or(0) as usize,
+            total_tasks: unsigned(node.get::<i64>("total_tasks").unwrap_or(0), usize::MAX),
+            current_wave: unsigned(node.get::<i64>("current_wave").unwrap_or(0), usize::MAX),
             current_task_id: current_task_id.and_then(|s| s.parse().ok()),
             current_task_title: None,
             active_agents: Vec::new(),
