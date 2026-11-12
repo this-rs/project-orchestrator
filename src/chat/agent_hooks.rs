@@ -1404,6 +1404,8 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
             narrow(&mut request, held, None);
             request.session_id = router.session_id;
             request.turn_index = Some(ctx.turn_index);
+            // Mesure du fournisseur après le tour précédent ; `None` quand il n'en rapporte pas.
+            request.prefix_tokens = ctx.context_tokens;
             let Some(decision) = router.ask(request).await else {
                 return TurnDirective::none();
             };

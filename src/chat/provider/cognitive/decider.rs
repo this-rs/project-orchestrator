@@ -162,6 +162,49 @@ pub fn decide_with(
     decision
 }
 
+/// Coût en USD de réécrire le préfixe quand on change de modèle : le challenger écrit le
+/// préfixe (`write`), l'ancien cache est perdu, et les lectures de cache que chacun aurait
+/// faites sont perdues : `prefix × (write(chal) + write(inc) − read(chal) − read(inc)) / 1e6`.
+/// `None` dès qu'un prix de cache manque (jamais de prix inventé).
+pub fn switch_cost_usd(
+    prefix_tokens: u64,
+    challenger: &ModelFacts,
+    incumbent: &ModelFacts,
+) -> Option<f64> {
+    let (c, i) = (challenger.price?, incumbent.price?);
+    let per_mtok = c.cache_write_per_mtok? + i.cache_write_per_mtok?
+        - c.cache_read_per_mtok?
+        - i.cache_read_per_mtok?;
+    Some((prefix_tokens as f64 * per_mtok.max(0.0)) / 1_000_000.0)
+}
+
+/// Gain attendu par tour d'un challenger MOINS CHER que le modèle en force, dans la même
+/// unité des deux côtés (coût mesuré de l'arme si les deux en ont un, sinon coût estimé).
+/// `None` quand une des deux valeurs manque ou que le challenger n'est pas moins cher.
+fn expected_gain_per_turn(challenger: &Scored, incumbent: &Scored) -> Option<f64> {
+    let gain = match (challenger.arm_mean_cost_usd, incumbent.arm_mean_cost_usd) {
+        (Some(c), Some(i)) => i - c,
+        _ => incumbent.est_turn_cost_usd? - challenger.est_turn_cost_usd?,
+    };
+    (gain.is_finite() && gain > 0.0).then_some(gain)
+}
+
+/// `Some(gain − coût de bascule)` (négatif) quand garder le modèle en force vaut mieux que
+/// de basculer ; `None` quand la règle ne s'applique pas ou que la bascule se rembourse.
+/// Ne s'applique que si le préfixe est connu (`prefix_tokens`), les prix de cache aussi, et
+/// que le challenger est une économie : un challenger plus cher est choisi pour sa qualité,
+/// pas pour un gain d'argent que la bascule annulerait.
+fn switch_cache_shortfall(
+    challenger: &Scored,
+    incumbent: &Scored,
+    prefix_tokens: Option<u64>,
+) -> Option<f64> {
+    let prefix = prefix_tokens?;
+    let cost = switch_cost_usd(prefix, &challenger.candidate, &incumbent.candidate)?;
+    let gain = expected_gain_per_turn(challenger, incumbent)?;
+    (gain <= cost).then_some(gain - cost)
+}
+
 /// The utility of a scored pair with its posterior MEAN in place of its Thompson draw.
 fn mean_utility(scored: &Scored, settings: &RoutingSettings) -> f64 {
     utility_of(
@@ -358,6 +401,7 @@ fn decide_free(
             .collect(),
     });
     let mut kept = false;
+    let mut cache_note: Option<String> = None;
     if !scored[0].explored {
         if let Some(current) = &request.current {
             let at_index = scored
@@ -370,6 +414,21 @@ fn decide_free(
                         let stay = scored.remove(index);
                         scored.insert(0, stay);
                         kept = true;
+                    } else if request.not_selectable.is_none() {
+                        // Coût de cache d'une bascule : le challenger gagne sur l'utilité,
+                        // mais changer de modèle réécrit tout le préfixe.
+                        if let Some(shortfall) = switch_cache_shortfall(
+                            &scored[0],
+                            &scored[index],
+                            request.prefix_tokens,
+                        ) {
+                            let stay = scored.remove(index);
+                            scored.insert(0, stay);
+                            kept = true;
+                            cache_note = Some(format!(
+                                "switch_costs_more_than_it_saves({shortfall:.2} USD)"
+                            ));
+                        }
                     }
                 }
             }
@@ -380,6 +439,9 @@ fn decide_free(
     decision.score = Some(best.utility);
     decision.explored = best.explored;
     decision.reason = reason_of(signature, best, best.explored, kept);
+    if let Some(note) = cache_note {
+        decision.reason = format!("{}; {note}", decision.reason);
+    }
     decision.applied = is_applied(settings.mode, settings.stage, signature.role);
     // Log the off-policy propensities: the exploration rate in force, the
     // number of scored arms, and per arm both the pure-Thompson top-1
@@ -1611,6 +1673,100 @@ mod tests {
         // A current pair that is not eligible is not kept.
         req.current = Some(Pick::new("ghost", "x"));
         assert_ne!(scored_order(&req, id).chosen, Some(Pick::new("ghost", "x")));
+    }
+
+    /// Pool de deux modèles dont les prix de cache sont publiés (0,1× / 1,25× l'entrée).
+    fn cached_request() -> DecideRequest {
+        let mut req = request(pilot(), ProviderRoutingMode::Full, LearningStage::Auto);
+        for f in &mut req.pool {
+            f.price = f.price.map(candidates::with_anthropic_cache_prices);
+        }
+        req.current = Some(Pick::new("glm", "big"));
+        req
+    }
+
+    /// Un id où le challenger (deepseek, moins cher) bat nettement le modèle en force.
+    fn clear_win_id(req: &DecideRequest) -> Uuid {
+        (1..2_000u128)
+            .map(Uuid::from_u128)
+            .find(|id| {
+                let d = decide_with(*id, Utc::now(), req, &[], &PriorHints::new());
+                d.chosen == Some(Pick::new("deepseek", "v4"))
+            })
+            .expect("a clear win exists")
+    }
+
+    #[test]
+    fn a_big_prefix_keeps_the_model_in_force_when_the_switch_costs_more_than_it_saves() {
+        let mut req = cached_request();
+        let id = clear_win_id(&req);
+        let run = |req: &DecideRequest| decide_with(id, Utc::now(), req, &[], &PriorHints::new());
+        // Préfixe inconnu : comportement d'avant, le challenger passe.
+        req.prefix_tokens = None;
+        assert_eq!(run(&req).chosen, Some(Pick::new("deepseek", "v4")));
+        // Petit préfixe : la bascule se rembourse, elle passe.
+        req.prefix_tokens = Some(10);
+        let small = run(&req);
+        assert_eq!(small.chosen, Some(Pick::new("deepseek", "v4")));
+        assert!(!small.reason.contains("switch_costs_more_than_it_saves"));
+        // Gros préfixe (p90 mesuré) : on garde le modèle en force.
+        req.prefix_tokens = Some(485_106);
+        let big = run(&req);
+        assert_eq!(big.chosen, Some(Pick::new("glm", "big")), "{}", big.reason);
+        assert!(
+            big.reason.contains("switch_costs_more_than_it_saves(-"),
+            "{}",
+            big.reason
+        );
+    }
+
+    #[test]
+    fn a_forced_change_is_never_blocked_by_the_cache_cost() {
+        let mut req = cached_request();
+        let id = clear_win_id(&req);
+        req.prefix_tokens = Some(485_106);
+        req.not_selectable = Some(COMPACTION_MODEL_NOT_SELECTABLE);
+        let d = decide_with(id, Utc::now(), &req, &[], &PriorHints::new());
+        // La décision garde son choix (appliquée nulle part, `used` = le modèle en force),
+        // et la règle de cache ne l'a pas retenu.
+        assert_eq!(d.chosen, Some(Pick::new("deepseek", "v4")), "{}", d.reason);
+        assert!(!d.reason.contains("switch_costs_more_than_it_saves"));
+    }
+
+    #[test]
+    fn without_cache_prices_the_rule_does_not_apply_even_with_a_huge_prefix() {
+        let mut req = request(pilot(), ProviderRoutingMode::Full, LearningStage::Auto);
+        req.current = Some(Pick::new("glm", "big"));
+        let id = clear_win_id(&req);
+        req.prefix_tokens = Some(842_638);
+        let d = decide_with(id, Utc::now(), &req, &[], &PriorHints::new());
+        assert_eq!(d.chosen, Some(Pick::new("deepseek", "v4")));
+    }
+
+    #[test]
+    fn cache_prices_come_from_the_published_input_price_only() {
+        let p = candidates::with_anthropic_cache_prices(ModelPrice {
+            input_per_mtok: 5.0,
+            output_per_mtok: 25.0,
+            cache_read_per_mtok: None,
+            cache_write_per_mtok: None,
+        });
+        assert_eq!(p.cache_read_per_mtok, Some(0.5));
+        assert_eq!(p.cache_write_per_mtok, Some(6.25));
+        let kept = candidates::with_anthropic_cache_prices(ModelPrice {
+            input_per_mtok: 5.0,
+            output_per_mtok: 25.0,
+            cache_read_per_mtok: Some(0.3),
+            cache_write_per_mtok: None,
+        });
+        assert_eq!(kept.cache_read_per_mtok, Some(0.3));
+        let unknown = candidates::with_anthropic_cache_prices(ModelPrice {
+            input_per_mtok: f64::NAN,
+            output_per_mtok: 25.0,
+            cache_read_per_mtok: None,
+            cache_write_per_mtok: None,
+        });
+        assert_eq!(unknown.cache_read_per_mtok, None);
     }
 
     #[test]
