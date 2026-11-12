@@ -1,4 +1,5 @@
 //! Neo4j Workspace operations
+use super::unsigned::unsigned;
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
@@ -941,7 +942,7 @@ impl Neo4jClient {
             let node: neo4rs::Node = row.get("s")?;
             let step = StepNode {
                 id: node.get::<String>("id")?.parse()?,
-                order: node.get::<i64>("order")? as u32,
+                order: unsigned(node.get::<i64>("order")?, u32::MAX),
                 description: node.get("description")?,
                 status: serde_json::from_str(&format!(
                     "\"{}\"",

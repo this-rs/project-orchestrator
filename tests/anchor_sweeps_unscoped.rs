@@ -13,6 +13,8 @@
 //! `HARNESS_NEO4J_REQUIRED=1` turns that into a failure. Local run:
 //!   NEO4J_URI=bolt://localhost:17687 NEO4J_PASSWORD=testpassword \
 //!     cargo test --test anchor_sweeps_unscoped
+mod common;
+
 #[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
 
@@ -26,9 +28,11 @@ use project_orchestrator::neo4j::GraphStore;
 use uuid::Uuid;
 
 async fn env() -> Option<(Neo4jClient, Graph)> {
-    let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:17687".into());
-    let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
-    let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
+    let common::harness::Neo4jTarget {
+        uri,
+        user,
+        password,
+    } = common::harness::neo4j_target();
     let connected = async {
         let client = Neo4jClient::new(&uri, &user, &password).await.ok()?;
         let raw = Graph::new(&uri, &user, &password).await.ok()?;

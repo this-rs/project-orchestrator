@@ -10,6 +10,8 @@
 //!
 //! The test prints a notice and returns when no Neo4j is reachable;
 //! `HARNESS_NEO4J_REQUIRED=1` (set in CI) turns that into a failure.
+mod common;
+
 #[allow(unused_imports)]
 use project_orchestrator::neo4j::traits::*;
 
@@ -23,9 +25,11 @@ struct Env {
 }
 
 async fn env() -> Option<Env> {
-    let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:17687".into());
-    let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
-    let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
+    let common::harness::Neo4jTarget {
+        uri,
+        user,
+        password,
+    } = common::harness::neo4j_target();
     let connected = async {
         let client = Neo4jClient::new(&uri, &user, &password).await.ok()?;
         let raw = Graph::new(&uri, &user, &password).await.ok()?;

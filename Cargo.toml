@@ -5,7 +5,12 @@ members = [".", "crates/*", "desktop/src-tauri"]
 # release builds, which copy Cargo.toml + crates/ + src/ only, never
 # see it.
 # vendor/candle-core/ is gone: candle-core 0.11.1 carries zip 9.1.3 itself.
-exclude = ["xtask"]
+# vendor/neo4rs/ is the local copy of neo4rs 0.8.0 that reads the integers
+# -16..=-1 with their sign (see vendor/neo4rs/PATCH.md). It is not a member, so
+# its formatting and lints stay out of `cargo fmt --all` and `cargo clippy
+# --workspace`; it enters the dependency graph through [patch], and the Docker
+# build copies vendor/ for that reason.
+exclude = ["xtask", "vendor/neo4rs"]
 resolver = "2"
 
 # =============================================================================
@@ -31,6 +36,10 @@ serde-saphyr = "2.0"
 toml = "1.1"
 
 # Neo4j
+# neo4rs comes from a local copy: see the [patch.crates-io] block at the bottom
+# of this file and vendor/neo4rs/PATCH.md. The published 0.8.0 reads the
+# one-byte negative integers (-16..=-1) as 240..=255, and the only releases
+# that fix it are 0.9 release candidates with a different API.
 neo4rs = "0.8"
 
 # Logging
@@ -445,3 +454,12 @@ name = "mem_embed"
 required-features = ["local-embeddings"]
 
 
+# neo4rs 0.8.0 decodes a Bolt TINY_INT marker with `marker as i64` on a `u8`:
+# every stored integer in -16..=-1 is read 240..=255, so the backend's `-1`
+# sentinels ("no timeout", "not computed") come back as 255. Upstream fixed it
+# in neo4j-labs/neo4rs#252, released only in the 0.9.0 release candidates,
+# whose API differs from 0.8 (about 2 000 decoding sites here). The copy is the
+# crates.io 0.8.0 plus that one upstream commit and a lint attribute. Removal
+# procedure and verification: vendor/neo4rs/PATCH.md.
+[patch.crates-io]
+neo4rs = { path = "vendor/neo4rs" }

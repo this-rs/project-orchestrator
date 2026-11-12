@@ -1,4 +1,5 @@
 //! Neo4j Task operations
+use super::unsigned::unsigned;
 #[allow(unused_imports)]
 use crate::neo4j::traits::*;
 
@@ -213,7 +214,7 @@ impl Neo4jClient {
     fn node_to_step(&self, node: &neo4rs::Node) -> Option<StepNode> {
         Some(StepNode {
             id: node.get::<String>("id").ok()?.parse().ok()?,
-            order: node.get::<i64>("order").ok()? as u32,
+            order: unsigned(node.get::<i64>("order").ok()?, u32::MAX),
             description: node.get::<String>("description").ok()?,
             status: node
                 .get::<String>("status")

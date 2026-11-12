@@ -23,10 +23,11 @@
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use neo4rs::{query, BoltType, Row};
+use neo4rs::{query, BoltType, Graph, Row};
 use serde::Serialize;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -60,6 +61,112 @@ pub(crate) const MAX_BATCHES: u32 = 10_000;
 /// the self can hold tens of thousands of `AUTHORED` edges, while the loop
 /// still drains a backlog of that size in a few dozen statements.
 pub const AGENT_SELF_BATCH: usize = 500;
+
+/// Reset to `-1` ("no timeout") the `ProtocolState.state_timeout_secs` that hold `255`.
+///
+/// WHY 255 IS A GHOST, NOT A VALUE. `upsert_protocol_state` stores `-1` for a state
+/// without timeout, and `neo4rs 0.8.0` read that `-1` back as `255` (a TINY_INT
+/// decoded without its sign, `vendor/neo4rs/PATCH.md`). `seed_prompt_fragments` reads
+/// the states and writes them back: the 255 it read was stored. No production path
+/// writes a real `Some(n)`: the 13 constructors of `ProtocolState` set `None`,
+/// `PortableState` (the export format) does not carry the field, and no API body
+/// deserialises a `ProtocolState`. On a copy of the production graph the property
+/// held only `-1` (89), `255` (65, all the states of 13 `session-lifecycle`
+/// protocols) and nothing (273).
+///
+/// WHAT MAKES A 255 A GHOST, TOMORROW. The write path marks a timeout someone CHOSE
+/// (`upsert_protocol_state`: `state_timeout_explicit = true` when a positive value is
+/// written on a state that did not hold it; a value read and written back earns no
+/// marker). This repair touches only a 255 WITHOUT that marker. So a handler that one
+/// day lets a user set 255 s writes it with the marker, and the repair leaves it; a 255
+/// an old binary rewrote from a `-1` has none, and is repaired. The test
+/// `the_phantom_255_timeouts_are_reset_on_every_start` pins both.
+///
+/// REPLAYED ON EVERY START, not marked complete (see
+/// [`Neo4jClient::repair_phantom_state_timeouts`]): an OLD binary still connected to
+/// the same database re-reads `-1` as 255 and rewrites it at its next
+/// `seed_prompt_fragments`. The cost is one label scan of `ProtocolState` (hundreds of
+/// nodes) and no write when there is nothing to repair. REMOVE this replay, together
+/// with the old binaries, when a write path for `Some(n)` is introduced: from then on a
+/// 255 can be a real value.
+const RESET_PHANTOM_STATE_TIMEOUTS: &str = r#"
+MATCH (s:ProtocolState)
+WHERE s.state_timeout_secs = 255
+  AND coalesce(s.state_timeout_explicit, false) = false
+  AND ($scope IS NULL
+       OR EXISTS { MATCH (p:Protocol {id: s.protocol_id}) WHERE p.project_id = $scope })
+WITH s LIMIT $batch
+SET s.state_timeout_secs = -1
+RETURN count(s) AS processed
+"#;
+
+/// Id of the replayed repair in logs and outcomes (never registered: no completion marker).
+pub const PHANTOM_STATE_TIMEOUTS_ID: &str = "2026-11-reset-phantom-state-timeouts";
+
+/// The batch loop of [`RESET_PHANTOM_STATE_TIMEOUTS`], on its own task. A free
+/// function on purpose: it is spawned (see `repair_phantom_state_timeouts`), so its
+/// future lives on the heap.
+async fn reset_phantom_state_timeouts(
+    graph: Arc<Graph>,
+    scope: Option<String>,
+) -> MigrationOutcome {
+    repair_until_empty(|| {
+        let (graph, scope) = (graph.clone(), scope.clone());
+        async move {
+            let mut rows = graph
+                .execute(
+                    query(RESET_PHANTOM_STATE_TIMEOUTS)
+                        .param("scope", scope)
+                        .param("batch", BATCH),
+                )
+                .await?;
+            let row = rows.next().await?.context("the repair returned no row")?;
+            Ok(row.get::<i64>("processed").unwrap_or(0))
+        }
+    })
+    .await
+}
+
+/// Run `batch` (one bounded statement, returning how many states it repaired)
+/// until it repairs none. A failing statement stops the loop with its error (the
+/// next start retries); one that never stops repairing is reported, not looped on.
+async fn repair_until_empty<F, Fut>(mut batch: F) -> MigrationOutcome
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<i64>>,
+{
+    let mut outcome = MigrationOutcome {
+        id: PHANTOM_STATE_TIMEOUTS_ID.to_string(),
+        ..Default::default()
+    };
+    for _ in 0..MAX_BATCHES {
+        match batch().await {
+            Ok(0) => {
+                outcome.completed = true;
+                return outcome;
+            }
+            Ok(n) => {
+                outcome.processed += n;
+                outcome.batches += 1;
+            }
+            Err(e) => {
+                outcome.error = Some(format!("{e:#}"));
+                return outcome;
+            }
+        }
+    }
+    outcome.error = Some(format!("did not converge within {MAX_BATCHES} batches"));
+    outcome
+}
+
+/// The outcome reported when the spawned repair task panicked or was cancelled.
+fn repair_task_died(e: impl std::fmt::Display) -> MigrationOutcome {
+    MigrationOutcome {
+        id: PHANTOM_STATE_TIMEOUTS_ID.to_string(),
+        error: Some(format!("the repair task died: {e}")),
+        ..Default::default()
+    }
+}
 
 /// Relationships that make a skill referenced by something other than its
 /// member notes/decisions. A referenced skill is never archived as a
@@ -982,7 +1089,34 @@ impl Neo4jClient {
     pub async fn run_data_migrations(&self) -> Vec<MigrationOutcome> {
         let mut outcomes = self.run_registered_migrations().await;
         outcomes.push(self.run_agent_identity_migration().await);
+        outcomes.push(self.repair_phantom_state_timeouts(None).await);
         outcomes
+    }
+
+    /// Reset the phantom `255` timeouts of protocol states to `-1`
+    /// ([`RESET_PHANTOM_STATE_TIMEOUTS`]). Replayable: it touches only what still
+    /// holds 255, and reports `processed` = states repaired. `scope`: a project id
+    /// (tests), `None` for the whole database (the boot path). Never fails: the
+    /// outcome carries the error and the next start retries.
+    pub async fn repair_phantom_state_timeouts(&self, scope: Option<Uuid>) -> MigrationOutcome {
+        // On its own task: the startup chain is awaited from a single future that is
+        // already very large (the data-migrations integration test overflows a 2 MB
+        // stack in a debug build on macOS without this step), so this step adds
+        // a JoinHandle to the chain and not a second batch loop.
+        let handle = tokio::spawn(reset_phantom_state_timeouts(
+            self.graph.clone(),
+            scope.map(|s| s.to_string()),
+        ));
+        let outcome = handle.await.unwrap_or_else(repair_task_died);
+        if outcome.processed > 0 {
+            warn!(
+                id = PHANTOM_STATE_TIMEOUTS_ID,
+                repaired = outcome.processed,
+                "Protocol states had a 255 s timeout nobody set: reset to none. If this repeats on \
+                 every start, an older binary is still connected to this database."
+            );
+        }
+        outcome
     }
 
     /// The agent-identity migration as one [`MigrationOutcome`], so the boot
@@ -1554,6 +1688,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The one invariant of the repair that no Neo4j test can state: it is NOT in
+    /// the registry (a completion marker would let an older binary's 255 survive).
+    /// What the query does is pinned against a real Neo4j by
+    /// `the_phantom_255_timeouts_are_reset_on_every_start` (tests/neo4j_integer_fidelity.rs).
+    #[test]
+    fn the_phantom_timeout_repair_is_never_registered_so_it_replays() {
+        assert!(
+            Neo4jClient::data_migrations()
+                .iter()
+                .all(|r| r.id != PHANTOM_STATE_TIMEOUTS_ID),
+            "a registered migration is skipped once marked: the repair must replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_repair_loop_stops_on_an_empty_batch_and_counts_what_it_repaired() {
+        let mut script = vec![Ok(2), Ok(1), Ok(0)].into_iter();
+        let out = repair_until_empty(|| std::future::ready(script.next().unwrap())).await;
+        assert_eq!((out.processed, out.batches, out.completed), (3, 2, true));
+        assert!(out.error.is_none());
+        assert_eq!(out.id, PHANTOM_STATE_TIMEOUTS_ID);
+    }
+
+    #[tokio::test]
+    async fn the_repair_loop_reports_a_failing_batch_and_stops() {
+        let mut script = vec![Ok(5), Err(anyhow::anyhow!("lock conflict"))].into_iter();
+        let out = repair_until_empty(|| std::future::ready(script.next().unwrap())).await;
+        assert_eq!((out.processed, out.completed), (5, false));
+        assert_eq!(out.error.as_deref(), Some("lock conflict"));
+    }
+
+    #[tokio::test]
+    async fn the_repair_loop_does_not_run_forever_on_a_batch_that_never_empties() {
+        let mut calls = 0u32;
+        let out = repair_until_empty(|| {
+            calls += 1;
+            std::future::ready(Ok(1))
+        })
+        .await;
+        assert_eq!(calls, MAX_BATCHES);
+        assert!(!out.completed);
+        assert!(out.error.unwrap().contains("did not converge"));
+    }
+
+    /// Coverage of the error shape only: no invariant beyond "an error, not a panic".
+    #[test]
+    fn coverage_a_dead_repair_task_is_an_error_outcome_not_a_panic() {
+        let out = repair_task_died("cancelled");
+        assert_eq!(out.id, PHANTOM_STATE_TIMEOUTS_ID);
+        assert_eq!(
+            out.error.as_deref(),
+            Some("the repair task died: cancelled")
+        );
+        assert!(!out.completed && out.processed == 0);
     }
 
     #[test]

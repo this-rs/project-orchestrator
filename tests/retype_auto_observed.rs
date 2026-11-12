@@ -11,10 +11,12 @@
 //! asserts on.
 //!
 //!   scripts/ephemeral-prod-copy.sh up
-//!   NEO4J_URI=bolt://localhost:27699 NEO4J_PASSWORD=testpassword \
+//!   NEO4J_URI=bolt://localhost:17687 NEO4J_PASSWORD=testpassword \
 //!     cargo test --test retype_auto_observed -- --nocapture
 //!
 //! Skipped, loudly, when no Neo4j is reachable.
+
+mod common;
 
 use neo4rs::{query, Graph};
 use project_orchestrator::neo4j::client::Neo4jClient;
@@ -61,9 +63,11 @@ async fn shape(graph: &Graph, project: &str) -> Shape {
 
 #[tokio::test]
 async fn a_regex_does_not_get_to_call_a_sentence_knowledge() {
-    let uri = std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:27699".into());
-    let user = std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
-    let password = std::env::var("NEO4J_PASSWORD").unwrap_or_else(|_| "testpassword".into());
+    let common::harness::Neo4jTarget {
+        uri,
+        user,
+        password,
+    } = common::harness::neo4j_target();
 
     let client = match Neo4jClient::new(&uri, &user, &password).await {
         Ok(c) => c,
