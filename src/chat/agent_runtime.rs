@@ -674,6 +674,22 @@ pub struct TurnOutcome {
     /// the instance is out for a while, which says nothing of how well the model works. The
     /// bandit is not fed it as a failure of the arm (`decision::turn_reward`).
     pub quota_refusal: bool,
+    /// Le préfixe facturé au tour — l'entrée réellement envoyée au modèle, lectures de cache
+    /// comprises (la plus grosse part du préfixe d'une session Claude Code). `None` quand le
+    /// fournisseur ne l'a pas rapporté ; jamais un zéro inventé. La mémoire du routeur s'en
+    /// sert pour combler le trou des fournisseurs dont `TurnContext::context_tokens` n'est
+    /// jamais renseigné (Claude Code).
+    pub prompt_tokens: Option<u64>,
+}
+
+/// Le préfixe qu'un tour a été facturé : l'entrée réellement envoyée au modèle plus les
+/// lectures et écritures de cache — les lectures de cache sont la plus grosse part du préfixe
+/// d'une session Claude Code. Gardé par `input_tokens` : sans lui les chiffres de cache n'ont
+/// pas de base, et la valeur reste `None` (jamais un zéro inventé, jamais l'entrée seule).
+fn billed_prompt_tokens(usage: &nexus_claude::agent::Usage) -> Option<u64> {
+    usage.input_tokens.map(|input| {
+        input + usage.cache_read_tokens.unwrap_or(0) + usage.cache_creation_tokens.unwrap_or(0)
+    })
 }
 
 /// What the host asks of the session after a turn: events to emit, then system
@@ -2608,6 +2624,7 @@ impl AgentSessionHandle {
                     stop_reason,
                     subtype,
                     error,
+                    usage,
                     ..
                 } = &event
                 {
@@ -2635,6 +2652,9 @@ impl AgentSessionHandle {
                             .code
                             .to_string()
                     });
+                    // PREFIX-CC : le préfixe facturé au tour (lectures de cache comprises),
+                    // pour la mémoire du routeur. `input_tokens` garde la somme.
+                    outcome.prompt_tokens = billed_prompt_tokens(usage);
                 }
                 let event = mask_agent_event(event);
                 // The harness' advisories (credentials_locked, model_retry, ...) are what
@@ -7263,6 +7283,7 @@ mod answered_tests {
         subtype: String,
         is_error: bool,
         error_code: Option<String>,
+        prompt_tokens: Option<u64>,
     }
 
     /// The `answered` of each turn the host saw end, plus its terminal result.
@@ -7299,6 +7320,7 @@ mod answered_tests {
                 subtype: outcome.subtype.clone(),
                 is_error: outcome.is_error,
                 error_code: outcome.error_code.clone(),
+                prompt_tokens: outcome.prompt_tokens,
             });
             AfterTurn::default()
         }
@@ -7424,6 +7446,56 @@ mod answered_tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(ends.next().is_none(), "every attempt was played");
+    }
+
+    /// PREFIX-CC : le préfixe facturé est capturé du `done` (entrée + lectures/écritures de
+    /// cache), et reste `None` quand l'entrée n'est pas rapportée (jamais 0, jamais l'entrée
+    /// seule).
+    #[tokio::test]
+    async fn the_turn_outcome_carries_the_billed_prefix() {
+        let (provider, handle, host) = session(0).await;
+        let done = |usage: nexus_claude::agent::Usage| AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Completed,
+            subtype: None,
+            is_error: false,
+            result_text: None,
+            usage,
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 1,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        };
+        play(
+            &provider,
+            &handle,
+            vec![done(nexus_claude::agent::Usage {
+                input_tokens: Some(1_000),
+                cache_read_tokens: Some(50_000),
+                cache_creation_tokens: Some(9_000),
+                ..Default::default()
+            })],
+        )
+        .await;
+        assert_eq!(host.seen_outcome()[0].prompt_tokens, Some(60_000));
+
+        // Une entrée non rapportée ne donne pas de préfixe : la somme est gardée par
+        // `input_tokens`, les chiffres de cache seuls sont ignorés.
+        play(
+            &provider,
+            &handle,
+            vec![done(nexus_claude::agent::Usage {
+                input_tokens: None,
+                cache_read_tokens: Some(50_000),
+                cache_creation_tokens: Some(9_000),
+                ..Default::default()
+            })],
+        )
+        .await;
+        assert_eq!(host.seen_outcome()[1].prompt_tokens, None);
     }
 
     #[tokio::test]

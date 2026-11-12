@@ -2717,6 +2717,14 @@ impl super::agent_runtime::TurnServices for ManagerTurnServices {
     ) -> super::agent_runtime::AfterTurn {
         let mut after = super::agent_runtime::AfterTurn::default();
         let uuid = Uuid::parse_str(session_id).ok();
+        // PREFIX-CC : le routeur de la session mémorise le préfixe facturé au tour (lectures
+        // de cache comprises) — la meilleure estimation du préfixe lu en cache du tour suivant
+        // pour un fournisseur qui ne renseigne jamais `TurnContext::context_tokens` (Claude Code).
+        if let Some(router) = self.turn_routing.get(session_id) {
+            if let Some(prompt_tokens) = outcome.prompt_tokens {
+                router.note_prefix_tokens(prompt_tokens);
+            }
+        }
         // Gap 2: feed the bandit the outcome of the turn it routed. Only for the
         // OPEN decision of a turn that reached a terminal `done`; an overridden
         // decision is skipped — `close_routing_decision` already feeds it.

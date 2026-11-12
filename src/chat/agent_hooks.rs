@@ -52,7 +52,7 @@
 use crate::neo4j::traits::*;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -666,6 +666,16 @@ pub(crate) struct TurnRouter {
     /// The next turn carries an image (`set_turn_input`): its decision excludes the models
     /// that cannot read one (`needs_images`, `RejectReason::NoImages`).
     last_has_images: AtomicBool,
+    /// Le préfixe facturé au tour précédent (jetons d'entrée, lectures de cache comprises),
+    /// mémorisé par [`TurnRouter::note_prefix_tokens`]. `0` = jamais mesuré. Le fournisseur
+    /// qui renseigne `TurnContext::context_tokens` reste l'autorité ; cette mémoire ne comble
+    /// que le trou des fournisseurs qui ne le renseignent jamais (Claude Code) : le préfixe du
+    /// tour précédent est la meilleure estimation du préfixe lu en cache du tour suivant.
+    /// Pas de purge explicite quand l'historique est réécrit : un relais (mouvement de
+    /// fournisseur) ouvre un routeur neuf (`0`), une compaction auto rafraîchit la valeur au
+    /// `done` suivant ; seule une compaction manuelle laisse une valeur périmée un tour —
+    /// proche, jamais fausse loin.
+    last_prefix_tokens: AtomicU64,
     /// The turn [`model_for_images`] changed the model for, and the model in force before:
     /// what [`TurnRouter::forget_image_change`] puts back when the host could not apply it.
     image_change: Mutex<Option<(u32, String)>>,
@@ -828,6 +838,7 @@ impl TurnRouter {
             decided: Mutex::new(None),
             last_message: Mutex::new(None),
             last_has_images: AtomicBool::new(false),
+            last_prefix_tokens: AtomicU64::new(0),
             image_change: Mutex::new(None),
             state: Mutex::new(TurnState {
                 current_model: spec.current_model,
@@ -920,6 +931,22 @@ impl TurnRouter {
     /// The user changed the model by hand: the router leaves the session alone.
     pub(crate) fn mark_manual(&self) {
         self.manual.store(true, Ordering::SeqCst);
+    }
+
+    /// Mémorise le préfixe facturé au tour (entrée + lectures/écritures de cache), rapporté
+    /// par le `done` terminal du fournisseur. C'est l'estimation du préfixe lu en cache du
+    /// tour suivant pour un fournisseur qui ne renseigne jamais `TurnContext::context_tokens`
+    /// (Claude Code).
+    pub(crate) fn note_prefix_tokens(&self, tokens: u64) {
+        self.last_prefix_tokens.store(tokens, Ordering::SeqCst);
+    }
+
+    /// Le préfixe facturé au tour précédent, `None` quand jamais mesuré (`0` = inconnu).
+    pub(crate) fn prefix_tokens(&self) -> Option<u64> {
+        match self.last_prefix_tokens.load(Ordering::SeqCst) {
+            0 => None,
+            tokens => Some(tokens),
+        }
     }
 
     /// The context of the next turn of a session whose turns the router counts itself.
@@ -1404,8 +1431,10 @@ pub(crate) async fn directive_for_turn(router: &TurnRouter, ctx: &TurnContext) -
             narrow(&mut request, held, None);
             request.session_id = router.session_id;
             request.turn_index = Some(ctx.turn_index);
-            // Mesure du fournisseur après le tour précédent ; `None` quand il n'en rapporte pas.
-            request.prefix_tokens = ctx.context_tokens;
+            // Mesure du fournisseur après le tour précédent ; `None` quand il n'en rapporte
+            // pas. Le moteur natif renseigne `TurnContext::context_tokens` ; Claude Code non :
+            // la mémoire du routeur (le préfixe du tour précédent) comble alors le trou.
+            request.prefix_tokens = ctx.context_tokens.or_else(|| router.prefix_tokens());
             let Some(decision) = router.ask(request).await else {
                 return TurnDirective::none();
             };
@@ -2710,6 +2739,37 @@ mod provider_move_tests {
         let directive = directive_for_turn(&router, &TurnContext::new(1, "m")).await;
         assert_eq!(directive.model, None, "a move is never a model directive");
         assert_eq!(decider.calls(), 1, "one decision per turn");
+    }
+
+    /// PREFIX-CC : la mémoire du préfixe est `None` tant que rien n'a été noté, puis rend la
+    /// valeur notée ensuite.
+    #[test]
+    fn the_router_remembers_the_last_prefix() {
+        let router = full_auto(Fake::picking("local", 0.9, 0.5));
+        assert_eq!(router.prefix_tokens(), None, "nothing measured yet");
+        router.note_prefix_tokens(60_000);
+        assert_eq!(router.prefix_tokens(), Some(60_000));
+    }
+
+    /// PREFIX-CC : la mesure du moteur natif (`context_tokens`) reste l'autorité ; la mémoire
+    /// du routeur ne comble que le trou laissé par Claude Code (`context_tokens` à `None`).
+    #[tokio::test]
+    async fn the_prefix_memory_fills_the_gap_the_provider_leaves() {
+        let decider = Fake::picking("local", 0.9, 0.5);
+        let router = full_auto(decider.clone());
+        router.note_prefix_tokens(60_000);
+
+        // Claude Code : `context_tokens` jamais renseigné → la mémoire du routeur répond.
+        let mut native_absent = TurnContext::new(1, "m");
+        native_absent.context_tokens = None;
+        directive_for_turn(&router, &native_absent).await;
+        assert_eq!(decider.last().prefix_tokens, Some(60_000));
+
+        // Moteur natif : sa mesure gagne, la mémoire (périmée) est ignorée.
+        let mut native_reports = TurnContext::new(2, "m");
+        native_reports.context_tokens = Some(10_000);
+        directive_for_turn(&router, &native_reports).await;
+        assert_eq!(decider.last().prefix_tokens, Some(10_000));
     }
 
     fn entry(provider: &str, model: &str) -> RoutingPoolEntry {
