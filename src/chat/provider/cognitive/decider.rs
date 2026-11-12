@@ -170,6 +170,11 @@ pub fn decide_with(
 /// encore être rentable, sans faire d'une conversation longue un prétexte à basculer.
 pub const SWITCH_PAYBACK_TURNS: f64 = 3.0;
 
+/// Suppose le cache du modèle en force CHAUD (TTL de 5 minutes, rafraîchi à chaque requête
+/// d'un tour) : c'est ce qui donne un coût à la bascule. Cache déjà froid, la réécriture
+/// n'ajoute rien et la règle retient à tort — le coût estimé reste du même ordre, et le
+/// routeur ne connaît pas l'instant de la dernière requête.
+///
 /// Coût en USD, sur [`SWITCH_PAYBACK_TURNS`] tours, de réécrire le préfixe en changeant de
 /// modèle : le challenger ÉCRIT le préfixe une fois (`write(chal)`), puis le lit à chaque
 /// tour suivant (`(H−1) × read(chal)`), au lieu de le lire à chaque tour chez le modèle en
@@ -188,15 +193,33 @@ pub fn switch_cost_usd(
     Some((prefix_tokens as f64 * per_mtok) / 1_000_000.0)
 }
 
-/// Gain attendu par tour d'un challenger MOINS CHER que le modèle en force, dans la même
-/// unité des deux côtés (coût mesuré de l'arme si les deux en ont un, sinon coût estimé).
-/// `None` quand une des deux valeurs manque ou que le challenger n'est pas moins cher.
+/// Gain (USD par tour) d'un challenger MOINS CHER que le modèle en force, **mesuré** des
+/// deux côtés. `None` quand une des deux armes n'a pas de coût observé, ou quand le
+/// challenger n'est pas moins cher.
+///
+/// Le repli sur `est_turn_cost_usd` a été RETIRÉ (relecture indépendante, B1) : l'estimation
+/// facture tout le contexte au prix d'entrée, SANS cache, alors que le coût de bascule est
+/// calculé, lui, avec les prix de cache. Comparer les deux surestime le gain d'un facteur
+/// ~10 et penche vers la bascule exactement quand il faudrait la refuser. Pas de mesure
+/// commune, pas de règle : le comportement d'avant s'applique.
 fn expected_gain_per_turn(challenger: &Scored, incumbent: &Scored) -> Option<f64> {
-    let gain = match (challenger.arm_mean_cost_usd, incumbent.arm_mean_cost_usd) {
-        (Some(c), Some(i)) => i - c,
-        _ => incumbent.est_turn_cost_usd? - challenger.est_turn_cost_usd?,
-    };
+    let gain = incumbent.arm_mean_cost_usd? - challenger.arm_mean_cost_usd?;
     (gain.is_finite() && gain > 0.0).then_some(gain)
+}
+
+/// Écart de probabilité de succès au-delà duquel un challenger est retenu pour sa QUALITÉ et
+/// non pour son prix. La règle de cache ne s'applique alors pas : changer de modèle pour
+/// réussir vaut la réécriture d'un préfixe, c'est la raison d'être du routage.
+pub const CACHE_QUALITY_MARGIN: f64 = 0.05;
+
+/// Le challenger est-il nettement plus susceptible de RÉUSSIR que le modèle en force ? Les
+/// deux armes doivent avoir été observées : un a priori n'est pas une preuve.
+fn clearly_better_quality(challenger: &Scored, incumbent: &Scored) -> bool {
+    if challenger.n == 0 || incumbent.n == 0 {
+        return false;
+    }
+    let rate = |s: &Scored| s.alpha / (s.alpha + s.beta);
+    rate(challenger) - rate(incumbent) > CACHE_QUALITY_MARGIN
 }
 
 /// Le coût de bascule et ce que le challenger rapporte sur l'horizon de remboursement,
@@ -212,6 +235,11 @@ fn switch_cache_shortfall(
     prefix_tokens: Option<u64>,
 ) -> Option<(f64, f64)> {
     let prefix = prefix_tokens?;
+    // Une bascule faite pour RÉUSSIR n'est pas une bascule faite pour économiser : le
+    // préfixe réécrit est alors le prix de la qualité, pas une perte.
+    if clearly_better_quality(challenger, incumbent) {
+        return None;
+    }
     let cost = switch_cost_usd(prefix, &challenger.candidate, &incumbent.candidate)?;
     let gain = expected_gain_per_turn(challenger, incumbent)?;
     // Le gain est PAR TOUR : c'est sur l'horizon de remboursement qu'il doit couvrir la
@@ -439,7 +467,10 @@ fn decide_free(
                         ) {
                             let stay = scored.remove(index);
                             scored.insert(0, stay);
-                            kept = true;
+                            // `kept` reste faux À DESSEIN : `reason_of` dirait « kept
+                            // because no challenger is clearly better », ce qui est faux ici
+                            // (le challenger est justement meilleur, c'est son prix qui ne
+                            // couvre pas la réécriture). La note dit la vraie raison.
                             cache_note = Some(format!(
                                 "switch_costs_more_than_it_saves(rewrites {cost:.2} USD, \
                                  saves {covered:.2} USD over {SWITCH_PAYBACK_TURNS:.0} turns)"
@@ -1691,9 +1722,26 @@ mod tests {
         assert_ne!(scored_order(&req, id).chosen, Some(Pick::new("ghost", "x")));
     }
 
-    /// Pool de deux modèles dont les prix de cache sont publiés (0,1× / 1,25× l'entrée).
+    /// Les deux armes du pool, avec un coût par tour MESURÉ — le seul comparable au coût de
+    /// réécriture du préfixe (`expected_gain_per_turn` refuse de comparer une estimation).
+    fn measured_arms(sig: &TaskSignature) -> Vec<ArmStats> {
+        let arm = |provider: &str, model: &str, cost: f64| ArmStats {
+            n: 10,
+            cost_sum_usd: cost * 10.0,
+            cost_n: 10,
+            ..ArmStats::fresh(ArmKey::new(sig.arm_key(), provider, model), 6.0, 4.0)
+        };
+        vec![arm("deepseek", "v4", 0.15), arm("glm", "big", 0.20)]
+    }
+
+    /// Pool à deux modèles de prix VOISINS : c'est là qu'une bascule ne se rembourse pas.
+    /// Un écart large (Opus → Haiku) rembourse la réécriture en un tour et le routeur doit
+    /// basculer ; un écart étroit ne la rembourse jamais.
+    /// `deepseek/v4` : entrée 1,0 $/Mtok → lecture 0,10, écriture 1,25.
+    /// `glm/big`     : entrée 1,2 $/Mtok → lecture 0,12, écriture 1,50.
     fn cached_request() -> DecideRequest {
         let mut req = request(pilot(), ProviderRoutingMode::Full, LearningStage::Auto);
+        req.pool = vec![facts("deepseek", "v4", 1.0), facts("glm", "big", 1.2)];
         for f in &mut req.pool {
             f.price = f.price.map(candidates::with_anthropic_cache_prices);
         }
@@ -1702,11 +1750,11 @@ mod tests {
     }
 
     /// Un id où le challenger (deepseek, moins cher) bat nettement le modèle en force.
-    fn clear_win_id(req: &DecideRequest) -> Uuid {
+    fn clear_win_id(req: &DecideRequest, arms: &[ArmStats]) -> Uuid {
         (1..2_000u128)
             .map(Uuid::from_u128)
             .find(|id| {
-                let d = decide_with(*id, Utc::now(), req, &[], &PriorHints::new());
+                let d = decide_with(*id, Utc::now(), req, arms, &PriorHints::new());
                 d.chosen == Some(Pick::new("deepseek", "v4"))
             })
             .expect("a clear win exists")
@@ -1715,17 +1763,18 @@ mod tests {
     #[test]
     fn a_big_prefix_keeps_the_model_in_force_when_the_switch_costs_more_than_it_saves() {
         let mut req = cached_request();
-        let id = clear_win_id(&req);
-        let run = |req: &DecideRequest| decide_with(id, Utc::now(), req, &[], &PriorHints::new());
+        let arms = measured_arms(&req.signature);
+        let id = clear_win_id(&req, &arms);
+        let run = |req: &DecideRequest| decide_with(id, Utc::now(), req, &arms, &PriorHints::new());
         // Préfixe inconnu : comportement d'avant, le challenger passe.
         req.prefix_tokens = None;
         assert_eq!(run(&req).chosen, Some(Pick::new("deepseek", "v4")));
-        // Petit préfixe : la bascule se rembourse, elle passe.
+        // Petit préfixe : la réécriture ne coûte rien, la bascule passe.
         req.prefix_tokens = Some(10);
         let small = run(&req);
         assert_eq!(small.chosen, Some(Pick::new("deepseek", "v4")));
         assert!(!small.reason.contains("switch_costs_more_than_it_saves"));
-        // Gros préfixe (p90 mesuré) : on garde le modèle en force.
+        // Gros préfixe (p90 mesuré le 12/11/2026) : on garde le modèle en force.
         req.prefix_tokens = Some(485_106);
         let big = run(&req);
         assert_eq!(big.chosen, Some(Pick::new("glm", "big")), "{}", big.reason);
@@ -1736,15 +1785,24 @@ mod tests {
             big.reason
         );
         assert!(big.reason.contains("saves "), "{}", big.reason);
+        // La raison ne doit PAS prétendre que le challenger était à peine meilleur : il
+        // gagnait sur l'utilité, c'est son prix qui ne couvre pas la réécriture.
+        assert!(
+            !big.reason
+                .contains("kept because no challenger is clearly better"),
+            "{}",
+            big.reason
+        );
     }
 
     #[test]
     fn a_forced_change_is_never_blocked_by_the_cache_cost() {
         let mut req = cached_request();
-        let id = clear_win_id(&req);
+        let arms = measured_arms(&req.signature);
+        let id = clear_win_id(&req, &arms);
         req.prefix_tokens = Some(485_106);
         req.not_selectable = Some(COMPACTION_MODEL_NOT_SELECTABLE);
-        let d = decide_with(id, Utc::now(), &req, &[], &PriorHints::new());
+        let d = decide_with(id, Utc::now(), &req, &arms, &PriorHints::new());
         // La décision garde son choix (appliquée nulle part, `used` = le modèle en force),
         // et la règle de cache ne l'a pas retenu.
         assert_eq!(d.chosen, Some(Pick::new("deepseek", "v4")), "{}", d.reason);
@@ -1752,13 +1810,62 @@ mod tests {
     }
 
     #[test]
+    fn a_challenger_clearly_more_likely_to_succeed_is_never_held_by_the_cache_cost() {
+        // Le challenger réussit nettement plus souvent ET coûte moins cher : la bascule
+        // sert la QUALITÉ, le préfixe réécrit en est le prix, pas une perte.
+        let mut req = cached_request();
+        let sig = req.signature.clone();
+        let arms = vec![
+            ArmStats {
+                n: 10,
+                cost_sum_usd: 1.5,
+                cost_n: 10,
+                ..ArmStats::fresh(ArmKey::new(sig.arm_key(), "deepseek", "v4"), 9.0, 1.0)
+            },
+            ArmStats {
+                n: 10,
+                cost_sum_usd: 2.0,
+                cost_n: 10,
+                ..ArmStats::fresh(ArmKey::new(sig.arm_key(), "glm", "big"), 4.0, 6.0)
+            },
+        ];
+        let id = clear_win_id(&req, &arms);
+        req.prefix_tokens = Some(485_106);
+        let d = decide_with(id, Utc::now(), &req, &arms, &PriorHints::new());
+        assert_eq!(d.chosen, Some(Pick::new("deepseek", "v4")), "{}", d.reason);
+        assert!(
+            !d.reason.contains("switch_costs_more_than_it_saves"),
+            "{}",
+            d.reason
+        );
+    }
+
+    #[test]
+    fn without_a_measured_cost_per_turn_the_rule_does_not_apply() {
+        // Aucune arme observée : pas de coût mesuré, donc pas de gain comparable à la
+        // réécriture. La règle se taît plutôt que de comparer une estimation sans cache
+        // (relecture indépendante, B1).
+        let mut req = cached_request();
+        let id = clear_win_id(&req, &[]);
+        req.prefix_tokens = Some(842_638);
+        let d = decide_with(id, Utc::now(), &req, &[], &PriorHints::new());
+        assert_eq!(d.chosen, Some(Pick::new("deepseek", "v4")), "{}", d.reason);
+        assert!(
+            !d.reason.contains("switch_costs_more_than_it_saves"),
+            "{}",
+            d.reason
+        );
+    }
+
+    #[test]
     fn without_cache_prices_the_rule_does_not_apply_even_with_a_huge_prefix() {
         let mut req = request(pilot(), ProviderRoutingMode::Full, LearningStage::Auto);
         req.current = Some(Pick::new("glm", "big"));
-        let id = clear_win_id(&req);
+        let arms = measured_arms(&req.signature);
+        let id = clear_win_id(&req, &arms);
         req.prefix_tokens = Some(842_638);
-        let d = decide_with(id, Utc::now(), &req, &[], &PriorHints::new());
-        assert_eq!(d.chosen, Some(Pick::new("deepseek", "v4")));
+        let d = decide_with(id, Utc::now(), &req, &arms, &PriorHints::new());
+        assert_eq!(d.chosen, Some(Pick::new("deepseek", "v4")), "{}", d.reason);
     }
 
     #[test]
