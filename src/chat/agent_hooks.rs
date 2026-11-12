@@ -940,11 +940,14 @@ impl TurnRouter {
         self.last_prefix_tokens.store(tokens, Ordering::SeqCst);
     }
 
-    /// Mémorise le préfixe d'un tour terminé. `None` (le tour n'en a pas rapporté) ne touche
-    /// pas la mémoire : une bonne valeur n'est jamais écrasée par l'absence de mesure.
-    pub(crate) fn remember_turn_prefix(&self, prefix: Option<u64>) {
-        if let Some(tokens) = prefix {
-            self.note_prefix_tokens(tokens);
+    /// Mémorise le préfixe d'un tour terminé. Sans préfixe, deux cas : un tour qui a compacté
+    /// ne laisse plus de préfixe (la valeur d'avant la compaction est fausse, elle est
+    /// oubliée) ; un tour sans compaction ne dit rien, la mémoire reste.
+    pub(crate) fn remember_turn_prefix(&self, prefix: Option<u64>, compacted: bool) {
+        match prefix {
+            Some(tokens) => self.note_prefix_tokens(tokens),
+            None if compacted => self.last_prefix_tokens.store(0, Ordering::SeqCst),
+            None => {}
         }
     }
 
@@ -2763,15 +2766,25 @@ mod provider_move_tests {
     #[test]
     fn a_turn_without_a_prefix_does_not_overwrite_the_remembered_one() {
         let router = full_auto(Fake::picking("local", 0.9, 0.5));
-        router.remember_turn_prefix(Some(60_000));
-        router.remember_turn_prefix(None);
+        router.remember_turn_prefix(Some(60_000), false);
+        router.remember_turn_prefix(None, false);
         assert_eq!(
             router.prefix_tokens(),
             Some(60_000),
-            "None leaves the memory alone"
+            "no prefix and no compaction: kept"
         );
-        router.remember_turn_prefix(Some(70_000));
+        router.remember_turn_prefix(Some(70_000), false);
         assert_eq!(router.prefix_tokens(), Some(70_000));
+    }
+
+    /// Un tour qui compacte sans appel après : l'ancien préfixe (d'avant la compaction) ne
+    /// doit pas resservir comme comblement au tour suivant.
+    #[test]
+    fn a_turn_that_compacts_without_a_later_call_forgets_the_old_prefix() {
+        let router = full_auto(Fake::picking("local", 0.9, 0.5));
+        router.remember_turn_prefix(Some(60_000), false);
+        router.remember_turn_prefix(None, true);
+        assert_eq!(router.prefix_tokens(), None);
     }
 
     #[tokio::test]

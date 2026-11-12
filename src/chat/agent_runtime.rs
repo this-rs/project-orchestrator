@@ -681,31 +681,12 @@ pub struct TurnOutcome {
     pub prompt_tokens: Option<u64>,
 }
 
-/// Le préfixe facturé d'un tour du moteur natif : l'entrée réellement envoyée au modèle plus
-/// les lectures et écritures de cache. Gardé par `input_tokens` : sans lui les chiffres de
-/// cache n'ont pas de base, et la valeur reste `None` (jamais un zéro inventé, jamais l'entrée
-/// seule). Claude Code n'utilise pas cette somme : son `usage` additionne les appels du tour.
-fn billed_prompt_tokens(usage: &nexus_claude::agent::Usage) -> Option<u64> {
-    usage.input_tokens.map(|input| {
-        input + usage.cache_read_tokens.unwrap_or(0) + usage.cache_creation_tokens.unwrap_or(0)
-    })
-}
-
-/// Le préfixe d'un tour pour la mémoire du routeur. Tout fournisseur non natif rapporte
-/// `context_tokens` = le préfixe du DERNIER appel (Claude Code, Codex, ACP : nexus le renseigne)
-/// et jamais la somme des appels du tour. Le natif garde la somme de ses lectures/écritures de
-/// cache, mais seulement quand il a rapporté un préfixe : après une compaction (`None`), le
-/// tour ne fournit aucun préfixe, la somme ne doit pas le remplacer.
-fn prefix_of_turn(
-    asker: super::session_grants::Asker,
-    usage: &nexus_claude::agent::Usage,
-) -> Option<u64> {
-    match asker {
-        super::session_grants::Asker::Native => usage
-            .context_tokens
-            .and_then(|_| billed_prompt_tokens(usage)),
-        _ => usage.context_tokens,
-    }
+/// Le préfixe d'un tour pour la mémoire du routeur : `context_tokens`, le préfixe du DERNIER
+/// appel, pour tous les moteurs (nexus le renseigne pour Claude Code, Codex, ACP et natif).
+/// Jamais la somme des appels du tour, résumé de compaction compris : `None` quand le
+/// moteur n'a pas de préfixe (après une compaction, sans appel ensuite).
+fn prefix_of_turn(usage: &nexus_claude::agent::Usage) -> Option<u64> {
+    usage.context_tokens
 }
 
 /// What the host asks of the session after a turn: events to emit, then system
@@ -2672,7 +2653,7 @@ impl AgentSessionHandle {
                     // somme les appels du tour dans `usage` : son préfixe est celui du DERNIER
                     // appel, que nexus rend en `context_tokens`. Le natif garde la somme de
                     // ses lectures et écritures de cache (`input_tokens` garde la somme).
-                    outcome.prompt_tokens = prefix_of_turn(self.asker, usage);
+                    outcome.prompt_tokens = prefix_of_turn(usage);
                 }
                 let event = mask_agent_event(event);
                 // The harness' advisories (credentials_locked, model_retry, ...) are what
@@ -7536,6 +7517,35 @@ mod answered_tests {
         let (provider, handle, host) = session_of("claude_code", 0).await;
         play(&provider, &handle, vec![three_call_done(None)]).await;
         assert_eq!(host.seen_outcome()[0].prompt_tokens, None);
+    }
+
+    /// Compaction native au milieu d'un tour, puis un appel : le préfixe mémorisé est celui
+    /// du DERNIER appel (21 000), jamais la somme des appels, résumé compris (300 000).
+    #[tokio::test]
+    async fn a_native_turn_that_compacts_then_calls_remembers_the_last_call_not_the_sum() {
+        let (provider, handle, host) = session(0).await;
+        let done = AgentEvent::Done {
+            stop_reason: nexus_claude::agent::StopReason::Completed,
+            subtype: None,
+            is_error: false,
+            result_text: None,
+            usage: nexus_claude::agent::Usage {
+                input_tokens: Some(3),
+                cache_read_tokens: Some(300_000),
+                context_tokens: Some(21_000),
+                ..Default::default()
+            },
+            cost: Default::default(),
+            duration_ms: 0,
+            duration_api_ms: None,
+            num_turns: 2,
+            model: None,
+            provider_session_id: None,
+            structured_output: None,
+            error: None,
+        };
+        play(&provider, &handle, vec![done]).await;
+        assert_eq!(host.seen_outcome()[0].prompt_tokens, Some(21_000));
     }
 
     /// Après une compaction native, le tour n'a pas de préfixe : la somme ne doit pas
