@@ -21,16 +21,18 @@ use super::ObrainGraphStore;
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Interruption {
-    /// `create_project`: the node exists, nothing on it.
+    /// A creation under the draft marker (`create_project`, `create_plan`, the
+    /// release domain's and the federation's creations): the node exists, nothing
+    /// on it.
     ApresLeNoeud,
-    /// `create_project`: the draft marker is set, no property yet.
+    /// A creation: the draft marker is set, no property yet.
     ApresLeMarqueur,
-    /// `create_project`: after the n-th of the eleven properties (1-based).
+    /// A creation: after the n-th of its properties (1-based).
     ApresLaPropriete(usize),
-    /// `create_project`: every property written (and a blob-carrying one flushed),
+    /// A creation: every property written (and a blob-carrying one flushed),
     /// the marker still there.
     AvantLeRetraitDuMarqueur,
-    /// `create_project`: the marker removed (the commit point), before the fsync
+    /// A creation: the marker removed (the commit point), before the fsync
     /// that acknowledges.
     ApresLeRetraitDuMarqueur,
     /// `update_project` with a root: after the n-th of `declared_path`,
@@ -41,6 +43,26 @@ pub enum Interruption {
     /// After the k-th engine write of a multi-write (notes: supersede, rescope, delete,
     /// update, confirm, link). Each such write is a separate record, with no marker.
     ApresEtape(usize),
+}
+
+/// A property value for the raw-write hooks below, so that a test never names
+/// the engine's own `Value`.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValeurBrute<'a> {
+    Texte(&'a str),
+    Entier(i64),
+    Booleen(bool),
+}
+
+impl From<ValeurBrute<'_>> for Value {
+    fn from(v: ValeurBrute<'_>) -> Self {
+        match v {
+            ValeurBrute::Texte(s) => Value::from(s),
+            ValeurBrute::Entier(i) => Value::from(i),
+            ValeurBrute::Booleen(b) => Value::from(b),
+        }
+    }
 }
 
 /// What makes a write durable, once per write. Only `Wal` exists in production
@@ -146,6 +168,98 @@ impl ObrainGraphStore {
             .db
             .commit_wal()
             .map_err(|e| anyhow!("flush : {e}"))
+    }
+
+    /// The engine node of label `etiquette` whose `id` property is `id`, found by a
+    /// scan of the label (a test helper: no index is read).
+    fn noeud_brut(&self, etiquette: &str, id: uuid::Uuid) -> Option<obrain_common::types::NodeId> {
+        let db = &self.interne.db;
+        let id = id.to_string();
+        db.store().nodes_by_label(etiquette).into_iter().find(|n| {
+            db.get_node(*n).is_some_and(|node| {
+                node.get_property("id")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| s == id)
+            })
+        })
+    }
+
+    /// Write a node of `etiquette` with these string properties straight into the
+    /// ENGINE, behind the index (a node of a migrated base, or a corrupted one),
+    /// and fsync the WAL. The index sees it at the next open.
+    #[doc(hidden)]
+    pub fn creer_noeud_brut_pour_test(
+        &self,
+        etiquette: &str,
+        proprietes: &[(&str, ValeurBrute<'_>)],
+    ) {
+        let db = &self.interne.db;
+        let n = db.create_node(&[etiquette]);
+        for (cle, valeur) in proprietes {
+            db.set_node_property(n, cle, Value::from(*valeur));
+        }
+        db.flush_wal().expect("fsync du WAL");
+    }
+
+    /// Set (`Some`) or remove (`None`) one property of the node of `etiquette`
+    /// whose `id` is `id`, straight into the ENGINE, behind the index, and fsync
+    /// the WAL. `false` when no such node exists.
+    #[doc(hidden)]
+    pub fn ecrire_propriete_brute_pour_test(
+        &self,
+        etiquette: &str,
+        id: uuid::Uuid,
+        cle: &str,
+        valeur: Option<ValeurBrute<'_>>,
+    ) -> bool {
+        let Some(n) = self.noeud_brut(etiquette, id) else {
+            return false;
+        };
+        let db = &self.interne.db;
+        match valeur {
+            Some(v) => db.set_node_property(n, cle, Value::from(v)),
+            None => {
+                db.remove_node_property(n, cle);
+            }
+        }
+        db.flush_wal().expect("fsync du WAL");
+        true
+    }
+
+    /// Delete the node of `etiquette` whose `id` is `id` straight from the ENGINE,
+    /// behind the index (the index still holds it), and fsync the WAL.
+    #[doc(hidden)]
+    pub fn supprimer_noeud_brut_pour_test(&self, etiquette: &str, id: uuid::Uuid) -> bool {
+        let Some(n) = self.noeud_brut(etiquette, id) else {
+            return false;
+        };
+        let ok = self.interne.db.delete_node(n);
+        self.interne.db.flush_wal().expect("fsync du WAL");
+        ok
+    }
+
+    /// An edge `type_` from the node (`de`, `id_de`) to the node (`vers`, `id_vers`),
+    /// written straight into the ENGINE (a migrated base), and fsync the WAL.
+    #[doc(hidden)]
+    pub fn creer_arete_brute_pour_test(
+        &self,
+        de: (&str, uuid::Uuid),
+        vers: (&str, uuid::Uuid),
+        type_: &str,
+    ) -> bool {
+        let (Some(a), Some(b)) = (self.noeud_brut(de.0, de.1), self.noeud_brut(vers.0, vers.1))
+        else {
+            return false;
+        };
+        let _ = self.interne.db.create_edge(a, b, type_);
+        self.interne.db.flush_wal().expect("fsync du WAL");
+        true
+    }
+
+    /// How many live nodes carry `etiquette`, as the engine sees them.
+    #[doc(hidden)]
+    pub fn noeuds_de_label_pour_test(&self, etiquette: &str) -> usize {
+        self.interne.db.store().nodes_by_label(etiquette).len()
     }
 
     /// Live nodes of the base, all labels.

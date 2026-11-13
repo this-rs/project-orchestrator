@@ -2106,68 +2106,76 @@ pub mod conformance {
         store.delete_mcp_server(s.id).await.unwrap();
     }
 
-    /// Servers of a project come out by `(server_id, id)`, the tools of a server by
-    /// `(name, id)`: a total order, the id breaking the ties of the first key.
+    /// Servers come out sorted by `server_id`, the tools of a server by `name`:
+    /// what Neo4j states (`ORDER BY s.server_id`, `ORDER BY t.name, t.id`). A tie on
+    /// `server_id` has no order in the contract, so the order WITHIN a tie is not
+    /// asserted here; the obrain order, total, is checked in
+    /// `obrain_federation_specifique`.
     pub async fn check_mcp_list_order(store: &dyn GraphStore) {
         let project = Uuid::new_v4();
         let tag = Uuid::new_v4();
         let sid = |x: &str| format!("conformance-ord-{tag}-{x}");
 
-        // The contract promises no total order on these listings: `traits.rs`
-        // documents them as "List MCP servers for a project" / "List tools for an MCP
-        // server", and the Neo4j reference sorts servers by `server_id` alone (no
-        // tie-break). Two servers sharing a `server_id` — or two tools sharing a name
-        // — are therefore interchangeable: assert the set of ids, not their order.
         let servers = vec![
             an_mcp_server(project, &sid("zeta")),
             an_mcp_server(project, &sid("alpha")),
+            an_mcp_server(project, &sid("mu")),
             an_mcp_server(project, &sid("alpha")),
         ];
         for s in &servers {
             store.create_mcp_server(s).await.unwrap();
         }
         let expected: HashSet<Uuid> = servers.iter().map(|s| s.id).collect();
-        let listed: HashSet<Uuid> = store
-            .list_mcp_servers(project)
-            .await
-            .unwrap()
-            .iter()
-            .map(|s| s.id)
-            .collect();
-        assert_eq!(listed, expected, "list_mcp_servers: the same servers");
-        let all: HashSet<Uuid> = store
+        let listed = store.list_mcp_servers(project).await.unwrap();
+        assert_eq!(
+            id_set(&listed, |s| s.id),
+            expected,
+            "list_mcp_servers: the same servers"
+        );
+        let keys: Vec<&str> = listed.iter().map(|s| s.server_id.as_str()).collect();
+        assert!(
+            keys.windows(2).all(|w| w[0] <= w[1]),
+            "list_mcp_servers by server_id: {keys:?}"
+        );
+        let all: Vec<_> = store
             .list_all_mcp_servers()
             .await
             .unwrap()
-            .iter()
-            .map(|s| s.id)
-            .filter(|id| expected.contains(id))
+            .into_iter()
+            .filter(|s| expected.contains(&s.id))
             .collect();
         assert_eq!(
-            all, expected,
+            id_set(&all, |s| s.id),
+            expected,
             "list_all_mcp_servers: the same servers among ours"
+        );
+        let keys: Vec<&str> = all.iter().map(|s| s.server_id.as_str()).collect();
+        assert!(
+            keys.windows(2).all(|w| w[0] <= w[1]),
+            "list_all_mcp_servers by server_id: {keys:?}"
         );
 
         let tools_sid = sid("tools");
         let tools = vec![
             an_mcp_tool(&tools_sid, "write"),
             an_mcp_tool(&tools_sid, "read"),
+            an_mcp_tool(&tools_sid, "list"),
             an_mcp_tool(&tools_sid, "read"),
         ];
         for t in &tools {
             store.create_mcp_tool(t).await.unwrap();
         }
-        let expected_tools: HashSet<Uuid> = tools.iter().map(|t| t.id).collect();
-        let listed_tools: HashSet<Uuid> = store
-            .list_mcp_tools_for_server(&tools_sid)
-            .await
-            .unwrap()
-            .iter()
-            .map(|t| t.id)
-            .collect();
+        let listed_tools = store.list_mcp_tools_for_server(&tools_sid).await.unwrap();
         assert_eq!(
-            listed_tools, expected_tools,
+            id_set(&listed_tools, |t| t.id),
+            tools.iter().map(|t| t.id).collect::<HashSet<_>>(),
             "list_mcp_tools_for_server: the same tools"
+        );
+        let names: Vec<&str> = listed_tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["list", "read", "read", "write"],
+            "list_mcp_tools_for_server by name"
         );
 
         for s in &servers {
@@ -3224,6 +3232,35 @@ pub mod conformance {
             "target_date ascending, an absent one first"
         );
 
+        // list_milestones_filtered: ORDER BY <field> <dir>, m.id — every sort key,
+        // both directions (the stored target_date of an absent one is "").
+        for (sort_by, order, want) in [
+            (None, "desc", vec![later.id, sooner.id, undated.id]),
+            (None, "asc", vec![undated.id, sooner.id, later.id]),
+            (Some("title"), "asc", vec![later.id, sooner.id, undated.id]),
+            (Some("title"), "desc", vec![undated.id, sooner.id, later.id]),
+            (
+                Some("created_at"),
+                "desc",
+                vec![undated.id, sooner.id, later.id],
+            ),
+            (
+                Some("created_at"),
+                "asc",
+                vec![later.id, sooner.id, undated.id],
+            ),
+        ] {
+            let (page, total) = store
+                .list_milestones_filtered(p.id, None, 10, 0, sort_by, order)
+                .await
+                .unwrap();
+            assert_eq!(
+                (ids(&page, |j| j.id), total),
+                (want, 3),
+                "list_milestones_filtered sorted by {sort_by:?} {order}"
+            );
+        }
+
         store
             .update_milestone(
                 later.id,
@@ -3288,6 +3325,16 @@ pub mod conformance {
             .await
             .unwrap();
         assert_eq!(ids(&upper, |p| p.id), vec![a.id], "the match ignores case");
+
+        // last_synced: an absent one sorts last ascending and first descending.
+        store.update_project_synced(a.id).await.unwrap();
+        for (order, want) in [("asc", vec![a.id, b.id]), ("desc", vec![b.id, a.id])] {
+            let (page, _) = store
+                .list_projects_filtered(Some(&tag.to_string()), 50, 0, Some("last_synced"), order)
+                .await
+                .unwrap();
+            assert_eq!(ids(&page, |p| p.id), want, "last_synced {order}");
+        }
 
         store.delete_project(a.id, &a.name).await.unwrap();
         store.delete_project(b.id, &b.name).await.unwrap();
@@ -3704,6 +3751,11 @@ pub mod conformance {
         assert_eq!(again, api, "upsert is keyed by (workspace, name)");
         let kept = store.get_component(api).await.unwrap().expect("api");
         assert_eq!(
+            kept.description.as_deref(),
+            Some("the api"),
+            "an absent description keeps the stored one"
+        );
+        assert_eq!(
             kept.runtime.as_deref(),
             Some("rust"),
             "an empty runtime keeps the stored one"
@@ -3772,6 +3824,29 @@ pub mod conformance {
             .await
             .unwrap());
         assert_eq!(store.list_components(ws.id).await.unwrap().len(), 2);
+        // The (workspace, name) identity follows the rename: the new name finds
+        // the component, the old one is free and creates another.
+        let derived = |name: &str| DerivedComponentWrite {
+            workspace_id: ws.id,
+            name: name.into(),
+            component_type: ComponentType::Database,
+            description: None,
+            runtime: None,
+            tags: vec![],
+            config: serde_json::json!({}),
+        };
+        assert_eq!(
+            store
+                .upsert_derived_component(derived("database"))
+                .await
+                .unwrap(),
+            db,
+            "the renamed component is found by its new name"
+        );
+        let fresh = store.upsert_derived_component(derived("db")).await.unwrap();
+        assert_ne!(fresh, db, "the old name no longer finds it");
+        assert_eq!(store.list_components(ws.id).await.unwrap().len(), 3);
+        store.delete_component(fresh).await.unwrap();
 
         store.delete_component(api).await.unwrap();
         assert!(store.get_component(api).await.unwrap().is_none());
@@ -4061,6 +4136,208 @@ pub mod conformance {
         }
         store.delete_project(p.id, &p.name).await.ok();
     }
+
+    // ------------------------------------------------------------------
+    // Plans: the core the obrain backend ports (`plan_checks!`).
+    // ------------------------------------------------------------------
+
+    /// `ORDER BY p.priority DESC, p.created_at DESC, p.id DESC`.
+    fn plan_order(a: &PlanNode, b: &PlanNode) -> std::cmp::Ordering {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| b.id.cmp(&a.id))
+    }
+
+    /// The lists of a project's plans: only the project's, only the active ones
+    /// where the contract says so, in the total order `priority DESC, created_at
+    /// DESC, id DESC` (ties on the priority AND on `created_at`), the status filter
+    /// as Neo4j normalises it (`in_progress` and `Draft` match, an unknown value
+    /// matches nothing), and the pagination with its total counted before the page.
+    pub async fn check_plan_project_lists(store: &dyn GraphStore) {
+        let p = a_project("plan-lists");
+        let q = a_project("plan-lists-other");
+        store.create_project(&p).await.unwrap();
+        store.create_project(&q).await.unwrap();
+
+        let with = |title: &str, priority: i32, t: i64, status: PlanStatus| {
+            let mut x = a_plan(p.id, title, priority, at(t));
+            x.status = status;
+            x
+        };
+        // Inserted in an order that is none of the expected orders.
+        let e = with("e", 1, 0, PlanStatus::Cancelled);
+        let a = with("a", 5, 10, PlanStatus::Draft);
+        let d = with("d", 9, 0, PlanStatus::Completed);
+        let b = with("b", 5, 10, PlanStatus::InProgress);
+        let c = with("c", 5, 20, PlanStatus::Approved);
+        let mut other = a_plan(q.id, "other", 3, at(5));
+        other.status = PlanStatus::Draft;
+        for x in [&e, &a, &d, &b, &c, &other] {
+            store.create_plan(x).await.unwrap();
+        }
+
+        let mut all = vec![a.clone(), b.clone(), c.clone(), d.clone(), e.clone()];
+        all.sort_by(plan_order);
+        let active: Vec<Uuid> = all
+            .iter()
+            .filter(|x| {
+                matches!(
+                    x.status,
+                    PlanStatus::Draft | PlanStatus::Approved | PlanStatus::InProgress
+                )
+            })
+            .map(|x| x.id)
+            .collect();
+        assert_eq!(active.len(), 3);
+
+        assert_eq!(
+            ids(&store.list_project_plans(p.id).await.unwrap(), |x| x.id),
+            active,
+            "list_project_plans: the active plans of the project, priority DESC, created_at DESC, id DESC"
+        );
+        assert_eq!(store.count_project_plans(p.id).await.unwrap(), 3);
+        assert_eq!(
+            ids(&store.list_project_plans(q.id).await.unwrap(), |x| x.id),
+            vec![other.id]
+        );
+        assert!(store
+            .list_project_plans(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.count_project_plans(Uuid::new_v4()).await.unwrap(), 0);
+
+        let ours: HashSet<Uuid> = [a.id, b.id, c.id, d.id, e.id, other.id].into();
+        let mut expected_active: Vec<PlanNode> =
+            vec![a.clone(), b.clone(), c.clone(), other.clone()];
+        expected_active.sort_by(plan_order);
+        let listed: Vec<Uuid> = store
+            .list_active_plans()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|x| x.id)
+            .filter(|id| ours.contains(id))
+            .collect();
+        assert_eq!(
+            listed,
+            ids(&expected_active, |x| x.id),
+            "list_active_plans: every project's active plans, in the same order"
+        );
+
+        let (page, total) = store
+            .list_plans_for_project(p.id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            (ids(&page, |x| x.id), total),
+            (ids(&all, |x| x.id), 5),
+            "list_plans_for_project without a filter: every status, the same order"
+        );
+        let (page, total) = store
+            .list_plans_for_project(p.id, None, 2, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            (ids(&page, |x| x.id), total),
+            (ids(&all[1..3], |x| x.id), 5),
+            "SKIP 1 LIMIT 2, the total counted before the page"
+        );
+        let filter = vec![
+            "in_progress".to_string(),
+            "Draft".to_string(),
+            "inconnu".to_string(),
+        ];
+        let mut drafted = vec![a.clone(), b.clone()];
+        drafted.sort_by(plan_order);
+        let (page, total) = store
+            .list_plans_for_project(p.id, Some(filter), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            (ids(&page, |x| x.id), total),
+            (ids(&drafted, |x| x.id), 2),
+            "the filter: in_progress and Draft match, an unknown value matches nothing"
+        );
+        let (page, total) = store
+            .list_plans_for_project(Uuid::new_v4(), None, 10, 0)
+            .await
+            .unwrap();
+        assert!(page.is_empty() && total == 0);
+
+        for x in [&e, &a, &d, &b, &c, &other] {
+            store.delete_plan(x.id).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.ok();
+        store.delete_project(q.id, &q.name).await.ok();
+    }
+
+    /// A plan reads back as written; an update and a status change are read back;
+    /// on an absent plan they are silent no-ops; a deleted plan is gone, and
+    /// deleting it again is not an error.
+    pub async fn check_plan_update_and_delete(store: &dyn GraphStore) {
+        let p = a_project("plan-update");
+        store.create_project(&p).await.unwrap();
+        let x = a_plan(p.id, "before", 2, at(0));
+        store.create_plan(&x).await.unwrap();
+        let back = store.get_plan(x.id).await.unwrap().expect("read by id");
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(&x).unwrap(),
+            "the plan reads back identical"
+        );
+
+        store
+            .update_plan(
+                x.id,
+                &project_orchestrator::plan::models::UpdatePlanRequest {
+                    title: Some("after".to_string()),
+                    description: None,
+                    priority: Some(7),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .update_plan_status(x.id, PlanStatus::InProgress)
+            .await
+            .unwrap();
+        let back = store.get_plan(x.id).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                back.title.as_str(),
+                back.description.as_str(),
+                back.priority,
+                back.status
+            ),
+            ("after", "conformance plan", 7, PlanStatus::InProgress)
+        );
+
+        let absent = Uuid::new_v4();
+        store
+            .update_plan_status(absent, PlanStatus::Completed)
+            .await
+            .unwrap();
+        store
+            .update_plan(
+                absent,
+                &project_orchestrator::plan::models::UpdatePlanRequest {
+                    title: Some("x".to_string()),
+                    description: None,
+                    priority: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(store.get_plan(absent).await.unwrap().is_none());
+
+        store.delete_plan(x.id).await.unwrap();
+        assert!(store.get_plan(x.id).await.unwrap().is_none());
+        assert_eq!(store.count_project_plans(p.id).await.unwrap(), 0);
+        store.delete_plan(x.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.ok();
+    }
 }
 
 // ===============================================================// Factories: one per backend.
@@ -4223,6 +4500,12 @@ const EXPECTED_DIVERGENCES: &[Divergence] = &[
     mock(
         "check_sorting",
         "list_plans_filtered ignores sort_by and sort_order (HashMap order) where Neo4j sorts by created_at DESC by default, priority/title/status on request",
+    ),
+    mock(
+        "check_plan_project_lists",
+        "list_project_plans returns the plans in insertion order and list_active_plans in map order (Neo4j: priority DESC, \
+         created_at DESC, id DESC); list_plans_for_project sorts by created_at alone and compares the filter with the \
+         snake_case spelling, so `Draft` matches nothing (Neo4j: plan_status_values, then the stored PascalCase)",
     ),
     mock(
         "check_pagination",
@@ -4482,6 +4765,23 @@ release_checks!(neo4j_release, Neo4jFactory);
 #[cfg(feature = "obrain-backend")]
 release_checks!(obrain_release, ObrainFactory);
 
+/// The plan domain: the core the obrain backend ports (plans and the lists of a
+/// project's plans), on the same fixtures for every backend.
+macro_rules! plan_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [check_plan_project_lists, check_plan_update_and_delete,]
+        );
+    };
+}
+
+plan_checks!(mock_plan, MockFactory);
+plan_checks!(neo4j_plan, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+plan_checks!(obrain_plan, ObrainFactory);
+
 /// What only the obrain adapter does: the refusals of the workspace methods it
 /// does not port are named (a `NonPorte` downcast), and what it writes is read
 /// back, identical, after a close and an open of the same base (the index is
@@ -4494,7 +4794,9 @@ mod obrain_workspace_specifique {
         ResourceNode, ResourceType, WorkspaceMilestoneNode, WorkspaceNode,
     };
     use project_orchestrator::neo4j::traits::{ProjectStore, WorkspaceStore};
-    use project_orchestrator::obrain::{Creation, NonPorte, ObrainGraphStore};
+    use project_orchestrator::obrain::{
+        Creation, Interruption, NonPorte, ObrainGraphStore, ValeurBrute,
+    };
     use uuid::Uuid;
 
     fn erreur<T>(r: anyhow::Result<T>) -> anyhow::Error {
@@ -4597,8 +4899,8 @@ mod obrain_workspace_specifique {
             id: Uuid::new_v4(),
             workspace_id: ws.id,
             title: "jalon".into(),
-            description: None,
-            status: MilestoneStatus::Open,
+            description: Some("décrit".into()),
+            status: MilestoneStatus::InProgress,
             target_date: Some(now),
             closed_at: None,
             created_at: now,
@@ -4611,10 +4913,10 @@ mod obrain_workspace_specifique {
             name: "contrat".into(),
             resource_type: ResourceType::ApiContract,
             file_path: "api.yaml".into(),
-            url: None,
-            format: None,
-            version: None,
-            description: None,
+            url: Some("https://example.invalid/api".into()),
+            format: Some("openapi".into()),
+            version: Some("3".into()),
+            description: Some("le contrat".into()),
             created_at: now,
             updated_at: None,
             metadata: serde_json::json!({}),
@@ -4649,7 +4951,7 @@ mod obrain_workspace_specifique {
         let c_api = comps[0].1;
         let c_db = comps[1].1;
         store
-            .add_component_dependency(c_api, c_db, Some("sql".into()), true)
+            .add_component_dependency(c_api, c_db, Some("sql".into()), false)
             .await
             .unwrap();
         store.map_component_to_project(c_api, p.id).await.unwrap();
@@ -4673,13 +4975,29 @@ mod obrain_workspace_specifique {
             vec![p.id],
             "membership comes back from the edges"
         );
+        // Every field, the list of tags and the dates included: a count would not
+        // see a status, a date or a type lost by the round-trip.
         assert_eq!(
-            store.list_workspace_milestones(ws.id).await.unwrap().len(),
-            1
+            store
+                .list_workspace_milestones(ws.id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|m| serde_json::to_value(m).unwrap())
+                .collect::<Vec<_>>(),
+            vec![serde_json::to_value(&jalon).unwrap()],
+            "the milestone reads back identical"
         );
         assert_eq!(
-            store.list_workspace_resources(ws.id).await.unwrap().len(),
-            1
+            store
+                .list_workspace_resources(ws.id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| serde_json::to_value(r).unwrap())
+                .collect::<Vec<_>>(),
+            vec![serde_json::to_value(&res).unwrap()],
+            "the resource reads back identical"
         );
         assert_eq!(
             store.get_resource_implementers(res.id).await.unwrap().len(),
@@ -4689,11 +5007,994 @@ mod obrain_workspace_specifique {
         let (_, nom, deps) = topo.iter().find(|(c, _, _)| c.id == c_api).unwrap();
         assert_eq!(nom.as_deref(), Some("reopen project"));
         assert_eq!(deps.len(), 1);
+        // `false`, not the default `true` a missing edge property reads as: the
+        // property is written and replayed.
         assert_eq!(
             (deps[0].to_id, deps[0].protocol.as_deref(), deps[0].required),
-            (c_db, Some("sql"), true)
+            (c_db, Some("sql"), false)
         );
         store.close().await.unwrap();
+    }
+
+    fn espace() -> WorkspaceNode {
+        WorkspaceNode {
+            id: Uuid::new_v4(),
+            name: "ws".into(),
+            slug: format!("ws-{}", Uuid::new_v4().simple()),
+            description: None,
+            created_at: Utc::now(),
+            updated_at: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn jalon_de(ws: Uuid) -> WorkspaceMilestoneNode {
+        WorkspaceMilestoneNode {
+            id: Uuid::new_v4(),
+            workspace_id: ws,
+            title: "jalon".into(),
+            description: None,
+            status: MilestoneStatus::Open,
+            target_date: None,
+            closed_at: None,
+            created_at: Utc::now(),
+            tags: vec![],
+        }
+    }
+
+    /// The workspace node is gone from the engine while the index holds it (an
+    /// index and a base that disagree): `delete_workspace` refuses and deletes
+    /// NOTHING. Its children are still there, before and after a reopen.
+    #[tokio::test]
+    async fn delete_workspace_writes_nothing_when_it_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let ws = espace();
+        let j = jalon_de(ws.id);
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_workspace(&ws).await.unwrap();
+            store.create_workspace_milestone(&j).await.unwrap();
+            assert!(store.supprimer_noeud_brut_pour_test("Workspace", ws.id));
+            let e = store.delete_workspace(ws.id).await.unwrap_err();
+            assert!(format!("{e:#}").contains("rien n'a été supprimé"), "{e:#}");
+            assert!(store.get_workspace_milestone(j.id).await.unwrap().is_some());
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert!(
+            store.get_workspace_milestone(j.id).await.unwrap().is_some(),
+            "the refused deletion deleted the child"
+        );
+    }
+
+    /// `delete_workspace` cut after its marker and one child: the next open
+    /// finishes it rather than serving the workspace with part of its children.
+    #[tokio::test]
+    async fn a_workspace_deletion_cut_half_way_is_finished_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let ws = espace();
+        let jalons: Vec<WorkspaceMilestoneNode> = (0..3).map(|_| jalon_de(ws.id)).collect();
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_workspace(&ws).await.unwrap();
+            for j in &jalons {
+                store.create_workspace_milestone(j).await.unwrap();
+            }
+            // Step 1 is the marker, step 2 the first child deleted.
+            store.interrompre_au_prochain(Interruption::ApresEtape(2));
+            assert!(store.delete_workspace(ws.id).await.is_err());
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert_eq!(store.rapport_d_ouverture().suppressions_achevees, 1);
+        assert!(store.get_workspace(ws.id).await.unwrap().is_none());
+        for j in &jalons {
+            assert!(store.get_workspace_milestone(j.id).await.unwrap().is_none());
+        }
+        assert_eq!(store.noeuds_de_label_pour_test("WorkspaceMilestone"), 0);
+    }
+
+    /// A quarantined milestone (it no longer decodes) is still reached by its
+    /// workspace's `HAS_WORKSPACE_MILESTONE` edge: the online deletion takes it, as
+    /// the repair at open and Neo4j's cascade do. The final base does not depend on
+    /// a cut.
+    #[tokio::test]
+    async fn a_quarantined_child_goes_with_its_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let ws = espace();
+        let j = jalon_de(ws.id);
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_workspace(&ws).await.unwrap();
+            store.create_workspace_milestone(&j).await.unwrap();
+            assert!(store.ecrire_propriete_brute_pour_test(
+                "WorkspaceMilestone",
+                j.id,
+                "title",
+                None
+            ));
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert!(
+            store.get_workspace_milestone(j.id).await.unwrap().is_none(),
+            "quarantined"
+        );
+        store.delete_workspace(ws.id).await.unwrap();
+        assert_eq!(store.noeuds_de_label_pour_test("WorkspaceMilestone"), 0);
+    }
+
+    /// A milestone status stored in PascalCase (a base migrated from Neo4j) reads
+    /// as Neo4j reads it, and the filter sees it under that status.
+    #[tokio::test]
+    async fn a_pascal_case_milestone_status_reads_as_on_neo4j() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let ws = espace();
+        let j = jalon_de(ws.id);
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_workspace(&ws).await.unwrap();
+            store.create_workspace_milestone(&j).await.unwrap();
+            assert!(store.ecrire_propriete_brute_pour_test(
+                "WorkspaceMilestone",
+                j.id,
+                "status",
+                Some(ValeurBrute::Texte("InProgress"))
+            ));
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert_eq!(
+            store
+                .get_workspace_milestone(j.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            MilestoneStatus::InProgress
+        );
+        let (_, en_cours) = store
+            .list_workspace_milestones_filtered(ws.id, Some("in_progress"), 10, 0)
+            .await
+            .unwrap();
+        let (_, ouverts) = store
+            .list_workspace_milestones_filtered(ws.id, Some("open"), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!((en_cours, ouverts), (1, 0));
+    }
+}
+
+/// What only the obrain adapter does for plans: the deletion of a plan does not
+/// depend on the other domains' nodes, a creation stopped at any point of its
+/// protocol reopens as nothing or as the whole plan, the status is read as Neo4j
+/// reads it, and a migrated plan whose `HAS_PLAN` edges disagree with its
+/// `project_id` is quarantined.
+#[cfg(feature = "obrain-backend")]
+mod obrain_plan_specifique {
+    use chrono::{TimeZone, Utc};
+    use project_orchestrator::neo4j::models::{PlanNode, PlanStatus, ProjectNode, WorkspaceNode};
+    use project_orchestrator::neo4j::traits::{PlanStore, ProjectStore, WorkspaceStore};
+    use project_orchestrator::obrain::{
+        Creation, Interruption, NonPorte, ObrainGraphStore, ValeurBrute,
+    };
+    use project_orchestrator::plan::models::UpdatePlanRequest;
+    use uuid::Uuid;
+
+    fn projet(label: &str) -> ProjectNode {
+        let mut p = super::conformance::a_project(label);
+        p.created_at = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        p
+    }
+
+    fn plan(project_id: Option<Uuid>) -> PlanNode {
+        PlanNode {
+            id: Uuid::new_v4(),
+            title: "plan".into(),
+            description: "description".into(),
+            status: PlanStatus::Draft,
+            created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            created_by: "test".into(),
+            priority: 3,
+            project_id,
+            execution_context: None,
+            persona: None,
+        }
+    }
+
+    /// A plan is deleted although the base holds nodes of other domains (a
+    /// workspace here): only what hangs from the plan counts.
+    #[tokio::test]
+    async fn delete_plan_ignores_the_nodes_of_other_domains() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let ws = WorkspaceNode {
+            id: Uuid::new_v4(),
+            name: "ws".into(),
+            slug: format!("ws-{}", Uuid::new_v4().simple()),
+            description: None,
+            created_at: Utc::now(),
+            updated_at: None,
+            metadata: serde_json::json!({}),
+        };
+        store.create_workspace(&ws).await.unwrap();
+        let x = plan(None);
+        store.create_plan(&x).await.unwrap();
+        store.delete_plan(x.id).await.unwrap();
+        assert!(store.get_plan(x.id).await.unwrap().is_none());
+    }
+
+    /// A plan with an outgoing edge (a task of a migrated base) is refused by name:
+    /// the cascade would have to reach the task.
+    #[tokio::test]
+    async fn delete_plan_refuses_a_plan_with_a_task() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let x = plan(None);
+        store.create_plan(&x).await.unwrap();
+        let tache = Uuid::new_v4().to_string();
+        store.creer_noeud_brut_pour_test("Task", &[("id", ValeurBrute::Texte(&tache))]);
+        assert!(store.creer_arete_brute_pour_test(
+            ("Plan", x.id),
+            ("Task", tache.parse().unwrap()),
+            "HAS_TASK"
+        ));
+        let e = store.delete_plan(x.id).await.unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<NonPorte>(),
+            Some(&NonPorte("PlanStore::delete_plan (cascade)"))
+        );
+        assert!(format!("{e:#}").contains("1 arête(s) sortante(s)"), "{e:#}");
+        assert!(store.get_plan(x.id).await.unwrap().is_some());
+    }
+
+    /// A creation stopped at each point of the draft-marker protocol: before the
+    /// marker is removed, the reopened base has no plan and one draft deleted;
+    /// after, the whole plan.
+    #[tokio::test]
+    async fn an_interrupted_creation_reopens_as_nothing_or_the_whole_plan() {
+        let mut points = vec![Interruption::ApresLeNoeud, Interruption::ApresLeMarqueur];
+        points.extend((1..=8).map(Interruption::ApresLaPropriete));
+        points.push(Interruption::AvantLeRetraitDuMarqueur);
+        points.push(Interruption::ApresLeRetraitDuMarqueur);
+        for point in points {
+            let dir = tempfile::tempdir().unwrap();
+            let chemin = dir.path().join("base");
+            let x = plan(None);
+            {
+                let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+                store.interrompre_au_prochain(point);
+                let e = store.create_plan(&x).await.unwrap_err();
+                assert!(
+                    format!("{e:#}").contains("interruption injectée"),
+                    "{point:?}: {e:#}"
+                );
+                store.close().await.unwrap();
+            }
+            let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+            let rapport = store.rapport_d_ouverture().clone();
+            assert!(rapport.en_quarantaine.is_empty(), "{point:?}: {rapport:?}");
+            let relu = store.get_plan(x.id).await.unwrap();
+            if point == Interruption::ApresLeRetraitDuMarqueur {
+                assert_eq!(rapport.brouillons_supprimes, 0, "{point:?}");
+                assert_eq!(
+                    serde_json::to_value(relu.expect("committed")).unwrap(),
+                    serde_json::to_value(&x).unwrap(),
+                    "{point:?}"
+                );
+            } else {
+                assert_eq!(rapport.brouillons_supprimes, 1, "{point:?}");
+                assert!(relu.is_none(), "{point:?}");
+            }
+            store.close().await.unwrap();
+        }
+    }
+
+    /// The stored status is read as Neo4j reads it: `in_progress` decodes as
+    /// `InProgress` but is not active (the filter compares the stored string), and a
+    /// plan with no status is quarantined (Neo4j's read fails).
+    #[tokio::test]
+    async fn the_stored_status_is_read_as_neo4j_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let p = projet("plan-statut");
+        let migre = plan(Some(p.id));
+        let sans_statut = plan(Some(p.id));
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_project(&p).await.unwrap();
+            store.create_plan(&migre).await.unwrap();
+            store.create_plan(&sans_statut).await.unwrap();
+            assert!(store.ecrire_propriete_brute_pour_test(
+                "Plan",
+                migre.id,
+                "status",
+                Some(ValeurBrute::Texte("in_progress"))
+            ));
+            assert!(store.ecrire_propriete_brute_pour_test("Plan", sans_statut.id, "status", None));
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert_eq!(
+            store.get_plan(migre.id).await.unwrap().unwrap().status,
+            PlanStatus::InProgress
+        );
+        assert!(store.list_active_plans().await.unwrap().is_empty());
+        assert_eq!(store.count_project_plans(p.id).await.unwrap(), 0);
+        let (page, total) = store
+            .list_plans_for_project(p.id, Some(vec!["in_progress".into()]), 10, 0)
+            .await
+            .unwrap();
+        assert!(
+            page.is_empty() && total == 0,
+            "the filter compares the stored string: in_progress becomes InProgress, which is not stored"
+        );
+        assert!(store.get_plan(sans_statut.id).await.unwrap().is_none());
+        assert!(store
+            .rapport_d_ouverture()
+            .en_quarantaine
+            .iter()
+            .any(|q| q.contains("status")));
+    }
+
+    /// The project lists need the project (Neo4j's `MATCH (project:Project {id})`):
+    /// a plan whose project is absent is listed under no project.
+    #[tokio::test]
+    async fn a_plan_of_an_absent_project_is_listed_under_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let p = projet("plan-absent");
+        let x = plan(Some(p.id));
+        let ailleurs = Uuid::new_v4();
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_project(&p).await.unwrap();
+            store.create_plan(&x).await.unwrap();
+            let ailleurs_s = ailleurs.to_string();
+            assert!(store.ecrire_propriete_brute_pour_test(
+                "Plan",
+                x.id,
+                "project_id",
+                Some(ValeurBrute::Texte(&ailleurs_s))
+            ));
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert!(store.get_plan(x.id).await.unwrap().is_some());
+        assert!(store.list_project_plans(ailleurs).await.unwrap().is_empty());
+        assert_eq!(store.count_project_plans(ailleurs).await.unwrap(), 0);
+        let (page, total) = store
+            .list_plans_for_project(ailleurs, None, 10, 0)
+            .await
+            .unwrap();
+        assert!(page.is_empty() && total == 0);
+    }
+
+    /// A migrated plan linked by `HAS_PLAN` to A and to B (`project_id = B`):
+    /// Neo4j lists it under both, this backend could only list it under B. It is
+    /// quarantined and named.
+    #[tokio::test]
+    async fn a_plan_linked_to_several_projects_is_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let a = projet("plan-a");
+        let b = projet("plan-b");
+        let x = plan(Some(b.id));
+        let seul = plan(Some(b.id));
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_project(&a).await.unwrap();
+            store.create_project(&b).await.unwrap();
+            store.create_plan(&x).await.unwrap();
+            store.create_plan(&seul).await.unwrap();
+            for (projet, plan) in [(a.id, x.id), (b.id, x.id), (b.id, seul.id)] {
+                assert!(store.creer_arete_brute_pour_test(
+                    ("Project", projet),
+                    ("Plan", plan),
+                    "HAS_PLAN"
+                ));
+            }
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert!(store.get_plan(x.id).await.unwrap().is_none());
+        assert!(store
+            .rapport_d_ouverture()
+            .en_quarantaine
+            .iter()
+            .any(|q| q.contains(&x.id.to_string()) && q.contains("HAS_PLAN")));
+        // The edge that agrees with `project_id` is the migrated base's normal case.
+        assert_eq!(
+            store
+                .list_project_plans(b.id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
+            vec![seul.id]
+        );
+    }
+
+    /// The id of a quarantined plan is reserved: creating a plan with it is
+    /// refused (Neo4j's uniqueness constraint), and writes no second node.
+    #[tokio::test]
+    async fn the_id_of_a_quarantined_plan_is_reserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let x = plan(None);
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_plan(&x).await.unwrap();
+            assert!(store.ecrire_propriete_brute_pour_test("Plan", x.id, "status", None));
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert!(store.get_plan(x.id).await.unwrap().is_none(), "quarantined");
+        let e = store.create_plan(&x).await.unwrap_err();
+        assert!(format!("{e:#}").contains("réservé"), "{e:#}");
+        assert_eq!(store.noeuds_de_label_pour_test("Plan"), 1);
+    }
+
+    /// An empty update on a closed base refuses like every other operation.
+    #[tokio::test]
+    async fn an_empty_update_on_a_closed_base_refuses() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        store.close().await.unwrap();
+        let vide = UpdatePlanRequest {
+            title: None,
+            description: None,
+            priority: None,
+        };
+        let e = store.update_plan(Uuid::new_v4(), &vide).await.unwrap_err();
+        assert!(format!("{e:#}").contains("fermée"), "{e:#}");
+    }
+}
+
+/// The refusal of `delete_project` while the base holds nodes of other domains:
+/// the cascade is not ported, so it stays refused, but it names what it found.
+#[cfg(feature = "obrain-backend")]
+mod obrain_delete_project_refus {
+    use chrono::Utc;
+    use project_orchestrator::neo4j::models::{MilestoneNode, MilestoneStatus, WorkspaceNode};
+    use project_orchestrator::neo4j::traits::{
+        FederationStore, ProjectStore, ReleaseStore, WorkspaceStore,
+    };
+    use project_orchestrator::obrain::{NonPorte, ObrainGraphStore};
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn the_refusal_names_the_domains_it_found() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let a = super::conformance::a_project("refus-a");
+        let b = super::conformance::a_project("refus-b");
+        store.create_project(&a).await.unwrap();
+        store.create_project(&b).await.unwrap();
+        store
+            .create_workspace(&WorkspaceNode {
+                id: Uuid::new_v4(),
+                name: "ws".into(),
+                slug: format!("ws-{}", Uuid::new_v4().simple()),
+                description: None,
+                created_at: Utc::now(),
+                updated_at: None,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        store
+            .create_milestone(&MilestoneNode {
+                id: Uuid::new_v4(),
+                title: "jalon de A".into(),
+                description: None,
+                status: MilestoneStatus::Open,
+                target_date: None,
+                closed_at: None,
+                created_at: Utc::now(),
+                project_id: a.id,
+            })
+            .await
+            .unwrap();
+        store
+            .create_mcp_server(&super::conformance::an_mcp_server(Uuid::nil(), "refus"))
+            .await
+            .unwrap();
+
+        // B has nothing of its own: the refusal still holds (the cascade is not
+        // ported), and says why, domain by domain.
+        let e = store.delete_project(b.id, &b.name).await.unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<NonPorte>(),
+            Some(&NonPorte("ProjectStore::delete_project (cascade)"))
+        );
+        let msg = format!("{e:#}");
+        for attendu in [
+            "3 nœud(s)",
+            "releases (Milestone ×1)",
+            "workspaces (Workspace ×1)",
+            "fédération (McpServer ×1)",
+        ] {
+            assert!(msg.contains(attendu), "« {attendu} » absent de : {msg}");
+        }
+        assert!(!msg.contains("écrites hors de lui"), "{msg}");
+        assert!(store.get_project(b.id).await.unwrap().is_some());
+
+        // A node no ported domain writes is named as such.
+        store.creer_noeud_brut_pour_test("Task", &[]);
+        let msg = format!(
+            "{:#}",
+            store.delete_project(b.id, &b.name).await.unwrap_err()
+        );
+        assert!(
+            msg.contains("hors des domaines portés, écrits par un autre que ce backend (Task ×1)"),
+            "{msg}"
+        );
+    }
+}
+
+/// What only the obrain adapter does for the release domain: every refused
+/// method refuses by its name, the four entities read back identical after a
+/// close and an open, a creation stopped before its commit point is a draft
+/// deleted at open, a status is required, and an environment deletion cut half
+/// way is finished at open.
+#[cfg(feature = "obrain-backend")]
+mod obrain_release_specifique {
+    use chrono::{Duration, TimeZone, Utc};
+    use project_orchestrator::neo4j::models::{
+        DeploymentNode, DeploymentStatus, EnvironmentKind, EnvironmentNode, MilestoneNode,
+        MilestoneStatus, ReleaseNode, ReleaseStatus,
+    };
+    use project_orchestrator::neo4j::traits::{ProjectStore, ReleaseStore};
+    use project_orchestrator::obrain::{
+        refusees_release, Creation, Interruption, NonPorte, ObrainGraphStore, ValeurBrute,
+    };
+    use uuid::Uuid;
+
+    fn t(s: i64) -> chrono::DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000 + s, 0).unwrap()
+    }
+
+    fn release(p: Uuid) -> ReleaseNode {
+        ReleaseNode {
+            id: Uuid::new_v4(),
+            version: "1.2.3".into(),
+            title: Some("titre".into()),
+            description: Some("description".into()),
+            status: ReleaseStatus::InProgress,
+            target_date: Some(t(100)),
+            released_at: None,
+            created_at: t(1),
+            project_id: p,
+        }
+    }
+
+    fn environnement(p: Uuid) -> EnvironmentNode {
+        EnvironmentNode {
+            id: Uuid::new_v4(),
+            project_id: p,
+            name: format!("env-{}", Uuid::new_v4().simple()),
+            kind: EnvironmentKind::Staging,
+            url: Some("https://example.invalid".into()),
+            description: Some("préprod".into()),
+            config: Some("{\"region\":\"eu\"}".into()),
+            created_at: t(2),
+        }
+    }
+
+    fn deploiement(env: Uuid, k: i64) -> DeploymentNode {
+        DeploymentNode {
+            id: Uuid::new_v4(),
+            environment_id: env,
+            version: Some(format!("1.0.{k}")),
+            commit_sha: Some("abc123".into()),
+            status: DeploymentStatus::Succeeded,
+            notes: Some("ok".into()),
+            created_by: "ci".into(),
+            started_at: t(10 + k),
+            finished_at: Some(t(10 + k) + Duration::seconds(5)),
+        }
+    }
+
+    fn jalon(p: Uuid) -> MilestoneNode {
+        MilestoneNode {
+            id: Uuid::new_v4(),
+            title: "jalon".into(),
+            description: Some("d".into()),
+            status: MilestoneStatus::InProgress,
+            target_date: Some(t(50)),
+            closed_at: None,
+            created_at: t(3),
+            project_id: p,
+        }
+    }
+
+    fn json<T: serde::Serialize>(v: &T) -> serde_json::Value {
+        serde_json::to_value(v).unwrap()
+    }
+
+    /// Each of the 18 refused methods answers `NonPorte` with its own name.
+    #[tokio::test]
+    async fn every_refused_method_refuses_by_its_name() {
+        let s = ObrainGraphStore::open_temporary().unwrap();
+        let id = Uuid::new_v4();
+        fn nom<T>(r: anyhow::Result<T>) -> Option<NonPorte> {
+            r.err().and_then(|e| e.downcast_ref::<NonPorte>().copied())
+        }
+        let vus = vec![
+            nom(s.add_task_to_release(id, id).await),
+            nom(s.add_commit_to_release(id, "abc").await),
+            nom(s.remove_commit_from_release(id, "abc").await),
+            nom(s.get_release_details(id).await),
+            nom(s.get_release_tasks(id).await),
+            nom(s.add_task_to_milestone(id, id).await),
+            nom(s.link_plan_to_milestone(id, id).await),
+            nom(s.unlink_plan_from_milestone(id, id).await),
+            nom(s.get_milestone_details(id).await),
+            nom(s.get_milestone_progress(id).await),
+            nom(s.get_milestone_tasks_with_plans(id).await),
+            nom(s.get_milestone_steps_batch(id).await),
+            nom(s.get_milestone_tasks(id).await),
+            nom(s.get_project_progress(id).await),
+            nom(s.get_project_task_dependencies(id).await),
+            nom(s.get_project_tasks(id).await),
+            nom(s
+                .list_plans_filtered(None, None, None, None, None, None, 10, 0, None, "desc")
+                .await),
+            nom(s
+                .list_all_tasks_filtered(
+                    None, None, None, None, None, None, None, None, 10, 0, None, "desc",
+                )
+                .await),
+        ];
+        let attendus: Vec<Option<NonPorte>> = refusees_release()
+            .iter()
+            .map(|m| Some(NonPorte(m)))
+            .collect();
+        assert_eq!(vus, attendus, "in the order of REFUSEES");
+    }
+
+    /// The four entities read back identical after a close and an open.
+    #[tokio::test]
+    async fn the_four_entities_survive_close_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let p = super::conformance::a_project("release-reopen");
+        let r = release(p.id);
+        let e = environnement(p.id);
+        let d = deploiement(e.id, 1);
+        let j = jalon(p.id);
+        {
+            let s = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            s.create_project(&p).await.unwrap();
+            s.create_release(&r).await.unwrap();
+            s.create_environment(&e).await.unwrap();
+            s.create_deployment(&d).await.unwrap();
+            s.create_milestone(&j).await.unwrap();
+            s.close().await.unwrap();
+        }
+        let s = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert_eq!(s.rapport_d_ouverture().brouillons_supprimes, 0);
+        assert_eq!(json(&s.get_release(r.id).await.unwrap().unwrap()), json(&r));
+        assert_eq!(
+            json(&s.get_environment(e.id).await.unwrap().unwrap()),
+            json(&e)
+        );
+        assert_eq!(
+            json(&s.get_deployment(d.id).await.unwrap().unwrap()),
+            json(&d)
+        );
+        assert_eq!(
+            json(&s.get_milestone(j.id).await.unwrap().unwrap()),
+            json(&j)
+        );
+    }
+
+    /// A release creation stopped before its marker is removed is a draft: deleted
+    /// at open, counted, and the release is absent.
+    #[tokio::test]
+    async fn an_interrupted_creation_is_a_draft_deleted_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let p = super::conformance::a_project("release-draft");
+        let r = release(p.id);
+        {
+            let s = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            s.create_project(&p).await.unwrap();
+            s.interrompre_au_prochain(Interruption::AvantLeRetraitDuMarqueur);
+            assert!(s.create_release(&r).await.is_err());
+            s.close().await.unwrap();
+        }
+        let s = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert_eq!(s.rapport_d_ouverture().brouillons_supprimes, 1);
+        assert!(s.get_release(r.id).await.unwrap().is_none());
+    }
+
+    /// A release and a milestone with no `status` are quarantined (Neo4j's read
+    /// fails on them); a legacy PascalCase status is read and filtered as snake_case.
+    #[tokio::test]
+    async fn a_status_is_required_and_a_legacy_spelling_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let p = super::conformance::a_project("release-status");
+        let r = release(p.id);
+        let j = jalon(p.id);
+        let legacy = jalon(p.id);
+        {
+            let s = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            s.create_project(&p).await.unwrap();
+            s.create_release(&r).await.unwrap();
+            s.create_milestone(&j).await.unwrap();
+            s.create_milestone(&legacy).await.unwrap();
+            assert!(s.ecrire_propriete_brute_pour_test("Release", r.id, "status", None));
+            assert!(s.ecrire_propriete_brute_pour_test("Milestone", j.id, "status", None));
+            assert!(s.ecrire_propriete_brute_pour_test(
+                "Milestone",
+                legacy.id,
+                "status",
+                Some(ValeurBrute::Texte("InProgress"))
+            ));
+            s.close().await.unwrap();
+        }
+        let s = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert!(s.get_release(r.id).await.unwrap().is_none());
+        assert!(s.get_milestone(j.id).await.unwrap().is_none());
+        let q = &s.rapport_d_ouverture().en_quarantaine;
+        assert_eq!(
+            q.iter().filter(|x| x.contains("status")).count(),
+            2,
+            "{q:?}"
+        );
+        let (page, total) = s
+            .list_milestones_filtered(p.id, Some(vec!["in_progress".into()]), 10, 0, None, "asc")
+            .await
+            .unwrap();
+        assert_eq!((page.len(), total), (1, 1));
+        assert_eq!(page[0].status, MilestoneStatus::InProgress);
+    }
+
+    /// `delete_environment` cut after the marker and one deployment: the next open
+    /// finishes it — no environment, no deployment, one deletion finished — rather
+    /// than serving the environment with part of its deployments.
+    #[tokio::test]
+    async fn an_environment_deletion_cut_half_way_is_finished_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let p = super::conformance::a_project("env-cut");
+        let e = environnement(p.id);
+        let ds: Vec<DeploymentNode> = (1..=3).map(|k| deploiement(e.id, k)).collect();
+        {
+            let s = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            s.create_project(&p).await.unwrap();
+            s.create_environment(&e).await.unwrap();
+            for d in &ds {
+                s.create_deployment(d).await.unwrap();
+            }
+            // Step 1 is the marker, step 2 the first deployment deleted.
+            s.interrompre_au_prochain(Interruption::ApresEtape(2));
+            assert!(s.delete_environment(e.id).await.is_err());
+            s.close().await.unwrap();
+        }
+        let s = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert_eq!(s.rapport_d_ouverture().suppressions_achevees, 1);
+        assert!(s.get_environment(e.id).await.unwrap().is_none());
+        for d in &ds {
+            assert!(s.get_deployment(d.id).await.unwrap().is_none());
+        }
+        assert_eq!(s.noeuds_de_label_pour_test("Deployment"), 0);
+        assert_eq!(s.noeuds_de_label_pour_test("Environment"), 0);
+    }
+
+    /// A quarantined deployment (it no longer decodes) still belongs to its
+    /// environment: deleting the environment deletes it, online, as Neo4j's
+    /// `DETACH DELETE d, e` does.
+    #[tokio::test]
+    async fn a_quarantined_deployment_goes_with_its_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let p = super::conformance::a_project("env-quarantaine");
+        let e = environnement(p.id);
+        let d = deploiement(e.id, 1);
+        {
+            let s = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            s.create_project(&p).await.unwrap();
+            s.create_environment(&e).await.unwrap();
+            s.create_deployment(&d).await.unwrap();
+            assert!(s.ecrire_propriete_brute_pour_test("Deployment", d.id, "started_at", None));
+            s.close().await.unwrap();
+        }
+        let s = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert!(
+            s.get_deployment(d.id).await.unwrap().is_none(),
+            "quarantined"
+        );
+        s.delete_environment(e.id).await.unwrap();
+        assert_eq!(s.noeuds_de_label_pour_test("Deployment"), 0);
+    }
+
+    /// The environment node is gone from the engine while the index holds it: the
+    /// deletion refuses and deletes no deployment.
+    #[tokio::test]
+    async fn delete_environment_writes_nothing_when_it_refuses() {
+        let s = ObrainGraphStore::open_temporary().unwrap();
+        let p = super::conformance::a_project("env-refus");
+        let e = environnement(p.id);
+        let d = deploiement(e.id, 1);
+        s.create_project(&p).await.unwrap();
+        s.create_environment(&e).await.unwrap();
+        s.create_deployment(&d).await.unwrap();
+        assert!(s.supprimer_noeud_brut_pour_test("Environment", e.id));
+        let err = s.delete_environment(e.id).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("rien n'a été supprimé"),
+            "{err:#}"
+        );
+        assert_eq!(s.noeuds_de_label_pour_test("Deployment"), 1);
+    }
+}
+
+/// What only the obrain adapter does for the federation: the total order of the
+/// lists, the drafts and the duplicates.
+#[cfg(feature = "obrain-backend")]
+mod obrain_federation_specifique {
+    use chrono::{TimeZone, Utc};
+    use project_orchestrator::neo4j::traits::FederationStore;
+    use project_orchestrator::obrain::{Creation, Interruption, ObrainGraphStore, ValeurBrute};
+    use uuid::Uuid;
+
+    /// Servers by `(server_id, most recent created_at, id)`, tools by `(name, id)`:
+    /// the exact order, ties included. The two servers `alpha` are the case of a
+    /// server connected again after a failed reconnection: the newer comes first,
+    /// whatever their ids, so startup restores the latest configuration.
+    #[tokio::test]
+    async fn the_lists_follow_the_total_order() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let project = Uuid::new_v4();
+        let mk = |sid: &str, id: u128, t: i64| {
+            let mut s = super::conformance::an_mcp_server(project, sid);
+            s.id = Uuid::from_u128(id);
+            s.created_at = Utc.timestamp_opt(1_700_000_000 + t, 0).unwrap();
+            s
+        };
+        let ancien = mk("alpha", 1, 0);
+        let recent = mk("alpha", 2, 100);
+        let meme_instant_a = mk("beta", 3, 0);
+        let meme_instant_b = mk("beta", 4, 0);
+        let zeta = mk("zeta", 5, 0);
+        for s in [&zeta, &meme_instant_b, &ancien, &recent, &meme_instant_a] {
+            store.create_mcp_server(s).await.unwrap();
+        }
+        let attendu = vec![
+            recent.id,
+            ancien.id,
+            meme_instant_a.id,
+            meme_instant_b.id,
+            zeta.id,
+        ];
+        let ids = |v: Vec<project_orchestrator::neo4j::models::McpServerNode>| {
+            v.into_iter().map(|s| s.id).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(store.list_all_mcp_servers().await.unwrap()), attendu);
+        assert_eq!(ids(store.list_mcp_servers(project).await.unwrap()), attendu);
+
+        // `delete_mcp_server_by_server_id` still finds every server of the id.
+        store.delete_mcp_server_by_server_id("alpha").await.unwrap();
+        assert_eq!(
+            ids(store.list_all_mcp_servers().await.unwrap()),
+            vec![meme_instant_a.id, meme_instant_b.id, zeta.id]
+        );
+
+        let mut tools = Vec::new();
+        for (name, id) in [("read", 9u128), ("write", 1), ("read", 7)] {
+            let mut t = super::conformance::an_mcp_tool("outils", name);
+            t.id = Uuid::from_u128(id);
+            store.create_mcp_tool(&t).await.unwrap();
+            tools.push(t);
+        }
+        let listed: Vec<Uuid> = store
+            .list_mcp_tools_for_server("outils")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            listed,
+            vec![Uuid::from_u128(7), Uuid::from_u128(9), Uuid::from_u128(1)]
+        );
+    }
+
+    /// A server or tool creation stopped before its commit point is a draft: deleted
+    /// at open, counted, absent.
+    #[tokio::test]
+    async fn an_interrupted_creation_is_a_draft_deleted_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let s = super::conformance::an_mcp_server(Uuid::nil(), "brouillon");
+        let t = super::conformance::an_mcp_tool("brouillon", "read");
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.interrompre_au_prochain(Interruption::ApresLaPropriete(3));
+            assert!(store.create_mcp_server(&s).await.is_err());
+            store.interrompre_au_prochain(Interruption::AvantLeRetraitDuMarqueur);
+            assert!(store.create_mcp_tool(&t).await.is_err());
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert_eq!(store.rapport_d_ouverture().brouillons_supprimes, 2);
+        assert!(store.get_mcp_server(s.id).await.unwrap().is_none());
+        assert!(store.list_all_mcp_servers().await.unwrap().is_empty());
+        assert!(store
+            .list_mcp_tools_for_server("brouillon")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A second creation with a taken id is refused and writes nothing; a duplicate
+    /// found at open (a corrupted base) is quarantined and named, the first kept.
+    #[tokio::test]
+    async fn a_duplicate_id_is_refused_and_quarantined_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let s = super::conformance::an_mcp_server(Uuid::nil(), "double");
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_mcp_server(&s).await.unwrap();
+            let mut autre = super::conformance::an_mcp_server(Uuid::nil(), "autre");
+            autre.id = s.id;
+            let e = store.create_mcp_server(&autre).await.unwrap_err();
+            assert!(format!("{e:#}").contains("existe déjà"), "{e:#}");
+            assert_eq!(store.noeuds_de_label_pour_test("McpServer"), 1);
+            // The duplicate a corrupted base would hold, written behind the index.
+            let id = s.id.to_string();
+            let cree = s.created_at.to_rfc3339();
+            store.creer_noeud_brut_pour_test(
+                "McpServer",
+                &[
+                    ("id", ValeurBrute::Texte(&id)),
+                    ("project_id", ValeurBrute::Texte(&Uuid::nil().to_string())),
+                    ("server_id", ValeurBrute::Texte("intrus")),
+                    ("created_at", ValeurBrute::Texte(&cree)),
+                ],
+            );
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert_eq!(
+            store.get_mcp_server(s.id).await.unwrap().unwrap().server_id,
+            "double",
+            "the first created is kept"
+        );
+        assert!(store
+            .rapport_d_ouverture()
+            .en_quarantaine
+            .iter()
+            .any(|q| q.contains("McpServer") && q.contains("déjà pris")));
+    }
+
+    /// An unreadable optional timestamp reads as absent (Neo4j's `.ok()`): the
+    /// server is still served and reconnected at startup.
+    #[tokio::test]
+    async fn an_unreadable_optional_timestamp_reads_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let s = super::conformance::an_mcp_server(Uuid::nil(), "horodatage");
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_mcp_server(&s).await.unwrap();
+            assert!(store.ecrire_propriete_brute_pour_test(
+                "McpServer",
+                s.id,
+                "last_connected_at",
+                Some(ValeurBrute::Texte("pas une date"))
+            ));
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        let lu = store.get_mcp_server(s.id).await.unwrap().expect("served");
+        assert_eq!(lu.last_connected_at, None);
     }
 }
 

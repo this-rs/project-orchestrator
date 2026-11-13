@@ -19,29 +19,64 @@
 //! does: `Draft`, `InProgress`…), `created_at` (RFC 3339 string), `created_by`,
 //! `priority`, `project_id` (the empty string for none).
 //!
-//! Membership in a project is the `project_id` property. Neo4j stores it as a
-//! `HAS_PLAN` edge and keeps the property in step. The two agree for every plan
-//! that this backend creates or reads, because the only way to change
-//! `project_id` is `link_plan_to_project`, which is refused.
+//! The status is read as Neo4j reads it, in two ways: DECODED through
+//! `pascal_to_snake_case` (`InProgress` and `in_progress` are both
+//! `InProgress`, an unknown value is `Draft`), and FILTERED on the stored
+//! string (`list_active_plans` and the project lists keep `Draft`, `Approved`,
+//! `InProgress` as stored; `list_plans_for_project` compares the stored string
+//! with `plan_status_values`). A migrated `in_progress` therefore decodes as
+//! `InProgress` and is not active, exactly as on Neo4j.
+//!
+//! Membership in a project is the `project_id` property; the project lists also
+//! require the project to exist (Neo4j's `MATCH (project:Project {id})`). Neo4j
+//! stores the membership as a `HAS_PLAN` edge and keeps the property in step
+//! with the LAST project linked (`link_plan_to_project` overwrites it,
+//! `unlink_plan_from_project` empties it). This backend writes no edge and
+//! refuses those two methods, so the property is the whole truth for what it
+//! writes. A migrated base can disagree: a plan linked to A then to B has
+//! `project_id = B` and two `HAS_PLAN` edges, and Neo4j lists it under A too.
+//! Opening reads the incoming `HAS_PLAN` edges of every plan and QUARANTINES one
+//! whose linking projects are not exactly `{project_id}`: it is not served rather
+//! than served under one project when Neo4j serves it under several.
 //!
 //! # Divergences, all on the strict side
 //!
 //! - `create_plan` with a `project_id` whose project does not exist is REFUSED.
 //!   Neo4j's `MATCH` on the project silently creates a plan with no link.
-//! - `delete_plan` deletes only a plan with nothing else in the base: the Neo4j
-//!   cascade reaches tasks, steps, decisions and constraints, which this backend
-//!   does not port. The check is one counter, as in `delete_project`.
+//! - `delete_plan` deletes only a plan with no OUTGOING edge: the Neo4j cascade
+//!   follows `HAS_TASK` and `CONSTRAINED_BY` from the plan (tasks, their steps and
+//!   decisions, constraints), which this backend does not port and cannot write.
+//!   A plan that has such an edge (a migrated base) is refused by name. The check
+//!   is the plan's degree (O(1)); the nodes of other domains do not count.
 //! - A plan whose `created_at` does not parse, or that lacks `title`,
-//!   `description` or `created_by`, is quarantined at open (as projects are),
-//!   where Neo4j would replace the timestamp with "now".
+//!   `description`, `created_by`, `status` or `priority`, is quarantined at open
+//!   (as projects are). Neo4j fails the read of such a node, except for an
+//!   unparsable `created_at`, which it replaces with "now".
+//! - The ids of the plans quarantined at open are RESERVED: `create_plan` with
+//!   one of them is refused, as Neo4j's uniqueness constraint would refuse it.
+//! - A migrated plan with a `project_id` and NO `HAS_PLAN` edge (Neo4j writes the
+//!   property before the `MATCH (project) MERGE (project)-[:HAS_PLAN]->(p)`, so a
+//!   plan created while its project did not exist has the property alone) is
+//!   listed and counted under that project here, and not on Neo4j. It cannot be
+//!   told from a plan this backend wrote, which has no edge either; it also keeps
+//!   `delete_project` of that project refused.
+//! - Deleting a plan that a migrated note links (`LINKED_TO`) does not update the
+//!   note's unresolved anchors (`note.rs`): `get_note_anchors` of that note keeps
+//!   refusing until a restart, then answers. Strict side, transient.
+//! - An update writes its properties one by one (one WAL record each; obrain has
+//!   no multi-property write): a crash in the middle of `update_plan` can reopen
+//!   with the new title and the old description. Each state is a valid plan;
+//!   Neo4j's single `SET` is atomic. Same limit as `project.rs`.
 //!
 //! # Order and atomicity
 //!
 //! Lists sort by `ORDER BY p.priority DESC, p.created_at DESC, p.id DESC`, a
 //! total order (the id breaks every tie). A creation follows the draft-marker
 //! protocol of `project.rs`: the marker is set first and removed last, and
-//! opening deletes what still carries it. Reads come from the in-memory index,
-//! which a write publishes only once durable.
+//! opening deletes what still carries it (the interruption points are those of
+//! `create_project`, and `tests/store_conformance.rs` stops a creation at each
+//! of them). Reads come from the in-memory index, which a write publishes only
+//! once durable.
 
 use std::collections::HashMap;
 
@@ -52,12 +87,19 @@ use obrain_common::types::{NodeId, Value};
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
+use super::project::IndexProjets;
+#[cfg(any(test, feature = "mock-store"))]
+use super::Interruption;
 use super::{Ecriture, NonPorte, ObrainGraphStore, SEUIL_COLONNE_BLOB};
+use crate::neo4j::client::pascal_to_snake_case;
 use crate::neo4j::models::*;
+use crate::neo4j::plan::plan_status_values;
 use crate::neo4j::traits::PlanStore;
 use crate::plan::models::{TaskDetails, UpdatePlanRequest, UpdateStepRequest, UpdateTaskRequest};
 
 const LABEL: &str = "Plan";
+/// The edge Neo4j writes from a project to each of its plans.
+const A_PLAN: &str = "HAS_PLAN";
 /// The draft marker: present from the first record of a creation to the last.
 const BROUILLON: &str = "_brouillon";
 
@@ -129,23 +171,17 @@ fn nom_statut(s: &PlanStatus) -> &'static str {
     }
 }
 
-/// Decodes a stored status. An unknown value reads as `Draft`, as Neo4j does.
+/// Decodes a stored status as `Neo4jClient::node_to_plan` does: through
+/// `pascal_to_snake_case`, so `InProgress` and `in_progress` are both
+/// `InProgress`; an unknown value reads as `Draft`.
 fn statut_depuis(s: &str) -> PlanStatus {
-    match s {
-        "Approved" => PlanStatus::Approved,
-        "InProgress" => PlanStatus::InProgress,
-        "Completed" => PlanStatus::Completed,
-        "Cancelled" => PlanStatus::Cancelled,
-        _ => PlanStatus::Draft,
-    }
+    serde_json::from_str(&format!("\"{}\"", pascal_to_snake_case(s))).unwrap_or(PlanStatus::Draft)
 }
 
-/// Active statuses: what `list_active_plans` and the counts read.
-fn est_actif(s: &PlanStatus) -> bool {
-    matches!(
-        s,
-        PlanStatus::Draft | PlanStatus::Approved | PlanStatus::InProgress
-    )
+/// Active statuses, on the STORED string: Neo4j's
+/// `WHERE p.status IN ['Draft', 'Approved', 'InProgress']`.
+fn est_actif(stocke: &str) -> bool {
+    matches!(stocke, "Draft" | "Approved" | "InProgress")
 }
 
 /// `ORDER BY priority DESC, created_at DESC, id DESC`.
@@ -154,36 +190,6 @@ fn ordre_de_liste(a: &PlanNode, b: &PlanNode) -> std::cmp::Ordering {
         .cmp(&a.priority)
         .then_with(|| b.created_at.cmp(&a.created_at))
         .then_with(|| b.id.cmp(&a.id))
-}
-
-/// The status filter of `list_plans_for_project`, as Neo4j reads it: an empty
-/// filter means none; a known spelling (`in_progress`, `InProgress`…) maps to its
-/// variant; an unknown value matches no plan, so it is dropped.
-fn filtre_statuts(statuts: Option<&[String]>) -> Option<Vec<&'static str>> {
-    let statuts = statuts?;
-    if statuts.is_empty() {
-        return None;
-    }
-    Some(
-        statuts
-            .iter()
-            .filter_map(|s| {
-                let normalise = match s.to_lowercase().as_str() {
-                    "draft" => Some("Draft"),
-                    "approved" => Some("Approved"),
-                    "in_progress" => Some("InProgress"),
-                    "completed" => Some("Completed"),
-                    "cancelled" => Some("Cancelled"),
-                    _ => None,
-                };
-                normalise.or_else(|| {
-                    ["Draft", "Approved", "InProgress", "Completed", "Cancelled"]
-                        .into_iter()
-                        .find(|nom| *nom == s.as_str())
-                })
-            })
-            .collect(),
-    )
 }
 
 /// The properties a creation writes, in the order it writes them.
@@ -203,10 +209,10 @@ fn proprietes_de_creation(p: &PlanNode) -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// The domain value of a `Plan` node from a property lookup. A missing
-/// `title`, `description`, `created_by` or `created_at` is an error, as in
-/// `Neo4jClient::node_to_plan`.
-fn lire_plan(get: &dyn Fn(&str) -> Option<Value>) -> Result<PlanNode> {
+/// The domain value of a `Plan` node from a property lookup, with its stored
+/// status. A missing `title`, `description`, `status`, `created_by`, `priority`
+/// or `created_at` is an error, as in `Neo4jClient::node_to_plan`.
+fn lire_plan(get: &dyn Fn(&str) -> Option<Value>) -> Result<(PlanNode, String)> {
     let chaine = |cle: &str| get(cle).and_then(|v| v.as_str().map(str::to_string));
     let id: Uuid = chaine("id")
         .and_then(|s| s.parse().ok())
@@ -217,11 +223,12 @@ fn lire_plan(get: &dyn Fn(&str) -> Option<Value>) -> Result<PlanNode> {
     let created_at: DateTime<Utc> = created_at_brut
         .parse()
         .map_err(|e| anyhow!("plan {id} : `created_at` illisible (« {created_at_brut} ») : {e}"))?;
-    Ok(PlanNode {
+    let statut = requise("status")?;
+    let plan = PlanNode {
         id,
         title: requise("title")?,
         description: requise("description")?,
-        status: statut_depuis(&chaine("status").unwrap_or_default()),
+        status: statut_depuis(&statut),
         created_at,
         created_by: requise("created_by")?,
         priority: get("priority")
@@ -233,13 +240,16 @@ fn lire_plan(get: &dyn Fn(&str) -> Option<Value>) -> Result<PlanNode> {
             .and_then(|s| s.parse().ok()),
         execution_context: chaine("execution_context").filter(|s| !s.is_empty()),
         persona: chaine("persona").filter(|s| !s.is_empty()),
-    })
+    };
+    Ok((plan, statut))
 }
 
-/// One plan: where it lives in the base, and its decoded value.
+/// One plan: where it lives in the base, its decoded value, and its status as
+/// stored (what the filters compare, as Neo4j's `WHERE p.status IN …`).
 pub(super) struct Entree {
     noeud: NodeId,
     pub(super) plan: PlanNode,
+    statut: String,
 }
 
 impl Entree {
@@ -253,9 +263,11 @@ impl Entree {
                 .filter(|v| !matches!(v, Value::Null))
                 .cloned()
         };
+        let (plan, statut) = lire_plan(&get)?;
         Ok(Self {
             noeud,
-            plan: lire_plan(&get)?,
+            plan,
+            statut,
         })
     }
 }
@@ -264,13 +276,22 @@ impl Entree {
 #[derive(Default)]
 pub(super) struct IndexPlans {
     pub(super) par_id: HashMap<Uuid, Entree>,
+    /// The ids of the plans quarantined at open: not served, but taken. A
+    /// creation with one of them is refused (Neo4j's uniqueness constraint on
+    /// `Plan.id`), as `note.rs` and `chat.rs` do.
+    reserves: std::collections::HashSet<Uuid>,
 }
 
 impl IndexPlans {
     /// Rebuilds the index. Returns it with the number of drafts deleted and the
-    /// nodes quarantined (named, left untouched).
-    pub(super) fn reconstruire(db: &ObrainDB) -> Result<(Self, usize, Vec<String>)> {
+    /// nodes quarantined (named, left untouched). `projets` is read for the
+    /// `HAS_PLAN` edges of a migrated base (module doc).
+    pub(super) fn reconstruire(
+        db: &ObrainDB,
+        projets: &IndexProjets,
+    ) -> Result<(Self, usize, Vec<String>)> {
         let store = db.store();
+        let projet_de: HashMap<NodeId, Uuid> = projets.entrees().map(|(id, n)| (n, id)).collect();
         let mut index = Self::default();
         let mut brouillons = 0;
         let mut quarantaine = Vec::new();
@@ -291,10 +312,16 @@ impl IndexPlans {
                 brouillons += 1;
                 continue;
             }
-            let plan = match lire_plan(&get) {
-                Ok(plan) => plan,
+            let (plan, statut) = match lire_plan(&get) {
+                Ok(lu) => lu,
                 Err(e) => {
                     quarantaine.push(format!("nœud Plan {noeud:?} : {e}"));
+                    if let Some(id) = get("id")
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .and_then(|s| s.parse::<Uuid>().ok())
+                    {
+                        index.reserves.insert(id);
+                    }
                     continue;
                 }
             };
@@ -302,7 +329,38 @@ impl IndexPlans {
                 quarantaine.push(format!("nœud Plan {noeud:?} : id {} déjà pris", plan.id));
                 continue;
             }
-            index.par_id.insert(plan.id, Entree { noeud, plan });
+            // The `HAS_PLAN` edges of a migrated base: Neo4j lists the plan under
+            // every project that links it, this backend under `project_id` only.
+            // A plan where the two disagree is not served (module doc).
+            let session = db.session();
+            let liants: std::collections::BTreeSet<Uuid> = session
+                .get_neighbors_incoming(noeud)
+                .into_iter()
+                .filter(|(_, arete)| {
+                    session
+                        .get_edge(*arete)
+                        .is_some_and(|e| e.edge_type.as_str() == A_PLAN)
+                })
+                .filter_map(|(source, _)| projet_de.get(&source).copied())
+                .collect();
+            if !liants.is_empty() && liants.iter().copied().ne(plan.project_id) {
+                quarantaine.push(format!(
+                    "nœud Plan {noeud:?} : plan {} lié par HAS_PLAN aux projets {liants:?}, \
+                     alors que son project_id est {:?} (une base migrée : Neo4j le liste sous \
+                     chacun de ces projets)",
+                    plan.id, plan.project_id
+                ));
+                index.reserves.insert(plan.id);
+                continue;
+            }
+            index.par_id.insert(
+                plan.id,
+                Entree {
+                    noeud,
+                    plan,
+                    statut,
+                },
+            );
         }
         Ok((index, brouillons, quarantaine))
     }
@@ -329,6 +387,14 @@ impl PlanStore for ObrainGraphStore {
                     if etat.plans.par_id.contains_key(&p.id) {
                         bail!("un plan d'id {} existe déjà (unicité de Plan.id)", p.id);
                     }
+                    if etat.plans.reserves.contains(&p.id) {
+                        bail!(
+                            "l'id {} est celui d'un plan en quarantaine (nœud illisible ou lié \
+                             autrement que par son project_id) : réservé, la création est refusée \
+                             (unicité de Plan.id)",
+                            p.id
+                        );
+                    }
                     if let Some(projet) = p.project_id {
                         if !etat.projets.contient(projet) {
                             bail!(
@@ -341,13 +407,23 @@ impl PlanStore for ObrainGraphStore {
                 }
                 w.flush_complet = proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
                 let noeud = w.db.create_node(&[LABEL]);
+                #[cfg(any(test, feature = "mock-store"))]
+                w.point(Interruption::ApresLeNoeud)?;
                 w.db.set_node_property(noeud, BROUILLON, Value::from(true));
-                for (cle, valeur) in proprietes {
+                #[cfg(any(test, feature = "mock-store"))]
+                w.point(Interruption::ApresLeMarqueur)?;
+                for (n, (cle, valeur)) in proprietes.into_iter().enumerate() {
                     w.db.set_node_property(noeud, cle, valeur);
+                    #[cfg(any(test, feature = "mock-store"))]
+                    w.point(Interruption::ApresLaPropriete(n + 1))?;
                 }
                 w.rendre_durable_avant_le_marqueur()?;
+                #[cfg(any(test, feature = "mock-store"))]
+                w.point(Interruption::AvantLeRetraitDuMarqueur)?;
                 // The commit point.
                 w.db.remove_node_property(noeud, BROUILLON);
+                #[cfg(any(test, feature = "mock-store"))]
+                w.point(Interruption::ApresLeRetraitDuMarqueur)?;
                 let entree = w.apres_ecriture(Entree::decoder(w.db, noeud))?;
                 w.rendre_durable()?;
                 w.index_mut()?.plans.par_id.insert(p.id, entree);
@@ -367,7 +443,7 @@ impl PlanStore for ObrainGraphStore {
                 .plans
                 .par_id
                 .values()
-                .filter(|e| est_actif(&e.plan.status))
+                .filter(|e| est_actif(&e.statut))
                 .map(|e| e.plan.clone())
                 .collect();
             plans.sort_by(ordre_de_liste);
@@ -377,11 +453,15 @@ impl PlanStore for ObrainGraphStore {
 
     async fn list_project_plans(&self, project_id: Uuid) -> Result<Vec<PlanNode>> {
         self.lire(|_, etat| {
+            // `MATCH (project:Project {id})-[:HAS_PLAN]->(p)`: no project, no plan.
+            if !etat.projets.contient(project_id) {
+                return Ok(Vec::new());
+            }
             let mut plans: Vec<PlanNode> = etat
                 .plans
                 .par_id
                 .values()
-                .filter(|e| e.plan.project_id == Some(project_id) && est_actif(&e.plan.status))
+                .filter(|e| e.plan.project_id == Some(project_id) && est_actif(&e.statut))
                 .map(|e| e.plan.clone())
                 .collect();
             plans.sort_by(ordre_de_liste);
@@ -391,11 +471,14 @@ impl PlanStore for ObrainGraphStore {
 
     async fn count_project_plans(&self, project_id: Uuid) -> Result<i64> {
         self.lire(|_, etat| {
+            if !etat.projets.contient(project_id) {
+                return Ok(0);
+            }
             let n = etat
                 .plans
                 .par_id
                 .values()
-                .filter(|e| e.plan.project_id == Some(project_id) && est_actif(&e.plan.status))
+                .filter(|e| e.plan.project_id == Some(project_id) && est_actif(&e.statut))
                 .count();
             Ok(n as i64)
         })
@@ -409,16 +492,19 @@ impl PlanStore for ObrainGraphStore {
         offset: usize,
     ) -> Result<(Vec<PlanNode>, usize)> {
         self.lire(|_, etat| {
-            let filtre = filtre_statuts(status_filter.as_deref());
+            if !etat.projets.contient(project_id) {
+                return Ok((Vec::new(), 0));
+            }
+            // Neo4j's normalisation of the filter, then `p.status IN $statuses` on
+            // the stored string.
+            let filtre = plan_status_values(status_filter.as_deref());
             let mut plans: Vec<PlanNode> = etat
                 .plans
                 .par_id
                 .values()
                 .filter(|e| {
                     e.plan.project_id == Some(project_id)
-                        && filtre
-                            .as_ref()
-                            .is_none_or(|f| f.contains(&nom_statut(&e.plan.status)))
+                        && filtre.as_ref().is_none_or(|f| f.contains(&e.statut))
                 })
                 .map(|e| e.plan.clone())
                 .collect();
@@ -429,6 +515,8 @@ impl PlanStore for ObrainGraphStore {
     }
 
     async fn update_plan(&self, id: Uuid, updates: &UpdatePlanRequest) -> Result<()> {
+        // A closed or indeterminate base refuses, even an empty update.
+        self.garde()?;
         // Nothing to set: nothing is written (Neo4j answers the same).
         if updates.title.is_none() && updates.description.is_none() && updates.priority.is_none() {
             return Ok(());
@@ -492,26 +580,23 @@ impl PlanStore for ObrainGraphStore {
         self.ecrire(
             || (),
             move |(), w: &mut Ecriture<'_>| {
-                let (noeud, projets, plans) = {
-                    let etat = w.index()?;
-                    let Some(e) = etat.plans.par_id.get(&plan_id) else {
-                        return Ok(());
-                    };
-                    (e.noeud, etat.projets.nombre(), etat.plans.par_id.len())
+                let Some(noeud) = w.index()?.plans.par_id.get(&plan_id).map(|e| e.noeud) else {
+                    return Ok(());
                 };
-                // One counter, no scan: every live node of the base against the
-                // projects and plans this backend addresses. Anything else is a
-                // task, step, decision or constraint the cascade must reach.
-                let noeuds = w.db.store().node_count();
-                if noeuds != projets + plans {
+                // The Neo4j cascade starts from the plan's OUTGOING edges
+                // (`HAS_TASK`, `CONSTRAINED_BY`): what it would reach hangs there.
+                // A plan this backend wrote has none; the incoming `HAS_PLAN` of a
+                // migrated base is detached by the deletion, as `DETACH DELETE`.
+                let sortantes = w.db.store().out_degree(noeud);
+                if sortantes > 0 {
                     return Err(
                         anyhow::Error::new(NonPorte("PlanStore::delete_plan (cascade)")).context(
                             format!(
-                            "la base contient {} nœud(s) hors des projets et plans que ce backend \
-                             adresse : tâches, étapes, décisions ou contraintes que la suppression \
-                             en cascade devrait atteindre. Elle attend le portage de ces domaines",
-                            noeuds.saturating_sub(projets + plans)
-                        ),
+                                "le plan {plan_id} a {sortantes} arête(s) sortante(s) (HAS_TASK, \
+                                 CONSTRAINED_BY… : tâches ou contraintes d'une base migrée) que la \
+                                 suppression en cascade devrait atteindre. Elle attend le portage \
+                                 des tâches et des contraintes"
+                            ),
                         ),
                     );
                 }
@@ -798,7 +883,11 @@ mod tests {
         let store = ObrainGraphStore::open_temporary().unwrap();
         let mut p = plan("orphelin", 0, PlanStatus::Draft, 0);
         p.project_id = Some(Uuid::new_v4());
-        assert!(store.create_plan(&p).await.is_err());
+        let e = store.create_plan(&p).await.unwrap_err();
+        assert!(
+            format!("{e:#}").contains("n'existe pas"),
+            "the refusal names the missing project, not another failure: {e:#}"
+        );
         assert!(store.get_plan(p.id).await.unwrap().is_none());
     }
 

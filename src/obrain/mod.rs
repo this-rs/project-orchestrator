@@ -81,7 +81,7 @@ mod release;
 mod workspace;
 
 #[cfg(any(test, feature = "mock-store"))]
-pub use mesure::{Durabilite, Interruption};
+pub use mesure::{Durabilite, Interruption, ValeurBrute};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -244,6 +244,10 @@ pub struct RapportOuverture {
     /// its commit point (the draft marker still there, or nothing on the node):
     /// deleted, whatever they held (`project.rs`, "Atomicity").
     pub brouillons_supprimes: usize,
+    /// Deletions that had started and not finished (a `Workspace` or an
+    /// `Environment` carrying the `_suppression` marker, `workspace.rs` and
+    /// `release.rs`): finished at open, the node and what it held.
+    pub suppressions_achevees: usize,
     /// Projects whose path trio (`root_path`, `declared_path`,
     /// `canonical_path`) was torn by an interrupted update: recomputed from
     /// `root_path`, which is written last.
@@ -366,6 +370,47 @@ impl Ecriture<'_> {
                 self.interne.chemin.display()
             ))
         })
+    }
+
+    /// Refuse, writing nothing, when one of these nodes is held by the index and
+    /// absent from the engine: the index and the base disagree.
+    fn verifier_vivants(&self, noeuds: &[obrain_common::types::NodeId], quoi: &str) -> Result<()> {
+        if let Some(absent) = noeuds.iter().find(|n| self.db.get_node(**n).is_none()) {
+            bail!(
+                "{quoi} : le nœud {absent:?} est indexé mais absent de la base (index et base \
+                 divergent) ; rien n'a été supprimé"
+            );
+        }
+        Ok(())
+    }
+
+    /// Delete these nodes, in this order, so that an `Err` keeps its meaning:
+    /// - every node must be live in the engine BEFORE the first deletion; one that
+    ///   the index holds and the engine does not have is refused with NOTHING
+    ///   written (the index and the base disagree; deleting the others first would
+    ///   leave the index serving them);
+    /// - an engine refusal after a first deletion leaves the base written and the
+    ///   index stale: the store becomes indeterminate ([`Self::apres_ecriture`]).
+    ///
+    /// Each deletion is one step of [`Self::etape`] (the test hook).
+    fn supprimer_noeuds(
+        &mut self,
+        noeuds: &[obrain_common::types::NodeId],
+        quoi: &str,
+    ) -> Result<()> {
+        self.verifier_vivants(noeuds, quoi)?;
+        for (k, noeud) in noeuds.iter().enumerate() {
+            if !self.db.delete_node(*noeud) {
+                let e = anyhow!("{quoi} : obrain a refusé la suppression du nœud {noeud:?}");
+                return if k == 0 {
+                    Err(e)
+                } else {
+                    self.apres_ecriture(Err(e))
+                };
+            }
+            self.etape()?;
+        }
+        Ok(())
     }
 
     /// For a creation that carries a blob-sized value: run the FULL flush now, before
@@ -548,13 +593,14 @@ impl ObrainGraphStore {
         let (projets, mut rapport) =
             project::IndexProjets::reconstruire(&db).with_context(contexte)?;
         let (plans, brouillons, quarantaine) =
-            plan::IndexPlans::reconstruire(&db).with_context(contexte)?;
+            plan::IndexPlans::reconstruire(&db, &projets).with_context(contexte)?;
         rapport.brouillons_supprimes += brouillons;
         rapport.en_quarantaine.extend(quarantaine);
         let auth = auth::IndexAuth::reconstruire(&db, &mut rapport);
         let (releases, rapport_releases) =
             release::IndexReleases::reconstruire(&db).with_context(contexte)?;
         rapport.brouillons_supprimes += rapport_releases.brouillons_supprimes;
+        rapport.suppressions_achevees += rapport_releases.suppressions_achevees;
         rapport
             .en_quarantaine
             .extend(rapport_releases.en_quarantaine);

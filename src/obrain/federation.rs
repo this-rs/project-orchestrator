@@ -8,9 +8,13 @@
 //!   the Neo4j nodes. An absent optional value is stored as `""` and reads back
 //!   as `None`, as the Neo4j reader does;
 //! - timestamps are RFC 3339 strings, as in `project.rs`;
-//! - ordering is TOTAL: servers by `(server_id, id)`, tools by `(name, id)`. The
-//!   `id` breaks the ties that the Neo4j `ORDER BY` left open. `Uuid` order is
-//!   the order of its canonical string.
+//! - ordering is TOTAL: servers by `server_id`, then the MOST RECENT `created_at`
+//!   first, then `id`; tools by `(name, id)`. Neo4j orders the servers by
+//!   `server_id` alone. The tie-break is not arbitrary: startup
+//!   (`list_all_mcp_servers`, then the first server of each `server_id`) restores
+//!   the latest configuration of a server that was connected again after a failed
+//!   reconnection (`connect_server` creates a node and keeps the old one). `Uuid`
+//!   order is the order of its canonical string.
 //!
 //! Deliberate differences with the Neo4j adapter:
 //!
@@ -24,8 +28,19 @@
 //!   live Neo4j;
 //! - the server-to-tool link is the `server_id` property. The `EXPOSES` edge is not
 //!   written: nothing here reads it, and the deletions go by `server_id`. The Neo4j
-//!   deletions go through `EXPOSES`, which selects the same tools when the server
-//!   exists before its tools (the order discovery uses).
+//!   deletions go through `EXPOSES`, which Neo4j writes only when the server exists
+//!   at the tool's creation: `delete_mcp_server` here also deletes the tools of
+//!   that `server_id` created BEFORE their server, which Neo4j leaves (no production
+//!   caller creates tools, `create_mcp_tool` has none);
+//! - the project-to-server edge `HAS_MCP_SERVER` (Neo4j's `MERGE (p)-[:HAS_MCP_SERVER]->(s)`)
+//!   is not written either: nothing reads it, the project is the `project_id`
+//!   property, which is `Uuid::nil()` in production;
+//! - an optional timestamp (`updated_at`, `last_connected_at`) that does not parse
+//!   reads as absent, as on Neo4j; a `created_at` that does not parse quarantines
+//!   the node;
+//! - two nodes with the same `id` (a corrupted base: creation refuses a duplicate)
+//!   are resolved at open in the engine's slot order (`nodes_by_label` is sorted
+//!   by node id): the first created is kept, the others are quarantined and named.
 //!
 //! Refused by name ([`NonPorte`]):
 //!
@@ -43,6 +58,7 @@
 //! Reads are served from the in-memory index, rebuilt at open. A write is
 //! published to it only after its durability step.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::Ordering;
 
@@ -53,6 +69,8 @@ use obrain_common::types::{NodeId, Value};
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
+#[cfg(any(test, feature = "mock-store"))]
+use super::Interruption;
 use super::{Ecriture, NonPorte, ObrainGraphStore, SEUIL_COLONNE_BLOB};
 use crate::neo4j::models::{McpServerNode, McpToolNode};
 use crate::neo4j::traits::FederationStore;
@@ -62,8 +80,16 @@ const ETIQUETTE_OUTIL: &str = "McpTool";
 /// The draft marker: present from the first record of a creation to the last.
 const BROUILLON: &str = "_brouillon";
 
-/// `(server_id, id)` for a server, `(name, id)` for a tool: the total order.
+/// `(name, id)` for a tool: the total order.
 type Cle = (String, Uuid);
+
+/// `(server_id, most recent created_at first, id)` for a server: the total order
+/// (module doc).
+type CleServeur = (String, Reverse<DateTime<Utc>>, Uuid);
+
+fn cle_serveur(s: &McpServerNode) -> CleServeur {
+    (s.server_id.clone(), Reverse(s.created_at), s.id)
+}
 
 struct EntreeServeur {
     noeud: NodeId,
@@ -79,10 +105,10 @@ struct EntreeOutil {
 #[derive(Default)]
 pub(super) struct IndexFederation {
     serveurs: HashMap<Uuid, EntreeServeur>,
-    /// Every server by `(server_id, id)`: `list_all_mcp_servers`.
-    ordre_serveurs: BTreeSet<Cle>,
+    /// Every server in the order of `CleServeur`: `list_all_mcp_servers`.
+    ordre_serveurs: BTreeSet<CleServeur>,
     /// The same keys by project: `list_mcp_servers`.
-    serveurs_par_projet: HashMap<Uuid, BTreeSet<Cle>>,
+    serveurs_par_projet: HashMap<Uuid, BTreeSet<CleServeur>>,
     outils: HashMap<Uuid, EntreeOutil>,
     /// The tools of each `server_id` by `(name, id)`: `list_mcp_tools_for_server`.
     outils_par_serveur: HashMap<String, BTreeSet<Cle>>,
@@ -92,7 +118,7 @@ impl IndexFederation {
     fn inserer_serveur(&mut self, e: EntreeServeur) {
         let id = e.serveur.id;
         self.retirer_serveur(id);
-        let cle: Cle = (e.serveur.server_id.clone(), id);
+        let cle = cle_serveur(&e.serveur);
         self.ordre_serveurs.insert(cle.clone());
         self.serveurs_par_projet
             .entry(e.serveur.project_id)
@@ -103,7 +129,7 @@ impl IndexFederation {
 
     fn retirer_serveur(&mut self, id: Uuid) -> Option<EntreeServeur> {
         let e = self.serveurs.remove(&id)?;
-        let cle: Cle = (e.serveur.server_id.clone(), id);
+        let cle = cle_serveur(&e.serveur);
         self.ordre_serveurs.remove(&cle);
         let projet = e.serveur.project_id;
         let vide = self
@@ -285,8 +311,11 @@ fn lire_serveur(get: &dyn Fn(&str) -> Option<Value>) -> Result<McpServerNode> {
             .unwrap_or(0)
             .max(0) as usize,
         created_at,
-        updated_at: instant(texte("updated_at"), "updated_at")?,
-        last_connected_at: instant(texte("last_connected_at"), "last_connected_at")?,
+        // Optional: unreadable reads as absent, as Neo4j's `.ok()` (module doc).
+        updated_at: instant(texte("updated_at"), "updated_at").ok().flatten(),
+        last_connected_at: instant(texte("last_connected_at"), "last_connected_at")
+            .ok()
+            .flatten(),
     })
 }
 
@@ -314,7 +343,7 @@ fn lire_outil(get: &dyn Fn(&str) -> Option<Value>) -> Result<McpToolNode> {
         category: texte("category").unwrap_or_else(|| "unknown".to_string()),
         embedding: texte("embedding").filter(|s| !s.is_empty()),
         created_at,
-        updated_at: instant(texte("updated_at"), "updated_at")?,
+        updated_at: instant(texte("updated_at"), "updated_at").ok().flatten(),
     })
 }
 
@@ -394,12 +423,22 @@ fn creer_noeud(
     // disk BEFORE the marker says the node is complete (see `project.rs`).
     w.flush_complet = proprietes.iter().any(|(_, v)| en_colonne_blob(v));
     let noeud = w.db.create_node(&[etiquette]);
+    #[cfg(any(test, feature = "mock-store"))]
+    w.point(Interruption::ApresLeNoeud)?;
     w.db.set_node_property(noeud, BROUILLON, Value::from(true));
-    for (cle, valeur) in proprietes {
+    #[cfg(any(test, feature = "mock-store"))]
+    w.point(Interruption::ApresLeMarqueur)?;
+    for (n, (cle, valeur)) in proprietes.into_iter().enumerate() {
         w.db.set_node_property(noeud, cle, valeur);
+        #[cfg(any(test, feature = "mock-store"))]
+        w.point(Interruption::ApresLaPropriete(n + 1))?;
     }
     w.rendre_durable_avant_le_marqueur()?;
+    #[cfg(any(test, feature = "mock-store"))]
+    w.point(Interruption::AvantLeRetraitDuMarqueur)?;
     w.db.remove_node_property(noeud, BROUILLON);
+    #[cfg(any(test, feature = "mock-store"))]
+    w.point(Interruption::ApresLeRetraitDuMarqueur)?;
     Ok(noeud)
 }
 
@@ -484,7 +523,7 @@ impl FederationStore for ObrainGraphStore {
                 .get(&project_id)
                 .into_iter()
                 .flatten()
-                .filter_map(|(_, id)| f.serveurs.get(id).map(|e| e.serveur.clone()))
+                .filter_map(|(_, _, id)| f.serveurs.get(id).map(|e| e.serveur.clone()))
                 .collect();
             Ok(servers)
         })
@@ -496,7 +535,7 @@ impl FederationStore for ObrainGraphStore {
             let servers: Vec<McpServerNode> = f
                 .ordre_serveurs
                 .iter()
-                .filter_map(|(_, id)| f.serveurs.get(id).map(|e| e.serveur.clone()))
+                .filter_map(|(_, _, id)| f.serveurs.get(id).map(|e| e.serveur.clone()))
                 .collect();
             Ok(servers)
         })
@@ -544,9 +583,9 @@ impl FederationStore for ObrainGraphStore {
                     let f = &etat.federation;
                     let serveurs: Vec<(Uuid, NodeId)> = f
                         .ordre_serveurs
-                        .range((sid.clone(), Uuid::nil())..)
-                        .take_while(|(s, _)| s == &sid)
-                        .filter_map(|(_, id)| f.serveurs.get(id).map(|e| (*id, e.noeud)))
+                        .range((sid.clone(), Reverse(DateTime::<Utc>::MAX_UTC), Uuid::nil())..)
+                        .take_while(|(s, _, _)| s == &sid)
+                        .filter_map(|(_, _, id)| f.serveurs.get(id).map(|e| (*id, e.noeud)))
                         .collect();
                     (serveurs, f.outils_du_serveur(&sid))
                 };
@@ -763,22 +802,29 @@ mod tests {
         store.close().await.unwrap();
     }
 
-    /// The relations are refused by name, never answered as written.
+    /// The five relation writes and backfills are refused by name, never answered
+    /// as written.
     #[tokio::test]
     async fn relations_and_backfills_refuse_by_name() {
         let store = ObrainGraphStore::open_temporary().unwrap();
-        let e = store
-            .create_mcp_co_activated("a::x", "a::y", 3)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            e.downcast_ref::<NonPorte>(),
-            Some(&NonPorte("FederationStore::create_mcp_co_activated"))
-        );
-        let e = store.backfill_often_follows().await.unwrap_err();
-        assert_eq!(
-            e.downcast_ref::<NonPorte>(),
-            Some(&NonPorte("FederationStore::backfill_often_follows"))
-        );
+        fn nom<T>(r: Result<T>) -> Option<NonPorte> {
+            r.err().and_then(|e| e.downcast_ref::<NonPorte>().copied())
+        }
+        let vus = [
+            nom(store.create_mcp_similar_to("a::x", "a::y", 0.5).await),
+            nom(store.create_mcp_co_activated("a::x", "a::y", 3).await),
+            nom(store.create_mcp_often_follows("a::x", "a::y", 3, 1.0).await),
+            nom(store.backfill_co_activated_with().await),
+            nom(store.backfill_often_follows().await),
+        ];
+        let attendus = [
+            "FederationStore::create_mcp_similar_to",
+            "FederationStore::create_mcp_co_activated",
+            "FederationStore::create_mcp_often_follows",
+            "FederationStore::backfill_co_activated_with",
+            "FederationStore::backfill_often_follows",
+        ]
+        .map(|m| Some(NonPorte(m)));
+        assert_eq!(vus, attendus);
     }
 }

@@ -30,15 +30,30 @@
 //!   `upsert_derived_component`, whose identity is (workspace, name), could not
 //!   then tell the two apart).
 //!
+//! Other named differences:
+//! - a milestone status is decoded like Neo4j (`pascal_to_snake_case`, unknown or
+//!   absent → `open`), but `list_workspace_milestones_filtered` filters on the
+//!   DECODED status where Neo4j filters the stored string: a migrated unknown
+//!   status (`"Foo"`) is counted under `open` here and under no filter value there;
+//! - `get_workspace_topology` gives one row per mapped project. When a component
+//!   maps to two projects with the SAME name, Neo4j aggregates by `(c, p.name)`
+//!   and gives one row (its dependencies repeated by the cartesian product); this
+//!   gives two rows with the dependencies once each;
+//! - `get_project_workspace` answers the workspace of smallest id when a project
+//!   belongs to several; Neo4j answers any one of them.
+//!
 //! # Order
 //!
 //! Each list is sorted by a TOTAL key: `workspaces` by `(name, id)`, `resources`
 //! and `components` by `(name, id)`, `milestones` by `(target_date, title, id)`
-//! with `target_date` read as the stored string (`""` when absent, which sorts
-//! first, as in Neo4j). Projects by `(name, id)`, the project's order. The
-//! Neo4j queries of `get_resource_implementers`, `get_resource_consumers` and
-//! `get_workspace_topology` state NO order: here they are sorted by the keys
-//! above, which is a stricter contract.
+//! with `target_date` as `to_rfc3339` of the DECODED date (`""` when absent or
+//! unreadable, which sorts first, as in Neo4j). For a date this backend wrote,
+//! that is the stored string; Neo4j sorts the raw stored string, so a migrated
+//! date with an offset (`2026-01-01T01:00:00+02:00`) or an unreadable one sorts
+//! differently here (by its UTC instant, or as absent). Projects by `(name, id)`,
+//! the project's order. The Neo4j queries of `get_resource_implementers`,
+//! `get_resource_consumers` and `get_workspace_topology` state NO order: here
+//! they are sorted by the keys above, which is a stricter contract.
 //!
 //! # Reads are served from memory, and a write is visible once durable
 //!
@@ -62,8 +77,18 @@
 //! some of the properties of one update and not the others; each state is a
 //! valid value of the node.
 //!
-//! `delete_workspace` deletes its children first and the workspace LAST, so an
-//! interruption leaves a workspace that still exists and can be deleted again.
+//! `delete_workspace` is one operation in several engine records. Every node is
+//! checked live first (a node the index holds and the engine lacks refuses with
+//! nothing written). The children are those the index holds AND those the
+//! workspace's `HAS_*` edges reach (a quarantined child included), the same set
+//! the repair at open reaches. The workspace is then marked `_suppression` — the commit
+//! point —, its children are deleted, the workspace LAST. A restart that finds
+//! the marker deletes what the workspace's `HAS_*` edges still reach, then the
+//! workspace (`RapportOuverture::suppressions_achevees`): a cut never leaves a
+//! workspace with part of its children, as Neo4j's `DETACH DELETE` never does. A
+//! failure after the marker makes the store indeterminate until that restart.
+//! (The marker idea comes from the unfinished `obrain/workspace-wip`, 6384ebcf,
+//! which used a separate marker node.)
 //!
 //! # Refused by name (not ported)
 //!
@@ -87,7 +112,7 @@ use uuid::Uuid;
 
 use super::project::{self, IndexProjets};
 use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
-use crate::neo4j::client::status_variants;
+use crate::neo4j::client::{pascal_to_snake_case, status_variants};
 use crate::neo4j::models::{
     ComponentDependency, ComponentNode, ComponentType, ComponentUpdate, CouplingMatrix,
     DerivedComponentWrite, MilestoneStatus, ProjectNode, ProjectWorkspaceRow, ResourceNode,
@@ -100,6 +125,9 @@ const JALON: &str = "WorkspaceMilestone";
 const RESSOURCE: &str = "Resource";
 const COMPOSANT: &str = "Component";
 const BROUILLON: &str = "_brouillon";
+/// The deletion marker of a workspace: set before its children are deleted, gone
+/// with the workspace. Opening finishes a deletion that carries it.
+const SUPPRESSION: &str = "_suppression";
 
 const APPARTIENT: &str = "BELONGS_TO_WORKSPACE";
 const A_JALON: &str = "HAS_WORKSPACE_MILESTONE";
@@ -157,6 +185,25 @@ impl IndexEspaces {
         rapport: &mut RapportOuverture,
     ) -> Result<Self> {
         let mut idx = Self::default();
+        // A deletion that had started (module doc): its workspace still carries the
+        // marker. The children its edges reach, then the workspace, are deleted now,
+        // before anything is read.
+        for noeud in db.store().nodes_by_label(ESPACE) {
+            let marque = db.get_node(noeud).is_some_and(|n| {
+                n.get_property(SUPPRESSION)
+                    .is_some_and(|v| !matches!(v, Value::Null))
+            });
+            if !marque {
+                continue;
+            }
+            for type_ in [A_JALON, A_RESSOURCE, A_COMPOSANT] {
+                for (enfant, _) in voisins(db, noeud, type_) {
+                    db.delete_node(enfant);
+                }
+            }
+            db.delete_node(noeud);
+            rapport.suppressions_achevees += 1;
+        }
         // Engine node → domain id, for every node the index accepts (projects too:
         // the edges of a project are read through this map).
         let mut uuid_de: HashMap<NodeId, Uuid> = projets.entrees().map(|(id, n)| (n, id)).collect();
@@ -266,8 +313,6 @@ impl IndexEspaces {
         Ok(idx)
     }
 
-    /// Forget a component everywhere the index holds it (its own node, its name,
-    /// its workspace, its projects, its dependencies in both directions).
     /// Project → workspace rows (`BELONGS_TO_WORKSPACE`), for
     /// `ChatStore::list_project_workspace_rows`.
     pub(super) fn lignes_projets_espaces(
@@ -294,6 +339,8 @@ impl IndexEspaces {
         lignes
     }
 
+    /// Forget a component everywhere the index holds it (its own node, its name,
+    /// its workspace, its projects, its dependencies in both directions).
     fn oublier_composant(&mut self, cid: Uuid) {
         if let Some(f) = self.composants.remove(&cid) {
             self.par_nom_composant
@@ -487,8 +534,15 @@ fn decoder_espace(get: Get<'_>) -> Result<(Uuid, WorkspaceNode)> {
 fn decoder_jalon(get: Get<'_>) -> Result<(Uuid, WorkspaceMilestoneNode)> {
     let id = id_requis(get, "id", "nœud WorkspaceMilestone")?;
     let quoi = format!("jalon {id}");
+    // As `node_to_workspace_milestone`: through `pascal_to_snake_case`, so a
+    // legacy `InProgress` reads as `in_progress`; absent or unknown is `open`.
     let status = chaine(get, "status")
-        .and_then(|s| serde_json::from_value::<MilestoneStatus>(serde_json::Value::String(s)).ok())
+        .and_then(|s| {
+            serde_json::from_value::<MilestoneStatus>(serde_json::Value::String(
+                pascal_to_snake_case(&s),
+            ))
+            .ok()
+        })
         .unwrap_or(MilestoneStatus::Open);
     let valeur = WorkspaceMilestoneNode {
         id,
@@ -822,9 +876,6 @@ impl WorkspaceStore for ObrainGraphStore {
                     let composants: Vec<Uuid> = de(etat.espaces.composants_de.get(&id));
                     (f.noeud, jalons, ressources, composants)
                 };
-                // Children first, the workspace last: an interruption leaves a
-                // workspace that still exists and can be deleted again.
-                let db = w.db;
                 let mut supprimes: Vec<(Uuid, NodeId, &'static str)> = Vec::new();
                 {
                     let etat = w.index()?;
@@ -844,12 +895,29 @@ impl WorkspaceStore for ObrainGraphStore {
                         }
                     }
                 }
-                for (_, noeud_enfant, _) in &supprimes {
-                    db.delete_node(*noeud_enfant);
+                // Every node checked live first (nothing written otherwise), then the
+                // marker on the workspace — the commit point of the deletion: from
+                // there a restart finishes it — then the children, the workspace last.
+                let mut noeuds: Vec<NodeId> = supprimes.iter().map(|(_, n, _)| *n).collect();
+                // The children the `HAS_*` edges reach, indexed or not (a quarantined
+                // milestone, resource or component): what Neo4j's cascade and the
+                // repair at open reach. The final base does not depend on a cut.
+                for type_ in [A_JALON, A_RESSOURCE, A_COMPOSANT] {
+                    for (enfant, _) in voisins(w.db, noeud, type_) {
+                        if !noeuds.contains(&enfant) {
+                            noeuds.push(enfant);
+                        }
+                    }
                 }
-                if !db.delete_node(noeud) {
-                    bail!("obrain a refusé la suppression du workspace {id}");
-                }
+                noeuds.push(noeud);
+                let quoi = format!("suppression du workspace {id}");
+                w.verifier_vivants(&noeuds, &quoi)?;
+                w.db.set_node_property(noeud, SUPPRESSION, Value::from(true));
+                w.etape()?;
+                // Past the marker, a failure leaves a deletion the next open finishes:
+                // the index no longer says what the base holds (indeterminate).
+                let r = w.supprimer_noeuds(&noeuds, &quoi);
+                w.apres_ecriture(r)?;
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 for (cid, _, genre) in &supprimes {
@@ -1190,7 +1258,7 @@ impl WorkspaceStore for ObrainGraphStore {
                 let Some(noeud) = trouve else {
                     return Ok(());
                 };
-                w.db.delete_node(noeud);
+                w.supprimer_noeuds(&[noeud], &format!("suppression du jalon {id}"))?;
                 w.rendre_durable()?;
                 w.index_mut()?.espaces.oublier_jalon(id);
                 Ok(())
@@ -1420,7 +1488,7 @@ impl WorkspaceStore for ObrainGraphStore {
                 let Some(noeud) = trouve else {
                     return Ok(());
                 };
-                w.db.delete_node(noeud);
+                w.supprimer_noeuds(&[noeud], &format!("suppression du ressource {id}"))?;
                 w.rendre_durable()?;
                 w.index_mut()?.espaces.oublier_ressource(id);
                 Ok(())
@@ -1729,7 +1797,7 @@ impl WorkspaceStore for ObrainGraphStore {
                     return Ok(());
                 };
                 // DETACH DELETE: the component's dependencies and mappings go with it.
-                w.db.delete_node(noeud);
+                w.supprimer_noeuds(&[noeud], &format!("suppression du composant {id}"))?;
                 w.rendre_durable()?;
                 w.index_mut()?.espaces.oublier_composant(id);
                 Ok(())
