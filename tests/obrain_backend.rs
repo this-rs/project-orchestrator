@@ -98,9 +98,9 @@ mod with_the_feature {
     use project_orchestrator::neo4j::traits::*;
     use project_orchestrator::obrain::{
         defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees,
-        refusees_chat, refusees_note, refusees_plan, refusees_release, Creation, Durabilite,
-        Interruption, NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture, MARQUEUR_PO,
-        REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
+        refusees_chat, refusees_decision, refusees_note, refusees_plan, refusees_release, Creation,
+        Durabilite, Interruption, NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture,
+        MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -174,6 +174,52 @@ mod with_the_feature {
         })
         .await
         .unwrap();
+    }
+
+    /// The `created_at` of every `SUPERSEDES` edge leaving a `Decision` node, as the
+    /// ENGINE reads them in a closed base (one entry per edge).
+    async fn supersedes_on_disk(base: &Path) -> Vec<Option<String>> {
+        let base = base.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let db = obrain_engine::ObrainDB::open(&base).unwrap();
+            let mut out = Vec::new();
+            for n in db.store().nodes_by_label("Decision") {
+                for (_, a) in db
+                    .store()
+                    .edges_from(n, obrain_core::graph::Direction::Outgoing)
+                {
+                    let e = db.get_edge(a).unwrap();
+                    if &*e.edge_type == "SUPERSEDES" {
+                        out.push(
+                            e.get_property("created_at")
+                                .and_then(|v| v.as_str().map(str::to_string)),
+                        );
+                    }
+                }
+            }
+            db.close().unwrap();
+            out
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A decision with the given description, no project, proposed.
+    fn a_decision(description: &str) -> project_orchestrator::neo4j::models::DecisionNode {
+        project_orchestrator::neo4j::models::DecisionNode {
+            id: Uuid::new_v4(),
+            description: description.to_string(),
+            rationale: "parce que".to_string(),
+            alternatives: vec![],
+            chosen_option: None,
+            decided_by: "alice".to_string(),
+            decided_at: Utc::now(),
+            status: project_orchestrator::neo4j::models::DecisionStatus::Proposed,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+            sharing_consent: Default::default(),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2195,6 +2241,599 @@ mod with_the_feature {
         assert!(store.get_note(n.id).await.unwrap().is_none());
     }
 
+    /// Decision noyau : une décision globale rattachée à un projet, une autre sans
+    /// projet, une mise à jour, une supersession, puis une fermeture et une
+    /// réouverture — tout est durable, y compris une description au-delà du seuil
+    /// de colonne. Le jalon « décision de bout en bout » sur obrain.
+    #[tokio::test]
+    async fn decisions_survive_a_close_and_a_reopen_with_project_and_supersession() {
+        use project_orchestrator::neo4j::models::{DecisionNode, DecisionStatus};
+        use project_orchestrator::neo4j::traits::{DecisionStore, ProjectStore};
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project("decision-reopen");
+        store.create_project(&p).await.unwrap();
+
+        let d1 = DecisionNode {
+            id: Uuid::new_v4(),
+            description: format!(
+                "une description longue, au-delà du seuil de colonne : {}",
+                "é".repeat(200)
+            ),
+            rationale: "parce que".to_string(),
+            alternatives: vec!["autre".to_string()],
+            chosen_option: Some("A".to_string()),
+            decided_by: "alice".to_string(),
+            decided_at: Utc::now(),
+            status: DecisionStatus::Proposed,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+            sharing_consent: Default::default(),
+        };
+        let d2 = DecisionNode {
+            id: Uuid::new_v4(),
+            description: "choix B".to_string(),
+            rationale: "parce que aussi".to_string(),
+            alternatives: vec![],
+            chosen_option: None,
+            decided_by: "alice".to_string(),
+            decided_at: Utc::now(),
+            status: DecisionStatus::Proposed,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+            sharing_consent: Default::default(),
+        };
+
+        store.create_decision_global(&d1, Some(p.id)).await.unwrap();
+        store.create_decision_global(&d2, None).await.unwrap();
+
+        assert_eq!(
+            store
+                .get_decision(d1.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            d1.description
+        );
+        assert_eq!(
+            store.get_decision_project_id(d1.id).await.unwrap(),
+            Some(p.id.to_string())
+        );
+        assert_eq!(store.get_decision_project_id(d2.id).await.unwrap(), None);
+        let projets = store
+            .get_decision_project_ids(&[d1.id, d2.id])
+            .await
+            .unwrap();
+        assert_eq!(projets.len(), 1);
+        assert_eq!(projets.get(&d1.id), Some(&p.id));
+
+        // The long description is NOT touched by the update: it is read back after
+        // the reopen as it was written at creation.
+        store
+            .update_decision(
+                d1.id,
+                None,
+                Some("nouveau pourquoi".to_string()),
+                Some("B".to_string()),
+                Some(DecisionStatus::Accepted),
+            )
+            .await
+            .unwrap();
+        let maj = store.get_decision(d1.id).await.unwrap().unwrap();
+        assert_eq!(maj.description, d1.description);
+        assert_eq!(maj.rationale, "nouveau pourquoi");
+        assert_eq!(maj.chosen_option.as_deref(), Some("B"));
+        assert_eq!(maj.status, DecisionStatus::Accepted);
+
+        // Twice: the MERGE draws one edge.
+        store.supersede_decision(d2.id, d1.id).await.unwrap();
+        store.supersede_decision(d2.id, d1.id).await.unwrap();
+        assert_eq!(
+            store.get_decision(d1.id).await.unwrap().unwrap().status,
+            DecisionStatus::Superseded
+        );
+
+        // Une décision rattachée à un projet inconnu est refusée, rien n'est créé.
+        let inconnu = DecisionNode {
+            id: Uuid::new_v4(),
+            description: "x".to_string(),
+            rationale: "y".to_string(),
+            alternatives: vec![],
+            chosen_option: None,
+            decided_by: "alice".to_string(),
+            decided_at: Utc::now(),
+            status: DecisionStatus::Proposed,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+            sharing_consent: Default::default(),
+        };
+        let err = store
+            .create_decision_global(&inconnu, Some(Uuid::new_v4()))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("projet inconnu"), "{err:#}");
+        assert!(store.get_decision(inconnu.id).await.unwrap().is_none());
+
+        store.close().await.unwrap();
+        drop(store);
+
+        let aretes = supersedes_on_disk(&base).await;
+        assert_eq!(aretes.len(), 1, "two supersessions, one edge: {aretes:?}");
+        let quand = aretes[0].as_deref().expect("the edge carries `created_at`");
+        assert!(quand.parse::<chrono::DateTime<Utc>>().is_ok(), "{quand}");
+
+        let store = open(&base).await;
+        assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
+        let relue = store.get_decision(d1.id).await.unwrap().unwrap();
+        assert_eq!(relue.description, d1.description);
+        assert_eq!(relue.rationale, "nouveau pourquoi");
+        assert_eq!(relue.status, DecisionStatus::Superseded);
+        assert_eq!(relue.chosen_option.as_deref(), Some("B"));
+        assert_eq!(
+            store.get_decision_project_id(d1.id).await.unwrap(),
+            Some(p.id.to_string())
+        );
+        assert_eq!(
+            store
+                .get_decision(d2.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            "choix B"
+        );
+        assert_eq!(store.get_decision_project_id(d2.id).await.unwrap(), None);
+
+        // Suppression : le DETACH emporte la décision et ses arêtes.
+        store.delete_decision(d2.id).await.unwrap();
+        assert!(store.get_decision(d2.id).await.unwrap().is_none());
+        assert_eq!(
+            store
+                .get_decision_project_ids(&[d1.id])
+                .await
+                .unwrap()
+                .get(&d1.id),
+            Some(&p.id)
+        );
+    }
+
+    /// Les méthodes non portées de `DecisionStore` refusent par leur nom, et n'écrivent
+    /// rien.
+    #[tokio::test]
+    async fn decision_refusals_are_named_and_write_nothing() {
+        use project_orchestrator::neo4j::models::{DecisionNode, DecisionStatus};
+        use project_orchestrator::neo4j::traits::DecisionStore;
+        let store = temporary(Durabilite::Wal).await;
+        // A project and a decision already there: the count below is not trivially 0.
+        let p = a_project("decision-refus");
+        store.create_project(&p).await.unwrap();
+        store
+            .create_decision_global(&a_decision("déjà là"), Some(p.id))
+            .await
+            .unwrap();
+        let avant = store.noeuds_pour_mesure();
+        let d = DecisionNode {
+            id: Uuid::new_v4(),
+            description: "x".to_string(),
+            rationale: "y".to_string(),
+            alternatives: vec![],
+            chosen_option: None,
+            decided_by: "alice".to_string(),
+            decided_at: Utc::now(),
+            status: DecisionStatus::Proposed,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+            sharing_consent: Default::default(),
+        };
+        assert_eq!(
+            not_ported(store.create_decision(Uuid::new_v4(), &d).await),
+            NonPorte("DecisionStore::create_decision")
+        );
+        assert_eq!(
+            not_ported(store.set_decision_embedding(d.id, &[1.0f32], "m").await),
+            NonPorte("DecisionStore::set_decision_embedding")
+        );
+        assert_eq!(
+            not_ported(store.get_decision_embedding(d.id).await),
+            NonPorte("DecisionStore::get_decision_embedding")
+        );
+        assert_eq!(
+            not_ported(store.search_decisions_by_vector(&[1.0f32], 5, None).await),
+            NonPorte("DecisionStore::search_decisions_by_vector")
+        );
+        assert_eq!(
+            not_ported(store.get_decisions_without_embedding().await),
+            NonPorte("DecisionStore::get_decisions_without_embedding")
+        );
+        assert_eq!(
+            not_ported(store.get_all_decisions_with_task_id().await),
+            NonPorte("DecisionStore::get_all_decisions_with_task_id")
+        );
+        assert_eq!(
+            not_ported(store.get_decisions_for_entity("File", "src/x.rs", 5).await),
+            NonPorte("DecisionStore::get_decisions_for_entity")
+        );
+        assert_eq!(
+            not_ported(
+                store
+                    .get_decisions_affecting("File", "src/x.rs", None)
+                    .await
+            ),
+            NonPorte("DecisionStore::get_decisions_affecting")
+        );
+        assert_eq!(
+            not_ported(
+                store
+                    .add_decision_affects(d.id, "File", "src/x.rs", None)
+                    .await
+            ),
+            NonPorte("DecisionStore::add_decision_affects")
+        );
+        assert_eq!(
+            not_ported(
+                store
+                    .remove_decision_affects(d.id, "File", "src/x.rs")
+                    .await
+            ),
+            NonPorte("DecisionStore::remove_decision_affects")
+        );
+        assert_eq!(
+            not_ported(store.list_decision_affects(d.id).await),
+            NonPorte("DecisionStore::list_decision_affects")
+        );
+        assert_eq!(
+            not_ported(store.get_decision_timeline(None, None, None).await),
+            NonPorte("DecisionStore::get_decision_timeline")
+        );
+        assert_eq!(
+            not_ported(
+                store
+                    .list_decisions_by_status(DecisionStatus::Proposed, None, None, 10, 0)
+                    .await
+            ),
+            NonPorte("DecisionStore::list_decisions_by_status")
+        );
+        // Les refus n'ont rien écrit : ni la décision, ni aucun autre nœud.
+        assert!(store.get_decision(d.id).await.unwrap().is_none());
+        assert_eq!(store.noeuds_pour_mesure(), avant);
+    }
+
+    /// A decision creation interrupted at each of its points reopens to no decision
+    /// (the draft is deleted at open), except past the commit point; the creation can
+    /// then be made again.
+    #[tokio::test]
+    async fn an_interrupted_decision_creation_reopens_consistently() {
+        use project_orchestrator::neo4j::traits::DecisionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let mut points = vec![Interruption::ApresLeNoeud, Interruption::ApresLeMarqueur];
+        points.extend((1..=9).map(Interruption::ApresLaPropriete));
+        points.extend([
+            Interruption::AvantLeRetraitDuMarqueur,
+            Interruption::ApresLeRetraitDuMarqueur,
+        ]);
+        let mut touches = 0;
+        for (k, point) in points.iter().copied().enumerate() {
+            let base = dir.path().join(format!("decision-{k}"));
+            let store = open(&base).await;
+            let p = a_project("decision-interrupted");
+            store.create_project(&p).await.unwrap();
+            let d = a_decision("interrompue");
+            store.interrompre_au_prochain(point);
+            let issue = store.create_decision_global(&d, Some(p.id)).await;
+            assert!(issue.is_err(), "{point:?} is on the path of a creation");
+            touches += 1;
+            assert!(
+                store.get_decision(d.id).await.unwrap().is_none(),
+                "{point:?}"
+            );
+            store.close().await.unwrap();
+            drop(store);
+
+            let store = open(&base).await;
+            let rapport = store.rapport_d_ouverture().clone();
+            assert!(rapport.en_quarantaine.is_empty(), "{point:?}: {rapport:?}");
+            if point == Interruption::ApresLeRetraitDuMarqueur {
+                assert!(
+                    store.get_decision(d.id).await.unwrap().is_some(),
+                    "{point:?}"
+                );
+                assert_eq!(
+                    store.get_decision_project_id(d.id).await.unwrap(),
+                    Some(p.id.to_string())
+                );
+            } else {
+                assert_eq!(rapport.brouillons_supprimes, 1, "{point:?}: {rapport:?}");
+                assert!(
+                    store.get_decision(d.id).await.unwrap().is_none(),
+                    "{point:?}"
+                );
+                // Only the project is left: the draft went with its edge.
+                assert_eq!(store.noeuds_pour_mesure(), 1, "{point:?}");
+                store.create_decision_global(&d, Some(p.id)).await.unwrap();
+            }
+            store.close().await.unwrap();
+        }
+        assert_eq!(touches, 13);
+    }
+
+    /// `delete_decision` crashed after the k-th engine write: the reopen finishes the
+    /// deletion (the draft marker goes first), or — crashed before any write — finds
+    /// the decision whole. Never a decision stripped of part of its edges.
+    #[tokio::test]
+    async fn an_interrupted_decision_deletion_is_finished_at_open() {
+        use project_orchestrator::neo4j::traits::DecisionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let mut atteints = 0;
+        for k in 1..=10 {
+            let base = dir.path().join(format!("delete-{k}"));
+            let store = open(&base).await;
+            let p = a_project("decision-delete");
+            store.create_project(&p).await.unwrap();
+            let (a, b, c) = (a_decision("a"), a_decision("b"), a_decision("c"));
+            store.create_decision_global(&a, Some(p.id)).await.unwrap();
+            store.create_decision_global(&b, None).await.unwrap();
+            store.create_decision_global(&c, None).await.unwrap();
+            // `a` has three edges: HAS_DECISION in, SUPERSEDES in (from b), out (to c).
+            store.supersede_decision(b.id, a.id).await.unwrap();
+            store.supersede_decision(a.id, c.id).await.unwrap();
+
+            store.interrompre_au_prochain(Interruption::ApresEtape(k));
+            let issue = store.delete_decision(a.id).await;
+            if issue.is_ok() {
+                store.close().await.unwrap();
+                break;
+            }
+            atteints += 1;
+            store.close().await.unwrap();
+            drop(store);
+
+            let store = open(&base).await;
+            let rapport = store.rapport_d_ouverture().clone();
+            assert!(rapport.en_quarantaine.is_empty(), "k={k}: {rapport:?}");
+            if k == 1 {
+                // Nothing written yet: the decision is whole.
+                assert!(store.get_decision(a.id).await.unwrap().is_some());
+                assert_eq!(
+                    store.get_decision_project_id(a.id).await.unwrap(),
+                    Some(p.id.to_string())
+                );
+            } else {
+                assert_eq!(rapport.brouillons_supprimes, 1, "k={k}: {rapport:?}");
+                assert!(store.get_decision(a.id).await.unwrap().is_none(), "k={k}");
+            }
+            // The others are untouched, and a retry converges.
+            assert!(store.get_decision(b.id).await.unwrap().is_some());
+            assert!(store.get_decision(c.id).await.unwrap().is_some());
+            store.delete_decision(a.id).await.unwrap();
+            assert!(store.get_decision(a.id).await.unwrap().is_none());
+            assert_eq!(store.noeuds_pour_mesure(), 3, "k={k}");
+            store.close().await.unwrap();
+            drop(store);
+            assert!(supersedes_on_disk(&base).await.is_empty(), "k={k}");
+        }
+        // The marker, the three edges, the node.
+        assert_eq!(atteints, 5);
+    }
+
+    /// Two readable Decision nodes with the same id: the second is quarantined and the
+    /// id is reserved — a write on it is refused, named, and a creation too.
+    #[tokio::test]
+    async fn a_duplicate_decision_id_is_reserved_and_its_writes_refused() {
+        use project_orchestrator::neo4j::traits::DecisionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        store.close().await.unwrap();
+        drop(store);
+        let d = a_decision("en double");
+        let id = d.id;
+        write_foreign(&base, move |db| {
+            for description in ["premier", "second"] {
+                db.create_node_with_props(
+                    &["Decision"],
+                    vec![
+                        ("id", Value::from(id.to_string())),
+                        ("description", Value::from(description)),
+                        ("rationale", Value::from("r")),
+                        ("status", Value::from("proposed")),
+                    ],
+                );
+            }
+        })
+        .await;
+        let store = open(&base).await;
+        assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+        assert!(store.get_decision(id).await.unwrap().is_some());
+        let err = store.delete_decision(id).await.unwrap_err();
+        assert!(format!("{err:#}").contains("refusé"), "{err:#}");
+        assert!(store.get_decision(id).await.unwrap().is_some());
+        let err = store.create_decision_global(&d, None).await.unwrap_err();
+        assert!(format!("{err:#}").contains("existe déjà"), "{err:#}");
+        let avant = store.noeuds_pour_mesure();
+        assert_eq!(avant, 2, "both nodes are still on disk");
+    }
+
+    /// A decision quarantined at open (unreadable: no `description`): update, delete
+    /// and supersede on its id refuse by name, never answer `Ok` without acting.
+    #[tokio::test]
+    async fn writes_on_a_quarantined_decision_are_refused_not_ignored() {
+        use project_orchestrator::neo4j::models::DecisionStatus;
+        use project_orchestrator::neo4j::traits::DecisionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let saine = a_decision("saine");
+        store.create_decision_global(&saine, None).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+        let id = Uuid::new_v4();
+        write_foreign(&base, move |db| {
+            db.create_node_with_props(
+                &["Decision"],
+                vec![
+                    ("id", Value::from(id.to_string())),
+                    ("rationale", Value::from("sans description")),
+                ],
+            );
+        })
+        .await;
+        let store = open(&base).await;
+        assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+        let refuse = |r: anyhow::Result<()>| {
+            let e = r.expect_err("a write on a quarantined decision must refuse");
+            assert!(format!("{e:#}").contains("quarantaine"), "{e:#}");
+        };
+        refuse(
+            store
+                .update_decision(id, None, None, None, Some(DecisionStatus::Accepted))
+                .await,
+        );
+        refuse(store.delete_decision(id).await);
+        refuse(store.supersede_decision(saine.id, id).await);
+        refuse(store.supersede_decision(id, saine.id).await);
+        // Nothing was written: the sound decision is untouched, both nodes remain.
+        let relue = store.get_decision(saine.id).await.unwrap().unwrap();
+        assert_eq!(relue.status, DecisionStatus::Proposed);
+        assert_eq!(store.noeuds_pour_mesure(), 2);
+        // An id that is neither held nor reserved stays Neo4j's silent no-op.
+        store.delete_decision(Uuid::new_v4()).await.unwrap();
+    }
+
+    /// An update that puts a `chosen_option` above the blob threshold, or replaces
+    /// one that sat there, pays the FULL flush: counted in fsyncs, with no
+    /// `close()` (the WAL alone does not recover such a value).
+    #[tokio::test]
+    async fn a_long_chosen_option_pays_the_full_flush_without_close() {
+        use project_orchestrator::neo4j::traits::DecisionStore;
+        let store = temporary(Durabilite::Wal).await;
+        let fsyncs = || store.fsyncs_du_wal().unwrap();
+        let d = a_decision("courte");
+        store.create_decision_global(&d, None).await.unwrap();
+        let mut cout = Vec::new();
+        for option in ["a".to_string(), "x".repeat(300), "b".to_string()] {
+            let t = fsyncs();
+            store
+                .update_decision(d.id, None, None, Some(option), None)
+                .await
+                .unwrap();
+            cout.push(fsyncs() - t);
+        }
+        let [court, long, remplace] = cout[..] else {
+            unreachable!()
+        };
+        assert!(court >= 1, "the WAL fsync ran");
+        assert!(long > court, "long chosen_option: {long} against {court}");
+        assert!(
+            remplace > court,
+            "long chosen_option replaced: {remplace} against {court}"
+        );
+    }
+
+    /// `supersede_decision` crashed after its k-th engine write (status, edge,
+    /// `created_at`): the retry converges to ONE edge that carries its `created_at`.
+    #[tokio::test]
+    async fn an_interrupted_supersession_converges_with_its_date() {
+        use project_orchestrator::neo4j::models::DecisionStatus;
+        use project_orchestrator::neo4j::traits::DecisionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let mut atteints = 0;
+        for k in 1..=4 {
+            let base = dir.path().join(format!("supersede-{k}"));
+            let store = open(&base).await;
+            let (a, b) = (a_decision("ancienne"), a_decision("nouvelle"));
+            store.create_decision_global(&a, None).await.unwrap();
+            store.create_decision_global(&b, None).await.unwrap();
+            store.interrompre_au_prochain(Interruption::ApresEtape(k));
+            let issue = store.supersede_decision(b.id, a.id).await;
+            store.close().await.unwrap();
+            drop(store);
+            if issue.is_ok() {
+                break;
+            }
+            atteints += 1;
+            let store = open(&base).await;
+            assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
+            store.supersede_decision(b.id, a.id).await.unwrap();
+            assert_eq!(
+                store.get_decision(a.id).await.unwrap().unwrap().status,
+                DecisionStatus::Superseded
+            );
+            store.close().await.unwrap();
+            drop(store);
+            let aretes = supersedes_on_disk(&base).await;
+            assert_eq!(aretes.len(), 1, "k={k}: {aretes:?}");
+            assert!(
+                aretes[0].is_some(),
+                "k={k}: the edge carries its created_at"
+            );
+        }
+        // The status, the edge, its date.
+        assert_eq!(atteints, 3);
+    }
+
+    /// A `HAS_DECISION` edge from a Project node quarantined as a duplicate id: the
+    /// decision reads as having NO project, not the held project of the same id.
+    #[tokio::test]
+    async fn a_decision_of_a_duplicate_project_node_reads_without_project() {
+        use project_orchestrator::neo4j::traits::DecisionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project("le vrai");
+        store.create_project(&p).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+        let d = a_decision("rattachée au doublon");
+        let (pid, did) = (p.id, d.id);
+        write_foreign(&base, move |db| {
+            let doublon = db.create_node_with_props(
+                &["Project"],
+                vec![
+                    ("id", Value::from(pid.to_string())),
+                    ("name", Value::from("doublon")),
+                    ("slug", Value::from(format!("doublon-{pid}"))),
+                    ("created_at", Value::from("2026-01-02T03:04:05+00:00")),
+                ],
+            );
+            let decision = db.create_node_with_props(
+                &["Decision"],
+                vec![
+                    ("id", Value::from(did.to_string())),
+                    ("description", Value::from("d")),
+                    ("rationale", Value::from("r")),
+                    ("status", Value::from("proposed")),
+                ],
+            );
+            db.create_edge(doublon, decision, "HAS_DECISION");
+        })
+        .await;
+        let store = open(&base).await;
+        // Precondition: the held project is the original, the duplicate is quarantined.
+        assert_eq!(
+            store.get_project(p.id).await.unwrap().unwrap().name,
+            "le vrai"
+        );
+        assert_eq!(
+            store.rapport_d_ouverture().en_quarantaine.len(),
+            1,
+            "{:?}",
+            store.rapport_d_ouverture()
+        );
+        assert!(store.get_decision(d.id).await.unwrap().is_some());
+        assert_eq!(store.get_decision_project_id(d.id).await.unwrap(), None);
+        assert!(store
+            .get_decision_project_ids(&[d.id])
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     /// The generator skips nothing: every `async fn` of the two contracts is
     /// either refused, or written by hand (and the build has checked that it IS
     /// written), or one of the few that cannot refuse and keep the contract's
@@ -2274,7 +2913,9 @@ mod with_the_feature {
         assert!(refusees_note().iter().all(|m| written.contains(m)));
         assert!(refusees_release().iter().all(|m| written.contains(m)));
         assert!(refusees_chat().iter().all(|m| written.contains(m)));
+        assert!(refusees_decision().iter().all(|m| written.contains(m)));
         assert!(refusees_plan().iter().all(|m| written.contains(m)));
+
         assert!(REFUS_ECRITS_A_LA_MAIN.iter().all(|m| written.contains(m)));
         // What keeps a default is known and justified where it is declared.
         assert_eq!(kept, ["AnalyticsStore::run_data_migrations"]);
