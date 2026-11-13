@@ -10,7 +10,9 @@
 //! its trait (an omitted method would silently inherit the contract's default).
 //!
 //! Ported so far: [`ProjectStore`](crate::neo4j::traits::ProjectStore)
-//! (`project.rs`).
+//! (`project.rs`), and [`ReleaseStore`](crate::neo4j::traits::ReleaseStore)
+//! for releases, environments, deployments and milestones (`release.rs`), whose
+//! refusals (tasks, plans, commits) are listed in `release::REFUSEES`.
 //!
 //! # How obrain is used
 //!
@@ -61,6 +63,7 @@
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
 mod project;
+mod release;
 
 #[cfg(any(test, feature = "mock-store"))]
 pub use mesure::{Durabilite, Interruption};
@@ -113,7 +116,11 @@ pub fn methodes_qui_servent() -> Vec<&'static str> {
     PORTEES
         .iter()
         .copied()
-        .filter(|m| !REFUS_ECRITS_A_LA_MAIN.contains(m) && !m.starts_with("GraphStore::"))
+        .filter(|m| {
+            !REFUS_ECRITS_A_LA_MAIN.contains(m)
+                && !release::REFUSEES.contains(m)
+                && !m.starts_with("GraphStore::")
+        })
         .collect()
 }
 
@@ -212,6 +219,7 @@ struct Interne {
 #[derive(Default)]
 struct Etat {
     projets: project::IndexProjets,
+    releases: release::IndexReleases,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -443,14 +451,25 @@ impl ObrainGraphStore {
                 )
             })?;
         }
-        let (etat, rapport) = project::IndexProjets::reconstruire(&db)
-            .map(|(projets, rapport)| (Etat { projets }, rapport))
-            .with_context(|| {
+        let (projets, mut rapport) =
+            project::IndexProjets::reconstruire(&db).with_context(|| {
                 format!(
                     "reconstruction des index de la base obrain {}",
                     chemin.display()
                 )
             })?;
+        let (releases, rapport_releases) =
+            release::IndexReleases::reconstruire(&db).with_context(|| {
+                format!(
+                    "reconstruction des index releases/environnements/jalons de la base obrain {}",
+                    chemin.display()
+                )
+            })?;
+        rapport.brouillons_supprimes += rapport_releases.brouillons_supprimes;
+        rapport
+            .en_quarantaine
+            .extend(rapport_releases.en_quarantaine);
+        let etat = Etat { projets, releases };
         let store = Self {
             interne: Arc::new(Interne {
                 db,

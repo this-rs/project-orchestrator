@@ -170,6 +170,17 @@ impl IndexProjets {
         self.par_id.get(&id).map(|e| e.noeud)
     }
 
+    /// Is there a project of this id? Read by the other domains' creations (a
+    /// release, an environment, a milestone belongs to a project).
+    pub(super) fn contient(&self, id: Uuid) -> bool {
+        self.par_id.contains_key(&id)
+    }
+
+    /// Every project, as the readers are served them (unsorted).
+    pub(super) fn tous(&self) -> Vec<ProjectNode> {
+        self.par_id.values().map(|e| e.projet.clone()).collect()
+    }
+
     /// Rebuild the index from the persisted `Project` nodes, repairing what an
     /// interrupted write left (see the module doc). A scan of the node zone.
     pub(super) fn reconstruire(db: &ObrainDB) -> Result<(Self, RapportOuverture)> {
