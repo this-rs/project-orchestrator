@@ -351,32 +351,6 @@ impl IndexEspaces {
 
     /// Forget a component everywhere the index holds it (its own node, its name,
     /// its workspace, its projects, its dependencies in both directions).
-    /// Project → workspace rows (`BELONGS_TO_WORKSPACE`), for
-    /// `ChatStore::list_project_workspace_rows`.
-    pub(super) fn lignes_projets_espaces(
-        &self,
-        projets: &IndexProjets,
-    ) -> Vec<ProjectWorkspaceRow> {
-        let mut lignes = Vec::new();
-        for (wid, pids) in &self.projets_de {
-            let Some(fiche) = self.espaces.get(wid) else {
-                continue;
-            };
-            for pid in pids {
-                let Some(p) = projets.projet(*pid) else {
-                    continue;
-                };
-                lignes.push(ProjectWorkspaceRow {
-                    project_id: *pid,
-                    project_slug: p.slug.clone(),
-                    workspace_id: *wid,
-                    workspace_slug: fiche.valeur.slug.clone(),
-                });
-            }
-        }
-        lignes
-    }
-
     fn oublier_composant(&mut self, cid: Uuid) {
         if let Some(f) = self.composants.remove(&cid) {
             self.par_nom_composant
