@@ -52,6 +52,17 @@
 //!   `description`, `created_by`, `status` or `priority`, is quarantined at open
 //!   (as projects are). Neo4j fails the read of such a node, except for an
 //!   unparsable `created_at`, which it replaces with "now".
+//! - The ids of the plans quarantined at open are RESERVED: `create_plan` with
+//!   one of them is refused, as Neo4j's uniqueness constraint would refuse it.
+//! - A migrated plan with a `project_id` and NO `HAS_PLAN` edge (Neo4j writes the
+//!   property before the `MATCH (project) MERGE (project)-[:HAS_PLAN]->(p)`, so a
+//!   plan created while its project did not exist has the property alone) is
+//!   listed and counted under that project here, and not on Neo4j. It cannot be
+//!   told from a plan this backend wrote, which has no edge either; it also keeps
+//!   `delete_project` of that project refused.
+//! - Deleting a plan that a migrated note links (`LINKED_TO`) does not update the
+//!   note's unresolved anchors (`note.rs`): `get_note_anchors` of that note keeps
+//!   refusing until a restart, then answers. Strict side, transient.
 //! - An update writes its properties one by one (one WAL record each; obrain has
 //!   no multi-property write): a crash in the middle of `update_plan` can reopen
 //!   with the new title and the old description. Each state is a valid plan;
@@ -265,6 +276,10 @@ impl Entree {
 #[derive(Default)]
 pub(super) struct IndexPlans {
     pub(super) par_id: HashMap<Uuid, Entree>,
+    /// The ids of the plans quarantined at open: not served, but taken. A
+    /// creation with one of them is refused (Neo4j's uniqueness constraint on
+    /// `Plan.id`), as `note.rs` and `chat.rs` do.
+    reserves: std::collections::HashSet<Uuid>,
 }
 
 impl IndexPlans {
@@ -301,6 +316,12 @@ impl IndexPlans {
                 Ok(lu) => lu,
                 Err(e) => {
                     quarantaine.push(format!("nœud Plan {noeud:?} : {e}"));
+                    if let Some(id) = get("id")
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .and_then(|s| s.parse::<Uuid>().ok())
+                    {
+                        index.reserves.insert(id);
+                    }
                     continue;
                 }
             };
@@ -329,6 +350,7 @@ impl IndexPlans {
                      chacun de ces projets)",
                     plan.id, plan.project_id
                 ));
+                index.reserves.insert(plan.id);
                 continue;
             }
             index.par_id.insert(
@@ -364,6 +386,14 @@ impl PlanStore for ObrainGraphStore {
                     let etat = w.index()?;
                     if etat.plans.par_id.contains_key(&p.id) {
                         bail!("un plan d'id {} existe déjà (unicité de Plan.id)", p.id);
+                    }
+                    if etat.plans.reserves.contains(&p.id) {
+                        bail!(
+                            "l'id {} est celui d'un plan en quarantaine (nœud illisible ou lié \
+                             autrement que par son project_id) : réservé, la création est refusée \
+                             (unicité de Plan.id)",
+                            p.id
+                        );
                     }
                     if let Some(projet) = p.project_id {
                         if !etat.projets.contient(projet) {

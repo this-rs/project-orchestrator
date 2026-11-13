@@ -5387,6 +5387,26 @@ mod obrain_plan_specifique {
         );
     }
 
+    /// The id of a quarantined plan is reserved: creating a plan with it is
+    /// refused (Neo4j's uniqueness constraint), and writes no second node.
+    #[tokio::test]
+    async fn the_id_of_a_quarantined_plan_is_reserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let x = plan(None);
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_plan(&x).await.unwrap();
+            assert!(store.ecrire_propriete_brute_pour_test("Plan", x.id, "status", None));
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert!(store.get_plan(x.id).await.unwrap().is_none(), "quarantined");
+        let e = store.create_plan(&x).await.unwrap_err();
+        assert!(format!("{e:#}").contains("réservé"), "{e:#}");
+        assert_eq!(store.noeuds_de_label_pour_test("Plan"), 1);
+    }
+
     /// An empty update on a closed base refuses like every other operation.
     #[tokio::test]
     async fn an_empty_update_on_a_closed_base_refuses() {
