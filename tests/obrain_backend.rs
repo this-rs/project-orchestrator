@@ -94,13 +94,17 @@ mod with_the_feature {
     use chrono::Utc;
     use obrain_common::types::Value;
     use project_orchestrator::meilisearch::SearchStore;
-    use project_orchestrator::neo4j::models::{ProgressKind, ProjectNode, ProjectProfile};
+    use project_orchestrator::neo4j::models::{
+        CommitNode, FileChangedInfo, PlanNode, PlanStatus, ProgressKind, ProjectNode,
+        ProjectProfile,
+    };
     use project_orchestrator::neo4j::traits::*;
     use project_orchestrator::obrain::{
         defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees,
-        refusees_chat, refusees_decision, refusees_note, refusees_plan, refusees_protocolrun,
-        refusees_release, Creation, Durabilite, Interruption, NonPorte, ObrainGraphStore,
-        ObrainSearchStore, RapportOuverture, MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
+        refusees_chat, refusees_commit, refusees_decision, refusees_note, refusees_plan,
+        refusees_protocolrun, refusees_release, Creation, Durabilite, Interruption, NonPorte,
+        ObrainGraphStore, ObrainSearchStore, RapportOuverture, MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN,
+        SCHEMA_PO,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1897,6 +1901,187 @@ mod with_the_feature {
             .any(|m| m.starts_with("ProtocolStore::")));
     }
 
+    /// The commit methods that are not ported refuse by name, with their reason.
+    #[tokio::test]
+    async fn commit_refusals_are_named() {
+        let store = temporary(Durabilite::Wal).await;
+        let id = Uuid::new_v4();
+        assert_eq!(
+            not_ported(store.find_dependent_files("a.rs", 3, None).await),
+            NonPorte("CommitStore::find_dependent_files")
+        );
+        assert_eq!(
+            not_ported(store.find_impacted_files("a.rs", 3, None).await),
+            NonPorte("CommitStore::find_impacted_files")
+        );
+        assert_eq!(
+            not_ported(store.find_callers("a.rs::f", None).await),
+            NonPorte("CommitStore::find_callers")
+        );
+        assert_eq!(
+            not_ported(store.link_task_to_files(id, &[]).await),
+            NonPorte("CommitStore::link_task_to_files")
+        );
+        assert_eq!(
+            not_ported(store.link_commit_to_task("h", id).await),
+            NonPorte("CommitStore::link_commit_to_task")
+        );
+        assert_eq!(
+            not_ported(store.link_commit_to_task_from("h", id, "merged").await),
+            NonPorte("CommitStore::link_commit_to_task_from")
+        );
+        assert_eq!(
+            not_ported(store.get_task_commits(id).await),
+            NonPorte("CommitStore::get_task_commits")
+        );
+        assert_eq!(
+            not_ported(store.ping_freshness_for_files(&[]).await),
+            NonPorte("CommitStore::ping_freshness_for_files")
+        );
+        // The TOUCHES / CO_CHANGED machinery: no production code writes `File`
+        // on obrain, so served it would answer Ok while dropping every file.
+        let p = Uuid::new_v4();
+        assert_eq!(
+            not_ported(
+                store
+                    .create_commit_touches("h", &[touche("a.rs", Some(1), Some(1))])
+                    .await
+            ),
+            NonPorte("CommitStore::create_commit_touches")
+        );
+        assert_eq!(
+            not_ported(store.get_commit_files("h").await),
+            NonPorte("CommitStore::get_commit_files")
+        );
+        assert_eq!(
+            not_ported(store.get_file_history("a.rs", None).await),
+            NonPorte("CommitStore::get_file_history")
+        );
+        assert_eq!(
+            not_ported(store.compute_co_changed(p, None, 1, 100).await),
+            NonPorte("CommitStore::compute_co_changed")
+        );
+        assert_eq!(
+            not_ported(store.get_co_change_graph(p, 1, 100).await),
+            NonPorte("CommitStore::get_co_change_graph")
+        );
+        assert_eq!(
+            not_ported(store.get_file_co_changers("a.rs", 1, 100).await),
+            NonPorte("CommitStore::get_file_co_changers")
+        );
+        assert_eq!(
+            not_ported(store.compute_co_changed_transitive(p, 2, 0.1).await),
+            NonPorte("CommitStore::compute_co_changed_transitive")
+        );
+        assert_eq!(
+            not_ported(
+                store
+                    .get_file_transitive_co_changers("a.rs", 0.1, 100)
+                    .await
+            ),
+            NonPorte("CommitStore::get_file_transitive_co_changers")
+        );
+    }
+
+    fn commit(hash: &str, secs: i64) -> CommitNode {
+        CommitNode {
+            hash: hash.to_string(),
+            message: format!("message {hash}"),
+            author: "e2e".to_string(),
+            timestamp: chrono::DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap(),
+        }
+    }
+
+    fn touche(path: &str, additions: Option<i64>, deletions: Option<i64>) -> FileChangedInfo {
+        FileChangedInfo {
+            path: path.to_string(),
+            additions,
+            deletions,
+        }
+    }
+
+    /// The commit domain end to end, as it serves: commits, their plan link and
+    /// the project's co-change timestamp — written, then read back AFTER a close
+    /// and a reopen. The TOUCHES / CO_CHANGED machinery is refused (no `File` is
+    /// written in production); its own close-and-reopen proof is a module test
+    /// (`commit.rs`, `co_change_transitif_et_horodatage_survivent_a_la_reouverture`).
+    #[tokio::test]
+    async fn commits_and_their_plan_link_survive_a_close_and_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+
+        let projet = a_project("commit");
+        store.create_project(&projet).await.unwrap();
+        let plan = PlanNode {
+            id: Uuid::new_v4(),
+            title: "plan commit".to_string(),
+            description: "description".to_string(),
+            status: PlanStatus::Draft,
+            created_at: Utc::now(),
+            created_by: "e2e".to_string(),
+            priority: 1,
+            project_id: Some(projet.id),
+            execution_context: None,
+            persona: None,
+        };
+        store.create_plan(&plan).await.unwrap();
+
+        let c1 = commit("h1", 1);
+        let c2 = commit("h2", 2);
+        store.create_commit(&c1).await.unwrap();
+        store.create_commit(&c2).await.unwrap();
+        store.link_commit_to_plan("h1", plan.id).await.unwrap();
+        store.link_commit_to_plan("h2", plan.id).await.unwrap();
+        // A second link: the plan's list stays one entry per commit. That the
+        // ENGINE holds one edge (the MERGE) is counted in the module test
+        // `commit.rs::commit_lie_a_un_plan`: the index is a set and would hide it.
+        store.link_commit_to_plan("h1", plan.id).await.unwrap();
+        store
+            .update_project_co_change_timestamp(projet.id)
+            .await
+            .unwrap();
+        let horodatage = store
+            .get_project(projet.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_co_change_computed_at
+            .expect("le projet est horodaté");
+
+        store.close().await.unwrap();
+        let store = open(&base).await;
+
+        assert_eq!(
+            store.get_commit("h1").await.unwrap().unwrap().message,
+            "message h1"
+        );
+        let commits = store.get_plan_commits(plan.id).await.unwrap();
+        assert_eq!(
+            commits.iter().map(|c| c.hash.as_str()).collect::<Vec<_>>(),
+            ["h2", "h1"],
+            "newest first, each once"
+        );
+        assert_eq!(
+            store
+                .get_project(projet.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_co_change_computed_at,
+            Some(horodatage)
+        );
+
+        store.delete_commit("h1").await.unwrap();
+        assert!(store.get_commit("h1").await.unwrap().is_none());
+        let commits = store.get_plan_commits(plan.id).await.unwrap();
+        assert_eq!(
+            commits.iter().map(|c| c.hash.as_str()).collect::<Vec<_>>(),
+            ["h2"],
+            "the deleted commit leaves the plan's list"
+        );
+    }
+
     /// A note with a project, a link to the project and to another note, a
     /// succession and a confirmation: all of it survives a close and a reopen, with
     /// the same values, the same links and the same order.
@@ -3122,6 +3307,7 @@ mod with_the_feature {
         // The written refusals are written, and are not counted as serving.
         assert!(refusees_note().iter().all(|m| written.contains(m)));
         assert!(refusees_release().iter().all(|m| written.contains(m)));
+        assert!(refusees_commit().iter().all(|m| written.contains(m)));
         assert!(refusees_chat().iter().all(|m| written.contains(m)));
         assert!(refusees_decision().iter().all(|m| written.contains(m)));
         assert!(refusees_plan().iter().all(|m| written.contains(m)));

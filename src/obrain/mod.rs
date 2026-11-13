@@ -78,6 +78,7 @@
 
 mod auth;
 mod chat;
+mod commit;
 mod decision;
 mod federation;
 #[cfg(any(test, feature = "mock-store"))]
@@ -134,6 +135,13 @@ pub fn methodes_portees() -> &'static [&'static str] {
 /// (`note.rs`). Three more note methods refuse only in some cases.
 pub fn refusees_note() -> &'static [&'static str] {
     note::REFUSEES
+}
+
+/// The methods of `CommitStore` refused on every call, as
+/// `CommitStore::<method>` (`commit.rs`): the dependency analysis (the code
+/// graph), the task links, and the freshness ping over `Note → File` links.
+pub fn refusees_commit() -> &'static [&'static str] {
+    commit::REFUSEES
 }
 
 /// The methods of `ReleaseStore` refused on every call, as
@@ -206,6 +214,7 @@ pub fn methodes_qui_servent() -> Vec<&'static str> {
             !REFUS_ECRITS_A_LA_MAIN.contains(m)
                 && !release::REFUSEES.contains(m)
                 && !note::REFUSEES.contains(m)
+                && !commit::REFUSEES.contains(m)
                 && !chat::REFUSEES.contains(m)
                 && !decision::REFUSEES.contains(m)
                 && !plan::REFUSEES.contains(m)
@@ -327,6 +336,7 @@ struct Etat {
     chat: chat::IndexChat,
     decisions: decision::IndexDecisions,
     federation: federation::IndexFederation,
+    commits: commit::IndexCommits,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -653,6 +663,8 @@ impl ObrainGraphStore {
             })?;
         rapport.brouillons_supprimes += brouillons;
         rapport.en_quarantaine.extend(quarantaine);
+        let commits =
+            commit::IndexCommits::reconstruire(&db, &mut rapport).with_context(contexte)?;
         let etat = Etat {
             projets,
             plans,
@@ -665,6 +677,7 @@ impl ObrainGraphStore {
             chat,
             decisions,
             federation,
+            commits,
         };
         let store = Self {
             interne: Arc::new(Interne {
