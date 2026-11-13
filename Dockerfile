@@ -84,6 +84,15 @@ COPY crates ./crates/
 # runs — and it is the only reason this list is not just Cargo.toml + crates/ + src/.
 COPY vendor ./vendor/
 
+# Examples are declared as targets in Cargo.toml ([[example]] name = "mem_embed",
+# MEM-1). Cargo REFUSES to parse the manifest when a declared target file is
+# absent: `cargo build` does not build examples, but it validates every target
+# path first. Without this line every image build dies on
+#   error: Cargo.toml: can't find `mem_embed` example at `examples/mem_embed.rs`
+# and because that parse happens before anything compiles, the dependency-cache
+# layer below fails too (masked by `|| true`) instead of caching a build.
+COPY examples ./examples
+
 # Create dummy source files to build dependencies.
 # This must match the actual module layout so the dep-cache layer is valid.
 # Module directories (16):
