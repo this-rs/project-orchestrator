@@ -189,6 +189,9 @@ nexus-tools = { git = "https://github.com/this-rs/nexus.git", rev = "9710c9866f3
 # direct because the adapter names its types (`Value`, `NodeId`).
 obrain-engine = { git = "https://github.com/obrain-db/obrain.git", rev = "c4b6ada9b29707ac329eeebc09850de308f336ff", optional = true }
 obrain-common = { git = "https://github.com/obrain-db/obrain.git", rev = "c4b6ada9b29707ac329eeebc09850de308f336ff", optional = true }
+# `obrain-core` is direct for ONE name the engine does not re-export: `graph::Direction`, the
+# argument of `GraphStore::edges_from` (note.rs enumerates the edges of a node). Same rev as above.
+obrain-core = { git = "https://github.com/obrain-db/obrain.git", rev = "c4b6ada9b29707ac329eeebc09850de308f336ff", optional = true }
 tokio-stream = { workspace = true }
 
 # Auth
@@ -322,7 +325,7 @@ mock-store = []
 # it, asking for `obrain` is a startup error that says so. The build-dependencies are the generator
 # of the refusals (build.rs reads the store contracts and writes, for every method no domain has
 # ported yet, an implementation that returns a named error).
-obrain-backend = ["dep:obrain-engine", "dep:obrain-common", "dep:syn", "dep:quote", "dep:proc-macro2"]
+obrain-backend = ["dep:obrain-engine", "dep:obrain-common", "dep:obrain-core", "dep:syn", "dep:quote", "dep:proc-macro2"]
 
 [build-dependencies]
 # Only for the `obrain-backend` feature (see above): build.rs parses the store contracts.

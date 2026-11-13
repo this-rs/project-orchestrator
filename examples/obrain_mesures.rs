@@ -15,7 +15,8 @@
 //! Output: one `mesure<TAB>valeur<TAB>unité` line per measure.
 
 use project_orchestrator::neo4j::models::{ProjectNode, ProjectProfile};
-use project_orchestrator::neo4j::traits::ProjectStore;
+use project_orchestrator::neo4j::traits::{NoteStore, ProjectStore};
+use project_orchestrator::notes::{EntityType, Note, NoteFilters, NoteType};
 use project_orchestrator::obrain::{Creation, Durabilite, ObrainGraphStore};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -178,6 +179,112 @@ async fn main() {
     let refus = store.delete_project(ids[0].0, "x").await;
     dire("delete_refuse", us(t.elapsed()), "µs");
     assert_eq!(refus.is_err(), noeuds > 0);
+
+    // 5b. The note domain (NoteStore) on the same base: a project of notes, short and
+    //     long contents (a value past the blob threshold pays the full flush), reads by
+    //     id, by project, over the whole base, and by linked entity.
+    let proj = ids[0].0;
+    let mut mesures = Vec::new();
+    let mut notes_ids = Vec::new();
+    for i in 0..200 {
+        let n = Note::new(
+            Some(proj),
+            NoteType::Observation,
+            format!("note de mesure {i}, courte"),
+            "mesure".to_string(),
+        );
+        let t = Instant::now();
+        store.create_note(&n).await.unwrap();
+        mesures.push(t.elapsed());
+        notes_ids.push(n.id);
+    }
+    dire("create_note_court_p50", us(pct(mesures.clone(), 0.5)), "µs");
+    dire("create_note_court_p99", us(pct(mesures, 0.99)), "µs");
+    let mut mesures = Vec::new();
+    for i in 0..30 {
+        let n = Note::new(
+            Some(proj),
+            NoteType::Observation,
+            format!("note longue {i} {}", "é-long ".repeat(60)),
+            "mesure".to_string(),
+        );
+        let t = Instant::now();
+        store.create_note(&n).await.unwrap();
+        mesures.push(t.elapsed());
+        notes_ids.push(n.id);
+    }
+    dire("create_note_long_p50", us(pct(mesures.clone(), 0.5)), "µs");
+    dire("create_note_long_p99", us(pct(mesures, 0.99)), "µs");
+    let mut mesures = Vec::new();
+    for id in notes_ids.iter().take(100) {
+        let t = Instant::now();
+        store
+            .update_note(
+                *id,
+                Some("contenu mis à jour".into()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        mesures.push(t.elapsed());
+    }
+    dire("update_note_p50", us(pct(mesures.clone(), 0.5)), "µs");
+    dire("update_note_p99", us(pct(mesures, 0.99)), "µs");
+    let rondes = 200_000u32;
+    let t = Instant::now();
+    for k in 0..rondes {
+        let id = notes_ids[(k as usize) % notes_ids.len()];
+        std::hint::black_box(store.get_note(id).await.unwrap());
+    }
+    dire(
+        "get_note",
+        t.elapsed().as_secs_f64() * 1e9 / rondes as f64,
+        "ns",
+    );
+    let filtre = NoteFilters {
+        limit: Some(20),
+        ..Default::default()
+    };
+    let t = Instant::now();
+    for _ in 0..1000 {
+        std::hint::black_box(store.list_notes(Some(proj), None, &filtre).await.unwrap());
+    }
+    dire("list_notes_projet", us(t.elapsed()) / 1000.0, "µs");
+    let t = Instant::now();
+    for _ in 0..20 {
+        std::hint::black_box(store.list_notes(None, None, &filtre).await.unwrap());
+    }
+    dire("list_notes_toutes", us(t.elapsed()) / 20.0, "µs");
+    let mut mesures = Vec::new();
+    for id in notes_ids.iter().take(100) {
+        let t = Instant::now();
+        store
+            .link_note_to_entity(
+                *id,
+                &EntityType::Project,
+                &proj.to_string(),
+                Some("s"),
+                Some("b"),
+            )
+            .await
+            .unwrap();
+        mesures.push(t.elapsed());
+    }
+    dire("link_note_p50", us(pct(mesures.clone(), 0.5)), "µs");
+    dire("link_note_p99", us(pct(mesures, 0.99)), "µs");
+    let t = Instant::now();
+    for _ in 0..1000 {
+        std::hint::black_box(
+            store
+                .get_notes_for_entity(&EntityType::Project, &proj.to_string())
+                .await
+                .unwrap(),
+        );
+    }
+    dire("get_notes_for_entity", us(t.elapsed()) / 1000.0, "µs");
 
     // 6. The first version's step: a full flush after EVERY write.
     store.close().await.unwrap();

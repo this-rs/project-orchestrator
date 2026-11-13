@@ -165,7 +165,8 @@ pub(super) struct IndexProjets {
 }
 
 impl IndexProjets {
-    /// The engine node of a project this backend addresses.
+    /// The engine node of a project this backend addresses (used by the other
+    /// domains that attach to a project).
     pub(super) fn noeud_de(&self, id: Uuid) -> Option<NodeId> {
         self.par_id.get(&id).map(|e| e.noeud)
     }

@@ -97,9 +97,9 @@ mod with_the_feature {
     use project_orchestrator::neo4j::models::{ProgressKind, ProjectNode, ProjectProfile};
     use project_orchestrator::neo4j::traits::*;
     use project_orchestrator::obrain::{
-        defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees, Creation,
-        Durabilite, Interruption, NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture,
-        MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
+        defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees,
+        refusees_note, Creation, Durabilite, Interruption, NonPorte, ObrainGraphStore,
+        ObrainSearchStore, RapportOuverture, MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1448,8 +1448,8 @@ mod with_the_feature {
             NonPorte("CodeStore::list_project_files")
         );
         assert_eq!(
-            not_ported(store.delete_note(id).await),
-            NonPorte("NoteStore::delete_note")
+            not_ported(store.propagate_structural_links(id).await),
+            NonPorte("NoteStore::propagate_structural_links")
         );
         // Defaulted by the contract to `Ok((0, 0))`: refused all the same.
         assert_eq!(
@@ -1482,6 +1482,560 @@ mod with_the_feature {
             msg,
             "non porté sur le backend obrain : WorkspaceStore::get_workspace_milestone_progress"
         );
+    }
+
+    /// A note with a project, a link to the project and to another note, a
+    /// succession and a confirmation: all of it survives a close and a reopen, with
+    /// the same values, the same links and the same order.
+    #[tokio::test]
+    async fn notes_survive_a_close_and_a_reopen_with_links_and_states() {
+        use project_orchestrator::neo4j::traits::NoteStore;
+        use project_orchestrator::notes::{EntityType, Note, NoteFilters, NoteType};
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project("notes-reopen");
+        store.create_project(&p).await.unwrap();
+        let mut n = Note::new(
+            Some(p.id),
+            NoteType::Gotcha,
+            format!(
+                "une note longue, au-delà du seuil de colonne : {}",
+                "é".repeat(200)
+            ),
+            "alice".to_string(),
+        );
+        n.tags = vec!["a".into(), "b".into()];
+        let m = Note::new(
+            None,
+            NoteType::Tip,
+            "globale".to_string(),
+            "system/x".to_string(),
+        );
+        store.create_note(&n).await.unwrap();
+        store.create_note(&m).await.unwrap();
+        store
+            .link_note_to_entity(
+                n.id,
+                &EntityType::Project,
+                &p.id.to_string(),
+                Some("sig"),
+                Some("body"),
+            )
+            .await
+            .unwrap();
+        store
+            .link_note_to_entity(n.id, &EntityType::Note, &m.id.to_string(), None, None)
+            .await
+            .unwrap();
+        store.supersede_note(m.id, n.id).await.unwrap();
+        let confirmee = store.confirm_note(n.id, "alice").await.unwrap().unwrap();
+        let avant_n = store.get_note(n.id).await.unwrap().unwrap();
+        let avant_m = store.get_note(m.id).await.unwrap().unwrap();
+        let avant_liste = store
+            .list_notes(Some(p.id), None, &NoteFilters::default())
+            .await
+            .unwrap();
+        let avant_anchors = store.get_note_anchors(n.id).await.unwrap();
+        assert_eq!(avant_n.human_confirmed_by.as_deref(), Some("alice"));
+        assert_eq!(avant_n.human_confirmed_by, confirmee.human_confirmed_by);
+        assert_eq!(
+            avant_m.status,
+            project_orchestrator::notes::NoteStatus::Archived
+        );
+        assert_eq!(avant_anchors.len(), 2);
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = open(&base).await;
+        assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
+        assert_eq!(
+            store.get_note(n.id).await.unwrap().unwrap().content,
+            avant_n.content
+        );
+        assert_eq!(
+            store.get_note(n.id).await.unwrap().unwrap().tags,
+            avant_n.tags
+        );
+        assert_eq!(
+            store.get_note(m.id).await.unwrap().unwrap().superseded_by,
+            Some(n.id)
+        );
+        let liste = store
+            .list_notes(Some(p.id), None, &NoteFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(liste.0.len(), avant_liste.0.len());
+        assert_eq!(
+            liste.0.iter().map(|x| x.id).collect::<Vec<_>>(),
+            avant_liste.0.iter().map(|x| x.id).collect::<Vec<_>>()
+        );
+        assert_eq!(store.get_note_anchors(n.id).await.unwrap().len(), 2);
+        assert_eq!(
+            store
+                .get_notes_for_entity(&EntityType::Note, &m.id.to_string())
+                .await
+                .unwrap()
+                .iter()
+                .map(|x| x.id)
+                .collect::<Vec<_>>(),
+            vec![n.id]
+        );
+    }
+
+    /// A creation of a note interrupted at every step reopens to a consistent base:
+    /// the draft is deleted with its edges, or the note is whole when the commit
+    /// point was passed. Nothing is quarantined.
+    #[tokio::test]
+    async fn an_interrupted_note_creation_reopens_consistently() {
+        use project_orchestrator::neo4j::traits::NoteStore;
+        use project_orchestrator::notes::{Note, NoteType};
+        let dir = tempfile::tempdir().unwrap();
+        let mut points = vec![Interruption::ApresLeNoeud, Interruption::ApresLeMarqueur];
+        points.extend((1..=40).map(Interruption::ApresLaPropriete));
+        points.extend([
+            Interruption::AvantLeRetraitDuMarqueur,
+            Interruption::ApresLeRetraitDuMarqueur,
+        ]);
+        let mut touches = 0;
+        for (k, point) in points.iter().copied().enumerate() {
+            let base = dir.path().join(format!("note-{k}"));
+            let store = open(&base).await;
+            let p = a_project("note-interrupted");
+            store.create_project(&p).await.unwrap();
+            let n = Note::new(
+                Some(p.id),
+                NoteType::Tip,
+                "interrompue".to_string(),
+                "alice".to_string(),
+            );
+            store.interrompre_au_prochain(point);
+            let issue = store.create_note(&n).await;
+            if issue.is_ok() {
+                // The creation finished before this point: the point is not on its path.
+                store.close().await.unwrap();
+                continue;
+            }
+            touches += 1;
+            assert!(store.get_note(n.id).await.unwrap().is_none(), "{point:?}");
+            store.close().await.unwrap();
+            drop(store);
+
+            let store = open(&base).await;
+            let rapport = store.rapport_d_ouverture().clone();
+            assert!(rapport.en_quarantaine.is_empty(), "{point:?}: {rapport:?}");
+            if point == Interruption::ApresLeRetraitDuMarqueur {
+                assert!(store.get_note(n.id).await.unwrap().is_some(), "{point:?}");
+            } else {
+                assert_eq!(rapport.brouillons_supprimes, 1, "{point:?}: {rapport:?}");
+                assert!(store.get_note(n.id).await.unwrap().is_none(), "{point:?}");
+                assert!(store
+                    .list_notes(Some(p.id), None, &Default::default())
+                    .await
+                    .unwrap()
+                    .0
+                    .is_empty());
+                store.create_note(&n).await.unwrap();
+            }
+            store.close().await.unwrap();
+        }
+        // Every creation step is on the path: the properties, the marker, the commit point.
+        assert!(touches >= 28, "the points were reached: {touches}");
+    }
+
+    /// What the note domain refuses, refuses by name and before any write: an
+    /// agent author, a workspace filter, a link to an entity of another domain.
+    #[tokio::test]
+    async fn note_refusals_are_named_and_write_nothing() {
+        use project_orchestrator::neo4j::traits::NoteStore;
+        use project_orchestrator::notes::{EntityType, Note, NoteFilters, NoteType};
+        let store = temporary(Durabilite::Wal).await;
+        let p = a_project("note-refus");
+        store.create_project(&p).await.unwrap();
+
+        let agent = Note::new(
+            Some(p.id),
+            NoteType::Tip,
+            "écrite par un agent".to_string(),
+            format!("agent:{}", Uuid::new_v4()),
+        );
+        let err = store.create_note(&agent).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<NonPorte>(),
+            Some(&NonPorte("NoteStore::create_note"))
+        );
+        assert!(store.get_note(agent.id).await.unwrap().is_none());
+
+        let f = NoteFilters::default();
+        assert_eq!(
+            not_ported(store.list_notes(None, Some("ws"), &f).await),
+            NonPorte("NoteStore::list_notes")
+        );
+        assert_eq!(
+            not_ported(store.get_notes_needing_review(None, Some("ws")).await),
+            NonPorte("NoteStore::get_notes_needing_review")
+        );
+        let n = Note::new(
+            Some(p.id),
+            NoteType::Tip,
+            "ok".to_string(),
+            "alice".to_string(),
+        );
+        store.create_note(&n).await.unwrap();
+        assert_eq!(
+            not_ported(
+                store
+                    .link_note_to_entity(n.id, &EntityType::File, "src/lib.rs", None, None)
+                    .await
+            ),
+            NonPorte("NoteStore::link_note_to_entity")
+        );
+        assert!(store.get_note_anchors(n.id).await.unwrap().is_empty());
+        // A link to a project this backend does not hold is a no-op, as in Neo4j.
+        store
+            .link_note_to_entity(
+                n.id,
+                &EntityType::Project,
+                &Uuid::new_v4().to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(store.get_note_anchors(n.id).await.unwrap().is_empty());
+    }
+
+    /// A multi-write is a sequence of engine writes with no marker. A crash after the
+    /// k-th write must reopen with nothing quarantined, and a retry of the same call must
+    /// converge to the full state. One loop per operation (supersede, rescope, delete,
+    /// update, confirm, link).
+    #[tokio::test]
+    async fn note_multi_writes_interrupted_then_retried_converge() {
+        use project_orchestrator::neo4j::traits::NoteStore;
+        use project_orchestrator::notes::{
+            EntityType, Note, NoteFilters, NoteImportance, NoteStatus, NoteType,
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        // A base with one project and two notes, crashed at the k-th write of `nom`.
+        async fn fixture(dir: &Path, nom: &str, k: usize) -> (ObrainGraphStore, Uuid, Note, Note) {
+            let store = open(&dir.join(format!("{nom}-{k}"))).await;
+            let p = a_project("multi");
+            store.create_project(&p).await.unwrap();
+            let a = Note::new(Some(p.id), NoteType::Tip, "a".into(), "alice".into());
+            let b = Note::new(Some(p.id), NoteType::Tip, "b".into(), "alice".into());
+            store.create_note(&a).await.unwrap();
+            store.create_note(&b).await.unwrap();
+            (store, p.id, a, b)
+        }
+        // Reopen after the crash, check that nothing is quarantined.
+        async fn reouvrir(dir: &Path, nom: &str, k: usize) -> ObrainGraphStore {
+            let store = open(&dir.join(format!("{nom}-{k}"))).await;
+            assert!(
+                store.rapport_d_ouverture().en_quarantaine.is_empty(),
+                "{nom} k={k}"
+            );
+            store
+        }
+        let mut atteints = 0;
+
+        // supersede: old archived + superseded_by, new.supersedes, the edge.
+        for k in 1..=10 {
+            let (store, _p, a, b) = fixture(dir.path(), "supersede", k).await;
+            store.interrompre_au_prochain(Interruption::ApresEtape(k));
+            let issue = store.supersede_note(a.id, b.id).await;
+            if issue.is_ok() {
+                store.close().await.unwrap();
+                break;
+            }
+            atteints += 1;
+            assert!(format!("{:#}", issue.unwrap_err()).contains("interruption injectée"));
+            store.close().await.unwrap();
+            drop(store);
+            let store = reouvrir(dir.path(), "supersede", k).await;
+            store.supersede_note(a.id, b.id).await.unwrap();
+            let (va, vb) = (
+                store.get_note(a.id).await.unwrap().unwrap(),
+                store.get_note(b.id).await.unwrap().unwrap(),
+            );
+            assert_eq!(
+                (va.status, va.superseded_by),
+                (NoteStatus::Archived, Some(b.id)),
+                "k={k}"
+            );
+            assert_eq!(vb.supersedes, Some(a.id), "k={k}");
+            store.close().await.unwrap();
+        }
+
+        // rescope to the global level: the HAS_NOTE edge goes, the property goes.
+        for k in 1..=10 {
+            let (store, p, a, _b) = fixture(dir.path(), "rescope", k).await;
+            store.interrompre_au_prochain(Interruption::ApresEtape(k));
+            let issue = store.rescope_note(a.id, None).await;
+            if issue.is_ok() {
+                store.close().await.unwrap();
+                break;
+            }
+            atteints += 1;
+            store.close().await.unwrap();
+            drop(store);
+            let store = reouvrir(dir.path(), "rescope", k).await;
+            store.rescope_note(a.id, None).await.unwrap();
+            assert_eq!(
+                store.get_note(a.id).await.unwrap().unwrap().project_id,
+                None,
+                "k={k}"
+            );
+            let (dans_p, _) = store
+                .list_notes(Some(p), None, &NoteFilters::default())
+                .await
+                .unwrap();
+            assert!(!dans_p.iter().any(|n| n.id == a.id), "k={k}");
+            store.close().await.unwrap();
+        }
+
+        // delete: edges first, then the node. A crash between them leaves a note with no
+        // edges; the retry deletes it.
+        for k in 1..=10 {
+            let (store, _p, a, _b) = fixture(dir.path(), "delete", k).await;
+            store.interrompre_au_prochain(Interruption::ApresEtape(k));
+            let issue = store.delete_note(a.id).await;
+            if issue.is_ok() {
+                store.close().await.unwrap();
+                break;
+            }
+            atteints += 1;
+            store.close().await.unwrap();
+            drop(store);
+            let store = reouvrir(dir.path(), "delete", k).await;
+            store.delete_note(a.id).await.unwrap();
+            assert!(store.get_note(a.id).await.unwrap().is_none(), "k={k}");
+            store.close().await.unwrap();
+        }
+
+        // update: the fields are written one by one.
+        for k in 1..=10 {
+            let (store, _p, a, _b) = fixture(dir.path(), "update", k).await;
+            store.interrompre_au_prochain(Interruption::ApresEtape(k));
+            let issue = store
+                .update_note(
+                    a.id,
+                    Some("nouveau".into()),
+                    Some(NoteImportance::Critical),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            if issue.is_ok() {
+                store.close().await.unwrap();
+                break;
+            }
+            atteints += 1;
+            store.close().await.unwrap();
+            drop(store);
+            let store = reouvrir(dir.path(), "update", k).await;
+            store
+                .update_note(
+                    a.id,
+                    Some("nouveau".into()),
+                    Some(NoteImportance::Critical),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let v = store.get_note(a.id).await.unwrap().unwrap();
+            assert_eq!(
+                (v.content.as_str(), v.importance),
+                ("nouveau", NoteImportance::Critical),
+                "k={k}"
+            );
+            store.close().await.unwrap();
+        }
+
+        // confirm: the freshness clock and the signature, field by field.
+        for k in 1..=12 {
+            let (store, _p, a, _b) = fixture(dir.path(), "confirm", k).await;
+            store.interrompre_au_prochain(Interruption::ApresEtape(k));
+            let issue = store.confirm_note(a.id, "alice").await;
+            if issue.is_ok() {
+                store.close().await.unwrap();
+                break;
+            }
+            atteints += 1;
+            store.close().await.unwrap();
+            drop(store);
+            let store = reouvrir(dir.path(), "confirm", k).await;
+            let v = store.confirm_note(a.id, "alice").await.unwrap().unwrap();
+            assert_eq!(v.human_confirmed_by.as_deref(), Some("alice"), "k={k}");
+            assert_eq!(v.staleness_score, 0.0, "k={k}");
+            store.close().await.unwrap();
+        }
+
+        // link: the edge is created, then its three properties. A crash after the edge
+        // leaves a link with no hashes; the retry gives it its hashes (no duplicate edge).
+        for k in 1..=6 {
+            let (store, _p, a, b) = fixture(dir.path(), "link", k).await;
+            store.interrompre_au_prochain(Interruption::ApresEtape(k));
+            let issue = store
+                .link_note_to_entity(
+                    a.id,
+                    &EntityType::Note,
+                    &b.id.to_string(),
+                    Some("sig"),
+                    Some("body"),
+                )
+                .await;
+            if issue.is_ok() {
+                store.close().await.unwrap();
+                break;
+            }
+            atteints += 1;
+            store.close().await.unwrap();
+            drop(store);
+            let store = reouvrir(dir.path(), "link", k).await;
+            store
+                .link_note_to_entity(
+                    a.id,
+                    &EntityType::Note,
+                    &b.id.to_string(),
+                    Some("sig"),
+                    Some("body"),
+                )
+                .await
+                .unwrap();
+            let anchors = store.get_note_anchors(a.id).await.unwrap();
+            assert_eq!(anchors.len(), 1, "one link after the retry, k={k}");
+            assert_eq!(anchors[0].signature_hash.as_deref(), Some("sig"), "k={k}");
+            store.close().await.unwrap();
+        }
+        // supersede 4, rescope 2, delete 2, update 3, confirm 8, link 3 writes.
+        assert_eq!(atteints, 22, "the crash points were reached");
+    }
+
+    /// An id whose node is on disk but unreadable at open is reserved: a new note may not
+    /// take it (two nodes would share an id).
+    #[tokio::test]
+    async fn an_id_on_disk_but_unreadable_is_reserved_for_notes() {
+        use project_orchestrator::neo4j::traits::NoteStore;
+        use project_orchestrator::notes::{Note, NoteType};
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        store.close().await.unwrap();
+        drop(store);
+        let id = Uuid::new_v4();
+        // A Note node with an id and no `created_at`: unreadable at open, so quarantined.
+        write_foreign(&base, move |db| {
+            db.create_node_with_props(
+                &["Note"],
+                vec![
+                    ("id", Value::from(id.to_string())),
+                    ("status", Value::from("active")),
+                    ("note_type", Value::from("tip")),
+                    ("content", Value::from("illisible")),
+                    ("created_by", Value::from("alice")),
+                ],
+            );
+        })
+        .await;
+        let store = open(&base).await;
+        assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+        let mut n = Note::new(None, NoteType::Tip, "nouvelle".into(), "alice".into());
+        n.id = id;
+        let err = store.create_note(&n).await.unwrap_err();
+        assert!(format!("{err:#}").contains("réservé"), "{err:#}");
+        assert!(store.get_note(id).await.unwrap().is_none());
+    }
+
+    /// A base with links to a domain this backend does not port: the anchors of that note
+    /// are a named refusal, not a silently short list.
+    #[tokio::test]
+    async fn anchors_are_refused_by_name_when_the_base_links_to_an_unported_domain() {
+        use project_orchestrator::neo4j::traits::NoteStore;
+        use project_orchestrator::notes::{Note, NoteType};
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let n = Note::new(
+            None,
+            NoteType::Tip,
+            "liée à un fichier".into(),
+            "alice".into(),
+        );
+        store.create_note(&n).await.unwrap();
+        let autre = Note::new(None, NoteType::Tip, "sans lien".into(), "alice".into());
+        store.create_note(&autre).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+        let id = n.id;
+        write_foreign(&base, move |db| {
+            let noeud = db.find_nodes_by_property("id", &Value::from(id.to_string()))[0];
+            let fichier = db.create_node(&["File"]);
+            db.set_node_property(fichier, "path", Value::from("/src/lib.rs"));
+            db.create_edge(noeud, fichier, "LINKED_TO");
+        })
+        .await;
+        let store = open(&base).await;
+        assert_eq!(
+            not_ported(store.get_note_anchors(id).await),
+            NonPorte("NoteStore::get_note_anchors")
+        );
+        assert!(store.get_note_anchors(autre.id).await.unwrap().is_empty());
+    }
+
+    /// Entity ids of a ported type must be canonical: two spellings of one node would be
+    /// two links. Refused by name, before any write.
+    #[tokio::test]
+    async fn non_canonical_entity_ids_are_refused_before_any_write() {
+        use project_orchestrator::neo4j::traits::NoteStore;
+        use project_orchestrator::notes::{EntityType, Note, NoteType};
+        let store = temporary(Durabilite::Wal).await;
+        let p = a_project("canonique");
+        store.create_project(&p).await.unwrap();
+        let n = Note::new(Some(p.id), NoteType::Tip, "x".into(), "alice".into());
+        store.create_note(&n).await.unwrap();
+        let majuscules = p.id.to_string().to_uppercase();
+        for err in [
+            store
+                .link_note_to_entity(n.id, &EntityType::Project, &majuscules, None, None)
+                .await
+                .unwrap_err(),
+            store
+                .unlink_note_from_entity(n.id, &EntityType::Project, &majuscules)
+                .await
+                .unwrap_err(),
+            store
+                .get_notes_for_entity(&EntityType::Project, &majuscules)
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(format!("{err:#}").contains("non canonique"), "{err:#}");
+        }
+        assert!(store.get_note_anchors(n.id).await.unwrap().is_empty());
+        // The canonical spelling twice: one link.
+        for _ in 0..2 {
+            store
+                .link_note_to_entity(n.id, &EntityType::Project, &p.id.to_string(), None, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.get_note_anchors(n.id).await.unwrap().len(), 1);
+    }
+
+    /// A non-finite value of a sort key is refused at creation: NaN has no place in a total order.
+    #[tokio::test]
+    async fn a_non_finite_sort_key_is_refused_at_creation() {
+        use project_orchestrator::neo4j::traits::NoteStore;
+        use project_orchestrator::notes::{Note, NoteType};
+        let store = temporary(Durabilite::Wal).await;
+        let mut n = Note::new(None, NoteType::Tip, "nan".into(), "alice".into());
+        n.staleness_score = f64::NAN;
+        let err = store.create_note(&n).await.unwrap_err();
+        assert!(format!("{err:#}").contains("non fini"), "{err:#}");
+        assert!(store.get_note(n.id).await.unwrap().is_none());
     }
 
     /// The generator skips nothing: every `async fn` of the two contracts is
@@ -1521,29 +2075,34 @@ mod with_the_feature {
             in_contracts
         );
 
-        // The ported domains: ProjectStore (nine methods), WorkspaceStore (45, of which
-        // ten are refused by name), and the two of GraphStore.
+        // ProjectStore's nine methods, WorkspaceStore (45, of which ten are refused by
+        // name), the 41 of NoteStore (13 ported, 28 refused by name), plus the two of
+        // GraphStore.
         let domains: std::collections::BTreeSet<&str> = written
             .iter()
             .map(|m| m.split("::").next().unwrap())
             .collect();
         assert_eq!(
             domains.into_iter().collect::<Vec<_>>(),
-            ["GraphStore", "ProjectStore", "WorkspaceStore"]
+            ["GraphStore", "NoteStore", "ProjectStore", "WorkspaceStore"]
         );
         // ProjectStore's nine methods and WorkspaceStore's 35 that serve (its 10
         // refusals are written by hand and listed as such).
         let servent = methodes_qui_servent();
-        assert_eq!(servent.len(), 44, "{servent:?}");
-        assert!(servent
-            .iter()
-            .all(|m| m.starts_with("ProjectStore::") || m.starts_with("WorkspaceStore::")));
+        // ProjectStore's nine, WorkspaceStore's 35 that serve, and the thirteen ported
+        // NoteStore methods.
+        assert_eq!(servent.len(), 57, "{servent:?}");
+        assert!(servent.iter().all(|m| m.starts_with("ProjectStore::")
+            || m.starts_with("WorkspaceStore::")
+            || m.starts_with("NoteStore::")));
         // The written refusals are written, and are not counted as serving.
         assert_eq!(
             REFUS_ECRITS_A_LA_MAIN.len(),
             11,
             "{REFUS_ECRITS_A_LA_MAIN:?}"
         );
+        assert_eq!(refusees_note().len(), 28);
+        assert!(refusees_note().iter().all(|m| written.contains(m)));
         assert!(REFUS_ECRITS_A_LA_MAIN.iter().all(|m| written.contains(m)));
         // What keeps a default is known and justified where it is declared.
         assert_eq!(kept, ["AnalyticsStore::run_data_migrations"]);
