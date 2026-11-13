@@ -21,7 +21,11 @@
 //! node of [`NoteStore`](crate::neo4j::traits::NoteStore) (`note.rs`: 13 of its 41
 //! methods; the others are refused by name there), and the node part of
 //! [`FederationStore`](crate::neo4j::traits::FederationStore)
-//! (`federation.rs`: the five relation writes and the two backfills are refused by name).
+//! (`federation.rs`: the five relation writes and the two backfills are refused by name),
+//! and part of [`CodeStore`](crate::neo4j::traits::CodeStore) (`code.rs`: 6 of its 85
+//! methods — the link and the deletions of files, three project switches; the file
+//! writes and reads, the symbols, their edges, the processes and the graph analytics are
+//! refused by name there, the file domain until the symbol writes are ported).
 //!
 //! # How obrain is used
 //!
@@ -71,6 +75,7 @@
 
 mod auth;
 mod chat;
+mod code;
 mod federation;
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
@@ -147,6 +152,14 @@ pub fn refusees_plan() -> &'static [&'static str] {
     plan::REFUSEES
 }
 
+/// The methods of `CodeStore` refused on every call, as `CodeStore::<method>`
+/// (`code.rs`): symbols, their edges, processes, graph analytics, `CO_CHANGED`,
+/// and the file domain (its two writes, which would store a hash before the refused
+/// symbols, and its eight reads, which would answer empty on a base nothing can fill).
+pub fn refusees_code() -> &'static [&'static str] {
+    code::REFUSEES
+}
+
 /// The hand-written methods that REFUSE: `GraphStore::get_progress_batch` (its
 /// contract default loops over getters of other domains), the five
 /// `FederationStore` methods whose relation writes and backfills are not ported
@@ -185,6 +198,7 @@ pub fn methodes_qui_servent() -> Vec<&'static str> {
                 && !note::REFUSEES.contains(m)
                 && !chat::REFUSEES.contains(m)
                 && !plan::REFUSEES.contains(m)
+                && !code::REFUSEES.contains(m)
                 && !m.starts_with("GraphStore::")
         })
         .collect()
@@ -296,6 +310,7 @@ struct Etat {
     notes: note::IndexNotes,
     chat: chat::IndexChat,
     federation: federation::IndexFederation,
+    code: code::IndexCode,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -618,6 +633,7 @@ impl ObrainGraphStore {
             })?;
         rapport.brouillons_supprimes += brouillons;
         rapport.en_quarantaine.extend(quarantaine);
+        let code = code::IndexCode::reconstruire(&db, &projets, &mut rapport);
         let etat = Etat {
             projets,
             plans,
@@ -627,6 +643,7 @@ impl ObrainGraphStore {
             notes,
             chat,
             federation,
+            code,
         };
         let store = Self {
             interne: Arc::new(Interne {

@@ -735,4 +735,34 @@ impl ObrainGraphStore {
         )
         .await
     }
+
+    /// Set (or clear, with `None`) one property of a project, as the Neo4j
+    /// `MATCH … SET` / `REMOVE`: a missing project is a silent no-op. Used by the
+    /// code domain for the three project switches the contract keeps there.
+    pub(super) async fn modifier_propriete_projet(
+        &self,
+        id: Uuid,
+        cle: &'static str,
+        valeur: Option<Value>,
+    ) -> Result<()> {
+        self.ecrire(
+            || (),
+            move |(), w: &mut Ecriture<'_>| {
+                let Some(noeud) = w.index()?.projets.par_id.get(&id).map(|e| e.noeud) else {
+                    return Ok(());
+                };
+                match valeur {
+                    Some(v) => w.db.set_node_property(noeud, cle, v),
+                    None => {
+                        w.db.remove_node_property(noeud, cle);
+                    }
+                }
+                let entree = w.apres_ecriture(Entree::decoder(w.db, noeud))?;
+                w.rendre_durable()?;
+                w.index_mut()?.projets.par_id.insert(id, entree);
+                Ok(())
+            },
+        )
+        .await
+    }
 }
