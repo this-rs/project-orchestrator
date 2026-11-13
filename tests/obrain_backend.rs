@@ -98,9 +98,9 @@ mod with_the_feature {
     use project_orchestrator::neo4j::traits::*;
     use project_orchestrator::obrain::{
         defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees,
-        refusees_note, refusees_release, Creation, Durabilite, Interruption, NonPorte,
-        ObrainGraphStore, ObrainSearchStore, RapportOuverture, MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN,
-        SCHEMA_PO,
+        refusees_note, refusees_plan, refusees_release, Creation, Durabilite, Interruption,
+        NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture, MARQUEUR_PO,
+        REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -2076,11 +2076,11 @@ mod with_the_feature {
             in_contracts
         );
 
-        // ProjectStore's nine methods, WorkspaceStore (45, of which ten are refused by
-        // name), the 41 of NoteStore (13 ported, 28 refused by name), the 41 of
-        // ReleaseStore (23 ported, 18 refused by name), the 17 of AuthStore (all ported),
-        // the ten served methods of FederationStore (five more are refused by name),
-        // plus the two of GraphStore.
+        // ProjectStore's nine methods, the 54 of PlanStore (nine serve, 45 are refused
+        // by name), WorkspaceStore (45, of which ten are refused by name), the 41 of
+        // NoteStore (13 ported, 28 refused by name), the 41 of ReleaseStore (23 ported,
+        // 18 refused by name), the 17 of AuthStore (all ported), the ten served methods
+        // of FederationStore (five more are refused by name), plus the two of GraphStore.
         let domains: std::collections::BTreeSet<&str> = written
             .iter()
             .map(|m| m.split("::").next().unwrap())
@@ -2092,6 +2092,7 @@ mod with_the_feature {
                 "FederationStore",
                 "GraphStore",
                 "NoteStore",
+                "PlanStore",
                 "ProjectStore",
                 "ReleaseStore",
                 "WorkspaceStore"
@@ -2102,14 +2103,16 @@ mod with_the_feature {
         let servent = methodes_qui_servent();
         // ProjectStore's nine, WorkspaceStore's 35 that serve, the thirteen ported
         // NoteStore methods, the twenty-three ReleaseStore methods that serve, the
-        // seventeen AuthStore methods, and the ten served FederationStore methods.
-        assert_eq!(servent.len(), 107, "{servent:?}");
+        // seventeen AuthStore methods, the ten served FederationStore methods, and the
+        // nine PlanStore methods that serve (its 45 refusals are in `plan::REFUSEES`).
+        assert_eq!(servent.len(), 116, "{servent:?}");
         assert!(servent.iter().all(|m| m.starts_with("ProjectStore::")
             || m.starts_with("WorkspaceStore::")
             || m.starts_with("NoteStore::")
             || m.starts_with("ReleaseStore::")
             || m.starts_with("AuthStore::")
-            || m.starts_with("FederationStore::")));
+            || m.starts_with("FederationStore::")
+            || m.starts_with("PlanStore::")));
         // The written refusals are written, and are not counted as serving.
         assert_eq!(
             REFUS_ECRITS_A_LA_MAIN.len(),
@@ -2120,6 +2123,8 @@ mod with_the_feature {
         assert!(refusees_note().iter().all(|m| written.contains(m)));
         assert_eq!(refusees_release().len(), 18);
         assert!(refusees_release().iter().all(|m| written.contains(m)));
+        assert_eq!(refusees_plan().len(), 45);
+        assert!(refusees_plan().iter().all(|m| written.contains(m)));
         assert!(REFUS_ECRITS_A_LA_MAIN.iter().all(|m| written.contains(m)));
         // What keeps a default is known and justified where it is declared.
         assert_eq!(kept, ["AnalyticsStore::run_data_migrations"]);

@@ -10,7 +10,9 @@
 //! its trait (an omitted method would silently inherit the contract's default).
 //!
 //! Ported so far: [`ProjectStore`](crate::neo4j::traits::ProjectStore)
-//! (`project.rs`), [`AuthStore`](crate::neo4j::traits::AuthStore) (`auth.rs`),
+//! (`project.rs`), the core of [`PlanStore`](crate::neo4j::traits::PlanStore)
+//! (`plan.rs`: no tasks, steps, constraints or day plan yet),
+//! [`AuthStore`](crate::neo4j::traits::AuthStore) (`auth.rs`),
 //! [`ReleaseStore`](crate::neo4j::traits::ReleaseStore)
 //! for releases, environments, deployments and milestones (`release.rs`), whose
 //! refusals (tasks, plans, commits) are listed in `release::REFUSEES`,
@@ -72,6 +74,7 @@ mod federation;
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
 mod note;
+mod plan;
 mod project;
 mod release;
 mod workspace;
@@ -129,6 +132,14 @@ pub fn refusees_release() -> &'static [&'static str] {
     release::REFUSEES
 }
 
+/// The methods of `PlanStore` refused on every call, as `PlanStore::<method>`
+/// (`plan.rs`): tasks, steps, constraints, the day plan, dependencies, the
+/// graphs and waves, the enrichment, and the HAS_PLAN links to several
+/// projects.
+pub fn refusees_plan() -> &'static [&'static str] {
+    plan::REFUSEES
+}
+
 /// The hand-written methods that REFUSE: `GraphStore::get_progress_batch` (its
 /// contract default loops over getters of other domains), the five
 /// `FederationStore` methods whose relation writes and backfills are not ported
@@ -165,6 +176,7 @@ pub fn methodes_qui_servent() -> Vec<&'static str> {
             !REFUS_ECRITS_A_LA_MAIN.contains(m)
                 && !release::REFUSEES.contains(m)
                 && !note::REFUSEES.contains(m)
+                && !plan::REFUSEES.contains(m)
                 && !m.starts_with("GraphStore::")
         })
         .collect()
@@ -265,6 +277,7 @@ struct Interne {
 #[derive(Default)]
 struct Etat {
     projets: project::IndexProjets,
+    plans: plan::IndexPlans,
     auth: auth::IndexAuth,
     releases: release::IndexReleases,
     espaces: workspace::IndexEspaces,
@@ -525,6 +538,10 @@ impl ObrainGraphStore {
         };
         let (projets, mut rapport) =
             project::IndexProjets::reconstruire(&db).with_context(contexte)?;
+        let (plans, brouillons, quarantaine) =
+            plan::IndexPlans::reconstruire(&db).with_context(contexte)?;
+        rapport.brouillons_supprimes += brouillons;
+        rapport.en_quarantaine.extend(quarantaine);
         let auth = auth::IndexAuth::reconstruire(&db, &mut rapport);
         let (releases, rapport_releases) =
             release::IndexReleases::reconstruire(&db).with_context(contexte)?;
@@ -547,6 +564,7 @@ impl ObrainGraphStore {
         rapport.en_quarantaine.extend(quarantaine);
         let etat = Etat {
             projets,
+            plans,
             auth,
             releases,
             espaces,
