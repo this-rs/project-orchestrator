@@ -842,12 +842,12 @@ impl NoteStore for ObrainGraphStore {
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeNoeud)?;
                 w.etape()?;
-                w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+                w.poser(noeud, BROUILLON, Value::from(true));
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeMarqueur)?;
                 for (k, (cle, valeur)) in proprietes.into_iter().enumerate() {
                     w.etape()?;
-                    w.db.set_node_property(noeud, cle, valeur);
+                    w.poser(noeud, cle, valeur);
                     #[cfg(any(test, feature = "mock-store"))]
                     w.point(Interruption::ApresLaPropriete(k + 1))?;
                 }
@@ -899,22 +899,22 @@ impl NoteStore for ObrainGraphStore {
                 let noeud = ancienne.noeud;
                 let maj = Utc::now();
                 w.etape()?;
-                w.db.set_node_property(noeud, "updated_at", Value::from(maj.to_rfc3339()));
+                w.poser(noeud, "updated_at", Value::from(maj.to_rfc3339()));
                 if let Some(c) = &content {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "content", Value::from(c.clone()));
+                    w.poser(noeud, "content", Value::from(c.clone()));
                 }
                 if let Some(i) = importance {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "importance", Value::from(i.to_string()));
+                    w.poser(noeud, "importance", Value::from(i.to_string()));
                 }
                 if let Some(s) = status {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "status", Value::from(s.to_string()));
+                    w.poser(noeud, "status", Value::from(s.to_string()));
                 }
                 if let Some(t) = &tags {
                     w.etape()?;
-                    w.db.set_node_property(
+                    w.poser(
                         noeud,
                         "tags",
                         Value::List(
@@ -927,7 +927,7 @@ impl NoteStore for ObrainGraphStore {
                 }
                 if let Some(s) = staleness {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "staleness_score", Value::from(s));
+                    w.poser(noeud, "staleness_score", Value::from(s));
                 }
                 let entree = Self::relire(w, &ancienne)?;
                 w.rendre_durable()?;
@@ -970,7 +970,7 @@ impl NoteStore for ObrainGraphStore {
                 match project_id {
                     Some(p) => {
                         w.etape()?;
-                        w.db.set_node_property(noeud, "project_id", Value::from(p.to_string()))
+                        w.poser(noeud, "project_id", Value::from(p.to_string()))
                     }
                     None => {
                         w.etape()?;
@@ -1156,15 +1156,11 @@ impl NoteStore for ObrainGraphStore {
                     None => w.db.create_edge(e.noeud, noeud_cible, LIEN),
                 };
                 w.etape()?;
-                w.db.set_edge_property(arete, "signature_hash", Value::from(signature.clone()));
+                w.poser_arete(arete, "signature_hash", Value::from(signature.clone()));
                 w.etape()?;
-                w.db.set_edge_property(arete, "body_hash", Value::from(corps.clone()));
+                w.poser_arete(arete, "body_hash", Value::from(corps.clone()));
                 w.etape()?;
-                w.db.set_edge_property(
-                    arete,
-                    "last_verified",
-                    Value::from(maintenant.to_rfc3339()),
-                );
+                w.poser_arete(arete, "last_verified", Value::from(maintenant.to_rfc3339()));
                 let lien = Lien {
                     entite: entite.clone(),
                     id_entite: id_entite.clone(),
@@ -1366,15 +1362,15 @@ impl NoteStore for ObrainGraphStore {
                     return Ok(());
                 };
                 w.etape()?;
-                w.db.set_node_property(vieille.noeud, "status", Value::from("archived"));
+                w.poser(vieille.noeud, "status", Value::from("archived"));
                 w.etape()?;
-                w.db.set_node_property(
+                w.poser(
                     vieille.noeud,
                     "superseded_by",
                     Value::from(new_note_id.to_string()),
                 );
                 w.etape()?;
-                w.db.set_node_property(
+                w.poser(
                     nouvelle.noeud,
                     "supersedes",
                     Value::from(old_note_id.to_string()),
@@ -1426,34 +1422,34 @@ impl NoteStore for ObrainGraphStore {
                         .any(|(_, a)| w.db.get_edge(a).is_some_and(|x| &*x.edge_type == SUCCEDE));
                 let maintenant = Utc::now();
                 w.etape()?;
-                w.db.set_node_property(
+                w.poser(
                     noeud,
                     "last_confirmed_at",
                     Value::from(maintenant.to_rfc3339()),
                 );
                 w.etape()?;
-                w.db.set_node_property(noeud, "last_confirmed_by", Value::from(par.clone()));
+                w.poser(noeud, "last_confirmed_by", Value::from(par.clone()));
                 if par_humain {
                     w.etape()?;
-                    w.db.set_node_property(
+                    w.poser(
                         noeud,
                         "human_confirmed_at",
                         Value::from(maintenant.to_rfc3339()),
                     );
                     w.etape()?;
-                    w.db.set_node_property(noeud, "human_confirmed_by", Value::from(par.clone()));
+                    w.poser(noeud, "human_confirmed_by", Value::from(par.clone()));
                 }
                 w.etape()?;
-                w.db.set_node_property(noeud, "staleness_score", Value::from(0.0_f64));
+                w.poser(noeud, "staleness_score", Value::from(0.0_f64));
                 if !remplacee {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "status", Value::from("active"));
+                    w.poser(noeud, "status", Value::from("active"));
                     let energie = e.note.energy + 0.3;
                     w.etape()?;
-                    w.db.set_node_property(noeud, "energy", Value::from(energie.min(1.0)));
+                    w.poser(noeud, "energy", Value::from(energie.min(1.0)));
                 }
                 w.etape()?;
-                w.db.set_node_property(
+                w.poser(
                     noeud,
                     "last_activated",
                     Value::from(maintenant.to_rfc3339()),

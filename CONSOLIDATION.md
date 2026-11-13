@@ -105,7 +105,7 @@ Mesuré sur le premier lot (#1171, bases 0 / 1 M / 5 M, opt-level 3) : `get_proj
 
 Après le retrait du flush complet par écriture (cette PR, obrain `e5648dbf`) : une valeur > 256 o paie le MÊME fsync WAL qu'une valeur ≤ 256 o — mesuré en debug sur 10 k nœuds / 20 k arêtes, `create_blob_p50` = 4,3 ms contre `create_wal_p50` = 5,2 ms, là où le pas « flush complet après chaque écriture » (`create_flush_complet_p50`) reste à 40,7 ms. Le test `a_write_past_the_blob_threshold_pays_no_full_flush` verrouille l'égalité des fsyncs (rouge sans le correctif, vert avec), et `kill9_during_creations…` rejoue les descriptions longues depuis le WAL.
 
-Mesuré sur `main` d'obrain (`c4b6ada9`) : `MATCH (n) WITH n.p AS p, count(*) AS c RETURN p, c` échoue en Cypher (`Undefined variable 'p'`) et passe en GQL ; un second `MATCH` dont la cible est déjà liée rend 36 lignes au lieu de 14 en Cypher. Tant que #108 et ses suites ne sont pas fusionnées, le backend obrain de PO passe par l'API Rust ou par des requêtes simples.
+Mesuré sur `main` d'obrain (`c4b6ada9`) : `MATCH (n) WITH n.p AS p, count(*) AS c RETURN p, c` échoue en Cypher (`Undefined variable 'p'`) et passe en GQL ; un second `MATCH` dont la cible est déjà liée rend 36 lignes au lieu de 14 en Cypher. #108 et ses suites #119 et #121 sont fusionnées sur `main` d'obrain et incluses dans l'épingle `e5648dbf` (de même que #99, #115 et #118 ; #117 n'y est pas) ; ces deux mesures n'ont PAS été refaites à `e5648dbf`, et les réserves de relecture notées plus haut sur #119/#121 n'ont pas été re-vérifiées. Le backend obrain de PO passe donc toujours par l'API Rust, jamais par une requête, jusqu'à un lot qui mesure les requêtes dont il a besoin.
 
 ## Migration des données : ce qui est établi
 

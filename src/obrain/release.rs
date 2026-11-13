@@ -505,9 +505,9 @@ fn creer_noeud(
     proprietes: Vec<(&'static str, Value)>,
 ) -> Result<NodeId> {
     let noeud = w.db.create_node(&[etiquette]);
-    w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+    w.poser(noeud, BROUILLON, Value::from(true));
     for (cle, valeur) in proprietes {
-        w.db.set_node_property(noeud, cle, valeur);
+        w.poser(noeud, cle, valeur);
     }
     w.db.remove_node_property(noeud, BROUILLON);
     Ok(noeud)
@@ -516,7 +516,7 @@ fn creer_noeud(
 /// Overwrite some properties of an existing node.
 fn ecrire_champs(w: &mut Ecriture<'_>, noeud: NodeId, champs: Vec<(&'static str, Value)>) {
     for (cle, valeur) in champs {
-        w.db.set_node_property(noeud, cle, valeur);
+        w.poser(noeud, cle, valeur);
     }
 }
 

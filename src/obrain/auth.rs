@@ -422,9 +422,9 @@ fn creer_noeud(
     proprietes: Vec<(&'static str, Value)>,
 ) -> Result<NodeId> {
     let noeud = w.db.create_node(&[etiquette]);
-    w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+    w.poser(noeud, BROUILLON, Value::from(true));
     for (cle, valeur) in proprietes {
-        w.db.set_node_property(noeud, cle, valeur);
+        w.poser(noeud, cle, valeur);
     }
     w.db.remove_node_property(noeud, BROUILLON);
     Ok(noeud)
@@ -432,7 +432,7 @@ fn creer_noeud(
 
 /// Set one property of an existing node.
 fn poser(w: &mut Ecriture<'_>, noeud: NodeId, cle: &'static str, valeur: Value) {
-    w.db.set_node_property(noeud, cle, valeur);
+    w.poser(noeud, cle, valeur);
 }
 
 /// Upsert under the writer lock: MERGE on the provider key, ON MATCH or ON CREATE.
@@ -522,7 +522,7 @@ fn fusionner_utilisateur(w: &mut Ecriture<'_>, u: UserNode) -> Result<UserNode> 
 
 /// Set `revoked = true` on a refresh token, make it durable, publish it.
 fn revoquer_jeton(w: &mut Ecriture<'_>, hash: &str, noeud: NodeId) -> Result<()> {
-    w.db.set_node_property(noeud, "revoked", Value::from(true));
+    w.poser(noeud, "revoked", Value::from(true));
     let entree = w.apres_ecriture(entree_jeton(w.db, noeud))?;
     w.rendre_durable()?;
     w.index_mut()?.auth.jetons.insert(hash.to_string(), entree);
@@ -531,7 +531,7 @@ fn revoquer_jeton(w: &mut Ecriture<'_>, hash: &str, noeud: NodeId) -> Result<()>
 
 /// Set `revoked = true` on an MCP token, make it durable, publish it.
 fn revoquer_mcp(w: &mut Ecriture<'_>, jti: &str, noeud: NodeId) -> Result<()> {
-    w.db.set_node_property(noeud, "revoked", Value::from(true));
+    w.poser(noeud, "revoked", Value::from(true));
     let entree = w.apres_ecriture(entree_mcp(w.db, noeud))?;
     w.rendre_durable()?;
     w.index_mut()?.auth.mcp.insert(jti.to_string(), entree);
@@ -785,7 +785,7 @@ impl AuthStore for ObrainGraphStore {
                     return Ok(0);
                 }
                 for (_, noeud) in &actifs {
-                    w.db.set_node_property(*noeud, "revoked", Value::from(true));
+                    w.poser(*noeud, "revoked", Value::from(true));
                 }
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;

@@ -36,12 +36,30 @@
 //!   from. Since obrain #123, a value above 256 bytes — a `String`, a `Bytes`, or
 //!   a bincode-encoded `List`/`Map`/`Path` — is journaled in the WAL WITH its
 //!   value (`BlobColumnWrite`/`BlobColumnClear` frames) and replayed on reopen,
-//!   so a write that carries one no longer pays the full flush per write: the
-//!   full flush (`commit_wal`) runs every [`FLUSH_COMPLET_TOUS_LES`] writes and
-//!   at close, to bound the WAL a restart replays. Two classes are still NOT
-//!   recovered by the WAL, documented as obrain limits and never written by this
-//!   backend: a `Value::Vector` (its `VecColumnWrite` frame carries no value) and
-//!   a blob value above obrain's `BLOB_WAL_MAX_BYTES` (32 MiB). The fsync is
+//!   so a write that carries one no longer pays the full flush per write. The
+//!   full flush (`commit_wal`) runs every [`FLUSH_COMPLET_TOUS_LES`] writes, once
+//!   [`FLUSH_COMPLET_APRES_OCTETS`] bytes of values have been written since the
+//!   last one, and at close: it bounds the WAL a restart replays (obrain
+//!   truncates its WAL only inside a full flush).
+//! - Two classes of value are still NOT recovered by obrain's WAL: a
+//!   `Value::Vector` (its `VecColumnWrite` frame carries no value) and a blob
+//!   value above obrain's `BLOB_WAL_MAX_BYTES` (32 MiB, [`PLAFOND_WAL_OBRAIN`]).
+//!   Every property write of a write closure goes through ONE point,
+//!   `Ecriture::poser` / `Ecriture::poser_arete` (a source scan in this module's
+//!   tests forbids a direct `set_node_property` / `set_edge_property` elsewhere),
+//!   and that point runs the full flush RIGHT AFTER writing such a value, before
+//!   anything else the closure writes (the draft marker's removal, a later
+//!   property): the value is on disk before the write can be acknowledged or
+//!   look committed. A full flush rather than a refusal because obrain's direct
+//!   API has no rollback: a refusal in the middle of a closure would leave the
+//!   properties written before it applied and unacknowledged.
+//! - **Known limit, obrain's, not closed here**: when obrain fails to APPEND a
+//!   value's frame to the WAL (`BlobColumnWrite`, or the inline `PropSetInline`),
+//!   it logs the failure (`tracing::error!`) and returns normally; the next
+//!   `flush_wal` fsyncs what was appended and returns `Ok`. The write is then
+//!   acknowledged by this backend while its value would not survive a kill
+//!   before the next full flush. obrain keeps no error on its writer for the
+//!   next fsync to return (obrain-db/obrain#161). The fsync itself is
 //!   proved by obrain's own counter (`wal_fsyncs`); what a power cut does to an
 //!   acknowledged write is obrain's guarantee, not re-proved here.
 //! - obrain addresses a node by an internal `NodeId`; the domain addresses it
@@ -85,6 +103,7 @@ use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use obrain_common::types::{EdgeId, NodeId, Value};
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
@@ -179,6 +198,58 @@ pub fn defauts_conserves() -> &'static [&'static str] {
 /// WAL fsync: it bounds how much WAL a restart has to replay.
 pub const FLUSH_COMPLET_TOUS_LES: u64 = 256;
 
+/// A full flush as well once this many bytes of property values have been
+/// written since the last one: [`FLUSH_COMPLET_TOUS_LES`] counts writes, and 256
+/// writes of 30 MiB values would otherwise leave gigabytes of WAL for a restart
+/// to replay (obrain measures ~3 ms per MiB replayed at open). Counted by
+/// [`borne_encodee`], an upper bound of what each value weighs in a frame.
+pub const FLUSH_COMPLET_APRES_OCTETS: u64 = 64 * 1024 * 1024;
+
+/// obrain's `BLOB_WAL_MAX_BYTES` (`obrain-substrate/src/store.rs`, rev pinned in
+/// `Cargo.toml`): a blob value whose tagged encoding (one type byte, then the
+/// bytes) is LONGER than this is written to its column but not journaled. Not
+/// re-exported by `obrain-engine`, hence mirrored; a pin bump re-reads it.
+pub const PLAFOND_WAL_OBRAIN: usize = 32 * 1024 * 1024;
+
+/// An upper bound of the bytes `valeur` weighs once encoded by obrain: the tagged
+/// blob for a `String`/`Bytes` (exact: one type byte and the bytes), and a bound
+/// of the bincode varint encoding for the others (each length or variant prefix
+/// counted at its widest). Over-counting only brings a full flush forward.
+pub fn borne_encodee(valeur: &Value) -> usize {
+    fn bincode(v: &Value) -> usize {
+        // Variant index: a varint u32, at most 5 bytes. A length: a varint u64, at
+        // most 10. A fixed-width scalar (temporals measured at 9 to 29 bytes): 32.
+        5 + match v {
+            Value::String(s) => 10 + s.len(),
+            Value::Bytes(b) => 10 + b.len(),
+            Value::List(l) => 10 + l.iter().map(bincode).sum::<usize>(),
+            Value::Map(m) => {
+                10 + m
+                    .iter()
+                    .map(|(k, x)| 10 + k.as_str().len() + bincode(x))
+                    .sum::<usize>()
+            }
+            Value::Path { nodes, edges } => {
+                20 + nodes.iter().chain(edges.iter()).map(bincode).sum::<usize>()
+            }
+            Value::Vector(x) => 10 + 4 * x.len(),
+            _ => 32,
+        }
+    }
+    match valeur {
+        Value::String(s) => 1 + s.len(),
+        Value::Bytes(b) => 1 + b.len(),
+        autre => 1 + bincode(autre),
+    }
+}
+
+/// Whether obrain's WAL would NOT recover `valeur` after a kill: a vector (its
+/// frame carries no value), or a blob longer than [`PLAFOND_WAL_OBRAIN`]. Exact
+/// for a `String`/`Bytes`, conservative for a bincode-encoded value.
+pub fn hors_du_wal(valeur: &Value) -> bool {
+    matches!(valeur, Value::Vector(_)) || borne_encodee(valeur) > PLAFOND_WAL_OBRAIN
+}
+
 /// What makes a write durable, once per write. In a production build only the WAL
 /// fsync exists; the test builds add the measures' and the tests' variants
 /// (`mesure.rs`).
@@ -241,6 +312,12 @@ struct Interne {
     /// The last durability step failed: what is on disk is unknown.
     indetermine: AtomicBool,
     ecritures: AtomicU64,
+    /// Bytes of property values written since the last full flush
+    /// ([`FLUSH_COMPLET_APRES_OCTETS`]).
+    octets_depuis_flush: AtomicU64,
+    /// Full flushes run by the write path (periodic, by bytes, or for a value the
+    /// WAL does not recover). Not the one of `close`.
+    flushs_complets: AtomicU64,
     durabilite: Durabilite,
     rapport: RapportOuverture,
     /// A test hook: the point where the next write stops (`mesure.rs`).
@@ -269,6 +346,9 @@ struct Ecriture<'a> {
     db: &'a ObrainDB,
     interne: &'a Interne,
     rendu_durable: bool,
+    /// The full flush run right after a value the WAL does not recover failed:
+    /// [`Ecriture::rendre_durable`] returns it, so the write is not acknowledged.
+    echec_flush_immediat: Option<String>,
     /// How many engine writes of this closure have been made (the test hook
     /// `Interruption::ApresEtape` counts them).
     #[cfg_attr(not(any(test, feature = "mock-store")), allow(dead_code))]
@@ -334,6 +414,60 @@ impl Ecriture<'_> {
         })
     }
 
+    /// THE point where a write closure sets a node property. Never call
+    /// `set_node_property` directly in a closure (the source scan of this
+    /// module's tests refuses it): this is where a value obrain's WAL does not
+    /// recover ([`hors_du_wal`]) is made durable by a full flush at once, and
+    /// where the bytes for [`FLUSH_COMPLET_APRES_OCTETS`] are counted.
+    fn poser(&mut self, noeud: NodeId, cle: &str, valeur: Value) {
+        let (octets, hors) = (borne_encodee(&valeur), hors_du_wal(&valeur));
+        self.db.set_node_property(noeud, cle, valeur);
+        self.apres_pose(octets, hors);
+    }
+
+    /// [`Ecriture::poser`] for an edge property.
+    fn poser_arete(&mut self, arete: EdgeId, cle: &str, valeur: Value) {
+        let (octets, hors) = (borne_encodee(&valeur), hors_du_wal(&valeur));
+        self.db.set_edge_property(arete, cle, valeur);
+        self.apres_pose(octets, hors);
+    }
+
+    fn apres_pose(&mut self, octets: usize, hors_du_wal: bool) {
+        self.interne
+            .octets_depuis_flush
+            .fetch_add(octets as u64, Ordering::Relaxed);
+        if !hors_du_wal || self.echec_flush_immediat.is_some() {
+            return;
+        }
+        let resultat = match self.interne.durabilite {
+            Durabilite::Wal => self.flush_complet(),
+            #[cfg(any(test, feature = "mock-store"))]
+            Durabilite::Complet | Durabilite::LenteAPourTest(_) => self.flush_complet(),
+            #[cfg(any(test, feature = "mock-store"))]
+            Durabilite::Aucune => Ok(()),
+            #[cfg(any(test, feature = "mock-store"))]
+            Durabilite::EchoueAPourTest => Err(obrain_common::utils::error::Error::Internal(
+                "échec injecté par le test".into(),
+            )),
+        };
+        if let Err(e) = resultat {
+            // The store is indeterminate from now on; the closure goes on (it has no
+            // rollback either way) and `rendre_durable` refuses to acknowledge.
+            self.interne.indetermine.store(true, Ordering::Release);
+            self.echec_flush_immediat = Some(format!(
+                "flush complet d'une valeur hors du WAL d'obrain : {e}"
+            ));
+        }
+    }
+
+    /// `commit_wal`, counted, and the byte counter reset.
+    fn flush_complet(&self) -> obrain_common::utils::error::Result<()> {
+        self.db.commit_wal()?;
+        self.interne.octets_depuis_flush.store(0, Ordering::Relaxed);
+        self.interne.flushs_complets.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Make what was written durable. Call it BEFORE publishing the write to
     /// readers when the write is a creation; [`ObrainGraphStore::ecrire`] calls
     /// it itself if the closure did not.
@@ -341,15 +475,26 @@ impl Ecriture<'_> {
         self.rendu_durable = true;
         let n = self.interne.ecritures.fetch_add(1, Ordering::Relaxed) + 1;
         let resultat = match self.interne.durabilite {
+            _ if self.echec_flush_immediat.is_some() => {
+                Err(obrain_common::utils::error::Error::Internal(
+                    self.echec_flush_immediat.clone().unwrap_or_default(),
+                ))
+            }
             Durabilite::Wal => {
                 let wal = self.db.flush_wal();
+                let octets = self.interne.octets_depuis_flush.load(Ordering::Relaxed);
                 match wal {
-                    Ok(()) if n.is_multiple_of(FLUSH_COMPLET_TOUS_LES) => self.db.commit_wal(),
+                    Ok(())
+                        if n.is_multiple_of(FLUSH_COMPLET_TOUS_LES)
+                            || octets >= FLUSH_COMPLET_APRES_OCTETS =>
+                    {
+                        self.flush_complet()
+                    }
                     autre => autre,
                 }
             }
             #[cfg(any(test, feature = "mock-store"))]
-            Durabilite::Complet => self.db.commit_wal(),
+            Durabilite::Complet => self.flush_complet(),
             #[cfg(any(test, feature = "mock-store"))]
             Durabilite::Aucune => Ok(()),
             #[cfg(any(test, feature = "mock-store"))]
@@ -533,6 +678,8 @@ impl ObrainGraphStore {
                 ferme: AtomicBool::new(false),
                 indetermine: AtomicBool::new(false),
                 ecritures: AtomicU64::new(0),
+                octets_depuis_flush: AtomicU64::new(0),
+                flushs_complets: AtomicU64::new(0),
                 durabilite,
                 rapport,
                 #[cfg(any(test, feature = "mock-store"))]
@@ -662,6 +809,7 @@ impl ObrainGraphStore {
                 db: &interne.db,
                 interne: &interne,
                 rendu_durable: false,
+                echec_flush_immediat: None,
                 etapes: 0,
             };
             let rendu = f(prepare, &mut ecriture)?;
@@ -800,5 +948,65 @@ impl neural_routing_runtime::TrajectoryStore for ObrainTrajectoryStore {
         _entities: &[neural_routing_runtime::TouchedEntity],
     ) -> neural_routing_runtime::routing_error::Result<()> {
         trajectoire_non_portee("TrajectoryStore::link_touched_entities_batch")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every property write of a write closure goes through `Ecriture::poser` /
+    /// `poser_arete`: a direct engine call would skip the full flush of a value
+    /// the WAL does not recover. The only exceptions are marked `hors-poser:`
+    /// on the line above, with their reason.
+    #[test]
+    fn every_property_write_goes_through_the_single_pass_point() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/obrain");
+        let mut fautes = Vec::new();
+        for entree in std::fs::read_dir(&dir).unwrap() {
+            let chemin = entree.unwrap().path();
+            let nom = chemin.file_name().unwrap().to_string_lossy().into_owned();
+            // `mod.rs` holds the pass point; `mesure.rs` is the test-only bulk loader.
+            if !nom.ends_with(".rs") || nom == "mod.rs" || nom == "mesure.rs" {
+                continue;
+            }
+            let texte = std::fs::read_to_string(&chemin).unwrap();
+            let lignes: Vec<&str> = texte.lines().collect();
+            for (i, ligne) in lignes.iter().enumerate() {
+                let code = ligne.split("//").next().unwrap_or("");
+                let ecrit = ["set_node_property(", "set_edge_property(", "_with_props("]
+                    .iter()
+                    .any(|m| code.contains(m));
+                let excuse = i > 0 && lignes[i - 1].trim_start().starts_with("// hors-poser:");
+                if ecrit && !excuse {
+                    fautes.push(format!("{nom}:{} {}", i + 1, ligne.trim()));
+                }
+            }
+        }
+        assert!(
+            fautes.is_empty(),
+            "property writes outside `Ecriture::poser`: {fautes:#?}"
+        );
+    }
+
+    #[test]
+    fn a_blob_is_out_of_the_wal_exactly_past_obrain_s_cap() {
+        // The tagged blob is one type byte, then the bytes: obrain journals it up
+        // to `BLOB_WAL_MAX_BYTES` included.
+        let au_plafond = Value::from("E".repeat(PLAFOND_WAL_OBRAIN - 1));
+        let au_dela = Value::from("E".repeat(PLAFOND_WAL_OBRAIN));
+        assert_eq!(borne_encodee(&au_plafond), PLAFOND_WAL_OBRAIN);
+        assert!(!hors_du_wal(&au_plafond));
+        assert!(hors_du_wal(&au_dela));
+        let octets: Vec<u8> = vec![7; PLAFOND_WAL_OBRAIN];
+        assert!(hors_du_wal(&Value::Bytes(octets.into())));
+        assert!(hors_du_wal(&Value::Vector(vec![0.5_f32; 3].into())));
+        assert!(!hors_du_wal(&Value::from("court")));
+        assert!(!hors_du_wal(&Value::from(42_i64)));
+        // A list is counted through its elements: past the cap together, out.
+        let moitie = Value::from("x".repeat(PLAFOND_WAL_OBRAIN / 2));
+        assert!(hors_du_wal(&Value::List(
+            vec![moitie.clone(), moitie].into()
+        )));
     }
 }

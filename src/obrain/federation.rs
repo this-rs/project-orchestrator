@@ -386,9 +386,9 @@ fn creer_noeud(
     proprietes: Vec<(&'static str, Value)>,
 ) -> Result<NodeId> {
     let noeud = w.db.create_node(&[etiquette]);
-    w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+    w.poser(noeud, BROUILLON, Value::from(true));
     for (cle, valeur) in proprietes {
-        w.db.set_node_property(noeud, cle, valeur);
+        w.poser(noeud, cle, valeur);
     }
     w.db.remove_node_property(noeud, BROUILLON);
     Ok(noeud)
@@ -572,8 +572,8 @@ impl FederationStore for ObrainGraphStore {
                     };
                     e.noeud
                 };
-                w.db.set_node_property(noeud, "status", Value::from(status));
-                w.db.set_node_property(noeud, "updated_at", Value::from(Utc::now().to_rfc3339()));
+                w.poser(noeud, "status", Value::from(status));
+                w.poser(noeud, "updated_at", Value::from(Utc::now().to_rfc3339()));
                 let entree = w.apres_ecriture(decoder_serveur(w.db, noeud))?;
                 w.rendre_durable()?;
                 w.index_mut()?.federation.inserer_serveur(entree);

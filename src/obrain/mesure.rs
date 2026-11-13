@@ -87,6 +87,15 @@ impl ObrainGraphStore {
         Self::ouvrir(dir.path().to_path_buf(), durabilite, true, Some(dir))
     }
 
+    /// How many full flushes (`commit_wal`) the write path has run since open:
+    /// periodic, by bytes, or right after a value obrain's WAL does not recover.
+    #[doc(hidden)]
+    pub fn flushs_complets(&self) -> u64 {
+        self.interne
+            .flushs_complets
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Arm an [`Interruption`]: the next write that reaches that point stops there.
     #[doc(hidden)]
     pub fn interrompre_au_prochain(&self, point: Interruption) {

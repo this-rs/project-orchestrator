@@ -240,11 +240,16 @@ impl IndexProjets {
                 || (!attendu.is_empty() && canonique.as_deref().unwrap_or("").is_empty());
             if dechire {
                 // Recomputed from `root_path`: the one value every state agrees on.
+                // Outside `Ecriture::poser` on purpose (repair at open, no write
+                // closure): two paths, far below obrain's WAL cap; made durable by
+                // the `flush_wal` that ends a repairing open.
+                // hors-poser: réparation d'ouverture
                 db.set_node_property(
                     noeud,
                     "canonical_path",
                     Value::from(canonical_root(Some(&projet.root_path))),
                 );
+                // hors-poser: réparation d'ouverture
                 db.set_node_property(noeud, "declared_path", Value::from(attendu));
                 rapport.chemins_repares += 1;
             }
@@ -383,11 +388,11 @@ impl ProjectStore for ObrainGraphStore {
                 let noeud = w.db.create_node(&[LABEL]);
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeNoeud)?;
-                w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+                w.poser(noeud, BROUILLON, Value::from(true));
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeMarqueur)?;
                 for (n, (cle, valeur)) in proprietes.into_iter().enumerate() {
-                    w.db.set_node_property(noeud, cle, valeur);
+                    w.poser(noeud, cle, valeur);
                     #[cfg(any(test, feature = "mock-store"))]
                     w.point(Interruption::ApresLaPropriete(n + 1))?;
                 }
@@ -478,23 +483,23 @@ impl ProjectStore for ObrainGraphStore {
                 // The engine writes: readers keep being served the previous value
                 // from the index until this write is durable.
                 if let Some(name) = name {
-                    w.db.set_node_property(noeud, "name", Value::from(name));
+                    w.poser(noeud, "name", Value::from(name));
                 }
                 if let Some(description) = description {
-                    w.db.set_node_property(
+                    w.poser(
                         noeud,
                         "description",
                         Value::from(description.unwrap_or_default()),
                     );
                 }
                 if let Some(profile) = profile {
-                    w.db.set_node_property(noeud, "profile", Value::from(profile.as_str()));
+                    w.poser(noeud, "profile", Value::from(profile.as_str()));
                 }
                 if let Some(trio) = chemins {
                     // `declared_path`, `canonical_path`, then `root_path` LAST: the
                     // commit point an interrupted update is recomputed from at open.
                     for (n, (cle, valeur)) in trio.into_iter().enumerate() {
-                        w.db.set_node_property(noeud, cle, valeur);
+                        w.poser(noeud, cle, valeur);
                         #[cfg(any(test, feature = "mock-store"))]
                         w.point(Interruption::ApresLeChemin(n + 1))?;
                     }
@@ -570,7 +575,7 @@ impl ObrainGraphStore {
                 let Some(noeud) = w.index()?.projets.par_id.get(&id).map(|e| e.noeud) else {
                     return Ok(());
                 };
-                w.db.set_node_property(noeud, cle, Value::from(Utc::now().to_rfc3339()));
+                w.poser(noeud, cle, Value::from(Utc::now().to_rfc3339()));
                 let entree = w.apres_ecriture(Entree::decoder(w.db, noeud))?;
                 w.rendre_durable()?;
                 w.index_mut()?.projets.par_id.insert(id, entree);

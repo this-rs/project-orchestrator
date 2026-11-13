@@ -99,8 +99,8 @@ mod with_the_feature {
     use project_orchestrator::obrain::{
         defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees,
         refusees_note, refusees_release, Creation, Durabilite, Interruption, NonPorte,
-        ObrainGraphStore, ObrainSearchStore, RapportOuverture, MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN,
-        SCHEMA_PO,
+        ObrainGraphStore, ObrainSearchStore, RapportOuverture, FLUSH_COMPLET_APRES_OCTETS,
+        MARQUEUR_PO, PLAFOND_WAL_OBRAIN, REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -596,6 +596,130 @@ mod with_the_feature {
         );
     }
 
+    /// A value obrain's WAL does not journal (a blob longer than its
+    /// `BLOB_WAL_MAX_BYTES`) pays ONE full flush, at the single pass point of a
+    /// property write — whichever domain writes it — and a value at the cap pays
+    /// none. Whether the value then survives a kill is
+    /// `kill9_after_a_value_past_obrain_s_wal_cap_keeps_it`.
+    #[tokio::test]
+    async fn a_value_past_obrain_s_wal_cap_pays_one_full_flush_and_one_at_the_cap_none() {
+        use project_orchestrator::notes::{Note, NoteType};
+        let store = temporary(Durabilite::Wal).await;
+        let p = a_project("cap");
+        store.create_project(&p).await.unwrap();
+        let f0 = store.flushs_complets();
+        // One type byte, then the bytes: `PLAFOND_WAL_OBRAIN - 1` bytes is AT the cap.
+        let au_plafond = "a".repeat(PLAFOND_WAL_OBRAIN - 1);
+        store
+            .update_project(p.id, None, Some(Some(au_plafond)), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.flushs_complets(),
+            f0,
+            "a journaled value: no full flush"
+        );
+        let au_dela = "E".repeat(PLAFOND_WAL_OBRAIN + 1);
+        store
+            .update_project(p.id, None, Some(Some(au_dela.clone())), None, None)
+            .await
+            .unwrap();
+        assert_eq!(store.flushs_complets(), f0 + 1, "32 MiB + 1 in a project");
+        let n = Note::new(Some(p.id), NoteType::Tip, au_dela, "cap".into());
+        store.create_note(&n).await.unwrap();
+        assert_eq!(store.flushs_complets(), f0 + 2, "32 MiB + 1 in a note");
+        store
+            .update_project(p.id, None, Some(Some("court".into())), None, None)
+            .await
+            .unwrap();
+        assert_eq!(store.flushs_complets(), f0 + 2, "a short value after: none");
+    }
+
+    /// [`FLUSH_COMPLET_TOUS_LES`] counts writes; a full flush also runs once
+    /// [`FLUSH_COMPLET_APRES_OCTETS`] bytes of values have been written since the
+    /// last one, and the count starts again from there.
+    #[tokio::test]
+    async fn a_full_flush_also_runs_once_enough_bytes_were_written_since_the_last_one() {
+        assert_eq!(FLUSH_COMPLET_APRES_OCTETS, 64 * 1024 * 1024);
+        let store = temporary(Durabilite::Wal).await;
+        let p = a_project("bytes");
+        store.create_project(&p).await.unwrap();
+        let f0 = store.flushs_complets();
+        // 30 MiB each: journaled (under the cap), and the third crosses 64 MiB.
+        let trente = 30 * 1024 * 1024;
+        let mut apres = Vec::new();
+        for c in ['a', 'b', 'c', 'd'] {
+            store
+                .update_project(
+                    p.id,
+                    None,
+                    Some(Some(c.to_string().repeat(trente))),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            apres.push(store.flushs_complets() - f0);
+        }
+        assert_eq!(
+            apres,
+            vec![0, 0, 1, 1],
+            "full flushes after each 30 MiB write: none until 64 MiB, one, then none"
+        );
+    }
+
+    /// The value past the cap is made durable before the write is acknowledged: a
+    /// child creates a project with a 32 MiB + 1 description and updates another
+    /// one to such a value, says so, and is killed with SIGKILL; the reopen (no
+    /// close, no flush by the child) reads both back whole.
+    #[tokio::test]
+    async fn kill9_after_a_value_past_obrain_s_wal_cap_keeps_it() {
+        let longueur = PLAFOND_WAL_OBRAIN + 1;
+        if let Ok(dir) = std::env::var(ENV_PLAFOND) {
+            let dir = std::path::PathBuf::from(dir);
+            let store = open(&dir.join("base")).await;
+            let mut a = a_project("created past the cap");
+            a.description = Some("A".repeat(longueur));
+            store.create_project(&a).await.unwrap();
+            let b = a_project("updated past the cap");
+            store.create_project(&b).await.unwrap();
+            store
+                .update_project(b.id, None, Some(Some("B".repeat(longueur))), None, None)
+                .await
+                .unwrap();
+            std::fs::write(dir.join("pret.tmp"), format!("{}\t{}", a.id, b.id)).unwrap();
+            std::fs::rename(dir.join("pret.tmp"), dir.join("pret")).unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = lancer_enfant(
+            "with_the_feature::kill9_after_a_value_past_obrain_s_wal_cap_keeps_it",
+            ENV_PLAFOND,
+            dir.path(),
+            &[],
+        );
+        attendre(&dir.path().join("pret"), "its marker").await;
+        child.kill().unwrap(); // SIGKILL: no close, no flush
+        child.wait().unwrap();
+        let ids = std::fs::read_to_string(dir.path().join("pret")).unwrap();
+        let (a, b) = ids.split_once('\t').unwrap();
+        let (a, b): (Uuid, Uuid) = (a.parse().unwrap(), b.parse().unwrap());
+
+        let store = open(&dir.path().join("base")).await;
+        for (id, c) in [(a, 'A'), (b, 'B')] {
+            let d = store.get_project(id).await.unwrap().unwrap().description;
+            let d = d.unwrap_or_default();
+            assert!(
+                d.len() == longueur && d.chars().all(|x| x == c),
+                "project {c}: the acknowledged 32 MiB + 1 description must survive the kill \
+                 (read {} bytes)",
+                d.len()
+            );
+        }
+    }
+
     /// If the fsync fails, the write is applied in memory and the disk is in an
     /// unknown state. The store says so, and stops: nothing is read or written
     /// on a base whose durability is unknown, until a restart replays the log.
@@ -773,6 +897,7 @@ mod with_the_feature {
 
     const ENV_VERROU: &str = "OBRAIN_PO_TEST_ENFANT_VERROU";
     const ENV_KILL9: &str = "OBRAIN_PO_TEST_ENFANT_KILL9";
+    const ENV_PLAFOND: &str = "OBRAIN_PO_TEST_ENFANT_PLAFOND";
 
     fn lancer_enfant(
         cas: &str,
@@ -854,7 +979,12 @@ mod with_the_feature {
     ///
     /// - `wal` (production durability): every project the child ACKNOWLEDGED is
     ///   there, whole, after the kill — long descriptions (blob column) and short
-    ///   ones alike;
+    ///   ones alike. The child also creates a note per project and then UPDATES
+    ///   acknowledged projects and notes, each one twice: long → short → long, or
+    ///   short → long → short. Every acknowledged update reads back after the kill,
+    ///   on a reopen with no close in between (so from the WAL replay, not from a
+    ///   full flush): an update that was in flight may read old or new, nothing
+    ///   else;
     /// - `aucune` (no fsync, no flush: the child is mostly INSIDE a creation when
     ///   the kill lands): nothing acknowledged is promised, but the base must
     ///   reopen, repair what was interrupted, quarantine nothing, and list.
@@ -863,6 +993,7 @@ mod with_the_feature {
     /// does is obrain's guarantee.
     #[tokio::test]
     async fn kill9_during_creations_loses_no_acknowledged_project_and_never_blocks_the_reopen() {
+        use project_orchestrator::notes::{Note, NoteType};
         if let Ok(dir) = std::env::var(ENV_KILL9) {
             let dir = std::path::PathBuf::from(dir);
             let mode = std::env::var("OBRAIN_PO_TEST_ENFANT_MODE").unwrap();
@@ -885,15 +1016,54 @@ mod with_the_feature {
                 .append(true)
                 .open(dir.join(format!("acquittes-{mode}")))
                 .unwrap();
+            let mut maj = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(format!("maj-{mode}")))
+                .unwrap();
+            // What the `wal` child updates: (kind, id, long now, version).
+            let mut cibles: Vec<(&str, Uuid, bool, u32)> = Vec::new();
             let mut i = 0u32;
             loop {
+                use std::io::Write as _;
                 let mut p = a_project("kill9");
                 p.name = format!("kill9 {}", p.id);
                 p.description = Some(description_du_test(p.id, i, mode == "wal"));
+                let long = p.description.as_ref().unwrap().len() > 256;
                 i += 1;
                 store.create_project(&p).await.unwrap();
-                use std::io::Write as _;
                 writeln!(log, "{}\t{}", p.id, i - 1).unwrap();
+                if mode != "wal" {
+                    continue;
+                }
+                let mut n = Note::new(Some(p.id), NoteType::Tip, String::new(), "kill9".into());
+                let note_longue = i.is_multiple_of(2);
+                n.content = valeur_maj(n.id, 0, note_longue);
+                store.create_note(&n).await.unwrap();
+                writeln!(maj, "ack\tnote\t{}\t0\t{note_longue}", n.id).unwrap();
+                // The two targets of the previous round flip a first time, the two of
+                // the round before a second time (back to what they were created with).
+                for c in cibles.iter_mut().rev().take(4) {
+                    let (genre, id) = (c.0, c.1);
+                    let (k, long) = (c.3 + 1, !c.2);
+                    let v = valeur_maj(id, k, long);
+                    writeln!(maj, "intent\t{genre}\t{id}\t{k}\t{long}").unwrap();
+                    if genre == "projet" {
+                        store
+                            .update_project(id, None, Some(Some(v)), None, None)
+                            .await
+                            .unwrap();
+                    } else {
+                        store
+                            .update_note(id, Some(v), None, None, None, None)
+                            .await
+                            .unwrap();
+                    }
+                    writeln!(maj, "ack\t{genre}\t{id}\t{k}\t{long}").unwrap();
+                    (c.2, c.3) = (long, k);
+                }
+                cibles.push(("projet", p.id, long, 0));
+                cibles.push(("note", n.id, note_longue, 0));
             }
         }
 
@@ -902,11 +1072,15 @@ mod with_the_feature {
         let base = dir.path().join("base");
         let (mut repares, mut quarantaine) = (RapportOuverture::default(), 0usize);
         let (mut vus_wal, mut longues) = (0usize, 0usize);
+        // Acknowledged updates checked right after a kill, by direction.
+        let (mut long_vers_court, mut court_vers_long) = (0usize, 0usize);
         for tour in 0..TOURS {
             let mode = if tour % 2 == 0 { "wal" } else { "aucune" };
             let acquittes = dir.path().join(format!("acquittes-{mode}"));
             let compte = || std::fs::read_to_string(&acquittes).map_or(0, |s| s.lines().count());
             let avant = compte();
+            // Where this round's updates start in the update log.
+            let debut_maj = std::fs::metadata(dir.path().join("maj-wal")).map_or(0, |m| m.len());
             let mut child = lancer_enfant(
                 "with_the_feature::kill9_during_creations_loses_no_acknowledged_project_and_never_blocks_the_reopen",
                 ENV_KILL9,
@@ -942,6 +1116,13 @@ mod with_the_feature {
             );
 
             if mode == "wal" {
+                // Each value the child wrote and acknowledged — a project's
+                // description from its creation, then each acknowledged update, and a
+                // note's content likewise — or, for the one write the kill may have
+                // cut, the value that write carried. Read on this reopen, with no
+                // close in between: what the WAL replay gives back.
+                let mut etat: std::collections::HashMap<(&str, Uuid), MajVue> =
+                    std::collections::HashMap::new();
                 let log = std::fs::read_to_string(&acquittes).unwrap();
                 for ligne in log.lines() {
                     let (id, i) = ligne.split_once('\t').unwrap();
@@ -951,15 +1132,89 @@ mod with_the_feature {
                     });
                     assert_eq!(p.name, format!("kill9 {id}"));
                     assert_eq!(p.slug, format!("obrain-{id}"));
-                    let attendue = description_du_test(id, i, true);
-                    longues += usize::from(attendue.len() > 256);
-                    assert_eq!(
-                        p.description.as_deref(),
-                        Some(attendue.as_str()),
-                        "round {tour}: description of {id} ({} bytes) must survive the kill",
-                        attendue.len()
+                    let creation = description_du_test(id, i, true);
+                    longues += usize::from(creation.len() > 256);
+                    let long = creation.len() > 256;
+                    etat.insert(
+                        ("projet", id),
+                        MajVue {
+                            acquitte: Some((creation, long)),
+                            ..MajVue::default()
+                        },
                     );
                     vus_wal += 1;
+                }
+                let maj = std::fs::read_to_string(dir.path().join("maj-wal")).unwrap_or_default();
+                let mut position = 0u64;
+                for ligne in maj.lines() {
+                    let ce_tour = position >= debut_maj;
+                    position += ligne.len() as u64 + 1;
+                    let champs: Vec<&str> = ligne.split('\t').collect();
+                    let [quoi, genre, id, k, long] = champs[..] else {
+                        continue; // a line the kill cut
+                    };
+                    let (Ok(id), Ok(k), Ok(long)) = (id.parse::<Uuid>(), k.parse(), long.parse())
+                    else {
+                        continue;
+                    };
+                    let genre = if genre == "projet" { "projet" } else { "note" };
+                    let valeur = valeur_maj(id, k, long);
+                    let e = etat.entry((genre, id)).or_default();
+                    match quoi {
+                        "intent" => e.en_vol = Some(valeur),
+                        "ack" => {
+                            e.sens = e
+                                .acquitte
+                                .as_ref()
+                                .map(|(_, avant)| (*avant, long, ce_tour));
+                            e.acquitte = Some((valeur, long));
+                            e.en_vol = None;
+                        }
+                        _ => {}
+                    }
+                }
+                for ((genre, id), vue) in &etat {
+                    // Nothing acknowledged (a note whose creation the kill cut): nothing
+                    // promised.
+                    let Some((acquittee, _)) = &vue.acquitte else {
+                        continue;
+                    };
+                    let actuelle = if *genre == "projet" {
+                        store
+                            .get_project(*id)
+                            .await
+                            .unwrap()
+                            .and_then(|p| p.description)
+                    } else {
+                        store.get_note(*id).await.unwrap().map(|n| n.content)
+                    };
+                    let actuelle = actuelle.unwrap_or_else(|| {
+                        panic!(
+                            "round {tour}: acknowledged {genre} {id} lost its value after the kill"
+                        )
+                    });
+                    let permises: Vec<&String> = std::iter::once(acquittee)
+                        .chain(vue.en_vol.as_ref())
+                        .collect();
+                    assert!(
+                        permises.contains(&&actuelle),
+                        "round {tour}: {genre} {id} reads {} bytes ({}…), not its acknowledged \
+                         value ({} bytes{})",
+                        actuelle.len(),
+                        actuelle.chars().take(60).collect::<String>(),
+                        acquittee.len(),
+                        vue.en_vol.as_ref().map_or(String::new(), |v| format!(
+                            ", or the in-flight {} bytes",
+                            v.len()
+                        ))
+                    );
+                    // Counted when the value just checked came from an update
+                    // acknowledged in THIS round.
+                    match vue.sens {
+                        Some((true, false, true)) => long_vers_court += 1,
+                        Some((false, true, true)) => court_vers_long += 1,
+                        _ => {}
+                    }
                 }
             }
             // Whatever the round was, every project the base lists is WHOLE: a creation
@@ -988,6 +1243,11 @@ mod with_the_feature {
         }
         assert!(vus_wal >= 30, "the child made progress ({vus_wal} checks)");
         assert!(longues > 0, "long descriptions were part of the check");
+        assert!(
+            long_vers_court > 0 && court_vers_long > 0,
+            "acknowledged updates in both directions were checked after a kill \
+             ({long_vers_court} long → short, {court_vers_long} short → long)"
+        );
         // At least one kill landed inside a creation and its draft was found and
         // deleted: without this, a run where every kill fell between two creations
         // would prove nothing about the marker. (The exact step of each kill is
@@ -998,19 +1258,46 @@ mod with_the_feature {
         );
         eprintln!(
             "kill -9 over {TOURS} rounds: {vus_wal} acknowledged-project checks ({longues} with a \
-             description past the blob threshold); at open: {} interrupted creations deleted, {} \
-             torn paths repaired, {quarantaine} quarantined",
+             description past the blob threshold), acknowledged updates checked: \
+             {long_vers_court} long → short, {court_vers_long} short → long; at open: {} \
+             interrupted creations deleted, {} torn paths repaired, {quarantaine} quarantined",
             repares.brouillons_supprimes, repares.chemins_repares
         );
     }
 
+    /// What the `wal` child of the kill -9 test logged about one updated value.
+    #[derive(Default)]
+    struct MajVue {
+        /// The last acknowledged value, and whether it is long.
+        acquitte: Option<(String, bool)>,
+        /// The value of a write logged as started and never acknowledged (the kill
+        /// cut it).
+        en_vol: Option<String>,
+        /// The change that produced the last acknowledged value: (was long, is
+        /// long, acknowledged in the round being checked).
+        sens: Option<(bool, bool, bool)>,
+    }
+
+    /// The value of version `k` of an updated description or note content: long
+    /// (multi-byte, well past the 256-byte blob threshold) or short.
+    fn valeur_maj(id: Uuid, k: u32, long: bool) -> String {
+        if long {
+            format!("{id} maj{k} é-long ").repeat(20)
+        } else {
+            format!("short {id} maj{k}")
+        }
+    }
+
     /// Short, then long (multi-byte, past the 256-byte blob threshold), in turn. The
-    /// `aucune` rounds only ever write SHORT values: a blob-sized write that is never
-    /// flushed leaves an index row in the page cache pointing past the data the engine
-    /// recovers, and a LATER write reuses that space — the first project then reads
-    /// another project's description (measured, round 2 of this very test; an obrain
-    /// defect, see the PR). `aucune` rounds exist to be killed inside a creation, not
-    /// to exercise that.
+    /// `aucune` rounds only ever write SHORT values. Measured on obrain `c4b6ada9`
+    /// (round 2 of this very test): a blob-sized write never flushed left an index
+    /// row pointing past the data the engine recovered, a LATER write reused that
+    /// space, and the first project read another project's description — obrain
+    /// issue #120, fixed by obrain #123 (the value is journaled in the WAL with its
+    /// bytes and replayed), which the `wal` rounds exercise. An `aucune` round runs
+    /// no fsync at all, so it is promised nothing about a blob value; it exists to
+    /// be killed inside a creation, and keeping its values short keeps it about the
+    /// draft marker.
     fn description_du_test(id: Uuid, i: u32, avec_blob: bool) -> String {
         if !avec_blob || i.is_multiple_of(3) {
             format!("short {id}")
@@ -1284,7 +1571,10 @@ mod with_the_feature {
             store.create_project(&witness).await.unwrap();
 
             let mut p = a_project("interrupted");
-            // Past the blob threshold: the full flush before the marker is exercised too.
+            // Past the blob threshold: the value goes to a blob column (and its
+            // `BlobColumnWrite` frame), so each interruption point also leaves a
+            // half-written blob for the reopen to cope with. No full flush runs here
+            // (the base is closed below, which flushes).
             p.description = Some("é-long ".repeat(60));
             store.interrompre_au_prochain(point);
             let err = store.create_project(&p).await.unwrap_err();
