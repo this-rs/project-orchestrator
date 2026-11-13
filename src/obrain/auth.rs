@@ -41,8 +41,7 @@
 //! index is published only after the durability step. A creation writes a draft
 //! marker first and removes it last (the commit point); a draft found at open is
 //! deleted. A multi-property update is not atomic: after a crash it can show some
-//! of its properties, each state a valid user or token. A blob-sized value (above
-//! [`SEUIL_COLONNE_BLOB`]) pays the full flush, as in `project.rs`.
+//! of its properties, each state a valid user or token.
 //!
 //! `purge_mcp_tokens` and `revoke_all_user_tokens` write one property (or delete one
 //! node) per row and make the set durable once. A crash in the middle leaves some
@@ -70,7 +69,7 @@ use obrain_common::types::{NodeId, Value};
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
-use super::{Ecriture, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
+use super::{Ecriture, ObrainGraphStore, RapportOuverture};
 use crate::neo4j::models::{AuthProvider, McpTokenNode, RefreshTokenNode, UserNode};
 use crate::neo4j::traits::AuthStore;
 
@@ -410,49 +409,30 @@ impl IndexAuth {
 // Writing a node
 // ============================================================================
 
-/// Does this value go to a blob column (a string above the threshold)?
-fn en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-}
-
 /// A write that changed nothing: the durability step is not needed.
 fn sans_ecriture(w: &mut Ecriture<'_>) {
     w.rendu_durable = true;
 }
 
 /// Create a node: draft marker first, properties, marker removed last (the commit
-/// point). A value in a blob column is only recovered by the full flush, which
-/// runs BEFORE the marker is removed (see `project.rs`).
+/// point).
 fn creer_noeud(
     w: &mut Ecriture<'_>,
     etiquette: &str,
     proprietes: Vec<(&'static str, Value)>,
 ) -> Result<NodeId> {
-    w.flush_complet = proprietes.iter().any(|(_, v)| en_colonne_blob(v));
     let noeud = w.db.create_node(&[etiquette]);
     w.db.set_node_property(noeud, BROUILLON, Value::from(true));
     for (cle, valeur) in proprietes {
         w.db.set_node_property(noeud, cle, valeur);
     }
-    w.rendre_durable_avant_le_marqueur()?;
     w.db.remove_node_property(noeud, BROUILLON);
     Ok(noeud)
 }
 
-/// Set one property of an existing node. `longue` is true when the value it
-/// replaces was blob-sized: clearing that slot is not WAL-recovered either.
-fn poser(w: &mut Ecriture<'_>, noeud: NodeId, cle: &'static str, valeur: Value, longue: bool) {
-    if longue || en_colonne_blob(&valeur) {
-        w.flush_complet = true;
-    }
+/// Set one property of an existing node.
+fn poser(w: &mut Ecriture<'_>, noeud: NodeId, cle: &'static str, valeur: Value) {
     w.db.set_node_property(noeud, cle, valeur);
-}
-
-fn longue(u: &UserNode) -> bool {
-    let seuil = SEUIL_COLONNE_BLOB;
-    u.email.len() > seuil
-        || u.name.len() > seuil
-        || u.picture_url.as_ref().is_some_and(|p| p.len() > seuil)
 }
 
 /// Upsert under the writer lock: MERGE on the provider key, ON MATCH or ON CREATE.
@@ -467,42 +447,28 @@ fn fusionner_utilisateur(w: &mut Ecriture<'_>, u: UserNode) -> Result<UserNode> 
         } else {
             etat.auth.fournisseur_email(&fournisseur, &u.email)
         };
-        entree.map(|e| (e.utilisateur.id, e.noeud, longue(&e.utilisateur)))
+        entree.map(|e| (e.utilisateur.id, e.noeud))
     };
 
     match existant {
         // ON MATCH: the email of an OIDC user follows the provider; name, picture
         // and last login are refreshed. The password hash is never rewritten here.
-        Some((id, noeud, ancienne_longue)) => {
+        Some((id, noeud)) => {
             if oidc {
-                poser(
-                    w,
-                    noeud,
-                    "email",
-                    Value::from(u.email.clone()),
-                    ancienne_longue,
-                );
+                poser(w, noeud, "email", Value::from(u.email.clone()));
             }
-            poser(
-                w,
-                noeud,
-                "name",
-                Value::from(u.name.clone()),
-                ancienne_longue,
-            );
+            poser(w, noeud, "name", Value::from(u.name.clone()));
             poser(
                 w,
                 noeud,
                 "picture_url",
                 Value::from(u.picture_url.clone().unwrap_or_default()),
-                ancienne_longue,
             );
             poser(
                 w,
                 noeud,
                 "last_login_at",
                 Value::from(u.last_login_at.to_rfc3339()),
-                ancienne_longue,
             );
             let entree = w.apres_ecriture(entree_utilisateur(w.db, noeud))?;
             w.rendre_durable()?;

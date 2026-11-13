@@ -42,10 +42,7 @@
 //! The creation carries the draft marker `_brouillon` (see `project.rs`): the
 //! node, its properties and its `HAS_NOTE` edge are written under it, the marker
 //! is removed last (the commit point), and opening deletes any draft with its
-//! edges. A value above [`SEUIL_COLONNE_BLOB`] — a note's `content` usually is —
-//! makes the creation pay the FULL flush (`commit_wal`) before the marker goes:
-//! its cost is proportional to the base (see the PR's measures and
-//! `src/obrain/mod.rs`, issue obrain #120).
+//! edges.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -60,7 +57,7 @@ use uuid::Uuid;
 
 #[cfg(any(test, feature = "mock-store"))]
 use super::Interruption;
-use super::{project, Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
+use super::{project, Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::neo4j::document::{Document, DocumentChunk, DocumentChunkHit};
 use crate::neo4j::traits::NoteStore;
 use crate::notes::provenance;
@@ -144,16 +141,6 @@ fn id_entite_canonique(t: &EntityType, id: &str) -> Result<()> {
 /// A refusal, by name, with the reason it is not ported.
 fn refus<T>(methode: &'static str, raison: &'static str) -> Result<T> {
     Err(anyhow::Error::new(NonPorte(methode)).context(raison))
-}
-
-/// Does this value go to a blob column (a string above the threshold, or a
-/// string inside a list)?
-fn va_en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-        || v.as_list().is_some_and(|l| {
-            l.iter()
-                .any(|e| e.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB))
-        })
 }
 
 /// `project_id` of the scope a note is attached to, as Neo4j stores the scope.
@@ -851,7 +838,6 @@ impl NoteStore for ObrainGraphStore {
                     };
                     (projet, proprietes_de_creation(&n)?)
                 };
-                w.flush_complet = proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
                 let noeud = w.db.create_node(&[LABEL]);
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeNoeud)?;
@@ -868,7 +854,6 @@ impl NoteStore for ObrainGraphStore {
                 if let Some(projet) = projet_noeud {
                     let _ = w.db.create_edge(projet, noeud, APPARTIENT);
                 }
-                w.rendre_durable_avant_le_marqueur()?;
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::AvantLeRetraitDuMarqueur)?;
                 w.etape()?;
@@ -911,13 +896,6 @@ impl NoteStore for ObrainGraphStore {
                     return Ok(None);
                 };
                 let staleness = staleness_score.filter(|v| v.is_finite());
-                // The OLD content too: replacing a value that sat in a blob column clears
-                // that slot, which the WAL does not recover (as in project.rs).
-                w.flush_complet = ancienne.note.content.len() > SEUIL_COLONNE_BLOB
-                    || content
-                        .as_ref()
-                        .is_some_and(|c| c.len() > SEUIL_COLONNE_BLOB)
-                    || tags.iter().flatten().any(|t| t.len() > SEUIL_COLONNE_BLOB);
                 let noeud = ancienne.noeud;
                 let maj = Utc::now();
                 w.etape()?;
@@ -1169,18 +1147,6 @@ impl NoteStore for ObrainGraphStore {
                     return Ok(());
                 };
                 let maintenant = Utc::now();
-                // The hashes are strings too: above the blob threshold the full flush runs
-                // (new values, and those of the link they replace).
-                let long = |s: &str| s.len() > SEUIL_COLONNE_BLOB;
-                w.flush_complet = long(&signature)
-                    || long(&corps)
-                    || e.liens
-                        .iter()
-                        .filter(|l| l.entite == entite && l.id_entite == id_entite)
-                        .any(|l| {
-                            l.signature_hash.as_deref().is_some_and(long)
-                                || l.body_hash.as_deref().is_some_and(long)
-                        });
                 let arete = match e
                     .liens
                     .iter()
@@ -1459,12 +1425,6 @@ impl NoteStore for ObrainGraphStore {
                         .into_iter()
                         .any(|(_, a)| w.db.get_edge(a).is_some_and(|x| &*x.edge_type == SUCCEDE));
                 let maintenant = Utc::now();
-                // Strings above the blob threshold are not WAL-covered: the full flush runs
-                // before the answer, as for a creation (new values and replaced ones).
-                let long = |s: &str| s.len() > SEUIL_COLONNE_BLOB;
-                w.flush_complet = long(&par)
-                    || e.note.human_confirmed_by.as_deref().is_some_and(long)
-                    || e.note.last_confirmed_by.as_deref().is_some_and(long);
                 w.etape()?;
                 w.db.set_node_property(
                     noeud,

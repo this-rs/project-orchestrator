@@ -33,17 +33,16 @@
 //!   written first and removed last, repaired at open).
 //! - **Durability** is the WAL fsync (`ObrainDB::flush_wal`), once per write,
 //!   which obrain documents as the source of truth that replay rebuilds the rest
-//!   from — PLUS the full flush (`commit_wal`) for a write that carries a value
-//!   the WAL does not recover: a string above [`SEUIL_COLONNE_BLOB`] goes to a
-//!   blob column whose registry reaches the disk only at a flush. MEASURED: a
-//!   project with a 585-byte description, acknowledged and then killed with
-//!   SIGKILL, reopened with no description (kill -9 test, first run). The full
-//!   flush costs in proportion to the base (msync of every zone, the dictionary,
-//!   and on a base in the inherited format a full rewrite of the property
-//!   sidecar — see `examples/obrain_mesures.rs` for the numbers), so it is paid
-//!   only by those writes, and otherwise every [`FLUSH_COMPLET_TOUS_LES`] writes
-//!   and at close, to bound the WAL a restart replays. The fsync is proved by
-//!   obrain's own counter (`wal_fsyncs`); what a power cut does to an
+//!   from. Since obrain #123, a value above 256 bytes — a `String`, a `Bytes`, or
+//!   a bincode-encoded `List`/`Map`/`Path` — is journaled in the WAL WITH its
+//!   value (`BlobColumnWrite`/`BlobColumnClear` frames) and replayed on reopen,
+//!   so a write that carries one no longer pays the full flush per write: the
+//!   full flush (`commit_wal`) runs every [`FLUSH_COMPLET_TOUS_LES`] writes and
+//!   at close, to bound the WAL a restart replays. Two classes are still NOT
+//!   recovered by the WAL, documented as obrain limits and never written by this
+//!   backend: a `Value::Vector` (its `VecColumnWrite` frame carries no value) and
+//!   a blob value above obrain's `BLOB_WAL_MAX_BYTES` (32 MiB). The fsync is
+//!   proved by obrain's own counter (`wal_fsyncs`); what a power cut does to an
 //!   acknowledged write is obrain's guarantee, not re-proved here.
 //! - obrain addresses a node by an internal `NodeId`; the domain addresses it
 //!   by `Uuid`. The index between the two lives in memory and is **rebuilt
@@ -176,14 +175,6 @@ pub fn defauts_conserves() -> &'static [&'static str] {
     DEFAUTS_CONSERVES
 }
 
-/// obrain moves a string longer than this many bytes out of the property zone, into a
-/// "blob column" (`BLOB_COLUMN_THRESHOLD_BYTES`, obrain-substrate). Those writes are NOT
-/// recovered by the WAL: the column and its registry reach the disk at the next full flush.
-/// MEASURED here: a project whose description is longer, acknowledged and then killed with
-/// SIGKILL before any flush, reopens with NO description. So a write that carries such a value
-/// pays the full flush before it is acknowledged (`tests/obrain_backend.rs`, kill -9 test).
-pub const SEUIL_COLONNE_BLOB: usize = 256;
-
 /// A full flush (`commit_wal`) every this many writes, on top of the per-write
 /// WAL fsync: it bounds how much WAL a restart has to replay.
 pub const FLUSH_COMPLET_TOUS_LES: u64 = 256;
@@ -278,9 +269,6 @@ struct Ecriture<'a> {
     db: &'a ObrainDB,
     interne: &'a Interne,
     rendu_durable: bool,
-    /// The write put a value in a place the WAL does not recover (see
-    /// [`SEUIL_COLONNE_BLOB`]): the WAL fsync is not enough, the full flush runs.
-    flush_complet: bool,
     /// How many engine writes of this closure have been made (the test hook
     /// `Interruption::ApresEtape` counts them).
     #[cfg_attr(not(any(test, feature = "mock-store")), allow(dead_code))]
@@ -346,21 +334,6 @@ impl Ecriture<'_> {
         })
     }
 
-    /// For a creation that carries a blob-sized value: run the FULL flush now, before
-    /// the draft marker is removed. A crash before the flush completes then leaves a
-    /// draft (its description lost with the blob, so it reads incomplete and is
-    /// deleted at open), never a project that looks whole and is missing a value.
-    /// No-op when the write carries no such value.
-    fn rendre_durable_avant_le_marqueur(&mut self) -> Result<()> {
-        if !self.flush_complet {
-            return Ok(());
-        }
-        self.rendre_durable()?;
-        self.flush_complet = false;
-        self.rendu_durable = false;
-        Ok(())
-    }
-
     /// Make what was written durable. Call it BEFORE publishing the write to
     /// readers when the write is a creation; [`ObrainGraphStore::ecrire`] calls
     /// it itself if the closure did not.
@@ -371,9 +344,7 @@ impl Ecriture<'_> {
             Durabilite::Wal => {
                 let wal = self.db.flush_wal();
                 match wal {
-                    Ok(()) if self.flush_complet || n.is_multiple_of(FLUSH_COMPLET_TOUS_LES) => {
-                        self.db.commit_wal()
-                    }
+                    Ok(()) if n.is_multiple_of(FLUSH_COMPLET_TOUS_LES) => self.db.commit_wal(),
                     autre => autre,
                 }
             }
@@ -691,7 +662,6 @@ impl ObrainGraphStore {
                 db: &interne.db,
                 interne: &interne,
                 rendu_durable: false,
-                flush_complet: false,
                 etapes: 0,
             };
             let rendu = f(prepare, &mut ecriture)?;

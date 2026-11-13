@@ -53,7 +53,7 @@ use obrain_common::types::{NodeId, Value};
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
-use super::{Ecriture, NonPorte, ObrainGraphStore, SEUIL_COLONNE_BLOB};
+use super::{Ecriture, NonPorte, ObrainGraphStore};
 use crate::neo4j::models::{McpServerNode, McpToolNode};
 use crate::neo4j::traits::FederationStore;
 
@@ -231,11 +231,6 @@ impl IndexFederation {
     }
 }
 
-/// Does this value go to a blob column (a string above the threshold)?
-fn en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-}
-
 fn instant(brut: Option<String>, cle: &str) -> Result<Option<DateTime<Utc>>> {
     brut.filter(|s| !s.is_empty())
         .map(|s| {
@@ -390,15 +385,11 @@ fn creer_noeud(
     etiquette: &'static str,
     proprietes: Vec<(&'static str, Value)>,
 ) -> Result<NodeId> {
-    // A value in a blob column is only recovered by the full flush: it must be on
-    // disk BEFORE the marker says the node is complete (see `project.rs`).
-    w.flush_complet = proprietes.iter().any(|(_, v)| en_colonne_blob(v));
     let noeud = w.db.create_node(&[etiquette]);
     w.db.set_node_property(noeud, BROUILLON, Value::from(true));
     for (cle, valeur) in proprietes {
         w.db.set_node_property(noeud, cle, valeur);
     }
-    w.rendre_durable_avant_le_marqueur()?;
     w.db.remove_node_property(noeud, BROUILLON);
     Ok(noeud)
 }
@@ -574,16 +565,13 @@ impl FederationStore for ObrainGraphStore {
         self.ecrire(
             || (),
             move |(), w: &mut Ecriture<'_>| {
-                let (noeud, ancien) = {
+                let noeud = {
                     let etat = w.index()?;
                     let Some(e) = etat.federation.serveurs.get(&id) else {
                         return Ok(());
                     };
-                    (e.noeud, e.serveur.status.clone())
+                    e.noeud
                 };
-                // A replaced value that WAS in a blob column is not in the WAL either.
-                w.flush_complet =
-                    status.len() > SEUIL_COLONNE_BLOB || ancien.len() > SEUIL_COLONNE_BLOB;
                 w.db.set_node_property(noeud, "status", Value::from(status));
                 w.db.set_node_property(noeud, "updated_at", Value::from(Utc::now().to_rfc3339()));
                 let entree = w.apres_ecriture(decoder_serveur(w.db, noeud))?;

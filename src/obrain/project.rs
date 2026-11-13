@@ -52,10 +52,7 @@
 //!
 //! - **create**: the node is created, the draft marker `_brouillon` is set
 //!   FIRST, the eleven properties follow, the marker is removed LAST. The WAL
-//!   is replayed in order, so a surviving record implies the ones before it. A
-//!   value in a blob column is not in the WAL: when the creation carries one, the
-//!   full flush runs BEFORE the marker is removed (measured: a killed creation
-//!   otherwise reopened as a project that looked whole and had lost its description).
+//!   is replayed in order, so a surviving record implies the ones before it.
 //!   **The removal of the marker is the commit point**, and the fsync that
 //!   follows is the acknowledgement. A crash between the two leaves a complete,
 //!   unmarked project that opening PROMOTES although the caller never got its
@@ -77,11 +74,7 @@
 //!   or slug) is quarantined: left untouched, ignored, and named in
 //!   [`RapportOuverture`](super::RapportOuverture).
 //!
-//! What this does NOT give: an UPDATE of a blob-sized value (a string above 256
-//! bytes) killed before its full flush may lose that property altogether — neither
-//! the old value nor the new — because obrain's blob columns are not WAL-covered
-//! (an obrain lot: log blob writes, or persist the column registry with each
-//! write). And the properties of ONE update land one by one, so after a crash the
+//! What this does NOT give: the properties of ONE update land one by one, so after a crash the
 //! base can hold `name` new and `description` old. Each state is a valid project,
 //! and the reopened base is one of them. A real transactional multi-property write
 //! is an obrain lot (the `Session` has `create_node_with_props` but no
@@ -98,17 +91,13 @@ use uuid::Uuid;
 
 #[cfg(any(test, feature = "mock-store"))]
 use super::Interruption;
-use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
+use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::neo4j::file_uid::{canonical_root, declared_root_of, PathPolicy};
 use crate::neo4j::models::{ProjectNode, ProjectProfile};
 use crate::neo4j::traits::ProjectStore;
 
 const LABEL: &str = "Project";
 
-/// Does this value go to a blob column (a string above the threshold)?
-fn va_en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-}
 /// The draft marker: present from the first record of a creation to the last.
 const BROUILLON: &str = "_brouillon";
 /// The properties a creation writes, in the order it writes them.
@@ -391,7 +380,6 @@ impl ProjectStore for ObrainGraphStore {
                         );
                     }
                 }
-                w.flush_complet = proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
                 let noeud = w.db.create_node(&[LABEL]);
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeNoeud)?;
@@ -403,9 +391,6 @@ impl ProjectStore for ObrainGraphStore {
                     #[cfg(any(test, feature = "mock-store"))]
                     w.point(Interruption::ApresLaPropriete(n + 1))?;
                 }
-                // A value in a blob column is only recovered by the full flush: it
-                // must be on disk BEFORE the marker says the project is complete.
-                w.rendre_durable_avant_le_marqueur()?;
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::AvantLeRetraitDuMarqueur)?;
                 // The commit point.
@@ -483,36 +468,13 @@ impl ProjectStore for ObrainGraphStore {
             // The filesystem is consulted on the blocking pool, before any lock.
             move || root_path.map(trio_de_chemins),
             move |chemins, w: &mut Ecriture<'_>| {
-                let (noeud, ancien_en_blob) = {
+                let noeud = {
                     let etat = w.index()?;
                     let Some(e) = etat.projets.par_id.get(&id) else {
                         return Ok(());
                     };
-                    // Replacing a value that WAS in a blob column clears that slot,
-                    // which the WAL does not recover either: the old value counts too.
-                    let ancien = (name.is_some() && e.projet.name.len() > SEUIL_COLONNE_BLOB)
-                        || (description.is_some()
-                            && e.projet
-                                .description
-                                .as_ref()
-                                .is_some_and(|d| d.len() > SEUIL_COLONNE_BLOB))
-                        || (chemins.is_some()
-                            && [
-                                e.projet.root_path.as_str(),
-                                e.politique.declared_root.as_str(),
-                                e.politique.canonical_root.as_str(),
-                            ]
-                            .iter()
-                            .any(|c| c.len() > SEUIL_COLONNE_BLOB));
-                    (e.noeud, ancien)
+                    e.noeud
                 };
-                w.flush_complet = ancien_en_blob
-                    || name.iter().any(|n| n.len() > SEUIL_COLONNE_BLOB)
-                    || description
-                        .iter()
-                        .flatten()
-                        .any(|d| d.len() > SEUIL_COLONNE_BLOB)
-                    || chemins.iter().flatten().any(|(_, v)| va_en_colonne_blob(v));
                 // The engine writes: readers keep being served the previous value
                 // from the index until this write is durable.
                 if let Some(name) = name {
