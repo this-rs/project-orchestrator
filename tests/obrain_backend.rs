@@ -98,9 +98,9 @@ mod with_the_feature {
     use project_orchestrator::neo4j::traits::*;
     use project_orchestrator::obrain::{
         defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees,
-        refusees_chat, refusees_note, refusees_plan, refusees_release, Creation, Durabilite,
-        Interruption, NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture, MARQUEUR_PO,
-        REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
+        refusees_chat, refusees_decision, refusees_note, refusees_plan, refusees_release, Creation,
+        Durabilite, Interruption, NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture,
+        MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -2039,6 +2039,249 @@ mod with_the_feature {
         assert!(store.get_note(n.id).await.unwrap().is_none());
     }
 
+    /// Decision noyau : une décision globale rattachée à un projet, une autre sans
+    /// projet, une mise à jour, une supersession, puis une fermeture et une
+    /// réouverture — tout est durable, y compris une description au-delà du seuil
+    /// de colonne. Le jalon « décision de bout en bout » sur obrain.
+    #[tokio::test]
+    async fn decisions_survive_a_close_and_a_reopen_with_project_and_supersession() {
+        use project_orchestrator::neo4j::models::{DecisionNode, DecisionStatus};
+        use project_orchestrator::neo4j::traits::{DecisionStore, ProjectStore};
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project("decision-reopen");
+        store.create_project(&p).await.unwrap();
+
+        let d1 = DecisionNode {
+            id: Uuid::new_v4(),
+            description: format!(
+                "une description longue, au-delà du seuil de colonne : {}",
+                "é".repeat(200)
+            ),
+            rationale: "parce que".to_string(),
+            alternatives: vec!["autre".to_string()],
+            chosen_option: Some("A".to_string()),
+            decided_by: "alice".to_string(),
+            decided_at: Utc::now(),
+            status: DecisionStatus::Proposed,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+            sharing_consent: Default::default(),
+        };
+        let d2 = DecisionNode {
+            id: Uuid::new_v4(),
+            description: "choix B".to_string(),
+            rationale: "parce que aussi".to_string(),
+            alternatives: vec![],
+            chosen_option: None,
+            decided_by: "alice".to_string(),
+            decided_at: Utc::now(),
+            status: DecisionStatus::Proposed,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+            sharing_consent: Default::default(),
+        };
+
+        store.create_decision_global(&d1, Some(p.id)).await.unwrap();
+        store.create_decision_global(&d2, None).await.unwrap();
+
+        assert_eq!(
+            store
+                .get_decision(d1.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            d1.description
+        );
+        assert_eq!(
+            store.get_decision_project_id(d1.id).await.unwrap(),
+            Some(p.id.to_string())
+        );
+        assert_eq!(store.get_decision_project_id(d2.id).await.unwrap(), None);
+        let projets = store
+            .get_decision_project_ids(&[d1.id, d2.id])
+            .await
+            .unwrap();
+        assert_eq!(projets.len(), 1);
+        assert_eq!(projets.get(&d1.id), Some(&p.id));
+
+        store
+            .update_decision(
+                d1.id,
+                Some("nouvelle description".to_string()),
+                Some("nouveau pourquoi".to_string()),
+                Some("B".to_string()),
+                Some(DecisionStatus::Accepted),
+            )
+            .await
+            .unwrap();
+        let maj = store.get_decision(d1.id).await.unwrap().unwrap();
+        assert_eq!(maj.description, "nouvelle description");
+        assert_eq!(maj.chosen_option.as_deref(), Some("B"));
+        assert_eq!(maj.status, DecisionStatus::Accepted);
+
+        store.supersede_decision(d2.id, d1.id).await.unwrap();
+        assert_eq!(
+            store.get_decision(d1.id).await.unwrap().unwrap().status,
+            DecisionStatus::Superseded
+        );
+
+        // Une décision rattachée à un projet inconnu est refusée, rien n'est créé.
+        let inconnu = DecisionNode {
+            id: Uuid::new_v4(),
+            description: "x".to_string(),
+            rationale: "y".to_string(),
+            alternatives: vec![],
+            chosen_option: None,
+            decided_by: "alice".to_string(),
+            decided_at: Utc::now(),
+            status: DecisionStatus::Proposed,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+            sharing_consent: Default::default(),
+        };
+        let err = store
+            .create_decision_global(&inconnu, Some(Uuid::new_v4()))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("projet inconnu"), "{err:#}");
+        assert!(store.get_decision(inconnu.id).await.unwrap().is_none());
+
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = open(&base).await;
+        assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
+        let relue = store.get_decision(d1.id).await.unwrap().unwrap();
+        assert_eq!(relue.description, "nouvelle description");
+        assert_eq!(relue.status, DecisionStatus::Superseded);
+        assert_eq!(relue.chosen_option.as_deref(), Some("B"));
+        assert_eq!(
+            store.get_decision_project_id(d1.id).await.unwrap(),
+            Some(p.id.to_string())
+        );
+        assert_eq!(
+            store
+                .get_decision(d2.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            "choix B"
+        );
+        assert_eq!(store.get_decision_project_id(d2.id).await.unwrap(), None);
+
+        // Suppression : le DETACH emporte la décision et ses arêtes.
+        store.delete_decision(d2.id).await.unwrap();
+        assert!(store.get_decision(d2.id).await.unwrap().is_none());
+        assert_eq!(
+            store
+                .get_decision_project_ids(&[d1.id])
+                .await
+                .unwrap()
+                .get(&d1.id),
+            Some(&p.id)
+        );
+    }
+
+    /// Les méthodes non portées de `DecisionStore` refusent par leur nom, et n'écrivent
+    /// rien.
+    #[tokio::test]
+    async fn decision_refusals_are_named_and_write_nothing() {
+        use project_orchestrator::neo4j::models::{DecisionNode, DecisionStatus};
+        use project_orchestrator::neo4j::traits::DecisionStore;
+        let store = temporary(Durabilite::Wal).await;
+        let d = DecisionNode {
+            id: Uuid::new_v4(),
+            description: "x".to_string(),
+            rationale: "y".to_string(),
+            alternatives: vec![],
+            chosen_option: None,
+            decided_by: "alice".to_string(),
+            decided_at: Utc::now(),
+            status: DecisionStatus::Proposed,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+            sharing_consent: Default::default(),
+        };
+        assert_eq!(
+            not_ported(store.create_decision(Uuid::new_v4(), &d).await),
+            NonPorte("DecisionStore::create_decision")
+        );
+        assert_eq!(
+            not_ported(store.set_decision_embedding(d.id, &[1.0f32], "m").await),
+            NonPorte("DecisionStore::set_decision_embedding")
+        );
+        assert_eq!(
+            not_ported(store.get_decision_embedding(d.id).await),
+            NonPorte("DecisionStore::get_decision_embedding")
+        );
+        assert_eq!(
+            not_ported(store.search_decisions_by_vector(&[1.0f32], 5, None).await),
+            NonPorte("DecisionStore::search_decisions_by_vector")
+        );
+        assert_eq!(
+            not_ported(store.get_decisions_without_embedding().await),
+            NonPorte("DecisionStore::get_decisions_without_embedding")
+        );
+        assert_eq!(
+            not_ported(store.get_all_decisions_with_task_id().await),
+            NonPorte("DecisionStore::get_all_decisions_with_task_id")
+        );
+        assert_eq!(
+            not_ported(store.get_decisions_for_entity("File", "src/x.rs", 5).await),
+            NonPorte("DecisionStore::get_decisions_for_entity")
+        );
+        assert_eq!(
+            not_ported(
+                store
+                    .get_decisions_affecting("File", "src/x.rs", None)
+                    .await
+            ),
+            NonPorte("DecisionStore::get_decisions_affecting")
+        );
+        assert_eq!(
+            not_ported(
+                store
+                    .add_decision_affects(d.id, "File", "src/x.rs", None)
+                    .await
+            ),
+            NonPorte("DecisionStore::add_decision_affects")
+        );
+        assert_eq!(
+            not_ported(
+                store
+                    .remove_decision_affects(d.id, "File", "src/x.rs")
+                    .await
+            ),
+            NonPorte("DecisionStore::remove_decision_affects")
+        );
+        assert_eq!(
+            not_ported(store.list_decision_affects(d.id).await),
+            NonPorte("DecisionStore::list_decision_affects")
+        );
+        assert_eq!(
+            not_ported(store.get_decision_timeline(None, None, None).await),
+            NonPorte("DecisionStore::get_decision_timeline")
+        );
+        assert_eq!(
+            not_ported(
+                store
+                    .list_decisions_by_status(DecisionStatus::Proposed, None, None, 10, 0)
+                    .await
+            ),
+            NonPorte("DecisionStore::list_decisions_by_status")
+        );
+        // Les refus n'ont rien écrit.
+        assert!(store.get_decision(d.id).await.unwrap().is_none());
+    }
+
     /// The generator skips nothing: every `async fn` of the two contracts is
     /// either refused, or written by hand (and the build has checked that it IS
     /// written), or one of the few that cannot refuse and keep the contract's
@@ -2118,7 +2361,9 @@ mod with_the_feature {
         assert!(refusees_note().iter().all(|m| written.contains(m)));
         assert!(refusees_release().iter().all(|m| written.contains(m)));
         assert!(refusees_chat().iter().all(|m| written.contains(m)));
+        assert!(refusees_decision().iter().all(|m| written.contains(m)));
         assert!(refusees_plan().iter().all(|m| written.contains(m)));
+
         assert!(REFUS_ECRITS_A_LA_MAIN.iter().all(|m| written.contains(m)));
         // What keeps a default is known and justified where it is declared.
         assert_eq!(kept, ["AnalyticsStore::run_data_migrations"]);

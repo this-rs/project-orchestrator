@@ -21,7 +21,10 @@
 //! node of [`NoteStore`](crate::neo4j::traits::NoteStore) (`note.rs`: 13 of its 41
 //! methods; the others are refused by name there), and the node part of
 //! [`FederationStore`](crate::neo4j::traits::FederationStore)
-//! (`federation.rs`: the five relation writes and the two backfills are refused by name).
+//! (`federation.rs`: the five relation writes and the two backfills are refused by name),
+//! and the decision node of [`DecisionStore`](crate::neo4j::traits::DecisionStore)
+//! (`decision.rs`: the node, its direct project and its supersession are ported;
+//! the task-bound creation, the AFFECTS edges and the embeddings are refused by name).
 //!
 //! # How obrain is used
 //!
@@ -71,6 +74,7 @@
 
 mod auth;
 mod chat;
+mod decision;
 mod federation;
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
@@ -139,6 +143,13 @@ pub fn refusees_chat() -> &'static [&'static str] {
     chat::REFUSEES
 }
 
+/// The methods of `DecisionStore` refused on every call, as
+/// `DecisionStore::<method>` (`decision.rs`): the task-bound creation, the
+/// AFFECTS edges to code entities, and the three embedding methods.
+pub fn refusees_decision() -> &'static [&'static str] {
+    decision::REFUSEES
+}
+
 /// The methods of `PlanStore` refused on every call, as `PlanStore::<method>`
 /// (`plan.rs`): tasks, steps, constraints, the day plan, dependencies, the
 /// graphs and waves, the enrichment, and the HAS_PLAN links to several
@@ -184,6 +195,7 @@ pub fn methodes_qui_servent() -> Vec<&'static str> {
                 && !release::REFUSEES.contains(m)
                 && !note::REFUSEES.contains(m)
                 && !chat::REFUSEES.contains(m)
+                && !decision::REFUSEES.contains(m)
                 && !plan::REFUSEES.contains(m)
                 && !m.starts_with("GraphStore::")
         })
@@ -295,6 +307,7 @@ struct Etat {
     espaces: workspace::IndexEspaces,
     notes: note::IndexNotes,
     chat: chat::IndexChat,
+    decisions: decision::IndexDecisions,
     federation: federation::IndexFederation,
 }
 
@@ -609,6 +622,8 @@ impl ObrainGraphStore {
         let notes =
             note::IndexNotes::reconstruire(&db, &projets, &mut rapport).with_context(contexte)?;
         let chat = chat::IndexChat::reconstruire(&db, &mut rapport).with_context(contexte)?;
+        let decisions = decision::IndexDecisions::reconstruire(&db, &projets, &mut rapport)
+            .with_context(contexte)?;
         let (federation, brouillons, quarantaine) = federation::IndexFederation::reconstruire(&db)
             .with_context(|| {
                 format!(
@@ -626,6 +641,7 @@ impl ObrainGraphStore {
             espaces,
             notes,
             chat,
+            decisions,
             federation,
         };
         let store = Self {
