@@ -483,6 +483,10 @@ required-features = ["local-embeddings"]
 name = "obrain_mesures"
 required-features = ["obrain-backend", "mock-store"]
 
+[[example]]
+name = "obrain_mesures_workspace"
+required-features = ["obrain-backend", "mock-store"]
+
 # neo4rs 0.8.0 decodes a Bolt TINY_INT marker with `marker as i64` on a `u8`:
 # every stored integer in -16..=-1 is read 240..=255, so the backend's `-1`
 # sentinels ("no timeout", "not computed") come back as 255. Upstream fixed it
