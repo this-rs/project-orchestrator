@@ -16937,6 +16937,10 @@ impl AuthStore for MockGraphStore {
     async fn upsert_user(&self, user: &UserNode) -> Result<UserNode> {
         use crate::neo4j::models::AuthProvider;
 
+        // As the Neo4j adapter: an OIDC user has no MERGE key without it.
+        if user.auth_provider == AuthProvider::Oidc && user.external_id.is_none() {
+            anyhow::bail!("OIDC user must have external_id");
+        }
         let mut users = self.users.write().await;
 
         // Find existing user based on auth provider strategy
@@ -17114,11 +17118,13 @@ impl AuthStore for MockGraphStore {
                 return Ok(None);
             };
             let was_valid = !token.revoked && token.expires_at > chrono::Utc::now();
+            // The state observed BEFORE the revoke, as the Neo4j statement returns it.
+            let observed = token.clone();
             token.revoked = true;
             if !was_valid {
                 return Ok(None);
             }
-            token.clone()
+            observed
         };
 
         let user = self.users.read().await.get(&consumed.user_id).cloned();
