@@ -2548,6 +2548,54 @@ pub mod conformance {
             store.delete_project(p.id, &p.name).await.unwrap();
         }
     }
+
+    /// The enabled filter of `list_event_triggers` does not look at the scope:
+    /// with no scope asked, a disabled global trigger leaves the list and a
+    /// scoped trigger that stays enabled remains in it.
+    pub async fn check_trigger_enabled_filter_ignores_scope(store: &dyn GraphStore) {
+        use project_orchestrator::events::trigger::EventTrigger;
+        let projet = Uuid::new_v4();
+        let un = |scope: Option<Uuid>| EventTrigger {
+            id: Uuid::new_v4(),
+            name: "conformance".into(),
+            protocol_id: Uuid::new_v4(),
+            entity_type_pattern: None,
+            action_pattern: None,
+            payload_conditions: None,
+            cooldown_secs: 0,
+            enabled: true,
+            project_scope: scope,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let scoped = un(Some(projet));
+        let global = un(None);
+        store.create_event_trigger(&scoped).await.unwrap();
+        store.create_event_trigger(&global).await.unwrap();
+        assert!(store
+            .update_event_trigger(global.id, Some(false), None, None, None, None, None, None)
+            .await
+            .unwrap());
+
+        let actifs: Vec<Uuid> = store
+            .list_event_triggers(None, true)
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(
+            actifs.contains(&scoped.id),
+            "the scoped trigger stays enabled"
+        );
+        assert!(
+            !actifs.contains(&global.id),
+            "the disabled one leaves the enabled list"
+        );
+
+        store.delete_event_trigger(scoped.id).await.unwrap();
+        store.delete_event_trigger(global.id).await.unwrap();
+    }
 }
 
 // ======================================================================
@@ -2879,3 +2927,20 @@ project_checks!(mock_project, MockFactory);
 project_checks!(neo4j_project, Neo4jFactory);
 #[cfg(feature = "obrain-backend")]
 project_checks!(obrain_project, ObrainFactory);
+
+/// The trigger domain (alerts, event triggers, lifecycle hooks), on the
+/// backends that run it: the Neo4j reference and obrain. No mock entry here:
+/// the mock is not the reference of this domain.
+macro_rules! trigger_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [check_trigger_enabled_filter_ignores_scope]
+        );
+    };
+}
+
+trigger_checks!(neo4j_trigger, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+trigger_checks!(obrain_trigger, ObrainFactory);

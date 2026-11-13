@@ -10,7 +10,8 @@
 //! its trait (an omitted method would silently inherit the contract's default).
 //!
 //! Ported so far: [`ProjectStore`](crate::neo4j::traits::ProjectStore)
-//! (`project.rs`).
+//! (`project.rs`), and [`TriggerStore`](crate::neo4j::traits::TriggerStore)
+//! (alerts, event triggers, lifecycle hooks; `trigger.rs`).
 //!
 //! # How obrain is used
 //!
@@ -61,6 +62,7 @@
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
 mod project;
+mod trigger;
 
 #[cfg(any(test, feature = "mock-store"))]
 pub use mesure::{Durabilite, Interruption};
@@ -212,6 +214,7 @@ struct Interne {
 #[derive(Default)]
 struct Etat {
     projets: project::IndexProjets,
+    declencheurs: trigger::IndexDeclencheurs,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -443,14 +446,24 @@ impl ObrainGraphStore {
                 )
             })?;
         }
-        let (etat, rapport) = project::IndexProjets::reconstruire(&db)
-            .map(|(projets, rapport)| (Etat { projets }, rapport))
-            .with_context(|| {
-                format!(
-                    "reconstruction des index de la base obrain {}",
-                    chemin.display()
-                )
-            })?;
+        let contexte_index = || {
+            format!(
+                "reconstruction des index de la base obrain {}",
+                chemin.display()
+            )
+        };
+        let (projets, mut rapport) =
+            project::IndexProjets::reconstruire(&db).with_context(contexte_index)?;
+        let (declencheurs, rapport_declencheurs) =
+            trigger::IndexDeclencheurs::reconstruire(&db).with_context(contexte_index)?;
+        rapport.brouillons_supprimes += rapport_declencheurs.brouillons_supprimes;
+        rapport
+            .en_quarantaine
+            .extend(rapport_declencheurs.en_quarantaine);
+        let etat = Etat {
+            projets,
+            declencheurs,
+        };
         let store = Self {
             interne: Arc::new(Interne {
                 db,
