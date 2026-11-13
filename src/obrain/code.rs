@@ -1,18 +1,31 @@
 //! `CodeStore` on obrain — the core of the code domain: the `File` nodes, their
 //! membership of a project, and the three project switches the contract keeps here.
 //!
-//! What is ported (16 of the 85 methods): the files (`upsert_file`,
-//! `batch_upsert_files`, `get_file`, `get_file_language`, `find_files_by_path_suffix`,
-//! `list_project_files`, `count_project_files`, `get_project_file_paths`,
-//! `link_file_to_project`, `delete_file`, `delete_stale_files`), the two language
-//! statistics, and `set_scaffolding_override` / `set_watch_enabled` /
-//! `set_default_note_energy` (they write a property of the `Project` node, owned by
-//! `project.rs`). What is refused by name ([`REFUSEES`], 69 methods): everything that
-//! writes or reads a symbol (`Function`, `Struct`, `Trait`, `Enum`, `Impl`, `Import`),
-//! an `IMPORTS` / `CALLS` / `EXTENDS` / … edge, a process, a graph-analytics metric,
-//! or the `CO_CHANGED` edges. Each refusal carries its reason, and `mod.rs` keeps the
-//! list apart from the methods that serve (`methodes_qui_servent`). A port that
-//! answered those with an empty list would be a false success.
+//! What is ported (14 of the 85 methods): the files read and maintained (`get_file`,
+//! `get_file_language`, `find_files_by_path_suffix`, `list_project_files`,
+//! `count_project_files`, `get_project_file_paths`, `link_file_to_project`,
+//! `delete_file`, `delete_stale_files`), the two language statistics, and
+//! `set_scaffolding_override` / `set_watch_enabled` / `set_default_note_energy` (they
+//! write a property of the `Project` node, owned by `project.rs`). What is refused by
+//! name ([`REFUSEES`], 71 methods): everything that writes or reads a symbol
+//! (`Function`, `Struct`, `Trait`, `Enum`, `Impl`, `Import`), an `IMPORTS` / `CALLS` /
+//! `EXTENDS` / … edge, a process, a graph-analytics metric, the `CO_CHANGED` edges —
+//! and the two file WRITES, `upsert_file` and `batch_upsert_files`. Each refusal carries
+//! its reason, and `mod.rs` keeps the list apart from the methods that serve
+//! (`methodes_qui_servent`). A port that answered those with an empty list would be a
+//! false success.
+//!
+//! # Why the file writes are refused while the symbols are
+//!
+//! The sync (`src/orchestrator/runner.rs`, `store_parsed_file_for_project_with_ctx` and
+//! the batched store) writes the `File` WITH ITS HASH first, then its symbols. If the
+//! file write served and the symbol writes refused, the sync would fail after the hash
+//! is stored, and every later sync would skip the file as unchanged (`get_file` → same
+//! hash): it would never be parsed again, even once the symbols are ported. Refusing the
+//! file write too keeps the hash unwritten, so the first sync after the symbols are
+//! ported parses everything. The writer is complete and tested (`ecrire_fichiers`, test
+//! builds only: [`ObrainGraphStore::semer_fichiers_pour_essai`]); it is plugged back into
+//! `upsert_file` / `batch_upsert_files` together with the symbol writes.
 //!
 //! # Storage
 //!
@@ -42,8 +55,20 @@
 //!   under another root) is NOT reproduced: it is a decision about the identity of files,
 //!   not a port.
 //! - **A stored node that does not decode is quarantined** (`last_parsed` unreadable, a
-//!   missing property) instead of being read with "now" as its date. It then counts in
-//!   no read.
+//!   missing property) instead of being read with "now" as its date, and so is a second
+//!   node at a path already taken. It then counts in no read. Its PATH (when it has a
+//!   readable one) stays known to the index: every write and every deletion that touches
+//!   a quarantined path refuses by name (`CodeStore::<method> (quarantaine)`), before
+//!   writing anything. Otherwise a write would create a second `File` beside the
+//!   quarantined one, and deleting the indexed node of a duplicated path would let the
+//!   duplicate come back as the file at the next open. `delete_stale_files` refuses as
+//!   well when the project CONTAINS a quarantined path it would have to delete. The
+//!   quarantine is lifted by repairing the base by hand, then reopening.
+//! - **A deletion the engine refuses leaves the store indeterminate.** obrain's
+//!   `delete_node` detaches the node's edges BEFORE it deletes the node, so a `false`
+//!   may come after a write; and in `delete_stale_files` the earlier files of the call
+//!   are already gone. As everywhere in this backend (`note.rs`, `delete_note`), the
+//!   store then refuses everything until a restart rebuilds the index from the base.
 //! - **A batch is not atomic against a crash.** Neo4j runs a chunk in one transaction;
 //!   here the nodes are written one by one then made durable once. A creation killed
 //!   half-way is deleted at open (draft marker), but an UPDATE killed half-way may leave a
@@ -75,7 +100,7 @@ use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
 use super::project::IndexProjets;
-use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
+use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::neo4j::models::*;
 use crate::neo4j::traits::CodeStore;
 use crate::parser::FunctionCall;
@@ -89,6 +114,8 @@ const BROUILLON: &str = "_brouillon";
 /// The methods this domain refuses by name, as `CodeStore::<method>`. They are
 /// written (so the build sees them as implemented) but they answer [`NonPorte`].
 pub const REFUSEES: &[&str] = &[
+    "CodeStore::upsert_file",
+    "CodeStore::batch_upsert_files",
     "CodeStore::count_orphan_files",
     "CodeStore::count_co_change_pairs",
     "CodeStore::count_protocol_states_transitions",
@@ -160,6 +187,12 @@ pub const REFUSEES: &[&str] = &[
     "CodeStore::get_type_impl_blocks_detailed",
 ];
 
+/// Why `upsert_file` / `batch_upsert_files` refuse (see the module header).
+const RAISON_ECRITURE_FICHIER: &str = "la synchro écrit le File avec son hash PUIS ses symboles, \
+     qui ne sont pas portés : le hash écrit, l'échec qui suit ferait sauter ce fichier par \
+     hash à toutes les synchros suivantes, et il ne serait jamais reparsé. Refusé tant que \
+     les écritures de symboles le sont";
+
 /// A property lookup over one node: `None` for an absent or null property.
 type Lecture<'a> = &'a dyn Fn(&str) -> Option<Value>;
 
@@ -185,6 +218,30 @@ pub(super) struct IndexCode {
     fichiers: HashMap<String, Fichier>,
     /// `project → paths it CONTAINS` (sorted: the order of `list_project_files`).
     contenus: HashMap<Uuid, BTreeSet<String>>,
+    /// The paths of the quarantined nodes (a duplicate, or a node that does not
+    /// decode but has a readable path). Every write and deletion on them refuses.
+    quarantaine: HashSet<String>,
+    /// `project → quarantined paths it CONTAINS` (what `delete_stale_files` cannot
+    /// see in `contenus` and must not silently leave behind).
+    quarantaine_contenue: HashMap<Uuid, BTreeSet<String>>,
+}
+
+impl IndexCode {
+    /// Refuse by name when one of `paths` is in quarantine: nothing is written.
+    fn refus_si_quarantaine<'a>(
+        &self,
+        methode: &'static str,
+        mut paths: impl Iterator<Item = &'a String>,
+    ) -> Result<()> {
+        if let Some(p) = paths.find(|p| self.quarantaine.contains(*p)) {
+            return Err(anyhow::Error::new(NonPorte(methode)).context(format!(
+                "le chemin {p} a un nœud File en quarantaine (doublon ou nœud illisible) : \
+                 y écrire créerait un second File, y supprimer laisserait le doublon revenir \
+                 à la prochaine ouverture. Réparer la base, puis rouvrir"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl IndexCode {
@@ -197,6 +254,7 @@ impl IndexCode {
     ) -> Self {
         let mut idx = Self::default();
         let mut chemin_de: HashMap<NodeId, String> = HashMap::new();
+        let mut chemin_en_quarantaine: HashMap<NodeId, String> = HashMap::new();
         let store = db.store();
         for noeud in store.nodes_by_label(ETIQUETTE_FICHIER) {
             let Some(n) = db.get_node(noeud) else {
@@ -222,21 +280,34 @@ impl IndexCode {
                         "nœud File {noeud:?} : chemin {} déjà pris",
                         valeur.path
                     ));
+                    idx.quarantaine.insert(valeur.path.clone());
+                    chemin_en_quarantaine.insert(noeud, valeur.path);
                 }
                 Ok(valeur) => {
                     chemin_de.insert(noeud, valeur.path.clone());
                     idx.fichiers
                         .insert(valeur.path.clone(), Fichier { noeud, valeur });
                 }
-                Err(e) => rapport
-                    .en_quarantaine
-                    .push(format!("nœud File {noeud:?} : {e}")),
+                Err(e) => {
+                    rapport
+                        .en_quarantaine
+                        .push(format!("nœud File {noeud:?} : {e}"));
+                    if let Some(path) = chaine(&get, "path") {
+                        idx.quarantaine.insert(path.clone());
+                        chemin_en_quarantaine.insert(noeud, path);
+                    }
+                }
             }
         }
         for (projet, noeud_projet) in projets.entrees() {
             for (cible, _) in voisins(db, noeud_projet, CONTIENT) {
                 if let Some(chemin) = chemin_de.get(&cible) {
                     idx.contenus
+                        .entry(projet)
+                        .or_default()
+                        .insert(chemin.clone());
+                } else if let Some(chemin) = chemin_en_quarantaine.get(&cible) {
+                    idx.quarantaine_contenue
                         .entry(projet)
                         .or_default()
                         .insert(chemin.clone());
@@ -284,6 +355,7 @@ fn lire_fichier(get: Lecture<'_>) -> Result<FileNode> {
     })
 }
 
+#[cfg(any(test, feature = "mock-store"))]
 fn props_fichier(f: &FileNode) -> Vec<(&'static str, Value)> {
     vec![
         ("path", Value::from(f.path.clone())),
@@ -298,6 +370,7 @@ fn props_fichier(f: &FileNode) -> Vec<(&'static str, Value)> {
 }
 
 /// Decode a node once it has been written (the index is then published from this).
+#[cfg(any(test, feature = "mock-store"))]
 fn relire(db: &ObrainDB, noeud: NodeId) -> Result<FileNode> {
     let n = db
         .get_node(noeud)
@@ -312,10 +385,13 @@ fn relire(db: &ObrainDB, noeud: NodeId) -> Result<FileNode> {
 
 /// Does this value go to a blob column (a string above the threshold)? Such a value
 /// is not recovered by the WAL: see `mod.rs` (`SEUIL_COLONNE_BLOB`).
+#[cfg(any(test, feature = "mock-store"))]
 fn valeur_en_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
+    v.as_str()
+        .is_some_and(|s| s.len() > super::SEUIL_COLONNE_BLOB)
 }
 
+#[cfg(any(test, feature = "mock-store"))]
 fn fichier_en_blob(f: &FileNode) -> bool {
     props_fichier(f).iter().any(|(_, v)| valeur_en_blob(v))
 }
@@ -324,9 +400,15 @@ fn fichier_en_blob(f: &FileNode) -> bool {
 // The store
 // ============================================================================
 
+#[cfg(any(test, feature = "mock-store"))]
 impl ObrainGraphStore {
     /// Create or update `files` (last one wins on a repeated path), link each to its
     /// project when that project exists, and make it all durable ONCE.
+    ///
+    /// Not reachable from the contract while the symbol writes refuse (see the
+    /// module header): compiled for test builds only, through
+    /// [`ObrainGraphStore::semer_fichiers_pour_essai`]. Each engine write is preceded
+    /// by a crash point (`Interruption::ApresEtape`).
     async fn ecrire_fichiers(&self, files: Vec<FileNode>) -> Result<()> {
         if files.is_empty() {
             return Ok(());
@@ -338,6 +420,12 @@ impl ObrainGraphStore {
                 // memberships already there.
                 let (existants, projets, membres) = {
                     let etat = w.index()?;
+                    // A quarantined path would get a SECOND File beside the one held
+                    // back: refused before anything is written.
+                    etat.code.refus_si_quarantaine(
+                        "CodeStore::upsert_file (quarantaine)",
+                        files.iter().map(|f| &f.path),
+                    )?;
                     let mut existants: HashMap<String, (NodeId, bool)> = HashMap::new();
                     let mut projets: HashMap<Uuid, NodeId> = HashMap::new();
                     let mut membres: HashSet<(Uuid, String)> = HashSet::new();
@@ -379,7 +467,9 @@ impl ObrainGraphStore {
                                 *n
                             }
                             None => {
+                                w.etape()?;
                                 let n = w.db.create_node(&[ETIQUETTE_FICHIER]);
+                                w.etape()?;
                                 w.db.set_node_property(n, BROUILLON, Value::from(true));
                                 crees.push(n);
                                 n
@@ -387,6 +477,7 @@ impl ObrainGraphStore {
                         },
                     };
                     for (cle, valeur) in props_fichier(f) {
+                        w.etape()?;
                         w.db.set_node_property(noeud, cle, valeur);
                     }
                     noeuds.insert(f.path.clone(), noeud);
@@ -395,6 +486,7 @@ impl ObrainGraphStore {
                         if let Some(pn) = projets.get(&p) {
                             if !membres.contains(&cle) && !ajoutes.contains(&cle) {
                                 // MERGE: a membership is not written twice.
+                                w.etape()?;
                                 let _ = w.db.create_edge(*pn, noeud, CONTIENT);
                                 ajoutes.push(cle);
                             }
@@ -409,6 +501,7 @@ impl ObrainGraphStore {
                     w.rendre_durable_avant_le_marqueur()?;
                 }
                 for n in &crees {
+                    w.etape()?;
                     w.db.remove_node_property(*n, BROUILLON);
                 }
                 let mut publies: Vec<(String, Fichier)> = Vec::with_capacity(dernier.len());
@@ -430,6 +523,59 @@ impl ObrainGraphStore {
         )
         .await
     }
+
+    /// Write files through the writer the contract does not expose yet (see the
+    /// module header): what the tests of the reads, the deletions and the crash
+    /// points start from. Test builds only.
+    #[doc(hidden)]
+    pub async fn semer_fichiers_pour_essai(&self, files: &[FileNode]) -> Result<()> {
+        self.ecrire_fichiers(files.to_vec()).await
+    }
+
+    /// Outgoing edges of a project's node as the ENGINE counts them (a draft deleted
+    /// at open must take its `CONTAINS` edge with it). Test builds only.
+    #[doc(hidden)]
+    pub fn aretes_sortantes_du_projet_pour_essai(&self, id: Uuid) -> Option<usize> {
+        let noeud = self.interne.etat.read().ok()?.projets.noeud_de(id)?;
+        Some(self.interne.db.store().out_degree(noeud))
+    }
+
+    /// Delete a file's node in the ENGINE behind the index, so that the next
+    /// `delete_node` of it answers `false` (an index that disagrees with the base).
+    /// Test builds only.
+    #[doc(hidden)]
+    pub fn retirer_du_moteur_pour_essai(&self, path: &str) -> bool {
+        let Some(noeud) = self
+            .interne
+            .etat
+            .read()
+            .ok()
+            .and_then(|e| e.code.fichiers.get(path).map(|f| f.noeud))
+        else {
+            return false;
+        };
+        self.interne.db.delete_node(noeud)
+    }
+}
+
+/// Delete a file's node. obrain detaches the edges BEFORE it deletes the node
+/// (`ObrainDB::delete_node`), so a `false` can come after a write — and in a
+/// multi-delete, the earlier nodes are gone: the store is then indeterminate (as
+/// `note.rs` does for `delete_note`), and refuses everything until a restart rebuilds
+/// the index from the base.
+fn supprimer_fichier(w: &mut Ecriture<'_>, noeud: NodeId, path: &str) -> Result<()> {
+    w.etape()?;
+    if !w.db.delete_node(noeud) {
+        w.interne
+            .indetermine
+            .store(true, std::sync::atomic::Ordering::Release);
+        bail!(
+            "obrain a refusé la suppression du nœud {noeud:?} (fichier {path}) : ses arêtes, \
+             et les fichiers supprimés avant lui dans cet appel, peuvent être déjà partis. \
+             Base INDÉTERMINÉE, tout est refusé jusqu'au redémarrage"
+        );
+    }
+    Ok(())
 }
 
 /// The stale files of a project, and the refusal when one has symbols.
@@ -469,13 +615,19 @@ impl CodeStore for ObrainGraphStore {
         self.ecrire(
             || (),
             move |(), w: &mut Ecriture<'_>| {
-                let Some(noeud) = w.index()?.code.fichiers.get(&path).map(|f| f.noeud) else {
-                    return Ok(());
+                let noeud = {
+                    let etat = w.index()?;
+                    etat.code.refus_si_quarantaine(
+                        "CodeStore::delete_file (quarantaine)",
+                        [&path].into_iter(),
+                    )?;
+                    let Some(noeud) = etat.code.fichiers.get(&path).map(|f| f.noeud) else {
+                        return Ok(());
+                    };
+                    noeud
                 };
                 refus_si_symboles(w.db, &[noeud])?;
-                if !w.db.delete_node(noeud) {
-                    bail!("obrain a refusé la suppression du nœud {noeud:?} (fichier {path})");
-                }
+                supprimer_fichier(w, noeud, &path)?;
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 etat.code.fichiers.remove(&path);
@@ -502,6 +654,27 @@ impl CodeStore for ObrainGraphStore {
                     if !etat.projets.contient(project_id) {
                         return Ok((0, 0, Vec::new()));
                     }
+                    // A quarantined path the project contains and that is stale, or a
+                    // stale path that has a quarantined duplicate: refused, nothing
+                    // written.
+                    let perimes_en_quarantaine = etat
+                        .code
+                        .quarantaine_contenue
+                        .get(&project_id)
+                        .into_iter()
+                        .flatten()
+                        .filter(|p| !valides.contains(*p));
+                    etat.code.refus_si_quarantaine(
+                        "CodeStore::delete_stale_files (quarantaine)",
+                        perimes_en_quarantaine.chain(
+                            etat.code
+                                .contenus
+                                .get(&project_id)
+                                .into_iter()
+                                .flatten()
+                                .filter(|p| !valides.contains(*p)),
+                        ),
+                    )?;
                     etat.code
                         .contenus
                         .get(&project_id)
@@ -518,9 +691,7 @@ impl CodeStore for ObrainGraphStore {
                 // Everything is checked BEFORE the first deletion.
                 refus_si_symboles(w.db, &noeuds)?;
                 for (path, noeud) in &perimees {
-                    if !w.db.delete_node(*noeud) {
-                        bail!("obrain a refusé la suppression du nœud {noeud:?} (fichier {path})");
-                    }
+                    supprimer_fichier(w, *noeud, path)?;
                 }
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
@@ -546,6 +717,10 @@ impl CodeStore for ObrainGraphStore {
             move |(), w: &mut Ecriture<'_>| {
                 let (fichier, projet) = {
                     let etat = w.index()?;
+                    etat.code.refus_si_quarantaine(
+                        "CodeStore::link_file_to_project (quarantaine)",
+                        [&path].into_iter(),
+                    )?;
                     let (Some(f), Some(p)) = (
                         etat.code.fichiers.get(&path).map(|f| f.noeud),
                         etat.projets.noeud_de(project_id),
@@ -576,12 +751,12 @@ impl CodeStore for ObrainGraphStore {
         .await
     }
 
-    async fn upsert_file(&self, file: &FileNode) -> Result<()> {
-        self.ecrire_fichiers(vec![file.clone()]).await
+    async fn upsert_file(&self, _file: &FileNode) -> Result<()> {
+        refus("CodeStore::upsert_file", RAISON_ECRITURE_FICHIER)
     }
 
-    async fn batch_upsert_files(&self, files: &[FileNode]) -> Result<()> {
-        self.ecrire_fichiers(files.to_vec()).await
+    async fn batch_upsert_files(&self, _files: &[FileNode]) -> Result<()> {
+        refus("CodeStore::batch_upsert_files", RAISON_ECRITURE_FICHIER)
     }
 
     async fn get_file(&self, path: &str) -> Result<Option<FileNode>> {

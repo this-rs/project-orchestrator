@@ -152,7 +152,9 @@ pub fn refusees_plan() -> &'static [&'static str] {
 }
 
 /// The methods of `CodeStore` refused on every call, as `CodeStore::<method>`
-/// (`code.rs`): symbols, their edges, processes, graph analytics, `CO_CHANGED`.
+/// (`code.rs`): symbols, their edges, processes, graph analytics, `CO_CHANGED`,
+/// and the two file writes (`upsert_file`, `batch_upsert_files`) that would store a
+/// hash before the refused symbols.
 pub fn refusees_code() -> &'static [&'static str] {
     code::REFUSEES
 }
