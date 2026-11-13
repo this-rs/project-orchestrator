@@ -5786,6 +5786,33 @@ mod obrain_release_specifique {
         assert_eq!(s.noeuds_de_label_pour_test("Environment"), 0);
     }
 
+    /// A quarantined deployment (it no longer decodes) still belongs to its
+    /// environment: deleting the environment deletes it, online, as Neo4j's
+    /// `DETACH DELETE d, e` does.
+    #[tokio::test]
+    async fn a_quarantined_deployment_goes_with_its_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let p = super::conformance::a_project("env-quarantaine");
+        let e = environnement(p.id);
+        let d = deploiement(e.id, 1);
+        {
+            let s = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            s.create_project(&p).await.unwrap();
+            s.create_environment(&e).await.unwrap();
+            s.create_deployment(&d).await.unwrap();
+            assert!(s.ecrire_propriete_brute_pour_test("Deployment", d.id, "started_at", None));
+            s.close().await.unwrap();
+        }
+        let s = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert!(
+            s.get_deployment(d.id).await.unwrap().is_none(),
+            "quarantined"
+        );
+        s.delete_environment(e.id).await.unwrap();
+        assert_eq!(s.noeuds_de_label_pour_test("Deployment"), 0);
+    }
+
     /// The environment node is gone from the engine while the index holds it: the
     /// deletion refuses and deletes no deployment.
     #[tokio::test]

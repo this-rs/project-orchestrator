@@ -35,10 +35,13 @@
 //! - `delete_environment` deletes the environment and its deployments as ONE
 //!   operation, but in several engine records: the environment is marked
 //!   `_suppression` FIRST, its deployments are deleted, the environment LAST. A
-//!   restart that finds the marker finishes the deletion (counted in
-//!   `RapportOuverture::suppressions_achevees`): a cut never leaves an environment
-//!   with part of its deployments, which Neo4j's `DETACH DELETE d, e` never does
-//!   either.
+//!   restart that finds the marker finishes the deletion in the same order —
+//!   deployments, then the environment, so a cut during that repair leaves the
+//!   marker for the next open (counted in `RapportOuverture::suppressions_achevees`):
+//!   a cut never leaves an environment with part of its deployments, nor
+//!   deployments of a deleted environment, which Neo4j's `DETACH DELETE d, e`
+//!   never does either. The deployments taken are every `Deployment` naming the
+//!   environment, quarantined ones included.
 //!
 //! Same reference defect, mirrored on purpose and flagged: the Neo4j search
 //! filter of `list_projects_filtered` reads `p.title`, which projects do not
@@ -138,6 +141,9 @@ pub(super) struct IndexReleases {
     environnements_par_projet: HashMap<Uuid, Vec<Uuid>>,
     deploiements: HashMap<Uuid, Entree<DeploymentNode>>,
     deploiements_par_env: HashMap<Uuid, Vec<Uuid>>,
+    /// The quarantined `Deployment` nodes of each environment (not served, but
+    /// deleted with their environment).
+    deploiements_hors_index: HashMap<Uuid, Vec<NodeId>>,
     jalons: HashMap<Uuid, Entree<MilestoneNode>>,
     jalons_par_projet: HashMap<Uuid, Vec<Uuid>>,
 }
@@ -193,6 +199,17 @@ fn charger<T>(
     decodeur: fn(Lecture<'_>) -> Result<T>,
     rapport: &mut RapportOuverture,
 ) -> Vec<(NodeId, T)> {
+    charger_avec_quarantaine(db, etiquette, decodeur, rapport).0
+}
+
+/// [`charger`], and the nodes it quarantined for not decoding.
+fn charger_avec_quarantaine<T>(
+    db: &ObrainDB,
+    etiquette: &str,
+    decodeur: fn(Lecture<'_>) -> Result<T>,
+    rapport: &mut RapportOuverture,
+) -> (Vec<(NodeId, T)>, Vec<NodeId>) {
+    let mut quarantaine = Vec::new();
     let mut lus = Vec::new();
     let store = db.store();
     for noeud in store.nodes_by_label(etiquette) {
@@ -214,12 +231,73 @@ fn charger<T>(
         }
         match decodeur(&get) {
             Ok(valeur) => lus.push((noeud, valeur)),
-            Err(e) => rapport
-                .en_quarantaine
-                .push(format!("nœud {etiquette} {noeud:?} : {e}")),
+            Err(e) => {
+                rapport
+                    .en_quarantaine
+                    .push(format!("nœud {etiquette} {noeud:?} : {e}"));
+                quarantaine.push(noeud);
+            }
         }
     }
-    lus
+    (lus, quarantaine)
+}
+
+/// The `environment_id` a `Deployment` node stores, when it reads as a UUID
+/// (also for a node that does not decode as a whole).
+fn environnement_de(db: &ObrainDB, noeud: NodeId) -> Option<Uuid> {
+    db.get_node(noeud)?
+        .get_property("environment_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+}
+
+/// Finish the environment deletions an interruption left (the `_suppression`
+/// marker still on the environment): every `Deployment` whose `environment_id`
+/// names a marked environment — decodable or not — FIRST, the environment LAST,
+/// as the online deletion does. A cut during this repair leaves the marker, and
+/// the next open finishes again. `budget` bounds the engine deletions: `usize::MAX`
+/// in production; a test passes less to cut the repair half way. Returns the
+/// number of deletions finished.
+fn achever_suppressions(db: &ObrainDB, budget: usize) -> usize {
+    let mut marques: Vec<(NodeId, Option<Uuid>)> = Vec::new();
+    for noeud in db.store().nodes_by_label(ETIQUETTE_ENVIRONNEMENT) {
+        let Some(n) = db.get_node(noeud) else {
+            continue;
+        };
+        if n.get_property(SUPPRESSION)
+            .is_some_and(|v| !matches!(v, Value::Null))
+        {
+            let id = n
+                .get_property("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<Uuid>().ok());
+            marques.push((noeud, id));
+        }
+    }
+    if marques.is_empty() {
+        return 0;
+    }
+    let ids: HashSet<Uuid> = marques.iter().filter_map(|(_, id)| *id).collect();
+    let mut reste = budget;
+    for noeud in db.store().nodes_by_label(ETIQUETTE_DEPLOIEMENT) {
+        if environnement_de(db, noeud).is_some_and(|e| ids.contains(&e)) {
+            if reste == 0 {
+                return 0;
+            }
+            db.delete_node(noeud);
+            reste -= 1;
+        }
+    }
+    let mut achevees = 0;
+    for (noeud, _) in marques {
+        if reste == 0 {
+            break;
+        }
+        db.delete_node(noeud);
+        reste -= 1;
+        achevees += 1;
+    }
+    achevees
 }
 
 impl IndexReleases {
@@ -228,29 +306,9 @@ impl IndexReleases {
         let mut idx = Self::default();
         let mut rapport = RapportOuverture::default();
 
-        // An environment whose deletion had started (module doc): deleted now,
-        // before anything is read, and its deployments below.
-        let mut envs_supprimes: HashSet<Uuid> = HashSet::new();
-        for noeud in db.store().nodes_by_label(ETIQUETTE_ENVIRONNEMENT) {
-            let Some(n) = db.get_node(noeud) else {
-                continue;
-            };
-            let marque = n
-                .get_property(SUPPRESSION)
-                .is_some_and(|v| !matches!(v, Value::Null));
-            if !marque {
-                continue;
-            }
-            if let Some(id) = n
-                .get_property("id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<Uuid>().ok())
-            {
-                envs_supprimes.insert(id);
-            }
-            db.delete_node(noeud);
-            rapport.suppressions_achevees += 1;
-        }
+        // An environment whose deletion had started (module doc): finished now,
+        // its deployments first, before anything is read.
+        rapport.suppressions_achevees += achever_suppressions(db, usize::MAX);
 
         for (noeud, r) in charger(db, ETIQUETTE_RELEASE, lire_release, &mut rapport) {
             if idx.releases.contains_key(&r.id) {
@@ -290,16 +348,27 @@ impl IndexReleases {
                 Entree { noeud, valeur: e },
             );
         }
-        for (noeud, d) in charger(db, ETIQUETTE_DEPLOIEMENT, lire_deploiement, &mut rapport) {
-            if envs_supprimes.contains(&d.environment_id) {
-                // A deployment of an environment whose deletion opening finished.
-                db.delete_node(noeud);
-                continue;
+        let (deploiements, illisibles) =
+            charger_avec_quarantaine(db, ETIQUETTE_DEPLOIEMENT, lire_deploiement, &mut rapport);
+        // A quarantined deployment still belongs to its environment: its deletion
+        // must take it, as Neo4j's `DETACH DELETE d, e` does.
+        for noeud in illisibles {
+            if let Some(env) = environnement_de(db, noeud) {
+                idx.deploiements_hors_index
+                    .entry(env)
+                    .or_default()
+                    .push(noeud);
             }
+        }
+        for (noeud, d) in deploiements {
             if idx.deploiements.contains_key(&d.id) {
                 rapport
                     .en_quarantaine
                     .push(format!("nœud Deployment {noeud:?} : id {} déjà pris", d.id));
+                idx.deploiements_hors_index
+                    .entry(d.environment_id)
+                    .or_default()
+                    .push(noeud);
                 continue;
             }
             let (id, parent) = (d.id, d.environment_id);
@@ -1083,7 +1152,7 @@ impl ReleaseStore for ObrainGraphStore {
             move |(), w: &mut Ecriture<'_>| {
                 // The environment and its deployments, in one durable step, behind
                 // a deletion marker (module doc).
-                let (noeud, parent, deploiements) = {
+                let (noeud, parent, deploiements, hors_index) = {
                     let etat = w.index()?;
                     let Some(e) = etat.releases.environnements.get(&id) else {
                         return Ok(());
@@ -1098,12 +1167,19 @@ impl ReleaseStore for ObrainGraphStore {
                         .into_iter()
                         .filter_map(|i| etat.releases.deploiements.get(&i).map(|d| (d.noeud, i)))
                         .collect();
-                    (e.noeud, e.valeur.project_id, deps)
+                    let hors_index = etat
+                        .releases
+                        .deploiements_hors_index
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_default();
+                    (e.noeud, e.valeur.project_id, deps, hors_index)
                 };
                 // The deployments, then the environment: all checked live first
                 // (nothing written otherwise), then the marker, the commit point of
                 // the deletion: from there a restart finishes it (module doc).
                 let mut noeuds: Vec<NodeId> = deploiements.iter().map(|(n, _)| *n).collect();
+                noeuds.extend(hors_index);
                 noeuds.push(noeud);
                 let quoi = format!("suppression de l'environnement {id}");
                 w.verifier_vivants(&noeuds, &quoi)?;
@@ -1116,6 +1192,7 @@ impl ReleaseStore for ObrainGraphStore {
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 let idx = &mut etat.releases;
+                idx.deploiements_hors_index.remove(&id);
                 for (_, dep_id) in deploiements {
                     oublier(
                         &mut idx.deploiements,
@@ -1584,5 +1661,96 @@ impl ReleaseStore for ObrainGraphStore {
             trier(&mut v, primaire, desc, |p| p.id, false);
             Ok(page(v, offset, limit))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::neo4j::traits::ProjectStore;
+    use crate::obrain::{Creation, ValeurBrute};
+
+    fn projet() -> ProjectNode {
+        let id = Uuid::new_v4();
+        ProjectNode {
+            id,
+            name: format!("projet {id}"),
+            slug: format!("projet-{id}"),
+            root_path: String::new(),
+            description: None,
+            created_at: Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+            watch_enabled: false,
+            profile: Default::default(),
+        }
+    }
+
+    /// The repair at open is itself cut after ONE engine deletion. It deletes the
+    /// deployments first, so the cut leaves the marked environment, which the next
+    /// open finishes: no deployment of a deleted environment is ever served.
+    #[tokio::test]
+    async fn a_cut_during_the_repair_leaves_the_marker_for_the_next_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let p = projet();
+        let e = EnvironmentNode {
+            id: Uuid::new_v4(),
+            project_id: p.id,
+            name: "préprod".into(),
+            kind: EnvironmentKind::Staging,
+            url: None,
+            description: None,
+            config: None,
+            created_at: Utc::now(),
+        };
+        let ds: Vec<DeploymentNode> = (0..2)
+            .map(|_| DeploymentNode {
+                id: Uuid::new_v4(),
+                environment_id: e.id,
+                version: None,
+                commit_sha: None,
+                status: DeploymentStatus::Succeeded,
+                notes: None,
+                created_by: "ci".into(),
+                started_at: Utc::now(),
+                finished_at: None,
+            })
+            .collect();
+        {
+            let s = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            s.create_project(&p).await.unwrap();
+            s.create_environment(&e).await.unwrap();
+            for d in &ds {
+                s.create_deployment(d).await.unwrap();
+            }
+            // The state a cut after the marker of `delete_environment` leaves.
+            assert!(s.ecrire_propriete_brute_pour_test(
+                "Environment",
+                e.id,
+                SUPPRESSION,
+                Some(ValeurBrute::Booleen(true))
+            ));
+            s.close().await.unwrap();
+        }
+        {
+            let db = ObrainDB::open(&chemin).unwrap();
+            assert_eq!(achever_suppressions(&db, 1), 0, "cut before the end");
+            db.close().unwrap();
+        }
+        let s = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        for d in &ds {
+            assert!(
+                s.get_deployment(d.id).await.unwrap().is_none(),
+                "a deployment of a deleted environment is served"
+            );
+        }
+        assert!(s.get_environment(e.id).await.unwrap().is_none());
+        assert_eq!(s.rapport_d_ouverture().suppressions_achevees, 1);
+        assert_eq!(s.noeuds_de_label_pour_test(ETIQUETTE_DEPLOIEMENT), 0);
     }
 }
