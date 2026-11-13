@@ -10,7 +10,8 @@
 //! its trait (an omitted method would silently inherit the contract's default).
 //!
 //! Ported so far: [`ProjectStore`](crate::neo4j::traits::ProjectStore)
-//! (`project.rs`).
+//! (`project.rs`), and — partially — [`SharingStore`](crate::neo4j::traits::SharingStore)
+//! (`sharing.rs`: the audit-event write only; the rest is refused by name).
 //!
 //! # How obrain is used
 //!
@@ -61,6 +62,7 @@
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
 mod project;
+mod sharing;
 
 #[cfg(any(test, feature = "mock-store"))]
 pub use mesure::{Durabilite, Interruption};
