@@ -27,8 +27,7 @@ pub enum Interruption {
     ApresLeMarqueur,
     /// `create_project`: after the n-th of the eleven properties (1-based).
     ApresLaPropriete(usize),
-    /// `create_project`: every property written (and a blob-carrying one flushed),
-    /// the marker still there.
+    /// `create_project`: every property written, the marker still there.
     AvantLeRetraitDuMarqueur,
     /// `create_project`: the marker removed (the commit point), before the fsync
     /// that acknowledges.

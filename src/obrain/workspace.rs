@@ -56,8 +56,7 @@
 //!
 //! As for `project.rs`: a creation sets the draft marker `_brouillon` first and
 //! removes it LAST, after its edges; opening deletes every draft of these four
-//! labels. A value above [`SEUIL_COLONNE_BLOB`](super::SEUIL_COLONNE_BLOB) makes
-//! the full flush run before the marker goes, as there. Multi-property updates
+//! labels. Multi-property updates
 //! are not atomic (obrain has no multi-property write): an interruption can leave
 //! some of the properties of one update and not the others; each state is a
 //! valid value of the node.
@@ -86,7 +85,7 @@ use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
 use super::project::{self, IndexProjets};
-use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
+use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::neo4j::client::status_variants;
 use crate::neo4j::models::{
     ComponentDependency, ComponentNode, ComponentType, ComponentUpdate, CouplingMatrix,
@@ -558,10 +557,6 @@ fn relire<T>(db: &ObrainDB, noeud: NodeId, decoder: Decodeur<T>) -> Result<(Uuid
     decoder(&get)
 }
 
-fn va_en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-}
-
 /// Create a node of `etiquette` as a draft: the marker first, the properties,
 /// the edges (`liens`), then the marker removed last — the commit point. Returns
 /// the node; the caller decodes and publishes it once durable.
@@ -571,7 +566,6 @@ fn creer_noeud(
     proprietes: Vec<(&'static str, Value)>,
     liens: impl FnOnce(&ObrainDB, NodeId),
 ) -> Result<NodeId> {
-    w.flush_complet = proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
     let db = w.db;
     let noeud = db.create_node(&[etiquette]);
     db.set_node_property(noeud, BROUILLON, Value::from(true));
@@ -579,7 +573,6 @@ fn creer_noeud(
         db.set_node_property(noeud, cle, valeur);
     }
     liens(db, noeud);
-    w.rendre_durable_avant_le_marqueur()?;
     db.remove_node_property(noeud, BROUILLON);
     Ok(noeud)
 }
@@ -748,11 +741,9 @@ impl WorkspaceStore for ObrainGraphStore {
                 };
                 let db = w.db;
                 if let Some(n) = &name {
-                    w.flush_complet |= n.len() > SEUIL_COLONNE_BLOB;
                     db.set_node_property(noeud, "name", Value::from(n.clone()));
                 }
                 if let Some(d) = &description {
-                    w.flush_complet |= d.len() > SEUIL_COLONNE_BLOB;
                     db.set_node_property(noeud, "description", Value::from(d.clone()));
                 }
                 if let Some(m) = &metadata {
@@ -1128,11 +1119,9 @@ impl WorkspaceStore for ObrainGraphStore {
                 };
                 let db = w.db;
                 if let Some(t) = &title {
-                    w.flush_complet |= t.len() > SEUIL_COLONNE_BLOB;
                     db.set_node_property(noeud, "title", Value::from(t.clone()));
                 }
                 if let Some(d) = &description {
-                    w.flush_complet |= d.len() > SEUIL_COLONNE_BLOB;
                     db.set_node_property(noeud, "description", Value::from(d.clone()));
                 }
                 if let Some(s) = status {
@@ -1367,7 +1356,6 @@ impl WorkspaceStore for ObrainGraphStore {
                     ("description", description),
                 ] {
                     if let Some(v) = v {
-                        w.flush_complet |= v.len() > SEUIL_COLONNE_BLOB;
                         db.set_node_property(noeud, cle, Value::from(v));
                     }
                 }
@@ -1663,7 +1651,6 @@ impl WorkspaceStore for ObrainGraphStore {
                     db.set_node_property(noeud, "component_type", Value::from(format!("{:?}", t)));
                 }
                 if let Some(d) = &patch.description {
-                    w.flush_complet |= d.len() > SEUIL_COLONNE_BLOB;
                     db.set_node_property(noeud, "description", Value::from(d.clone()));
                 }
                 if let Some(r) = &patch.runtime {

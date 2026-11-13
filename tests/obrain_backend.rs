@@ -571,12 +571,12 @@ mod with_the_feature {
         );
     }
 
-    /// A value past the blob threshold is not recovered by the WAL: the write
-    /// that carries it must run the full flush too (measured: lost after SIGKILL
-    /// otherwise, see `SEUIL_COLONNE_BLOB`). Observed through the engine's own
-    /// counter of fsyncs: a flush runs more of them than the WAL fsync alone.
+    /// A value past the blob threshold is journaled in the WAL with its value
+    /// (obrain #123), so the write that carries it must pay the SAME WAL fsync as
+    /// a short write — no full flush. Observed through the engine's own counter
+    /// of fsyncs: a full flush would run more of them than the WAL fsync alone.
     #[tokio::test]
-    async fn a_write_past_the_blob_threshold_pays_the_full_flush() {
+    async fn a_write_past_the_blob_threshold_pays_no_full_flush() {
         let store = temporary(Durabilite::Wal).await;
         let fsyncs = || store.fsyncs_du_wal().unwrap();
         let mut small = a_project("small");
@@ -590,9 +590,9 @@ mod with_the_feature {
         store.create_project(&big).await.unwrap();
         let big_cost = fsyncs() - t1;
         assert!(small_cost >= 1, "256 bytes: the WAL fsync ran");
-        assert!(
-            big_cost > small_cost,
-            "257 bytes: the full flush too ({big_cost} fsyncs against {small_cost})"
+        assert_eq!(
+            big_cost, small_cost,
+            "257 bytes must cost only the WAL fsync, not a full flush ({big_cost} against {small_cost})"
         );
     }
 

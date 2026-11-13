@@ -124,7 +124,8 @@ async fn main() {
     dire("update_wal_p50", us(pct(mesures.clone(), 0.5)), "µs");
     dire("update_wal_p99", us(pct(mesures, 0.99)), "µs");
 
-    // A write that carries a value past the blob threshold pays the full flush too.
+    // A write that carries a value past the blob threshold: journaled in the WAL
+    // (obrain #123), it pays the same WAL fsync as a short write.
     let mut mesures = Vec::new();
     for i in 0..30 {
         let mut p = projet(500 + i);
@@ -181,8 +182,8 @@ async fn main() {
     assert_eq!(refus.is_err(), noeuds > 0);
 
     // 5b. The note domain (NoteStore) on the same base: a project of notes, short and
-    //     long contents (a value past the blob threshold pays the full flush), reads by
-    //     id, by project, over the whole base, and by linked entity.
+    //     long contents (journaled in the WAL, obrain #123), reads by id, by project,
+    //     over the whole base, and by linked entity.
     let proj = ids[0].0;
     let mut mesures = Vec::new();
     let mut notes_ids = Vec::new();
