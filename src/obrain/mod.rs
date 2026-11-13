@@ -10,7 +10,15 @@
 //! its trait (an omitted method would silently inherit the contract's default).
 //!
 //! Ported so far: [`ProjectStore`](crate::neo4j::traits::ProjectStore)
-//! (`project.rs`), and the node part of [`FederationStore`](crate::neo4j::traits::FederationStore)
+//! (`project.rs`), [`AuthStore`](crate::neo4j::traits::AuthStore) (`auth.rs`),
+//! [`ReleaseStore`](crate::neo4j::traits::ReleaseStore)
+//! for releases, environments, deployments and milestones (`release.rs`), whose
+//! refusals (tasks, plans, commits) are listed in `release::REFUSEES`,
+//! [`WorkspaceStore`](crate::neo4j::traits::WorkspaceStore)
+//! (`workspace.rs`, 35 of its 45 methods; the rest are refused by name), the note
+//! node of [`NoteStore`](crate::neo4j::traits::NoteStore) (`note.rs`: 13 of its 41
+//! methods; the others are refused by name there), and the node part of
+//! [`FederationStore`](crate::neo4j::traits::FederationStore)
 //! (`federation.rs`: the five relation writes and the two backfills are refused by name).
 //!
 //! # How obrain is used
@@ -59,10 +67,14 @@
 //! Reads are served inline (obrain reads are mmap and hash lookups); writes run
 //! on the blocking pool.
 
+mod auth;
 mod federation;
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
+mod note;
 mod project;
+mod release;
+mod workspace;
 
 #[cfg(any(test, feature = "mock-store"))]
 pub use mesure::{Durabilite, Interruption};
@@ -104,11 +116,25 @@ pub fn methodes_portees() -> &'static [&'static str] {
     PORTEES
 }
 
+/// The methods of `NoteStore` refused on every call, as `NoteStore::<method>`
+/// (`note.rs`). Three more note methods refuse only in some cases.
+pub fn refusees_note() -> &'static [&'static str] {
+    note::REFUSEES
+}
+
+/// The methods of `ReleaseStore` refused on every call, as
+/// `ReleaseStore::<method>` (`release.rs`): they read or link a `Task`, a
+/// `Plan`, a `Commit` or a `Step`, domains not yet ported.
+pub fn refusees_release() -> &'static [&'static str] {
+    release::REFUSEES
+}
+
 /// The hand-written methods that REFUSE: `GraphStore::get_progress_batch` (its
-/// contract default loops over getters of other domains), and the five
+/// contract default loops over getters of other domains), the five
 /// `FederationStore` methods whose relation writes and backfills are not ported
-/// (`federation.rs`). They are in [`methodes_portees`] because they are written,
-/// not because they work.
+/// (`federation.rs`), and the ten `WorkspaceStore` methods whose domains (plan,
+/// cross-workspace listing) are not ported. They are in [`methodes_portees`]
+/// because they are written, not because they work.
 pub const REFUS_ECRITS_A_LA_MAIN: &[&str] = &[
     "GraphStore::get_progress_batch",
     "FederationStore::create_mcp_similar_to",
@@ -116,6 +142,17 @@ pub const REFUS_ECRITS_A_LA_MAIN: &[&str] = &[
     "FederationStore::create_mcp_often_follows",
     "FederationStore::backfill_co_activated_with",
     "FederationStore::backfill_often_follows",
+    // WorkspaceStore: the domains they read (plan, cross-workspace listing) are not ported.
+    "WorkspaceStore::list_all_workspace_milestones_filtered",
+    "WorkspaceStore::count_all_workspace_milestones",
+    "WorkspaceStore::add_task_to_workspace_milestone",
+    "WorkspaceStore::remove_task_from_workspace_milestone",
+    "WorkspaceStore::link_plan_to_workspace_milestone",
+    "WorkspaceStore::unlink_plan_from_workspace_milestone",
+    "WorkspaceStore::get_workspace_milestone_progress",
+    "WorkspaceStore::get_workspace_milestone_tasks",
+    "WorkspaceStore::get_workspace_milestone_steps",
+    "WorkspaceStore::compute_coupling_matrix",
 ];
 
 /// The methods that really serve something: the ported methods of the domains,
@@ -124,7 +161,12 @@ pub fn methodes_qui_servent() -> Vec<&'static str> {
     PORTEES
         .iter()
         .copied()
-        .filter(|m| !REFUS_ECRITS_A_LA_MAIN.contains(m) && !m.starts_with("GraphStore::"))
+        .filter(|m| {
+            !REFUS_ECRITS_A_LA_MAIN.contains(m)
+                && !release::REFUSEES.contains(m)
+                && !note::REFUSEES.contains(m)
+                && !m.starts_with("GraphStore::")
+        })
         .collect()
 }
 
@@ -223,6 +265,10 @@ struct Interne {
 #[derive(Default)]
 struct Etat {
     projets: project::IndexProjets,
+    auth: auth::IndexAuth,
+    releases: release::IndexReleases,
+    espaces: workspace::IndexEspaces,
+    notes: note::IndexNotes,
     federation: federation::IndexFederation,
 }
 
@@ -235,6 +281,10 @@ struct Ecriture<'a> {
     /// The write put a value in a place the WAL does not recover (see
     /// [`SEUIL_COLONNE_BLOB`]): the WAL fsync is not enough, the full flush runs.
     flush_complet: bool,
+    /// How many engine writes of this closure have been made (the test hook
+    /// `Interruption::ApresEtape` counts them).
+    #[cfg_attr(not(any(test, feature = "mock-store")), allow(dead_code))]
+    etapes: usize,
 }
 
 impl Ecriture<'_> {
@@ -266,6 +316,18 @@ impl Ecriture<'_> {
         if *arme == Some(point) {
             *arme = None;
             bail!("interruption injectée par le test : {point:?}");
+        }
+        Ok(())
+    }
+
+    /// A test hook after each engine write of a multi-write (see `note.rs`): a crash
+    /// simulation at the k-th write. Nothing in production.
+    fn etape(&mut self) -> Result<()> {
+        #[cfg(any(test, feature = "mock-store"))]
+        {
+            self.etapes += 1;
+            let n = self.etapes;
+            self.point(Interruption::ApresEtape(n))?;
         }
         Ok(())
     }
@@ -455,13 +517,25 @@ impl ObrainGraphStore {
                 )
             })?;
         }
+        let contexte = || {
+            format!(
+                "reconstruction des index de la base obrain {}",
+                chemin.display()
+            )
+        };
         let (projets, mut rapport) =
-            project::IndexProjets::reconstruire(&db).with_context(|| {
-                format!(
-                    "reconstruction des index de la base obrain {}",
-                    chemin.display()
-                )
-            })?;
+            project::IndexProjets::reconstruire(&db).with_context(contexte)?;
+        let auth = auth::IndexAuth::reconstruire(&db, &mut rapport);
+        let (releases, rapport_releases) =
+            release::IndexReleases::reconstruire(&db).with_context(contexte)?;
+        rapport.brouillons_supprimes += rapport_releases.brouillons_supprimes;
+        rapport
+            .en_quarantaine
+            .extend(rapport_releases.en_quarantaine);
+        let espaces = workspace::IndexEspaces::reconstruire(&db, &projets, &mut rapport)
+            .with_context(contexte)?;
+        let notes =
+            note::IndexNotes::reconstruire(&db, &projets, &mut rapport).with_context(contexte)?;
         let (federation, brouillons, quarantaine) = federation::IndexFederation::reconstruire(&db)
             .with_context(|| {
                 format!(
@@ -473,6 +547,10 @@ impl ObrainGraphStore {
         rapport.en_quarantaine.extend(quarantaine);
         let etat = Etat {
             projets,
+            auth,
+            releases,
+            espaces,
+            notes,
             federation,
         };
         let store = Self {
@@ -614,6 +692,7 @@ impl ObrainGraphStore {
                 interne: &interne,
                 rendu_durable: false,
                 flush_complet: false,
+                etapes: 0,
             };
             let rendu = f(prepare, &mut ecriture)?;
             if !ecriture.rendu_durable {
