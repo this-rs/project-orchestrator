@@ -177,11 +177,6 @@ impl IndexProjets {
         self.par_id.contains_key(&id)
     }
 
-    /// How many projects this backend addresses.
-    pub(super) fn nombre(&self) -> usize {
-        self.par_id.len()
-    }
-
     /// Every project, as the readers are served them (unsorted).
     pub(super) fn tous(&self) -> Vec<ProjectNode> {
         self.par_id.values().map(|e| e.projet.clone()).collect()

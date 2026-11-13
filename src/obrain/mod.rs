@@ -81,7 +81,7 @@ mod release;
 mod workspace;
 
 #[cfg(any(test, feature = "mock-store"))]
-pub use mesure::{Durabilite, Interruption};
+pub use mesure::{Durabilite, Interruption, ValeurBrute};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -548,7 +548,7 @@ impl ObrainGraphStore {
         let (projets, mut rapport) =
             project::IndexProjets::reconstruire(&db).with_context(contexte)?;
         let (plans, brouillons, quarantaine) =
-            plan::IndexPlans::reconstruire(&db).with_context(contexte)?;
+            plan::IndexPlans::reconstruire(&db, &projets).with_context(contexte)?;
         rapport.brouillons_supprimes += brouillons;
         rapport.en_quarantaine.extend(quarantaine);
         let auth = auth::IndexAuth::reconstruire(&db, &mut rapport);

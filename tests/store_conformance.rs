@@ -4061,6 +4061,208 @@ pub mod conformance {
         }
         store.delete_project(p.id, &p.name).await.ok();
     }
+
+    // ------------------------------------------------------------------
+    // Plans: the core the obrain backend ports (`plan_checks!`).
+    // ------------------------------------------------------------------
+
+    /// `ORDER BY p.priority DESC, p.created_at DESC, p.id DESC`.
+    fn plan_order(a: &PlanNode, b: &PlanNode) -> std::cmp::Ordering {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| b.id.cmp(&a.id))
+    }
+
+    /// The lists of a project's plans: only the project's, only the active ones
+    /// where the contract says so, in the total order `priority DESC, created_at
+    /// DESC, id DESC` (ties on the priority AND on `created_at`), the status filter
+    /// as Neo4j normalises it (`in_progress` and `Draft` match, an unknown value
+    /// matches nothing), and the pagination with its total counted before the page.
+    pub async fn check_plan_project_lists(store: &dyn GraphStore) {
+        let p = a_project("plan-lists");
+        let q = a_project("plan-lists-other");
+        store.create_project(&p).await.unwrap();
+        store.create_project(&q).await.unwrap();
+
+        let with = |title: &str, priority: i32, t: i64, status: PlanStatus| {
+            let mut x = a_plan(p.id, title, priority, at(t));
+            x.status = status;
+            x
+        };
+        // Inserted in an order that is none of the expected orders.
+        let e = with("e", 1, 0, PlanStatus::Cancelled);
+        let a = with("a", 5, 10, PlanStatus::Draft);
+        let d = with("d", 9, 0, PlanStatus::Completed);
+        let b = with("b", 5, 10, PlanStatus::InProgress);
+        let c = with("c", 5, 20, PlanStatus::Approved);
+        let mut other = a_plan(q.id, "other", 3, at(5));
+        other.status = PlanStatus::Draft;
+        for x in [&e, &a, &d, &b, &c, &other] {
+            store.create_plan(x).await.unwrap();
+        }
+
+        let mut all = vec![a.clone(), b.clone(), c.clone(), d.clone(), e.clone()];
+        all.sort_by(plan_order);
+        let active: Vec<Uuid> = all
+            .iter()
+            .filter(|x| {
+                matches!(
+                    x.status,
+                    PlanStatus::Draft | PlanStatus::Approved | PlanStatus::InProgress
+                )
+            })
+            .map(|x| x.id)
+            .collect();
+        assert_eq!(active.len(), 3);
+
+        assert_eq!(
+            ids(&store.list_project_plans(p.id).await.unwrap(), |x| x.id),
+            active,
+            "list_project_plans: the active plans of the project, priority DESC, created_at DESC, id DESC"
+        );
+        assert_eq!(store.count_project_plans(p.id).await.unwrap(), 3);
+        assert_eq!(
+            ids(&store.list_project_plans(q.id).await.unwrap(), |x| x.id),
+            vec![other.id]
+        );
+        assert!(store
+            .list_project_plans(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.count_project_plans(Uuid::new_v4()).await.unwrap(), 0);
+
+        let ours: HashSet<Uuid> = [a.id, b.id, c.id, d.id, e.id, other.id].into();
+        let mut expected_active: Vec<PlanNode> =
+            vec![a.clone(), b.clone(), c.clone(), other.clone()];
+        expected_active.sort_by(plan_order);
+        let listed: Vec<Uuid> = store
+            .list_active_plans()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|x| x.id)
+            .filter(|id| ours.contains(id))
+            .collect();
+        assert_eq!(
+            listed,
+            ids(&expected_active, |x| x.id),
+            "list_active_plans: every project's active plans, in the same order"
+        );
+
+        let (page, total) = store
+            .list_plans_for_project(p.id, None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            (ids(&page, |x| x.id), total),
+            (ids(&all, |x| x.id), 5),
+            "list_plans_for_project without a filter: every status, the same order"
+        );
+        let (page, total) = store
+            .list_plans_for_project(p.id, None, 2, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            (ids(&page, |x| x.id), total),
+            (ids(&all[1..3], |x| x.id), 5),
+            "SKIP 1 LIMIT 2, the total counted before the page"
+        );
+        let filter = vec![
+            "in_progress".to_string(),
+            "Draft".to_string(),
+            "inconnu".to_string(),
+        ];
+        let mut drafted = vec![a.clone(), b.clone()];
+        drafted.sort_by(plan_order);
+        let (page, total) = store
+            .list_plans_for_project(p.id, Some(filter), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            (ids(&page, |x| x.id), total),
+            (ids(&drafted, |x| x.id), 2),
+            "the filter: in_progress and Draft match, an unknown value matches nothing"
+        );
+        let (page, total) = store
+            .list_plans_for_project(Uuid::new_v4(), None, 10, 0)
+            .await
+            .unwrap();
+        assert!(page.is_empty() && total == 0);
+
+        for x in [&e, &a, &d, &b, &c, &other] {
+            store.delete_plan(x.id).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.ok();
+        store.delete_project(q.id, &q.name).await.ok();
+    }
+
+    /// A plan reads back as written; an update and a status change are read back;
+    /// on an absent plan they are silent no-ops; a deleted plan is gone, and
+    /// deleting it again is not an error.
+    pub async fn check_plan_update_and_delete(store: &dyn GraphStore) {
+        let p = a_project("plan-update");
+        store.create_project(&p).await.unwrap();
+        let x = a_plan(p.id, "before", 2, at(0));
+        store.create_plan(&x).await.unwrap();
+        let back = store.get_plan(x.id).await.unwrap().expect("read by id");
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(&x).unwrap(),
+            "the plan reads back identical"
+        );
+
+        store
+            .update_plan(
+                x.id,
+                &project_orchestrator::plan::models::UpdatePlanRequest {
+                    title: Some("after".to_string()),
+                    description: None,
+                    priority: Some(7),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .update_plan_status(x.id, PlanStatus::InProgress)
+            .await
+            .unwrap();
+        let back = store.get_plan(x.id).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                back.title.as_str(),
+                back.description.as_str(),
+                back.priority,
+                back.status
+            ),
+            ("after", "conformance plan", 7, PlanStatus::InProgress)
+        );
+
+        let absent = Uuid::new_v4();
+        store
+            .update_plan_status(absent, PlanStatus::Completed)
+            .await
+            .unwrap();
+        store
+            .update_plan(
+                absent,
+                &project_orchestrator::plan::models::UpdatePlanRequest {
+                    title: Some("x".to_string()),
+                    description: None,
+                    priority: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(store.get_plan(absent).await.unwrap().is_none());
+
+        store.delete_plan(x.id).await.unwrap();
+        assert!(store.get_plan(x.id).await.unwrap().is_none());
+        assert_eq!(store.count_project_plans(p.id).await.unwrap(), 0);
+        store.delete_plan(x.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.ok();
+    }
 }
 
 // ===============================================================// Factories: one per backend.
@@ -4223,6 +4425,12 @@ const EXPECTED_DIVERGENCES: &[Divergence] = &[
     mock(
         "check_sorting",
         "list_plans_filtered ignores sort_by and sort_order (HashMap order) where Neo4j sorts by created_at DESC by default, priority/title/status on request",
+    ),
+    mock(
+        "check_plan_project_lists",
+        "list_project_plans returns the plans in insertion order and list_active_plans in map order (Neo4j: priority DESC, \
+         created_at DESC, id DESC); list_plans_for_project sorts by created_at alone and compares the filter with the \
+         snake_case spelling, so `Draft` matches nothing (Neo4j: plan_status_values, then the stored PascalCase)",
     ),
     mock(
         "check_pagination",
@@ -4482,6 +4690,23 @@ release_checks!(neo4j_release, Neo4jFactory);
 #[cfg(feature = "obrain-backend")]
 release_checks!(obrain_release, ObrainFactory);
 
+/// The plan domain: the core the obrain backend ports (plans and the lists of a
+/// project's plans), on the same fixtures for every backend.
+macro_rules! plan_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [check_plan_project_lists, check_plan_update_and_delete,]
+        );
+    };
+}
+
+plan_checks!(mock_plan, MockFactory);
+plan_checks!(neo4j_plan, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+plan_checks!(obrain_plan, ObrainFactory);
+
 /// What only the obrain adapter does: the refusals of the workspace methods it
 /// does not port are named (a `NonPorte` downcast), and what it writes is read
 /// back, identical, after a close and an open of the same base (the index is
@@ -4694,6 +4919,270 @@ mod obrain_workspace_specifique {
             (c_db, Some("sql"), true)
         );
         store.close().await.unwrap();
+    }
+}
+
+/// What only the obrain adapter does for plans: the deletion of a plan does not
+/// depend on the other domains' nodes, a creation stopped at any point of its
+/// protocol reopens as nothing or as the whole plan, the status is read as Neo4j
+/// reads it, and a migrated plan whose `HAS_PLAN` edges disagree with its
+/// `project_id` is quarantined.
+#[cfg(feature = "obrain-backend")]
+mod obrain_plan_specifique {
+    use chrono::{TimeZone, Utc};
+    use project_orchestrator::neo4j::models::{PlanNode, PlanStatus, ProjectNode, WorkspaceNode};
+    use project_orchestrator::neo4j::traits::{PlanStore, ProjectStore, WorkspaceStore};
+    use project_orchestrator::obrain::{
+        Creation, Interruption, NonPorte, ObrainGraphStore, ValeurBrute,
+    };
+    use project_orchestrator::plan::models::UpdatePlanRequest;
+    use uuid::Uuid;
+
+    fn projet(label: &str) -> ProjectNode {
+        let mut p = super::conformance::a_project(label);
+        p.created_at = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        p
+    }
+
+    fn plan(project_id: Option<Uuid>) -> PlanNode {
+        PlanNode {
+            id: Uuid::new_v4(),
+            title: "plan".into(),
+            description: "description".into(),
+            status: PlanStatus::Draft,
+            created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            created_by: "test".into(),
+            priority: 3,
+            project_id,
+            execution_context: None,
+            persona: None,
+        }
+    }
+
+    /// A plan is deleted although the base holds nodes of other domains (a
+    /// workspace here): only what hangs from the plan counts.
+    #[tokio::test]
+    async fn delete_plan_ignores_the_nodes_of_other_domains() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let ws = WorkspaceNode {
+            id: Uuid::new_v4(),
+            name: "ws".into(),
+            slug: format!("ws-{}", Uuid::new_v4().simple()),
+            description: None,
+            created_at: Utc::now(),
+            updated_at: None,
+            metadata: serde_json::json!({}),
+        };
+        store.create_workspace(&ws).await.unwrap();
+        let x = plan(None);
+        store.create_plan(&x).await.unwrap();
+        store.delete_plan(x.id).await.unwrap();
+        assert!(store.get_plan(x.id).await.unwrap().is_none());
+    }
+
+    /// A plan with an outgoing edge (a task of a migrated base) is refused by name:
+    /// the cascade would have to reach the task.
+    #[tokio::test]
+    async fn delete_plan_refuses_a_plan_with_a_task() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let x = plan(None);
+        store.create_plan(&x).await.unwrap();
+        let tache = Uuid::new_v4().to_string();
+        store.creer_noeud_brut_pour_test("Task", &[("id", ValeurBrute::Texte(&tache))]);
+        assert!(store.creer_arete_brute_pour_test(
+            ("Plan", x.id),
+            ("Task", tache.parse().unwrap()),
+            "HAS_TASK"
+        ));
+        let e = store.delete_plan(x.id).await.unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<NonPorte>(),
+            Some(&NonPorte("PlanStore::delete_plan (cascade)"))
+        );
+        assert!(format!("{e:#}").contains("1 arête(s) sortante(s)"), "{e:#}");
+        assert!(store.get_plan(x.id).await.unwrap().is_some());
+    }
+
+    /// A creation stopped at each point of the draft-marker protocol: before the
+    /// marker is removed, the reopened base has no plan and one draft deleted;
+    /// after, the whole plan.
+    #[tokio::test]
+    async fn an_interrupted_creation_reopens_as_nothing_or_the_whole_plan() {
+        let mut points = vec![Interruption::ApresLeNoeud, Interruption::ApresLeMarqueur];
+        points.extend((1..=8).map(Interruption::ApresLaPropriete));
+        points.push(Interruption::AvantLeRetraitDuMarqueur);
+        points.push(Interruption::ApresLeRetraitDuMarqueur);
+        for point in points {
+            let dir = tempfile::tempdir().unwrap();
+            let chemin = dir.path().join("base");
+            let x = plan(None);
+            {
+                let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+                store.interrompre_au_prochain(point);
+                let e = store.create_plan(&x).await.unwrap_err();
+                assert!(
+                    format!("{e:#}").contains("interruption injectée"),
+                    "{point:?}: {e:#}"
+                );
+                store.close().await.unwrap();
+            }
+            let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+            let rapport = store.rapport_d_ouverture().clone();
+            assert!(rapport.en_quarantaine.is_empty(), "{point:?}: {rapport:?}");
+            let relu = store.get_plan(x.id).await.unwrap();
+            if point == Interruption::ApresLeRetraitDuMarqueur {
+                assert_eq!(rapport.brouillons_supprimes, 0, "{point:?}");
+                assert_eq!(
+                    serde_json::to_value(relu.expect("committed")).unwrap(),
+                    serde_json::to_value(&x).unwrap(),
+                    "{point:?}"
+                );
+            } else {
+                assert_eq!(rapport.brouillons_supprimes, 1, "{point:?}");
+                assert!(relu.is_none(), "{point:?}");
+            }
+            store.close().await.unwrap();
+        }
+    }
+
+    /// The stored status is read as Neo4j reads it: `in_progress` decodes as
+    /// `InProgress` but is not active (the filter compares the stored string), and a
+    /// plan with no status is quarantined (Neo4j's read fails).
+    #[tokio::test]
+    async fn the_stored_status_is_read_as_neo4j_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let p = projet("plan-statut");
+        let migre = plan(Some(p.id));
+        let sans_statut = plan(Some(p.id));
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_project(&p).await.unwrap();
+            store.create_plan(&migre).await.unwrap();
+            store.create_plan(&sans_statut).await.unwrap();
+            assert!(store.ecrire_propriete_brute_pour_test(
+                "Plan",
+                migre.id,
+                "status",
+                Some(ValeurBrute::Texte("in_progress"))
+            ));
+            assert!(store.ecrire_propriete_brute_pour_test("Plan", sans_statut.id, "status", None));
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert_eq!(
+            store.get_plan(migre.id).await.unwrap().unwrap().status,
+            PlanStatus::InProgress
+        );
+        assert!(store.list_active_plans().await.unwrap().is_empty());
+        assert_eq!(store.count_project_plans(p.id).await.unwrap(), 0);
+        let (page, total) = store
+            .list_plans_for_project(p.id, Some(vec!["in_progress".into()]), 10, 0)
+            .await
+            .unwrap();
+        assert!(
+            page.is_empty() && total == 0,
+            "the filter compares the stored string: in_progress becomes InProgress, which is not stored"
+        );
+        assert!(store.get_plan(sans_statut.id).await.unwrap().is_none());
+        assert!(store
+            .rapport_d_ouverture()
+            .en_quarantaine
+            .iter()
+            .any(|q| q.contains("status")));
+    }
+
+    /// The project lists need the project (Neo4j's `MATCH (project:Project {id})`):
+    /// a plan whose project is absent is listed under no project.
+    #[tokio::test]
+    async fn a_plan_of_an_absent_project_is_listed_under_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let p = projet("plan-absent");
+        let x = plan(Some(p.id));
+        let ailleurs = Uuid::new_v4();
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_project(&p).await.unwrap();
+            store.create_plan(&x).await.unwrap();
+            let ailleurs_s = ailleurs.to_string();
+            assert!(store.ecrire_propriete_brute_pour_test(
+                "Plan",
+                x.id,
+                "project_id",
+                Some(ValeurBrute::Texte(&ailleurs_s))
+            ));
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert!(store.get_plan(x.id).await.unwrap().is_some());
+        assert!(store.list_project_plans(ailleurs).await.unwrap().is_empty());
+        assert_eq!(store.count_project_plans(ailleurs).await.unwrap(), 0);
+        let (page, total) = store
+            .list_plans_for_project(ailleurs, None, 10, 0)
+            .await
+            .unwrap();
+        assert!(page.is_empty() && total == 0);
+    }
+
+    /// A migrated plan linked by `HAS_PLAN` to A and to B (`project_id = B`):
+    /// Neo4j lists it under both, this backend could only list it under B. It is
+    /// quarantined and named.
+    #[tokio::test]
+    async fn a_plan_linked_to_several_projects_is_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let a = projet("plan-a");
+        let b = projet("plan-b");
+        let x = plan(Some(b.id));
+        let seul = plan(Some(b.id));
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_project(&a).await.unwrap();
+            store.create_project(&b).await.unwrap();
+            store.create_plan(&x).await.unwrap();
+            store.create_plan(&seul).await.unwrap();
+            for (projet, plan) in [(a.id, x.id), (b.id, x.id), (b.id, seul.id)] {
+                assert!(store.creer_arete_brute_pour_test(
+                    ("Project", projet),
+                    ("Plan", plan),
+                    "HAS_PLAN"
+                ));
+            }
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert!(store.get_plan(x.id).await.unwrap().is_none());
+        assert!(store
+            .rapport_d_ouverture()
+            .en_quarantaine
+            .iter()
+            .any(|q| q.contains(&x.id.to_string()) && q.contains("HAS_PLAN")));
+        // The edge that agrees with `project_id` is the migrated base's normal case.
+        assert_eq!(
+            store
+                .list_project_plans(b.id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
+            vec![seul.id]
+        );
+    }
+
+    /// An empty update on a closed base refuses like every other operation.
+    #[tokio::test]
+    async fn an_empty_update_on_a_closed_base_refuses() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        store.close().await.unwrap();
+        let vide = UpdatePlanRequest {
+            title: None,
+            description: None,
+            priority: None,
+        };
+        let e = store.update_plan(Uuid::new_v4(), &vide).await.unwrap_err();
+        assert!(format!("{e:#}").contains("fermée"), "{e:#}");
     }
 }
 
