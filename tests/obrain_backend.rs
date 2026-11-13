@@ -571,6 +571,57 @@ mod with_the_feature {
         );
     }
 
+    /// The auth domain under the same oracle: every acknowledged auth write ran a
+    /// WAL fsync before it answered (users, refresh tokens, MCP tokens, the
+    /// rotation, the revocations and the purge).
+    #[tokio::test]
+    async fn every_acknowledged_auth_write_ran_a_wal_fsync() {
+        let store = temporary(Durabilite::Wal).await;
+        let last = std::cell::Cell::new(store.fsyncs_du_wal().expect("a persistent base"));
+        let ran = |quoi: &str| {
+            let n = store.fsyncs_du_wal().unwrap();
+            assert!(
+                n > last.get(),
+                "{quoi}: no WAL fsync ran since the previous acknowledgement ({} → {n})",
+                last.get()
+            );
+            last.set(n);
+        };
+        let u = store
+            .create_password_user("durable@ex.test", "D", "h")
+            .await
+            .unwrap();
+        ran("create_password_user");
+        store
+            .create_password_user("durable@ex.test", "D2", "h")
+            .await
+            .unwrap();
+        ran("upsert_user (ON MATCH)");
+        let futur = Utc::now() + chrono::Duration::hours(1);
+        for k in 0..3 {
+            store
+                .create_refresh_token(u.id, &format!("durable-rt-{k}"), futur)
+                .await
+                .unwrap();
+            ran("create_refresh_token");
+        }
+        store.consume_refresh_token("durable-rt-0").await.unwrap();
+        ran("consume_refresh_token");
+        store.revoke_refresh_token("durable-rt-1").await.unwrap();
+        ran("revoke_refresh_token");
+        store.revoke_all_user_tokens(u.id).await.unwrap();
+        ran("revoke_all_user_tokens");
+        store
+            .create_mcp_token(u.id, "durable-jti", "l", "s", futur)
+            .await
+            .unwrap();
+        ran("create_mcp_token");
+        store.revoke_mcp_token(u.id, "durable-jti").await.unwrap();
+        ran("revoke_mcp_token");
+        store.purge_mcp_tokens(u.id).await.unwrap();
+        ran("purge_mcp_tokens");
+    }
+
     /// A value past the blob threshold is not recovered by the WAL: the write
     /// that carries it must run the full flush too (measured: lost after SIGKILL
     /// otherwise, see `SEUIL_COLONNE_BLOB`). Observed through the engine's own
@@ -1002,6 +1053,111 @@ mod with_the_feature {
              torn paths repaired, {quarantaine} quarantined",
             repares.brouillons_supprimes, repares.chemins_repares
         );
+    }
+
+    const ENV_KILL9_AUTH: &str = "OBRAIN_PO_TEST_ENFANT_KILL9_AUTH";
+
+    /// The auth domain under SIGKILL, never closed: the child registers users and
+    /// gives each a refresh token and an MCP token, logging each user once all three
+    /// writes are acknowledged; it is killed while writing. The base reopens (from
+    /// what the kill left, with no close and no full flush), quarantines nothing,
+    /// deletes what was half-created, and serves everything acknowledged: the user
+    /// by its key, the refresh token valid, the MCP token active.
+    #[tokio::test]
+    async fn kill9_during_auth_writes_loses_nothing_acknowledged() {
+        if let Ok(dir) = std::env::var(ENV_KILL9_AUTH) {
+            let dir = std::path::PathBuf::from(dir);
+            let store = open(&dir.join("base")).await;
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("acquittes-auth"))
+                .unwrap();
+            let futur = Utc::now() + chrono::Duration::days(1);
+            loop {
+                let k = Uuid::new_v4();
+                let u = store
+                    .create_password_user(&format!("{k}@kill9.test"), "K", &format!("h-{k}"))
+                    .await
+                    .unwrap();
+                store
+                    .create_refresh_token(u.id, &format!("rt-{k}"), futur)
+                    .await
+                    .unwrap();
+                store
+                    .create_mcp_token(u.id, &format!("jti-{k}"), "l", "s", futur)
+                    .await
+                    .unwrap();
+                use std::io::Write as _;
+                writeln!(log, "{k}\t{}", u.id).unwrap();
+            }
+        }
+
+        const TOURS: usize = 4;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let acquittes = dir.path().join("acquittes-auth");
+        let compte = || std::fs::read_to_string(&acquittes).map_or(0, |s| s.lines().count());
+        let mut vus = 0usize;
+        for tour in 0..TOURS {
+            let avant = compte();
+            let mut child = lancer_enfant(
+                "with_the_feature::kill9_during_auth_writes_loses_nothing_acknowledged",
+                ENV_KILL9_AUTH,
+                dir.path(),
+                &[],
+            );
+            for _ in 0..2400 {
+                if compte() >= avant + 5 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(
+                compte() >= avant + 5,
+                "round {tour}: the child acknowledged nothing in 60 s"
+            );
+            tokio::time::sleep(Duration::from_micros(1_300 * (tour as u64 % 7 + 1))).await;
+            child.kill().unwrap(); // SIGKILL: no close, no flush
+            child.wait().unwrap();
+
+            let store = open(&base).await;
+            let rapport = store.rapport_d_ouverture().clone();
+            assert!(
+                rapport.en_quarantaine.is_empty(),
+                "round {tour}: an auth write killed half-way is repaired, never quarantined: \
+                 {rapport:?}"
+            );
+            for ligne in std::fs::read_to_string(&acquittes).unwrap().lines() {
+                let (k, id) = ligne.split_once('\t').unwrap();
+                let id: Uuid = id.parse().unwrap();
+                let u = store
+                    .get_user_by_email_and_provider(&format!("{k}@kill9.test"), "password")
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("round {tour}: acknowledged user {id} is gone"));
+                assert_eq!(u.id, id);
+                assert_eq!(u.password_hash, Some(format!("h-{k}")));
+                assert!(
+                    store
+                        .validate_refresh_token(&format!("rt-{k}"))
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "round {tour}: acknowledged refresh token of {id} is gone"
+                );
+                assert!(
+                    store
+                        .is_mcp_token_active(&format!("jti-{k}"))
+                        .await
+                        .unwrap(),
+                    "round {tour}: acknowledged MCP token of {id} is gone"
+                );
+                vus += 1;
+            }
+            store.close().await.unwrap();
+        }
+        assert!(vus >= 20, "the child made progress ({vus} checks)");
     }
 
     /// Short, then long (multi-byte, past the 256-byte blob threshold), in turn. The

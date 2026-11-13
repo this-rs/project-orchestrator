@@ -16937,6 +16937,10 @@ impl AuthStore for MockGraphStore {
     async fn upsert_user(&self, user: &UserNode) -> Result<UserNode> {
         use crate::neo4j::models::AuthProvider;
 
+        // As the Neo4j adapter: an OIDC user has no MERGE key without it.
+        if user.auth_provider == AuthProvider::Oidc && user.external_id.is_none() {
+            anyhow::bail!("OIDC user must have external_id");
+        }
         let mut users = self.users.write().await;
 
         // Find existing user based on auth provider strategy
@@ -17046,7 +17050,10 @@ impl AuthStore for MockGraphStore {
     }
 
     async fn list_users(&self) -> Result<Vec<UserNode>> {
-        Ok(self.users.read().await.values().cloned().collect())
+        let mut users: Vec<UserNode> = self.users.read().await.values().cloned().collect();
+        // ORDER BY u.created_at DESC, u.id DESC, as the Cypher.
+        users.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        Ok(users)
     }
 
     // Refresh Tokens
@@ -17111,11 +17118,13 @@ impl AuthStore for MockGraphStore {
                 return Ok(None);
             };
             let was_valid = !token.revoked && token.expires_at > chrono::Utc::now();
+            // The state observed BEFORE the revoke, as the Neo4j statement returns it.
+            let observed = token.clone();
             token.revoked = true;
             if !was_valid {
                 return Ok(None);
             }
-            token.clone()
+            observed
         };
 
         let user = self.users.read().await.get(&consumed.user_id).cloned();
@@ -17179,11 +17188,15 @@ impl AuthStore for MockGraphStore {
         user_id: Uuid,
     ) -> Result<Vec<crate::neo4j::models::McpTokenNode>> {
         let tokens = self.mcp_tokens.read().await;
-        Ok(tokens
+        let mut tokens: Vec<_> = tokens
             .values()
             .filter(|t| t.user_id == user_id)
             .cloned()
-            .collect())
+            .collect();
+        // ORDER BY mt.created_at DESC, as the Cypher (its tie-break on `mt.id`, a
+        // property never written, is undefined: `jti` here, as the obrain adapter).
+        tokens.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.jti.cmp(&a.jti)));
+        Ok(tokens)
     }
 
     async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64> {
