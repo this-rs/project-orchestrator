@@ -3704,6 +3704,11 @@ pub mod conformance {
         assert_eq!(again, api, "upsert is keyed by (workspace, name)");
         let kept = store.get_component(api).await.unwrap().expect("api");
         assert_eq!(
+            kept.description.as_deref(),
+            Some("the api"),
+            "an absent description keeps the stored one"
+        );
+        assert_eq!(
             kept.runtime.as_deref(),
             Some("rust"),
             "an empty runtime keeps the stored one"
@@ -3772,6 +3777,29 @@ pub mod conformance {
             .await
             .unwrap());
         assert_eq!(store.list_components(ws.id).await.unwrap().len(), 2);
+        // The (workspace, name) identity follows the rename: the new name finds
+        // the component, the old one is free and creates another.
+        let derived = |name: &str| DerivedComponentWrite {
+            workspace_id: ws.id,
+            name: name.into(),
+            component_type: ComponentType::Database,
+            description: None,
+            runtime: None,
+            tags: vec![],
+            config: serde_json::json!({}),
+        };
+        assert_eq!(
+            store
+                .upsert_derived_component(derived("database"))
+                .await
+                .unwrap(),
+            db,
+            "the renamed component is found by its new name"
+        );
+        let fresh = store.upsert_derived_component(derived("db")).await.unwrap();
+        assert_ne!(fresh, db, "the old name no longer finds it");
+        assert_eq!(store.list_components(ws.id).await.unwrap().len(), 3);
+        store.delete_component(fresh).await.unwrap();
 
         store.delete_component(api).await.unwrap();
         assert!(store.get_component(api).await.unwrap().is_none());
@@ -4719,7 +4747,9 @@ mod obrain_workspace_specifique {
         ResourceNode, ResourceType, WorkspaceMilestoneNode, WorkspaceNode,
     };
     use project_orchestrator::neo4j::traits::{ProjectStore, WorkspaceStore};
-    use project_orchestrator::obrain::{Creation, NonPorte, ObrainGraphStore};
+    use project_orchestrator::obrain::{
+        Creation, Interruption, NonPorte, ObrainGraphStore, ValeurBrute,
+    };
     use uuid::Uuid;
 
     fn erreur<T>(r: anyhow::Result<T>) -> anyhow::Error {
@@ -4822,8 +4852,8 @@ mod obrain_workspace_specifique {
             id: Uuid::new_v4(),
             workspace_id: ws.id,
             title: "jalon".into(),
-            description: None,
-            status: MilestoneStatus::Open,
+            description: Some("décrit".into()),
+            status: MilestoneStatus::InProgress,
             target_date: Some(now),
             closed_at: None,
             created_at: now,
@@ -4836,10 +4866,10 @@ mod obrain_workspace_specifique {
             name: "contrat".into(),
             resource_type: ResourceType::ApiContract,
             file_path: "api.yaml".into(),
-            url: None,
-            format: None,
-            version: None,
-            description: None,
+            url: Some("https://example.invalid/api".into()),
+            format: Some("openapi".into()),
+            version: Some("3".into()),
+            description: Some("le contrat".into()),
             created_at: now,
             updated_at: None,
             metadata: serde_json::json!({}),
@@ -4874,7 +4904,7 @@ mod obrain_workspace_specifique {
         let c_api = comps[0].1;
         let c_db = comps[1].1;
         store
-            .add_component_dependency(c_api, c_db, Some("sql".into()), true)
+            .add_component_dependency(c_api, c_db, Some("sql".into()), false)
             .await
             .unwrap();
         store.map_component_to_project(c_api, p.id).await.unwrap();
@@ -4898,13 +4928,29 @@ mod obrain_workspace_specifique {
             vec![p.id],
             "membership comes back from the edges"
         );
+        // Every field, the list of tags and the dates included: a count would not
+        // see a status, a date or a type lost by the round-trip.
         assert_eq!(
-            store.list_workspace_milestones(ws.id).await.unwrap().len(),
-            1
+            store
+                .list_workspace_milestones(ws.id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|m| serde_json::to_value(m).unwrap())
+                .collect::<Vec<_>>(),
+            vec![serde_json::to_value(&jalon).unwrap()],
+            "the milestone reads back identical"
         );
         assert_eq!(
-            store.list_workspace_resources(ws.id).await.unwrap().len(),
-            1
+            store
+                .list_workspace_resources(ws.id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| serde_json::to_value(r).unwrap())
+                .collect::<Vec<_>>(),
+            vec![serde_json::to_value(&res).unwrap()],
+            "the resource reads back identical"
         );
         assert_eq!(
             store.get_resource_implementers(res.id).await.unwrap().len(),
@@ -4914,11 +4960,134 @@ mod obrain_workspace_specifique {
         let (_, nom, deps) = topo.iter().find(|(c, _, _)| c.id == c_api).unwrap();
         assert_eq!(nom.as_deref(), Some("reopen project"));
         assert_eq!(deps.len(), 1);
+        // `false`, not the default `true` a missing edge property reads as: the
+        // property is written and replayed.
         assert_eq!(
             (deps[0].to_id, deps[0].protocol.as_deref(), deps[0].required),
-            (c_db, Some("sql"), true)
+            (c_db, Some("sql"), false)
         );
         store.close().await.unwrap();
+    }
+
+    fn espace() -> WorkspaceNode {
+        WorkspaceNode {
+            id: Uuid::new_v4(),
+            name: "ws".into(),
+            slug: format!("ws-{}", Uuid::new_v4().simple()),
+            description: None,
+            created_at: Utc::now(),
+            updated_at: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn jalon_de(ws: Uuid) -> WorkspaceMilestoneNode {
+        WorkspaceMilestoneNode {
+            id: Uuid::new_v4(),
+            workspace_id: ws,
+            title: "jalon".into(),
+            description: None,
+            status: MilestoneStatus::Open,
+            target_date: None,
+            closed_at: None,
+            created_at: Utc::now(),
+            tags: vec![],
+        }
+    }
+
+    /// The workspace node is gone from the engine while the index holds it (an
+    /// index and a base that disagree): `delete_workspace` refuses and deletes
+    /// NOTHING. Its children are still there, before and after a reopen.
+    #[tokio::test]
+    async fn delete_workspace_writes_nothing_when_it_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let ws = espace();
+        let j = jalon_de(ws.id);
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_workspace(&ws).await.unwrap();
+            store.create_workspace_milestone(&j).await.unwrap();
+            assert!(store.supprimer_noeud_brut_pour_test("Workspace", ws.id));
+            let e = store.delete_workspace(ws.id).await.unwrap_err();
+            assert!(format!("{e:#}").contains("rien n'a été supprimé"), "{e:#}");
+            assert!(store.get_workspace_milestone(j.id).await.unwrap().is_some());
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert!(
+            store.get_workspace_milestone(j.id).await.unwrap().is_some(),
+            "the refused deletion deleted the child"
+        );
+    }
+
+    /// `delete_workspace` cut after its marker and one child: the next open
+    /// finishes it rather than serving the workspace with part of its children.
+    #[tokio::test]
+    async fn a_workspace_deletion_cut_half_way_is_finished_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let ws = espace();
+        let jalons: Vec<WorkspaceMilestoneNode> = (0..3).map(|_| jalon_de(ws.id)).collect();
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_workspace(&ws).await.unwrap();
+            for j in &jalons {
+                store.create_workspace_milestone(j).await.unwrap();
+            }
+            // Step 1 is the marker, step 2 the first child deleted.
+            store.interrompre_au_prochain(Interruption::ApresEtape(2));
+            assert!(store.delete_workspace(ws.id).await.is_err());
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert_eq!(store.rapport_d_ouverture().suppressions_achevees, 1);
+        assert!(store.get_workspace(ws.id).await.unwrap().is_none());
+        for j in &jalons {
+            assert!(store.get_workspace_milestone(j.id).await.unwrap().is_none());
+        }
+        assert_eq!(store.noeuds_de_label_pour_test("WorkspaceMilestone"), 0);
+    }
+
+    /// A milestone status stored in PascalCase (a base migrated from Neo4j) reads
+    /// as Neo4j reads it, and the filter sees it under that status.
+    #[tokio::test]
+    async fn a_pascal_case_milestone_status_reads_as_on_neo4j() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let ws = espace();
+        let j = jalon_de(ws.id);
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_workspace(&ws).await.unwrap();
+            store.create_workspace_milestone(&j).await.unwrap();
+            assert!(store.ecrire_propriete_brute_pour_test(
+                "WorkspaceMilestone",
+                j.id,
+                "status",
+                Some(ValeurBrute::Texte("InProgress"))
+            ));
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert_eq!(
+            store
+                .get_workspace_milestone(j.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            MilestoneStatus::InProgress
+        );
+        let (_, en_cours) = store
+            .list_workspace_milestones_filtered(ws.id, Some("in_progress"), 10, 0)
+            .await
+            .unwrap();
+        let (_, ouverts) = store
+            .list_workspace_milestones_filtered(ws.id, Some("open"), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!((en_cours, ouverts), (1, 0));
     }
 }
 
