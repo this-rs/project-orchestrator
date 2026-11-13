@@ -165,10 +165,20 @@ pub(super) struct IndexProjets {
 }
 
 impl IndexProjets {
-    /// The node of the project `id`, if this backend holds it (used by the other
+    /// The engine node of a project this backend addresses (used by the other
     /// domains that attach to a project).
     pub(super) fn noeud_de(&self, id: Uuid) -> Option<NodeId> {
         self.par_id.get(&id).map(|e| e.noeud)
+    }
+
+    /// The project `id`, as the index holds it (decoded, never a read of the engine).
+    pub(super) fn projet(&self, id: Uuid) -> Option<&ProjectNode> {
+        self.par_id.get(&id).map(|e| &e.projet)
+    }
+
+    /// Every project this backend addresses, with its engine node.
+    pub(super) fn entrees(&self) -> impl Iterator<Item = (Uuid, NodeId)> + '_ {
+        self.par_id.iter().map(|(id, e)| (*id, e.noeud))
     }
 
     /// Rebuild the index from the persisted `Project` nodes, repairing what an
@@ -294,7 +304,10 @@ fn lire_projet(get: &dyn Fn(&str) -> Option<Value>) -> Result<ProjectNode> {
 
 /// A property lookup over ONE hydration of the node (`get_node` reads every
 /// property once; the lookups are then hash probes).
-fn noeud_lisible(db: &ObrainDB, noeud: NodeId) -> Result<impl Fn(&str) -> Option<Value>> {
+pub(super) fn noeud_lisible(
+    db: &ObrainDB,
+    noeud: NodeId,
+) -> Result<impl Fn(&str) -> Option<Value>> {
     let n = db
         .get_node(noeud)
         .ok_or_else(|| anyhow!("nœud Project {noeud:?} indexé mais absent de la base"))?;
