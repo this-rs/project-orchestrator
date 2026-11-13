@@ -98,8 +98,9 @@ mod with_the_feature {
     use project_orchestrator::neo4j::traits::*;
     use project_orchestrator::obrain::{
         defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees,
-        refusees_note, Creation, Durabilite, Interruption, NonPorte, ObrainGraphStore,
-        ObrainSearchStore, RapportOuverture, MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
+        refusees_note, refusees_release, Creation, Durabilite, Interruption, NonPorte,
+        ObrainGraphStore, ObrainSearchStore, RapportOuverture, MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN,
+        SCHEMA_PO,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -2076,25 +2077,32 @@ mod with_the_feature {
         );
 
         // ProjectStore's nine methods, WorkspaceStore (45, of which ten are refused by
-        // name), the 41 of NoteStore (13 ported, 28 refused by name), plus the two of
-        // GraphStore.
+        // name), the 41 of NoteStore (13 ported, 28 refused by name), the 41 of
+        // ReleaseStore (23 ported, 18 refused by name), plus the two of GraphStore.
         let domains: std::collections::BTreeSet<&str> = written
             .iter()
             .map(|m| m.split("::").next().unwrap())
             .collect();
         assert_eq!(
             domains.into_iter().collect::<Vec<_>>(),
-            ["GraphStore", "NoteStore", "ProjectStore", "WorkspaceStore"]
+            [
+                "GraphStore",
+                "NoteStore",
+                "ProjectStore",
+                "ReleaseStore",
+                "WorkspaceStore"
+            ]
         );
         // ProjectStore's nine methods and WorkspaceStore's 35 that serve (its 10
         // refusals are written by hand and listed as such).
         let servent = methodes_qui_servent();
-        // ProjectStore's nine, WorkspaceStore's 35 that serve, and the thirteen ported
-        // NoteStore methods.
-        assert_eq!(servent.len(), 57, "{servent:?}");
+        // ProjectStore's nine, WorkspaceStore's 35 that serve, the thirteen ported
+        // NoteStore methods and the twenty-three ReleaseStore methods that serve.
+        assert_eq!(servent.len(), 80, "{servent:?}");
         assert!(servent.iter().all(|m| m.starts_with("ProjectStore::")
             || m.starts_with("WorkspaceStore::")
-            || m.starts_with("NoteStore::")));
+            || m.starts_with("NoteStore::")
+            || m.starts_with("ReleaseStore::")));
         // The written refusals are written, and are not counted as serving.
         assert_eq!(
             REFUS_ECRITS_A_LA_MAIN.len(),
@@ -2103,6 +2111,8 @@ mod with_the_feature {
         );
         assert_eq!(refusees_note().len(), 28);
         assert!(refusees_note().iter().all(|m| written.contains(m)));
+        assert_eq!(refusees_release().len(), 18);
+        assert!(refusees_release().iter().all(|m| written.contains(m)));
         assert!(REFUS_ECRITS_A_LA_MAIN.iter().all(|m| written.contains(m)));
         // What keeps a default is known and justified where it is declared.
         assert_eq!(kept, ["AnalyticsStore::run_data_migrations"]);

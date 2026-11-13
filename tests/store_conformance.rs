@@ -56,10 +56,11 @@ pub mod conformance {
     use project_orchestrator::ingress::{ExternalEvent, IngressOutcome};
     use project_orchestrator::neo4j::file_uid::PathPolicy;
     use project_orchestrator::neo4j::models::{
-        AlertNode, AlertSeverity, ComponentType, ComponentUpdate, DerivedComponentWrite, FileNode,
-        MilestoneStatus, PlanNode, PlanStatus, ProjectNode, ProjectProfile, ResourceNode,
-        ResourceType, StepNode, StepStatus, TaskNode, TaskStatus, WorkspaceMilestoneNode,
-        WorkspaceNode,
+        AlertNode, AlertSeverity, ComponentType, ComponentUpdate, DeploymentNode, DeploymentStatus,
+        DerivedComponentWrite, EnvironmentKind, EnvironmentNode, FileNode, MilestoneNode,
+        MilestoneStatus, PlanNode, PlanStatus, ProjectNode, ProjectProfile, ReleaseNode,
+        ReleaseStatus, ResourceNode, ResourceType, StepNode, StepStatus, TaskNode, TaskStatus,
+        WorkspaceMilestoneNode, WorkspaceNode,
     };
     use project_orchestrator::neo4j::GraphStore;
     use project_orchestrator::notes::{
@@ -2554,6 +2555,480 @@ pub mod conformance {
     }
 
     // ------------------------------------------------------------------
+    // Release domain: releases, environments, deployments, milestones, and the
+    // project list the release store serves (`list_projects_filtered`).
+    // Timestamps are whole seconds so that every backend stores the same value.
+    // ------------------------------------------------------------------
+
+    fn a_release(project_id: Uuid, version: &str, created: i64) -> ReleaseNode {
+        ReleaseNode {
+            id: Uuid::new_v4(),
+            version: version.to_string(),
+            title: None,
+            description: None,
+            status: ReleaseStatus::Planned,
+            target_date: None,
+            released_at: None,
+            created_at: at(created),
+            project_id,
+        }
+    }
+
+    fn json<T: serde::Serialize>(v: &T) -> serde_json::Value {
+        serde_json::to_value(v).unwrap()
+    }
+
+    /// A release reads back the values it was created with, `update_release` changes
+    /// exactly the fields it is given, an update on an unknown id is a no-op, and a
+    /// deleted release is gone.
+    pub async fn check_release_roundtrip(store: &dyn GraphStore) {
+        let p = a_project("release-roundtrip");
+        store.create_project(&p).await.unwrap();
+
+        let mut r = a_release(p.id, "1.0.0", 10);
+        r.title = Some("first".to_string());
+        r.description = None;
+        r.target_date = Some(at(100));
+        store.create_release(&r).await.unwrap();
+
+        let got = store.get_release(r.id).await.unwrap().unwrap();
+        assert_eq!(
+            json(&got),
+            json(&r),
+            "a release reads back what was created"
+        );
+        // An absent description is stored as "" and reads back as "" or None, but never
+        // as a value of its own: the title and the dates stay as they were given.
+        assert_eq!(got.title.as_deref(), Some("first"));
+        assert_eq!(got.target_date, Some(at(100)));
+        assert_eq!(got.released_at, None);
+
+        store
+            .update_release(
+                r.id,
+                Some(ReleaseStatus::InProgress),
+                None,
+                None,
+                None,
+                Some("notes".to_string()),
+            )
+            .await
+            .unwrap();
+        let got = store.get_release(r.id).await.unwrap().unwrap();
+        assert_eq!(got.status, ReleaseStatus::InProgress, "status changed");
+        assert_eq!(
+            got.description.as_deref(),
+            Some("notes"),
+            "description changed"
+        );
+        assert_eq!(got.title.as_deref(), Some("first"), "title untouched");
+        assert_eq!(got.target_date, Some(at(100)), "target_date untouched");
+
+        // Unknown id: nothing is created, nothing fails.
+        store
+            .update_release(
+                Uuid::new_v4(),
+                Some(ReleaseStatus::Released),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A release of a project that does not exist is refused.
+        let ghost = a_release(Uuid::new_v4(), "9.9.9", 1);
+        assert!(store.create_release(&ghost).await.is_err());
+        assert!(store.get_release(ghost.id).await.unwrap().is_none());
+
+        store.delete_release(r.id).await.unwrap();
+        assert!(store.get_release(r.id).await.unwrap().is_none());
+        assert!(store
+            .list_project_releases(p.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|x| x.id != r.id));
+        store.delete_release(r.id).await.unwrap(); // second delete: no-op
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    /// `list_project_releases` is newest first, ties broken by id descending;
+    /// `list_releases_filtered` filters by status (any case), sorts by the field asked
+    /// (id ascending as the tie-break) and pages with the total.
+    pub async fn check_release_list_order(store: &dyn GraphStore) {
+        let p = a_project("release-order");
+        store.create_project(&p).await.unwrap();
+        let mut a = a_release(p.id, "1.0.0", 30);
+        let mut b = a_release(p.id, "1.1.0", 20);
+        let mut c = a_release(p.id, "2.0.0", 20);
+        a.status = ReleaseStatus::Released;
+        b.status = ReleaseStatus::Planned;
+        c.status = ReleaseStatus::InProgress;
+        b.target_date = Some(at(500));
+        for r in [&a, &b, &c] {
+            store.create_release(r).await.unwrap();
+        }
+
+        // Newest first; the tie on created_at (b, c) is broken by id, descending.
+        let mut tie = [b.id, c.id];
+        tie.sort();
+        tie.reverse();
+        let expected = vec![a.id, tie[0], tie[1]];
+        let listed: Vec<Uuid> = store
+            .list_project_releases(p.id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(listed, expected, "newest first, then id descending");
+
+        let (all, total) = store
+            .list_releases_filtered(p.id, None, 10, 0, None, "desc")
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+        // The filtered list breaks a tie on created_at by id ASCENDING (not descending
+        // as the project list does): `b` and `c` share created_at.
+        let (low, high) = if b.id < c.id {
+            (b.id, c.id)
+        } else {
+            (c.id, b.id)
+        };
+        assert_eq!(
+            ids(&all, |r| r.id),
+            vec![a.id, low, high],
+            "default sort: created_at desc, then id asc"
+        );
+
+        let (in_progress, total) = store
+            .list_releases_filtered(
+                p.id,
+                Some(vec!["in_progress".to_string()]),
+                10,
+                0,
+                None,
+                "desc",
+            )
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "a status filter counts its matches");
+        assert_eq!(ids(&in_progress, |r| r.id), vec![c.id]);
+
+        // Sorted by version ascending, then one row per page: the total stays 3.
+        let (page1, total) = store
+            .list_releases_filtered(p.id, None, 1, 0, Some("version"), "asc")
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(ids(&page1, |r| r.id), vec![a.id], "version 1.0.0 first");
+        let (page2, _) = store
+            .list_releases_filtered(p.id, None, 1, 1, Some("version"), "asc")
+            .await
+            .unwrap();
+        assert_eq!(ids(&page2, |r| r.id), vec![b.id], "then 1.1.0");
+
+        // A target_date sort puts the release without one first, ascending.
+        let (by_target, _) = store
+            .list_releases_filtered(p.id, None, 10, 0, Some("target_date"), "asc")
+            .await
+            .unwrap();
+        assert_eq!(by_target.last().map(|r| r.id), Some(b.id));
+
+        for r in [&a, &b, &c] {
+            store.delete_release(r.id).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    /// Environments: names are unique within a project, listed oldest first, updated
+    /// field by field (an empty string clears an optional one), and deleting one
+    /// deletes its deployments.
+    pub async fn check_environment_lifecycle(store: &dyn GraphStore) {
+        let p = a_project("env-lifecycle");
+        store.create_project(&p).await.unwrap();
+        let env = |name: &str, created: i64| EnvironmentNode {
+            id: Uuid::new_v4(),
+            project_id: p.id,
+            name: name.to_string(),
+            kind: EnvironmentKind::Staging,
+            url: Some("https://example.test".to_string()),
+            description: None,
+            config: None,
+            created_at: at(created),
+        };
+        let late = env("late", 50);
+        let early = env("early", 10);
+        store.create_environment(&late).await.unwrap();
+        store.create_environment(&early).await.unwrap();
+
+        let dup = EnvironmentNode {
+            id: Uuid::new_v4(),
+            ..env("late", 60)
+        };
+        assert!(
+            store.create_environment(&dup).await.is_err(),
+            "a second environment with the same name in the project is refused"
+        );
+
+        let listed = store.list_project_environments(p.id).await.unwrap();
+        assert_eq!(
+            ids(&listed, |e| e.id),
+            vec![early.id, late.id],
+            "oldest first"
+        );
+
+        store
+            .update_environment(
+                early.id,
+                None,
+                Some(EnvironmentKind::Production),
+                Some(String::new()),
+                Some("the live one".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        let got = store.get_environment(early.id).await.unwrap().unwrap();
+        assert_eq!(got.kind, EnvironmentKind::Production);
+        assert_eq!(got.url, None, "an empty string clears url");
+        assert_eq!(got.description.as_deref(), Some("the live one"));
+        assert_eq!(got.name, "early", "name untouched");
+
+        let dep = DeploymentNode {
+            id: Uuid::new_v4(),
+            environment_id: early.id,
+            version: Some("1.0.0".to_string()),
+            commit_sha: None,
+            status: DeploymentStatus::Pending,
+            notes: None,
+            created_by: "tester".to_string(),
+            started_at: at(70),
+            finished_at: None,
+        };
+        store.create_deployment(&dep).await.unwrap();
+        store.delete_environment(early.id).await.unwrap();
+        assert!(store.get_environment(early.id).await.unwrap().is_none());
+        assert!(
+            store.get_deployment(dep.id).await.unwrap().is_none(),
+            "its deployments go with it"
+        );
+
+        let orphan = DeploymentNode {
+            id: Uuid::new_v4(),
+            environment_id: early.id,
+            ..dep.clone()
+        };
+        assert!(
+            store.create_deployment(&orphan).await.is_err(),
+            "a deployment of an unknown environment is refused"
+        );
+
+        store.delete_environment(late.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    /// Deployments: newest first with the total, paged; the matrix gives each
+    /// environment its latest deployment and the statuses of its last five.
+    pub async fn check_deployment_matrix(store: &dyn GraphStore) {
+        let p = a_project("deploy-matrix");
+        store.create_project(&p).await.unwrap();
+        let prod = EnvironmentNode {
+            id: Uuid::new_v4(),
+            project_id: p.id,
+            name: "prod".to_string(),
+            kind: EnvironmentKind::Production,
+            url: None,
+            description: None,
+            config: None,
+            created_at: at(1),
+        };
+        let dev = EnvironmentNode {
+            id: Uuid::new_v4(),
+            name: "dev".to_string(),
+            kind: EnvironmentKind::Dev,
+            created_at: at(2),
+            ..prod.clone()
+        };
+        store.create_environment(&prod).await.unwrap();
+        store.create_environment(&dev).await.unwrap();
+
+        let statuses = [
+            DeploymentStatus::Succeeded,
+            DeploymentStatus::Failed,
+            DeploymentStatus::Running,
+            DeploymentStatus::Succeeded,
+            DeploymentStatus::RolledBack,
+            DeploymentStatus::Pending,
+            DeploymentStatus::Succeeded,
+        ];
+        let mut made = Vec::new();
+        for (i, s) in statuses.iter().enumerate() {
+            let d = DeploymentNode {
+                id: Uuid::new_v4(),
+                environment_id: prod.id,
+                version: None,
+                commit_sha: None,
+                status: *s,
+                notes: None,
+                created_by: "ci".to_string(),
+                started_at: at(100 + i as i64),
+                finished_at: None,
+            };
+            store.create_deployment(&d).await.unwrap();
+            made.push(d);
+        }
+
+        let (page, total) = store
+            .list_environment_deployments(prod.id, 3, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 7);
+        let newest_first: Vec<Uuid> = made.iter().rev().map(|d| d.id).collect();
+        assert_eq!(
+            ids(&page, |d| d.id),
+            newest_first[..3].to_vec(),
+            "newest first"
+        );
+        let (rest, _) = store
+            .list_environment_deployments(prod.id, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&rest, |d| d.id),
+            newest_first[5..].to_vec(),
+            "offset pages"
+        );
+
+        let matrix = store.get_deployment_matrix(p.id).await.unwrap();
+        assert_eq!(matrix.len(), 2);
+        assert_eq!(
+            matrix[0].environment.name, "prod",
+            "environments oldest first"
+        );
+        assert_eq!(matrix[1].environment.name, "dev");
+        assert_eq!(
+            matrix[0].latest_deployment.as_ref().map(|d| d.id),
+            Some(made[6].id)
+        );
+        assert_eq!(
+            matrix[0].recent_statuses,
+            statuses.iter().rev().take(5).copied().collect::<Vec<_>>(),
+            "the last five statuses, newest first"
+        );
+        assert!(matrix[1].latest_deployment.is_none());
+        assert!(matrix[1].recent_statuses.is_empty());
+
+        store.delete_environment(prod.id).await.unwrap();
+        store.delete_environment(dev.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    /// Milestones: created, read, listed by target date (undated ones first), updated
+    /// field by field, filtered by status, and deleted.
+    pub async fn check_milestone_lifecycle(store: &dyn GraphStore) {
+        let p = a_project("milestone");
+        store.create_project(&p).await.unwrap();
+        let jalon = |title: &str, target: Option<i64>, created: i64| MilestoneNode {
+            id: Uuid::new_v4(),
+            title: title.to_string(),
+            description: None,
+            status: MilestoneStatus::Open,
+            target_date: target.map(at),
+            closed_at: None,
+            created_at: at(created),
+            project_id: p.id,
+        };
+        let later = jalon("later", Some(900), 1);
+        let sooner = jalon("sooner", Some(300), 2);
+        let undated = jalon("undated", None, 3);
+        for j in [&later, &sooner, &undated] {
+            store.create_milestone(j).await.unwrap();
+        }
+        assert_eq!(
+            json(&store.get_milestone(later.id).await.unwrap().unwrap()),
+            json(&later)
+        );
+
+        let listed = store.list_project_milestones(p.id).await.unwrap();
+        assert_eq!(
+            ids(&listed, |j| j.id),
+            vec![undated.id, sooner.id, later.id],
+            "target_date ascending, an absent one first"
+        );
+
+        store
+            .update_milestone(
+                later.id,
+                Some(MilestoneStatus::InProgress),
+                None,
+                None,
+                Some("renamed".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        let got = store.get_milestone(later.id).await.unwrap().unwrap();
+        assert_eq!(got.status, MilestoneStatus::InProgress);
+        assert_eq!(got.title, "renamed");
+        assert_eq!(got.target_date, Some(at(900)), "target_date untouched");
+
+        let (open, total) = store
+            .list_milestones_filtered(p.id, Some(vec!["open".to_string()]), 10, 0, None, "desc")
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(open.len(), 2);
+
+        store.delete_milestone(later.id).await.unwrap();
+        assert!(store.get_milestone(later.id).await.unwrap().is_none());
+        store.delete_milestone(sooner.id).await.unwrap();
+        store.delete_milestone(undated.id).await.unwrap();
+
+        let ghost = jalon("ghost", None, 4);
+        let ghost = MilestoneNode {
+            project_id: Uuid::new_v4(),
+            ..ghost
+        };
+        assert!(store.create_milestone(&ghost).await.is_err());
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    /// `list_projects_filtered`: the search matches the description (case-insensitively),
+    /// the sort is by name by default, and the total counts the matches before the page.
+    pub async fn check_project_list_filtered(store: &dyn GraphStore) {
+        let tag = Uuid::new_v4();
+        let mut a = a_project("filtered-a");
+        a.name = format!("filtered {tag} b");
+        a.description = Some(format!("Marker {tag}"));
+        let mut b = a_project("filtered-b");
+        b.name = format!("filtered {tag} a");
+        b.description = Some(format!("other {tag}"));
+        store.create_project(&a).await.unwrap();
+        store.create_project(&b).await.unwrap();
+
+        // Both carry the tag in their description, so the search lists both, sorted by
+        // name ascending (`… a` is `b`, `… b` is `a`). The shared instance may hold many
+        // projects: the page is the whole set of the tag, so a small page is enough.
+        let (all, total) = store
+            .list_projects_filtered(Some(&tag.to_string()), 50, 0, Some("name"), "asc")
+            .await
+            .unwrap();
+        assert_eq!(total, 2, "the total counts the matches of the search");
+        assert_eq!(ids(&all, |p| p.id), vec![b.id, a.id], "name ascending");
+        let (upper, _) = store
+            .list_projects_filtered(Some(&format!("MARKER {tag}")), 50, 0, None, "asc")
+            .await
+            .unwrap();
+        assert_eq!(ids(&upper, |p| p.id), vec![a.id], "the match ignores case");
+
+        store.delete_project(a.id, &a.name).await.unwrap();
+        store.delete_project(b.id, &b.name).await.unwrap();
+    }
+
+    // ------------------------------------------------------------------
     // The workspace domain (`WorkspaceStore`), on its own.
     //
     // Same discipline as the project checks: they call nothing but the
@@ -3323,10 +3798,8 @@ pub mod conformance {
     }
 }
 
-// ======================================================================
-// Factories: one per backend.
-// ======================================================================
-
+// ===============================================================// Factories: one per backend.
+// ===============================================================
 /// Opens a store for one check. `None` means the backend is unavailable here:
 /// the check is skipped (the factory decides whether that is allowed).
 #[async_trait]
@@ -3401,10 +3874,8 @@ impl StoreFactory for ObrainFactory {
     }
 }
 
-// ======================================================================
-// Expected divergences (P0.2 fixes them; the mock converges towards Neo4j).
-// ======================================================================
-
+// ===============================================================// Expected divergences (P0.2 fixes them; the mock converges towards Neo4j).
+// ===============================================================
 /// A known gap between a backend and the contract the checks state.
 pub struct Divergence {
     pub backend: &'static str,
@@ -3701,6 +4172,31 @@ project_checks!(mock_project, MockFactory);
 project_checks!(neo4j_project, Neo4jFactory);
 #[cfg(feature = "obrain-backend")]
 project_checks!(obrain_project, ObrainFactory);
+
+/// The release domain: releases, environments, deployments, milestones and the
+/// project list of the release store. Same checks, same fixtures, on each backend
+/// that has ported them (see `release_checks!`).
+macro_rules! release_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [
+                check_release_roundtrip,
+                check_release_list_order,
+                check_environment_lifecycle,
+                check_deployment_matrix,
+                check_milestone_lifecycle,
+                check_project_list_filtered,
+            ]
+        );
+    };
+}
+
+release_checks!(mock_release, MockFactory);
+release_checks!(neo4j_release, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+release_checks!(obrain_release, ObrainFactory);
 
 /// What only the obrain adapter does: the refusals of the workspace methods it
 /// does not port are named (a `NonPorte` downcast), and what it writes is read

@@ -10,7 +10,10 @@
 //! its trait (an omitted method would silently inherit the contract's default).
 //!
 //! Ported so far: [`ProjectStore`](crate::neo4j::traits::ProjectStore)
-//! (`project.rs`), [`WorkspaceStore`](crate::neo4j::traits::WorkspaceStore)
+//! (`project.rs`), [`ReleaseStore`](crate::neo4j::traits::ReleaseStore)
+//! for releases, environments, deployments and milestones (`release.rs`), whose
+//! refusals (tasks, plans, commits) are listed in `release::REFUSEES`,
+//! [`WorkspaceStore`](crate::neo4j::traits::WorkspaceStore)
 //! (`workspace.rs`, 35 of its 45 methods; the rest are refused by name), and the note
 //! node of [`NoteStore`](crate::neo4j::traits::NoteStore) (`note.rs`: 13 of its 41
 //! methods; the others are refused by name there).
@@ -65,6 +68,7 @@
 mod mesure;
 mod note;
 mod project;
+mod release;
 mod workspace;
 
 #[cfg(any(test, feature = "mock-store"))]
@@ -113,6 +117,13 @@ pub fn refusees_note() -> &'static [&'static str] {
     note::REFUSEES
 }
 
+/// The methods of `ReleaseStore` refused on every call, as
+/// `ReleaseStore::<method>` (`release.rs`): they read or link a `Task`, a
+/// `Plan`, a `Commit` or a `Step`, domains not yet ported.
+pub fn refusees_release() -> &'static [&'static str] {
+    release::REFUSEES
+}
+
 /// The hand-written methods that REFUSE (`GraphStore::get_progress_batch`: its
 /// contract default loops over getters of other domains). They are in
 /// [`methodes_portees`] because they are written, not because they work.
@@ -139,6 +150,7 @@ pub fn methodes_qui_servent() -> Vec<&'static str> {
         .copied()
         .filter(|m| {
             !REFUS_ECRITS_A_LA_MAIN.contains(m)
+                && !release::REFUSEES.contains(m)
                 && !note::REFUSEES.contains(m)
                 && !m.starts_with("GraphStore::")
         })
@@ -240,6 +252,7 @@ struct Interne {
 #[derive(Default)]
 struct Etat {
     projets: project::IndexProjets,
+    releases: release::IndexReleases,
     espaces: workspace::IndexEspaces,
     notes: note::IndexNotes,
 }
@@ -489,27 +502,29 @@ impl ObrainGraphStore {
                 )
             })?;
         }
-        let (etat, rapport) = {
-            let contexte = || {
-                format!(
-                    "reconstruction des index de la base obrain {}",
-                    chemin.display()
-                )
-            };
-            let (projets, mut rapport) =
-                project::IndexProjets::reconstruire(&db).with_context(contexte)?;
-            let espaces = workspace::IndexEspaces::reconstruire(&db, &projets, &mut rapport)
-                .with_context(contexte)?;
-            let notes = note::IndexNotes::reconstruire(&db, &projets, &mut rapport)
-                .with_context(contexte)?;
-            (
-                Etat {
-                    projets,
-                    espaces,
-                    notes,
-                },
-                rapport,
+        let contexte = || {
+            format!(
+                "reconstruction des index de la base obrain {}",
+                chemin.display()
             )
+        };
+        let (projets, mut rapport) =
+            project::IndexProjets::reconstruire(&db).with_context(contexte)?;
+        let (releases, rapport_releases) =
+            release::IndexReleases::reconstruire(&db).with_context(contexte)?;
+        rapport.brouillons_supprimes += rapport_releases.brouillons_supprimes;
+        rapport
+            .en_quarantaine
+            .extend(rapport_releases.en_quarantaine);
+        let espaces = workspace::IndexEspaces::reconstruire(&db, &projets, &mut rapport)
+            .with_context(contexte)?;
+        let notes =
+            note::IndexNotes::reconstruire(&db, &projets, &mut rapport).with_context(contexte)?;
+        let etat = Etat {
+            projets,
+            releases,
+            espaces,
+            notes,
         };
         let store = Self {
             interne: Arc::new(Interne {
