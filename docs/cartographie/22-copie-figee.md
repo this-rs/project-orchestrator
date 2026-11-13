@@ -1,6 +1,6 @@
 # Copie figée de la base de PO : le tableau auquel toute migration se compare
 
-Copie prise le **2026-11-11T11:36:02Z → 11:36:15Z** (13 s), Neo4j 5.26.20 community. C'est la **source figée** que `20-reference-migration.md` annonçait : contrairement à la base vivante, elle ne bouge plus, donc une comparaison source/cible y a un sens.
+Copie prise le **2026-11-11T11:36:02Z → 11:36:15Z** (13 s), Neo4j 5.26.20 community. C'est la **source figée** que `20-reference-migration.md` annonçait : contrairement à la base vivante, elle ne devait plus bouger, donc une comparaison source/cible y a un sens (elle a pourtant été écrite après la mesure : voir « Provenance et dérive de la copie »).
 
 ## Totaux
 
@@ -22,11 +22,18 @@ L'écart entre les deux colonnes est l'**évolution** de la base vivante en dix 
 
 `diff` des deux sorties, labels puis types : **vide**.
 
-**Provenance non jointe.** Contrairement au document 20 (`20-reference-migration.raw.txt`), les sorties brutes des deux méthodes et de `size(labels(n))` ne sont pas versionnées : les tableaux ci-dessous, les durées (142 s / 6 s) et le `diff` vide ne sont donc **pas vérifiables depuis ce dépôt (non vérifié)**. Les sommes, elles, sont cohérentes : 64 labels peuplés totalisant 3 901 702, 80 types peuplés totalisant 6 013 360. Somme par label = 3 901 702 = nombre de nœuds ; chaque nœud porte **exactement un** label (`size(labels(n)) = 1` pour tous).
+**Provenance et dérive de la copie.** Les tableaux ci-dessous sont ceux du relevé du 11/11 à 11:36Z, dont la sortie brute n'a pas été versionnée (**non vérifié** tel quel, durées 142 s / 6 s comprises). La copie a été recomptée le **13/11/2026 à 19:21Z**, en lecture seule (`cypher-shell --access-mode read` dans `po-mig-copie-neo4j`, volume `po-mig-copie-data` seul) : sortie brute dans `22-copie-figee.raw.txt`. Ce relevé établit :
+
+- les deux méthodes concordent à nouveau label par label et type par type ;
+- `size(labels(n)) = 1` pour les 3 901 829 nœuds ;
+- **418 `ChatEvent` sans `HAS_EVENT` entrant, compté directement** ; aucun `HAS_EVENT` ne vise autre chose qu'un `ChatEvent`, aucun `ChatEvent` n'en reçoit deux ;
+- mais **la copie n'est plus figée** : 3 901 829 nœuds (+127) et 6 013 429 relations (+69) contre le tableau du 11/11. Treize labels et neuf types ont bougé (`Note` +64, `Skill` +14, `Function` +13, `Project` +6, `CONTAINS` +25, `SYNAPSE` +15, `MEMBER_OF` +14…) ; des nœuds datés du 11/11 entre 21:43Z et 21:47Z (`Note`, `Alert`, `Persona`, `Skill`) montrent qu'un processus a écrit dans la copie, ouverte sans authentification sur 127.0.0.1:27687, après la mesure. Son origine n'est pas identifiée (**non vérifié**). `ChatEvent` et `HAS_EVENT` sont inchangés.
+
+Conséquence : le tableau du 11/11 reste la référence datée, mais le volume `po-mig-copie-data` ne peut plus la reproduire. Une prochaine copie doit être lancée avec authentification ou arrêtée aussitôt après la mesure, et sa sortie brute versionnée dans la foulée.
 
 ## Ce que la copie confirme ou précise
 
-- **ChatEvent sans `HAS_EVENT` : 418** (418 relevés sur la base vivante à 01:17Z). Égal à la différence `ChatEvent` − `HAS_EVENT` des tableaux ci-dessous (2 702 931 − 2 702 513) ; la requête qui l'aurait compté directement n'est pas consignée : **non vérifié** comme compte direct. L'écart est dans la source ; la migration le reproduit et le signale.
+- **ChatEvent sans `HAS_EVENT` : 418** (418 relevés sur la base vivante à 01:17Z). Compté directement le 13/11 sur la copie (`22-copie-figee.raw.txt`), avec `ChatEvent` et `HAS_EVENT` inchangés depuis le 11/11. L'écart est dans la source ; la migration le reproduit et le signale.
 - **Labels déclarés sans données (6)** : `DayPlan` `ExternalEvent` `PredictedLink` `SynapseShadowTrace` `TopologyRule` `TriggerSignal` 
 - **Types de relation déclarés sans données (2)** : `CO_CHANGED_TRANSITIVE` `PREDICTED_LINK` 
 - Ces huit noms font partie du schéma : la cible doit les connaître, même vides.
