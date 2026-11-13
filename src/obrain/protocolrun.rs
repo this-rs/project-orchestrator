@@ -54,20 +54,35 @@
 //! exactly one wins (Neo4j's `WHERE NOT EXISTS` reads before it locks). A deletion
 //! removes the runtime states first and the run last.
 //!
-//! A multi-property update is not atomic. `update_protocol_run` writes each of
-//! its seven properties as its own engine write; a crash in between leaves some
-//! new and some old, and opening does not repair that (each mix reads as a
-//! valid run). What it guarantees is the compare-and-swap: `version` is written
-//! FIRST, so after such a crash the base carries the NEW version, and a writer
-//! holding the old one — the interrupted caller included — loses with
-//! `OptimisticLockError`, re-reads, and rewrites the whole state.
+//! A multi-property update is not atomic in the engine: `update_protocol_run`
+//! writes each of its seven properties as its own engine write. It is made so
+//! by an UPDATE MARKER, `_maj`: its first write puts on the node the whole new
+//! state (the seven values, as JSON), then it writes the seven properties, and
+//! its last write removes the marker. Opening finds a marker only where an
+//! update was cut: it finishes it from the marker (the seven values written,
+//! the marker removed, counted in `RapportOuverture::mises_a_jour_achevees`),
+//! so a run reads either wholly old (cut before the marker) or wholly new —
+//! never a terminal state with `status = running`. A marker that does not read
+//! leaves the run in quarantine (it is never decoded with the marker on).
+//! `version` is also written first of the seven, so the compare-and-swap holds
+//! even before opening.
 //!
-//! The root-run guard also covers a run it cannot read: a `ProtocolRun` node
-//! quarantined at open that may be a running root run (its `status` reads
-//! `running` or cannot be read, and its `parent_run_id` is empty, absent or
-//! unreadable) blocks the creation of a root run of its protocol, as a running
-//! one would, until the base is repaired. A quarantined node whose
-//! `protocol_id` cannot be read blocks nothing: it names no protocol.
+//! The marker carries the whole new state, history included: it is above the
+//! blob threshold as soon as the run has visited a state, so a run update pays
+//! the FULL flush before the marker goes (a marker the WAL alone did not
+//! recover would leave a torn update undetected). That is the cost of any
+//! long value here until obrain journals them in its WAL (#1190).
+//!
+//! The root-run guard also covers a run it does not serve: a `ProtocolRun`
+//! node not in the index (it does not decode, its protocol is not there, or its
+//! id is taken) that may be a running root run (its `status` reads `running`
+//! or cannot be read, and its `parent_run_id` is empty, absent or unreadable)
+//! blocks the creation of a root run of its protocol, as a running one would.
+//! The way out, from PO: `delete_protocol_run` of that id deletes such nodes
+//! too (and their runtime states), as Neo4j's `DETACH DELETE` would, which
+//! lifts the block; `delete_protocol` reaches them as well. A node whose `id`
+//! cannot be read is reached by `delete_protocol` only (by its raw
+//! `protocol_id`).
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -81,8 +96,9 @@ use uuid::Uuid;
 
 use super::protocol::{
     a_un_blob, chaine, charger, creer, date_facultative, date_requise, enumeration,
-    enumeration_requise, facultative, json_attendu, non_signe, reecrire, requise, supprimer,
-    texte_attendu, uuid_facultatif, uuid_requis, Fiche, Lecteur,
+    enumeration_requise, facultative, json_attendu, non_signe, relire, requise, supprimer,
+    supprimer_detache, texte_attendu, uuid_facultatif, uuid_requis, va_en_colonne_blob, Fiche,
+    Lecteur,
 };
 use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::neo4j::protocol::ProducedArtefact;
@@ -147,6 +163,11 @@ fn lire_run(get: Lecteur) -> Result<ProtocolRun> {
     let id = uuid_requis(get, "id", "nœud ProtocolRun")?;
     let quoi = format!("run {id}");
     let quoi = quoi.as_str();
+    // Opening finishes a cut update from its marker before decoding; a marker still
+    // here did not read: the run's state is half old, half new (module doc).
+    if get(MARQUEUR_MAJ).is_some() {
+        bail!("{quoi} : mise à jour interrompue dont le marqueur `{MARQUEUR_MAJ}` est illisible");
+    }
     // Fail closed: the history is written on every write, so an ABSENT one is a
     // history lost, not an empty one (module doc of `protocol.rs`).
     let visites: Vec<StateVisit> =
@@ -230,7 +251,95 @@ pub(super) struct IndexRuns {
     etats: HashMap<Uuid, Fiche<RuntimeState>>,
     /// Protocols with a run node quarantined at open that may be a RUNNING ROOT
     /// run: the root-run guard refuses for them as for a running one (module doc).
-    racines_en_quarantaine: HashSet<Uuid>,
+    /// Run nodes on disk that the index does not serve, by their raw id (`None`
+    /// when it does not read): what `delete_protocol_run` and `delete_protocol`
+    /// still reach, and what the root-run guard counts.
+    quarantaine: HashMap<Option<Uuid>, Vec<RunHorsIndex>>,
+    /// Runtime-state nodes on disk the index does not serve, with their raw
+    /// `run_id`: deleted with their run.
+    etats_hors_index: Vec<(NodeId, Option<Uuid>)>,
+}
+
+/// A run node on disk that the index does not serve.
+#[derive(Clone, Copy)]
+pub(super) struct RunHorsIndex {
+    pub(super) noeud: NodeId,
+    /// Its raw `protocol_id`, when it reads.
+    pub(super) protocole: Option<Uuid>,
+    /// It may be a running root run of `protocole`.
+    bloque: bool,
+}
+
+/// The update marker (module doc, « Atomicity »).
+const MARQUEUR_MAJ: &str = "_maj";
+
+/// The raw `id` / `run_id` … of a node, as a uuid, when it reads.
+fn uuid_brut(get: Lecteur, cle: &str) -> Option<Uuid> {
+    chaine(get, cle)?.parse().ok()
+}
+
+/// The seven values of an update, as the marker carries them.
+fn encoder_maj(maj: &[(&'static str, Value)]) -> Result<Value> {
+    let mut objet = serde_json::Map::new();
+    for (cle, v) in maj {
+        let j = if let Some(t) = v.as_str() {
+            serde_json::Value::from(t)
+        } else if let Some(n) = v.as_int64() {
+            serde_json::Value::from(n)
+        } else if let Some(b) = v.as_bool() {
+            serde_json::Value::from(b)
+        } else {
+            bail!("marqueur de mise à jour : valeur de `{cle}` non encodable ({v:?})");
+        };
+        objet.insert((*cle).to_string(), j);
+    }
+    Ok(Value::from(serde_json::Value::Object(objet).to_string()))
+}
+
+fn decoder_maj(brut: &str) -> Result<Vec<(String, Value)>> {
+    let objet: serde_json::Map<String, serde_json::Value> = serde_json::from_str(brut)
+        .map_err(|e| anyhow!("marqueur de mise à jour illisible : {e}"))?;
+    objet
+        .into_iter()
+        .map(|(cle, j)| {
+            let v = match &j {
+                serde_json::Value::String(t) => Value::from(t.clone()),
+                serde_json::Value::Bool(b) => Value::from(*b),
+                serde_json::Value::Number(n) => Value::from(
+                    n.as_i64()
+                        .ok_or_else(|| anyhow!("marqueur : `{cle}` n'est pas un entier"))?,
+                ),
+                _ => bail!("marqueur : `{cle}` d'un type inattendu"),
+            };
+            Ok((cle, v))
+        })
+        .collect()
+}
+
+/// Opening: finishes every update cut after its marker (module doc). Returns how
+/// many; a marker that does not read is left, and its run is quarantined.
+fn achever_les_mises_a_jour(db: &ObrainDB) -> usize {
+    let mut achevees = 0;
+    for noeud in db.store().nodes_by_label(RUN) {
+        let Some(n) = db.get_node(noeud) else {
+            continue;
+        };
+        let Some(brut) = n
+            .get_property(MARQUEUR_MAJ)
+            .and_then(|v| v.as_str().map(str::to_string))
+        else {
+            continue;
+        };
+        let Ok(valeurs) = decoder_maj(&brut) else {
+            continue;
+        };
+        for (cle, v) in valeurs {
+            db.set_node_property(noeud, &cle, v);
+        }
+        db.remove_node_property(noeud, MARQUEUR_MAJ);
+        achevees += 1;
+    }
+    achevees
 }
 
 /// From the raw properties of a run node that does not decode: the protocol it
@@ -265,17 +374,8 @@ impl IndexRuns {
         rapport: &mut RapportOuverture,
     ) -> Self {
         let mut index = Self::default();
-        let bloques = std::cell::RefCell::new(HashSet::new());
-        let lire_ou_bloquer = |get: Lecteur| {
-            lire_run(get).inspect_err(|_| {
-                if let Some(p) = racine_en_cours_possible(get) {
-                    bloques.borrow_mut().insert(p);
-                }
-            })
-        };
-        let fiches = charger(db, RUN, rapport, &lire_ou_bloquer);
-        index.racines_en_quarantaine = bloques.into_inner();
-        for f in fiches {
+        rapport.mises_a_jour_achevees += achever_les_mises_a_jour(db);
+        for f in charger(db, RUN, rapport, &lire_run) {
             if !protocoles.protocoles.contains_key(&f.valeur.protocol_id) {
                 rapport.en_quarantaine.push(format!(
                     "nœud {RUN} {:?} : le protocole {} n'existe pas",
@@ -283,16 +383,10 @@ impl IndexRuns {
                 ));
             } else {
                 match index.runs.entry(f.valeur.id) {
-                    Entry::Occupied(_) => {
-                        if f.valeur.status == RunStatus::Running && f.valeur.parent_run_id.is_none()
-                        {
-                            index.racines_en_quarantaine.insert(f.valeur.protocol_id);
-                        }
-                        rapport.en_quarantaine.push(format!(
-                            "nœud {RUN} {:?} : id {} déjà pris",
-                            f.noeud, f.valeur.id
-                        ))
-                    }
+                    Entry::Occupied(_) => rapport.en_quarantaine.push(format!(
+                        "nœud {RUN} {:?} : id {} déjà pris",
+                        f.noeud, f.valeur.id
+                    )),
                     Entry::Vacant(v) => {
                         v.insert(f);
                     }
@@ -317,7 +411,82 @@ impl IndexRuns {
                 }
             }
         }
+        // What is on disk and not served (it did not decode, its protocol or run is
+        // not there, its id is taken): kept by raw id, so a delete still reaches it
+        // and the root-run guard still counts it (module doc).
+        let servis: HashSet<NodeId> = index.runs.values().map(|f| f.noeud).collect();
+        for noeud in db.store().nodes_by_label(RUN) {
+            if servis.contains(&noeud) {
+                continue;
+            }
+            let Some(n) = db.get_node(noeud) else {
+                continue;
+            };
+            let get = |cle: &str| {
+                n.get_property(cle)
+                    .filter(|v| !matches!(v, Value::Null))
+                    .cloned()
+            };
+            let protocole = uuid_brut(&get, "protocol_id");
+            index
+                .quarantaine
+                .entry(uuid_brut(&get, "id"))
+                .or_default()
+                .push(RunHorsIndex {
+                    noeud,
+                    protocole,
+                    bloque: racine_en_cours_possible(&get).is_some(),
+                });
+        }
+        let servis: HashSet<NodeId> = index.etats.values().map(|f| f.noeud).collect();
+        for noeud in db.store().nodes_by_label(ETAT_RUNTIME) {
+            if servis.contains(&noeud) {
+                continue;
+            }
+            let run = db.get_node(noeud).and_then(|n| {
+                n.get_property("run_id")
+                    .and_then(|v| v.as_str().and_then(|t| t.parse::<Uuid>().ok()))
+            });
+            index.etats_hors_index.push((noeud, run));
+        }
         index
+    }
+
+    /// A run node not served may be a running root run of this protocol.
+    fn racine_bloquee(&self, protocole: Uuid) -> bool {
+        self.quarantaine
+            .values()
+            .flatten()
+            .any(|q| q.bloque && q.protocole == Some(protocole))
+    }
+
+    /// The run nodes not served whose raw `protocol_id` is this protocol.
+    pub(super) fn hors_index_du_protocole(&self, protocole: Uuid) -> Vec<(Option<Uuid>, NodeId)> {
+        self.quarantaine
+            .iter()
+            .flat_map(|(id, v)| v.iter().map(move |q| (*id, *q)))
+            .filter(|(_, q)| q.protocole == Some(protocole))
+            .map(|(id, q)| (id, q.noeud))
+            .collect()
+    }
+
+    /// The runtime-state nodes not served whose raw `run_id` is one of these runs.
+    pub(super) fn etats_hors_index_des(&self, runs: &HashSet<Uuid>) -> Vec<NodeId> {
+        self.etats_hors_index
+            .iter()
+            .filter(|(_, r)| r.is_some_and(|r| runs.contains(&r)))
+            .map(|(n, _)| *n)
+            .collect()
+    }
+
+    /// Forgets nodes not served once they are deleted and durable.
+    pub(super) fn oublier_hors_index(&mut self, supprimes: &HashSet<NodeId>) {
+        for v in self.quarantaine.values_mut() {
+            v.retain(|q| !supprimes.contains(&q.noeud));
+        }
+        self.quarantaine.retain(|_, v| !v.is_empty());
+        self.etats_hors_index
+            .retain(|(n, _)| !supprimes.contains(n));
     }
 
     /// The runs of a protocol and the runtime states of those runs, with their
@@ -416,14 +585,13 @@ impl ProtocolRunStore for ObrainGraphStore {
                             r.protocol_id
                         );
                     }
-                    if r.parent_run_id.is_none()
-                        && etat.runs.racines_en_quarantaine.contains(&r.protocol_id)
-                    {
+                    if r.parent_run_id.is_none() && etat.runs.racine_bloquee(r.protocol_id) {
                         bail!(
                             "Skipped: concurrent run already running for protocol {} — a run \
-                             node of this protocol was quarantined at open and may be a running \
-                             root run (see the opening report); no root run is created until \
-                             the base is repaired",
+                             node of this protocol that the backend does not serve (see the \
+                             opening report) may be a running root run; no root run is created \
+                             until it is deleted (`delete_protocol_run` of its id, or \
+                             `delete_protocol`)",
                             r.protocol_id
                         );
                     }
@@ -492,7 +660,21 @@ impl ProtocolRunStore for ObrainGraphStore {
                     // would leave the old version on new data, and that stale
                     // writer would win.
                     maj.sort_by_key(|(k, _)| *k != "version");
-                    let fiche = reecrire(w, noeud, maj, ancien_en_blob, &lire_run)?;
+                    // The update marker first, removed last (module doc).
+                    let marqueur = encoder_maj(&maj)?;
+                    w.flush_complet =
+                        ancien_en_blob || a_un_blob(&maj) || va_en_colonne_blob(&marqueur);
+                    w.etape()?;
+                    w.db.set_node_property(noeud, MARQUEUR_MAJ, marqueur);
+                    for (cle, valeur) in maj {
+                        w.etape()?;
+                        w.db.set_node_property(noeud, cle, valeur);
+                    }
+                    w.rendre_durable_avant_le_marqueur()?;
+                    w.etape()?;
+                    w.db.remove_node_property(noeud, MARQUEUR_MAJ);
+                    let fiche = w.apres_ecriture(relire(w.db, noeud, &lire_run))?;
+                    w.rendre_durable()?;
                     w.index_mut()?.runs.runs.insert(r.id, fiche);
                     Ok(nouvelle)
                 },
@@ -632,11 +814,21 @@ impl ProtocolRunStore for ObrainGraphStore {
         self.ecrire(
             || (),
             move |(), w: &mut Ecriture<'_>| {
-                let (noeud, etats) = {
+                let (noeud, etats, hors_index) = {
                     let etat = w.index()?;
-                    let Some(f) = etat.runs.runs.get(&run_id) else {
+                    let noeud = etat.runs.runs.get(&run_id).map(|f| f.noeud);
+                    // The nodes of this id the index does not serve (quarantined at open,
+                    // a duplicate): Neo4j's `DETACH DELETE` reaches every node of the id.
+                    let mut hors_index: Vec<NodeId> = etat
+                        .runs
+                        .quarantaine
+                        .get(&Some(run_id))
+                        .map(|v| v.iter().map(|q| q.noeud).collect())
+                        .unwrap_or_default();
+                    if noeud.is_none() && hors_index.is_empty() {
                         return Ok(false);
-                    };
+                    }
+                    hors_index.extend(etat.runs.etats_hors_index_des(&HashSet::from([run_id])));
                     let etats: Vec<(Uuid, NodeId)> = etat
                         .runs
                         .etats
@@ -644,18 +836,26 @@ impl ProtocolRunStore for ObrainGraphStore {
                         .filter(|(_, e)| e.valeur.run_id == run_id)
                         .map(|(id, e)| (*id, e.noeud))
                         .collect();
-                    (f.noeud, etats)
+                    (noeud, etats, hors_index)
                 };
                 // The runtime states first, the run last (module doc).
                 for (_, n) in &etats {
-                    supprimer(w, *n)?;
+                    supprimer_detache(w, *n)?;
                 }
-                supprimer(w, noeud)?;
+                for n in &hors_index {
+                    supprimer_detache(w, *n)?;
+                }
+                if let Some(n) = noeud {
+                    supprimer_detache(w, n)?;
+                }
                 w.rendre_durable()?;
-                w.index_mut()?.runs.retirer(
+                let mut etat = w.index_mut()?;
+                etat.runs.retirer(
                     &[run_id],
                     &etats.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
                 );
+                etat.runs
+                    .oublier_hors_index(&hors_index.into_iter().collect::<HashSet<_>>());
                 Ok(true)
             },
         )
@@ -1029,15 +1229,16 @@ mod tests {
         );
     }
 
-    /// `update_protocol_run` crashed after its k-th engine write: the version was
-    /// written FIRST, so the base carries the new one and a writer holding the old
-    /// version loses its compare-and-swap after the reopen.
+    /// `update_protocol_run` crashed after its k-th engine write (the marker, the
+    /// seven properties, the marker's removal): the reopen reads the run WHOLLY old
+    /// (cut before the marker) or WHOLLY new (the marker finishes it) — never a new
+    /// version with the old status — and a writer holding the old version loses.
     #[tokio::test]
-    async fn la_version_est_ecrite_d_abord_et_un_ecrivain_perime_perd_apres_un_crash() {
+    async fn une_mise_a_jour_coupee_se_relit_entiere_ancienne_ou_nouvelle() {
         use crate::obrain::Interruption;
         let dir = tempfile::tempdir().unwrap();
         let mut atteints = 0;
-        for k in 1..=8 {
+        for k in 1..=10 {
             let chemin = dir.path().join(format!("base-{k}"));
             let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
             let (p, _) = protocole(&store).await;
@@ -1047,6 +1248,7 @@ mod tests {
             maj.status = RunStatus::Failed;
             maj.current_state = Uuid::new_v4();
             maj.error = Some("boom".to_string());
+            maj.completed_at = Some(a(9));
             store.interrompre_au_prochain(Interruption::ApresEtape(k));
             let issue = store.update_protocol_run(&mut maj).await;
             store.close().await.unwrap();
@@ -1056,59 +1258,299 @@ mod tests {
             }
             atteints += 1;
             let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
-            assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
+            let rapport = store.rapport_d_ouverture().clone();
+            assert!(rapport.en_quarantaine.is_empty(), "k={k}: {rapport:?}");
             let relu = store.get_protocol_run(r.id).await.unwrap().unwrap();
             let mut perime = r.clone();
             perime.status = RunStatus::Cancelled;
             let resultat = store.update_protocol_run(&mut perime).await;
             if k == 1 {
-                // Nothing written: version 0 is the current one, not a stale one.
-                assert_eq!(relu.version, 0);
+                // Nothing written: wholly old, and version 0 is the current one.
+                assert_eq!(rapport.mises_a_jour_achevees, 0);
+                assert_eq!(
+                    (relu.version, relu.status, relu.current_state, relu.error),
+                    (0, RunStatus::Running, r.current_state, None)
+                );
                 resultat.unwrap();
             } else {
-                assert_eq!(relu.version, 1, "k={k}: the version is written first");
+                assert_eq!(rapport.mises_a_jour_achevees, 1, "k={k}");
+                assert_eq!(
+                    (
+                        relu.version,
+                        relu.status,
+                        relu.current_state,
+                        relu.error.as_deref(),
+                        relu.completed_at
+                    ),
+                    (
+                        1,
+                        RunStatus::Failed,
+                        maj.current_state,
+                        Some("boom"),
+                        Some(a(9))
+                    ),
+                    "k={k}: wholly new"
+                );
                 let e = resultat.unwrap_err();
                 assert!(e.to_string().contains("OptimisticLockError"), "k={k}: {e}");
             }
             store.close().await.unwrap();
         }
-        // The seven properties of the update.
-        assert_eq!(atteints, 7);
+        // The marker, the seven properties, the marker's removal.
+        assert_eq!(atteints, 9);
     }
 
-    /// A run node quarantined at open that may be a running root run blocks the
-    /// creation of a root run of its protocol; another protocol is not blocked.
+    /// A run node the backend does not serve that may be a running root run (its
+    /// `status` reads `running`, or is absent) blocks the creation of a root run of
+    /// its protocol; another protocol is not blocked; `delete_protocol_run` of its
+    /// id deletes it and lifts the block.
     #[tokio::test]
     async fn un_run_racine_en_cours_en_quarantaine_bloque_la_creation() {
         let dir = tempfile::tempdir().unwrap();
         let chemin = dir.path().join("base");
-        let p;
+        let (p, q);
+        let (fautif, sans_statut) = (Uuid::new_v4(), Uuid::new_v4());
         {
             let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
             p = protocole(&store).await.0;
+            q = protocole(&store).await.0;
             // Running, root, and unreadable (no `current_state`): quarantined.
             store.interne.db.create_node_with_props(
                 &[RUN],
                 vec![
-                    ("id", Value::from(Uuid::new_v4().to_string())),
+                    ("id", Value::from(fautif.to_string())),
                     ("protocol_id", Value::from(p.id.to_string())),
                     ("status", Value::from("running")),
                     ("parent_run_id", Value::from("")),
                 ],
             );
+            // No status at all: counted as running (fail closed).
+            store.interne.db.create_node_with_props(
+                &[RUN],
+                vec![
+                    ("id", Value::from(sans_statut.to_string())),
+                    ("protocol_id", Value::from(q.id.to_string())),
+                ],
+            );
             store.close().await.unwrap();
         }
         let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
-        assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+        assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 2);
         let racine = run(&p, None, 0);
         let e = store.create_protocol_run(&racine).await.unwrap_err();
-        assert!(e.to_string().contains("quarantined"), "{e}");
+        assert!(e.to_string().contains("does not serve"), "{e}");
         assert!(store.get_protocol_run(racine.id).await.unwrap().is_none());
+        assert!(store.create_protocol_run(&run(&q, None, 0)).await.is_err());
         let (autre, _) = protocole(&store).await;
         store
             .create_protocol_run(&run(&autre, None, 0))
             .await
             .unwrap();
+        // The way out: deleting the run of that id lifts the block, durably.
+        assert!(store.delete_protocol_run(fautif).await.unwrap());
+        store.create_protocol_run(&racine).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+        assert!(store.get_protocol_run(racine.id).await.unwrap().is_some());
+    }
+
+    /// A base migrated from Neo4j whose transitions and states predate the late keys
+    /// (`guard_expr`, `generator_config_json`, `prompt_fragment`, `available_tools_json`,
+    /// `forbidden_actions_json`): read as Neo4j reads them (none), nothing is
+    /// quarantined, and the state machine advances.
+    #[tokio::test]
+    async fn une_base_migree_sans_les_cles_tardives_se_lit_comme_neo4j_et_la_fsm_avance() {
+        use crate::protocol::{engine, ProtocolTransition, StateType};
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let (p, debut, fin);
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            let (proto, start) = protocole(&store).await;
+            let mut f = ProtocolState::new(proto.id, "fin");
+            f.state_type = StateType::Terminal;
+            store.upsert_protocol_state(&f).await.unwrap();
+            let mut proto = proto;
+            proto.terminal_states = vec![f.id];
+            store.upsert_protocol(&proto).await.unwrap();
+            let t = ProtocolTransition::new(proto.id, start.id, f.id, "go");
+            store.upsert_protocol_transition(&t).await.unwrap();
+            let (noeud_t, noeuds_e) = {
+                let etat = store.interne.etat.read().unwrap();
+                (
+                    etat.protocoles.transitions[&t.id].noeud,
+                    [
+                        etat.protocoles.etats[&start.id].noeud,
+                        etat.protocoles.etats[&f.id].noeud,
+                    ],
+                )
+            };
+            store.interne.db.remove_node_property(noeud_t, "guard_expr");
+            for n in noeuds_e {
+                for cle in [
+                    "generator_config_json",
+                    "prompt_fragment",
+                    "available_tools_json",
+                    "forbidden_actions_json",
+                ] {
+                    store.interne.db.remove_node_property(n, cle);
+                }
+            }
+            store.close().await.unwrap();
+            (p, debut, fin) = (proto, start, f);
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert!(
+            store.rapport_d_ouverture().en_quarantaine.is_empty(),
+            "{:?}",
+            store.rapport_d_ouverture()
+        );
+        let transitions = store.get_protocol_transitions(p.id).await.unwrap();
+        assert_eq!(transitions.len(), 1);
+        assert!(transitions[0].guard_expr.is_none());
+        let etats = store.get_protocol_states(p.id).await.unwrap();
+        assert_eq!(etats.len(), 2);
+        assert!(etats
+            .iter()
+            .all(|e| e.prompt_fragment.is_none() && e.available_tools.is_none()));
+        let lance = engine::start_run(&store, p.id, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(lance.current_state, debut.id);
+        let saut = engine::fire_transition(&store, lance.id, "go")
+            .await
+            .unwrap();
+        assert!(saut.success);
+        assert_eq!(saut.current_state, fin.id);
+    }
+
+    /// `delete_protocol` reaches, as Neo4j's `DETACH DELETE`, what the index does
+    /// not serve: a state quarantined (unreadable) by its raw `protocol_id`, a
+    /// transition reached only by its `HAS_TRANSITION` edge, a run quarantined and
+    /// its runtime state. Nothing is left in the base.
+    #[tokio::test]
+    async fn delete_protocol_atteint_ce_que_l_index_ne_sert_pas() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let p;
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            let (proto, etat) = protocole(&store).await;
+            p = proto;
+            let noeud_p = store.interne.etat.read().unwrap().protocoles.protocoles[&p.id].noeud;
+            let db = &store.interne.db;
+            // A state of p, unreadable (no `name`).
+            db.create_node_with_props(
+                &["ProtocolState"],
+                vec![
+                    ("id", Value::from(Uuid::new_v4().to_string())),
+                    ("protocol_id", Value::from(p.id.to_string())),
+                ],
+            );
+            // A transition whose property names another protocol, linked to p by edge.
+            let t = db.create_node_with_props(
+                &["ProtocolTransition"],
+                vec![
+                    ("id", Value::from(Uuid::new_v4().to_string())),
+                    ("protocol_id", Value::from(Uuid::new_v4().to_string())),
+                    ("from_state", Value::from(etat.id.to_string())),
+                    ("to_state", Value::from(etat.id.to_string())),
+                    ("trigger", Value::from("x")),
+                    ("guard", Value::from("")),
+                ],
+            );
+            db.create_edge(noeud_p, t, "HAS_TRANSITION");
+            // A run of p, unreadable, and its runtime state.
+            let run_id = Uuid::new_v4();
+            db.create_node_with_props(
+                &[RUN],
+                vec![
+                    ("id", Value::from(run_id.to_string())),
+                    ("protocol_id", Value::from(p.id.to_string())),
+                    ("status", Value::from("completed")),
+                ],
+            );
+            db.create_node_with_props(
+                &[ETAT_RUNTIME],
+                vec![
+                    ("id", Value::from(Uuid::new_v4().to_string())),
+                    ("run_id", Value::from(run_id.to_string())),
+                ],
+            );
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 4);
+        assert!(store.delete_protocol(p.id).await.unwrap());
+        assert_eq!(store.interne.db.store().node_count(), 0);
+        store.close().await.unwrap();
+        drop(store);
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
+    }
+
+    /// A value above the blob threshold — or one that sat there and is replaced —
+    /// makes the write pay the FULL flush (the WAL alone does not recover it):
+    /// counted in fsyncs, without any `close()`. For a run update (`error`), a
+    /// state upsert (`prompt_fragment`) and a protocol upsert (`description`).
+    #[tokio::test]
+    async fn une_valeur_longue_paie_le_flush_complet_sans_close() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let fsyncs = || store.fsyncs_du_wal().unwrap();
+        let (mut p, mut etat) = protocole(&store).await;
+        let mut r = run(&p, None, 0);
+        store.create_protocol_run(&r).await.unwrap();
+        // The fsyncs of one write.
+        macro_rules! cout {
+            ($e:expr) => {{
+                let t = fsyncs();
+                $e.await.unwrap();
+                fsyncs() - t
+            }};
+        }
+        // A write with nothing long: the WAL fsync alone.
+        let wal_seul = cout!(store.upsert_protocol(&p));
+        assert!(wal_seul >= 1, "the WAL fsync ran");
+        // A run update carries its update marker (the whole new state, history
+        // included: above the threshold as soon as the run has a visit), so it pays
+        // the full flush — with a long value, and with one replaced.
+        r.error = Some("x".repeat(300));
+        let long = cout!(store.update_protocol_run(&mut r));
+        r.error = None;
+        let remplace = cout!(store.update_protocol_run(&mut r));
+        assert!(
+            long > wal_seul,
+            "run, long value: {long} against {wal_seul}"
+        );
+        assert!(
+            remplace > wal_seul,
+            "run, long value replaced: {remplace} against {wal_seul}"
+        );
+
+        etat.prompt_fragment = Some("court".into());
+        let court = cout!(store.upsert_protocol_state(&etat));
+        etat.prompt_fragment = Some("x".repeat(300));
+        let long = cout!(store.upsert_protocol_state(&etat));
+        etat.prompt_fragment = None;
+        let remplace = cout!(store.upsert_protocol_state(&etat));
+        assert!(long > court, "state, long value: {long} against {court}");
+        assert!(
+            remplace > court,
+            "state, long value replaced: {remplace} against {court}"
+        );
+
+        let court = cout!(store.upsert_protocol(&p));
+        p.description = "x".repeat(300);
+        let long = cout!(store.upsert_protocol(&p));
+        p.description = String::new();
+        let remplace = cout!(store.upsert_protocol(&p));
+        assert!(long > court, "protocol, long value: {long} against {court}");
+        assert!(
+            remplace > court,
+            "protocol, long value replaced: {remplace} against {court}"
+        );
     }
 
     /// A stored "" stays "": the default ("manual", "pending") is for an ABSENT
@@ -1166,7 +1608,7 @@ mod tests {
             sans_statut = r2.id;
 
             let (p3, e3) = protocole(&store).await;
-            for cle in ["guard_expr", "guard"] {
+            for cle in ["guard"] {
                 let t = ProtocolTransition::new(p3.id, e3.id, e3.id, cle);
                 store.upsert_protocol_transition(&t).await.unwrap();
                 let n = store.interne.etat.read().unwrap().protocoles.transitions[&t.id].noeud;
@@ -1189,7 +1631,6 @@ mod tests {
         for cle in [
             "states_visited_json",
             "status",
-            "guard_expr",
             "guard",
             "terminal_states_json",
         ] {

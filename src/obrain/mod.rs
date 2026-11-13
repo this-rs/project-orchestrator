@@ -277,6 +277,9 @@ pub struct RapportOuverture {
     /// `canonical_path`) was torn by an interrupted update: recomputed from
     /// `root_path`, which is written last.
     pub chemins_repares: usize,
+    /// `ProtocolRun` updates cut after their update marker: finished from the
+    /// marker (`protocolrun.rs`, "Atomicity").
+    pub mises_a_jour_achevees: usize,
     /// `Project` nodes this backend cannot address (no readable `id`/`name`/
     /// `slug`/`created_at`, or an id or slug already taken): left untouched,
     /// ignored, named here.

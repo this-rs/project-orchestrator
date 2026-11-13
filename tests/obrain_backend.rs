@@ -1831,7 +1831,11 @@ mod with_the_feature {
         // The version survived: a stale writer still loses after the reopen.
         let mut stale = found.clone();
         stale.version = 1;
-        assert!(store.update_protocol_run(&mut stale).await.is_err());
+        let lost = store.update_protocol_run(&mut stale).await.unwrap_err();
+        assert!(
+            lost.to_string().contains("OptimisticLockError"),
+            "the stale writer loses its compare-and-swap, not anything else: {lost:#}"
+        );
 
         // The cascade is durable: protocol, states, transitions, runs, runtime states.
         assert!(store.delete_protocol(protocol.id).await.unwrap());
@@ -1860,32 +1864,34 @@ mod with_the_feature {
     async fn the_run_methods_that_name_other_domains_refuse_by_name() {
         let store = temporary(Durabilite::Wal).await;
         let id = Uuid::new_v4();
-        assert_eq!(
-            not_ported(store.get_run_outcomes(id).await),
-            NonPorte("ProtocolRunStore::get_run_outcomes")
-        );
-        assert_eq!(
-            not_ported(store.create_produced_during("note", id, id).await),
-            NonPorte("ProtocolRunStore::create_produced_during")
-        );
-        assert_eq!(
-            not_ported(store.get_run_reasoning_tree_id(id).await),
-            NonPorte("ProtocolRunStore::get_run_reasoning_tree_id")
-        );
         let tree = project_orchestrator::reasoning::ReasoningTree::new("why", None);
-        assert_eq!(
+        // What each refused method ACTUALLY answers, by calling it.
+        let answered = [
+            not_ported(store.get_run_outcomes(id).await),
+            not_ported(store.create_produced_during("note", id, id).await),
+            not_ported(store.get_run_reasoning_tree_id(id).await),
             not_ported(
                 store
                     .persist_reasoning_tree(&tree, Some("protocol_run"), Some(id))
-                    .await
+                    .await,
             ),
-            NonPorte("ProtocolRunStore::persist_reasoning_tree")
+        ];
+        assert_eq!(
+            answered,
+            [
+                NonPorte("ProtocolRunStore::get_run_outcomes"),
+                NonPorte("ProtocolRunStore::create_produced_during"),
+                NonPorte("ProtocolRunStore::get_run_reasoning_tree_id"),
+                NonPorte("ProtocolRunStore::persist_reasoning_tree"),
+            ]
         );
-        // The four, and only them.
-        assert_eq!(refusees_protocolrun().len(), 4);
-        assert!(refusees_protocolrun()
-            .iter()
-            .all(|m| m.starts_with("ProtocolRunStore::")));
+        // The registry the accounting reads names exactly the refusals the calls
+        // gave: one more, or one fewer, is caught here.
+        let mut registry: Vec<&str> = refusees_protocolrun().to_vec();
+        let mut called: Vec<&str> = answered.iter().map(|n| n.0).collect();
+        registry.sort_unstable();
+        called.sort_unstable();
+        assert_eq!(registry, called);
         assert!(!methodes_refusees()
             .iter()
             .any(|m| m.starts_with("ProtocolStore::")));

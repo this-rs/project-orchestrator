@@ -31,23 +31,27 @@
 //!   (the node is quarantined, named, untouched), where Neo4j drops it to its
 //!   default: a guard, a status, a terminal-state list never turns silently into
 //!   "none".
-//! - Fail closed on a MISSING value too: the keys below are written on every
-//!   write (the empty string for "none"), so a key that is ABSENT is a value
-//!   lost, not a value never set. It is an error at open (quarantine), where
-//!   Neo4j reads it as "none" or empty: `terminal_states_json`,
-//!   `trigger_config_json`, `relevance_vector_json` (protocol);
-//!   `generator_config_json`, `available_tools_json`, `forbidden_actions_json`,
-//!   `prompt_fragment` (state); `guard`, `guard_expr` (transition); and, in
-//!   `protocolrun.rs`, `states_visited_json`, `error` and `status` of a run. A
-//!   base whose nodes predate one of these keys (never re-written since) is
-//!   quarantined at open rather than read with a default: the report names
-//!   each node. The other missing values read as the default, as in Neo4j.
-//! - `delete_protocol` finds the protocol's states, transitions and runs by
-//!   their `protocol_id` PROPERTY; Neo4j finds them by EDGE (`HAS_STATE`,
-//!   `HAS_TRANSITION`, `INSTANCE_OF`). On a base this backend wrote the two are
-//!   the same set. On a migrated base where they disagree (a node whose edge
-//!   points to another protocol than its property), the property decides here,
-//!   the edge in Neo4j.
+//! - Fail closed on a MISSING value too, for the keys that exist since their
+//!   label does and that Neo4j writes on every write (the empty string for
+//!   "none"): a key ABSENT there is a value lost, an error at open
+//!   (quarantine), where Neo4j reads it as "none": `terminal_states_json`,
+//!   `trigger_config_json`, `relevance_vector_json` (protocol), `guard`
+//!   (transition) and, in `protocolrun.rs`, `states_visited_json`, `error` and
+//!   `status` of a run.
+//! - The keys that came LATER, with no back-fill of the nodes written before
+//!   (nothing in `data_migrations.rs`; `ensure_default_protocols` does not
+//!   rewrite existing transitions): `guard_expr` (2026-11-07),
+//!   `generator_config_json` (2026-03-10), `prompt_fragment`,
+//!   `available_tools_json`, `forbidden_actions_json` (2026-03-19). ABSENT reads
+//!   as "none", as in Neo4j — a migrated base keeps its old transitions and
+//!   states; a value PRESENT that does not read is still an error (quarantine).
+//! - `delete_protocol` reaches the protocol's states, transitions and runs by
+//!   their `protocol_id` PROPERTY, and ALSO by the edges Neo4j follows
+//!   (`HAS_STATE`, `HAS_TRANSITION` from the protocol, `INSTANCE_OF` to it), and
+//!   reaches the nodes of these labels the index does not serve (quarantined at
+//!   open) by their raw `protocol_id`: what Neo4j's `DETACH DELETE` removes,
+//!   readable or not, is removed here too, edges included. A migrated node whose
+//!   edge and property name two different protocols goes with both.
 //! - `delete_protocol` also deletes the runtime states of the runs it deletes:
 //!   Neo4j leaves them orphaned (`DETACH DELETE s, t, r, proto` does not reach
 //!   `RuntimeState`).
@@ -74,6 +78,7 @@ use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use obrain_common::types::{NodeId, Value};
+use obrain_core::graph::Direction;
 use obrain_engine::ObrainDB;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -131,6 +136,28 @@ pub(super) fn texte_attendu(get: Lecteur, cle: &str, quoi: &str) -> Result<Optio
             Some(s) => Ok(Some(s.to_string())),
         },
     }
+}
+
+/// A JSON property that came LATER than its label (module doc): absent is
+/// `None`, as in Neo4j; present, it reads as [`json_attendu`] (empty is `None`,
+/// not a string or not JSON is an error).
+pub(super) fn json_tardif<T: DeserializeOwned>(
+    get: Lecteur,
+    cle: &str,
+    quoi: &str,
+) -> Result<Option<T>> {
+    if get(cle).is_none() {
+        return Ok(None);
+    }
+    json_attendu(get, cle, quoi)
+}
+
+/// A string property that came later than its label: absent is `None`.
+fn texte_tardif(get: Lecteur, cle: &str, quoi: &str) -> Result<Option<String>> {
+    if get(cle).is_none() {
+        return Ok(None);
+    }
+    texte_attendu(get, cle, quoi)
 }
 
 /// A JSON property written on every write: absent is an error (see
@@ -365,6 +392,23 @@ pub(super) fn supprimer(w: &mut Ecriture<'_>, noeud: NodeId) -> Result<()> {
     })
 }
 
+/// Deletes one node with its edges (`DETACH DELETE`): for nodes this backend
+/// did not write (a migrated base links by edge), or does not serve.
+pub(super) fn supprimer_detache(w: &mut Ecriture<'_>, noeud: NodeId) -> Result<()> {
+    let store = w.db.store();
+    let aretes: Vec<_> = store
+        .edges_from(noeud, Direction::Outgoing)
+        .into_iter()
+        .chain(store.edges_from(noeud, Direction::Incoming))
+        .map(|(_, a)| a)
+        .collect();
+    for a in aretes {
+        w.etape()?;
+        w.db.delete_edge(a);
+    }
+    supprimer(w, noeud)
+}
+
 // ============================================================================
 // Encoding and decoding of the three entities
 // ============================================================================
@@ -508,10 +552,11 @@ fn lire_etat(get: Lecteur) -> Result<ProtocolState> {
         sub_protocol_id: uuid_facultatif(get, "sub_protocol_id", quoi)?,
         completion_strategy: enumeration_facultative(get, "completion_strategy", quoi)?,
         on_failure_strategy: enumeration_facultative(get, "on_failure_strategy", quoi)?,
-        generator_config: json_attendu(get, "generator_config_json", quoi)?,
-        prompt_fragment: texte_attendu(get, "prompt_fragment", quoi)?,
-        available_tools: json_attendu(get, "available_tools_json", quoi)?,
-        forbidden_actions: json_attendu(get, "forbidden_actions_json", quoi)?,
+        // Keys that came later than the label: absent is "none" (module doc).
+        generator_config: json_tardif(get, "generator_config_json", quoi)?,
+        prompt_fragment: texte_tardif(get, "prompt_fragment", quoi)?,
+        available_tools: json_tardif(get, "available_tools_json", quoi)?,
+        forbidden_actions: json_tardif(get, "forbidden_actions_json", quoi)?,
         state_timeout_secs: get("state_timeout_secs")
             .and_then(|v| v.as_int64())
             .and_then(timeout_lu),
@@ -543,7 +588,9 @@ fn lire_transition(get: Lecteur) -> Result<ProtocolTransition> {
         // Fail closed: a guard lost (absent) or that no longer parses is an
         // error, never a dropped guard (that would open a guarded transition).
         guard: texte_attendu(get, "guard", quoi)?,
-        guard_expr: json_attendu(get, "guard_expr", quoi)?,
+        // `guard_expr` came later (2026-11-07): absent is "no expression", as in
+        // Neo4j; present and unreadable is an error.
+        guard_expr: json_tardif(get, "guard_expr", quoi)?,
     })
 }
 
@@ -557,6 +604,9 @@ pub(super) struct IndexProtocoles {
     pub(super) protocoles: HashMap<Uuid, Fiche<Protocol>>,
     pub(super) etats: HashMap<Uuid, Fiche<ProtocolState>>,
     pub(super) transitions: HashMap<Uuid, Fiche<ProtocolTransition>>,
+    /// State and transition nodes on disk the index does not serve, with their
+    /// raw `protocol_id`: `delete_protocol` still reaches them.
+    hors_index: Vec<(NodeId, Option<Uuid>)>,
 }
 
 impl IndexProtocoles {
@@ -609,6 +659,24 @@ impl IndexProtocoles {
                         v.insert(f);
                     }
                 }
+            }
+        }
+        let servis: std::collections::HashSet<NodeId> = index
+            .etats
+            .values()
+            .map(|f| f.noeud)
+            .chain(index.transitions.values().map(|f| f.noeud))
+            .collect();
+        for label in [ETAT, TRANSITION] {
+            for noeud in db.store().nodes_by_label(label) {
+                if servis.contains(&noeud) {
+                    continue;
+                }
+                let protocole = db.get_node(noeud).and_then(|n| {
+                    n.get_property("protocol_id")
+                        .and_then(|v| v.as_str().and_then(|t| t.parse::<Uuid>().ok()))
+                });
+                index.hors_index.push((noeud, protocole));
             }
         }
         index
@@ -716,11 +784,41 @@ impl ProtocolStore for ObrainGraphStore {
         self.ecrire(
             || (),
             move |(), w: &mut Ecriture<'_>| {
-                let (noeud, etats, transitions, runs, etats_runtime) = {
+                let (noeud, etats, transitions, runs, etats_runtime, detaches) = {
                     let etat = w.index()?;
                     let Some(f) = etat.protocoles.protocoles.get(&id) else {
                         return Ok(false);
                     };
+                    // What the index does not serve, or reaches only by edge (module
+                    // doc): deleted WITH its edges, as Neo4j's DETACH DELETE.
+                    let mut detaches: Vec<NodeId> = etat
+                        .protocoles
+                        .hors_index
+                        .iter()
+                        .filter(|(_, p)| *p == Some(id))
+                        .map(|(n, _)| *n)
+                        .collect();
+                    let runs_hors_index = etat.runs.hors_index_du_protocole(id);
+                    detaches.extend(runs_hors_index.iter().map(|(_, n)| *n));
+                    let store = w.db.store();
+                    for (voisin, arete) in store
+                        .edges_from(f.noeud, Direction::Outgoing)
+                        .into_iter()
+                        .chain(store.edges_from(f.noeud, Direction::Incoming))
+                    {
+                        let Some(e) = w.db.get_edge(arete) else {
+                            continue;
+                        };
+                        let sortante = e.src == f.noeud;
+                        let suivie = match &*e.edge_type {
+                            "HAS_STATE" | "HAS_TRANSITION" => sortante,
+                            "INSTANCE_OF" => !sortante,
+                            _ => false,
+                        };
+                        if suivie && voisin != f.noeud {
+                            detaches.push(voisin);
+                        }
+                    }
                     let etats: Vec<(Uuid, NodeId)> = etat
                         .protocoles
                         .etats
@@ -736,22 +834,42 @@ impl ProtocolStore for ObrainGraphStore {
                         .map(|(i, t)| (*i, t.noeud))
                         .collect();
                     let (runs, etats_runtime) = etat.runs.du_protocole(id);
-                    (f.noeud, etats, transitions, runs, etats_runtime)
+                    // The runtime states of every run reached, served or not.
+                    let ids_runs: std::collections::HashSet<Uuid> = runs
+                        .iter()
+                        .map(|(i, _)| *i)
+                        .chain(runs_hors_index.iter().filter_map(|(i, _)| *i))
+                        .collect();
+                    detaches.extend(etat.runs.etats_hors_index_des(&ids_runs));
+                    // A node the index serves is deleted in its own place below.
+                    let servis: std::collections::HashSet<NodeId> = etats
+                        .iter()
+                        .chain(&transitions)
+                        .chain(&runs)
+                        .chain(&etats_runtime)
+                        .map(|(_, n)| *n)
+                        .collect();
+                    let mut vus = std::collections::HashSet::new();
+                    detaches.retain(|n| !servis.contains(n) && vus.insert(*n));
+                    (f.noeud, etats, transitions, runs, etats_runtime, detaches)
                 };
                 // Leaves first, the protocol node last (module doc).
                 for (_, n) in &etats_runtime {
-                    supprimer(w, *n)?;
+                    supprimer_detache(w, *n)?;
+                }
+                for n in &detaches {
+                    supprimer_detache(w, *n)?;
                 }
                 for (_, n) in &runs {
-                    supprimer(w, *n)?;
+                    supprimer_detache(w, *n)?;
                 }
                 for (_, n) in &etats {
-                    supprimer(w, *n)?;
+                    supprimer_detache(w, *n)?;
                 }
                 for (_, n) in &transitions {
-                    supprimer(w, *n)?;
+                    supprimer_detache(w, *n)?;
                 }
-                supprimer(w, noeud)?;
+                supprimer_detache(w, noeud)?;
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 etat.runs.retirer(
@@ -764,6 +882,11 @@ impl ProtocolStore for ObrainGraphStore {
                 for (i, _) in &transitions {
                     etat.protocoles.transitions.remove(i);
                 }
+                let detaches: std::collections::HashSet<NodeId> = detaches.into_iter().collect();
+                etat.protocoles
+                    .hors_index
+                    .retain(|(n, _)| !detaches.contains(n));
+                etat.runs.oublier_hors_index(&detaches);
                 etat.protocoles.protocoles.remove(&id);
                 Ok(true)
             },
