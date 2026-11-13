@@ -2157,7 +2157,7 @@ mod tests {
             })
         };
         let (a, b) = tokio::join!(send("victimpass1", "Victim"), send("intruder1", "Intruder"));
-        let mut results = vec![a.unwrap(), b.unwrap()];
+        let mut results = [a.unwrap(), b.unwrap()];
         results.sort_by_key(|r| r.0.as_u16());
         let (won, lost) = (&results[0], &results[1]);
 
