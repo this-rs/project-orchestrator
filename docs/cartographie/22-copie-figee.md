@@ -24,7 +24,7 @@ L'écart entre les deux colonnes est l'**évolution** de la base vivante en dix 
 
 ## Ce que la copie confirme ou précise
 
-- **ChatEvent sans `HAS_EVENT` : 418** (418 relevés sur la base vivante à 01:17Z). L'écart est dans la source ; la migration le reproduit et le signale.
+- **ChatEvent sans `HAS_EVENT` : 418** (418 relevés sur la base vivante à 01:17Z). Égal à la différence `ChatEvent` − `HAS_EVENT` des tableaux ci-dessous (2 702 931 − 2 702 513) ; la requête qui l'aurait compté directement n'est pas consignée : **non vérifié** comme compte direct. L'écart est dans la source ; la migration le reproduit et le signale.
 - **Labels déclarés sans données (6)** : `DayPlan` `ExternalEvent` `PredictedLink` `SynapseShadowTrace` `TopologyRule` `TriggerSignal` 
 - **Types de relation déclarés sans données (2)** : `CO_CHANGED_TRANSITIVE` `PREDICTED_LINK` 
 - Ces huit noms font partie du schéma : la cible doit les connaître, même vides.

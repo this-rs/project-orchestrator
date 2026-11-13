@@ -15,16 +15,16 @@ C'est la **méthode 1**. Le critère exige une seconde méthode indépendante (p
 
 ## Constats à préserver, pas à corriger
 
-1. **Un label par nœud** : la somme des comptes par label égale le nombre de nœuds.
-2. **6 labels et 2 types de relation déclarés sans données.** Ils font partie du schéma et doivent exister dans la cible ; leurs noms restent à relever (`db.labels()` / `db.relationshipTypes()` sur la copie).
-3. **418 `ChatEvent` sans `HAS_EVENT`** (2 692 558 événements, 2 692 140 liens). L'écart est dans la source : la migration le reproduit à l'identique et le signale, elle ne le crée ni ne le répare.
+1. **Un label par nœud** : la somme des comptes par label égale le nombre de nœuds. Cette égalité est nécessaire mais ne suffit pas (un nœud sans label compenserait un nœud à deux labels) ; le fait est établi sur la copie par `size(labels(n)) = 1` pour tous les nœuds (`22-copie-figee.md`).
+2. **6 labels et 2 types de relation déclarés sans données.** Ils font partie du schéma et doivent exister dans la cible ; leurs noms ont été relevés sur la copie (`22-copie-figee.md` : `DayPlan`, `ExternalEvent`, `PredictedLink`, `SynapseShadowTrace`, `TopologyRule`, `TriggerSignal` ; `CO_CHANGED_TRANSITIVE`, `PREDICTED_LINK`).
+3. **418 `ChatEvent` sans `HAS_EVENT`** (2 692 558 événements, 2 692 140 liens). Le chiffre est **déduit** de la différence des deux compteurs, pas compté : il suppose que chaque `HAS_EVENT` aboutit à un `ChatEvent` distinct. Le *count store* ne permet pas de le vérifier ; une requête directe (`MATCH (e:ChatEvent) WHERE NOT ()-[:HAS_EVENT]->(e) RETURN count(e)`) sur la copie reste à consigner : **non vérifié**. L'écart est dans la source : la migration le reproduit à l'identique et le signale, elle ne le crée ni ne le répare.
 4. **La base vivante écrit en continu** (`ChatEvent` domine à 70 %). Ces chiffres sont un instantané : la comparaison source/cible n'a de sens que sur une source figée — d'où la migration au démarrage, avant toute écriture (décision f8e1f200).
 
-## Défauts du convertisseur existant (`obrain/neo4j2obrain/src/neo4j_to_obrain.rs`)
+## Défauts du convertisseur existant (`src/neo4j_to_obrain.rs` du dépôt `obrain-db/neo4j2obrain`, hors de ce dépôt ; relu au commit afaaaf5)
 
-- `bolt_to_value` retire les `null` des listes et des maps (`filter_map`) : une liste change de longueur et ses positions bougent.
-- Dates, heures et durées deviennent `format!("{:?}")` : le type est perdu.
-- Le mot de passe a une valeur par défaut écrite dans le source.
+- `bolt_to_value` (l. 51) retire les `null` des listes (`filter_map`, l. 62) et des maps (l. 66-72) : une liste change de longueur et ses positions bougent.
+- Dates, heures et durées deviennent `format!("{:?}")` (l. 78) : le type est perdu.
+- Le mot de passe a une valeur par défaut écrite dans le source (`default_value`, l. 34).
 
 Il sert de point de départ ; il ne satisfait pas la garantie « aucune perte ».
 
