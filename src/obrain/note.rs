@@ -444,26 +444,6 @@ fn lire_note(get: &dyn Fn(&str) -> Option<Value>) -> Result<(Note, Option<DateTi
     Ok((note, instant("updated_at")))
 }
 
-/// What an index sorts a note by (the fields of `NOTE_SORT_FIELDS`).
-#[derive(PartialEq)]
-enum Valeur {
-    Instant(DateTime<Utc>),
-    Nombre(f64),
-    Texte(String),
-}
-
-impl Valeur {
-    /// The variant's rank: values of one field always share a variant, so this only
-    /// orders what could never meet, and keeps the order total.
-    fn rang(&self) -> u8 {
-        match self {
-            Valeur::Instant(_) => 0,
-            Valeur::Nombre(_) => 1,
-            Valeur::Texte(_) => 2,
-        }
-    }
-}
-
 /// The index of the notes.
 #[derive(Default)]
 pub(super) struct IndexNotes {
@@ -604,7 +584,7 @@ impl IndexNotes {
         // The links: the out-edges `LINKED_TO` of every indexed note.
         let mut liens_par_note: Vec<(Uuid, Vec<Lien>, usize)> = Vec::new();
         for (noeud, id) in &vus {
-            let mut liens = Vec::new();
+            let mut liens: Vec<Lien> = Vec::new();
             let mut non_resolus = 0usize;
             for (cible, arete) in store.edges_from(*noeud, Direction::Outgoing) {
                 let Some(e) = db.get_edge(arete) else {
@@ -646,13 +626,31 @@ impl IndexNotes {
                     non_resolus += 1;
                     continue;
                 };
+                // Canonical form, as every link written here: a migrated `ABC…` id is the
+                // same node as `abc…`, so the index must key on the canonical string.
+                let id_entite = match id_cible.parse::<Uuid>() {
+                    Ok(u) => u.to_string(),
+                    Err(_) => {
+                        non_resolus += 1;
+                        continue;
+                    }
+                };
+                // A second edge to a node already linked cannot be represented (the index
+                // keys on the target): the note is refused for its anchors instead.
+                if liens
+                    .iter()
+                    .any(|l| l.entite == entite && l.id_entite == id_entite)
+                {
+                    non_resolus += 1;
+                    continue;
+                }
                 let texte = |cle: &str| {
                     e.get_property(cle)
                         .and_then(|v| v.as_str().map(str::to_string))
                 };
                 liens.push(Lien {
                     entite,
-                    id_entite: id_cible,
+                    id_entite,
                     arete,
                     signature_hash: texte("signature_hash").filter(|s| !s.is_empty()),
                     body_hash: texte("body_hash").filter(|s| !s.is_empty()),
@@ -914,6 +912,11 @@ impl NoteStore for ObrainGraphStore {
                 // The OLD content too: replacing a value that sat in a blob column clears
                 // that slot, which the WAL does not recover (as in project.rs).
                 w.flush_complet = ancienne.note.content.len() > SEUIL_COLONNE_BLOB
+                    || ancienne
+                        .note
+                        .tags
+                        .iter()
+                        .any(|t| t.len() > SEUIL_COLONNE_BLOB)
                     || content
                         .as_ref()
                         .is_some_and(|c| c.len() > SEUIL_COLONNE_BLOB)
@@ -1033,7 +1036,8 @@ impl NoteStore for ObrainGraphStore {
                     w.db.delete_edge(a);
                 }
                 w.etape()?;
-                if !w.db.delete_node(noeud) {
+                let supprime = !w.suppression_echouee() && w.db.delete_node(noeud);
+                if !supprime {
                     // The edges are already gone: what is on disk is no longer the state
                     // before this call. Same contract as `apres_ecriture`: everything is
                     // refused until a restart rebuilds the index from the base.
@@ -1538,8 +1542,7 @@ impl NoteStore for ObrainGraphStore {
                 .collect();
             // ORDER BY staleness_score DESC, importance DESC, id DESC LIMIT 500.
             notes.sort_by(|a, b| {
-                b.staleness_score
-                    .total_cmp(&a.staleness_score)
+                cmp_nombre(b.staleness_score, a.staleness_score)
                     .then_with(|| b.importance.to_string().cmp(&a.importance.to_string()))
                     .then_with(|| b.id.cmp(&a.id))
             });
@@ -1654,36 +1657,54 @@ fn note_ordre_desc(requested: Option<&str>) -> bool {
     !matches!(requested.map(|d| d.trim().to_ascii_lowercase()), Some(d) if d == "asc")
 }
 
-/// The sort value of a note for one field. `None` is a null property.
-fn valeur_de_tri(e: &EntreeNote, champ: &str) -> Option<Valeur> {
-    let n = &e.note;
-    match champ {
-        "created_at" => Some(Valeur::Instant(n.created_at)),
-        "updated_at" => e.mise_a_jour.map(Valeur::Instant),
-        "importance" => Some(Valeur::Texte(n.importance.to_string())),
-        "status" => Some(Valeur::Texte(n.status.to_string())),
-        "note_type" => Some(Valeur::Texte(n.note_type.to_string())),
-        "staleness_score" => Some(Valeur::Nombre(n.staleness_score)),
-        "energy" => Some(Valeur::Nombre(n.energy)),
-        "last_confirmed_at" => n.last_confirmed_at.map(Valeur::Instant),
-        "last_activated" => n.last_activated.map(Valeur::Instant),
-        "scar_intensity" => Some(Valeur::Nombre(n.scar_intensity)),
-        _ => Some(Valeur::Instant(n.created_at)),
+/// Compares two numbers as a total order that agrees with Neo4j on equality: `-0.0` and
+/// `0.0` are equal (ties go to the id), NaN is ordered by `total_cmp` (greatest).
+fn cmp_nombre(a: f64, b: f64) -> Ordering {
+    if a == b {
+        Ordering::Equal
+    } else {
+        a.total_cmp(&b)
     }
 }
 
-/// The ascending order of a list: by the field, nulls LAST (as Cypher ascending),
-/// then by id. The caller reverses it for `DESC`, which puts nulls first, as Cypher.
-fn cmp_tri(a: &EntreeNote, b: &EntreeNote, champ: &str) -> Ordering {
-    let va = valeur_de_tri(a, champ);
-    let vb = valeur_de_tri(b, champ);
-    let par_champ = match (&va, &vb) {
-        (Some(x), Some(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+/// Ascending comparison of a nullable value: nulls LAST (as Cypher ascending).
+fn ord_nullable<T>(x: Option<&T>, y: Option<&T>, cmp: impl Fn(&T, &T) -> Ordering) -> Ordering {
+    match (x, y) {
+        (Some(a), Some(b)) => cmp(a, b),
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Greater,
         (Some(_), None) => Ordering::Less,
+    }
+}
+
+/// The ascending order of a list: by the field (nulls LAST), then by id. The caller
+/// reverses it for `DESC`, which puts nulls first, as Cypher does.
+fn cmp_tri(a: &EntreeNote, b: &EntreeNote, champ: &str) -> Ordering {
+    let (na, nb) = (&a.note, &b.note);
+    let par_champ = match champ {
+        "updated_at" => ord_nullable(a.mise_a_jour.as_ref(), b.mise_a_jour.as_ref(), |x, y| {
+            x.cmp(y)
+        }),
+        "last_confirmed_at" => ord_nullable(
+            na.last_confirmed_at.as_ref(),
+            nb.last_confirmed_at.as_ref(),
+            |x, y| x.cmp(y),
+        ),
+        "last_activated" => ord_nullable(
+            na.last_activated.as_ref(),
+            nb.last_activated.as_ref(),
+            |x, y| x.cmp(y),
+        ),
+        "importance" => na.importance.to_string().cmp(&nb.importance.to_string()),
+        "status" => na.status.to_string().cmp(&nb.status.to_string()),
+        "note_type" => na.note_type.to_string().cmp(&nb.note_type.to_string()),
+        "staleness_score" => cmp_nombre(na.staleness_score, nb.staleness_score),
+        "energy" => cmp_nombre(na.energy, nb.energy),
+        "scar_intensity" => cmp_nombre(na.scar_intensity, nb.scar_intensity),
+        // `note_order_field` only yields NOTE_SORT_FIELDS; `created_at` is its default.
+        _ => na.created_at.cmp(&nb.created_at),
     };
-    par_champ.then_with(|| a.note.id.cmp(&b.note.id))
+    par_champ.then_with(|| na.id.cmp(&nb.id))
 }
 
 /// The predicates of `list_notes` (`build_note_where`), on the decoded note.
@@ -1725,17 +1746,4 @@ fn filtre_note(n: &Note, f: &NoteFilters) -> bool {
         }
     }
     true
-}
-
-impl PartialOrd for Valeur {
-    /// Total: `f64::total_cmp` for numbers (a NaN is refused at the write, but the order
-    /// stays total if one comes from a migrated base).
-    fn partial_cmp(&self, autre: &Self) -> Option<Ordering> {
-        Some(match (self, autre) {
-            (Valeur::Instant(a), Valeur::Instant(b)) => a.cmp(b),
-            (Valeur::Nombre(a), Valeur::Nombre(b)) => a.total_cmp(b),
-            (Valeur::Texte(a), Valeur::Texte(b)) => a.cmp(b),
-            (a, b) => a.rang().cmp(&b.rang()),
-        })
-    }
 }
