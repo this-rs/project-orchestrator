@@ -3998,18 +3998,6 @@ const EXPECTED_DIVERGENCES: &[Divergence] = &[
         "vector_search_notes returns the raw cosine (orthogonal = 0.0) where Neo4j's index scores (1 + cosine) / 2 (orthogonal = 0.5); \
          the same min_similarity keeps different notes on the two backends",
     ),
-    mock(
-        "check_release_list_order",
-        "list_releases_filtered ignores sort_by target_date (the mock keeps insertion/HashMap order where Neo4j puts the undated release first ascending)",
-    ),
-    mock(
-        "check_milestone_lifecycle",
-        "list_project_milestones does not order by target_date ascending with an absent date first (HashMap order)",
-    ),
-    mock(
-        "check_project_list_filtered",
-        "list_projects_filtered ignores sort_by and sort_order (HashMap order) where Neo4j sorts by name ascending on request",
-    ),
     neo4j(
         "check_concurrent_create_protocol_run",
         "create_protocol_run checks `NOT EXISTS { running root run }` and CREATEs without a lock on the Protocol node first, \
