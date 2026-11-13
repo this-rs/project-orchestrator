@@ -59,7 +59,7 @@ Conséquence : ce n'est **pas** 104 requêtes à réécrire. Réécrire `WITH` e
 toujours possible (le `WITH` sert justement à poursuivre le pipeline). C'est un **défaut de
 sémantique à corriger dans obrain**, et il est étroit : la liaison des alias après agrégation.
 
-### 2. `duration.between(a, b)` — **10 occurrences**
+### 2. `duration.between(a, b)` — **3 requêtes** (4 occurrences dont 1 commentaire)
 
 ```
 syntax error: Expected end of query   (à la colonne du point)
@@ -68,12 +68,35 @@ syntax error: Expected end of query   (à la colonne du point)
 La forme `duration('P1D')` et l'arithmétique `datetime() + duration({days:3})` passent. C'est
 l'appel qualifié `duration.between` qui n'est pas reconnu.
 
-### 3. `apoc.*` — **30 occurrences, toutes dans `path_migration.rs`**
+Recompté le 13/11/2026 par `git grep -n 'duration\.between' -- src` sur `origin/main` (f41bf545)
+et `origin/consolidation/obrain-default` : `src/neo4j/mcp_federation.rs:482`,
+`src/neo4j/note.rs:2116`, `src/neo4j/note.rs:2138` (requêtes) et `src/neo4j/client.rs:348`
+(commentaire). La première version de ce document annonçait 10 occurrences ; ce chiffre n'est
+reproductible sur aucune des deux branches, ni sur `main` du 11/11 (e978eb3c).
 
-`apoc.merge.relationship`, `apoc.refactor.mergeNodes`. Vérifié : ces appels ne vivent que dans
-un **programme de migration ponctuel**, pas dans l'application. Ce n'est donc pas un blocage de
-la bascule — c'est un blocage de **l'outil de migration**, qui devra faire ces deux gestes
-autrement.
+### 3. `apoc.*` — **utilisé par l'application, pas seulement par la migration**
+
+La première version de ce document affirmait « 30 occurrences, toutes dans `path_migration.rs`,
+pas dans l'application ». **C'est faux.** Recompté le 13/11/2026 par
+`git grep -n 'apoc\.' -- src` (identique sur `origin/main` f41bf545,
+`origin/consolidation/obrain-default` et `main` du 11/11 e978eb3c) : 31 occurrences dans
+6 fichiers, dont des requêtes du **chemin applicatif** :
+
+| Fichier:ligne | Appel | Contexte |
+|---|---|---|
+| `src/neo4j/analytics.rs:822-823` | `apoc.coll.sort` | `get_project_percentiles` |
+| `src/neo4j/note.rs:1421,1425` | `apoc.coll.toSet` | `get_pairwise_coupling` |
+| `src/neo4j/graph_schema.rs:54` | `apoc.meta.schema` | `schema_catalog` |
+| `src/neo4j/data_migrations.rs:510-545` | `apoc.coll.indexOf`, `apoc.text.join`, `apoc.do.when`, `apoc.merge.relationship` | migrations de données du registre (exécutées au démarrage) |
+| `src/neo4j/path_migration.rs:196,488,505` | `apoc.merge.relationship`, `apoc.refactor.mergeNodes` | `migrate file-paths` (outil ponctuel) |
+
+Le reste (`src/graph/schema.rs`, `path_migration.rs:883-891,1013,1248`, `data_migrations.rs:389,1088`)
+est du commentaire, un test ou la vérification de présence d'APOC.
+
+Conséquence : APOC **est** un blocage de la bascule tant que ces requêtes applicatives ne sont pas
+réécrites ou qu'obrain n'offre pas d'équivalent (`apoc.coll.sort`, `apoc.coll.toSet` et
+`apoc.meta.schema` au minimum). Le support de ces fonctions par obrain n'a **pas** été mesuré :
+**non vérifié**.
 
 ### 4. `db.index.fulltext.*` — **0 occurrence**
 
@@ -91,8 +114,10 @@ faite plus tôt en lisant un log après coup.
 ## Ce que ça change dans l'ordre des travaux
 
 1. Corriger la liaison d'alias après agrégat dans obrain (**débloque 104 requêtes d'un coup**).
-2. `duration.between` (10 occurrences, correctif de parseur).
-3. Les deux gestes APOC de `path_migration.rs`, réécrits côté outil de migration.
+2. `duration.between` (3 requêtes, correctif de parseur).
+3. APOC : les requêtes applicatives (`analytics.rs`, `note.rs`, `graph_schema.rs`, `data_migrations.rs`)
+   réécrites ou couvertes par obrain, et les deux gestes de `path_migration.rs` réécrits côté outil de
+   migration.
 4. Le reste est déjà couvert.
 
 Rien de tout cela ne demande la base vivante : tout se rejoue sur une copie.
