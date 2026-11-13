@@ -56,11 +56,11 @@ pub mod conformance {
     use project_orchestrator::ingress::{ExternalEvent, IngressOutcome};
     use project_orchestrator::neo4j::file_uid::PathPolicy;
     use project_orchestrator::neo4j::models::{
-        AlertNode, AlertSeverity, ComponentType, ComponentUpdate, DeploymentNode, DeploymentStatus,
-        DerivedComponentWrite, EnvironmentKind, EnvironmentNode, FileNode, MilestoneNode,
-        MilestoneStatus, PlanNode, PlanStatus, ProjectNode, ProjectProfile, ReleaseNode,
-        ReleaseStatus, ResourceNode, ResourceType, StepNode, StepStatus, TaskNode, TaskStatus,
-        WorkspaceMilestoneNode, WorkspaceNode,
+        AlertNode, AlertSeverity, CommitNode, ComponentType, ComponentUpdate, DeploymentNode,
+        DeploymentStatus, DerivedComponentWrite, EnvironmentKind, EnvironmentNode, FileNode,
+        MilestoneNode, MilestoneStatus, PlanNode, PlanStatus, ProjectNode, ProjectProfile,
+        ReleaseNode, ReleaseStatus, ResourceNode, ResourceType, StepNode, StepStatus, TaskNode,
+        TaskStatus, WorkspaceMilestoneNode, WorkspaceNode,
     };
     use project_orchestrator::neo4j::GraphStore;
     use project_orchestrator::notes::{
@@ -4615,10 +4615,99 @@ pub mod conformance {
         assert!(store.revoke_mcp_token(owner, &jti("b")).await.unwrap());
         assert_eq!(store.purge_mcp_tokens(owner).await.unwrap(), 1);
     }
+
+    // ------------------------------------------------------------------
+    // Commit domain: the node part of `CommitStore` (create, get, delete),
+    // the part every backend serves — so `commit_checks!` is instantiated for
+    // all three below. The relations (TOUCHES, CO_CHANGED, task links) are not
+    // checked here: obrain refuses them by name (`tests/obrain_backend.rs`).
+    // ------------------------------------------------------------------
+
+    pub fn a_commit(label: &str) -> CommitNode {
+        CommitNode {
+            hash: format!("{:040x}", Uuid::new_v4().as_u128()),
+            message: format!("conformance {label}"),
+            author: "conformance <conformance@example.invalid>".to_string(),
+            timestamp: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap()
+                + Duration::nanoseconds(987_654_321),
+        }
+    }
+
+    fn commit_fields(c: &CommitNode) -> (String, String, String, DateTime<Utc>) {
+        (
+            c.hash.clone(),
+            c.message.clone(),
+            c.author.clone(),
+            c.timestamp,
+        )
+    }
+
+    /// `create_commit` then `get_commit` gives every field back, the instant to
+    /// the nanosecond; a hash that is not there reads as `None`, not an error.
+    pub async fn check_commit_roundtrip(store: &dyn GraphStore) {
+        let c = a_commit("roundtrip");
+        store.create_commit(&c).await.unwrap();
+        let got = store.get_commit(&c.hash).await.unwrap();
+        assert_eq!(
+            got.as_ref().map(commit_fields),
+            Some(commit_fields(&c)),
+            "every field reads back, the instant to the nanosecond"
+        );
+        let absent = format!("{:040x}", Uuid::new_v4().as_u128());
+        assert!(store.get_commit(&absent).await.unwrap().is_none());
+        store.delete_commit(&c.hash).await.unwrap();
+    }
+
+    /// `create_commit` is a MERGE on `hash`: a second create with the same hash
+    /// rewrites the three values and does not make a second commit.
+    pub async fn check_commit_upsert_on_hash(store: &dyn GraphStore) {
+        let first = a_commit("upsert-first");
+        store.create_commit(&first).await.unwrap();
+        let mut second = first.clone();
+        second.message = "conformance upsert-second".to_string();
+        second.author = "someone else".to_string();
+        second.timestamp = first.timestamp + Duration::seconds(60);
+        store.create_commit(&second).await.unwrap();
+        let got = store.get_commit(&first.hash).await.unwrap().unwrap();
+        assert_eq!(commit_fields(&got), commit_fields(&second));
+        store.delete_commit(&first.hash).await.unwrap();
+        assert!(store.get_commit(&first.hash).await.unwrap().is_none());
+    }
+
+    /// A message above the blob threshold (256 bytes) is the case the full flush
+    /// exists for; it reads back whole, on creation and on update.
+    pub async fn check_commit_long_message(store: &dyn GraphStore) {
+        let mut c = a_commit("long");
+        c.message = format!("{} — fin", "x".repeat(1000));
+        store.create_commit(&c).await.unwrap();
+        let got = store.get_commit(&c.hash).await.unwrap().unwrap();
+        assert_eq!(commit_fields(&got), commit_fields(&c));
+        c.message = format!("{} — fin 2", "y".repeat(700));
+        store.create_commit(&c).await.unwrap();
+        let got = store.get_commit(&c.hash).await.unwrap().unwrap();
+        assert_eq!(commit_fields(&got), commit_fields(&c));
+        store.delete_commit(&c.hash).await.unwrap();
+    }
+
+    /// `delete_commit` is idempotent: deleting a commit that is not there is Ok.
+    pub async fn check_commit_delete_idempotent(store: &dyn GraphStore) {
+        let c = a_commit("delete");
+        store.create_commit(&c).await.unwrap();
+        store.delete_commit(&c.hash).await.unwrap();
+        assert!(store.get_commit(&c.hash).await.unwrap().is_none());
+        store.delete_commit(&c.hash).await.unwrap();
+        store
+            .delete_commit(&format!("{:040x}", Uuid::new_v4().as_u128()))
+            .await
+            .unwrap();
+    }
 }
 
-// ===============================================================// Factories: one per backend.
-// ========================================================/// Opens a store for one check. `None` means the backend is unavailable here:
+// ======================================================================
+// Factories: one per backend.
+// ======================================================================
+
+/// Opens a store for one check. `None` means the backend is unavailable here:
 /// the check is skipped (the factory decides whether that is allowed).
 #[async_trait]
 pub trait StoreFactory: Send + Sync {
@@ -6342,3 +6431,27 @@ macro_rules! note_checks {
 note_checks!(neo4j_note, Neo4jFactory);
 #[cfg(feature = "obrain-backend")]
 note_checks!(obrain_note, ObrainFactory);
+
+/// The commit domain's checks: the node part of `CommitStore`, which the three
+/// backends serve, on the same fixtures for each. The relations of a commit
+/// (TOUCHES, CO_CHANGED, the task links) are refused by name on obrain
+/// (`tests/obrain_backend.rs`, `commit_refusals_are_named`) and not checked here.
+macro_rules! commit_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [
+                check_commit_roundtrip,
+                check_commit_upsert_on_hash,
+                check_commit_long_message,
+                check_commit_delete_idempotent,
+            ]
+        );
+    };
+}
+
+commit_checks!(mock_commit, MockFactory);
+commit_checks!(neo4j_commit, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+commit_checks!(obrain_commit, ObrainFactory);

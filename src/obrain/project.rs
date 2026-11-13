@@ -717,19 +717,52 @@ fn noeuds_hors_projets_et_plans(db: &ObrainDB, projets: usize, plans: usize) -> 
     parties.join(" ; ")
 }
 
+/// A project timestamp written inside a running write ([`poser_horodatage`]),
+/// to publish once that write is durable ([`Horodatage::publier`]).
+pub(super) struct Horodatage {
+    id: Uuid,
+    entree: Entree,
+}
+
+impl Horodatage {
+    /// Publish the timestamped project to the readers. Call it AFTER the
+    /// durability step of the write that set it.
+    pub(super) fn publier(self, etat: &mut super::Etat) {
+        etat.projets.par_id.insert(self.id, self.entree);
+    }
+}
+
+/// Set `cle` to now on the project, if it exists, inside the caller's write:
+/// `commit.rs` stamps `last_co_change_computed_at` in the same write as the
+/// co-change edges, so the edges are never durable without their timestamp.
+/// `None`: no such project, nothing written.
+pub(super) fn poser_horodatage(
+    w: &Ecriture<'_>,
+    id: Uuid,
+    cle: &str,
+) -> Result<Option<Horodatage>> {
+    let Some(noeud) = w.index()?.projets.par_id.get(&id).map(|e| e.noeud) else {
+        return Ok(None);
+    };
+    w.db.set_node_property(noeud, cle, Value::from(Utc::now().to_rfc3339()));
+    let entree = w.apres_ecriture(Entree::decoder(w.db, noeud))?;
+    Ok(Some(Horodatage { id, entree }))
+}
+
 impl ObrainGraphStore {
-    /// Set `cle` to now on the project, if it exists.
-    async fn horodater(&self, id: Uuid, cle: &'static str) -> Result<()> {
+    /// Set `cle` to now on the project, if it exists, in a write of its own.
+    /// Visible to the other domains: `commit.rs` serves
+    /// `update_project_co_change_timestamp` with it.
+    pub(super) async fn horodater(&self, id: Uuid, cle: &'static str) -> Result<()> {
         self.ecrire(
             || (),
             move |(), w: &mut Ecriture<'_>| {
-                let Some(noeud) = w.index()?.projets.par_id.get(&id).map(|e| e.noeud) else {
+                let Some(horodatage) = poser_horodatage(w, id, cle)? else {
                     return Ok(());
                 };
-                w.db.set_node_property(noeud, cle, Value::from(Utc::now().to_rfc3339()));
-                let entree = w.apres_ecriture(Entree::decoder(w.db, noeud))?;
                 w.rendre_durable()?;
-                w.index_mut()?.projets.par_id.insert(id, entree);
+                let mut etat = w.index_mut()?;
+                horodatage.publier(&mut etat);
                 Ok(())
             },
         )

@@ -25,7 +25,11 @@
 //! - `(:SessionEpisode)-[:EPISODE_OF]->(:ChatSession)` — one episode per session.
 //!
 //! The `HAS_CHAT_SESSION` edge (project → session) is NOT written: it is read
-//! only by refused methods (`get_discussed_co_changers`). A named divergence.
+//! only by refused methods (`get_discussed_co_changers`). A named divergence —
+//! and one of the three entries that keep `get_discussed_co_changers` refused,
+//! with `DISCUSSED → File` and the `File` nodes the code domain would write. The
+//! `CO_CHANGED` edge it also reads has its code in the commit domain
+//! (`commit.rs`), refused by name there too until the code domain writes `File`.
 //!
 //! # Differences, all on the strict side or named
 //!
@@ -3129,7 +3133,12 @@ impl ChatStore for ObrainGraphStore {
     ) -> Result<Vec<crate::neo4j::models::CoChanger>> {
         refus(
             "ChatStore::get_discussed_co_changers",
-            "lit File et CO_CHANGED : domaines non portés",
+            "trois de ses entrées manquent : l'arête HAS_CHAT_SESSION (projet → session, non \
+             écrite ici), les liens DISCUSSED vers File (`add_discussed` est refusé : ses cibles \
+             — Function/Struct/Trait/Enum/Plan/Task/Decision — ne sont pas portées), et les nœuds \
+             File eux-mêmes, que le domaine code écrit et qui n'existe pas encore. L'arête \
+             CO_CHANGED a son code (`commit.rs`), mais elle est refusée elle aussi tant que \
+             File n'est pas écrit",
         )
     }
 

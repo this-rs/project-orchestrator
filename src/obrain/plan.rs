@@ -283,6 +283,12 @@ pub(super) struct IndexPlans {
 }
 
 impl IndexPlans {
+    /// The engine node of a plan this backend addresses (read by `commit.rs`
+    /// to link a commit to a plan, or to list a plan's commits).
+    pub(super) fn noeud_de(&self, id: Uuid) -> Option<NodeId> {
+        self.par_id.get(&id).map(|e| e.noeud)
+    }
+
     /// Rebuilds the index. Returns it with the number of drafts deleted and the
     /// nodes quarantined (named, left untouched). `projets` is read for the
     /// `HAS_PLAN` edges of a migrated base (module doc).
