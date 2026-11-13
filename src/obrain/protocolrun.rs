@@ -53,6 +53,21 @@
 //! guard is checked under the writer lock, so of eight concurrent root creations
 //! exactly one wins (Neo4j's `WHERE NOT EXISTS` reads before it locks). A deletion
 //! removes the runtime states first and the run last.
+//!
+//! A multi-property update is not atomic. `update_protocol_run` writes each of
+//! its seven properties as its own engine write; a crash in between leaves some
+//! new and some old, and opening does not repair that (each mix reads as a
+//! valid run). What it guarantees is the compare-and-swap: `version` is written
+//! FIRST, so after such a crash the base carries the NEW version, and a writer
+//! holding the old one — the interrupted caller included — loses with
+//! `OptimisticLockError`, re-reads, and rewrites the whole state.
+//!
+//! The root-run guard also covers a run it cannot read: a `ProtocolRun` node
+//! quarantined at open that may be a running root run (its `status` reads
+//! `running` or cannot be read, and its `parent_run_id` is empty, absent or
+//! unreadable) blocks the creation of a root run of its protocol, as a running
+//! one would, until the base is repaired. A quarantined node whose
+//! `protocol_id` cannot be read blocks nothing: it names no protocol.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -65,8 +80,9 @@ use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
 use super::protocol::{
-    a_un_blob, charger, creer, date_facultative, date_requise, enumeration, facultative, non_signe,
-    reecrire, requise, supprimer, uuid_facultatif, uuid_requis, Fiche, Lecteur,
+    a_un_blob, chaine, charger, creer, date_facultative, date_requise, enumeration,
+    enumeration_requise, facultative, json_attendu, non_signe, reecrire, requise, supprimer,
+    texte_attendu, uuid_facultatif, uuid_requis, Fiche, Lecteur,
 };
 use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::neo4j::protocol::ProducedArtefact;
@@ -131,11 +147,10 @@ fn lire_run(get: Lecteur) -> Result<ProtocolRun> {
     let id = uuid_requis(get, "id", "nœud ProtocolRun")?;
     let quoi = format!("run {id}");
     let quoi = quoi.as_str();
-    let visites: Vec<StateVisit> = match facultative(get, "states_visited_json") {
-        None => Vec::new(),
-        Some(brut) => serde_json::from_str(&brut)
-            .map_err(|e| anyhow!("{quoi} : `states_visited_json` illisible : {e}"))?,
-    };
+    // Fail closed: the history is written on every write, so an ABSENT one is a
+    // history lost, not an empty one (module doc of `protocol.rs`).
+    let visites: Vec<StateVisit> =
+        json_attendu(get, "states_visited_json", quoi)?.unwrap_or_default();
     Ok(ProtocolRun {
         id,
         protocol_id: uuid_requis(get, "protocol_id", quoi)?,
@@ -145,13 +160,14 @@ fn lire_run(get: Lecteur) -> Result<ProtocolRun> {
         parent_run_id: uuid_facultatif(get, "parent_run_id", quoi)?,
         current_state: uuid_requis(get, "current_state", quoi)?,
         states_visited: visites,
-        // An unknown status is an error: a failed run must never read as running.
-        status: enumeration(get, "status", quoi)?,
+        // An unknown, empty or ABSENT status is an error: a failed run must never
+        // read as running (`RunStatus::default()` is `Running`; Neo4j falls back to it).
+        status: enumeration_requise(get, "status", quoi)?,
         started_at: date_requise(get, "started_at", quoi)?,
         completed_at: date_facultative(get, "completed_at", quoi)?,
-        error: facultative(get, "error"),
-        triggered_by: super::protocol::facultative(get, "triggered_by")
-            .unwrap_or_else(|| "manual".to_string()),
+        error: texte_attendu(get, "error", quoi)?,
+        // As Neo4j: the default only for an ABSENT value; a stored "" stays "".
+        triggered_by: chaine(get, "triggered_by").unwrap_or_else(|| "manual".to_string()),
         depth: non_signe(
             get("depth").and_then(|v| v.as_int64()).unwrap_or(0),
             u32::MAX,
@@ -197,7 +213,8 @@ fn lire_runtime(get: Lecteur) -> Result<RuntimeState> {
         ),
         sub_protocol_id: uuid_facultatif(get, "sub_protocol_id", quoi)?,
         action: facultative(get, "action"),
-        status: facultative(get, "status").unwrap_or_else(|| "pending".to_string()),
+        // As Neo4j: the default only for an ABSENT value; a stored "" stays "".
+        status: chaine(get, "status").unwrap_or_else(|| "pending".to_string()),
         next_runtime_state_id: uuid_facultatif(get, "next_runtime_state_id", quoi)?,
         linking_strategy: enumeration(get, "linking_strategy", quoi)?,
     })
@@ -211,6 +228,32 @@ pub(super) type Noeuds = Vec<(Uuid, NodeId)>;
 pub(super) struct IndexRuns {
     runs: HashMap<Uuid, Fiche<ProtocolRun>>,
     etats: HashMap<Uuid, Fiche<RuntimeState>>,
+    /// Protocols with a run node quarantined at open that may be a RUNNING ROOT
+    /// run: the root-run guard refuses for them as for a running one (module doc).
+    racines_en_quarantaine: HashSet<Uuid>,
+}
+
+/// From the raw properties of a run node that does not decode: the protocol it
+/// names, if it may be a running root run (fail closed: what cannot be read
+/// counts as running, and as root).
+fn racine_en_cours_possible(get: Lecteur) -> Option<Uuid> {
+    let protocole: Uuid = chaine(get, "protocol_id")?.parse().ok()?;
+    let en_cours = match chaine(get, "status") {
+        Some(s) => match s.parse::<RunStatus>() {
+            Ok(statut) => statut == RunStatus::Running,
+            Err(_) => true,
+        },
+        None => true,
+    };
+    let racine = match get("parent_run_id") {
+        None => true,
+        Some(v) => match v.as_str() {
+            Some("") => true,
+            Some(t) => t.parse::<Uuid>().is_err(),
+            None => true,
+        },
+    };
+    (en_cours && racine).then_some(protocole)
 }
 
 impl IndexRuns {
@@ -222,7 +265,17 @@ impl IndexRuns {
         rapport: &mut RapportOuverture,
     ) -> Self {
         let mut index = Self::default();
-        for f in charger(db, RUN, rapport, &lire_run) {
+        let bloques = std::cell::RefCell::new(HashSet::new());
+        let lire_ou_bloquer = |get: Lecteur| {
+            lire_run(get).inspect_err(|_| {
+                if let Some(p) = racine_en_cours_possible(get) {
+                    bloques.borrow_mut().insert(p);
+                }
+            })
+        };
+        let fiches = charger(db, RUN, rapport, &lire_ou_bloquer);
+        index.racines_en_quarantaine = bloques.into_inner();
+        for f in fiches {
             if !protocoles.protocoles.contains_key(&f.valeur.protocol_id) {
                 rapport.en_quarantaine.push(format!(
                     "nœud {RUN} {:?} : le protocole {} n'existe pas",
@@ -230,10 +283,16 @@ impl IndexRuns {
                 ));
             } else {
                 match index.runs.entry(f.valeur.id) {
-                    Entry::Occupied(_) => rapport.en_quarantaine.push(format!(
-                        "nœud {RUN} {:?} : id {} déjà pris",
-                        f.noeud, f.valeur.id
-                    )),
+                    Entry::Occupied(_) => {
+                        if f.valeur.status == RunStatus::Running && f.valeur.parent_run_id.is_none()
+                        {
+                            index.racines_en_quarantaine.insert(f.valeur.protocol_id);
+                        }
+                        rapport.en_quarantaine.push(format!(
+                            "nœud {RUN} {:?} : id {} déjà pris",
+                            f.noeud, f.valeur.id
+                        ))
+                    }
                     Entry::Vacant(v) => {
                         v.insert(f);
                     }
@@ -357,6 +416,17 @@ impl ProtocolRunStore for ObrainGraphStore {
                             r.protocol_id
                         );
                     }
+                    if r.parent_run_id.is_none()
+                        && etat.runs.racines_en_quarantaine.contains(&r.protocol_id)
+                    {
+                        bail!(
+                            "Skipped: concurrent run already running for protocol {} — a run \
+                             node of this protocol was quarantined at open and may be a running \
+                             root run (see the opening report); no root run is created until \
+                             the base is repaired",
+                            r.protocol_id
+                        );
+                    }
                 }
                 let fiche = creer(w, RUN, proprietes, &lire_run)?;
                 w.index_mut()?.runs.runs.insert(r.id, fiche);
@@ -401,7 +471,7 @@ impl ProtocolRunStore for ObrainGraphStore {
                     ecrit.version = nouvelle;
                     // Only what Neo4j's update sets: the links, `started_at`,
                     // `depth` and `triggered_by` are the run's identity.
-                    let maj = proprietes_run(&ecrit)?
+                    let mut maj: Vec<(&'static str, Value)> = proprietes_run(&ecrit)?
                         .into_iter()
                         .filter(|(k, _)| {
                             matches!(
@@ -416,6 +486,12 @@ impl ProtocolRunStore for ObrainGraphStore {
                             )
                         })
                         .collect();
+                    // `version` FIRST (module doc, « Atomicity »): a crash after it
+                    // leaves the new version on data old or new, so a writer holding
+                    // the old version loses its compare-and-swap. Written last, it
+                    // would leave the old version on new data, and that stale
+                    // writer would win.
+                    maj.sort_by_key(|(k, _)| *k != "version");
                     let fiche = reecrire(w, noeud, maj, ancien_en_blob, &lire_run)?;
                     w.index_mut()?.runs.runs.insert(r.id, fiche);
                     Ok(nouvelle)
@@ -933,7 +1009,207 @@ mod tests {
             .create_produced_during("note", Uuid::new_v4(), r.id)
             .await
             .unwrap_err();
-        assert!(e.downcast_ref::<NonPorte>().is_some());
-        assert!(store.get_run_reasoning_tree_id(r.id).await.is_err());
+        assert_eq!(
+            e.downcast_ref::<NonPorte>(),
+            Some(&NonPorte("ProtocolRunStore::create_produced_during"))
+        );
+        let e = store.get_run_reasoning_tree_id(r.id).await.unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<NonPorte>(),
+            Some(&NonPorte("ProtocolRunStore::get_run_reasoning_tree_id"))
+        );
+        let arbre = crate::reasoning::ReasoningTree::new("pourquoi", None);
+        let e = store
+            .persist_reasoning_tree(&arbre, Some("protocol_run"), Some(r.id))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<NonPorte>(),
+            Some(&NonPorte("ProtocolRunStore::persist_reasoning_tree"))
+        );
+    }
+
+    /// `update_protocol_run` crashed after its k-th engine write: the version was
+    /// written FIRST, so the base carries the new one and a writer holding the old
+    /// version loses its compare-and-swap after the reopen.
+    #[tokio::test]
+    async fn la_version_est_ecrite_d_abord_et_un_ecrivain_perime_perd_apres_un_crash() {
+        use crate::obrain::Interruption;
+        let dir = tempfile::tempdir().unwrap();
+        let mut atteints = 0;
+        for k in 1..=8 {
+            let chemin = dir.path().join(format!("base-{k}"));
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            let (p, _) = protocole(&store).await;
+            let r = run(&p, None, 0);
+            store.create_protocol_run(&r).await.unwrap();
+            let mut maj = r.clone();
+            maj.status = RunStatus::Failed;
+            maj.current_state = Uuid::new_v4();
+            maj.error = Some("boom".to_string());
+            store.interrompre_au_prochain(Interruption::ApresEtape(k));
+            let issue = store.update_protocol_run(&mut maj).await;
+            store.close().await.unwrap();
+            drop(store);
+            if issue.is_ok() {
+                break;
+            }
+            atteints += 1;
+            let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+            assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
+            let relu = store.get_protocol_run(r.id).await.unwrap().unwrap();
+            let mut perime = r.clone();
+            perime.status = RunStatus::Cancelled;
+            let resultat = store.update_protocol_run(&mut perime).await;
+            if k == 1 {
+                // Nothing written: version 0 is the current one, not a stale one.
+                assert_eq!(relu.version, 0);
+                resultat.unwrap();
+            } else {
+                assert_eq!(relu.version, 1, "k={k}: the version is written first");
+                let e = resultat.unwrap_err();
+                assert!(e.to_string().contains("OptimisticLockError"), "k={k}: {e}");
+            }
+            store.close().await.unwrap();
+        }
+        // The seven properties of the update.
+        assert_eq!(atteints, 7);
+    }
+
+    /// A run node quarantined at open that may be a running root run blocks the
+    /// creation of a root run of its protocol; another protocol is not blocked.
+    #[tokio::test]
+    async fn un_run_racine_en_cours_en_quarantaine_bloque_la_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let p;
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            p = protocole(&store).await.0;
+            // Running, root, and unreadable (no `current_state`): quarantined.
+            store.interne.db.create_node_with_props(
+                &[RUN],
+                vec![
+                    ("id", Value::from(Uuid::new_v4().to_string())),
+                    ("protocol_id", Value::from(p.id.to_string())),
+                    ("status", Value::from("running")),
+                    ("parent_run_id", Value::from("")),
+                ],
+            );
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+        let racine = run(&p, None, 0);
+        let e = store.create_protocol_run(&racine).await.unwrap_err();
+        assert!(e.to_string().contains("quarantined"), "{e}");
+        assert!(store.get_protocol_run(racine.id).await.unwrap().is_none());
+        let (autre, _) = protocole(&store).await;
+        store
+            .create_protocol_run(&run(&autre, None, 0))
+            .await
+            .unwrap();
+    }
+
+    /// A stored "" stays "": the default ("manual", "pending") is for an ABSENT
+    /// value only, as in Neo4j.
+    #[tokio::test]
+    async fn une_chaine_vide_n_est_pas_remplacee_par_le_defaut() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let (p, generateur) = protocole(&store).await;
+        let mut r = run(&p, None, 0);
+        r.triggered_by = String::new();
+        store.create_protocol_run(&r).await.unwrap();
+        assert_eq!(
+            store
+                .get_protocol_run(r.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .triggered_by,
+            ""
+        );
+        let mut s = RuntimeState::new(r.id, generateur.id, "s", 0);
+        s.status = String::new();
+        store.create_runtime_state(&s).await.unwrap();
+        assert_eq!(store.get_runtime_states(r.id).await.unwrap()[0].status, "");
+    }
+
+    /// Fail closed: a key written on every write and found ABSENT (a value lost) is
+    /// an error at open — the node is quarantined, never read with a default.
+    #[tokio::test]
+    async fn une_cle_attendue_absente_met_le_noeud_en_quarantaine() {
+        use crate::protocol::ProtocolTransition;
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let (sans_historique, sans_statut, sans_garde, sans_terminaux);
+        let mut transitions = Vec::new();
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            let noeud_run = |id: Uuid| store.interne.etat.read().unwrap().runs.runs[&id].noeud;
+            let (p1, _) = protocole(&store).await;
+            let r1 = run(&p1, None, 0);
+            store.create_protocol_run(&r1).await.unwrap();
+            store
+                .interne
+                .db
+                .remove_node_property(noeud_run(r1.id), "states_visited_json");
+            sans_historique = r1.id;
+
+            let (p2, _) = protocole(&store).await;
+            let r2 = run(&p2, None, 0);
+            store.create_protocol_run(&r2).await.unwrap();
+            store
+                .interne
+                .db
+                .remove_node_property(noeud_run(r2.id), "status");
+            sans_statut = r2.id;
+
+            let (p3, e3) = protocole(&store).await;
+            for cle in ["guard_expr", "guard"] {
+                let t = ProtocolTransition::new(p3.id, e3.id, e3.id, cle);
+                store.upsert_protocol_transition(&t).await.unwrap();
+                let n = store.interne.etat.read().unwrap().protocoles.transitions[&t.id].noeud;
+                store.interne.db.remove_node_property(n, cle);
+                transitions.push(t.id);
+            }
+            sans_garde = p3.id;
+
+            let (p4, _) = protocole(&store).await;
+            let n = store.interne.etat.read().unwrap().protocoles.protocoles[&p4.id].noeud;
+            store
+                .interne
+                .db
+                .remove_node_property(n, "terminal_states_json");
+            sans_terminaux = p4.id;
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        let rapport = store.rapport_d_ouverture().en_quarantaine.join("\n");
+        for cle in [
+            "states_visited_json",
+            "status",
+            "guard_expr",
+            "guard",
+            "terminal_states_json",
+        ] {
+            assert!(
+                rapport.contains(&format!("propriété `{cle}` absente")),
+                "{cle}: {rapport}"
+            );
+        }
+        assert!(store
+            .get_protocol_run(sans_historique)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.get_protocol_run(sans_statut).await.unwrap().is_none());
+        assert!(store
+            .get_protocol_transitions(sans_garde)
+            .await
+            .unwrap()
+            .iter()
+            .all(|t| !transitions.contains(&t.id)));
+        assert!(store.get_protocol(sans_terminaux).await.unwrap().is_none());
     }
 }

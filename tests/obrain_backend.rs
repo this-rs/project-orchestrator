@@ -1725,6 +1725,14 @@ mod with_the_feature {
         let mut run = ProtocolRun::new(protocol.id, start.id, "start");
         run.project_id = Some(project.id);
         store.create_protocol_run(&run).await.unwrap();
+        // A second root run is refused while the first one runs, and nothing is written.
+        let second = ProtocolRun::new(protocol.id, start.id, "start");
+        let refus = store.create_protocol_run(&second).await.unwrap_err();
+        assert!(
+            refus.to_string().contains("Skipped: concurrent run"),
+            "{refus:#}"
+        );
+        assert!(store.get_protocol_run(second.id).await.unwrap().is_none());
         let visit = |state: &ProtocolState, trigger: &str| StateVisit {
             state_id: state.id,
             state_name: state.name.clone(),
@@ -1745,7 +1753,7 @@ mod with_the_feature {
         run.completed_at = Some(Utc::now());
         store.update_protocol_run(&mut run).await.unwrap();
         assert_eq!(run.version, 2);
-        // A second root run is refused while one runs; none runs now.
+        // None runs now.
         assert!(store
             .find_active_run_for_project(project.id)
             .await
@@ -1864,6 +1872,17 @@ mod with_the_feature {
             not_ported(store.get_run_reasoning_tree_id(id).await),
             NonPorte("ProtocolRunStore::get_run_reasoning_tree_id")
         );
+        let tree = project_orchestrator::reasoning::ReasoningTree::new("why", None);
+        assert_eq!(
+            not_ported(
+                store
+                    .persist_reasoning_tree(&tree, Some("protocol_run"), Some(id))
+                    .await
+            ),
+            NonPorte("ProtocolRunStore::persist_reasoning_tree")
+        );
+        // The four, and only them.
+        assert_eq!(refusees_protocolrun().len(), 4);
         assert!(refusees_protocolrun()
             .iter()
             .all(|m| m.starts_with("ProtocolRunStore::")));

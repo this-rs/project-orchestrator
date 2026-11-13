@@ -5,8 +5,9 @@
 //! methods of the trait — `upsert_protocol`, `get_protocol`, `list_protocols`,
 //! `get_protocol_by_name_and_project`, `delete_protocol`, and the upsert, read
 //! and delete of states and transitions. Nothing of this trait is refused: the
-//! cascade of `delete_protocol` reaches only runs and runtime states, which the
-//! sister domain ports.
+//! cascade of `delete_protocol` reaches the protocol's states and transitions,
+//! its runs and their runtime states — all ported, here and in the sister
+//! domain (`protocolrun.rs`).
 //!
 //! # Layout
 //!
@@ -29,7 +30,24 @@
 //! - A stored JSON value or enum that does not parse is an error at open
 //!   (the node is quarantined, named, untouched), where Neo4j drops it to its
 //!   default: a guard, a status, a terminal-state list never turns silently into
-//!   "none". A missing value reads as the default, as in Neo4j.
+//!   "none".
+//! - Fail closed on a MISSING value too: the keys below are written on every
+//!   write (the empty string for "none"), so a key that is ABSENT is a value
+//!   lost, not a value never set. It is an error at open (quarantine), where
+//!   Neo4j reads it as "none" or empty: `terminal_states_json`,
+//!   `trigger_config_json`, `relevance_vector_json` (protocol);
+//!   `generator_config_json`, `available_tools_json`, `forbidden_actions_json`,
+//!   `prompt_fragment` (state); `guard`, `guard_expr` (transition); and, in
+//!   `protocolrun.rs`, `states_visited_json`, `error` and `status` of a run. A
+//!   base whose nodes predate one of these keys (never re-written since) is
+//!   quarantined at open rather than read with a default: the report names
+//!   each node. The other missing values read as the default, as in Neo4j.
+//! - `delete_protocol` finds the protocol's states, transitions and runs by
+//!   their `protocol_id` PROPERTY; Neo4j finds them by EDGE (`HAS_STATE`,
+//!   `HAS_TRANSITION`, `INSTANCE_OF`). On a base this backend wrote the two are
+//!   the same set. On a migrated base where they disagree (a node whose edge
+//!   points to another protocol than its property), the property decides here,
+//!   the edge in Neo4j.
 //! - `delete_protocol` also deletes the runtime states of the runs it deletes:
 //!   Neo4j leaves them orphaned (`DETACH DELETE s, t, r, proto` does not reach
 //!   `RuntimeState`).
@@ -92,8 +110,42 @@ pub(super) fn a_un_blob(proprietes: &[(&'static str, Value)]) -> bool {
     proprietes.iter().any(|(_, v)| va_en_colonne_blob(v))
 }
 
-fn chaine(get: Lecteur, cle: &str) -> Option<String> {
+/// A string property as stored, the empty string included (absent: `None`).
+pub(super) fn chaine(get: Lecteur, cle: &str) -> Option<String> {
     get(cle).and_then(|v| v.as_str().map(str::to_string))
+}
+
+/// A string property written on EVERY write (the empty string for "none"):
+/// absent, or not a string, is a value lost — an error, never `None` (fail
+/// closed, see the module doc). The empty string is `None`.
+pub(super) fn texte_attendu(get: Lecteur, cle: &str, quoi: &str) -> Result<Option<String>> {
+    match get(cle) {
+        None => bail!(
+            "{quoi} : propriété `{cle}` absente, alors qu'elle est écrite à chaque écriture \
+             (la chaîne vide pour « aucune ») : valeur perdue, le nœud n'est pas lu avec un \
+             défaut"
+        ),
+        Some(v) => match v.as_str() {
+            None => bail!("{quoi} : `{cle}` n'est pas une chaîne ({v:?})"),
+            Some("") => Ok(None),
+            Some(s) => Ok(Some(s.to_string())),
+        },
+    }
+}
+
+/// A JSON property written on every write: absent is an error (see
+/// [`texte_attendu`]), empty is `None`, a value that does not parse is an error.
+pub(super) fn json_attendu<T: DeserializeOwned>(
+    get: Lecteur,
+    cle: &str,
+    quoi: &str,
+) -> Result<Option<T>> {
+    texte_attendu(get, cle, quoi)?
+        .map(|brut| {
+            serde_json::from_str(&brut)
+                .map_err(|e| anyhow!("{quoi} : `{cle}` n'est pas du JSON valide : {e}"))
+        })
+        .transpose()
 }
 
 /// A required string property.
@@ -140,21 +192,6 @@ pub(super) fn date_facultative(
         .transpose()
 }
 
-/// A JSON property: absent or empty is `None`, a value that does not parse is an
-/// error (never a silent `None`).
-pub(super) fn json_facultatif<T: DeserializeOwned>(
-    get: Lecteur,
-    cle: &str,
-    quoi: &str,
-) -> Result<Option<T>> {
-    facultative(get, cle)
-        .map(|brut| {
-            serde_json::from_str(&brut)
-                .map_err(|e| anyhow!("{quoi} : `{cle}` n'est pas du JSON valide : {e}"))
-        })
-        .transpose()
-}
-
 /// An enum property: absent or empty reads as the default; an unknown spelling is
 /// an error.
 pub(super) fn enumeration<T: FromStr + Default>(get: Lecteur, cle: &str, quoi: &str) -> Result<T>
@@ -167,6 +204,18 @@ where
             .parse()
             .map_err(|e| anyhow!("{quoi} : `{cle}` illisible (« {brut} ») : {e}")),
     }
+}
+
+/// An enum property written on every write, never empty: absent or empty is an
+/// error (fail closed), as is an unknown spelling.
+pub(super) fn enumeration_requise<T: FromStr>(get: Lecteur, cle: &str, quoi: &str) -> Result<T>
+where
+    T::Err: std::fmt::Display,
+{
+    let brut = texte_attendu(get, cle, quoi)?
+        .ok_or_else(|| anyhow!("{quoi} : `{cle}` vide, alors qu'elle n'est jamais écrite vide"))?;
+    brut.parse()
+        .map_err(|e| anyhow!("{quoi} : `{cle}` illisible (« {brut} ») : {e}"))
 }
 
 /// An optional enum property: absent or empty is `None`.
@@ -383,11 +432,11 @@ fn lire_protocole(get: Lecteur) -> Result<Protocol> {
         project_id: uuid_facultatif(get, "project_id", quoi)?,
         skill_id: uuid_facultatif(get, "skill_id", quoi)?,
         entry_state: uuid_requis(get, "entry_state", quoi)?,
-        terminal_states: json_facultatif(get, "terminal_states_json", quoi)?.unwrap_or_default(),
+        terminal_states: json_attendu(get, "terminal_states_json", quoi)?.unwrap_or_default(),
         protocol_category: enumeration(get, "protocol_category", quoi)?,
         trigger_mode: enumeration(get, "trigger_mode", quoi)?,
-        trigger_config: json_facultatif(get, "trigger_config_json", quoi)?,
-        relevance_vector: json_facultatif(get, "relevance_vector_json", quoi)?,
+        trigger_config: json_attendu(get, "trigger_config_json", quoi)?,
+        relevance_vector: json_attendu(get, "relevance_vector_json", quoi)?,
         last_triggered_at: date_facultative(get, "last_triggered_at", quoi)?,
         created_at: date_requise(get, "created_at", quoi)?,
         updated_at: date_requise(get, "updated_at", quoi)?,
@@ -459,10 +508,10 @@ fn lire_etat(get: Lecteur) -> Result<ProtocolState> {
         sub_protocol_id: uuid_facultatif(get, "sub_protocol_id", quoi)?,
         completion_strategy: enumeration_facultative(get, "completion_strategy", quoi)?,
         on_failure_strategy: enumeration_facultative(get, "on_failure_strategy", quoi)?,
-        generator_config: json_facultatif(get, "generator_config_json", quoi)?,
-        prompt_fragment: facultative(get, "prompt_fragment"),
-        available_tools: json_facultatif(get, "available_tools_json", quoi)?,
-        forbidden_actions: json_facultatif(get, "forbidden_actions_json", quoi)?,
+        generator_config: json_attendu(get, "generator_config_json", quoi)?,
+        prompt_fragment: texte_attendu(get, "prompt_fragment", quoi)?,
+        available_tools: json_attendu(get, "available_tools_json", quoi)?,
+        forbidden_actions: json_attendu(get, "forbidden_actions_json", quoi)?,
         state_timeout_secs: get("state_timeout_secs")
             .and_then(|v| v.as_int64())
             .and_then(timeout_lu),
@@ -491,10 +540,10 @@ fn lire_transition(get: Lecteur) -> Result<ProtocolTransition> {
         from_state: uuid_requis(get, "from_state", quoi)?,
         to_state: uuid_requis(get, "to_state", quoi)?,
         trigger: requise(get, "trigger", quoi)?,
-        guard: facultative(get, "guard"),
-        // Fail closed, as in Neo4j: a stored guard that no longer parses is an
+        // Fail closed: a guard lost (absent) or that no longer parses is an
         // error, never a dropped guard (that would open a guarded transition).
-        guard_expr: json_facultatif(get, "guard_expr", quoi)?,
+        guard: texte_attendu(get, "guard", quoi)?,
+        guard_expr: json_attendu(get, "guard_expr", quoi)?,
     })
 }
 
