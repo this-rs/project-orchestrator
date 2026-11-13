@@ -165,6 +165,16 @@ pub(super) struct IndexProjets {
 }
 
 impl IndexProjets {
+    /// Does a project with this id exist? (For the plan domain: no project internals leak.)
+    pub(super) fn contient(&self, id: Uuid) -> bool {
+        self.par_id.contains_key(&id)
+    }
+
+    /// How many projects this backend addresses.
+    pub(super) fn nombre(&self) -> usize {
+        self.par_id.len()
+    }
+
     #[cfg(any(test, feature = "mock-store"))]
     pub(super) fn noeud_de(&self, id: Uuid) -> Option<NodeId> {
         self.par_id.get(&id).map(|e| e.noeud)
@@ -534,28 +544,50 @@ impl ProjectStore for ObrainGraphStore {
         self.ecrire(
             || (),
             move |(), w: &mut Ecriture<'_>| {
-                let (noeud, slug, projets) = {
+                let (noeud, slug, projets, plans, rattaches) = {
                     let etat = w.index()?;
                     let Some(e) = etat.projets.par_id.get(&id) else {
                         return Ok(());
                     };
-                    (e.noeud, e.projet.slug.clone(), etat.projets.par_id.len())
+                    // Plans of THIS project: the cascade would reach them (tasks too).
+                    let rattaches = etat
+                        .plans
+                        .par_id
+                        .values()
+                        .filter(|p| p.plan.project_id == Some(id))
+                        .count();
+                    (
+                        e.noeud,
+                        e.projet.slug.clone(),
+                        etat.projets.par_id.len(),
+                        etat.plans.par_id.len(),
+                        rattaches,
+                    )
                 };
-                // One counter, no scan: every live node of the base against the
-                // projects this backend addresses. `project_name` only tags the notes
-                // and decisions the cascade archives: part of what is refused.
-                let noeuds = w.db.store().node_count();
-                if noeuds != projets {
+                if rattaches > 0 {
                     return Err(anyhow::Error::new(NonPorte(
                         "ProjectStore::delete_project (cascade)",
                     ))
                     .context(format!(
-                        "la base contient {} nœud(s) hors des {projets} projet(s) que ce \
-                         backend adresse : des données écrites hors de lui (plans, tâches, \
-                         notes, fichiers, graphes de fonctionnalités, commits…) que la \
+                        "{rattaches} plan(s) rattaché(s) à ce projet : leur suppression en cascade \
+                         (tâches, étapes, contraintes) attend le portage du domaine Plan"
+                    )));
+                }
+                // One counter, no scan: every live node of the base against the
+                // projects this backend addresses. `project_name` only tags the notes
+                // and decisions the cascade archives: part of what is refused.
+                let noeuds = w.db.store().node_count();
+                if noeuds != projets + plans {
+                    return Err(anyhow::Error::new(NonPorte(
+                        "ProjectStore::delete_project (cascade)",
+                    ))
+                    .context(format!(
+                        "la base contient {} nœud(s) hors des {projets} projet(s) et {plans} \
+                         plan(s) que ce backend adresse : des données écrites hors de lui \
+                         (tâches, notes, fichiers, graphes de fonctionnalités, commits…) que la \
                          suppression en cascade devrait atteindre, par relation ou par \
                          `project_id`. Elle attend le portage des domaines concernés",
-                        noeuds.saturating_sub(projets)
+                        noeuds.saturating_sub(projets + plans)
                     )));
                 }
                 if !w.db.delete_node(noeud) {

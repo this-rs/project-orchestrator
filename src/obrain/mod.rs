@@ -10,7 +10,8 @@
 //! its trait (an omitted method would silently inherit the contract's default).
 //!
 //! Ported so far: [`ProjectStore`](crate::neo4j::traits::ProjectStore)
-//! (`project.rs`).
+//! (`project.rs`), and the core of [`PlanStore`](crate::neo4j::traits::PlanStore)
+//! (`plan.rs`: no tasks, steps, constraints or day plan yet).
 //!
 //! # How obrain is used
 //!
@@ -60,6 +61,7 @@
 
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
+mod plan;
 mod project;
 
 #[cfg(any(test, feature = "mock-store"))]
@@ -212,6 +214,7 @@ struct Interne {
 #[derive(Default)]
 struct Etat {
     projets: project::IndexProjets,
+    plans: plan::IndexPlans,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -444,7 +447,12 @@ impl ObrainGraphStore {
             })?;
         }
         let (etat, rapport) = project::IndexProjets::reconstruire(&db)
-            .map(|(projets, rapport)| (Etat { projets }, rapport))
+            .and_then(|(projets, mut rapport)| {
+                let (plans, brouillons, quarantaine) = plan::IndexPlans::reconstruire(&db)?;
+                rapport.brouillons_supprimes += brouillons;
+                rapport.en_quarantaine.extend(quarantaine);
+                Ok((Etat { projets, plans }, rapport))
+            })
             .with_context(|| {
                 format!(
                     "reconstruction des index de la base obrain {}",
