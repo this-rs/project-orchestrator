@@ -212,8 +212,8 @@ mod with_the_feature {
         // …and the rest of the storage refuses by name, graph, search and
         // trajectories alike.
         assert_eq!(
-            not_ported(backend.graph.list_workspaces().await),
-            NonPorte("WorkspaceStore::list_workspaces")
+            not_ported(backend.graph.compute_coupling_matrix(Uuid::new_v4()).await),
+            NonPorte("WorkspaceStore::compute_coupling_matrix")
         );
         assert_eq!(
             not_ported(backend.search.delete_code("x").await),
@@ -809,7 +809,9 @@ mod with_the_feature {
             let store = open(&dir.join("base")).await;
             let p = a_project("held by the child");
             store.create_project(&p).await.unwrap();
-            std::fs::write(dir.join("pret"), p.id.to_string()).unwrap();
+            // Written whole, then renamed: the parent reads the marker as soon as it exists.
+            std::fs::write(dir.join("pret.tmp"), p.id.to_string()).unwrap();
+            std::fs::rename(dir.join("pret.tmp"), dir.join("pret")).unwrap();
             loop {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
@@ -1434,8 +1436,8 @@ mod with_the_feature {
         let id = Uuid::new_v4();
 
         assert_eq!(
-            not_ported(store.get_workspace(id).await),
-            NonPorte("WorkspaceStore::get_workspace")
+            not_ported(store.get_workspace_milestone_progress(id).await),
+            NonPorte("WorkspaceStore::get_workspace_milestone_progress")
         );
         assert_eq!(
             not_ported(store.get_plan_tasks(id).await),
@@ -1471,10 +1473,14 @@ mod with_the_feature {
         );
 
         // The message is the stated one.
-        let msg = store.list_workspaces().await.unwrap_err().to_string();
+        let msg = store
+            .get_workspace_milestone_progress(Uuid::new_v4())
+            .await
+            .unwrap_err()
+            .to_string();
         assert_eq!(
             msg,
-            "non porté sur le backend obrain : WorkspaceStore::list_workspaces"
+            "non porté sur le backend obrain : WorkspaceStore::get_workspace_milestone_progress"
         );
     }
 
@@ -1515,20 +1521,29 @@ mod with_the_feature {
             in_contracts
         );
 
-        // This lot: ProjectStore's nine methods, plus the two of GraphStore.
+        // The ported domains: ProjectStore (nine methods), WorkspaceStore (45, of which
+        // ten are refused by name), and the two of GraphStore.
         let domains: std::collections::BTreeSet<&str> = written
             .iter()
             .map(|m| m.split("::").next().unwrap())
             .collect();
         assert_eq!(
             domains.into_iter().collect::<Vec<_>>(),
-            ["GraphStore", "ProjectStore"]
+            ["GraphStore", "ProjectStore", "WorkspaceStore"]
         );
+        // ProjectStore's nine methods and WorkspaceStore's 35 that serve (its 10
+        // refusals are written by hand and listed as such).
         let servent = methodes_qui_servent();
-        assert_eq!(servent.len(), 9, "{servent:?}");
-        assert!(servent.iter().all(|m| m.starts_with("ProjectStore::")));
+        assert_eq!(servent.len(), 44, "{servent:?}");
+        assert!(servent
+            .iter()
+            .all(|m| m.starts_with("ProjectStore::") || m.starts_with("WorkspaceStore::")));
         // The written refusals are written, and are not counted as serving.
-        assert_eq!(REFUS_ECRITS_A_LA_MAIN, ["GraphStore::get_progress_batch"]);
+        assert_eq!(
+            REFUS_ECRITS_A_LA_MAIN.len(),
+            11,
+            "{REFUS_ECRITS_A_LA_MAIN:?}"
+        );
         assert!(REFUS_ECRITS_A_LA_MAIN.iter().all(|m| written.contains(m)));
         // What keeps a default is known and justified where it is declared.
         assert_eq!(kept, ["AnalyticsStore::run_data_migrations"]);
