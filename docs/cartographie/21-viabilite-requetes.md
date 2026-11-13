@@ -4,7 +4,8 @@ Mesuré le 11/11/2026 sur l'archive `~/.obrain/db/po` (**1 227 051 nœuds, 1 889
 schéma réel de PO : `ChatEvent`, `Function`, `Import`, `Note`, `Task`, `Decision`…), en
 **lecture seule** (`obrain query --read-only`). Aucune écriture, aucune base vivante touchée.
 
-Cette archive date de juillet (1,35 M nœuds contre 3,85 M aujourd'hui) : elle ne sert pas de
+Cette archive date de juillet (**non vérifié** : plusieurs de ses fichiers portent une date de
+modification du 11/11/2026 17:24, postérieure à la mesure ; 1,23 M nœuds contre 3,85 M aujourd'hui) : elle ne sert pas de
 cible de migration, mais elle a **la forme** du graphe de PO, ce qui suffit à trancher la
 question « telle requête passe-t-elle ? ».
 
@@ -46,14 +47,20 @@ Deux formes voisines, elles, marchent : `RETURN <expr> AS p, count(*) AS c`, et
 C'est donc une règle précise, pas un manque général : **quand `WITH` mêle une expression de
 groupement et un agrégat, les alias de groupement ne sont pas exposés.**
 
-Dépendance mesurée dans `backend/src` :
+Dépendance mesurée dans `backend/src`, **en lignes** et non en requêtes (recompté le 13/11/2026,
+identique sur `origin/main` f41bf545 et `origin/consolidation/obrain-default`) :
 
-| Forme | Requêtes |
-|---|---|
-| `WITH … collect(` | **85** |
-| `WITH … count(*)` | **3** |
-| `WITH … sum/avg/min/max` | **16** |
-| **Total** | **104** |
+| Forme | Commande | Lignes |
+|---|---|---|
+| `WITH … collect(` | `git grep -E 'WITH .*collect\(' -- src` | **85** |
+| `WITH … count(*)` | `git grep -E 'WITH .*count\(\*\)' -- src` | **3** |
+| `WITH … sum/avg/min/max` | `git grep -E 'WITH .*(sum\|avg\|min\|max)\(' -- src` | **16** |
+| **Total** | | **104** |
+
+**Ce total est une borne grossière, pas un compte de requêtes touchées (non vérifié requête par
+requête).** Le grep ligne à ligne compte aussi des `WITH collect(x)` **sans** clé de groupe (qui
+passent, voir plus haut), manque les `WITH` dont l'agrégat est sur une autre ligne, et ignore
+`count(n)` / `count(DISTINCT …)` (`git grep -E 'WITH .*count\(' -- src` : 62 lignes).
 
 Conséquence : ce n'est **pas** 104 requêtes à réécrire. Réécrire `WITH` en `RETURN` n'est pas
 toujours possible (le `WITH` sert justement à poursuivre le pipeline). C'est un **défaut de
@@ -113,7 +120,7 @@ faite plus tôt en lisant un log après coup.
 
 ## Ce que ça change dans l'ordre des travaux
 
-1. Corriger la liaison d'alias après agrégat dans obrain (**débloque 104 requêtes d'un coup**).
+1. Corriger la liaison d'alias après agrégat dans obrain (débloque l'essentiel des ~104 lignes relevées ci-dessus ; nombre exact de requêtes **non vérifié**).
 2. `duration.between` (3 requêtes, correctif de parseur).
 3. APOC : les requêtes applicatives (`analytics.rs`, `note.rs`, `graph_schema.rs`, `data_migrations.rs`)
    réécrites ou couvertes par obrain, et les deux gestes de `path_migration.rs` réécrits côté outil de
