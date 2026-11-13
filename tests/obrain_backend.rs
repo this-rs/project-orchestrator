@@ -2466,9 +2466,9 @@ mod with_the_feature {
     }
 
     /// Two readable Decision nodes with the same id: the second is quarantined and the
-    /// id stays reserved, even once the first is deleted.
+    /// id is reserved — a write on it is refused, named, and a creation too.
     #[tokio::test]
-    async fn a_duplicate_decision_id_stays_reserved_after_the_first_is_deleted() {
+    async fn a_duplicate_decision_id_is_reserved_and_its_writes_refused() {
         use project_orchestrator::neo4j::traits::DecisionStore;
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
@@ -2494,11 +2494,188 @@ mod with_the_feature {
         let store = open(&base).await;
         assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
         assert!(store.get_decision(id).await.unwrap().is_some());
-        store.delete_decision(id).await.unwrap();
-        assert!(store.get_decision(id).await.unwrap().is_none());
+        let err = store.delete_decision(id).await.unwrap_err();
+        assert!(format!("{err:#}").contains("refusé"), "{err:#}");
+        assert!(store.get_decision(id).await.unwrap().is_some());
         let err = store.create_decision_global(&d, None).await.unwrap_err();
-        assert!(format!("{err:#}").contains("réservé"), "{err:#}");
-        assert!(store.get_decision(id).await.unwrap().is_none());
+        assert!(format!("{err:#}").contains("existe déjà"), "{err:#}");
+        let avant = store.noeuds_pour_mesure();
+        assert_eq!(avant, 2, "both nodes are still on disk");
+    }
+
+    /// A decision quarantined at open (unreadable: no `description`): update, delete
+    /// and supersede on its id refuse by name, never answer `Ok` without acting.
+    #[tokio::test]
+    async fn writes_on_a_quarantined_decision_are_refused_not_ignored() {
+        use project_orchestrator::neo4j::models::DecisionStatus;
+        use project_orchestrator::neo4j::traits::DecisionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let saine = a_decision("saine");
+        store.create_decision_global(&saine, None).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+        let id = Uuid::new_v4();
+        write_foreign(&base, move |db| {
+            db.create_node_with_props(
+                &["Decision"],
+                vec![
+                    ("id", Value::from(id.to_string())),
+                    ("rationale", Value::from("sans description")),
+                ],
+            );
+        })
+        .await;
+        let store = open(&base).await;
+        assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+        let refuse = |r: anyhow::Result<()>| {
+            let e = r.expect_err("a write on a quarantined decision must refuse");
+            assert!(format!("{e:#}").contains("quarantaine"), "{e:#}");
+        };
+        refuse(
+            store
+                .update_decision(id, None, None, None, Some(DecisionStatus::Accepted))
+                .await,
+        );
+        refuse(store.delete_decision(id).await);
+        refuse(store.supersede_decision(saine.id, id).await);
+        refuse(store.supersede_decision(id, saine.id).await);
+        // Nothing was written: the sound decision is untouched, both nodes remain.
+        let relue = store.get_decision(saine.id).await.unwrap().unwrap();
+        assert_eq!(relue.status, DecisionStatus::Proposed);
+        assert_eq!(store.noeuds_pour_mesure(), 2);
+        // An id that is neither held nor reserved stays Neo4j's silent no-op.
+        store.delete_decision(Uuid::new_v4()).await.unwrap();
+    }
+
+    /// An update that puts a `chosen_option` above the blob threshold, or replaces
+    /// one that sat there, pays the FULL flush: counted in fsyncs, with no
+    /// `close()` (the WAL alone does not recover such a value).
+    #[tokio::test]
+    async fn a_long_chosen_option_pays_the_full_flush_without_close() {
+        use project_orchestrator::neo4j::traits::DecisionStore;
+        let store = temporary(Durabilite::Wal).await;
+        let fsyncs = || store.fsyncs_du_wal().unwrap();
+        let d = a_decision("courte");
+        store.create_decision_global(&d, None).await.unwrap();
+        let mut cout = Vec::new();
+        for option in ["a".to_string(), "x".repeat(300), "b".to_string()] {
+            let t = fsyncs();
+            store
+                .update_decision(d.id, None, None, Some(option), None)
+                .await
+                .unwrap();
+            cout.push(fsyncs() - t);
+        }
+        let [court, long, remplace] = cout[..] else {
+            unreachable!()
+        };
+        assert!(court >= 1, "the WAL fsync ran");
+        assert!(long > court, "long chosen_option: {long} against {court}");
+        assert!(
+            remplace > court,
+            "long chosen_option replaced: {remplace} against {court}"
+        );
+    }
+
+    /// `supersede_decision` crashed after its k-th engine write (status, edge,
+    /// `created_at`): the retry converges to ONE edge that carries its `created_at`.
+    #[tokio::test]
+    async fn an_interrupted_supersession_converges_with_its_date() {
+        use project_orchestrator::neo4j::models::DecisionStatus;
+        use project_orchestrator::neo4j::traits::DecisionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let mut atteints = 0;
+        for k in 1..=4 {
+            let base = dir.path().join(format!("supersede-{k}"));
+            let store = open(&base).await;
+            let (a, b) = (a_decision("ancienne"), a_decision("nouvelle"));
+            store.create_decision_global(&a, None).await.unwrap();
+            store.create_decision_global(&b, None).await.unwrap();
+            store.interrompre_au_prochain(Interruption::ApresEtape(k));
+            let issue = store.supersede_decision(b.id, a.id).await;
+            store.close().await.unwrap();
+            drop(store);
+            if issue.is_ok() {
+                break;
+            }
+            atteints += 1;
+            let store = open(&base).await;
+            assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
+            store.supersede_decision(b.id, a.id).await.unwrap();
+            assert_eq!(
+                store.get_decision(a.id).await.unwrap().unwrap().status,
+                DecisionStatus::Superseded
+            );
+            store.close().await.unwrap();
+            drop(store);
+            let aretes = supersedes_on_disk(&base).await;
+            assert_eq!(aretes.len(), 1, "k={k}: {aretes:?}");
+            assert!(
+                aretes[0].is_some(),
+                "k={k}: the edge carries its created_at"
+            );
+        }
+        // The status, the edge, its date.
+        assert_eq!(atteints, 3);
+    }
+
+    /// A `HAS_DECISION` edge from a Project node quarantined as a duplicate id: the
+    /// decision reads as having NO project, not the held project of the same id.
+    #[tokio::test]
+    async fn a_decision_of_a_duplicate_project_node_reads_without_project() {
+        use project_orchestrator::neo4j::traits::DecisionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project("le vrai");
+        store.create_project(&p).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+        let d = a_decision("rattachée au doublon");
+        let (pid, did) = (p.id, d.id);
+        write_foreign(&base, move |db| {
+            let doublon = db.create_node_with_props(
+                &["Project"],
+                vec![
+                    ("id", Value::from(pid.to_string())),
+                    ("name", Value::from("doublon")),
+                    ("slug", Value::from(format!("doublon-{pid}"))),
+                    ("created_at", Value::from("2026-01-02T03:04:05+00:00")),
+                ],
+            );
+            let decision = db.create_node_with_props(
+                &["Decision"],
+                vec![
+                    ("id", Value::from(did.to_string())),
+                    ("description", Value::from("d")),
+                    ("rationale", Value::from("r")),
+                    ("status", Value::from("proposed")),
+                ],
+            );
+            db.create_edge(doublon, decision, "HAS_DECISION");
+        })
+        .await;
+        let store = open(&base).await;
+        // Precondition: the held project is the original, the duplicate is quarantined.
+        assert_eq!(
+            store.get_project(p.id).await.unwrap().unwrap().name,
+            "le vrai"
+        );
+        assert_eq!(
+            store.rapport_d_ouverture().en_quarantaine.len(),
+            1,
+            "{:?}",
+            store.rapport_d_ouverture()
+        );
+        assert!(store.get_decision(d.id).await.unwrap().is_some());
+        assert_eq!(store.get_decision_project_id(d.id).await.unwrap(), None);
+        assert!(store
+            .get_decision_project_ids(&[d.id])
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// The generator skips nothing: every `async fn` of the two contracts is

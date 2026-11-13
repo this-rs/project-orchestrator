@@ -42,8 +42,23 @@
 //!   13/11), so an embedding acknowledged could not be guaranteed durable —
 //!   the same reason as `ChatStore::search_episodes_by_embedding`;
 //! - `decided_at` is stored as an RFC 3339 **string**; Neo4j stores a `datetime`
-//!   (`datetime($decided_at)`). The value read back is the same instant, the
-//!   stored type is not (as for the timestamps of `project.rs`);
+//!   (`datetime($decided_at)`). A DIVERGENCE in favour of this backend: here the
+//!   instant written is the instant read back; `Neo4jClient::node_to_decision`
+//!   reads it with `get::<String>`, which a `datetime` does not convert to
+//!   (`vendor/neo4rs/src/convert.rs`, `TryFrom<BoltType> for String` accepts
+//!   only `BoltType::String`), so Neo4j falls back to `Utc::now()` — the time of
+//!   the READ. (A migration reading Neo4j through `node_to_decision` would lose
+//!   every date.) The string sorts chronologically only for the format written
+//!   here (`DateTime<Utc>::to_rfc3339`: always `+00:00`, a fraction of 0/3/6/9
+//!   digits, a 4-digit year); a mixed format (a `Z` suffix, another offset)
+//!   would be read without error and sorted wrong. No ported method sorts or
+//!   filters on `decided_at`; the future port of the timeline must sort on the
+//!   PARSED value (or normalise the writes);
+//! - `update_decision`, `delete_decision` and `supersede_decision` on an id that
+//!   is RESERVED (a node of that id is on disk but quarantined at open) refuse,
+//!   named, rather than answer `Ok` without touching it: Neo4j would act on
+//!   that node. An id that is neither held nor reserved stays the silent no-op
+//!   of Neo4j's `MATCH`;
 //! - a decision attached to a project that opening QUARANTINED (unreadable, so
 //!   absent from the project index) reads as having no project: Neo4j, which
 //!   has no quarantine, would return that project's id. The decision itself is
@@ -80,7 +95,17 @@
 //! status, then the edge, then the edge's `created_at`: a crash in between
 //! leaves some of them written and the others not, which opening does not
 //! repair (each state reads as a valid decision). A retry of the same call
-//! converges: the writes are idempotent, and the edge is drawn once.
+//! converges: the writes are idempotent, the edge is drawn once, and an edge
+//! found without its `created_at` gets it.
+//!
+//! Durability of long values: a value above [`SEUIL_COLONNE_BLOB`] is not
+//! recovered by the WAL alone, so every write that puts one — or REPLACES one
+//! that sat there — pays the full flush: the creation (any property, list
+//! elements included), and `update_decision` for `description`, `rationale`
+//! and `chosen_option`, old and new value (as `note.rs` and `plan.rs`). A test
+//! counts the fsyncs without any `close()`. The interruption tests stop a write
+//! with an error and then close cleanly: they check the order of the writes
+//! (the marker protocol), not what a `kill -9` leaves in the WAL.
 //!
 //! `delete_decision` sets the draft marker on the node BEFORE it removes the
 //! node's edges: a crash in the middle leaves a draft, which opening deletes
@@ -368,7 +393,9 @@ impl IndexDecisions {
                     n.get_property("id")
                         .and_then(|v| v.as_str().and_then(|t| t.parse::<Uuid>().ok()))
                 });
-                if let Some(pid) = pid.filter(|p| projets.noeud_de(*p).is_some()) {
+                // The project of that id must be THIS node: a duplicate quarantined at
+                // open carries the id of the held project, and is not it.
+                if let Some(pid) = pid.filter(|p| projets.noeud_de(*p) == Some(source)) {
                     projet = Some(projet.map_or(pid, |existant| existant.min(pid)));
                 }
             }
@@ -388,6 +415,19 @@ impl ObrainGraphStore {
     /// closures work on a copy and publish a new state).
     fn entree_decision(w: &Ecriture<'_>, id: Uuid) -> Result<Option<EntreeDecision>> {
         Ok(w.index()?.decisions.par_id.get(&id).cloned())
+    }
+
+    /// A refusal for a write on a RESERVED id (on disk, quarantined at open): it
+    /// is neither touched nor answered `Ok` as if absent (module doc).
+    fn refuser_si_reserve(w: &Ecriture<'_>, id: Uuid, operation: &str) -> Result<()> {
+        if w.index()?.decisions.reserves.contains(&id) {
+            bail!(
+                "{operation} de la décision {id} refusé : un nœud Decision de cet id est sur \
+                 disque, illisible ou en double à l'ouverture (quarantaine, voir le rapport \
+                 d'ouverture). Il n'est ni modifié ni ignoré en silence"
+            );
+        }
+        Ok(())
     }
 
     /// The decoded state of a decision, read back from the engine after a write.
@@ -536,6 +576,7 @@ impl DecisionStore for ObrainGraphStore {
         self.ecrire(
             || (),
             move |(), w: &mut Ecriture<'_>| {
+                Self::refuser_si_reserve(w, decision_id, "update_decision")?;
                 let Some(ancienne) = Self::entree_decision(w, decision_id)? else {
                     // Neo4j's MATCH on an unknown id is a silent no-op.
                     return Ok(());
@@ -548,6 +589,15 @@ impl DecisionStore for ObrainGraphStore {
                         .as_ref()
                         .is_some_and(|c| c.len() > SEUIL_COLONNE_BLOB)
                     || rationale
+                        .as_ref()
+                        .is_some_and(|c| c.len() > SEUIL_COLONNE_BLOB)
+                    // `chosen_option` is a free string too: its old and its new value.
+                    || ancienne
+                        .decision
+                        .chosen_option
+                        .as_ref()
+                        .is_some_and(|c| c.len() > SEUIL_COLONNE_BLOB)
+                    || chosen_option
                         .as_ref()
                         .is_some_and(|c| c.len() > SEUIL_COLONNE_BLOB);
                 let noeud = ancienne.noeud;
@@ -580,6 +630,7 @@ impl DecisionStore for ObrainGraphStore {
         self.ecrire(
             || (),
             move |(), w: &mut Ecriture<'_>| {
+                Self::refuser_si_reserve(w, decision_id, "delete_decision")?;
                 let Some(e) = Self::entree_decision(w, decision_id)? else {
                     // Neo4j's DETACH DELETE on an unknown id is a silent no-op.
                     return Ok(());
@@ -736,6 +787,8 @@ impl DecisionStore for ObrainGraphStore {
         self.ecrire(
             || (),
             move |(), w: &mut Ecriture<'_>| {
+                Self::refuser_si_reserve(w, new_decision_id, "supersede_decision")?;
+                Self::refuser_si_reserve(w, old_decision_id, "supersede_decision")?;
                 let Some(nouvelle) = Self::entree_decision(w, new_decision_id)? else {
                     // Neo4j's MATCH on an unknown id is a silent no-op.
                     return Ok(());
@@ -750,17 +803,30 @@ impl DecisionStore for ObrainGraphStore {
                     Value::from(DecisionStatus::Superseded.to_string()),
                 );
                 // MERGE: the edge is drawn once (see the module doc for Neo4j's).
-                let deja =
+                let deja: Option<(EdgeId, bool)> =
                     w.db.store()
                         .edges_from(nouvelle.noeud, Direction::Outgoing)
                         .into_iter()
-                        .any(|(cible, a)| {
-                            cible == ancienne.noeud
-                                && w.db.get_edge(a).is_some_and(|e| &*e.edge_type == SUCCEDE)
+                        .filter(|(cible, _)| *cible == ancienne.noeud)
+                        .find_map(|(_, a)| {
+                            let e = w.db.get_edge(a)?;
+                            (&*e.edge_type == SUCCEDE).then(|| {
+                                let date = e
+                                    .get_property("created_at")
+                                    .is_some_and(|v| !matches!(v, Value::Null));
+                                (a, date)
+                            })
                         });
-                if !deja {
-                    w.etape()?;
-                    let arete = w.db.create_edge(nouvelle.noeud, ancienne.noeud, SUCCEDE);
+                let arete = match deja {
+                    Some((a, _)) => a,
+                    None => {
+                        w.etape()?;
+                        w.db.create_edge(nouvelle.noeud, ancienne.noeud, SUCCEDE)
+                    }
+                };
+                // Also when the edge is there WITHOUT its date: a call cut between the
+                // edge and its `created_at` is finished by the retry.
+                if !deja.is_some_and(|(_, date)| date) {
                     w.etape()?;
                     w.db.set_edge_property(
                         arete,
