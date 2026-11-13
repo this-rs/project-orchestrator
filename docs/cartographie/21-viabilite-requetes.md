@@ -9,6 +9,11 @@ modification du 11/11/2026 17:24, postérieure à la mesure ; 1,23 M nœuds cont
 cible de migration, mais elle a **la forme** du graphe de PO, ce qui suffit à trancher la
 question « telle requête passe-t-elle ? ».
 
+Les sorties de ces essais ne sont pas versionnées : les résultats « ok » / erreur ci-dessous ne
+sont pas revérifiables depuis ce dépôt (**non vérifié**). Le drapeau `--read-only` existe bien
+(`obrain query --help`, obrain 0.0.1 installé) ; noter que le langage par défaut est GQL et
+qu'il faut `--lang cypher` pour rejouer ces requêtes.
+
 ## Ce qui passe
 
 | Forme | Résultat |

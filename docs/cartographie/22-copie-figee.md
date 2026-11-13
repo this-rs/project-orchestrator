@@ -20,7 +20,9 @@ L'écart entre les deux colonnes est l'**évolution** de la base vivante en dix 
 | 1 — *count store* | `MATCH (n:L) RETURN count(n)` et `MATCH ()-[r:T]->() RETURN count(r)`, une requête par label / type : Neo4j répond depuis ses compteurs, sans parcourir | 142 s (152 requêtes) |
 | 2 — parcours complet | `MATCH (n) UNWIND labels(n) AS l RETURN l, count(*)` et `MATCH ()-[r]->() RETURN type(r), count(*)` : chaque nœud et chaque relation est lu | 6 s |
 
-`diff` des deux sorties, labels puis types : **vide**. Somme par label = 3 901 702 = nombre de nœuds ; chaque nœud porte **exactement un** label (`size(labels(n)) = 1` pour tous).
+`diff` des deux sorties, labels puis types : **vide**.
+
+**Provenance non jointe.** Contrairement au document 20 (`20-reference-migration.raw.txt`), les sorties brutes des deux méthodes et de `size(labels(n))` ne sont pas versionnées : les tableaux ci-dessous, les durées (142 s / 6 s) et le `diff` vide ne sont donc **pas vérifiables depuis ce dépôt (non vérifié)**. Les sommes, elles, sont cohérentes : 64 labels peuplés totalisant 3 901 702, 80 types peuplés totalisant 6 013 360. Somme par label = 3 901 702 = nombre de nœuds ; chaque nœud porte **exactement un** label (`size(labels(n)) = 1` pour tous).
 
 ## Ce que la copie confirme ou précise
 
