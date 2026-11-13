@@ -38,10 +38,23 @@
 //!   of them, and a `get_user_by_*` that reads one, is REFUSED by name (an error,
 //!   never `None`). Neo4j would MATCH that node; answering `None` here would turn a
 //!   `register` on its email into a second account (Neo4j: Conflict), and an OIDC
-//!   login into a new id without its tokens.
+//!   login into a new id without its tokens. `consume_refresh_token` of a token
+//!   whose user is reserved is refused too (not "no user row", which would send the
+//!   handler to the root-account fallback). A key that a HEALTHY indexed node also
+//!   holds (a quarantined duplicate of a readable user) is NOT reserved: the MERGE
+//!   and the lookups find the healthy node, as Neo4j's MATCH would, and the healthy
+//!   account is not refused because of its broken twin.
+//! - A `RefreshToken` or `McpToken` quarantined at open (undecodable, or a
+//!   duplicate hash / jti) reserves its hash / jti, EVEN when a twin is indexed:
+//!   validate, consume, revoke, create, and `is_mcp_token_active` (an error, which
+//!   the middleware turns into Unauthorized) refuse it, and `purge_mcp_tokens`
+//!   keeps the indexed twin. Neo4j revokes every twin; here the quarantined one is
+//!   never written, so without the reservation it would be served, with its own
+//!   `revoked`, the day its indexed twin became unreadable or was purged.
 //! - `revoked` of a `RefreshToken` or a `McpToken` must be a boolean. Absent or of
-//!   another type, the node is quarantined at open, so the token is unknown: not
-//!   valid, not active, not consumable, not listed. Neo4j reads such an MCP token
+//!   another type, the node is quarantined at open and its hash / jti reserved
+//!   (see below): refused by name, never valid, active or consumable, not listed.
+//!   Neo4j reads such an MCP token
 //!   as revoked in `is_mcp_token_active` (`unwrap_or(true)`) but as not revoked in
 //!   `list_mcp_tokens`, and such a refresh token as not revoked (`unwrap_or(false)`:
 //!   valid and consumable). In particular `revoke_all_user_tokens` never meets a
@@ -284,6 +297,10 @@ struct Reserves {
     /// (raw `auth_provider`, raw `email`), as `par_fournisseur_email`.
     fournisseur_email: HashSet<(String, String)>,
     emails: HashSet<String>,
+    /// `token_hash` of the `RefreshToken` nodes quarantined at open.
+    jetons: HashSet<String>,
+    /// `jti` of the `McpToken` nodes quarantined at open.
+    mcp: HashSet<String>,
 }
 
 impl Reserves {
@@ -351,6 +368,31 @@ impl Reserves {
     fn email(&self, email: &str) -> Result<()> {
         if self.emails.contains(email) {
             return Err(Self::refus("l'email demandé"));
+        }
+        Ok(())
+    }
+
+    /// A refresh token whose hash a quarantined node also holds. The hash is a
+    /// secret: never in the message.
+    fn jeton(&self, hash: &str) -> Result<()> {
+        if self.jetons.contains(hash) {
+            bail!(
+                "ce jeton de rafraîchissement est réservé : un nœud RefreshToken de même \
+                 empreinte est sur disque, illisible ou en double à l'ouverture (quarantaine). \
+                 Refusé jusqu'à réparation de la base"
+            );
+        }
+        Ok(())
+    }
+
+    /// An MCP token whose jti a quarantined node also holds (the jti is not repeated).
+    fn jeton_mcp(&self, jti: &str) -> Result<()> {
+        if self.mcp.contains(jti) {
+            bail!(
+                "ce jeton MCP est réservé : un nœud McpToken de même jti est sur disque, \
+                 illisible ou en double à l'ouverture (quarantaine). Refusé jusqu'à réparation \
+                 de la base"
+            );
         }
         Ok(())
     }
@@ -502,29 +544,68 @@ impl IndexAuth {
                             .en_quarantaine
                             .push(format!("nœud {etiquette} {noeud:?} : {motif}"));
                     }
-                    JETON_RAFRAICHISSEMENT => match entree_jeton(db, noeud) {
-                        Ok(e) if !index.jetons.contains_key(&e.jeton.token_hash) => {
-                            index.inserer_jeton(e)
+                    JETON_RAFRAICHISSEMENT => {
+                        let motif = match entree_jeton(db, noeud) {
+                            Ok(e) if !index.jetons.contains_key(&e.jeton.token_hash) => {
+                                index.inserer_jeton(e);
+                                continue;
+                            }
+                            Ok(_) => "empreinte déjà prise".to_string(),
+                            Err(err) => err.to_string(),
+                        };
+                        // Reserved even when a twin is indexed: the twin on disk keeps its
+                        // own `revoked`, and would be served in place of the indexed one
+                        // the day that one is unreadable.
+                        if let Some(h) = hydrater(db, noeud)
+                            .ok()
+                            .and_then(|get| texte(&get, "token_hash"))
+                        {
+                            index.reserves.jetons.insert(h);
                         }
-                        Ok(_) => rapport
+                        rapport
                             .en_quarantaine
-                            .push(format!("nœud {etiquette} {noeud:?} : empreinte déjà prise")),
-                        Err(err) => rapport
+                            .push(format!("nœud {etiquette} {noeud:?} : {motif}"));
+                    }
+                    _ => {
+                        let motif = match entree_mcp(db, noeud) {
+                            Ok(e) if !index.mcp.contains_key(&e.jeton.jti) => {
+                                index.inserer_mcp(e);
+                                continue;
+                            }
+                            Ok(_) => "jti déjà pris".to_string(),
+                            Err(err) => err.to_string(),
+                        };
+                        if let Some(j) = hydrater(db, noeud).ok().and_then(|get| texte(&get, "jti"))
+                        {
+                            index.reserves.mcp.insert(j);
+                        }
+                        rapport
                             .en_quarantaine
-                            .push(format!("nœud {etiquette} {noeud:?} : {err}")),
-                    },
-                    _ => match entree_mcp(db, noeud) {
-                        Ok(e) if !index.mcp.contains_key(&e.jeton.jti) => index.inserer_mcp(e),
-                        Ok(_) => rapport
-                            .en_quarantaine
-                            .push(format!("nœud {etiquette} {noeud:?} : jti déjà pris")),
-                        Err(err) => rapport
-                            .en_quarantaine
-                            .push(format!("nœud {etiquette} {noeud:?} : {err}")),
-                    },
+                            .push(format!("nœud {etiquette} {noeud:?} : {motif}"));
+                    }
                 }
             }
         }
+        // A user key also held by a healthy indexed node is not reserved: Neo4j's
+        // MATCH would find that node too, and so does the index (a MERGE updates it,
+        // never creates under the key; a lookup returns it). Reserving it would refuse
+        // a healthy account because of its broken twin. Only the keys that nothing
+        // healthy holds stay taken: those are the ones a MERGE would wrongly create
+        // under.
+        let IndexAuth {
+            utilisateurs,
+            par_externe,
+            par_fournisseur_email,
+            par_email,
+            reserves,
+            ..
+        } = &mut index;
+        reserves.ids.retain(|id| !utilisateurs.contains_key(id));
+        reserves.externes.retain(|k| !par_externe.contains_key(k));
+        reserves
+            .fournisseur_email
+            .retain(|k| !par_fournisseur_email.contains_key(k));
+        reserves.emails.retain(|e| !par_email.contains_key(e));
         index
     }
 }
@@ -731,10 +812,18 @@ fn consommer_jeton(
 ) -> Result<Option<(RefreshTokenNode, Option<UserNode>)>> {
     let existant = {
         let etat = w.index()?;
-        etat.auth
+        etat.auth.reserves.jeton(hash)?;
+        let existant = etat
+            .auth
             .jetons
             .get(hash)
-            .map(|e| (e.noeud, e.jeton.clone()))
+            .map(|e| (e.noeud, e.jeton.clone()));
+        // A user in quarantine is not "no user row" (the handler would fall back to
+        // the root account): refused, before anything is written.
+        if let Some((_, j)) = &existant {
+            etat.auth.reserves.id(j.user_id)?;
+        }
+        existant
     };
     let Some((noeud, jeton)) = existant else {
         sans_ecriture(w);
@@ -870,7 +959,11 @@ impl AuthStore for ObrainGraphStore {
         self.ecrire(
             || (),
             move |(), w| {
-                let deja_pris = w.index()?.auth.jetons.contains_key(&hash);
+                let deja_pris = {
+                    let etat = w.index()?;
+                    etat.auth.reserves.jeton(&hash)?;
+                    etat.auth.jetons.contains_key(&hash)
+                };
                 if deja_pris {
                     bail!("un jeton de rafraîchissement de même empreinte existe déjà");
                 }
@@ -897,6 +990,7 @@ impl AuthStore for ObrainGraphStore {
     async fn validate_refresh_token(&self, token_hash: &str) -> Result<Option<RefreshTokenNode>> {
         let maintenant = Utc::now();
         self.lire(|_, etat| {
+            etat.auth.reserves.jeton(token_hash)?;
             Ok(etat
                 .auth
                 .jetons
@@ -914,6 +1008,7 @@ impl AuthStore for ObrainGraphStore {
             move |(), w| {
                 let existant = {
                     let etat = w.index()?;
+                    etat.auth.reserves.jeton(&hash)?;
                     etat.auth
                         .jetons
                         .get(&hash)
@@ -939,10 +1034,10 @@ impl AuthStore for ObrainGraphStore {
         token_hash: &str,
     ) -> Result<Option<(RefreshTokenNode, Option<UserNode>)>> {
         let hash = token_hash.to_string();
-        self.ecrire(Utc::now, move |maintenant, w| {
-            consommer_jeton(w, &hash, maintenant)
-        })
-        .await
+        // The instant is taken UNDER the writer lock: a token that expires while the
+        // call waits for the lock is expired (as Neo4j evaluates it after the MATCH).
+        self.ecrire(|| (), move |(), w| consommer_jeton(w, &hash, Utc::now()))
+            .await
     }
 
     async fn revoke_all_user_tokens(&self, user_id: Uuid) -> Result<u64> {
@@ -1002,7 +1097,11 @@ impl AuthStore for ObrainGraphStore {
         self.ecrire(
             || (),
             move |(), w| {
-                let deja_pris = w.index()?.auth.mcp.contains_key(&jti);
+                let deja_pris = {
+                    let etat = w.index()?;
+                    etat.auth.reserves.jeton_mcp(&jti)?;
+                    etat.auth.mcp.contains_key(&jti)
+                };
                 if deja_pris {
                     bail!("un jeton MCP de même identifiant (jti) existe déjà");
                 }
@@ -1031,6 +1130,9 @@ impl AuthStore for ObrainGraphStore {
     async fn is_mcp_token_active(&self, jti: &str) -> Result<bool> {
         let maintenant = Utc::now();
         self.lire(|_, etat| {
+            // An error, not `false`: the middleware refuses it all the same
+            // (Unauthorized) and logs why.
+            etat.auth.reserves.jeton_mcp(jti)?;
             Ok(etat
                 .auth
                 .mcp
@@ -1047,6 +1149,7 @@ impl AuthStore for ObrainGraphStore {
                 // Matched on the jti AND the owner: another user's token is not found.
                 let existant = {
                     let etat = w.index()?;
+                    etat.auth.reserves.jeton_mcp(&jti)?;
                     etat.auth
                         .mcp
                         .get(&jti)
@@ -1092,44 +1195,51 @@ impl AuthStore for ObrainGraphStore {
     }
 
     async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64> {
-        self.ecrire(Utc::now, move |maintenant, w| {
-            // Only dead records: revoked, or expired. An active token is never listed.
-            let morts: Vec<(String, NodeId)> = {
-                let etat = w.index()?;
-                etat.auth
-                    .mcp_par_utilisateur
-                    .get(&user_id)
-                    .map(|jtis| {
-                        jtis.iter()
-                            .filter_map(|j| etat.auth.mcp.get(j))
-                            .filter(|e| e.jeton.revoked || e.jeton.expires_at < maintenant)
-                            .map(|e| (e.jeton.jti.clone(), e.noeud))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            };
-            if morts.is_empty() {
-                sans_ecriture(w);
-                return Ok(0);
-            }
-            for (_, noeud) in &morts {
-                if !w.db.delete_node(*noeud) {
-                    // Some rows may already be gone: what the base holds is not
-                    // what the index says. Refuse everything until a restart.
-                    w.interne.indetermine.store(true, Ordering::Release);
-                    bail!(
-                        "obrain a refusé la suppression d'un jeton MCP : état indéterminé, \
-                         redémarrer"
-                    );
+        self.ecrire(
+            || (),
+            move |(), w| {
+                let maintenant = Utc::now();
+                // Only dead records: revoked, or expired. An active token is never listed.
+                // A reserved jti is kept: deleting its indexed twin would let the
+                // quarantined one (with its own `revoked`) be indexed at the next open.
+                let morts: Vec<(String, NodeId)> = {
+                    let etat = w.index()?;
+                    etat.auth
+                        .mcp_par_utilisateur
+                        .get(&user_id)
+                        .map(|jtis| {
+                            jtis.iter()
+                                .filter_map(|j| etat.auth.mcp.get(j))
+                                .filter(|e| e.jeton.revoked || e.jeton.expires_at < maintenant)
+                                .filter(|e| !etat.auth.reserves.mcp.contains(&e.jeton.jti))
+                                .map(|e| (e.jeton.jti.clone(), e.noeud))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                };
+                if morts.is_empty() {
+                    sans_ecriture(w);
+                    return Ok(0);
                 }
-            }
-            w.rendre_durable()?;
-            let mut etat = w.index_mut()?;
-            for (jti, _) in &morts {
-                etat.auth.retirer_mcp(jti);
-            }
-            Ok(morts.len() as u64)
-        })
+                for (_, noeud) in &morts {
+                    if !w.db.delete_node(*noeud) {
+                        // Some rows may already be gone: what the base holds is not
+                        // what the index says. Refuse everything until a restart.
+                        w.interne.indetermine.store(true, Ordering::Release);
+                        bail!(
+                            "obrain a refusé la suppression d'un jeton MCP : état indéterminé, \
+                         redémarrer"
+                        );
+                    }
+                }
+                w.rendre_durable()?;
+                let mut etat = w.index_mut()?;
+                for (jti, _) in &morts {
+                    etat.auth.retirer_mcp(jti);
+                }
+                Ok(morts.len() as u64)
+            },
+        )
         .await
     }
 }
@@ -1434,6 +1544,14 @@ mod tests {
             )
             .await
             .unwrap();
+        store
+            .create_refresh_token(
+                user.id,
+                "empreinte-saine",
+                Utc::now() + chrono::Duration::days(1),
+            )
+            .await
+            .unwrap();
         let mcp = |jti: &'static str, revoked: Option<Value>| {
             let mut p = vec![
                 ("jti", Value::from(jti)),
@@ -1474,20 +1592,25 @@ mod tests {
             "{:?}",
             store.rapport_d_ouverture()
         );
-        assert!(!store.is_mcp_token_active("jti-absent").await.unwrap());
-        assert!(!store.is_mcp_token_active("jti-texte").await.unwrap());
+        // Never active, never valid: refused by name (reserved), never `Ok(true)`.
+        assert!(store.is_mcp_token_active("jti-absent").await.is_err());
+        assert!(store.is_mcp_token_active("jti-texte").await.is_err());
         assert!(store.is_mcp_token_active("jti-sain").await.unwrap());
         assert!(store
             .validate_refresh_token("empreinte-absente")
             .await
-            .unwrap()
-            .is_none());
+            .is_err());
         assert!(store
             .consume_refresh_token("empreinte-absente")
             .await
+            .is_err());
+        assert!(store
+            .validate_refresh_token("empreinte-saine")
+            .await
             .unwrap()
-            .is_none());
-        assert_eq!(store.revoke_all_user_tokens(user.id).await.unwrap(), 0);
+            .is_some());
+        // Only the healthy one is revoked: the quarantined one is not a token here.
+        assert_eq!(store.revoke_all_user_tokens(user.id).await.unwrap(), 1);
         store.close().await.unwrap();
     }
 
@@ -1519,59 +1642,325 @@ mod tests {
         store.close().await.unwrap();
     }
 
+    /// One interrupted creation, judged at reopen. `false` when the point is not on
+    /// the creation's path (the creation then completed).
+    async fn creation_interrompue(chemin: &std::path::Path, point: Interruption) -> bool {
+        let store = ObrainGraphStore::open(chemin, Creation::Permise).unwrap();
+        store.interrompre_au_prochain(point);
+        let Err(err) = store.create_password_user("i@ex.test", "I", "h").await else {
+            store.close().await.unwrap();
+            return false;
+        };
+        assert!(
+            format!("{err:#}").contains("interruption injectée"),
+            "{point:?}"
+        );
+        assert!(store
+            .get_user_by_email("i@ex.test")
+            .await
+            .unwrap()
+            .is_none());
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = rouvrir(chemin).await;
+        let rapport = store.rapport_d_ouverture().clone();
+        assert!(rapport.en_quarantaine.is_empty(), "{point:?}: {rapport:?}");
+        let lu = store
+            .get_user_by_email_and_provider("i@ex.test", "password")
+            .await
+            .unwrap();
+        if point == Interruption::ApresLeRetraitDuMarqueur {
+            assert_eq!(rapport.brouillons_supprimes, 0, "{point:?}");
+            assert_eq!(lu.and_then(|u| u.password_hash).as_deref(), Some("h"));
+        } else {
+            assert_eq!(rapport.brouillons_supprimes, 1, "{point:?}: {rapport:?}");
+            assert!(lu.is_none(), "{point:?}");
+        }
+        let u = store
+            .create_password_user("i@ex.test", "I", "h")
+            .await
+            .unwrap();
+        assert_eq!(store.list_users().await.unwrap().len(), 1, "{point:?}");
+        assert_eq!(u.email, "i@ex.test");
+        store.close().await.unwrap();
+        true
+    }
+
     /// A creation stopped at any point before its commit point reopens as a
     /// deleted draft (the key is free, a retry succeeds); stopped after it, as the
-    /// whole record (a retry merges on it).
+    /// whole record (a retry merges on it). The property points are counted, not
+    /// written down: they run until one is past the last property, so a property
+    /// added to the creation is covered without touching this test.
     #[tokio::test]
     async fn une_creation_interrompue_reouvre_coherente() {
         let dossier = tempfile::tempdir().unwrap();
-        let mut points = vec![Interruption::ApresLeNoeud, Interruption::ApresLeMarqueur];
-        points.extend((1..=9).map(Interruption::ApresLaPropriete));
-        points.extend([
+        let mut n = 0;
+        let mut chemin = || {
+            n += 1;
+            dossier.path().join(format!("base-{n}"))
+        };
+        for point in [
+            Interruption::ApresLeNoeud,
+            Interruption::ApresLeMarqueur,
             Interruption::AvantLeRetraitDuMarqueur,
             Interruption::ApresLeRetraitDuMarqueur,
-        ]);
-        for (k, point) in points.into_iter().enumerate() {
-            let chemin = dossier.path().join(format!("base-{k}"));
-            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
-            store.interrompre_au_prochain(point);
-            let err = store
-                .create_password_user("i@ex.test", "I", "h")
-                .await
-                .unwrap_err();
-            assert!(
-                format!("{err:#}").contains("interruption injectée"),
-                "{point:?}"
-            );
-            assert!(store
-                .get_user_by_email("i@ex.test")
+        ] {
+            assert!(creation_interrompue(&chemin(), point).await, "{point:?}");
+        }
+        let mut proprietes = 0;
+        while creation_interrompue(&chemin(), Interruption::ApresLaPropriete(proprietes + 1)).await
+        {
+            proprietes += 1;
+        }
+        // The user node carries the nine properties of the Neo4j ON CREATE; at least
+        // those are each a point (more is fine: the loop covered them).
+        assert!(proprietes >= 9, "only {proprietes} property points reached");
+    }
+
+    /// The instant of a consumption is taken under the writer lock: a token that
+    /// expires while the call waits behind a slow write is expired, not consumed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn la_consommation_prend_l_heure_sous_le_verrou() {
+        use crate::obrain::Durabilite;
+        let store =
+            ObrainGraphStore::open_temporary_avec(Durabilite::LenteAPourTest(2000)).unwrap();
+        let user_id = Uuid::new_v4();
+        let t0 = Utc::now();
+        // Created in ~2 s (the slow durability step): ~1 s of life left after.
+        store
+            .create_refresh_token(
+                user_id,
+                "empreinte-lente",
+                t0 + chrono::Duration::seconds(3),
+            )
+            .await
+            .unwrap();
+        assert!(
+            Utc::now() < t0 + chrono::Duration::milliseconds(2700),
+            "setup too slow"
+        );
+        // A slow write holds the writer lock ~2 s; the consumption is called during
+        // it, while the token is still valid, and runs after it, once it has expired.
+        let (_, consomme) = tokio::join!(
+            store.create_mcp_token(
+                user_id,
+                "jti-lent",
+                "l",
+                "s",
+                t0 + chrono::Duration::days(1)
+            ),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                assert!(
+                    Utc::now() < t0 + chrono::Duration::seconds(3),
+                    "called too late"
+                );
+                store.consume_refresh_token("empreinte-lente").await
+            }
+        );
+        assert!(Utc::now() > t0 + chrono::Duration::seconds(3));
+        assert!(
+            consomme.unwrap().is_none(),
+            "expired while waiting for the lock: not a valid rotation"
+        );
+        store.close().await.unwrap();
+    }
+
+    /// A quarantined duplicate of a readable user's id does not lock out the
+    /// healthy account; its OWN keys (the ones no healthy node holds) stay taken.
+    #[tokio::test]
+    async fn un_doublon_d_id_ne_bloque_pas_le_compte_sain() {
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = dossier.path().join("base");
+        let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+        let sain = store
+            .create_password_user("sain@ex.test", "S", "hash-sain")
+            .await
+            .unwrap();
+        let maintenant = Utc::now().to_rfc3339();
+        // Twin of the same id, written after (a later slot: the healthy one is indexed
+        // first), with a key of its own.
+        noeud_etranger(
+            &store,
+            UTILISATEUR,
+            &[
+                ("id", Value::from(sain.id.to_string())),
+                ("auth_provider", Value::from("password")),
+                ("email", Value::from("jumeau@ex.test")),
+                ("name", Value::from("J")),
+                ("password_hash", Value::from("hash-jumeau")),
+                ("created_at", Value::from(maintenant.clone())),
+                ("last_login_at", Value::from(maintenant.clone())),
+            ],
+        );
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = rouvrir(&chemin).await;
+        assert_eq!(
+            store.rapport_d_ouverture().en_quarantaine.len(),
+            1,
+            "{:?}",
+            store.rapport_d_ouverture()
+        );
+        // The healthy account is served by every lookup, and its login merges.
+        assert_eq!(
+            store
+                .get_user_by_id(sain.id)
                 .await
                 .unwrap()
-                .is_none());
-            store.close().await.unwrap();
-            drop(store);
+                .map(|u| u.email),
+            Some("sain@ex.test".to_string())
+        );
+        assert_eq!(
+            store
+                .get_user_by_email_and_provider("sain@ex.test", "password")
+                .await
+                .unwrap()
+                .map(|u| u.id),
+            Some(sain.id)
+        );
+        let encore = store
+            .create_password_user("sain@ex.test", "S2", "autre")
+            .await
+            .unwrap();
+        assert_eq!(encore.id, sain.id);
+        // The twin's own key: no second account under it, no `None` for it.
+        refuse(
+            store
+                .get_user_by_email_and_provider("jumeau@ex.test", "password")
+                .await,
+            "the twin's (provider, email)",
+        );
+        refuse(
+            store
+                .create_password_user("jumeau@ex.test", "Intrus", "h")
+                .await,
+            "a creation on the twin's key",
+        );
+        store.close().await.unwrap();
+    }
 
-            let store = rouvrir(&chemin).await;
-            let rapport = store.rapport_d_ouverture().clone();
-            assert!(rapport.en_quarantaine.is_empty(), "{point:?}: {rapport:?}");
-            let lu = store
-                .get_user_by_email_and_provider("i@ex.test", "password")
-                .await
-                .unwrap();
-            if point == Interruption::ApresLeRetraitDuMarqueur {
-                assert_eq!(rapport.brouillons_supprimes, 0, "{point:?}");
-                assert_eq!(lu.and_then(|u| u.password_hash).as_deref(), Some("h"));
-            } else {
-                assert_eq!(rapport.brouillons_supprimes, 1, "{point:?}: {rapport:?}");
-                assert!(lu.is_none(), "{point:?}");
-            }
-            let u = store
-                .create_password_user("i@ex.test", "I", "h")
-                .await
-                .unwrap();
-            assert_eq!(store.list_users().await.unwrap().len(), 1, "{point:?}");
-            assert_eq!(u.email, "i@ex.test");
-            store.close().await.unwrap();
-        }
+    /// Consuming a refresh token whose user is quarantined is refused (not "no user
+    /// row", which sends the handler to the root fallback), and writes nothing.
+    #[tokio::test]
+    async fn la_consommation_pour_un_utilisateur_en_quarantaine_est_refusee() {
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = dossier.path().join("base");
+        let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+        let u = store
+            .create_password_user("qr@ex.test", "Q", "h")
+            .await
+            .unwrap();
+        store
+            .create_refresh_token(u.id, "empreinte-q", Utc::now() + chrono::Duration::hours(1))
+            .await
+            .unwrap();
+        store.interne.db.set_node_property(
+            noeud_utilisateur(&store, u.id),
+            "created_at",
+            Value::from("pas une date"),
+        );
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = rouvrir(&chemin).await;
+        refuse(
+            store.consume_refresh_token("empreinte-q").await,
+            "consume for a quarantined user",
+        );
+        // Refused before any write: the token is still valid for after the repair.
+        assert!(store
+            .validate_refresh_token("empreinte-q")
+            .await
+            .unwrap()
+            .is_some());
+        store.close().await.unwrap();
+    }
+
+    /// A token twin quarantined at open keeps its hash / jti reserved: the day the
+    /// indexed twin is unreadable (or purged), the unrevoked one is not served.
+    #[tokio::test]
+    async fn un_jumeau_de_jeton_en_quarantaine_ne_revit_pas() {
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = dossier.path().join("base");
+        let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+        let user = Uuid::new_v4();
+        let futur = Utc::now() + chrono::Duration::days(1);
+        // Used (revoked) refresh token, and a revoked MCP token.
+        store
+            .create_refresh_token(user, "empreinte-j", futur)
+            .await
+            .unwrap();
+        assert!(store
+            .consume_refresh_token("empreinte-j")
+            .await
+            .unwrap()
+            .is_some());
+        store
+            .create_mcp_token(user, "jti-j", "l", "s", futur)
+            .await
+            .unwrap();
+        assert!(store.revoke_mcp_token(user, "jti-j").await.unwrap());
+        // Their twins, NOT revoked (foreign data), in later slots.
+        let maintenant = Utc::now().to_rfc3339();
+        let commun = |cle: &'static str, v: &'static str| {
+            vec![
+                (cle, Value::from(v)),
+                ("user_id", Value::from(user.to_string())),
+                ("expires_at", Value::from(futur.to_rfc3339())),
+                ("created_at", Value::from(maintenant.clone())),
+                ("revoked", Value::from(false)),
+            ]
+        };
+        noeud_etranger(
+            &store,
+            JETON_RAFRAICHISSEMENT,
+            &commun("token_hash", "empreinte-j"),
+        );
+        noeud_etranger(&store, JETON_MCP, &commun("jti", "jti-j"));
+        store.close().await.unwrap();
+        drop(store);
+
+        // Open 1: the twins are quarantined; their keys are refused by name.
+        let store = rouvrir(&chemin).await;
+        assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 2);
+        assert!(store.validate_refresh_token("empreinte-j").await.is_err());
+        assert!(store.consume_refresh_token("empreinte-j").await.is_err());
+        assert!(store.is_mcp_token_active("jti-j").await.is_err());
+        // The purge keeps the indexed (revoked) MCP twin: deleting it would let the
+        // unrevoked one be indexed at the next open.
+        assert_eq!(store.purge_mcp_tokens(user).await.unwrap(), 0);
+        // The indexed refresh twin becomes unreadable.
+        let noeud = store.interne.etat.read().unwrap().auth.jetons["empreinte-j"].noeud;
+        store
+            .interne
+            .db
+            .set_node_property(noeud, "revoked", Value::from("true"));
+        store.close().await.unwrap();
+        drop(store);
+
+        // Open 2: the unrevoked twins are what is readable; still not served.
+        let store = rouvrir(&chemin).await;
+        assert!(
+            !matches!(
+                store.validate_refresh_token("empreinte-j").await,
+                Ok(Some(_))
+            ),
+            "an unrevoked twin of a used refresh token is valid again"
+        );
+        assert!(
+            !matches!(
+                store.consume_refresh_token("empreinte-j").await,
+                Ok(Some(_))
+            ),
+            "an unrevoked twin of a used refresh token is consumable again"
+        );
+        assert!(
+            !matches!(store.is_mcp_token_active("jti-j").await, Ok(true)),
+            "an unrevoked twin of a revoked MCP token is active again"
+        );
+        store.close().await.unwrap();
     }
 }
