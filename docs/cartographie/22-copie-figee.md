@@ -11,7 +11,7 @@ Copie prise le **2026-11-11T11:36:02Z → 11:36:15Z** (13 s), Neo4j 5.26.20 comm
 | Labels déclarés / peuplés | 70 / 64 | 70 / 64 |
 | Types de relation déclarés / peuplés | 82 / 80 | 82 / 80 |
 
-L'écart entre les deux colonnes est la croissance de la base vivante en dix heures, pas une perte : la copie est sa propre référence.
+L'écart entre les deux colonnes est l'**évolution** de la base vivante en dix heures, pas seulement sa croissance : trois comptes ont **baissé** entre 01:17Z et 11:36Z — `Skill` 448 → 423 (−25), `INCLUDES_ENTITY` 334 304 → 334 202 (−102), `BELONGS_TO` 1 285 → 1 260 (−25). L'hypothèse est une suppression légitime dans la base vivante (resynchronisation des skills, réindexation), pas une perte de la copie, puisque les deux méthodes concordent sur la copie : **non vérifié** (aucun journal des suppressions n'a été relevé). Dans tous les cas, la copie est sa propre référence : on ne compare jamais une cible à la colonne de droite.
 
 ## Deux méthodes indépendantes, un seul résultat
 
