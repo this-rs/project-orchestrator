@@ -10,7 +10,7 @@
 //! its trait (an omitted method would silently inherit the contract's default).
 //!
 //! Ported so far: [`ProjectStore`](crate::neo4j::traits::ProjectStore)
-//! (`project.rs`).
+//! (`project.rs`), [`AuthStore`](crate::neo4j::traits::AuthStore) (`auth.rs`).
 //!
 //! # How obrain is used
 //!
@@ -58,6 +58,7 @@
 //! Reads are served inline (obrain reads are mmap and hash lookups); writes run
 //! on the blocking pool.
 
+mod auth;
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
 mod project;
@@ -212,6 +213,7 @@ struct Interne {
 #[derive(Default)]
 struct Etat {
     projets: project::IndexProjets,
+    auth: auth::IndexAuth,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -443,14 +445,15 @@ impl ObrainGraphStore {
                 )
             })?;
         }
-        let (etat, rapport) = project::IndexProjets::reconstruire(&db)
-            .map(|(projets, rapport)| (Etat { projets }, rapport))
-            .with_context(|| {
+        let (projets, mut rapport) =
+            project::IndexProjets::reconstruire(&db).with_context(|| {
                 format!(
                     "reconstruction des index de la base obrain {}",
                     chemin.display()
                 )
             })?;
+        let auth = auth::IndexAuth::reconstruire(&db, &mut rapport);
+        let etat = Etat { projets, auth };
         let store = Self {
             interne: Arc::new(Interne {
                 db,
