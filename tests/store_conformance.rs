@@ -5096,6 +5096,37 @@ mod obrain_workspace_specifique {
         assert_eq!(store.noeuds_de_label_pour_test("WorkspaceMilestone"), 0);
     }
 
+    /// A quarantined milestone (it no longer decodes) is still reached by its
+    /// workspace's `HAS_WORKSPACE_MILESTONE` edge: the online deletion takes it, as
+    /// the repair at open and Neo4j's cascade do. The final base does not depend on
+    /// a cut.
+    #[tokio::test]
+    async fn a_quarantined_child_goes_with_its_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let ws = espace();
+        let j = jalon_de(ws.id);
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_workspace(&ws).await.unwrap();
+            store.create_workspace_milestone(&j).await.unwrap();
+            assert!(store.ecrire_propriete_brute_pour_test(
+                "WorkspaceMilestone",
+                j.id,
+                "title",
+                None
+            ));
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert!(
+            store.get_workspace_milestone(j.id).await.unwrap().is_none(),
+            "quarantined"
+        );
+        store.delete_workspace(ws.id).await.unwrap();
+        assert_eq!(store.noeuds_de_label_pour_test("WorkspaceMilestone"), 0);
+    }
+
     /// A milestone status stored in PascalCase (a base migrated from Neo4j) reads
     /// as Neo4j reads it, and the filter sees it under that status.
     #[tokio::test]

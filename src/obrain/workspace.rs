@@ -79,7 +79,9 @@
 //!
 //! `delete_workspace` is one operation in several engine records. Every node is
 //! checked live first (a node the index holds and the engine lacks refuses with
-//! nothing written). The workspace is then marked `_suppression` — the commit
+//! nothing written). The children are those the index holds AND those the
+//! workspace's `HAS_*` edges reach (a quarantined child included), the same set
+//! the repair at open reaches. The workspace is then marked `_suppression` — the commit
 //! point —, its children are deleted, the workspace LAST. A restart that finds
 //! the marker deletes what the workspace's `HAS_*` edges still reach, then the
 //! workspace (`RapportOuverture::suppressions_achevees`): a cut never leaves a
@@ -897,6 +899,16 @@ impl WorkspaceStore for ObrainGraphStore {
                 // marker on the workspace — the commit point of the deletion: from
                 // there a restart finishes it — then the children, the workspace last.
                 let mut noeuds: Vec<NodeId> = supprimes.iter().map(|(_, n, _)| *n).collect();
+                // The children the `HAS_*` edges reach, indexed or not (a quarantined
+                // milestone, resource or component): what Neo4j's cascade and the
+                // repair at open reach. The final base does not depend on a cut.
+                for type_ in [A_JALON, A_RESSOURCE, A_COMPOSANT] {
+                    for (enfant, _) in voisins(w.db, noeud, type_) {
+                        if !noeuds.contains(&enfant) {
+                            noeuds.push(enfant);
+                        }
+                    }
+                }
                 noeuds.push(noeud);
                 let quoi = format!("suppression du workspace {id}");
                 w.verifier_vivants(&noeuds, &quoi)?;
