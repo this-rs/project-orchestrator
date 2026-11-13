@@ -354,7 +354,8 @@ pub async fn register(
     // 2. Validate input fields
     validate_registration(&req, auth_config)?;
 
-    // 3. Check email uniqueness for password provider
+    // 3. Check email uniqueness for password provider. A fast path only (it
+    //    spares the bcrypt below): the decision is the store's, in step 5.
     let existing = state
         .orchestrator
         .neo4j()
@@ -370,12 +371,22 @@ pub async fn register(
     let password_hash = bcrypt::hash(&req.password, 12)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to hash password: {}", e)))?;
 
-    // 5. Create user in Neo4j
+    // 5. Create user in Neo4j. A creation, not an upsert: a `register` racing
+    //    on the same email passed step 3 too, and is refused here, atomically,
+    //    before any token is issued (it was merged into the winner's account and
+    //    handed a session on it).
     let user = state
         .orchestrator
         .neo4j()
         .create_password_user(&req.email, &req.name, &password_hash)
-        .await?;
+        .await
+        .map_err(|e| {
+            if crate::neo4j::models::PasswordUserExists::is(&e) {
+                AppError::Conflict("An account with this email already exists".to_string())
+            } else {
+                AppError::Internal(e)
+            }
+        })?;
 
     // 6. Generate JWT (auto-login)
     let token = encode_jwt(
@@ -2115,6 +2126,72 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    /// Two `register` racing on the same email: both pass the lookup before
+    /// either has written (the bcrypt of cost 12 sits between them), so the
+    /// store decides. Exactly one account, one session; the other request is a
+    /// 409 without a token or a cookie. Before the fix the create was an upsert:
+    /// both answered 200, the second with a session on the FIRST account.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_register_race_same_email_one_winner_no_token_for_the_loser() {
+        let (app, state) = test_auth_app_with_state(Some(auth_config_with_registration())).await;
+
+        let send = |password: &'static str, name: &'static str| {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let req = HttpRequest::builder()
+                    .method("POST")
+                    .uri("/auth/register")
+                    .header("content-type", "application/json")
+                    .body(register_body("race@ffs.holdings", password, name))
+                    .unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                let status = resp.status();
+                let cookie = resp.headers().get("set-cookie").cloned();
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                (status, cookie, json, password, name)
+            })
+        };
+        let (a, b) = tokio::join!(send("victimpass1", "Victim"), send("intruder1", "Intruder"));
+        let mut results = vec![a.unwrap(), b.unwrap()];
+        results.sort_by_key(|r| r.0.as_u16());
+        let (won, lost) = (&results[0], &results[1]);
+
+        assert_eq!(
+            won.0,
+            StatusCode::OK,
+            "one registration succeeds: {:?}",
+            won.2
+        );
+        assert_eq!(
+            lost.0,
+            StatusCode::CONFLICT,
+            "the other is refused, not merged into the first account: {:?}",
+            lost.2
+        );
+        assert!(lost.1.is_none(), "no refresh cookie for the loser");
+        assert!(lost.2.get("token").is_none(), "no JWT for the loser");
+
+        let store = state.orchestrator.neo4j();
+        let users: Vec<_> = store
+            .list_users()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|u| u.email == "race@ffs.holdings")
+            .collect();
+        assert_eq!(users.len(), 1, "exactly one account");
+        let account = &users[0];
+        assert_eq!(won.2["user"]["id"], account.id.to_string());
+        assert_eq!(account.name, won.4, "the loser did not rename the account");
+        assert!(
+            bcrypt::verify(won.3, account.password_hash.as_deref().unwrap()).unwrap(),
+            "the account keeps the winner's password"
+        );
     }
 
     #[tokio::test]

@@ -49,6 +49,7 @@ const EXPECTED_CONSTRAINTS: &[&str] = &[
     "deployment_id",
     "feature_graph_id",
     "user_id",
+    "user_password_account_email",
     "refresh_token_hash",
     // GraIL node labels
     "topology_rule_id",
@@ -511,6 +512,10 @@ impl Neo4jClient {
             "CREATE CONSTRAINT skill_id IF NOT EXISTS FOR (s:Skill) REQUIRE s.id IS UNIQUE",
             // User constraint
             "CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE",
+            // One password account per email: set only on the password accounts that
+            // `create_password_user` creates, so the OIDC accounts (which may share an
+            // email) and the accounts created before it are not concerned.
+            "CREATE CONSTRAINT user_password_account_email IF NOT EXISTS FOR (u:User) REQUIRE u.password_account_email IS UNIQUE",
             // RefreshToken constraint
             "CREATE CONSTRAINT refresh_token_hash IF NOT EXISTS FOR (rt:RefreshToken) REQUIRE rt.token_hash IS UNIQUE",
             // GraIL — TopologyRule constraint

@@ -3835,7 +3835,10 @@ pub trait AuthStore: Send + Sync {
     /// Get a user by email (any provider)
     async fn get_user_by_email(&self, email: &str) -> Result<Option<UserNode>>;
 
-    /// Create a password-authenticated user
+    /// Create a password-authenticated user. A CREATION, not an upsert: fails
+    /// with [`PasswordUserExists`](crate::neo4j::models::PasswordUserExists) when
+    /// a password account with this email exists, decided atomically by the
+    /// store (two racing calls: exactly one succeeds).
     async fn create_password_user(
         &self,
         email: &str,

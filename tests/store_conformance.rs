@@ -1944,6 +1944,73 @@ pub mod conformance {
             walks[0]
         );
     }
+
+    // ------------------------------------------------------------------
+    // Password accounts: a creation, never an upsert.
+    // ------------------------------------------------------------------
+
+    /// `create_password_user` creates or refuses: a second account on the same
+    /// email (password provider) is `PasswordUserExists`, sequentially and when
+    /// 8 creations race (exactly one wins, the account keeps the winner's hash
+    /// and name). It was an upsert: every call "succeeded" and returned the
+    /// first account, which `register` then handed a session on. The users are
+    /// left behind (no delete in the trait), on a fresh email each time.
+    pub async fn check_password_user_is_a_creation(store: &dyn GraphStore) {
+        use project_orchestrator::neo4j::models::PasswordUserExists;
+
+        let email = format!("conformance-{}@ex.test", Uuid::new_v4());
+        let first = store
+            .create_password_user(&email, "First", "hash-first")
+            .await
+            .unwrap();
+        let again = store
+            .create_password_user(&email, "Again", "hash-again")
+            .await
+            .expect_err("a second password account on the same email is refused");
+        assert!(PasswordUserExists::is(&again), "typed refusal: {again:#}");
+        let kept = store.get_user_by_id(first.id).await.unwrap().unwrap();
+        assert_eq!(kept.name, "First", "the refused call changed nothing");
+        assert_eq!(kept.password_hash.as_deref(), Some("hash-first"));
+
+        let email = format!("conformance-race-{}@ex.test", Uuid::new_v4());
+        let names: Vec<(String, String)> = (0..8)
+            .map(|i| (format!("Racer {i}"), format!("hash-racer-{i}")))
+            .collect();
+        let outcomes = join_all(
+            names
+                .iter()
+                .map(|(n, h)| store.create_password_user(&email, n, h)),
+        )
+        .await;
+        let winners: Vec<_> = outcomes.iter().filter_map(|o| o.as_ref().ok()).collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one of 8 concurrent creations wins: {outcomes:?}"
+        );
+        for o in &outcomes {
+            if let Err(e) = o {
+                assert!(PasswordUserExists::is(e), "typed refusal: {e:#}");
+            }
+        }
+        let winner = winners[0];
+        let held = store
+            .get_user_by_email_and_provider(&email, "password")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.id, winner.id, "the store holds the winner's account");
+        assert_eq!(held.name, winner.name);
+        assert_eq!(held.password_hash, winner.password_hash);
+        let accounts = store
+            .list_users()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|u| u.email == email)
+            .count();
+        assert_eq!(accounts, 1, "and exactly one account");
+    }
 }
 
 // ======================================================================
@@ -2184,6 +2251,7 @@ macro_rules! all_checks {
                 check_numeric_typing_preserved,
                 check_datetime_roundtrip_and_arithmetic,
                 check_ordering_is_deterministic_across_pages,
+                check_password_user_is_a_creation,
             ]
         );
     };

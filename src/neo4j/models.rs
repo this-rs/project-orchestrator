@@ -2765,6 +2765,25 @@ pub struct UserNode {
     pub last_login_at: DateTime<Utc>,
 }
 
+/// The refusal of [`create_password_user`](crate::neo4j::traits::AuthStore::create_password_user):
+/// a password account with this email already exists.
+///
+/// Creating a password account is a CREATION, not an upsert: two `register`
+/// racing on the same email must not both succeed (the second used to be merged
+/// into the account of the first and handed a session on it, without knowing
+/// its password). Every backend decides it atomically and returns this error,
+/// which `register` turns into a 409 without issuing any token.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("a password account already exists for this email")]
+pub struct PasswordUserExists;
+
+impl PasswordUserExists {
+    /// Whether `err` (or one of its causes) is this refusal.
+    pub fn is(err: &anyhow::Error) -> bool {
+        err.chain().any(|e| e.downcast_ref::<Self>().is_some())
+    }
+}
+
 /// A refresh token stored in the database (hashed).
 ///
 /// The raw token is never stored — only its SHA-256 hash.

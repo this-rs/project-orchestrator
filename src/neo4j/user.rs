@@ -155,7 +155,18 @@ impl Neo4jClient {
         }
     }
 
-    /// Create a password-authenticated user
+    /// Create a password-authenticated user: a CREATION, never an upsert.
+    ///
+    /// Fails with [`PasswordUserExists`] when a password account with this email
+    /// exists already, decided by the database in this one query:
+    /// - an account created before this check (no `password_account_email`) is
+    ///   found by the `OPTIONAL MATCH`, and nothing is created;
+    /// - two creations racing on the same email both carry
+    ///   `password_account_email`, under the uniqueness constraint
+    ///   `user_password_account_email` (client.rs): the second one waits for the
+    ///   first to commit, then fails with `ConstraintValidationFailed`.
+    ///
+    /// `upsert_user` (the OIDC login, which merges on its subject) is unchanged.
     pub async fn create_password_user(
         &self,
         email: &str,
@@ -163,18 +174,56 @@ impl Neo4jClient {
         password_hash: &str,
     ) -> Result<UserNode> {
         let now = chrono::Utc::now();
-        let user = UserNode {
-            id: Uuid::new_v4(),
-            email: email.to_string(),
-            name: name.to_string(),
-            picture_url: None,
-            auth_provider: crate::neo4j::models::AuthProvider::Password,
-            external_id: None,
-            password_hash: Some(password_hash.to_string()),
-            created_at: now,
-            last_login_at: now,
-        };
-        self.upsert_user(&user).await
+        let q = query(
+            r#"
+            OPTIONAL MATCH (existing:User {auth_provider: $auth_provider, email: $email})
+            WITH count(existing) AS existing
+            WHERE existing = 0
+            CREATE (u:User {
+                id: $id,
+                auth_provider: $auth_provider,
+                email: $email,
+                password_account_email: $email,
+                name: $name,
+                picture_url: '',
+                external_id: '',
+                password_hash: $password_hash,
+                created_at: datetime($now),
+                last_login_at: datetime($now)
+            })
+            RETURN u
+            "#,
+        )
+        .param("id", Uuid::new_v4().to_string())
+        .param(
+            "auth_provider",
+            crate::neo4j::models::AuthProvider::Password.to_string(),
+        )
+        .param("email", email)
+        .param("name", name)
+        .param("password_hash", password_hash)
+        .param("now", now.to_rfc3339());
+
+        let row = async {
+            let mut result = self.graph.execute(q).await?;
+            Ok::<_, anyhow::Error>(result.next().await?)
+        }
+        .await
+        .map_err(|e| {
+            if is_password_account_conflict(&e) {
+                anyhow::Error::new(PasswordUserExists)
+            } else {
+                e
+            }
+        })?;
+        match row {
+            Some(row) => {
+                let node: neo4rs::Node = row.get("u")?;
+                self.node_to_user(&node)
+            }
+            // The `OPTIONAL MATCH` found an account: nothing was created.
+            None => Err(anyhow::Error::new(PasswordUserExists)),
+        }
     }
 
     /// List all users
@@ -571,4 +620,18 @@ impl Neo4jClient {
             None => Ok(0),
         }
     }
+}
+
+/// Whether `err` is the uniqueness constraint `user_password_account_email`
+/// refusing a second password account. neo4rs reports a server failure either
+/// as `Error::Neo4j` or, when it arrives during the PULL, inside the text of
+/// `UnexpectedMessage` (see `is_transient_neo4j_error`): the text is checked.
+fn is_password_account_conflict(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let Some(e) = cause.downcast_ref::<neo4rs::Error>() else {
+            return false;
+        };
+        let text = e.to_string();
+        text.contains("ConstraintValidationFailed") && text.contains("password_account_email")
+    })
 }

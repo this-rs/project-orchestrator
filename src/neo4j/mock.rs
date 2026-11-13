@@ -16970,7 +16970,16 @@ impl AuthStore for MockGraphStore {
             created_at: now,
             last_login_at: now,
         };
-        self.upsert_user(&user).await
+        // A creation, not an upsert (see Neo4j): the check and the insert happen
+        // under the same write lock, so two racing creations cannot both pass.
+        let mut users = self.users.write().await;
+        if users.values().any(|u| {
+            u.auth_provider == crate::neo4j::models::AuthProvider::Password && u.email == user.email
+        }) {
+            return Err(anyhow::Error::new(crate::neo4j::models::PasswordUserExists));
+        }
+        users.insert(user.id, user.clone());
+        Ok(user)
     }
 
     async fn list_users(&self) -> Result<Vec<UserNode>> {
