@@ -15,9 +15,11 @@
 //! for releases, environments, deployments and milestones (`release.rs`), whose
 //! refusals (tasks, plans, commits) are listed in `release::REFUSEES`,
 //! [`WorkspaceStore`](crate::neo4j::traits::WorkspaceStore)
-//! (`workspace.rs`, 35 of its 45 methods; the rest are refused by name), and the note
+//! (`workspace.rs`, 35 of its 45 methods; the rest are refused by name), the note
 //! node of [`NoteStore`](crate::neo4j::traits::NoteStore) (`note.rs`: 13 of its 41
-//! methods; the others are refused by name there).
+//! methods; the others are refused by name there), and the node part of
+//! [`FederationStore`](crate::neo4j::traits::FederationStore)
+//! (`federation.rs`: the five relation writes and the two backfills are refused by name).
 //!
 //! # How obrain is used
 //!
@@ -66,6 +68,7 @@
 //! on the blocking pool.
 
 mod auth;
+mod federation;
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
 mod note;
@@ -126,11 +129,19 @@ pub fn refusees_release() -> &'static [&'static str] {
     release::REFUSEES
 }
 
-/// The hand-written methods that REFUSE (`GraphStore::get_progress_batch`: its
-/// contract default loops over getters of other domains). They are in
-/// [`methodes_portees`] because they are written, not because they work.
+/// The hand-written methods that REFUSE: `GraphStore::get_progress_batch` (its
+/// contract default loops over getters of other domains), the five
+/// `FederationStore` methods whose relation writes and backfills are not ported
+/// (`federation.rs`), and the ten `WorkspaceStore` methods whose domains (plan,
+/// cross-workspace listing) are not ported. They are in [`methodes_portees`]
+/// because they are written, not because they work.
 pub const REFUS_ECRITS_A_LA_MAIN: &[&str] = &[
     "GraphStore::get_progress_batch",
+    "FederationStore::create_mcp_similar_to",
+    "FederationStore::create_mcp_co_activated",
+    "FederationStore::create_mcp_often_follows",
+    "FederationStore::backfill_co_activated_with",
+    "FederationStore::backfill_often_follows",
     // WorkspaceStore: the domains they read (plan, cross-workspace listing) are not ported.
     "WorkspaceStore::list_all_workspace_milestones_filtered",
     "WorkspaceStore::count_all_workspace_milestones",
@@ -209,9 +220,9 @@ pub enum Creation {
 /// logged by the factory and readable by the caller.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RapportOuverture {
-    /// `Project` nodes of a creation that never reached its commit point (the
-    /// draft marker still there, or nothing on the node): deleted, whatever they
-    /// held (`project.rs`, "Atomicity").
+    /// `Project`, `McpServer` and `McpTool` nodes of a creation that never reached
+    /// its commit point (the draft marker still there, or nothing on the node):
+    /// deleted, whatever they held (`project.rs`, "Atomicity").
     pub brouillons_supprimes: usize,
     /// Projects whose path trio (`root_path`, `declared_path`,
     /// `canonical_path`) was torn by an interrupted update: recomputed from
@@ -258,6 +269,7 @@ struct Etat {
     releases: release::IndexReleases,
     espaces: workspace::IndexEspaces,
     notes: note::IndexNotes,
+    federation: federation::IndexFederation,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -524,12 +536,22 @@ impl ObrainGraphStore {
             .with_context(contexte)?;
         let notes =
             note::IndexNotes::reconstruire(&db, &projets, &mut rapport).with_context(contexte)?;
+        let (federation, brouillons, quarantaine) = federation::IndexFederation::reconstruire(&db)
+            .with_context(|| {
+                format!(
+                    "reconstruction des index fédération de la base obrain {}",
+                    chemin.display()
+                )
+            })?;
+        rapport.brouillons_supprimes += brouillons;
+        rapport.en_quarantaine.extend(quarantaine);
         let etat = Etat {
             projets,
             auth,
             releases,
             espaces,
             notes,
+            federation,
         };
         let store = Self {
             interne: Arc::new(Interne {

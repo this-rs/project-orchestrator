@@ -2079,6 +2079,7 @@ mod with_the_feature {
         // ProjectStore's nine methods, WorkspaceStore (45, of which ten are refused by
         // name), the 41 of NoteStore (13 ported, 28 refused by name), the 41 of
         // ReleaseStore (23 ported, 18 refused by name), the 17 of AuthStore (all ported),
+        // the ten served methods of FederationStore (five more are refused by name),
         // plus the two of GraphStore.
         let domains: std::collections::BTreeSet<&str> = written
             .iter()
@@ -2088,6 +2089,7 @@ mod with_the_feature {
             domains.into_iter().collect::<Vec<_>>(),
             [
                 "AuthStore",
+                "FederationStore",
                 "GraphStore",
                 "NoteStore",
                 "ProjectStore",
@@ -2099,18 +2101,19 @@ mod with_the_feature {
         // refusals are written by hand and listed as such).
         let servent = methodes_qui_servent();
         // ProjectStore's nine, WorkspaceStore's 35 that serve, the thirteen ported
-        // NoteStore methods, the twenty-three ReleaseStore methods that serve, and the
-        // seventeen AuthStore methods.
-        assert_eq!(servent.len(), 97, "{servent:?}");
+        // NoteStore methods, the twenty-three ReleaseStore methods that serve, the
+        // seventeen AuthStore methods, and the ten served FederationStore methods.
+        assert_eq!(servent.len(), 107, "{servent:?}");
         assert!(servent.iter().all(|m| m.starts_with("ProjectStore::")
             || m.starts_with("WorkspaceStore::")
             || m.starts_with("NoteStore::")
             || m.starts_with("ReleaseStore::")
-            || m.starts_with("AuthStore::")));
+            || m.starts_with("AuthStore::")
+            || m.starts_with("FederationStore::")));
         // The written refusals are written, and are not counted as serving.
         assert_eq!(
             REFUS_ECRITS_A_LA_MAIN.len(),
-            11,
+            16,
             "{REFUS_ECRITS_A_LA_MAIN:?}"
         );
         assert_eq!(refusees_note().len(), 28);
