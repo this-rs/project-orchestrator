@@ -17,14 +17,18 @@
 //!   but the decoding stays a plain string, as the Cypher/GQL mapping
 //!   recommends). A `created_at` that does not parse makes the node
 //!   unaddressable (see "Opening"); the Neo4j adapter replaces it with "now";
-//! - `delete_project` deletes only while the base holds nothing but `Project`
-//!   nodes. The Neo4j cascade walks plans, tasks, notes, files, feature graphs,
-//!   commits (linked by edge OR by a `project_id` property) — domains this
-//!   backend has not ported and therefore cannot have written. Any other node
-//!   in the base means data from elsewhere (a migrated base) that the cascade
-//!   would have to reach: the delete is refused by name rather than leaving
-//!   orphans. The check is one counter (O(1)); it neither scans edges nor
-//!   properties.
+//! - `delete_project` deletes only a project with no plan attached, and only
+//!   while the base holds nothing but the `Project` and `Plan` nodes this backend
+//!   addresses. The Neo4j cascade walks plans, tasks, milestones, releases,
+//!   environments and deployments, notes, files, feature graphs, commits (linked
+//!   by edge OR by a `project_id` property). This backend does not port that
+//!   cascade yet, and finding what belongs to ONE project would need a scan by
+//!   `project_id` of every domain. So the delete is refused by name as soon as
+//!   the base holds any other node — written by a ported domain (a workspace, a
+//!   release, a note, a user, a chat session, an MCP server…) or by another
+//!   writer (a migrated base) — even when none of it belongs to the project.
+//!   The check is one counter (O(1)); the refusal then names the domains whose
+//!   nodes it found (one label scan per label, paid by the refusal only).
 //!
 //! Order: `list_projects` sorts by `(name, id)` ascending — the total order
 //! `ORDER BY p.name, p.id ASC` states. Names compare by Unicode code point;
@@ -583,13 +587,14 @@ impl ProjectStore for ObrainGraphStore {
                         "ProjectStore::delete_project (cascade)",
                     ))
                     .context(format!(
-                        "{rattaches} plan(s) rattaché(s) à ce projet : leur suppression en cascade \
-                         (tâches, étapes, contraintes) attend le portage du domaine Plan"
+                        "{rattaches} plan(s) rattaché(s) à ce projet : la suppression en cascade \
+                         des plans d'un projet (et de leurs tâches, étapes, contraintes) n'est pas \
+                         portée"
                     )));
                 }
                 // One counter, no scan: every live node of the base against the
-                // projects this backend addresses. `project_name` only tags the notes
-                // and decisions the cascade archives: part of what is refused.
+                // projects and plans this backend addresses. `project_name` only tags
+                // the notes and decisions the cascade archives: part of what is refused.
                 let noeuds = w.db.store().node_count();
                 if noeuds != projets + plans {
                     return Err(anyhow::Error::new(NonPorte(
@@ -597,11 +602,13 @@ impl ProjectStore for ObrainGraphStore {
                     ))
                     .context(format!(
                         "la base contient {} nœud(s) hors des {projets} projet(s) et {plans} \
-                         plan(s) que ce backend adresse : des données écrites hors de lui \
-                         (tâches, notes, fichiers, graphes de fonctionnalités, commits…) que la \
-                         suppression en cascade devrait atteindre, par relation ou par \
-                         `project_id`. Elle attend le portage des domaines concernés",
-                        noeuds.saturating_sub(projets + plans)
+                         plan(s) que ce backend adresse : {}. La suppression en cascade d'un \
+                         projet (jalons, releases, environnements, notes, tâches…) n'est pas \
+                         portée, et ce qui appartient à CE projet ne se trouve qu'en parcourant \
+                         chaque domaine : la suppression est refusée pour tout projet tant que \
+                         ces nœuds existent, même s'ils n'appartiennent pas à celui-ci",
+                        noeuds.saturating_sub(projets + plans),
+                        noeuds_hors_projets_et_plans(w.db, projets, plans)
                     )));
                 }
                 if !w.db.delete_node(noeud) {
@@ -619,6 +626,95 @@ impl ProjectStore for ObrainGraphStore {
         )
         .await
     }
+}
+
+/// The labels each ported domain writes, by domain: what the refusal of
+/// `delete_project` names. A label absent from this table is not written by
+/// this backend (a migrated base, or another writer).
+const LABELS_PAR_DOMAINE: &[(&str, &[&str])] = &[
+    ("projets non adressés (quarantaine)", &["Project"]),
+    ("plans non adressés (quarantaine)", &["Plan"]),
+    ("authentification", &["User", "RefreshToken", "McpToken"]),
+    (
+        "releases",
+        &["Release", "Environment", "Deployment", "Milestone"],
+    ),
+    (
+        "workspaces",
+        &["Workspace", "WorkspaceMilestone", "Resource", "Component"],
+    ),
+    ("notes", &["Note"]),
+    (
+        "chat",
+        &[
+            "ChatSession",
+            "ChatEvent",
+            "LlmSetting",
+            "SessionEpisode",
+            "Anchor",
+            "AnchorEvent",
+            "ExecutionPlaceEvent",
+            "ConversationSegment",
+            "ConversationBoundary",
+            "AgentIdentityRoot",
+        ],
+    ),
+    ("fédération", &["McpServer", "McpTool"]),
+];
+
+/// What the nodes outside the addressed projects and plans are, by domain:
+/// `domaine (Label ×n, …)`, then the labels no ported domain writes. One label
+/// scan per label of the base: paid only by a refusal.
+fn noeuds_hors_projets_et_plans(db: &ObrainDB, projets: usize, plans: usize) -> String {
+    let store = db.store();
+    let mut par_label: Vec<(String, usize)> = store
+        .all_labels()
+        .into_iter()
+        .map(|l| {
+            let mut n = store.nodes_by_label(&l).len();
+            // The addressed ones are not "outside"; what is left of these two
+            // labels is quarantined or unreadable.
+            if l == LABEL {
+                n = n.saturating_sub(projets);
+            } else if l == "Plan" {
+                n = n.saturating_sub(plans);
+            }
+            (l, n)
+        })
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    par_label.sort();
+    let mut parties = Vec::new();
+    for (domaine, labels) in LABELS_PAR_DOMAINE {
+        let detail: Vec<String> = par_label
+            .iter()
+            .filter(|(l, _)| labels.contains(&l.as_str()))
+            .map(|(l, n)| format!("{l} ×{n}"))
+            .collect();
+        if !detail.is_empty() {
+            parties.push(format!("{domaine} ({})", detail.join(", ")));
+        }
+    }
+    let etrangers: Vec<String> = par_label
+        .iter()
+        .filter(|(l, _)| {
+            !LABELS_PAR_DOMAINE
+                .iter()
+                .any(|(_, ls)| ls.contains(&l.as_str()))
+        })
+        .map(|(l, n)| format!("{l} ×{n}"))
+        .collect();
+    if !etrangers.is_empty() {
+        parties.push(format!(
+            "hors des domaines portés, écrits par un autre que ce backend ({})",
+            etrangers.join(", ")
+        ));
+    }
+    if parties.is_empty() {
+        // Nodes without any label: counted by the engine, named by no label.
+        parties.push("des nœuds sans label".to_string());
+    }
+    parties.join(" ; ")
 }
 
 impl ObrainGraphStore {

@@ -5402,6 +5402,87 @@ mod obrain_plan_specifique {
     }
 }
 
+/// The refusal of `delete_project` while the base holds nodes of other domains:
+/// the cascade is not ported, so it stays refused, but it names what it found.
+#[cfg(feature = "obrain-backend")]
+mod obrain_delete_project_refus {
+    use chrono::Utc;
+    use project_orchestrator::neo4j::models::{MilestoneNode, MilestoneStatus, WorkspaceNode};
+    use project_orchestrator::neo4j::traits::{
+        FederationStore, ProjectStore, ReleaseStore, WorkspaceStore,
+    };
+    use project_orchestrator::obrain::{NonPorte, ObrainGraphStore};
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn the_refusal_names_the_domains_it_found() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let a = super::conformance::a_project("refus-a");
+        let b = super::conformance::a_project("refus-b");
+        store.create_project(&a).await.unwrap();
+        store.create_project(&b).await.unwrap();
+        store
+            .create_workspace(&WorkspaceNode {
+                id: Uuid::new_v4(),
+                name: "ws".into(),
+                slug: format!("ws-{}", Uuid::new_v4().simple()),
+                description: None,
+                created_at: Utc::now(),
+                updated_at: None,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        store
+            .create_milestone(&MilestoneNode {
+                id: Uuid::new_v4(),
+                title: "jalon de A".into(),
+                description: None,
+                status: MilestoneStatus::Open,
+                target_date: None,
+                closed_at: None,
+                created_at: Utc::now(),
+                project_id: a.id,
+            })
+            .await
+            .unwrap();
+        store
+            .create_mcp_server(&super::conformance::an_mcp_server(Uuid::nil(), "refus"))
+            .await
+            .unwrap();
+
+        // B has nothing of its own: the refusal still holds (the cascade is not
+        // ported), and says why, domain by domain.
+        let e = store.delete_project(b.id, &b.name).await.unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<NonPorte>(),
+            Some(&NonPorte("ProjectStore::delete_project (cascade)"))
+        );
+        let msg = format!("{e:#}");
+        for attendu in [
+            "3 nœud(s)",
+            "releases (Milestone ×1)",
+            "workspaces (Workspace ×1)",
+            "fédération (McpServer ×1)",
+        ] {
+            assert!(msg.contains(attendu), "« {attendu} » absent de : {msg}");
+        }
+        assert!(!msg.contains("écrites hors de lui"), "{msg}");
+        assert!(store.get_project(b.id).await.unwrap().is_some());
+
+        // A node no ported domain writes is named as such.
+        store.creer_noeud_brut_pour_test("Task", &[]);
+        let msg = format!(
+            "{:#}",
+            store.delete_project(b.id, &b.name).await.unwrap_err()
+        );
+        assert!(
+            msg.contains("hors des domaines portés, écrits par un autre que ce backend (Task ×1)"),
+            "{msg}"
+        );
+    }
+}
+
 /// What only the obrain adapter does for the release domain: every refused
 /// method refuses by its name, the four entities read back identical after a
 /// close and an open, a creation stopped before its commit point is a draft
