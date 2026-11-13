@@ -48,7 +48,7 @@
 //! `src/obrain/mod.rs`, issue obrain #120).
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
@@ -124,6 +124,23 @@ fn refus_entite<T>(methode: &'static str, t: &EntityType) -> Result<T> {
     )))
 }
 
+/// An entity id of a ported type must be canonical (UUID, lowercase, hyphenated). Two
+/// spellings of one node would otherwise give two links, since the index keys on the
+/// string. Refused by name, before any write. Neo4j silently matches nothing for the
+/// non-canonical spelling: a named divergence.
+fn id_entite_canonique(t: &EntityType, id: &str) -> Result<()> {
+    if entite_portee(t) {
+        let canonique = id.parse::<Uuid>().is_ok_and(|u| u.to_string() == id);
+        if !canonique {
+            bail!(
+                "identifiant d'entité non canonique « {id} » pour `{t}` (attendu : UUID en \
+                 minuscules, avec tirets) : refusé pour qu'un même nœud ne reçoive pas deux liens"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// A refusal, by name, with the reason it is not ported.
 fn refus<T>(methode: &'static str, raison: &'static str) -> Result<T> {
     Err(anyhow::Error::new(NonPorte(methode)).context(raison))
@@ -167,6 +184,21 @@ fn scope_depuis_proprietes(type_: &str, chemin: String) -> NoteScope {
 /// The properties a creation writes, in the order it writes them. Mirrors the
 /// `CREATE` of `Neo4jClient::create_note`.
 fn proprietes_de_creation(note: &Note) -> Result<Vec<(&'static str, Value)>> {
+    // The three floats a list sorts on must be finite: NaN has no place in a total order
+    // (`partial_cmp` made the order non-transitive). Neo4j would store it; this is a
+    // named divergence, refused at the write.
+    for (nom, v) in [
+        ("staleness_score", note.staleness_score),
+        ("energy", note.energy),
+        ("scar_intensity", note.scar_intensity),
+    ] {
+        if !v.is_finite() {
+            bail!(
+                "`{nom}` non fini ({v}) refusé : un tri total ne peut pas le ranger. Neo4j \
+                 l'accepterait ; divergence assumée"
+            );
+        }
+    }
     let (scope_type, scope_path) = scope_vers_proprietes(&note.scope);
     let mut p: Vec<(&'static str, Value)> = vec![
         ("id", Value::from(note.id.to_string())),
@@ -284,6 +316,9 @@ struct Lien {
 /// once), its `updated_at`, and its links.
 #[derive(Clone)]
 pub(super) struct EntreeNote {
+    /// Links on disk that this backend does not resolve (an unported domain, or a
+    /// missing target). Their presence makes `get_note_anchors` refuse by name.
+    non_resolus: usize,
     noeud: NodeId,
     note: Note,
     mise_a_jour: Option<DateTime<Utc>>,
@@ -296,6 +331,7 @@ impl EntreeNote {
         let get = lecteur(db, noeud)?;
         let (note, mise_a_jour) = lire_note(&get)?;
         Ok(Self {
+            non_resolus: 0,
             noeud,
             note,
             mise_a_jour,
@@ -416,9 +452,24 @@ enum Valeur {
     Texte(String),
 }
 
+impl Valeur {
+    /// The variant's rank: values of one field always share a variant, so this only
+    /// orders what could never meet, and keeps the order total.
+    fn rang(&self) -> u8 {
+        match self {
+            Valeur::Instant(_) => 0,
+            Valeur::Nombre(_) => 1,
+            Valeur::Texte(_) => 2,
+        }
+    }
+}
+
 /// The index of the notes.
 #[derive(Default)]
 pub(super) struct IndexNotes {
+    /// Ids of nodes that are on disk but could not be read at open (quarantined): a new
+    /// note may not take one of them, or two nodes would share an id.
+    reserves: HashSet<Uuid>,
     par_id: HashMap<Uuid, EntreeNote>,
     /// Notes attached to a project, by project id.
     par_projet: HashMap<Uuid, BTreeSet<Uuid>>,
@@ -522,6 +573,11 @@ impl IndexNotes {
             let (note, maj) = match lire_note(&get) {
                 Ok(v) => v,
                 Err(e) => {
+                    if let Some(id) =
+                        get("id").and_then(|v| v.as_str().and_then(|t| t.parse::<Uuid>().ok()))
+                    {
+                        index.reserves.insert(id);
+                    }
                     rapport
                         .en_quarantaine
                         .push(format!("nœud Note {noeud:?} : {e}"));
@@ -536,6 +592,7 @@ impl IndexNotes {
             }
             let id = note.id;
             index.inscrire(EntreeNote {
+                non_resolus: 0,
                 noeud,
                 note,
                 mise_a_jour: maj,
@@ -545,9 +602,10 @@ impl IndexNotes {
         }
 
         // The links: the out-edges `LINKED_TO` of every indexed note.
-        let mut liens_par_note: Vec<(Uuid, Vec<Lien>)> = Vec::new();
+        let mut liens_par_note: Vec<(Uuid, Vec<Lien>, usize)> = Vec::new();
         for (noeud, id) in &vus {
             let mut liens = Vec::new();
+            let mut non_resolus = 0usize;
             for (cible, arete) in store.edges_from(*noeud, Direction::Outgoing) {
                 let Some(e) = db.get_edge(arete) else {
                     continue;
@@ -570,6 +628,7 @@ impl IndexNotes {
                         rapport.en_quarantaine.push(format!(
                             "lien de la note {id} vers un nœud `{autre}` : domaine non porté, ignoré"
                         ));
+                        non_resolus += 1;
                         continue;
                     }
                 };
@@ -584,6 +643,7 @@ impl IndexNotes {
                         .is_some_and(|u| index.par_id.contains_key(&u)),
                 };
                 let Some(id_cible) = cible_id.filter(|_| cible_existe) else {
+                    non_resolus += 1;
                     continue;
                 };
                 let texte = |cle: &str| {
@@ -601,10 +661,11 @@ impl IndexNotes {
                         .unwrap_or_else(Utc::now),
                 });
             }
-            liens_par_note.push((*id, liens));
+            liens_par_note.push((*id, liens, non_resolus));
         }
-        for (id, liens) in liens_par_note {
+        for (id, liens, nr) in liens_par_note {
             if let Some(mut e) = index.desinscrire(id) {
+                e.non_resolus = nr;
                 e.liens = liens;
                 index.inscrire(e);
             }
@@ -622,7 +683,9 @@ impl ObrainGraphStore {
 
     /// The decoded state of a note, read back from the engine after a write.
     fn relire(w: &Ecriture<'_>, e: &EntreeNote) -> Result<EntreeNote> {
-        w.apres_ecriture(EntreeNote::decoder(w.db, e.noeud, e.liens.clone()))
+        let mut r = w.apres_ecriture(EntreeNote::decoder(w.db, e.noeud, e.liens.clone()))?;
+        r.non_resolus = e.non_resolus;
+        Ok(r)
     }
 
     /// The `Project` node of `id`, if this backend holds that project.
@@ -775,6 +838,13 @@ impl NoteStore for ObrainGraphStore {
                     if etat.notes.par_id.contains_key(&n.id) {
                         bail!("une note d'id {} existe déjà", n.id);
                     }
+                    if etat.notes.reserves.contains(&n.id) {
+                        bail!(
+                            "l'id {} est réservé : un nœud Note de cet id est sur disque, \
+                             illisible à l'ouverture (quarantaine). Il n'est ni repris ni écrasé",
+                            n.id
+                        );
+                    }
                     let projet = match n.project_id {
                         Some(p) => etat.projets.noeud_de(p),
                         None => None,
@@ -785,10 +855,12 @@ impl NoteStore for ObrainGraphStore {
                 let noeud = w.db.create_node(&[LABEL]);
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeNoeud)?;
+                w.etape()?;
                 w.db.set_node_property(noeud, BROUILLON, Value::from(true));
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeMarqueur)?;
                 for (k, (cle, valeur)) in proprietes.into_iter().enumerate() {
+                    w.etape()?;
                     w.db.set_node_property(noeud, cle, valeur);
                     #[cfg(any(test, feature = "mock-store"))]
                     w.point(Interruption::ApresLaPropriete(k + 1))?;
@@ -799,6 +871,7 @@ impl NoteStore for ObrainGraphStore {
                 w.rendre_durable_avant_le_marqueur()?;
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::AvantLeRetraitDuMarqueur)?;
+                w.etape()?;
                 w.db.remove_node_property(noeud, BROUILLON);
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeRetraitDuMarqueur)?;
@@ -838,6 +911,8 @@ impl NoteStore for ObrainGraphStore {
                     return Ok(None);
                 };
                 let staleness = staleness_score.filter(|v| v.is_finite());
+                // The OLD content too: replacing a value that sat in a blob column clears
+                // that slot, which the WAL does not recover (as in project.rs).
                 w.flush_complet = ancienne.note.content.len() > SEUIL_COLONNE_BLOB
                     || content
                         .as_ref()
@@ -845,17 +920,22 @@ impl NoteStore for ObrainGraphStore {
                     || tags.iter().flatten().any(|t| t.len() > SEUIL_COLONNE_BLOB);
                 let noeud = ancienne.noeud;
                 let maj = Utc::now();
+                w.etape()?;
                 w.db.set_node_property(noeud, "updated_at", Value::from(maj.to_rfc3339()));
                 if let Some(c) = &content {
+                    w.etape()?;
                     w.db.set_node_property(noeud, "content", Value::from(c.clone()));
                 }
                 if let Some(i) = importance {
+                    w.etape()?;
                     w.db.set_node_property(noeud, "importance", Value::from(i.to_string()));
                 }
                 if let Some(s) = status {
+                    w.etape()?;
                     w.db.set_node_property(noeud, "status", Value::from(s.to_string()));
                 }
                 if let Some(t) = &tags {
+                    w.etape()?;
                     w.db.set_node_property(
                         noeud,
                         "tags",
@@ -868,6 +948,7 @@ impl NoteStore for ObrainGraphStore {
                     );
                 }
                 if let Some(s) = staleness {
+                    w.etape()?;
                     w.db.set_node_property(noeud, "staleness_score", Value::from(s));
                 }
                 let entree = Self::relire(w, &ancienne)?;
@@ -905,17 +986,21 @@ impl NoteStore for ObrainGraphStore {
                         .map(|(_, a)| a)
                         .collect();
                 for a in anciennes {
+                    w.etape()?;
                     w.db.delete_edge(a);
                 }
                 match project_id {
                     Some(p) => {
+                        w.etape()?;
                         w.db.set_node_property(noeud, "project_id", Value::from(p.to_string()))
                     }
                     None => {
+                        w.etape()?;
                         w.db.remove_node_property(noeud, "project_id");
                     }
                 }
                 if let Some(pn) = projet_noeud {
+                    w.etape()?;
                     w.db.create_edge(pn, noeud, APPARTIENT);
                 }
                 let entree = Self::relire(w, &ancienne)?;
@@ -944,10 +1029,21 @@ impl NoteStore for ObrainGraphStore {
                         .map(|(_, a)| a)
                         .collect();
                 for a in aretes {
+                    w.etape()?;
                     w.db.delete_edge(a);
                 }
+                w.etape()?;
                 if !w.db.delete_node(noeud) {
-                    bail!("obrain a refusé la suppression du nœud {noeud:?} (note {id})");
+                    // The edges are already gone: what is on disk is no longer the state
+                    // before this call. Same contract as `apres_ecriture`: everything is
+                    // refused until a restart rebuilds the index from the base.
+                    w.interne
+                        .indetermine
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    bail!(
+                        "obrain a refusé la suppression du nœud {noeud:?} (note {id}) APRÈS la \
+                         suppression de ses arêtes : base indéterminée, redémarrer"
+                    );
                 }
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLaSuppression)?;
@@ -1049,6 +1145,7 @@ impl NoteStore for ObrainGraphStore {
         if !entite_portee(entity_type) {
             return refus_entite("NoteStore::link_note_to_entity", entity_type);
         }
+        id_entite_canonique(entity_type, entity_id)?;
         let signature = signature_hash.unwrap_or("").to_string();
         let corps = body_hash.unwrap_or("").to_string();
         let entite = entity_type.clone();
@@ -1072,6 +1169,18 @@ impl NoteStore for ObrainGraphStore {
                     return Ok(());
                 };
                 let maintenant = Utc::now();
+                // The hashes are strings too: above the blob threshold the full flush runs
+                // (new values, and those of the link they replace).
+                let long = |s: &str| s.len() > SEUIL_COLONNE_BLOB;
+                w.flush_complet = long(&signature)
+                    || long(&corps)
+                    || e.liens
+                        .iter()
+                        .filter(|l| l.entite == entite && l.id_entite == id_entite)
+                        .any(|l| {
+                            l.signature_hash.as_deref().is_some_and(long)
+                                || l.body_hash.as_deref().is_some_and(long)
+                        });
                 let arete = match e
                     .liens
                     .iter()
@@ -1080,8 +1189,11 @@ impl NoteStore for ObrainGraphStore {
                     Some(k) => e.liens[k].arete,
                     None => w.db.create_edge(e.noeud, noeud_cible, LIEN),
                 };
+                w.etape()?;
                 w.db.set_edge_property(arete, "signature_hash", Value::from(signature.clone()));
+                w.etape()?;
                 w.db.set_edge_property(arete, "body_hash", Value::from(corps.clone()));
+                w.etape()?;
                 w.db.set_edge_property(
                     arete,
                     "last_verified",
@@ -1189,6 +1301,7 @@ impl NoteStore for ObrainGraphStore {
         if !entite_portee(entity_type) {
             return refus_entite("NoteStore::unlink_note_from_entity", entity_type);
         }
+        id_entite_canonique(entity_type, entity_id)?;
         let entite = entity_type.clone();
         let id_entite = entity_id.to_string();
         self.ecrire(
@@ -1205,6 +1318,7 @@ impl NoteStore for ObrainGraphStore {
                     return Ok(());
                 };
                 let arete = e.liens.remove(k).arete;
+                w.etape()?;
                 w.db.delete_edge(arete);
                 w.rendre_durable()?;
                 w.index_mut()?.notes.publier(e);
@@ -1222,6 +1336,7 @@ impl NoteStore for ObrainGraphStore {
         if !entite_portee(entity_type) {
             return refus_entite("NoteStore::get_notes_for_entity", entity_type);
         }
+        id_entite_canonique(entity_type, entity_id)?;
         let cle = (entity_type.to_string(), entity_id.to_string());
         self.lire(|_, etat| {
             let mut notes: Vec<&Note> = etat
@@ -1284,12 +1399,15 @@ impl NoteStore for ObrainGraphStore {
                 ) else {
                     return Ok(());
                 };
+                w.etape()?;
                 w.db.set_node_property(vieille.noeud, "status", Value::from("archived"));
+                w.etape()?;
                 w.db.set_node_property(
                     vieille.noeud,
                     "superseded_by",
                     Value::from(new_note_id.to_string()),
                 );
+                w.etape()?;
                 w.db.set_node_property(
                     nouvelle.noeud,
                     "supersedes",
@@ -1305,6 +1423,7 @@ impl NoteStore for ObrainGraphStore {
                                 && w.db.get_edge(a).is_some_and(|e| &*e.edge_type == SUCCEDE)
                         });
                 if !deja {
+                    w.etape()?;
                     w.db.create_edge(nouvelle.noeud, vieille.noeud, SUCCEDE);
                 }
                 let entree_vieille = Self::relire(w, &vieille)?;
@@ -1340,26 +1459,40 @@ impl NoteStore for ObrainGraphStore {
                         .into_iter()
                         .any(|(_, a)| w.db.get_edge(a).is_some_and(|x| &*x.edge_type == SUCCEDE));
                 let maintenant = Utc::now();
+                // Strings above the blob threshold are not WAL-covered: the full flush runs
+                // before the answer, as for a creation (new values and replaced ones).
+                let long = |s: &str| s.len() > SEUIL_COLONNE_BLOB;
+                w.flush_complet = long(&par)
+                    || e.note.human_confirmed_by.as_deref().is_some_and(long)
+                    || e.note.last_confirmed_by.as_deref().is_some_and(long);
+                w.etape()?;
                 w.db.set_node_property(
                     noeud,
                     "last_confirmed_at",
                     Value::from(maintenant.to_rfc3339()),
                 );
+                w.etape()?;
                 w.db.set_node_property(noeud, "last_confirmed_by", Value::from(par.clone()));
                 if par_humain {
+                    w.etape()?;
                     w.db.set_node_property(
                         noeud,
                         "human_confirmed_at",
                         Value::from(maintenant.to_rfc3339()),
                     );
+                    w.etape()?;
                     w.db.set_node_property(noeud, "human_confirmed_by", Value::from(par.clone()));
                 }
+                w.etape()?;
                 w.db.set_node_property(noeud, "staleness_score", Value::from(0.0_f64));
                 if !remplacee {
+                    w.etape()?;
                     w.db.set_node_property(noeud, "status", Value::from("active"));
                     let energie = e.note.energy + 0.3;
+                    w.etape()?;
                     w.db.set_node_property(noeud, "energy", Value::from(energie.min(1.0)));
                 }
+                w.etape()?;
                 w.db.set_node_property(
                     noeud,
                     "last_activated",
@@ -1406,8 +1539,7 @@ impl NoteStore for ObrainGraphStore {
             // ORDER BY staleness_score DESC, importance DESC, id DESC LIMIT 500.
             notes.sort_by(|a, b| {
                 b.staleness_score
-                    .partial_cmp(&a.staleness_score)
-                    .unwrap_or(Ordering::Equal)
+                    .total_cmp(&a.staleness_score)
                     .then_with(|| b.importance.to_string().cmp(&a.importance.to_string()))
                     .then_with(|| b.id.cmp(&a.id))
             });
@@ -1424,24 +1556,30 @@ impl NoteStore for ObrainGraphStore {
 
     async fn get_note_anchors(&self, note_id: Uuid) -> Result<Vec<NoteAnchor>> {
         self.lire(|_, etat| {
-            Ok(etat
-                .notes
-                .par_id
-                .get(&note_id)
-                .map(|e| {
-                    e.liens
-                        .iter()
-                        .map(|l| NoteAnchor {
-                            entity_type: l.entite.clone(),
-                            entity_id: l.id_entite.clone(),
-                            signature_hash: l.signature_hash.clone(),
-                            body_hash: l.body_hash.clone(),
-                            last_verified: l.last_verified,
-                            is_valid: true,
-                        })
-                        .collect()
+            let Some(e) = etat.notes.par_id.get(&note_id) else {
+                return Ok(vec![]);
+            };
+            // A base migrated from Neo4j can hold links to domains this backend does not
+            // port: they are not in `liens`. Answering the partial list would be a silent
+            // empty or short result, so the answer is a named refusal instead.
+            if e.non_resolus > 0 {
+                return refus(
+                    "NoteStore::get_note_anchors",
+                    "la note a des liens sur disque vers des domaines non portés ou des cibles \
+                     absentes : la liste serait partielle",
+                );
+            }
+            Ok(e.liens
+                .iter()
+                .map(|l| NoteAnchor {
+                    entity_type: l.entite.clone(),
+                    entity_id: l.id_entite.clone(),
+                    signature_hash: l.signature_hash.clone(),
+                    body_hash: l.body_hash.clone(),
+                    last_verified: l.last_verified,
+                    is_valid: true,
                 })
-                .unwrap_or_default())
+                .collect())
         })
     }
 
@@ -1570,13 +1708,14 @@ fn filtre_note(n: &Note, f: &NoteFilters) -> bool {
             return false;
         }
     }
+    // A NaN is excluded by both bounds, as Neo4j's `NaN >= x` (NULL in WHERE) excludes it.
     if let Some(min) = f.min_staleness.filter(|v| v.is_finite()) {
-        if n.staleness_score < min {
+        if n.staleness_score.is_nan() || n.staleness_score < min {
             return false;
         }
     }
     if let Some(max) = f.max_staleness.filter(|v| v.is_finite()) {
-        if n.staleness_score > max {
+        if n.staleness_score.is_nan() || n.staleness_score > max {
             return false;
         }
     }
@@ -1589,12 +1728,14 @@ fn filtre_note(n: &Note, f: &NoteFilters) -> bool {
 }
 
 impl PartialOrd for Valeur {
+    /// Total: `f64::total_cmp` for numbers (a NaN is refused at the write, but the order
+    /// stays total if one comes from a migrated base).
     fn partial_cmp(&self, autre: &Self) -> Option<Ordering> {
-        match (self, autre) {
-            (Valeur::Instant(a), Valeur::Instant(b)) => a.partial_cmp(b),
-            (Valeur::Nombre(a), Valeur::Nombre(b)) => a.partial_cmp(b),
-            (Valeur::Texte(a), Valeur::Texte(b)) => a.partial_cmp(b),
-            _ => None,
-        }
+        Some(match (self, autre) {
+            (Valeur::Instant(a), Valeur::Instant(b)) => a.cmp(b),
+            (Valeur::Nombre(a), Valeur::Nombre(b)) => a.total_cmp(b),
+            (Valeur::Texte(a), Valeur::Texte(b)) => a.cmp(b),
+            (a, b) => a.rang().cmp(&b.rang()),
+        })
     }
 }

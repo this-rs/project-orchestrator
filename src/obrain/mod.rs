@@ -236,6 +236,10 @@ struct Ecriture<'a> {
     /// The write put a value in a place the WAL does not recover (see
     /// [`SEUIL_COLONNE_BLOB`]): the WAL fsync is not enough, the full flush runs.
     flush_complet: bool,
+    /// How many engine writes of this closure have been made (the test hook
+    /// `Interruption::ApresEtape` counts them).
+    #[cfg_attr(not(any(test, feature = "mock-store")), allow(dead_code))]
+    etapes: usize,
 }
 
 impl Ecriture<'_> {
@@ -267,6 +271,18 @@ impl Ecriture<'_> {
         if *arme == Some(point) {
             *arme = None;
             bail!("interruption injectée par le test : {point:?}");
+        }
+        Ok(())
+    }
+
+    /// A test hook after each engine write of a multi-write (see `note.rs`): a crash
+    /// simulation at the k-th write. Nothing in production.
+    fn etape(&mut self) -> Result<()> {
+        #[cfg(any(test, feature = "mock-store"))]
+        {
+            self.etapes += 1;
+            let n = self.etapes;
+            self.point(Interruption::ApresEtape(n))?;
         }
         Ok(())
     }
@@ -606,6 +622,7 @@ impl ObrainGraphStore {
                 interne: &interne,
                 rendu_durable: false,
                 flush_complet: false,
+                etapes: 0,
             };
             let rendu = f(prepare, &mut ecriture)?;
             if !ecriture.rendu_durable {
