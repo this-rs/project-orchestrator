@@ -68,6 +68,7 @@
 //! on the blocking pool.
 
 mod auth;
+mod chat;
 mod federation;
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
@@ -129,6 +130,12 @@ pub fn refusees_release() -> &'static [&'static str] {
     release::REFUSEES
 }
 
+/// The methods of `ChatStore` refused on every call, as `ChatStore::<method>`
+/// (`chat.rs`).
+pub fn refusees_chat() -> &'static [&'static str] {
+    chat::REFUSEES
+}
+
 /// The hand-written methods that REFUSE: `GraphStore::get_progress_batch` (its
 /// contract default loops over getters of other domains), the five
 /// `FederationStore` methods whose relation writes and backfills are not ported
@@ -165,6 +172,7 @@ pub fn methodes_qui_servent() -> Vec<&'static str> {
             !REFUS_ECRITS_A_LA_MAIN.contains(m)
                 && !release::REFUSEES.contains(m)
                 && !note::REFUSEES.contains(m)
+                && !chat::REFUSEES.contains(m)
                 && !m.starts_with("GraphStore::")
         })
         .collect()
@@ -269,6 +277,7 @@ struct Etat {
     releases: release::IndexReleases,
     espaces: workspace::IndexEspaces,
     notes: note::IndexNotes,
+    chat: chat::IndexChat,
     federation: federation::IndexFederation,
 }
 
@@ -536,6 +545,7 @@ impl ObrainGraphStore {
             .with_context(contexte)?;
         let notes =
             note::IndexNotes::reconstruire(&db, &projets, &mut rapport).with_context(contexte)?;
+        let chat = chat::IndexChat::reconstruire(&db, &mut rapport).with_context(contexte)?;
         let (federation, brouillons, quarantaine) = federation::IndexFederation::reconstruire(&db)
             .with_context(|| {
                 format!(
@@ -551,6 +561,7 @@ impl ObrainGraphStore {
             releases,
             espaces,
             notes,
+            chat,
             federation,
         };
         let store = Self {
