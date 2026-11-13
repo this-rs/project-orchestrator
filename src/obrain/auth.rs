@@ -33,6 +33,24 @@
 //! - `upsert_user` on an OIDC email change that another user of the same
 //!   provider already holds is not refused: the pair `(provider, email)` is not a
 //!   key (two OIDC users may share an email), exactly as in Neo4j.
+//! - A `User` node quarantined at open keeps its keys (id, `(provider,
+//!   external_id)`, `(provider, email)`, email): an `upsert_user` that merges on one
+//!   of them, and a `get_user_by_*` that reads one, is REFUSED by name (an error,
+//!   never `None`). Neo4j would MATCH that node; answering `None` here would turn a
+//!   `register` on its email into a second account (Neo4j: Conflict), and an OIDC
+//!   login into a new id without its tokens.
+//! - `revoked` of a `RefreshToken` or a `McpToken` must be a boolean. Absent or of
+//!   another type, the node is quarantined at open, so the token is unknown: not
+//!   valid, not active, not consumable, not listed. Neo4j reads such an MCP token
+//!   as revoked in `is_mcp_token_active` (`unwrap_or(true)`) but as not revoked in
+//!   `list_mcp_tokens`, and such a refresh token as not revoked (`unwrap_or(false)`:
+//!   valid and consumable). In particular `revoke_all_user_tokens` never meets a
+//!   token without `revoked` (Neo4j's `{revoked: false}` pattern skips it and
+//!   leaves it valid; here it is not valid at all).
+//! - Where several `User` nodes share a MERGE key (foreign data only: this backend
+//!   refuses the duplicate it would create), ON MATCH updates the earliest-created
+//!   one, the one the `get_*` return. Neo4j's MERGE applies ON MATCH to every
+//!   matching node.
 //!
 //! # Durability and atomicity
 //!
@@ -59,7 +77,7 @@
 //! Served from the index (hash lookups, and a sort for the listings), without
 //! engine calls. The index is rebuilt from the base at every open.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::atomic::Ordering;
 
@@ -70,6 +88,8 @@ use obrain_common::types::{NodeId, Value};
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
+#[cfg(any(test, feature = "mock-store"))]
+use super::Interruption;
 use super::{Ecriture, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
 use crate::neo4j::models::{AuthProvider, McpTokenNode, RefreshTokenNode, UserNode};
 use crate::neo4j::traits::AuthStore;
@@ -108,6 +128,15 @@ fn instant(get: &dyn Fn(&str) -> Option<Value>, cle: &str) -> Result<DateTime<Ut
     let s = requis(get, cle)?;
     s.parse::<DateTime<Utc>>()
         .map_err(|e| anyhow!("`{cle}` illisible : {e}"))
+}
+
+/// A boolean that must be one. Absent or of another type (`"true"`, `1`) is an
+/// error, so the node is quarantined at open: a token whose revocation state cannot
+/// be read is never served as "not revoked" (see the module doc).
+fn booleen(get: &dyn Fn(&str) -> Option<Value>, cle: &str) -> Result<bool> {
+    get(cle)
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| anyhow!("nœud d'authentification sans booléen `{cle}` lisible"))
 }
 
 fn non_vide(s: Option<String>) -> Option<String> {
@@ -152,7 +181,7 @@ fn lire_jeton(get: &dyn Fn(&str) -> Option<Value>) -> Result<RefreshTokenNode> {
             .map_err(|e| anyhow!("`user_id` illisible : {e}"))?,
         expires_at: instant(get, "expires_at")?,
         created_at: instant(get, "created_at")?,
-        revoked: get("revoked").and_then(|v| v.as_bool()).unwrap_or(false),
+        revoked: booleen(get, "revoked")?,
     })
 }
 
@@ -166,7 +195,7 @@ fn lire_mcp(get: &dyn Fn(&str) -> Option<Value>) -> Result<McpTokenNode> {
         scope: texte(get, "scope").unwrap_or_default(),
         expires_at: instant(get, "expires_at")?,
         created_at: instant(get, "created_at")?,
-        revoked: get("revoked").and_then(|v| v.as_bool()).unwrap_or(false),
+        revoked: booleen(get, "revoked")?,
     })
 }
 
@@ -236,6 +265,95 @@ pub(super) struct IndexAuth {
     /// jti → MCP token.
     mcp: HashMap<String, EntreeMcp>,
     mcp_par_utilisateur: HashMap<Uuid, Vec<String>>,
+    /// The raw keys of the `User` nodes quarantined at open (see [`Reserves`]).
+    reserves: Reserves,
+}
+
+/// The keys of the `User` nodes that are on disk but quarantined at open (undecodable,
+/// or a duplicate id): what Neo4j's MATCH and MERGE would still find. A quarantined
+/// node is in no index, so without this a MERGE would fall through to ON CREATE and
+/// make a SECOND account under the key (a `register` on the email of a quarantined
+/// password account would succeed, and hand its email to whoever registers; Neo4j
+/// answers Conflict). A key listed here refuses, by name, the upsert that merges on
+/// it and the lookups that read it; nothing is ever written over the node.
+#[derive(Default)]
+struct Reserves {
+    ids: HashSet<Uuid>,
+    /// (raw `auth_provider`, raw `external_id`), as `par_externe`.
+    externes: HashSet<(String, String)>,
+    /// (raw `auth_provider`, raw `email`), as `par_fournisseur_email`.
+    fournisseur_email: HashSet<(String, String)>,
+    emails: HashSet<String>,
+}
+
+impl Reserves {
+    /// Reserve what can be read of a quarantined `User` node's keys. The keys are
+    /// the raw strings the index would have used; an unreadable key reserves nothing
+    /// (no lookup can produce it).
+    fn reserver(&mut self, get: &dyn Fn(&str) -> Option<Value>) {
+        if let Some(id) = texte(get, "id").and_then(|s| s.parse::<Uuid>().ok()) {
+            self.ids.insert(id);
+        }
+        let email = texte(get, "email");
+        if let Some(f) = texte(get, "auth_provider") {
+            if let Some(x) = texte(get, "external_id") {
+                self.externes.insert((f.clone(), x));
+            }
+            if let Some(e) = &email {
+                self.fournisseur_email.insert((f, e.clone()));
+            }
+        }
+        if let Some(e) = email {
+            self.emails.insert(e);
+        }
+    }
+
+    fn refus(quoi: &str) -> anyhow::Error {
+        anyhow!(
+            "{quoi} est réservé : un nœud User de cette clé est sur disque, illisible ou en \
+             double à l'ouverture (quarantaine). Il n'est ni lu, ni repris, ni doublé ; \
+             réparer la base puis redémarrer"
+        )
+    }
+
+    fn id(&self, id: Uuid) -> Result<()> {
+        if self.ids.contains(&id) {
+            return Err(Self::refus(&format!("l'id utilisateur {id}")));
+        }
+        Ok(())
+    }
+
+    // The key values (an email, an external id) are not repeated in the message.
+    fn externe(&self, fournisseur: &str, externe: &str) -> Result<()> {
+        if self
+            .externes
+            .contains(&(fournisseur.to_string(), externe.to_string()))
+        {
+            return Err(Self::refus(&format!(
+                "la clé ({fournisseur}, external_id) demandée"
+            )));
+        }
+        Ok(())
+    }
+
+    fn fournisseur_email(&self, fournisseur: &str, email: &str) -> Result<()> {
+        if self
+            .fournisseur_email
+            .contains(&(fournisseur.to_string(), email.to_string()))
+        {
+            return Err(Self::refus(&format!(
+                "la clé ({fournisseur}, email) demandée"
+            )));
+        }
+        Ok(())
+    }
+
+    fn email(&self, email: &str) -> Result<()> {
+        if self.emails.contains(email) {
+            return Err(Self::refus("l'email demandé"));
+        }
+        Ok(())
+    }
 }
 
 /// Remove one value from the list of a key, and the key when its list is empty.
@@ -367,18 +485,23 @@ impl IndexAuth {
                     continue;
                 }
                 match etiquette {
-                    UTILISATEUR => match entree_utilisateur(db, noeud) {
-                        Ok(e) if !index.utilisateurs.contains_key(&e.utilisateur.id) => {
-                            index.inserer_utilisateur(e)
+                    UTILISATEUR => {
+                        let motif = match entree_utilisateur(db, noeud) {
+                            Ok(e) if !index.utilisateurs.contains_key(&e.utilisateur.id) => {
+                                index.inserer_utilisateur(e);
+                                continue;
+                            }
+                            Ok(e) => format!("id {} déjà pris", e.utilisateur.id),
+                            Err(err) => err.to_string(),
+                        };
+                        // Its keys stay taken: see `Reserves`.
+                        if let Ok(get) = hydrater(db, noeud) {
+                            index.reserves.reserver(&get);
                         }
-                        Ok(e) => rapport.en_quarantaine.push(format!(
-                            "nœud {etiquette} {noeud:?} : id {} déjà pris",
-                            e.utilisateur.id
-                        )),
-                        Err(err) => rapport
+                        rapport
                             .en_quarantaine
-                            .push(format!("nœud {etiquette} {noeud:?} : {err}")),
-                    },
+                            .push(format!("nœud {etiquette} {noeud:?} : {motif}"));
+                    }
                     JETON_RAFRAICHISSEMENT => match entree_jeton(db, noeud) {
                         Ok(e) if !index.jetons.contains_key(&e.jeton.token_hash) => {
                             index.inserer_jeton(e)
@@ -430,12 +553,22 @@ fn creer_noeud(
 ) -> Result<NodeId> {
     w.flush_complet = proprietes.iter().any(|(_, v)| en_colonne_blob(v));
     let noeud = w.db.create_node(&[etiquette]);
+    #[cfg(any(test, feature = "mock-store"))]
+    w.point(Interruption::ApresLeNoeud)?;
     w.db.set_node_property(noeud, BROUILLON, Value::from(true));
-    for (cle, valeur) in proprietes {
+    #[cfg(any(test, feature = "mock-store"))]
+    w.point(Interruption::ApresLeMarqueur)?;
+    for (_k, (cle, valeur)) in proprietes.into_iter().enumerate() {
         w.db.set_node_property(noeud, cle, valeur);
+        #[cfg(any(test, feature = "mock-store"))]
+        w.point(Interruption::ApresLaPropriete(_k + 1))?;
     }
     w.rendre_durable_avant_le_marqueur()?;
+    #[cfg(any(test, feature = "mock-store"))]
+    w.point(Interruption::AvantLeRetraitDuMarqueur)?;
     w.db.remove_node_property(noeud, BROUILLON);
+    #[cfg(any(test, feature = "mock-store"))]
+    w.point(Interruption::ApresLeRetraitDuMarqueur)?;
     Ok(noeud)
 }
 
@@ -461,6 +594,17 @@ fn fusionner_utilisateur(w: &mut Ecriture<'_>, u: UserNode) -> Result<UserNode> 
     let oidc = u.auth_provider == AuthProvider::Oidc;
     let existant = {
         let etat = w.index()?;
+        // A quarantined node holds the MERGE key: Neo4j would MATCH it. Neither
+        // updated (it is unreadable) nor doubled (a second account under its key).
+        if oidc {
+            etat.auth
+                .reserves
+                .externe(&fournisseur, u.external_id.as_deref().unwrap_or_default())?;
+        } else {
+            etat.auth
+                .reserves
+                .fournisseur_email(&fournisseur, &u.email)?;
+        }
         let entree = if oidc {
             etat.auth
                 .externe(&fournisseur, u.external_id.as_deref().unwrap_or_default())
@@ -514,7 +658,11 @@ fn fusionner_utilisateur(w: &mut Ecriture<'_>, u: UserNode) -> Result<UserNode> 
         }
         // ON CREATE: the MERGE key and the ON CREATE properties of the Neo4j query.
         None => {
-            let deja_pris = w.index()?.auth.utilisateurs.contains_key(&u.id);
+            let deja_pris = {
+                let etat = w.index()?;
+                etat.auth.reserves.id(u.id)?;
+                etat.auth.utilisateurs.contains_key(&u.id)
+            };
             if deja_pris {
                 bail!(
                     "un utilisateur d'id {} existe déjà (unicité de User.id)",
@@ -629,6 +777,7 @@ impl AuthStore for ObrainGraphStore {
 
     async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserNode>> {
         self.lire(|_, etat| {
+            etat.auth.reserves.id(id)?;
             Ok(etat
                 .auth
                 .utilisateurs
@@ -643,6 +792,7 @@ impl AuthStore for ObrainGraphStore {
         external_id: &str,
     ) -> Result<Option<UserNode>> {
         self.lire(|_, etat| {
+            etat.auth.reserves.externe(provider, external_id)?;
             Ok(etat
                 .auth
                 .externe(provider, external_id)
@@ -656,6 +806,7 @@ impl AuthStore for ObrainGraphStore {
         provider: &str,
     ) -> Result<Option<UserNode>> {
         self.lire(|_, etat| {
+            etat.auth.reserves.fournisseur_email(provider, email)?;
             Ok(etat
                 .auth
                 .fournisseur_email(provider, email)
@@ -664,7 +815,10 @@ impl AuthStore for ObrainGraphStore {
     }
 
     async fn get_user_by_email(&self, email: &str) -> Result<Option<UserNode>> {
-        self.lire(|_, etat| Ok(etat.auth.email(email).map(|e| e.utilisateur.clone())))
+        self.lire(|_, etat| {
+            etat.auth.reserves.email(email)?;
+            Ok(etat.auth.email(email).map(|e| e.utilisateur.clone()))
+        })
     }
 
     async fn create_password_user(
@@ -1135,5 +1289,289 @@ mod tests {
             .unwrap()
             .is_some());
         rouverte.close().await.unwrap();
+    }
+
+    /// The node of a user, as the index holds it.
+    fn noeud_utilisateur(store: &ObrainGraphStore, id: Uuid) -> NodeId {
+        store.interne.etat.read().unwrap().auth.utilisateurs[&id].noeud
+    }
+
+    /// A node written straight into the engine (another writer, a migration, a
+    /// damaged import), made durable by the close that follows.
+    fn noeud_etranger(store: &ObrainGraphStore, etiquette: &str, proprietes: &[(&str, Value)]) {
+        let db = &store.interne.db;
+        let n = db.create_node(&[etiquette]);
+        for (cle, valeur) in proprietes {
+            db.set_node_property(n, cle, valeur.clone());
+        }
+    }
+
+    async fn rouvrir(chemin: &std::path::Path) -> ObrainGraphStore {
+        let chemin = chemin.to_path_buf();
+        tokio::task::spawn_blocking(move || ObrainGraphStore::open(chemin, Creation::Interdite))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    fn refuse<T: std::fmt::Debug>(r: Result<T>, quoi: &str) {
+        let e = r.expect_err(quoi);
+        assert!(format!("{e:#}").contains("réservé"), "{quoi}: {e:#}");
+    }
+
+    /// A `User` quarantined at open keeps its keys: no second account is created
+    /// under them, and no lookup answers `None` for them (Neo4j would MATCH it).
+    #[tokio::test]
+    async fn un_utilisateur_en_quarantaine_garde_ses_cles() {
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = dossier.path().join("base");
+        let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+        let victime = store
+            .create_password_user("p@ex.test", "P", "hash-victime")
+            .await
+            .unwrap();
+        let oidc_victime = store
+            .upsert_user(&oidc("sub-q", "q@ex.test"))
+            .await
+            .unwrap();
+        let sain = store
+            .create_password_user("s@ex.test", "S", "hash-s")
+            .await
+            .unwrap();
+        // Damaged: `created_at` unreadable (no timestamp is invented), `name` gone.
+        let db = &store.interne.db;
+        db.set_node_property(
+            noeud_utilisateur(&store, victime.id),
+            "created_at",
+            Value::from("pas une date"),
+        );
+        db.remove_node_property(noeud_utilisateur(&store, oidc_victime.id), "name");
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = rouvrir(&chemin).await;
+        assert_eq!(
+            store.rapport_d_ouverture().en_quarantaine.len(),
+            2,
+            "{:?}",
+            store.rapport_d_ouverture()
+        );
+        // Password: the `register` sequence (lookup, then create) is refused at both
+        // steps, never a second account with the newcomer's hash.
+        refuse(
+            store
+                .get_user_by_email_and_provider("p@ex.test", "password")
+                .await,
+            "lookup of a quarantined (provider, email)",
+        );
+        refuse(
+            store
+                .create_password_user("p@ex.test", "Intrus", "hash-intrus")
+                .await,
+            "a creation on a quarantined (provider, email)",
+        );
+        refuse(store.get_user_by_email("p@ex.test").await, "by email");
+        refuse(store.get_user_by_id(victime.id).await, "by id");
+        let mut meme_id = oidc("sub-autre", "autre@ex.test");
+        meme_id.id = victime.id;
+        refuse(
+            store.upsert_user(&meme_id).await,
+            "a creation on a quarantined id",
+        );
+        // OIDC: the login of the quarantined subject is refused, not a new id.
+        refuse(
+            store.upsert_user(&oidc("sub-q", "q2@ex.test")).await,
+            "an OIDC upsert on a quarantined (provider, external_id)",
+        );
+        refuse(
+            store.get_user_by_provider_id("oidc", "sub-q").await,
+            "lookup of a quarantined (provider, external_id)",
+        );
+        // Nothing was created; the healthy user and other keys are served.
+        let ids: Vec<Uuid> = store
+            .list_users()
+            .await
+            .unwrap()
+            .iter()
+            .map(|u| u.id)
+            .collect();
+        assert_eq!(ids, vec![sain.id]);
+        assert_eq!(
+            store
+                .get_user_by_email_and_provider("s@ex.test", "password")
+                .await
+                .unwrap()
+                .map(|u| u.id),
+            Some(sain.id)
+        );
+        store
+            .create_password_user("n@ex.test", "N", "hash-n")
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+    }
+
+    /// A token whose `revoked` is absent or not a boolean is never served as
+    /// active (Neo4j's `is_mcp_token_active` reads it as revoked): quarantined.
+    #[tokio::test]
+    async fn un_jeton_sans_booleen_revoked_n_est_jamais_actif() {
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = dossier.path().join("base");
+        let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+        let user = store
+            .create_password_user("t@ex.test", "T", "h")
+            .await
+            .unwrap();
+        let futur = (Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        let maintenant = Utc::now().to_rfc3339();
+        store
+            .create_mcp_token(
+                user.id,
+                "jti-sain",
+                "l",
+                "s",
+                Utc::now() + chrono::Duration::days(1),
+            )
+            .await
+            .unwrap();
+        let mcp = |jti: &'static str, revoked: Option<Value>| {
+            let mut p = vec![
+                ("jti", Value::from(jti)),
+                ("user_id", Value::from(user.id.to_string())),
+                ("label", Value::from("l")),
+                ("scope", Value::from("s")),
+                ("expires_at", Value::from(futur.clone())),
+                ("created_at", Value::from(maintenant.clone())),
+            ];
+            if let Some(r) = revoked {
+                p.push(("revoked", r));
+            }
+            p
+        };
+        noeud_etranger(&store, JETON_MCP, &mcp("jti-absent", None));
+        noeud_etranger(
+            &store,
+            JETON_MCP,
+            &mcp("jti-texte", Some(Value::from("true"))),
+        );
+        noeud_etranger(
+            &store,
+            JETON_RAFRAICHISSEMENT,
+            &[
+                ("token_hash", Value::from("empreinte-absente")),
+                ("user_id", Value::from(user.id.to_string())),
+                ("expires_at", Value::from(futur.clone())),
+                ("created_at", Value::from(maintenant.clone())),
+            ],
+        );
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = rouvrir(&chemin).await;
+        assert_eq!(
+            store.rapport_d_ouverture().en_quarantaine.len(),
+            3,
+            "{:?}",
+            store.rapport_d_ouverture()
+        );
+        assert!(!store.is_mcp_token_active("jti-absent").await.unwrap());
+        assert!(!store.is_mcp_token_active("jti-texte").await.unwrap());
+        assert!(store.is_mcp_token_active("jti-sain").await.unwrap());
+        assert!(store
+            .validate_refresh_token("empreinte-absente")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .consume_refresh_token("empreinte-absente")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(store.revoke_all_user_tokens(user.id).await.unwrap(), 0);
+        store.close().await.unwrap();
+    }
+
+    /// The rotation's guarantee under real concurrency: N consumptions of one
+    /// token at once, exactly one succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn rotation_concurrente_un_seul_succes() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let user = store
+            .create_password_user("c@ex.test", "C", "h")
+            .await
+            .unwrap();
+        for tour in 0..5 {
+            let hash = format!("empreinte-concurrente-{tour}");
+            store
+                .create_refresh_token(user.id, &hash, Utc::now() + chrono::Duration::hours(1))
+                .await
+                .unwrap();
+            let reponses =
+                futures::future::join_all((0..16).map(|_| store.consume_refresh_token(&hash)))
+                    .await;
+            let succes = reponses
+                .into_iter()
+                .map(|r| r.unwrap())
+                .filter(Option::is_some)
+                .count();
+            assert_eq!(succes, 1, "tour {tour}: {succes} consumptions succeeded");
+        }
+        store.close().await.unwrap();
+    }
+
+    /// A creation stopped at any point before its commit point reopens as a
+    /// deleted draft (the key is free, a retry succeeds); stopped after it, as the
+    /// whole record (a retry merges on it).
+    #[tokio::test]
+    async fn une_creation_interrompue_reouvre_coherente() {
+        let dossier = tempfile::tempdir().unwrap();
+        let mut points = vec![Interruption::ApresLeNoeud, Interruption::ApresLeMarqueur];
+        points.extend((1..=9).map(Interruption::ApresLaPropriete));
+        points.extend([
+            Interruption::AvantLeRetraitDuMarqueur,
+            Interruption::ApresLeRetraitDuMarqueur,
+        ]);
+        for (k, point) in points.into_iter().enumerate() {
+            let chemin = dossier.path().join(format!("base-{k}"));
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.interrompre_au_prochain(point);
+            let err = store
+                .create_password_user("i@ex.test", "I", "h")
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("interruption injectée"),
+                "{point:?}"
+            );
+            assert!(store
+                .get_user_by_email("i@ex.test")
+                .await
+                .unwrap()
+                .is_none());
+            store.close().await.unwrap();
+            drop(store);
+
+            let store = rouvrir(&chemin).await;
+            let rapport = store.rapport_d_ouverture().clone();
+            assert!(rapport.en_quarantaine.is_empty(), "{point:?}: {rapport:?}");
+            let lu = store
+                .get_user_by_email_and_provider("i@ex.test", "password")
+                .await
+                .unwrap();
+            if point == Interruption::ApresLeRetraitDuMarqueur {
+                assert_eq!(rapport.brouillons_supprimes, 0, "{point:?}");
+                assert_eq!(lu.and_then(|u| u.password_hash).as_deref(), Some("h"));
+            } else {
+                assert_eq!(rapport.brouillons_supprimes, 1, "{point:?}: {rapport:?}");
+                assert!(lu.is_none(), "{point:?}");
+            }
+            let u = store
+                .create_password_user("i@ex.test", "I", "h")
+                .await
+                .unwrap();
+            assert_eq!(store.list_users().await.unwrap().len(), 1, "{point:?}");
+            assert_eq!(u.email, "i@ex.test");
+            store.close().await.unwrap();
+        }
     }
 }

@@ -17046,7 +17046,10 @@ impl AuthStore for MockGraphStore {
     }
 
     async fn list_users(&self) -> Result<Vec<UserNode>> {
-        Ok(self.users.read().await.values().cloned().collect())
+        let mut users: Vec<UserNode> = self.users.read().await.values().cloned().collect();
+        // ORDER BY u.created_at DESC, u.id DESC, as the Cypher.
+        users.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        Ok(users)
     }
 
     // Refresh Tokens
@@ -17179,11 +17182,15 @@ impl AuthStore for MockGraphStore {
         user_id: Uuid,
     ) -> Result<Vec<crate::neo4j::models::McpTokenNode>> {
         let tokens = self.mcp_tokens.read().await;
-        Ok(tokens
+        let mut tokens: Vec<_> = tokens
             .values()
             .filter(|t| t.user_id == user_id)
             .cloned()
-            .collect())
+            .collect();
+        // ORDER BY mt.created_at DESC, as the Cypher (its tie-break on `mt.id`, a
+        // property never written, is undefined: `jti` here, as the obrain adapter).
+        tokens.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.jti.cmp(&a.jti)));
+        Ok(tokens)
     }
 
     async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64> {

@@ -4338,6 +4338,283 @@ pub mod conformance {
         store.delete_plan(x.id).await.unwrap();
         store.delete_project(p.id, &p.name).await.ok();
     }
+
+    // ------------------------------------------------------------------
+    // Auth: users, refresh tokens, MCP tokens (`AuthStore`). Neo4j has no user
+    // delete in the trait: users are left behind, under fresh emails and ids.
+    // ------------------------------------------------------------------
+
+    fn a_user(
+        provider: project_orchestrator::neo4j::models::AuthProvider,
+        label: &str,
+        created_at: DateTime<Utc>,
+    ) -> project_orchestrator::neo4j::models::UserNode {
+        use project_orchestrator::neo4j::models::{AuthProvider, UserNode};
+        let id = Uuid::new_v4();
+        let oidc = provider == AuthProvider::Oidc;
+        UserNode {
+            id,
+            email: format!("conformance-{label}-{id}@example.test"),
+            name: format!("conformance {label}"),
+            picture_url: None,
+            auth_provider: provider,
+            external_id: oidc.then(|| format!("sub-{id}")),
+            password_hash: (!oidc).then(|| format!("hash-{id}")),
+            created_at,
+            last_login_at: created_at,
+        }
+    }
+
+    /// The MERGE keys: a password user merges on (provider, email) and never has
+    /// its hash rewritten; an OIDC user merges on (provider, external_id) and its
+    /// email follows the provider. Every lookup finds the merged user; the id a
+    /// second upsert offers never becomes a user.
+    pub async fn check_auth_user_merge(store: &dyn GraphStore) {
+        use project_orchestrator::neo4j::models::AuthProvider;
+        let p = a_user(AuthProvider::Password, "merge-pw", at(0));
+        let created = store.upsert_user(&p).await.unwrap();
+        assert_eq!(created.id, p.id);
+        let mut again = a_user(AuthProvider::Password, "merge-pw-2", at(5));
+        again.email = p.email.clone();
+        again.name = "renamed".to_string();
+        let merged = store.upsert_user(&again).await.unwrap();
+        assert_eq!(merged.id, p.id, "the password MERGE keeps the stored id");
+        assert_eq!(merged.name, "renamed", "ON MATCH refreshes the name");
+        assert_eq!(
+            merged.password_hash, p.password_hash,
+            "ON MATCH never rewrites the password hash"
+        );
+        assert!(store.get_user_by_id(again.id).await.unwrap().is_none());
+        let by_key = store
+            .get_user_by_email_and_provider(&p.email, "password")
+            .await
+            .unwrap()
+            .expect("found by (email, provider)");
+        assert_eq!(by_key.id, p.id);
+        assert_eq!(by_key.password_hash, p.password_hash);
+        assert!(store
+            .get_user_by_email_and_provider(&p.email, "oidc")
+            .await
+            .unwrap()
+            .is_none());
+
+        let o = a_user(AuthProvider::Oidc, "merge-oidc", at(0));
+        store.upsert_user(&o).await.unwrap();
+        let mut login = a_user(AuthProvider::Oidc, "merge-oidc-2", at(5));
+        login.external_id = o.external_id.clone();
+        login.name = "from the provider".to_string();
+        let merged = store.upsert_user(&login).await.unwrap();
+        assert_eq!(merged.id, o.id, "the OIDC MERGE keeps the stored id");
+        assert_eq!(merged.email, login.email, "the email follows the provider");
+        assert_eq!(merged.name, "from the provider");
+        let by_sub = store
+            .get_user_by_provider_id("oidc", o.external_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .expect("found by (provider, external_id)");
+        assert_eq!(by_sub.id, o.id);
+        assert_eq!(by_sub.email, login.email);
+        assert!(
+            store.get_user_by_email(&o.email).await.unwrap().is_none(),
+            "the old email no longer finds the user"
+        );
+        assert_eq!(
+            store
+                .get_user_by_email(&login.email)
+                .await
+                .unwrap()
+                .map(|u| u.id),
+            Some(o.id)
+        );
+
+        let mut sans_sub = a_user(AuthProvider::Oidc, "merge-nosub", at(0));
+        sans_sub.external_id = None;
+        let err = store.upsert_user(&sans_sub).await.unwrap_err();
+        assert!(err.to_string().contains("external_id"), "{err}");
+        assert!(store.get_user_by_id(sans_sub.id).await.unwrap().is_none());
+    }
+
+    /// `list_users`: newest `created_at` first, then id descending.
+    pub async fn check_auth_list_users_order(store: &dyn GraphStore) {
+        use project_orchestrator::neo4j::models::AuthProvider;
+        let mut mine = Vec::new();
+        for (i, s) in [10, 30, 20, 30].into_iter().enumerate() {
+            let u = a_user(AuthProvider::Password, &format!("order-{i}"), at(s));
+            store.upsert_user(&u).await.unwrap();
+            mine.push(u);
+        }
+        let ours: HashSet<Uuid> = mine.iter().map(|u| u.id).collect();
+        let got: Vec<Uuid> = store
+            .list_users()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|u| ours.contains(&u.id))
+            .map(|u| u.id)
+            .collect();
+        let mut want = mine.clone();
+        want.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        assert_eq!(got, want.iter().map(|u| u.id).collect::<Vec<_>>());
+    }
+
+    /// Refresh tokens: valid until consumed, consumed once (the observed state is
+    /// returned, with the user), an expired token is not consumable and is revoked
+    /// anyway, `revoke_*` answer true for a known token even if already revoked,
+    /// and `revoke_all_user_tokens` counts what it revoked.
+    pub async fn check_auth_refresh_rotation(store: &dyn GraphStore) {
+        use project_orchestrator::neo4j::models::AuthProvider;
+        let u = store
+            .upsert_user(&a_user(AuthProvider::Password, "refresh", Utc::now()))
+            .await
+            .unwrap();
+        let futur = Utc::now() + Duration::hours(1);
+        let h = format!("conformance-rt-{}", Uuid::new_v4());
+        store.create_refresh_token(u.id, &h, futur).await.unwrap();
+        let v = store
+            .validate_refresh_token(&h)
+            .await
+            .unwrap()
+            .expect("valid");
+        assert_eq!((v.user_id, v.revoked), (u.id, false));
+
+        let (jeton, user) = store
+            .consume_refresh_token(&h)
+            .await
+            .unwrap()
+            .expect("the first consumption succeeds");
+        assert_eq!(jeton.token_hash, h);
+        assert!(!jeton.revoked, "the state observed before the revoke");
+        assert_eq!(user.map(|x| x.id), Some(u.id));
+        assert!(store.consume_refresh_token(&h).await.unwrap().is_none());
+        assert!(store.validate_refresh_token(&h).await.unwrap().is_none());
+        assert!(
+            store.revoke_refresh_token(&h).await.unwrap(),
+            "known, already revoked"
+        );
+        assert!(!store
+            .revoke_refresh_token(&format!("conformance-absent-{}", Uuid::new_v4()))
+            .await
+            .unwrap());
+        assert!(store
+            .consume_refresh_token(&format!("conformance-absent-{}", Uuid::new_v4()))
+            .await
+            .unwrap()
+            .is_none());
+
+        // Expired: never consumable, revoked by the attempt all the same.
+        let expire = format!("conformance-rt-exp-{}", Uuid::new_v4());
+        store
+            .create_refresh_token(u.id, &expire, Utc::now() - Duration::hours(1))
+            .await
+            .unwrap();
+        assert!(store
+            .validate_refresh_token(&expire)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .consume_refresh_token(&expire)
+            .await
+            .unwrap()
+            .is_none());
+
+        // A consumable token of a user with no `User` row (the root account).
+        let orphelin = Uuid::new_v4();
+        let ho = format!("conformance-rt-orphan-{}", Uuid::new_v4());
+        store
+            .create_refresh_token(orphelin, &ho, futur)
+            .await
+            .unwrap();
+        let (_, user) = store.consume_refresh_token(&ho).await.unwrap().unwrap();
+        assert!(user.is_none());
+
+        for _ in 0..2 {
+            let x = format!("conformance-rt-all-{}", Uuid::new_v4());
+            store.create_refresh_token(u.id, &x, futur).await.unwrap();
+        }
+        assert_eq!(store.revoke_all_user_tokens(u.id).await.unwrap(), 2);
+        assert_eq!(store.revoke_all_user_tokens(u.id).await.unwrap(), 0);
+    }
+
+    /// MCP tokens: active until revoked by their OWNER or expired; listed newest
+    /// first; the purge removes the dead ones only.
+    pub async fn check_auth_mcp_tokens(store: &dyn GraphStore) {
+        let owner = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let futur = Utc::now() + Duration::days(1);
+        let jti = |k: &str| format!("conformance-jti-{k}-{owner}");
+        // Distinct `created_at` (set by the store): the order is not a tie.
+        store
+            .create_mcp_token(owner, &jti("a"), "a", "mcp:read", futur)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        store
+            .create_mcp_token(owner, &jti("b"), "b", "mcp:write", futur)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        store
+            .create_mcp_token(
+                owner,
+                &jti("c"),
+                "c",
+                "mcp:read",
+                Utc::now() - Duration::hours(1),
+            )
+            .await
+            .unwrap();
+
+        assert!(store.is_mcp_token_active(&jti("a")).await.unwrap());
+        assert!(
+            !store.is_mcp_token_active(&jti("c")).await.unwrap(),
+            "expired"
+        );
+        assert!(!store
+            .is_mcp_token_active(&format!("conformance-absent-{}", Uuid::new_v4()))
+            .await
+            .unwrap());
+        assert!(
+            !store.revoke_mcp_token(other, &jti("a")).await.unwrap(),
+            "another user's token is not found"
+        );
+        assert!(store.is_mcp_token_active(&jti("a")).await.unwrap());
+        assert!(store.revoke_mcp_token(owner, &jti("a")).await.unwrap());
+        assert!(!store.is_mcp_token_active(&jti("a")).await.unwrap());
+        assert!(
+            store.revoke_mcp_token(owner, &jti("a")).await.unwrap(),
+            "already revoked"
+        );
+
+        let liste = store.list_mcp_tokens(owner).await.unwrap();
+        assert_eq!(
+            liste.iter().map(|t| t.jti.clone()).collect::<Vec<_>>(),
+            vec![jti("c"), jti("b"), jti("a")],
+            "newest created_at first"
+        );
+        let b = &liste[1];
+        assert_eq!(
+            (b.user_id, b.label.as_str(), b.scope.as_str(), b.revoked),
+            (owner, "b", "mcp:write", false)
+        );
+        assert!(liste[2].revoked);
+        assert!(store.list_mcp_tokens(other).await.unwrap().is_empty());
+
+        assert_eq!(store.purge_mcp_tokens(other).await.unwrap(), 0);
+        assert_eq!(
+            store.purge_mcp_tokens(owner).await.unwrap(),
+            2,
+            "revoked + expired"
+        );
+        let reste = store.list_mcp_tokens(owner).await.unwrap();
+        assert_eq!(
+            reste.iter().map(|t| t.jti.clone()).collect::<Vec<_>>(),
+            vec![jti("b")]
+        );
+        assert!(store.is_mcp_token_active(&jti("b")).await.unwrap());
+        assert!(store.revoke_mcp_token(owner, &jti("b")).await.unwrap());
+        assert_eq!(store.purge_mcp_tokens(owner).await.unwrap(), 1);
+    }
 }
 
 // ===============================================================// Factories: one per backend.
@@ -4781,6 +5058,28 @@ plan_checks!(mock_plan, MockFactory);
 plan_checks!(neo4j_plan, Neo4jFactory);
 #[cfg(feature = "obrain-backend")]
 plan_checks!(obrain_plan, ObrainFactory);
+
+/// The auth domain: users, refresh tokens and MCP tokens (`AuthStore`), on the
+/// same fixtures for every backend that has ported it (obrain: `src/obrain/auth.rs`).
+macro_rules! auth_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [
+                check_auth_user_merge,
+                check_auth_list_users_order,
+                check_auth_refresh_rotation,
+                check_auth_mcp_tokens,
+            ]
+        );
+    };
+}
+
+auth_checks!(mock_auth, MockFactory);
+auth_checks!(neo4j_auth, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+auth_checks!(obrain_auth, ObrainFactory);
 
 /// What only the obrain adapter does: the refusals of the workspace methods it
 /// does not port are named (a `NonPorte` downcast), and what it writes is read
