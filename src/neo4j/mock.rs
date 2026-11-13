@@ -11196,10 +11196,17 @@ impl ReleaseStore for MockGraphStore {
         let pr = self.project_releases.read().await;
         let releases = self.releases.read().await;
         let ids = pr.get(&project_id).cloned().unwrap_or_default();
-        Ok(ids
+        let mut out: Vec<ReleaseNode> = ids
             .iter()
             .filter_map(|id| releases.get(id).cloned())
-            .collect())
+            .collect();
+        // ORDER BY r.created_at DESC, r.id DESC, as Neo4j does.
+        out.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        Ok(out)
     }
 
     async fn update_release(

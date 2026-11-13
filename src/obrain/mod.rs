@@ -10,7 +10,8 @@
 //! its trait (an omitted method would silently inherit the contract's default).
 //!
 //! Ported so far: [`ProjectStore`](crate::neo4j::traits::ProjectStore)
-//! (`project.rs`), [`ReleaseStore`](crate::neo4j::traits::ReleaseStore)
+//! (`project.rs`), [`AuthStore`](crate::neo4j::traits::AuthStore) (`auth.rs`),
+//! [`ReleaseStore`](crate::neo4j::traits::ReleaseStore)
 //! for releases, environments, deployments and milestones (`release.rs`), whose
 //! refusals (tasks, plans, commits) are listed in `release::REFUSEES`,
 //! [`WorkspaceStore`](crate::neo4j::traits::WorkspaceStore)
@@ -64,6 +65,7 @@
 //! Reads are served inline (obrain reads are mmap and hash lookups); writes run
 //! on the blocking pool.
 
+mod auth;
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
 mod note;
@@ -252,6 +254,7 @@ struct Interne {
 #[derive(Default)]
 struct Etat {
     projets: project::IndexProjets,
+    auth: auth::IndexAuth,
     releases: release::IndexReleases,
     espaces: workspace::IndexEspaces,
     notes: note::IndexNotes,
@@ -510,6 +513,7 @@ impl ObrainGraphStore {
         };
         let (projets, mut rapport) =
             project::IndexProjets::reconstruire(&db).with_context(contexte)?;
+        let auth = auth::IndexAuth::reconstruire(&db, &mut rapport);
         let (releases, rapport_releases) =
             release::IndexReleases::reconstruire(&db).with_context(contexte)?;
         rapport.brouillons_supprimes += rapport_releases.brouillons_supprimes;
@@ -522,6 +526,7 @@ impl ObrainGraphStore {
             note::IndexNotes::reconstruire(&db, &projets, &mut rapport).with_context(contexte)?;
         let etat = Etat {
             projets,
+            auth,
             releases,
             espaces,
             notes,
