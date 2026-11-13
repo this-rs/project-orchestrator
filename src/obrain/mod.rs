@@ -600,6 +600,7 @@ impl ObrainGraphStore {
         let (releases, rapport_releases) =
             release::IndexReleases::reconstruire(&db).with_context(contexte)?;
         rapport.brouillons_supprimes += rapport_releases.brouillons_supprimes;
+        rapport.suppressions_achevees += rapport_releases.suppressions_achevees;
         rapport
             .en_quarantaine
             .extend(rapport_releases.en_quarantaine);

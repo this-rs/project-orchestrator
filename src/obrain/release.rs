@@ -21,6 +21,24 @@
 //!   ported, so there is no node to link to. This is a limit, not a refusal: the
 //!   deployment itself is complete, and only a query starting from a commit would
 //!   see the missing edge.
+//! - a release or a milestone without a `status` is quarantined at open (Neo4j's
+//!   read fails on it too). An UNKNOWN stored status decodes as `planned` /
+//!   `open`, as on Neo4j, but the status filters compare the DECODED status where
+//!   Neo4j compares the stored string: such a node passes the filter `planned` /
+//!   `open` here and no filter there (a migrated base only: this backend writes
+//!   the snake_case spelling);
+//! - an update writes its fields one by one (one WAL record each, obrain has no
+//!   multi-property write): `update_milestone(status=closed, closed_at=now)` killed
+//!   between the two can reopen `closed` with no `closed_at`, a state Neo4j's
+//!   single `SET` never produces. Each field is valid on its own; the limit is the
+//!   one `project.rs` describes;
+//! - `delete_environment` deletes the environment and its deployments as ONE
+//!   operation, but in several engine records: the environment is marked
+//!   `_suppression` FIRST, its deployments are deleted, the environment LAST. A
+//!   restart that finds the marker finishes the deletion (counted in
+//!   `RapportOuverture::suppressions_achevees`): a cut never leaves an environment
+//!   with part of its deployments, which Neo4j's `DETACH DELETE d, e` never does
+//!   either.
 //!
 //! Same reference defect, mirrored on purpose and flagged: the Neo4j search
 //! filter of `list_projects_filtered` reads `p.title`, which projects do not
@@ -47,7 +65,7 @@
 //! not O(all nodes). That scan is the one open cost that grows with this domain.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -57,6 +75,8 @@ use obrain_engine::ObrainDB;
 use serde::Serialize;
 use uuid::Uuid;
 
+#[cfg(any(test, feature = "mock-store"))]
+use super::Interruption;
 use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
 use crate::neo4j::client::{pascal_to_snake_case, status_variants};
 use crate::neo4j::models::*;
@@ -68,6 +88,9 @@ const ETIQUETTE_DEPLOIEMENT: &str = "Deployment";
 const ETIQUETTE_JALON: &str = "Milestone";
 /// The draft marker: present from the first record of a creation to the last.
 const BROUILLON: &str = "_brouillon";
+/// The deletion marker of an environment: set before its deployments are
+/// deleted, gone with the environment. Opening finishes what carries it.
+const SUPPRESSION: &str = "_suppression";
 
 /// The methods this domain refuses by name. They are written (so the build sees
 /// them as implemented) but they answer [`NonPorte`]; see `mod.rs`
@@ -205,6 +228,30 @@ impl IndexReleases {
         let mut idx = Self::default();
         let mut rapport = RapportOuverture::default();
 
+        // An environment whose deletion had started (module doc): deleted now,
+        // before anything is read, and its deployments below.
+        let mut envs_supprimes: HashSet<Uuid> = HashSet::new();
+        for noeud in db.store().nodes_by_label(ETIQUETTE_ENVIRONNEMENT) {
+            let Some(n) = db.get_node(noeud) else {
+                continue;
+            };
+            let marque = n
+                .get_property(SUPPRESSION)
+                .is_some_and(|v| !matches!(v, Value::Null));
+            if !marque {
+                continue;
+            }
+            if let Some(id) = n
+                .get_property("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<Uuid>().ok())
+            {
+                envs_supprimes.insert(id);
+            }
+            db.delete_node(noeud);
+            rapport.suppressions_achevees += 1;
+        }
+
         for (noeud, r) in charger(db, ETIQUETTE_RELEASE, lire_release, &mut rapport) {
             if idx.releases.contains_key(&r.id) {
                 rapport
@@ -244,6 +291,11 @@ impl IndexReleases {
             );
         }
         for (noeud, d) in charger(db, ETIQUETTE_DEPLOIEMENT, lire_deploiement, &mut rapport) {
+            if envs_supprimes.contains(&d.environment_id) {
+                // A deployment of an environment whose deletion opening finished.
+                db.delete_node(noeud);
+                continue;
+            }
             if idx.deploiements.contains_key(&d.id) {
                 rapport
                     .en_quarantaine
@@ -312,10 +364,12 @@ fn instant_requis(get: Lecture<'_>, cle: &str, de: &str) -> Result<DateTime<Utc>
         .with_context(|| format!("{de} : `{cle}` illisible (« {brut} »)"))
 }
 
-/// An enum stored as snake_case (or PascalCase, from an older writer).
-fn enum_depuis<T: serde::de::DeserializeOwned>(get: Lecture<'_>, cle: &str) -> Option<T> {
-    chaine(get, cle)
-        .and_then(|s| serde_json::from_str(&format!("\"{}\"", pascal_to_snake_case(&s))).ok())
+/// A `status` stored as snake_case (or PascalCase, from an older writer). Absent
+/// is an error, as Neo4j's `node.get::<String>("status")?`; an unknown value is
+/// `None`, which the caller reads as the default, as Neo4j does.
+fn statut_requis<T: serde::de::DeserializeOwned>(get: Lecture<'_>, de: &str) -> Result<Option<T>> {
+    let brut = texte_requis(get, "status", de)?;
+    Ok(serde_json::from_str(&format!("\"{}\"", pascal_to_snake_case(&brut))).ok())
 }
 
 /// The stored spelling of a serde-encoded enum (snake_case).
@@ -345,7 +399,7 @@ fn lire_release(get: Lecture<'_>) -> Result<ReleaseNode> {
         version: texte_requis(get, "version", DE)?,
         title: chaine_pleine(get, "title"),
         description: chaine_pleine(get, "description"),
-        status: enum_depuis(get, "status").unwrap_or(ReleaseStatus::Planned),
+        status: statut_requis(get, DE)?.unwrap_or(ReleaseStatus::Planned),
         target_date: instant(get, "target_date"),
         released_at: instant(get, "released_at"),
         created_at: instant_requis(get, "created_at", DE)?,
@@ -392,7 +446,7 @@ fn lire_jalon(get: Lecture<'_>) -> Result<MilestoneNode> {
         id: uuid_requis(get, "id", DE)?,
         title: texte_requis(get, "title", DE)?,
         description: chaine_pleine(get, "description"),
-        status: enum_depuis(get, "status").unwrap_or(MilestoneStatus::Open),
+        status: statut_requis(get, DE)?.unwrap_or(MilestoneStatus::Open),
         target_date: instant(get, "target_date"),
         closed_at: instant(get, "closed_at"),
         created_at: instant_requis(get, "created_at", DE)?,
@@ -518,12 +572,22 @@ fn creer_noeud(
 ) -> Result<NodeId> {
     w.flush_complet = proprietes.iter().any(|(_, v)| valeur_en_blob(v));
     let noeud = w.db.create_node(&[etiquette]);
+    #[cfg(any(test, feature = "mock-store"))]
+    w.point(Interruption::ApresLeNoeud)?;
     w.db.set_node_property(noeud, BROUILLON, Value::from(true));
-    for (cle, valeur) in proprietes {
+    #[cfg(any(test, feature = "mock-store"))]
+    w.point(Interruption::ApresLeMarqueur)?;
+    for (n, (cle, valeur)) in proprietes.into_iter().enumerate() {
         w.db.set_node_property(noeud, cle, valeur);
+        #[cfg(any(test, feature = "mock-store"))]
+        w.point(Interruption::ApresLaPropriete(n + 1))?;
     }
     w.rendre_durable_avant_le_marqueur()?;
+    #[cfg(any(test, feature = "mock-store"))]
+    w.point(Interruption::AvantLeRetraitDuMarqueur)?;
     w.db.remove_node_property(noeud, BROUILLON);
+    #[cfg(any(test, feature = "mock-store"))]
+    w.point(Interruption::ApresLeRetraitDuMarqueur)?;
     Ok(noeud)
 }
 
@@ -656,10 +720,15 @@ impl ObrainGraphStore {
     /// Update the properties of one entity, found in the index. A missing id is a
     /// silent no-op, as the Neo4j `MATCH … SET`. The index is republished from the
     /// decoded node, once durable.
+    ///
+    /// `lecture` finds the entity under the READ lock of the index; `acces`, its
+    /// mutable twin, is taken only to publish (the write lock is for publishing,
+    /// `mod.rs`).
     async fn modifier_entite<T: Send + 'static>(
         &self,
         id: Uuid,
         champs: Vec<(&'static str, Value)>,
+        lecture: fn(&IndexReleases) -> &HashMap<Uuid, Entree<T>>,
         acces: fn(&mut IndexReleases) -> &mut HashMap<Uuid, Entree<T>>,
         blob: fn(&T) -> bool,
         decodeur: fn(Lecture<'_>) -> Result<T>,
@@ -671,8 +740,8 @@ impl ObrainGraphStore {
             || (),
             move |(), w: &mut Ecriture<'_>| {
                 let (noeud, ancien_blob) = {
-                    let mut etat = w.index_mut()?;
-                    let Some(e) = acces(&mut etat.releases).get(&id) else {
+                    let etat = w.index()?;
+                    let Some(e) = lecture(&etat.releases).get(&id) else {
                         return Ok(());
                     };
                     (e.noeud, blob(&e.valeur))
@@ -778,8 +847,15 @@ impl ReleaseStore for ObrainGraphStore {
         if let Some(d) = description {
             champs.push(("description", Value::from(d)));
         }
-        self.modifier_entite(id, champs, |i| &mut i.releases, blob_release, lire_release)
-            .await
+        self.modifier_entite(
+            id,
+            champs,
+            |i| &i.releases,
+            |i| &mut i.releases,
+            blob_release,
+            lire_release,
+        )
+        .await
     }
 
     async fn delete_release(&self, release_id: Uuid) -> Result<()> {
@@ -793,7 +869,7 @@ impl ReleaseStore for ObrainGraphStore {
                     };
                     (e.noeud, e.valeur.project_id)
                 };
-                w.db.delete_node(noeud);
+                w.supprimer_noeuds(&[noeud], &format!("suppression de la release {release_id}"))?;
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 let idx = &mut etat.releases;
@@ -993,6 +1069,7 @@ impl ReleaseStore for ObrainGraphStore {
         self.modifier_entite(
             id,
             champs,
+            |i| &i.environnements,
             |i| &mut i.environnements,
             blob_environnement,
             lire_environnement,
@@ -1004,7 +1081,8 @@ impl ReleaseStore for ObrainGraphStore {
         self.ecrire(
             || (),
             move |(), w: &mut Ecriture<'_>| {
-                // The environment and its deployments, in one durable step.
+                // The environment and its deployments, in one durable step, behind
+                // a deletion marker (module doc).
                 let (noeud, parent, deploiements) = {
                     let etat = w.index()?;
                     let Some(e) = etat.releases.environnements.get(&id) else {
@@ -1022,10 +1100,19 @@ impl ReleaseStore for ObrainGraphStore {
                         .collect();
                     (e.noeud, e.valeur.project_id, deps)
                 };
-                for (noeud_dep, _) in &deploiements {
-                    w.db.delete_node(*noeud_dep);
-                }
-                w.db.delete_node(noeud);
+                // The deployments, then the environment: all checked live first
+                // (nothing written otherwise), then the marker, the commit point of
+                // the deletion: from there a restart finishes it (module doc).
+                let mut noeuds: Vec<NodeId> = deploiements.iter().map(|(n, _)| *n).collect();
+                noeuds.push(noeud);
+                let quoi = format!("suppression de l'environnement {id}");
+                w.verifier_vivants(&noeuds, &quoi)?;
+                w.db.set_node_property(noeud, SUPPRESSION, Value::from(true));
+                w.etape()?;
+                // Past the marker, a failure leaves a deletion that the next open
+                // finishes: what the base holds is no longer what the index serves.
+                let r = w.supprimer_noeuds(&noeuds, &quoi);
+                w.apres_ecriture(r)?;
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 let idx = &mut etat.releases;
@@ -1143,6 +1230,7 @@ impl ReleaseStore for ObrainGraphStore {
         self.modifier_entite(
             id,
             champs,
+            |i| &i.deploiements,
             |i| &mut i.deploiements,
             blob_deploiement,
             lire_deploiement,
@@ -1290,8 +1378,15 @@ impl ReleaseStore for ObrainGraphStore {
         if let Some(d) = description {
             champs.push(("description", Value::from(d)));
         }
-        self.modifier_entite(id, champs, |i| &mut i.jalons, blob_jalon, lire_jalon)
-            .await
+        self.modifier_entite(
+            id,
+            champs,
+            |i| &i.jalons,
+            |i| &mut i.jalons,
+            blob_jalon,
+            lire_jalon,
+        )
+        .await
     }
 
     async fn delete_milestone(&self, milestone_id: Uuid) -> Result<()> {
@@ -1305,7 +1400,7 @@ impl ReleaseStore for ObrainGraphStore {
                     };
                     (j.noeud, j.valeur.project_id)
                 };
-                w.db.delete_node(noeud);
+                w.supprimer_noeuds(&[noeud], &format!("suppression du jalon {milestone_id}"))?;
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 let idx = &mut etat.releases;
