@@ -5017,6 +5017,29 @@ federation_checks!(neo4j_federation, Neo4jFactory);
 #[cfg(feature = "obrain-backend")]
 federation_checks!(obrain_federation, ObrainFactory);
 
+/// The protocol domain: protocols and the runs that execute them — the checks that
+/// call only `ProtocolStore`, `ProtocolRunStore` and the project they hang from, on
+/// the same fixtures for every backend ported to it.
+macro_rules! protocol_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [
+                check_protocol_scope_rule,
+                check_cas_protocol_run,
+                check_concurrent_create_protocol_run,
+                check_traversal_run_tree,
+            ]
+        );
+    };
+}
+
+protocol_checks!(mock_protocol, MockFactory);
+protocol_checks!(neo4j_protocol, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+protocol_checks!(obrain_protocol, ObrainFactory);
+
 /// The release domain: releases, environments, deployments, milestones and the
 /// project list of the release store. Same checks, same fixtures, on each backend
 /// that has ported them (see `release_checks!`).
