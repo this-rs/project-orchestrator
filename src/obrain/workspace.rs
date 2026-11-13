@@ -47,10 +47,14 @@
 //! index holds the decoded domain values and the relations as sets of ids, so a
 //! read costs O(size of its answer), never O(base).
 //!
-//! The rebuild at open reads the four labels (a scan of those nodes, not of the
-//! base) and the edges of each node it indexes. The edges are the truth of the
-//! relations: a child whose edge to its parent is missing is stored, but it is
-//! listed under no parent — the same answer Neo4j gives.
+//! The rebuild at open reads five labels (`nodes_by_label`: the four domain labels and
+//! the deletion marker), then the edges of each node it indexes: three per workspace,
+//! three per project it finds with one, two per component. Its cost is those reads, not a
+//! scan of the base. A cross-check at 1 M and 5 M is in the PR (the open of the whole base
+//! includes the engine's own open, which is not isolated here).
+//!
+//! A relation is listed only where its edge says so: a child whose edge to its parent is
+//! missing is stored, but listed under no parent — the same answer Neo4j gives.
 //!
 //! # Atomicity, built by ordering
 //!
@@ -62,8 +66,13 @@
 //! some of the properties of one update and not the others; each state is a
 //! valid value of the node.
 //!
-//! `delete_workspace` deletes its children first and the workspace LAST, so an
-//! interruption leaves a workspace that still exists and can be deleted again.
+//! `delete_workspace` has a marker, a commit point and a finish. The marker is a
+//! `WorkspaceSuppression` node naming the workspace, durable before anything else. The
+//! workspace node is deleted next (the commit point). Then its children and the marker.
+//! A failure before the commit point leaves the marker, which opening removes. A failure
+//! after it leaves the store INDETERMINATE (every operation refused until a restart): the
+//! children left behind are deleted by the opening that follows, which finds the marker of
+//! a workspace that no longer exists.
 //!
 //! # Refused by name (not ported)
 //!
@@ -86,8 +95,11 @@ use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
 use super::project::{self, IndexProjets};
+#[cfg(any(test, feature = "mock-store"))]
+use super::Interruption;
 use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
-use crate::neo4j::client::status_variants;
+use std::sync::atomic::Ordering;
+use crate::neo4j::client::{pascal_to_snake_case, status_variants};
 use crate::neo4j::models::{
     ComponentDependency, ComponentNode, ComponentType, ComponentUpdate, CouplingMatrix,
     DerivedComponentWrite, MilestoneStatus, ProjectNode, ResourceNode, ResourceType, StepNode,
@@ -100,6 +112,11 @@ const JALON: &str = "WorkspaceMilestone";
 const RESSOURCE: &str = "Resource";
 const COMPOSANT: &str = "Component";
 const BROUILLON: &str = "_brouillon";
+/// The deletion marker of a workspace (see `delete_workspace`).
+const SUPPRESSION: &str = "WorkspaceSuppression";
+const GENRE_JALON: u8 = 0;
+const GENRE_RESSOURCE: u8 = 1;
+const GENRE_COMPOSANT: u8 = 2;
 
 const APPARTIENT: &str = "BELONGS_TO_WORKSPACE";
 const A_JALON: &str = "HAS_WORKSPACE_MILESTONE";
@@ -148,9 +165,10 @@ pub(super) struct IndexEspaces {
 }
 
 impl IndexEspaces {
-    /// Rebuild the index from the base at open: the four labels' nodes (drafts
-    /// deleted, unreadable ones quarantined), then the relations, read from the
-    /// edges of those nodes and of the projects.
+    /// Rebuild the index from the base at open: the deletion markers first (a finished
+    /// deletion's leftovers are deleted), then the four labels' nodes (drafts deleted,
+    /// unreadable ones quarantined), then the relations, read from the edges of those nodes
+    /// and of the projects.
     pub(super) fn reconstruire(
         db: &ObrainDB,
         projets: &IndexProjets,
@@ -169,6 +187,34 @@ impl IndexEspaces {
             idx.par_slug.insert(valeur.slug.clone(), id);
             uuid_de.insert(noeud, id);
             idx.espaces.insert(id, Fiche { noeud, valeur });
+        }
+        // Deletions of a workspace, marked by a node that names it. A marker whose workspace
+        // is gone is a deletion that committed and did not finish: its children left behind
+        // are deleted here, before anything is indexed. A marker whose workspace is still
+        // there is a deletion that never committed: it is only removed.
+        for (marqueur, _, ws) in charger(db, SUPPRESSION, rapport, decoder_suppression)? {
+            if !idx.espaces.contains_key(&ws) {
+                for etiquette in [JALON, RESSOURCE, COMPOSANT] {
+                    let restes: Vec<NodeId> = db
+                        .store()
+                        .nodes_by_label(etiquette)
+                        .into_iter()
+                        .filter(|n| {
+                            db.get_node(*n)
+                                .and_then(|x| {
+                                    x.get_property("workspace_id")
+                                        .and_then(|v| v.as_str().map(str::to_string))
+                                })
+                                .is_some_and(|w| w == ws.to_string())
+                        })
+                        .collect();
+                    for n in restes {
+                        db.delete_node(n);
+                        rapport.restes_supprimes += 1;
+                    }
+                }
+            }
+            db.delete_node(marqueur);
         }
         for (noeud, id, valeur) in charger(db, JALON, rapport, decoder_jalon)? {
             if idx.jalons.contains_key(&id) {
@@ -461,8 +507,13 @@ fn decoder_espace(get: Get<'_>) -> Result<(Uuid, WorkspaceNode)> {
 fn decoder_jalon(get: Get<'_>) -> Result<(Uuid, WorkspaceMilestoneNode)> {
     let id = id_requis(get, "id", "nœud WorkspaceMilestone")?;
     let quoi = format!("jalon {id}");
+    // Neo4j's reading: a status is stored snake_case, and a legacy PascalCase spelling is
+    // converted the same way (`pascal_to_snake_case`); anything else reads as `Open`.
     let status = chaine(get, "status")
-        .and_then(|s| serde_json::from_value::<MilestoneStatus>(serde_json::Value::String(s)).ok())
+        .and_then(|s| {
+            serde_json::from_str::<MilestoneStatus>(&format!("\"{}\"", pascal_to_snake_case(&s)))
+                .ok()
+        })
         .unwrap_or(MilestoneStatus::Open);
     let valeur = WorkspaceMilestoneNode {
         id,
@@ -476,6 +527,13 @@ fn decoder_jalon(get: Get<'_>) -> Result<(Uuid, WorkspaceMilestoneNode)> {
         tags: liste(get, "tags"),
     };
     Ok((id, valeur))
+}
+
+/// A deletion marker: its own id, and the workspace it names.
+fn decoder_suppression(get: Get<'_>) -> Result<(Uuid, Uuid)> {
+    let id = id_requis(get, "id", "nœud WorkspaceSuppression")?;
+    let ws = id_requis(get, "workspace_id", &format!("marqueur {id}"))?;
+    Ok((id, ws))
 }
 
 /// Neo4j's mapping of a stored resource type (lowercase, underscores ignored).
@@ -558,8 +616,35 @@ fn relire<T>(db: &ObrainDB, noeud: NodeId, decoder: Decodeur<T>) -> Result<(Uuid
     decoder(&get)
 }
 
-fn va_en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
+/// Does this value go to a blob column? The engine's rule (`blob_column_registry.rs`): a
+/// string above [`SEUIL_COLONNE_BLOB`], or a list whose bincode encoding is above it. The
+/// bincode size is bounded from above (each element priced at its length plus 10 bytes of
+/// framing), so a borderline list may take a full flush for nothing; never the reverse.
+fn en_colonne_blob(v: &Value) -> bool {
+    match v {
+        Value::String(s) => s.len() > SEUIL_COLONNE_BLOB,
+        Value::List(_) => borne_bincode(v) > SEUIL_COLONNE_BLOB,
+        _ => false,
+    }
+}
+
+/// An upper bound of the bincode size of a value (see [`en_colonne_blob`]).
+fn borne_bincode(v: &Value) -> usize {
+    match v {
+        Value::String(s) => s.len() + 10,
+        Value::List(items) => 10 + items.iter().map(borne_bincode).sum::<usize>(),
+        _ => 10,
+    }
+}
+
+/// Does this string, written as a property, go to a blob column?
+fn blob_str(s: &str) -> bool {
+    en_colonne_blob(&Value::from(s))
+}
+
+/// Does this list of strings, written as a property, go to a blob column?
+fn blob_liste(items: &[String]) -> bool {
+    en_colonne_blob(&valeur_liste(items))
 }
 
 /// Create a node of `etiquette` as a draft: the marker first, the properties,
@@ -571,7 +656,7 @@ fn creer_noeud(
     proprietes: Vec<(&'static str, Value)>,
     liens: impl FnOnce(&ObrainDB, NodeId),
 ) -> Result<NodeId> {
-    w.flush_complet = proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
+    w.flush_complet = proprietes.iter().any(|(_, v)| en_colonne_blob(v));
     let db = w.db;
     let noeud = db.create_node(&[etiquette]);
     db.set_node_property(noeud, BROUILLON, Value::from(true));
@@ -582,6 +667,26 @@ fn creer_noeud(
     w.rendre_durable_avant_le_marqueur()?;
     db.remove_node_property(noeud, BROUILLON);
     Ok(noeud)
+}
+
+/// The rest of a committed workspace deletion: the children, then the marker. Every
+/// failure here is past the commit point (the caller makes the store indeterminate).
+fn finir_suppression(
+    w: &mut Ecriture<'_>,
+    marqueur: NodeId,
+    enfants: &[(Uuid, NodeId, u8)],
+) -> Result<()> {
+    #[cfg(any(test, feature = "mock-store"))]
+    w.point(Interruption::ApresLaSuppressionDuWorkspace)?;
+    for (_, noeud, _) in enfants {
+        if !w.db.delete_node(*noeud) {
+            bail!("obrain a refusé la suppression d'un nœud enfant");
+        }
+    }
+    if !w.db.delete_node(marqueur) {
+        bail!("obrain a refusé la suppression du marqueur de suppression");
+    }
+    w.rendre_durable()
 }
 
 /// Sort key of a milestone: its target date as stored (`""` when absent), then
@@ -741,21 +846,25 @@ impl WorkspaceStore for ObrainGraphStore {
                     etat.espaces
                         .espaces
                         .get(&id)
-                        .map(|f| (f.noeud, f.valeur.slug.clone()))
+                        .map(|f| (f.noeud, f.valeur.clone()))
                 };
-                let Some((noeud, ancien_slug)) = trouve else {
+                let Some((noeud, ancien)) = trouve else {
                     return Ok(());
                 };
+                let ancien_slug = ancien.slug.clone();
                 let db = w.db;
                 if let Some(n) = &name {
-                    w.flush_complet |= n.len() > SEUIL_COLONNE_BLOB;
+                    w.flush_complet |= blob_str(n) || blob_str(&ancien.name);
                     db.set_node_property(noeud, "name", Value::from(n.clone()));
                 }
                 if let Some(d) = &description {
-                    w.flush_complet |= d.len() > SEUIL_COLONNE_BLOB;
+                    w.flush_complet |= blob_str(d)
+                        || blob_str(ancien.description.as_deref().unwrap_or(""));
                     db.set_node_property(noeud, "description", Value::from(d.clone()));
                 }
                 if let Some(m) = &metadata {
+                    w.flush_complet |= blob_str(&m.to_string())
+                        || blob_str(&ancien.metadata.to_string());
                     db.set_node_property(noeud, "metadata", Value::from(m.to_string()));
                 }
                 if let Some(s) = &slug {
@@ -783,53 +892,73 @@ impl WorkspaceStore for ObrainGraphStore {
         self.ecrire(
             || (),
             move |(), w: &mut Ecriture<'_>| {
-                let (noeud, jalons, ressources, composants) = {
+                let trouve = {
                     let etat = w.index()?;
-                    let Some(f) = etat.espaces.espaces.get(&id) else {
-                        return Ok(());
-                    };
-                    let de = |m: Option<&BTreeSet<Uuid>>| -> Vec<Uuid> {
-                        m.into_iter().flatten().copied().collect::<Vec<_>>()
-                    };
-                    let jalons: Vec<Uuid> = de(etat.espaces.jalons_de.get(&id));
-                    let ressources: Vec<Uuid> = de(etat.espaces.ressources_de.get(&id));
-                    let composants: Vec<Uuid> = de(etat.espaces.composants_de.get(&id));
-                    (f.noeud, jalons, ressources, composants)
+                    etat.espaces
+                        .espaces
+                        .get(&id)
+                        .map(|f| (f.noeud, f.valeur.slug.clone()))
                 };
-                // Children first, the workspace last: an interruption leaves a
-                // workspace that still exists and can be deleted again.
-                let db = w.db;
-                let mut supprimes: Vec<(Uuid, NodeId, &'static str)> = Vec::new();
-                {
+                let Some((noeud, slug)) = trouve else {
+                    return Ok(());
+                };
+                let enfants = {
                     let etat = w.index()?;
-                    for j in &jalons {
-                        if let Some(f) = etat.espaces.jalons.get(j) {
-                            supprimes.push((*j, f.noeud, "jalon"));
+                    let de = |m: Option<&BTreeSet<Uuid>>| -> Vec<Uuid> {
+                        m.into_iter().flatten().copied().collect()
+                    };
+                    let mut out = Vec::new();
+                    for j in de(etat.espaces.jalons_de.get(&id)) {
+                        if let Some(f) = etat.espaces.jalons.get(&j) {
+                            out.push((j, f.noeud, GENRE_JALON));
                         }
                     }
-                    for r in &ressources {
-                        if let Some(f) = etat.espaces.ressources.get(r) {
-                            supprimes.push((*r, f.noeud, "ressource"));
+                    for r in de(etat.espaces.ressources_de.get(&id)) {
+                        if let Some(f) = etat.espaces.ressources.get(&r) {
+                            out.push((r, f.noeud, GENRE_RESSOURCE));
                         }
                     }
-                    for c in &composants {
-                        if let Some(f) = etat.espaces.composants.get(c) {
-                            supprimes.push((*c, f.noeud, "composant"));
+                    for c in de(etat.espaces.composants_de.get(&id)) {
+                        if let Some(f) = etat.espaces.composants.get(&c) {
+                            out.push((c, f.noeud, GENRE_COMPOSANT));
                         }
                     }
-                }
-                for (_, noeud_enfant, _) in &supprimes {
-                    db.delete_node(*noeud_enfant);
-                }
-                if !db.delete_node(noeud) {
+                    out
+                };
+                // 1. The deletion marker, durable before anything is deleted: a node
+                //    naming the workspace. Opening finishes a deletion whose marker is
+                //    there and whose workspace node is gone (`reconstruire`).
+                let marqueur = creer_noeud(
+                    w,
+                    SUPPRESSION,
+                    vec![
+                        ("id", Value::from(Uuid::new_v4().to_string())),
+                        ("workspace_id", Value::from(id.to_string())),
+                    ],
+                    |_, _| {},
+                )?;
+                w.rendre_durable()?;
+                // 2. The commit point: the workspace node goes FIRST. Failing before it
+                //    changes nothing but the marker, which opening removes.
+                if !w.db.delete_node(noeud) {
                     bail!("obrain a refusé la suppression du workspace {id}");
                 }
                 w.rendre_durable()?;
+                // 3. The rest. Past the commit point a failure leaves a partial deletion:
+                //    the store goes INDETERMINATE (refusing every operation until a
+                //    restart finishes the deletion), it does not answer as if nothing ran.
+                if let Err(e) = finir_suppression(w, marqueur, &enfants) {
+                    w.interne.indetermine.store(true, Ordering::Release);
+                    return Err(e.context(format!(
+                        "suppression du workspace {id} ({slug}) interrompue après son \
+                         point de validation : état indéterminé, redémarrer pour la finir"
+                    )));
+                }
                 let mut etat = w.index_mut()?;
-                for (cid, _, genre) in &supprimes {
+                for (cid, _, genre) in &enfants {
                     match *genre {
-                        "jalon" => etat.espaces.oublier_jalon(*cid),
-                        "ressource" => etat.espaces.oublier_ressource(*cid),
+                        GENRE_JALON => etat.espaces.oublier_jalon(*cid),
+                        GENRE_RESSOURCE => etat.espaces.oublier_ressource(*cid),
                         _ => etat.espaces.oublier_composant(*cid),
                     }
                 }
@@ -1121,18 +1250,19 @@ impl WorkspaceStore for ObrainGraphStore {
             move |(), w: &mut Ecriture<'_>| {
                 let trouve = {
                     let etat = w.index()?;
-                    etat.espaces.jalons.get(&id).map(|f| f.noeud)
+                    etat.espaces.jalons.get(&id).map(|f| (f.noeud, f.valeur.clone()))
                 };
-                let Some(noeud) = trouve else {
+                let Some((noeud, ancien)) = trouve else {
                     return Ok(false);
                 };
                 let db = w.db;
                 if let Some(t) = &title {
-                    w.flush_complet |= t.len() > SEUIL_COLONNE_BLOB;
+                    w.flush_complet |= blob_str(t) || blob_str(&ancien.title);
                     db.set_node_property(noeud, "title", Value::from(t.clone()));
                 }
                 if let Some(d) = &description {
-                    w.flush_complet |= d.len() > SEUIL_COLONNE_BLOB;
+                    w.flush_complet |= blob_str(d)
+                        || blob_str(ancien.description.as_deref().unwrap_or(""));
                     db.set_node_property(noeud, "description", Value::from(d.clone()));
                 }
                 if let Some(s) = status {
@@ -1353,9 +1483,12 @@ impl WorkspaceStore for ObrainGraphStore {
             move |(), w: &mut Ecriture<'_>| {
                 let trouve = {
                     let etat = w.index()?;
-                    etat.espaces.ressources.get(&id).map(|f| f.noeud)
+                    etat.espaces
+                        .ressources
+                        .get(&id)
+                        .map(|f| (f.noeud, f.valeur.clone()))
                 };
-                let Some(noeud) = trouve else {
+                let Some((noeud, ancien)) = trouve else {
                     return Ok(false);
                 };
                 let db = w.db;
@@ -1367,7 +1500,14 @@ impl WorkspaceStore for ObrainGraphStore {
                     ("description", description),
                 ] {
                     if let Some(v) = v {
-                        w.flush_complet |= v.len() > SEUIL_COLONNE_BLOB;
+                        let ancienne = match cle {
+                            "name" => ancien.name.clone(),
+                            "file_path" => ancien.file_path.clone(),
+                            "url" => ancien.url.clone().unwrap_or_default(),
+                            "version" => ancien.version.clone().unwrap_or_default(),
+                            _ => ancien.description.clone().unwrap_or_default(),
+                        };
+                        w.flush_complet |= blob_str(&v) || blob_str(&ancienne);
                         db.set_node_property(noeud, cle, Value::from(v));
                     }
                 }
@@ -1541,6 +1681,14 @@ impl WorkspaceStore for ObrainGraphStore {
                     // MERGE matched: the SET rules of the Neo4j query, field by field.
                     Some((noeud, ancien)) => {
                         let cid = ancien.id;
+                        w.flush_complet |= blob_str(description.as_deref().unwrap_or(""))
+                            || blob_str(ancien.description.as_deref().unwrap_or(""))
+                            || blob_str(&config.to_string())
+                            || blob_str(&ancien.config.to_string())
+                            || blob_str(runtime.as_deref().unwrap_or(""))
+                            || blob_str(ancien.runtime.as_deref().unwrap_or(""))
+                            || blob_liste(&tags)
+                            || blob_liste(&ancien.tags);
                         db.set_node_property(
                             noeud,
                             "component_type",
@@ -1638,11 +1786,13 @@ impl WorkspaceStore for ObrainGraphStore {
                     etat.espaces
                         .composants
                         .get(&id)
-                        .map(|f| (f.noeud, f.valeur.workspace_id, f.valeur.name.clone()))
+                        .map(|f| (f.noeud, f.valeur.clone()))
                 };
-                let Some((noeud, ws, ancien_nom)) = trouve else {
+                let Some((noeud, ancien)) = trouve else {
                     return Ok(false);
                 };
+                let ws = ancien.workspace_id;
+                let ancien_nom = ancien.name.clone();
                 if let Some(nouveau) = &patch.name {
                     let etat = w.index()?;
                     if let Some(autre) = etat.espaces.par_nom_composant.get(&(ws, nouveau.clone()))
@@ -1655,6 +1805,24 @@ impl WorkspaceStore for ObrainGraphStore {
                         }
                     }
                 }
+                w.flush_complet |= patch
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| blob_str(n) || blob_str(&ancien.name))
+                    || patch.description.as_deref().is_some_and(|d| {
+                        blob_str(d) || blob_str(ancien.description.as_deref().unwrap_or(""))
+                    })
+                    || patch.runtime.as_deref().is_some_and(|r| {
+                        blob_str(r) || blob_str(ancien.runtime.as_deref().unwrap_or(""))
+                    })
+                    || patch
+                        .config
+                        .as_ref()
+                        .is_some_and(|c| blob_str(&c.to_string()) || blob_str(&ancien.config.to_string()))
+                    || patch
+                        .tags
+                        .as_ref()
+                        .is_some_and(|t| blob_liste(t) || blob_liste(&ancien.tags));
                 let db = w.db;
                 if let Some(n) = &patch.name {
                     db.set_node_property(noeud, "name", Value::from(n.clone()));
@@ -1743,6 +1911,8 @@ impl WorkspaceStore for ObrainGraphStore {
                     Some(eid) => eid,
                     None => w.db.create_edge(c1, c2, DEPEND),
                 };
+                let ancien_protocole = lire_dependance(w.db, eid).0;
+                w.flush_complet |= blob_str(&protocole) || blob_str(&ancien_protocole);
                 w.db.set_edge_property(eid, "protocol", Value::from(protocole.clone()));
                 w.db.set_edge_property(eid, "required", Value::from(required));
                 w.rendre_durable()?;
@@ -1951,4 +2121,92 @@ fn projets_de_ressource(
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A workspace node as the create path writes it, with the given id and slug.
+    fn noeud_espace(db: &ObrainDB, id: Uuid, slug: &str) {
+        let n = db.create_node(&[ESPACE]);
+        for (k, v) in [
+            ("id", Value::from(id.to_string())),
+            ("name", Value::from("un espace")),
+            ("slug", Value::from(slug)),
+            ("description", Value::from("")),
+            ("created_at", Value::from(Utc::now().to_rfc3339())),
+            ("metadata", Value::from("{}")),
+        ] {
+            db.set_node_property(n, k, v);
+        }
+    }
+
+    /// A component node of `ws` named `nom`.
+    fn noeud_composant(db: &ObrainDB, id: Uuid, ws: Uuid, nom: &str) {
+        let n = db.create_node(&[COMPOSANT]);
+        for (k, v) in [
+            ("id", Value::from(id.to_string())),
+            ("workspace_id", Value::from(ws.to_string())),
+            ("name", Value::from(nom)),
+            ("created_at", Value::from(Utc::now().to_rfc3339())),
+        ] {
+            db.set_node_property(n, k, v);
+        }
+    }
+
+    /// Two duplicates of each kind a create refuses (the same id, the same slug, the same
+    /// component name) are quarantined at open: the first one is indexed, the rest are
+    /// reported and left alone.
+    #[test]
+    fn doublons_mis_en_quarantaine_a_la_reouverture() {
+        let db = ObrainDB::new_in_memory();
+        let a = Uuid::new_v4();
+        noeud_espace(&db, a, "slug-a");
+        noeud_espace(&db, a, "slug-b"); // same id
+        noeud_espace(&db, Uuid::new_v4(), "slug-a"); // same slug
+        noeud_composant(&db, Uuid::new_v4(), a, "api");
+        noeud_composant(&db, Uuid::new_v4(), a, "api"); // same name in the workspace
+
+        let mut rapport = RapportOuverture::default();
+        let idx = IndexEspaces::reconstruire(&db, &IndexProjets::default(), &mut rapport).unwrap();
+        assert_eq!(idx.espaces.len(), 1, "one workspace indexed");
+        assert_eq!(idx.composants.len(), 1, "one component indexed");
+        assert_eq!(rapport.en_quarantaine.len(), 3, "{:?}", rapport.en_quarantaine);
+    }
+
+    /// A status written in Neo4j's legacy PascalCase reads as the snake_case one; an
+    /// unknown spelling reads as `Open`, as Neo4j does.
+    #[test]
+    fn statut_pascal_se_lit_comme_neo4j() {
+        fn statut(stocke: &str) -> MilestoneStatus {
+            let id = Uuid::new_v4().to_string();
+            let ws = Uuid::new_v4().to_string();
+            let get = |cle: &str| -> Option<Value> {
+                match cle {
+                    "id" => Some(Value::from(id.as_str())),
+                    "workspace_id" => Some(Value::from(ws.as_str())),
+                    "title" => Some(Value::from("t")),
+                    "created_at" => Some(Value::from(Utc::now().to_rfc3339())),
+                    "status" => Some(Value::from(stocke)),
+                    _ => None,
+                }
+            };
+            decoder_jalon(&get).unwrap().1.status
+        }
+        assert_eq!(statut("InProgress"), MilestoneStatus::InProgress);
+        assert_eq!(statut("in_progress"), MilestoneStatus::InProgress);
+        assert_eq!(statut("Completed"), MilestoneStatus::Completed);
+        assert_eq!(statut("Bizarre"), MilestoneStatus::Open);
+    }
+
+    /// The engine's rule: a list above the threshold once encoded goes to a blob column; a
+    /// short list does not.
+    #[test]
+    fn liste_courte_pas_en_colonne_blob_liste_longue_oui() {
+        let court: Vec<String> = vec!["a".into(), "b".into()];
+        assert!(!blob_liste(&court));
+        let long: Vec<String> = (0..20).map(|i| format!("tag-numero-{i:03}")).collect();
+        assert!(blob_liste(&long), "20 tags of ~14 bytes are above 256 once encoded");
+    }
 }

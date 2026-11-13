@@ -38,6 +38,9 @@ pub enum Interruption {
     ApresLeChemin(usize),
     /// `delete_project`: the node deleted, before the fsync.
     ApresLaSuppression,
+    /// `delete_workspace`: the workspace node is deleted (the commit point) and made
+    /// durable; its children and the deletion marker are not yet.
+    ApresLaSuppressionDuWorkspace,
 }
 
 /// What makes a write durable, once per write. Only `Wal` exists in production

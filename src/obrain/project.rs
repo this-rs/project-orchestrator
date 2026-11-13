@@ -19,12 +19,13 @@
 //!   unaddressable (see "Opening"); the Neo4j adapter replaces it with "now";
 //! - `delete_project` deletes only while the base holds nothing but `Project`
 //!   nodes. The Neo4j cascade walks plans, tasks, notes, files, feature graphs,
-//!   commits (linked by edge OR by a `project_id` property) — domains this
-//!   backend has not ported and therefore cannot have written. Any other node
-//!   in the base means data from elsewhere (a migrated base) that the cascade
-//!   would have to reach: the delete is refused by name rather than leaving
-//!   orphans. The check is one counter (O(1)); it neither scans edges nor
-//!   properties.
+//!   commits and workspaces (linked by edge OR by a `project_id` property). The
+//!   domains this backend has not cascaded (and the workspace data, which it does
+//!   write) are in the base as nodes the cascade would have to reach: the delete is
+//!   refused by name rather than leaving orphans. This guard is conservative on
+//!   purpose: a base holding a workspace refuses the deletion of ANY project, even
+//!   one outside every workspace, until the cascade of those domains is ported. The
+//!   check is one counter (O(1)); it neither scans edges nor properties.
 //!
 //! Order: `list_projects` sorts by `(name, id)` ascending — the total order
 //! `ORDER BY p.name, p.id ASC` states. Names compare by Unicode code point;
@@ -563,11 +564,10 @@ impl ProjectStore for ObrainGraphStore {
                         "ProjectStore::delete_project (cascade)",
                     ))
                     .context(format!(
-                        "la base contient {} nœud(s) hors des {projets} projet(s) que ce \
-                         backend adresse : des données écrites hors de lui (plans, tâches, \
-                         notes, fichiers, graphes de fonctionnalités, commits…) que la \
-                         suppression en cascade devrait atteindre, par relation ou par \
-                         `project_id`. Elle attend le portage des domaines concernés",
+                        "la base contient {} nœud(s) qui ne sont pas des projets : des domaines \
+                         dont la cascade n'est pas portée (workspaces, et plans, tâches, notes, \
+                         fichiers… une fois écrits). Le refus est volontaire et conservateur : \
+                         la suppression attend le portage de ces cascades",
                         noeuds.saturating_sub(projets)
                     )));
                 }

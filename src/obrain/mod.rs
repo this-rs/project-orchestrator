@@ -186,6 +186,9 @@ pub struct RapportOuverture {
     /// draft marker still there, or nothing on the node): deleted, whatever they
     /// held (`project.rs`, "Atomicity").
     pub brouillons_supprimes: usize,
+    /// Nodes of a workspace whose deletion was committed but not finished (a crash
+    /// after the workspace node went): deleted at open, with their deletion marker.
+    pub restes_supprimes: usize,
     /// Projects whose path trio (`root_path`, `declared_path`,
     /// `canonical_path`) was torn by an interrupted update: recomputed from
     /// `root_path`, which is written last.
@@ -212,6 +215,9 @@ struct Interne {
     /// The last durability step failed: what is on disk is unknown.
     indetermine: AtomicBool,
     ecritures: AtomicU64,
+    /// Full flushes (`commit_wal`) run by a write: the blob-carrying ones and the periodic
+    /// ones. Read by the tests (`flushs_complets`).
+    flushs_complets: AtomicU64,
     durabilite: Durabilite,
     rapport: RapportOuverture,
     /// A test hook: the point where the next write stops (`mesure.rs`).
@@ -314,6 +320,7 @@ impl Ecriture<'_> {
                 let wal = self.db.flush_wal();
                 match wal {
                     Ok(()) if self.flush_complet || n.is_multiple_of(FLUSH_COMPLET_TOUS_LES) => {
+                        self.interne.flushs_complets.fetch_add(1, Ordering::Relaxed);
                         self.db.commit_wal()
                     }
                     autre => autre,
@@ -481,6 +488,7 @@ impl ObrainGraphStore {
                 ferme: AtomicBool::new(false),
                 indetermine: AtomicBool::new(false),
                 ecritures: AtomicU64::new(0),
+                flushs_complets: AtomicU64::new(0),
                 durabilite,
                 rapport,
                 #[cfg(any(test, feature = "mock-store"))]
@@ -507,6 +515,13 @@ impl ObrainGraphStore {
     /// What opening found and repaired.
     pub fn rapport_d_ouverture(&self) -> &RapportOuverture {
         &self.interne.rapport
+    }
+
+    /// How many full flushes (`commit_wal`) the writes have run so far. A test reads it to
+    /// prove that a write carrying a blob-sized value takes the full flush.
+    #[doc(hidden)]
+    pub fn flushs_complets(&self) -> u64 {
+        self.interne.flushs_complets.load(Ordering::Relaxed)
     }
 
     /// How many fsyncs the WAL has really run (obrain's oracle `wal_fsyncs`): between
@@ -627,7 +642,7 @@ impl ObrainGraphStore {
 impl GraphStore for ObrainGraphStore {
     /// Nothing is claimed. Every flag describes what the ENGINE does for the
     /// queries of the contract, and no query of the contract runs on obrain
-    /// yet: the one ported domain goes through the Rust API. The uniqueness of
+    /// yet: the ported domains go through the Rust API. The uniqueness of
     /// `Project.id` / `Project.slug` is enforced by this adapter under its
     /// writer lock (`project.rs`), not by an engine constraint, so
     /// `unique_constraints` stays false. A flag turns true in the lot that
