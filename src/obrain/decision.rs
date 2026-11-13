@@ -41,6 +41,25 @@
 //!   vector values in its WAL (trame `VecColumnWrite` without value; measured
 //!   13/11), so an embedding acknowledged could not be guaranteed durable —
 //!   the same reason as `ChatStore::search_episodes_by_embedding`;
+//! - `decided_at` is stored as an RFC 3339 **string**; Neo4j stores a `datetime`
+//!   (`datetime($decided_at)`). The value read back is the same instant, the
+//!   stored type is not (as for the timestamps of `project.rs`);
+//! - a decision attached to a project that opening QUARANTINED (unreadable, so
+//!   absent from the project index) reads as having no project: Neo4j, which
+//!   has no quarantine, would return that project's id. The decision itself is
+//!   still served; only its project is not, because it cannot be verified;
+//! - `supersede_decision` draws the `SUPERSEDES` edge ONCE, and only then sets
+//!   `created_at` on it (RFC 3339 string). Neo4j writes
+//!   `MERGE (new)-[:SUPERSEDES {created_at: datetime()}]->(old)`: the `MERGE`
+//!   pattern carries a fresh `datetime()`, so it never matches an earlier edge
+//!   and a repeated call draws a second one. Here a repeated call converges to
+//!   the single edge the `MERGE` intends (a retry after a crash must, too);
+//! - `ProjectStore::delete_project` refuses (`NonPorte`, cascade) as soon as the
+//!   base holds a decision, attached to that project or not: its check counts
+//!   every live node against the projects and plans it addresses, and the Neo4j
+//!   cascade would have to reach the decisions (it archives them). Writing a
+//!   decision therefore makes every project of the base undeletable here, until
+//!   the cascade is ported;
 //! - a decision node whose `status` does not parse decodes as `Accepted`, as
 //!   `Neo4jClient::node_to_decision` does (the model's own default is
 //!   `Proposed`); `embedding` is never loaded (`None`), and `scar_intensity`
@@ -55,6 +74,18 @@
 //! deletes any draft with its edges. A value above [`SEUIL_COLONNE_BLOB`] — a
 //! long `description` or `rationale` — makes the creation pay the FULL flush
 //! before the marker goes.
+//!
+//! A multi-property update is not atomic. `update_decision` writes each given
+//! property as its own engine write, and `supersede_decision` writes the
+//! status, then the edge, then the edge's `created_at`: a crash in between
+//! leaves some of them written and the others not, which opening does not
+//! repair (each state reads as a valid decision). A retry of the same call
+//! converges: the writes are idempotent, and the edge is drawn once.
+//!
+//! `delete_decision` sets the draft marker on the node BEFORE it removes the
+//! node's edges: a crash in the middle leaves a draft, which opening deletes
+//! with its remaining edges. The deletion is thus finished at open, never left
+//! as a decision stripped of some of its edges.
 
 use std::collections::{HashMap, HashSet};
 
@@ -119,7 +150,8 @@ fn va_en_colonne_blob(v: &Value) -> bool {
         })
 }
 
-/// The properties `create_decision_global` writes, exactly as Neo4j stores them.
+/// The properties `create_decision_global` writes, as Neo4j names them; the
+/// values are Neo4j's, except `decided_at`, a string here and a `datetime` there.
 fn proprietes_de_creation(d: &DecisionNode) -> Vec<(&'static str, Value)> {
     vec![
         ("id", Value::from(d.id.to_string())),
@@ -299,6 +331,10 @@ impl IndexDecisions {
                 }
             };
             if index.par_id.contains_key(&decision.id) {
+                // The id is on disk twice: the second node is quarantined, and the
+                // id stays reserved even once the first is deleted, so a later
+                // creation never lands next to the node left in quarantine.
+                index.reserves.insert(decision.id);
                 rapport.en_quarantaine.push(format!(
                     "nœud Decision {noeud:?} : id {} déjà pris",
                     decision.id
@@ -315,9 +351,10 @@ impl IndexDecisions {
         }
 
         // The project: the incoming `HAS_DECISION` edge of every indexed decision.
-        // A decision attached to a project this backend does not hold, or by a
-        // non-canonical id, is treated as having no verifiable project (as Neo4j
-        // leaves it absent from the map).
+        // A decision attached to a project absent from the project index (a node
+        // with a non-canonical id, or one quarantined at open) reads as having no
+        // project: it cannot be verified. A DIVERGENCE, named in the module doc:
+        // Neo4j has no quarantine and would return that project's id.
         for (noeud, id) in &vus {
             let mut projet: Option<Uuid> = None;
             for (source, arete) in store.edges_from(*noeud, Direction::Incoming) {
@@ -548,6 +585,10 @@ impl DecisionStore for ObrainGraphStore {
                     return Ok(());
                 };
                 let noeud = e.noeud;
+                // The draft marker first: from here a crash leaves a draft, which
+                // opening deletes with whatever edges remain (see the module doc).
+                w.etape()?;
+                w.db.set_node_property(noeud, BROUILLON, Value::from(true));
                 // DETACH DELETE: every edge of the decision goes with it, both ways.
                 let aretes: Vec<EdgeId> =
                     w.db.store()
@@ -708,8 +749,25 @@ impl DecisionStore for ObrainGraphStore {
                     "status",
                     Value::from(DecisionStatus::Superseded.to_string()),
                 );
-                w.etape()?;
-                let _ = w.db.create_edge(nouvelle.noeud, ancienne.noeud, SUCCEDE);
+                // MERGE: the edge is drawn once (see the module doc for Neo4j's).
+                let deja =
+                    w.db.store()
+                        .edges_from(nouvelle.noeud, Direction::Outgoing)
+                        .into_iter()
+                        .any(|(cible, a)| {
+                            cible == ancienne.noeud
+                                && w.db.get_edge(a).is_some_and(|e| &*e.edge_type == SUCCEDE)
+                        });
+                if !deja {
+                    w.etape()?;
+                    let arete = w.db.create_edge(nouvelle.noeud, ancienne.noeud, SUCCEDE);
+                    w.etape()?;
+                    w.db.set_edge_property(
+                        arete,
+                        "created_at",
+                        Value::from(Utc::now().to_rfc3339()),
+                    );
+                }
                 let entree = Self::relire_decision(w, &ancienne)?;
                 w.rendre_durable()?;
                 w.index_mut()?.decisions.publier(entree);

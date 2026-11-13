@@ -176,6 +176,52 @@ mod with_the_feature {
         .unwrap();
     }
 
+    /// The `created_at` of every `SUPERSEDES` edge leaving a `Decision` node, as the
+    /// ENGINE reads them in a closed base (one entry per edge).
+    async fn supersedes_on_disk(base: &Path) -> Vec<Option<String>> {
+        let base = base.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let db = obrain_engine::ObrainDB::open(&base).unwrap();
+            let mut out = Vec::new();
+            for n in db.store().nodes_by_label("Decision") {
+                for (_, a) in db
+                    .store()
+                    .edges_from(n, obrain_core::graph::Direction::Outgoing)
+                {
+                    let e = db.get_edge(a).unwrap();
+                    if &*e.edge_type == "SUPERSEDES" {
+                        out.push(
+                            e.get_property("created_at")
+                                .and_then(|v| v.as_str().map(str::to_string)),
+                        );
+                    }
+                }
+            }
+            db.close().unwrap();
+            out
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A decision with the given description, no project, proposed.
+    fn a_decision(description: &str) -> project_orchestrator::neo4j::models::DecisionNode {
+        project_orchestrator::neo4j::models::DecisionNode {
+            id: Uuid::new_v4(),
+            description: description.to_string(),
+            rationale: "parce que".to_string(),
+            alternatives: vec![],
+            chosen_option: None,
+            decided_by: "alice".to_string(),
+            decided_at: Utc::now(),
+            status: project_orchestrator::neo4j::models::DecisionStatus::Proposed,
+            embedding: None,
+            embedding_model: None,
+            scar_intensity: 0.0,
+            sharing_consent: Default::default(),
+        }
+    }
+
     // ------------------------------------------------------------------
     // Selection, configuration, and the guards of opening
     // ------------------------------------------------------------------
@@ -2109,10 +2155,12 @@ mod with_the_feature {
         assert_eq!(projets.len(), 1);
         assert_eq!(projets.get(&d1.id), Some(&p.id));
 
+        // The long description is NOT touched by the update: it is read back after
+        // the reopen as it was written at creation.
         store
             .update_decision(
                 d1.id,
-                Some("nouvelle description".to_string()),
+                None,
                 Some("nouveau pourquoi".to_string()),
                 Some("B".to_string()),
                 Some(DecisionStatus::Accepted),
@@ -2120,10 +2168,13 @@ mod with_the_feature {
             .await
             .unwrap();
         let maj = store.get_decision(d1.id).await.unwrap().unwrap();
-        assert_eq!(maj.description, "nouvelle description");
+        assert_eq!(maj.description, d1.description);
+        assert_eq!(maj.rationale, "nouveau pourquoi");
         assert_eq!(maj.chosen_option.as_deref(), Some("B"));
         assert_eq!(maj.status, DecisionStatus::Accepted);
 
+        // Twice: the MERGE draws one edge.
+        store.supersede_decision(d2.id, d1.id).await.unwrap();
         store.supersede_decision(d2.id, d1.id).await.unwrap();
         assert_eq!(
             store.get_decision(d1.id).await.unwrap().unwrap().status,
@@ -2155,10 +2206,16 @@ mod with_the_feature {
         store.close().await.unwrap();
         drop(store);
 
+        let aretes = supersedes_on_disk(&base).await;
+        assert_eq!(aretes.len(), 1, "two supersessions, one edge: {aretes:?}");
+        let quand = aretes[0].as_deref().expect("the edge carries `created_at`");
+        assert!(quand.parse::<chrono::DateTime<Utc>>().is_ok(), "{quand}");
+
         let store = open(&base).await;
         assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
         let relue = store.get_decision(d1.id).await.unwrap().unwrap();
-        assert_eq!(relue.description, "nouvelle description");
+        assert_eq!(relue.description, d1.description);
+        assert_eq!(relue.rationale, "nouveau pourquoi");
         assert_eq!(relue.status, DecisionStatus::Superseded);
         assert_eq!(relue.chosen_option.as_deref(), Some("B"));
         assert_eq!(
@@ -2196,6 +2253,14 @@ mod with_the_feature {
         use project_orchestrator::neo4j::models::{DecisionNode, DecisionStatus};
         use project_orchestrator::neo4j::traits::DecisionStore;
         let store = temporary(Durabilite::Wal).await;
+        // A project and a decision already there: the count below is not trivially 0.
+        let p = a_project("decision-refus");
+        store.create_project(&p).await.unwrap();
+        store
+            .create_decision_global(&a_decision("déjà là"), Some(p.id))
+            .await
+            .unwrap();
+        let avant = store.noeuds_pour_mesure();
         let d = DecisionNode {
             id: Uuid::new_v4(),
             description: "x".to_string(),
@@ -2278,8 +2343,162 @@ mod with_the_feature {
             ),
             NonPorte("DecisionStore::list_decisions_by_status")
         );
-        // Les refus n'ont rien écrit.
+        // Les refus n'ont rien écrit : ni la décision, ni aucun autre nœud.
         assert!(store.get_decision(d.id).await.unwrap().is_none());
+        assert_eq!(store.noeuds_pour_mesure(), avant);
+    }
+
+    /// A decision creation interrupted at each of its points reopens to no decision
+    /// (the draft is deleted at open), except past the commit point; the creation can
+    /// then be made again.
+    #[tokio::test]
+    async fn an_interrupted_decision_creation_reopens_consistently() {
+        use project_orchestrator::neo4j::traits::DecisionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let mut points = vec![Interruption::ApresLeNoeud, Interruption::ApresLeMarqueur];
+        points.extend((1..=9).map(Interruption::ApresLaPropriete));
+        points.extend([
+            Interruption::AvantLeRetraitDuMarqueur,
+            Interruption::ApresLeRetraitDuMarqueur,
+        ]);
+        let mut touches = 0;
+        for (k, point) in points.iter().copied().enumerate() {
+            let base = dir.path().join(format!("decision-{k}"));
+            let store = open(&base).await;
+            let p = a_project("decision-interrupted");
+            store.create_project(&p).await.unwrap();
+            let d = a_decision("interrompue");
+            store.interrompre_au_prochain(point);
+            let issue = store.create_decision_global(&d, Some(p.id)).await;
+            assert!(issue.is_err(), "{point:?} is on the path of a creation");
+            touches += 1;
+            assert!(
+                store.get_decision(d.id).await.unwrap().is_none(),
+                "{point:?}"
+            );
+            store.close().await.unwrap();
+            drop(store);
+
+            let store = open(&base).await;
+            let rapport = store.rapport_d_ouverture().clone();
+            assert!(rapport.en_quarantaine.is_empty(), "{point:?}: {rapport:?}");
+            if point == Interruption::ApresLeRetraitDuMarqueur {
+                assert!(
+                    store.get_decision(d.id).await.unwrap().is_some(),
+                    "{point:?}"
+                );
+                assert_eq!(
+                    store.get_decision_project_id(d.id).await.unwrap(),
+                    Some(p.id.to_string())
+                );
+            } else {
+                assert_eq!(rapport.brouillons_supprimes, 1, "{point:?}: {rapport:?}");
+                assert!(
+                    store.get_decision(d.id).await.unwrap().is_none(),
+                    "{point:?}"
+                );
+                // Only the project is left: the draft went with its edge.
+                assert_eq!(store.noeuds_pour_mesure(), 1, "{point:?}");
+                store.create_decision_global(&d, Some(p.id)).await.unwrap();
+            }
+            store.close().await.unwrap();
+        }
+        assert_eq!(touches, 13);
+    }
+
+    /// `delete_decision` crashed after the k-th engine write: the reopen finishes the
+    /// deletion (the draft marker goes first), or — crashed before any write — finds
+    /// the decision whole. Never a decision stripped of part of its edges.
+    #[tokio::test]
+    async fn an_interrupted_decision_deletion_is_finished_at_open() {
+        use project_orchestrator::neo4j::traits::DecisionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let mut atteints = 0;
+        for k in 1..=10 {
+            let base = dir.path().join(format!("delete-{k}"));
+            let store = open(&base).await;
+            let p = a_project("decision-delete");
+            store.create_project(&p).await.unwrap();
+            let (a, b, c) = (a_decision("a"), a_decision("b"), a_decision("c"));
+            store.create_decision_global(&a, Some(p.id)).await.unwrap();
+            store.create_decision_global(&b, None).await.unwrap();
+            store.create_decision_global(&c, None).await.unwrap();
+            // `a` has three edges: HAS_DECISION in, SUPERSEDES in (from b), out (to c).
+            store.supersede_decision(b.id, a.id).await.unwrap();
+            store.supersede_decision(a.id, c.id).await.unwrap();
+
+            store.interrompre_au_prochain(Interruption::ApresEtape(k));
+            let issue = store.delete_decision(a.id).await;
+            if issue.is_ok() {
+                store.close().await.unwrap();
+                break;
+            }
+            atteints += 1;
+            store.close().await.unwrap();
+            drop(store);
+
+            let store = open(&base).await;
+            let rapport = store.rapport_d_ouverture().clone();
+            assert!(rapport.en_quarantaine.is_empty(), "k={k}: {rapport:?}");
+            if k == 1 {
+                // Nothing written yet: the decision is whole.
+                assert!(store.get_decision(a.id).await.unwrap().is_some());
+                assert_eq!(
+                    store.get_decision_project_id(a.id).await.unwrap(),
+                    Some(p.id.to_string())
+                );
+            } else {
+                assert_eq!(rapport.brouillons_supprimes, 1, "k={k}: {rapport:?}");
+                assert!(store.get_decision(a.id).await.unwrap().is_none(), "k={k}");
+            }
+            // The others are untouched, and a retry converges.
+            assert!(store.get_decision(b.id).await.unwrap().is_some());
+            assert!(store.get_decision(c.id).await.unwrap().is_some());
+            store.delete_decision(a.id).await.unwrap();
+            assert!(store.get_decision(a.id).await.unwrap().is_none());
+            assert_eq!(store.noeuds_pour_mesure(), 3, "k={k}");
+            store.close().await.unwrap();
+            drop(store);
+            assert!(supersedes_on_disk(&base).await.is_empty(), "k={k}");
+        }
+        // The marker, the three edges, the node.
+        assert_eq!(atteints, 5);
+    }
+
+    /// Two readable Decision nodes with the same id: the second is quarantined and the
+    /// id stays reserved, even once the first is deleted.
+    #[tokio::test]
+    async fn a_duplicate_decision_id_stays_reserved_after_the_first_is_deleted() {
+        use project_orchestrator::neo4j::traits::DecisionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        store.close().await.unwrap();
+        drop(store);
+        let d = a_decision("en double");
+        let id = d.id;
+        write_foreign(&base, move |db| {
+            for description in ["premier", "second"] {
+                db.create_node_with_props(
+                    &["Decision"],
+                    vec![
+                        ("id", Value::from(id.to_string())),
+                        ("description", Value::from(description)),
+                        ("rationale", Value::from("r")),
+                        ("status", Value::from("proposed")),
+                    ],
+                );
+            }
+        })
+        .await;
+        let store = open(&base).await;
+        assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+        assert!(store.get_decision(id).await.unwrap().is_some());
+        store.delete_decision(id).await.unwrap();
+        assert!(store.get_decision(id).await.unwrap().is_none());
+        let err = store.create_decision_global(&d, None).await.unwrap_err();
+        assert!(format!("{err:#}").contains("réservé"), "{err:#}");
+        assert!(store.get_decision(id).await.unwrap().is_none());
     }
 
     /// The generator skips nothing: every `async fn` of the two contracts is
