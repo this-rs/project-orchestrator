@@ -10,7 +10,8 @@
 //! its trait (an omitted method would silently inherit the contract's default).
 //!
 //! Ported so far: [`ProjectStore`](crate::neo4j::traits::ProjectStore)
-//! (`project.rs`).
+//! (`project.rs`), and the node part of [`FederationStore`](crate::neo4j::traits::FederationStore)
+//! (`federation.rs`: the five relation writes and the two backfills are refused by name).
 //!
 //! # How obrain is used
 //!
@@ -58,6 +59,7 @@
 //! Reads are served inline (obrain reads are mmap and hash lookups); writes run
 //! on the blocking pool.
 
+mod federation;
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
 mod project;
@@ -102,10 +104,19 @@ pub fn methodes_portees() -> &'static [&'static str] {
     PORTEES
 }
 
-/// The hand-written methods that REFUSE (`GraphStore::get_progress_batch`: its
-/// contract default loops over getters of other domains). They are in
-/// [`methodes_portees`] because they are written, not because they work.
-pub const REFUS_ECRITS_A_LA_MAIN: &[&str] = &["GraphStore::get_progress_batch"];
+/// The hand-written methods that REFUSE: `GraphStore::get_progress_batch` (its
+/// contract default loops over getters of other domains), and the five
+/// `FederationStore` methods whose relation writes and backfills are not ported
+/// (`federation.rs`). They are in [`methodes_portees`] because they are written,
+/// not because they work.
+pub const REFUS_ECRITS_A_LA_MAIN: &[&str] = &[
+    "GraphStore::get_progress_batch",
+    "FederationStore::create_mcp_similar_to",
+    "FederationStore::create_mcp_co_activated",
+    "FederationStore::create_mcp_often_follows",
+    "FederationStore::backfill_co_activated_with",
+    "FederationStore::backfill_often_follows",
+];
 
 /// The methods that really serve something: the ported methods of the domains,
 /// without the hand-written refusals and without `GraphStore`'s own manifest.
@@ -167,9 +178,9 @@ pub enum Creation {
 /// logged by the factory and readable by the caller.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RapportOuverture {
-    /// `Project` nodes of a creation that never reached its commit point (the
-    /// draft marker still there, or nothing on the node): deleted, whatever they
-    /// held (`project.rs`, "Atomicity").
+    /// `Project`, `McpServer` and `McpTool` nodes of a creation that never reached
+    /// its commit point (the draft marker still there, or nothing on the node):
+    /// deleted, whatever they held (`project.rs`, "Atomicity").
     pub brouillons_supprimes: usize,
     /// Projects whose path trio (`root_path`, `declared_path`,
     /// `canonical_path`) was torn by an interrupted update: recomputed from
@@ -212,6 +223,7 @@ struct Interne {
 #[derive(Default)]
 struct Etat {
     projets: project::IndexProjets,
+    federation: federation::IndexFederation,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -443,14 +455,26 @@ impl ObrainGraphStore {
                 )
             })?;
         }
-        let (etat, rapport) = project::IndexProjets::reconstruire(&db)
-            .map(|(projets, rapport)| (Etat { projets }, rapport))
-            .with_context(|| {
+        let (projets, mut rapport) =
+            project::IndexProjets::reconstruire(&db).with_context(|| {
                 format!(
                     "reconstruction des index de la base obrain {}",
                     chemin.display()
                 )
             })?;
+        let (federation, brouillons, quarantaine) = federation::IndexFederation::reconstruire(&db)
+            .with_context(|| {
+                format!(
+                    "reconstruction des index fédération de la base obrain {}",
+                    chemin.display()
+                )
+            })?;
+        rapport.brouillons_supprimes += brouillons;
+        rapport.en_quarantaine.extend(quarantaine);
+        let etat = Etat {
+            projets,
+            federation,
+        };
         let store = Self {
             interne: Arc::new(Interne {
                 db,

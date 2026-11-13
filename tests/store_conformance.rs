@@ -1976,6 +1976,277 @@ pub mod conformance {
         format!("/nonexistent/conformance-{}", Uuid::new_v4())
     }
 
+    // ------------------------------------------------------------------
+    // Federation (MCP servers and their tools): the checks that call nothing
+    // but `FederationStore`, run by `federation_checks!`.
+    // ------------------------------------------------------------------
+
+    pub fn an_mcp_server(
+        project_id: Uuid,
+        server_id: &str,
+    ) -> project_orchestrator::neo4j::models::McpServerNode {
+        project_orchestrator::neo4j::models::McpServerNode {
+            id: Uuid::new_v4(),
+            project_id,
+            server_id: server_id.to_string(),
+            display_name: format!("conformance {server_id}"),
+            transport_type: "stdio".to_string(),
+            transport_url: None,
+            transport_command: Some("conformance-cmd".to_string()),
+            transport_args: Some("[\"--flag\"]".to_string()),
+            transport_secrets: None,
+            status: "disconnected".to_string(),
+            protocol_version: None,
+            server_name: Some("conformance".to_string()),
+            tool_count: 0,
+            created_at: Utc::now(),
+            updated_at: None,
+            last_connected_at: None,
+        }
+    }
+
+    pub fn an_mcp_tool(
+        server_id: &str,
+        name: &str,
+    ) -> project_orchestrator::neo4j::models::McpToolNode {
+        project_orchestrator::neo4j::models::McpToolNode {
+            id: Uuid::new_v4(),
+            server_id: server_id.to_string(),
+            name: name.to_string(),
+            fqn: format!("{server_id}::{name}"),
+            description: "conformance tool".to_string(),
+            input_schema: "{}".to_string(),
+            category: "query".to_string(),
+            embedding: None,
+            created_at: Utc::now(),
+            updated_at: None,
+        }
+    }
+
+    /// Every field but the timestamps, compared WITHOUT printing them: the
+    /// stdio secrets of a server must never reach a test log.
+    fn same_server(
+        a: &project_orchestrator::neo4j::models::McpServerNode,
+        b: &project_orchestrator::neo4j::models::McpServerNode,
+    ) -> bool {
+        a.id == b.id
+            && a.project_id == b.project_id
+            && a.server_id == b.server_id
+            && a.display_name == b.display_name
+            && a.transport_type == b.transport_type
+            && a.transport_url == b.transport_url
+            && a.transport_command == b.transport_command
+            && a.transport_args == b.transport_args
+            && a.transport_secrets == b.transport_secrets
+            && a.status == b.status
+            && a.protocol_version == b.protocol_version
+            && a.server_name == b.server_name
+            && a.tool_count == b.tool_count
+            && a.last_connected_at == b.last_connected_at
+    }
+
+    /// A server and a tool come back with the values written; the absent
+    /// optional values read back absent; the absent ids read as absent.
+    pub async fn check_mcp_roundtrip(store: &dyn GraphStore) {
+        let project = Uuid::new_v4();
+        let sid = format!("conformance-rt-{}", Uuid::new_v4());
+        let mut s = an_mcp_server(project, &sid);
+        s.transport_secrets = Some("{\"env\":{\"K\":\"v\"}}".to_string());
+        store.create_mcp_server(&s).await.unwrap();
+
+        let back = store
+            .get_mcp_server(s.id)
+            .await
+            .unwrap()
+            .expect("read by id");
+        assert!(
+            same_server(&back, &s),
+            "the server read back differs (secrets not printed)"
+        );
+        assert_eq!(
+            back.transport_url, None,
+            "an absent value reads back absent"
+        );
+        let listed = store.list_mcp_servers(project).await.unwrap();
+        assert_eq!(listed.len(), 1, "list_mcp_servers of its project");
+        assert!(same_server(&listed[0], &s), "the listed server differs");
+        assert!(store
+            .list_mcp_servers(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .get_mcp_server(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none());
+
+        let t = an_mcp_tool(&sid, "read");
+        store.create_mcp_tool(&t).await.unwrap();
+        let tools = store.list_mcp_tools_for_server(&sid).await.unwrap();
+        assert_eq!(tools.len(), 1, "one tool for the server");
+        assert_eq!(tools[0].id, t.id);
+        assert_eq!(tools[0].fqn, t.fqn);
+        assert_eq!(tools[0].description, t.description);
+        assert_eq!(
+            tools[0].embedding, None,
+            "an absent embedding reads back absent"
+        );
+        assert!(store
+            .list_mcp_tools_for_server(&format!("absent-{}", Uuid::new_v4()))
+            .await
+            .unwrap()
+            .is_empty());
+
+        store.delete_mcp_server(s.id).await.unwrap();
+    }
+
+    /// Servers of a project come out by `(server_id, id)`, the tools of a server by
+    /// `(name, id)`: a total order, the id breaking the ties of the first key.
+    pub async fn check_mcp_list_order(store: &dyn GraphStore) {
+        let project = Uuid::new_v4();
+        let tag = Uuid::new_v4();
+        let sid = |x: &str| format!("conformance-ord-{tag}-{x}");
+
+        let mut servers = vec![
+            an_mcp_server(project, &sid("zeta")),
+            an_mcp_server(project, &sid("alpha")),
+            an_mcp_server(project, &sid("alpha")),
+        ];
+        for s in &servers {
+            store.create_mcp_server(s).await.unwrap();
+        }
+        servers.sort_by(|a, b| {
+            a.server_id
+                .cmp(&b.server_id)
+                .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+        });
+        let expected: Vec<Uuid> = servers.iter().map(|s| s.id).collect();
+        let listed: Vec<Uuid> = store
+            .list_mcp_servers(project)
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(listed, expected, "list_mcp_servers: (server_id, id)");
+        let mine: HashSet<Uuid> = expected.iter().copied().collect();
+        let all: Vec<Uuid> = store
+            .list_all_mcp_servers()
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .filter(|id| mine.contains(id))
+            .collect();
+        assert_eq!(
+            all, expected,
+            "list_all_mcp_servers: the same order among ours"
+        );
+
+        let tools_sid = sid("tools");
+        let mut tools = vec![
+            an_mcp_tool(&tools_sid, "write"),
+            an_mcp_tool(&tools_sid, "read"),
+            an_mcp_tool(&tools_sid, "read"),
+        ];
+        for t in &tools {
+            store.create_mcp_tool(t).await.unwrap();
+        }
+        tools.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+        });
+        let expected_tools: Vec<Uuid> = tools.iter().map(|t| t.id).collect();
+        let listed_tools: Vec<Uuid> = store
+            .list_mcp_tools_for_server(&tools_sid)
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            listed_tools, expected_tools,
+            "list_mcp_tools_for_server: (name, id)"
+        );
+
+        for s in &servers {
+            store.delete_mcp_server(s.id).await.unwrap();
+        }
+        store.delete_mcp_tools_for_server(&tools_sid).await.unwrap();
+    }
+
+    /// A status update is read back, and is a no-op on an absent server. Deleting
+    /// a server takes its tools with it; by `server_id` it takes every server with
+    /// that id; deleting what is absent is not an error.
+    pub async fn check_mcp_status_and_deletion(store: &dyn GraphStore) {
+        let project = Uuid::new_v4();
+        let sid = format!("conformance-del-{}", Uuid::new_v4());
+        let s = an_mcp_server(project, &sid);
+        store.create_mcp_server(&s).await.unwrap();
+        store
+            .create_mcp_tool(&an_mcp_tool(&sid, "a"))
+            .await
+            .unwrap();
+        store
+            .create_mcp_tool(&an_mcp_tool(&sid, "b"))
+            .await
+            .unwrap();
+
+        store
+            .update_mcp_server_status(s.id, "connected")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_mcp_server(s.id).await.unwrap().unwrap().status,
+            "connected"
+        );
+        store
+            .update_mcp_server_status(Uuid::new_v4(), "error")
+            .await
+            .unwrap();
+
+        store.delete_mcp_server(s.id).await.unwrap();
+        assert!(store.get_mcp_server(s.id).await.unwrap().is_none());
+        assert!(store
+            .list_mcp_tools_for_server(&sid)
+            .await
+            .unwrap()
+            .is_empty());
+        store.delete_mcp_server(s.id).await.unwrap();
+
+        let again = an_mcp_server(project, &sid);
+        store.create_mcp_server(&again).await.unwrap();
+        store
+            .create_mcp_tool(&an_mcp_tool(&sid, "c"))
+            .await
+            .unwrap();
+        store.delete_mcp_server_by_server_id(&sid).await.unwrap();
+        assert!(store.get_mcp_server(again.id).await.unwrap().is_none());
+        assert!(store
+            .list_mcp_tools_for_server(&sid)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store.list_mcp_servers(project).await.unwrap().is_empty());
+        store
+            .delete_mcp_server_by_server_id(&format!("absent-{}", Uuid::new_v4()))
+            .await
+            .unwrap();
+
+        store
+            .create_mcp_tool(&an_mcp_tool(&sid, "d"))
+            .await
+            .unwrap();
+        store.delete_mcp_tools_for_server(&sid).await.unwrap();
+        assert!(store
+            .list_mcp_tools_for_server(&sid)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     /// What is created reads back identical, by id and by slug, down to the
     /// nanosecond of `created_at`; what was never created reads as absent.
     pub async fn check_project_roundtrip(store: &dyn GraphStore) {
@@ -2879,3 +3150,24 @@ project_checks!(mock_project, MockFactory);
 project_checks!(neo4j_project, Neo4jFactory);
 #[cfg(feature = "obrain-backend")]
 project_checks!(obrain_project, ObrainFactory);
+
+/// The federation domain: the checks that call only `FederationStore`, on the
+/// same fixtures for every backend ported to it.
+macro_rules! federation_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [
+                check_mcp_roundtrip,
+                check_mcp_list_order,
+                check_mcp_status_and_deletion,
+            ]
+        );
+    };
+}
+
+federation_checks!(mock_federation, MockFactory);
+federation_checks!(neo4j_federation, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+federation_checks!(obrain_federation, ObrainFactory);

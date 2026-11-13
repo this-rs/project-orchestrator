@@ -1515,20 +1515,33 @@ mod with_the_feature {
             in_contracts
         );
 
-        // This lot: ProjectStore's nine methods, plus the two of GraphStore.
+        // ProjectStore's nine methods, FederationStore's ten served ones, and the two
+        // of GraphStore (`capabilities`, `get_progress_batch`).
         let domains: std::collections::BTreeSet<&str> = written
             .iter()
             .map(|m| m.split("::").next().unwrap())
             .collect();
         assert_eq!(
             domains.into_iter().collect::<Vec<_>>(),
-            ["GraphStore", "ProjectStore"]
+            ["FederationStore", "GraphStore", "ProjectStore"]
         );
         let servent = methodes_qui_servent();
-        assert_eq!(servent.len(), 9, "{servent:?}");
-        assert!(servent.iter().all(|m| m.starts_with("ProjectStore::")));
+        assert_eq!(servent.len(), 19, "{servent:?}");
+        assert!(servent
+            .iter()
+            .all(|m| m.starts_with("ProjectStore::") || m.starts_with("FederationStore::")));
         // The written refusals are written, and are not counted as serving.
-        assert_eq!(REFUS_ECRITS_A_LA_MAIN, ["GraphStore::get_progress_batch"]);
+        assert_eq!(
+            REFUS_ECRITS_A_LA_MAIN,
+            [
+                "GraphStore::get_progress_batch",
+                "FederationStore::create_mcp_similar_to",
+                "FederationStore::create_mcp_co_activated",
+                "FederationStore::create_mcp_often_follows",
+                "FederationStore::backfill_co_activated_with",
+                "FederationStore::backfill_often_follows",
+            ]
+        );
         assert!(REFUS_ECRITS_A_LA_MAIN.iter().all(|m| written.contains(m)));
         // What keeps a default is known and justified where it is declared.
         assert_eq!(kept, ["AnalyticsStore::run_data_migrations"]);
