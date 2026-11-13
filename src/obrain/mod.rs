@@ -10,7 +10,8 @@
 //! its trait (an omitted method would silently inherit the contract's default).
 //!
 //! Ported so far: [`ProjectStore`](crate::neo4j::traits::ProjectStore)
-//! (`project.rs`).
+//! (`project.rs`), and the note node of [`NoteStore`](crate::neo4j::traits::NoteStore)
+//! (`note.rs`: 13 of its 41 methods; the others are refused by name there).
 //!
 //! # How obrain is used
 //!
@@ -60,6 +61,7 @@
 
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
+mod note;
 mod project;
 
 #[cfg(any(test, feature = "mock-store"))]
@@ -102,6 +104,12 @@ pub fn methodes_portees() -> &'static [&'static str] {
     PORTEES
 }
 
+/// The methods of `NoteStore` refused on every call, as `NoteStore::<method>`
+/// (`note.rs`). Three more note methods refuse only in some cases.
+pub fn refusees_note() -> &'static [&'static str] {
+    note::REFUSEES
+}
+
 /// The hand-written methods that REFUSE (`GraphStore::get_progress_batch`: its
 /// contract default loops over getters of other domains). They are in
 /// [`methodes_portees`] because they are written, not because they work.
@@ -113,7 +121,11 @@ pub fn methodes_qui_servent() -> Vec<&'static str> {
     PORTEES
         .iter()
         .copied()
-        .filter(|m| !REFUS_ECRITS_A_LA_MAIN.contains(m) && !m.starts_with("GraphStore::"))
+        .filter(|m| {
+            !REFUS_ECRITS_A_LA_MAIN.contains(m)
+                && !note::REFUSEES.contains(m)
+                && !m.starts_with("GraphStore::")
+        })
         .collect()
 }
 
@@ -212,6 +224,7 @@ struct Interne {
 #[derive(Default)]
 struct Etat {
     projets: project::IndexProjets,
+    notes: note::IndexNotes,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -223,6 +236,10 @@ struct Ecriture<'a> {
     /// The write put a value in a place the WAL does not recover (see
     /// [`SEUIL_COLONNE_BLOB`]): the WAL fsync is not enough, the full flush runs.
     flush_complet: bool,
+    /// How many engine writes of this closure have been made (the test hook
+    /// `Interruption::ApresEtape` counts them).
+    #[cfg_attr(not(any(test, feature = "mock-store")), allow(dead_code))]
+    etapes: usize,
 }
 
 impl Ecriture<'_> {
@@ -254,6 +271,18 @@ impl Ecriture<'_> {
         if *arme == Some(point) {
             *arme = None;
             bail!("interruption injectée par le test : {point:?}");
+        }
+        Ok(())
+    }
+
+    /// A test hook after each engine write of a multi-write (see `note.rs`): a crash
+    /// simulation at the k-th write. Nothing in production.
+    fn etape(&mut self) -> Result<()> {
+        #[cfg(any(test, feature = "mock-store"))]
+        {
+            self.etapes += 1;
+            let n = self.etapes;
+            self.point(Interruption::ApresEtape(n))?;
         }
         Ok(())
     }
@@ -443,14 +472,17 @@ impl ObrainGraphStore {
                 )
             })?;
         }
-        let (etat, rapport) = project::IndexProjets::reconstruire(&db)
-            .map(|(projets, rapport)| (Etat { projets }, rapport))
-            .with_context(|| {
-                format!(
-                    "reconstruction des index de la base obrain {}",
-                    chemin.display()
-                )
-            })?;
+        let contexte = || {
+            format!(
+                "reconstruction des index de la base obrain {}",
+                chemin.display()
+            )
+        };
+        let (projets, mut rapport) =
+            project::IndexProjets::reconstruire(&db).with_context(contexte)?;
+        let notes =
+            note::IndexNotes::reconstruire(&db, &projets, &mut rapport).with_context(contexte)?;
+        let etat = Etat { projets, notes };
         let store = Self {
             interne: Arc::new(Interne {
                 db,
@@ -590,6 +622,7 @@ impl ObrainGraphStore {
                 interne: &interne,
                 rendu_durable: false,
                 flush_complet: false,
+                etapes: 0,
             };
             let rendu = f(prepare, &mut ecriture)?;
             if !ecriture.rendu_durable {

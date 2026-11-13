@@ -60,7 +60,9 @@ pub mod conformance {
         StepNode, StepStatus, TaskNode, TaskStatus,
     };
     use project_orchestrator::neo4j::GraphStore;
-    use project_orchestrator::notes::{Note, NoteFilters, NoteStatus, NoteType};
+    use project_orchestrator::notes::{
+        EntityType, Note, NoteFilters, NoteImportance, NoteScope, NoteStatus, NoteType,
+    };
     use project_orchestrator::plan::models::UpdateTaskRequest;
     use project_orchestrator::protocol::{Protocol, ProtocolRun, RunStatus};
     use std::collections::HashSet;
@@ -2548,6 +2550,289 @@ pub mod conformance {
             store.delete_project(p.id, &p.name).await.unwrap();
         }
     }
+
+    // ------------------------------------------------------------------
+    // The note domain (NoteStore, the ported part). Each check works on fresh
+    // ids and deletes what it created. Neo4j is the reference.
+    // ------------------------------------------------------------------
+
+    /// A note with a project: every field the write path stores is set to a
+    /// value that is not the default, so a lossy round-trip shows.
+    pub async fn check_note_roundtrip(store: &dyn GraphStore) {
+        let p = a_project("note-rt");
+        store.create_project(&p).await.unwrap();
+        let mut n = a_note(Some(p.id), "une note « avec accents » et\nun saut de ligne");
+        n.importance = NoteImportance::High;
+        n.tags = vec!["alpha".into(), "beta".into()];
+        n.confidence = Some(0.25);
+        n.staleness_score = 0.5;
+        n.valid_from = Some(Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap());
+        n.scope = NoteScope::File("src/lib.rs".into());
+        store.create_note(&n).await.unwrap();
+        let got = store
+            .get_note(n.id)
+            .await
+            .unwrap()
+            .expect("the note reads back");
+        assert_eq!(got.id, n.id);
+        assert_eq!(got.project_id, Some(p.id));
+        assert_eq!(got.content, n.content);
+        assert_eq!(got.importance, NoteImportance::High);
+        assert_eq!(got.status, n.status);
+        assert_eq!(got.tags, n.tags);
+        assert_eq!(got.confidence, Some(0.25));
+        assert!((got.staleness_score - 0.5).abs() < 1e-12);
+        assert_eq!(got.valid_from, n.valid_from);
+        assert_eq!(got.scope, NoteScope::File("src/lib.rs".into()));
+        assert_eq!(got.created_at, n.created_at);
+        assert_eq!(got.created_by, n.created_by);
+        assert!(store.get_note(Uuid::new_v4()).await.unwrap().is_none());
+        store.delete_note(n.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.ok();
+    }
+
+    /// Update, rescope (both ways), delete, and the absent-note answers.
+    pub async fn check_note_update_rescope_delete(store: &dyn GraphStore) {
+        let p = a_project("note-urd");
+        store.create_project(&p).await.unwrap();
+        let n = a_note(None, "orpheline");
+        store.create_note(&n).await.unwrap();
+        // Global until rescoped (no global listing: a shared Neo4j may hold legacy notes).
+        assert_eq!(
+            store.get_note(n.id).await.unwrap().unwrap().project_id,
+            None
+        );
+        store.rescope_note(n.id, Some(p.id)).await.unwrap();
+        let (dans_p, total) = store
+            .list_notes(Some(p.id), None, &NoteFilters::default())
+            .await
+            .unwrap();
+        assert!(dans_p.iter().any(|x| x.id == n.id) && total >= 1);
+        store.rescope_note(n.id, None).await.unwrap();
+        assert_eq!(
+            store.get_note(n.id).await.unwrap().unwrap().project_id,
+            None
+        );
+        let u = store
+            .update_note(
+                n.id,
+                Some("nouveau contenu".into()),
+                Some(NoteImportance::Critical),
+                Some(NoteStatus::NeedsReview),
+                Some(vec!["t".into()]),
+                Some(0.75),
+            )
+            .await
+            .unwrap()
+            .expect("the note is updated");
+        assert_eq!(u.content, "nouveau contenu");
+        assert_eq!(u.importance, NoteImportance::Critical);
+        assert_eq!(u.status, NoteStatus::NeedsReview);
+        assert_eq!(u.tags, vec!["t".to_string()]);
+        assert!((u.staleness_score - 0.75).abs() < 1e-12);
+        assert!(store
+            .update_note(Uuid::new_v4(), Some("x".into()), None, None, None, None)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.delete_note(n.id).await.unwrap());
+        assert!(!store.delete_note(n.id).await.unwrap());
+        assert!(store.get_note(n.id).await.unwrap().is_none());
+        store.delete_project(p.id, &p.name).await.ok();
+    }
+
+    /// Sort by a field, a total order (id breaks ties), and paging over a tie.
+    pub async fn check_note_list_order_and_paging(store: &dyn GraphStore) {
+        let p = a_project("note-list");
+        store.create_project(&p).await.unwrap();
+        let mut ids = Vec::new();
+        for (k, s) in [0.3, 0.1, 0.3, 0.9, 0.5].iter().enumerate() {
+            let mut n = a_note(Some(p.id), &format!("note {k}"));
+            n.staleness_score = *s;
+            store.create_note(&n).await.unwrap();
+            ids.push(n.id);
+        }
+        let f = NoteFilters {
+            sort_by: Some("staleness_score".into()),
+            sort_order: Some("asc".into()),
+            ..Default::default()
+        };
+        let (liste, total) = store.list_notes(Some(p.id), None, &f).await.unwrap();
+        assert_eq!(total, 5);
+        let scores: Vec<f64> = liste.iter().map(|n| n.staleness_score).collect();
+        assert_eq!(scores, vec![0.1, 0.3, 0.3, 0.5, 0.9]);
+        // Ties on 0.3 are ordered by id: the page boundary does not move.
+        let tie: Vec<Uuid> = liste
+            .iter()
+            .filter(|n| n.staleness_score == 0.3)
+            .map(|n| n.id)
+            .collect();
+        let mut tie_sorted = tie.clone();
+        tie_sorted.sort();
+        assert_eq!(tie, tie_sorted);
+        let page = |offset: i64| NoteFilters {
+            sort_by: Some("staleness_score".into()),
+            sort_order: Some("asc".into()),
+            limit: Some(2),
+            offset: Some(offset),
+            ..Default::default()
+        };
+        let (p1, _) = store.list_notes(Some(p.id), None, &page(0)).await.unwrap();
+        let (p2, _) = store.list_notes(Some(p.id), None, &page(2)).await.unwrap();
+        let joined: Vec<Uuid> = p1.iter().chain(p2.iter()).map(|n| n.id).collect();
+        assert_eq!(
+            joined,
+            liste.iter().take(4).map(|n| n.id).collect::<Vec<_>>()
+        );
+        for id in ids {
+            store.delete_note(id).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.ok();
+    }
+
+    /// Links to a project and to a note: created, read back with their hashes,
+    /// updated in place (MERGE), removed; a link to an absent target is a no-op.
+    pub async fn check_note_entity_links(store: &dyn GraphStore) {
+        let p = a_project("note-links");
+        store.create_project(&p).await.unwrap();
+        let n = a_note(Some(p.id), "lie au projet");
+        let m = a_note(Some(p.id), "lie à une note");
+        store.create_note(&n).await.unwrap();
+        store.create_note(&m).await.unwrap();
+        store
+            .link_note_to_entity(
+                n.id,
+                &EntityType::Project,
+                &p.id.to_string(),
+                Some("sig"),
+                None,
+            )
+            .await
+            .unwrap();
+        let for_p = store
+            .get_notes_for_entity(&EntityType::Project, &p.id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(ids(&for_p, |x| x.id), vec![n.id]);
+        // Updated in place: one link, new hash.
+        store
+            .link_note_to_entity(
+                n.id,
+                &EntityType::Project,
+                &p.id.to_string(),
+                Some("sig2"),
+                Some("body"),
+            )
+            .await
+            .unwrap();
+        let anchors = store.get_note_anchors(n.id).await.unwrap();
+        assert_eq!(anchors.len(), 1, "MERGE: one edge per pair");
+        assert_eq!(anchors[0].signature_hash.as_deref(), Some("sig2"));
+        assert_eq!(anchors[0].body_hash.as_deref(), Some("body"));
+        assert!(anchors[0].is_valid);
+        store
+            .link_note_to_entity(n.id, &EntityType::Note, &m.id.to_string(), None, None)
+            .await
+            .unwrap();
+        let for_m = store
+            .get_notes_for_entity(&EntityType::Note, &m.id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(ids(&for_m, |x| x.id), vec![n.id]);
+        // An absent target: no edge, no error (Neo4j's MATCH finds nothing).
+        store
+            .link_note_to_entity(
+                n.id,
+                &EntityType::Project,
+                &Uuid::new_v4().to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.get_note_anchors(n.id).await.unwrap().len(), 2);
+        store
+            .unlink_note_from_entity(n.id, &EntityType::Note, &m.id.to_string())
+            .await
+            .unwrap();
+        assert!(store
+            .get_notes_for_entity(&EntityType::Note, &m.id.to_string())
+            .await
+            .unwrap()
+            .is_empty());
+        store.delete_note(n.id).await.unwrap();
+        store.delete_note(m.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.ok();
+    }
+
+    /// Supersession archives the old note, names its successor, and a
+    /// confirmation does not resurrect it; confirming the successor makes it active.
+    pub async fn check_note_supersede_and_confirm(store: &dyn GraphStore) {
+        let p = a_project("note-supersede");
+        store.create_project(&p).await.unwrap();
+        let old = a_note(Some(p.id), "ancienne");
+        let new = a_note(Some(p.id), "nouvelle");
+        store.create_note(&old).await.unwrap();
+        store.create_note(&new).await.unwrap();
+        store.supersede_note(old.id, new.id).await.unwrap();
+        let o = store.get_note(old.id).await.unwrap().unwrap();
+        let w = store.get_note(new.id).await.unwrap().unwrap();
+        assert_eq!(o.status, NoteStatus::Archived);
+        assert_eq!(o.superseded_by, Some(new.id));
+        assert_eq!(w.supersedes, Some(old.id));
+        let c = store.confirm_note(old.id, "alice").await.unwrap().unwrap();
+        assert_eq!(
+            c.status,
+            NoteStatus::Archived,
+            "a superseded note is not resurrected"
+        );
+        assert_eq!(c.human_confirmed_by.as_deref(), Some("alice"));
+        assert_eq!(c.staleness_score, 0.0);
+        let cw = store
+            .confirm_note(new.id, "system/heuristic")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cw.status, NoteStatus::Active);
+        assert_eq!(cw.human_confirmed_by, None, "a heuristic never signs");
+        assert_eq!(cw.staleness_score, 0.0);
+        assert!(store
+            .confirm_note(Uuid::new_v4(), "alice")
+            .await
+            .unwrap()
+            .is_none());
+        store.delete_note(old.id).await.unwrap();
+        store.delete_note(new.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.ok();
+    }
+
+    /// The review queue: only `stale` and `needs_review` notes of the project.
+    pub async fn check_note_needing_review(store: &dyn GraphStore) {
+        let p = a_project("note-review");
+        store.create_project(&p).await.unwrap();
+        let mut a = a_note(Some(p.id), "stale");
+        a.status = NoteStatus::Stale;
+        let mut b = a_note(Some(p.id), "active");
+        b.status = NoteStatus::Active;
+        let mut c = a_note(Some(p.id), "review");
+        c.status = NoteStatus::NeedsReview;
+        for n in [&a, &b, &c] {
+            store.create_note(n).await.unwrap();
+        }
+        let liste = store
+            .get_notes_needing_review(Some(p.id), None)
+            .await
+            .unwrap();
+        let mut got = ids(&liste, |x| x.id);
+        got.sort();
+        let mut want = vec![a.id, c.id];
+        want.sort();
+        assert_eq!(got, want);
+        for n in [a, b, c] {
+            store.delete_note(n.id).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.ok();
+    }
 }
 
 // ======================================================================
@@ -2879,3 +3164,26 @@ project_checks!(mock_project, MockFactory);
 project_checks!(neo4j_project, Neo4jFactory);
 #[cfg(feature = "obrain-backend")]
 project_checks!(obrain_project, ObrainFactory);
+
+/// The note domain: the checks that call nothing but `NoteStore` (and the
+/// project they attach to). Run on the obrain backend for the ported methods.
+macro_rules! note_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [
+                check_note_roundtrip,
+                check_note_update_rescope_delete,
+                check_note_list_order_and_paging,
+                check_note_entity_links,
+                check_note_supersede_and_confirm,
+                check_note_needing_review,
+            ]
+        );
+    };
+}
+
+note_checks!(neo4j_note, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+note_checks!(obrain_note, ObrainFactory);

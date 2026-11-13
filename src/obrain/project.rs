@@ -165,7 +165,8 @@ pub(super) struct IndexProjets {
 }
 
 impl IndexProjets {
-    #[cfg(any(test, feature = "mock-store"))]
+    /// The node of the project `id`, if this backend holds it (used by the other
+    /// domains that attach to a project).
     pub(super) fn noeud_de(&self, id: Uuid) -> Option<NodeId> {
         self.par_id.get(&id).map(|e| e.noeud)
     }
