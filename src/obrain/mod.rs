@@ -10,7 +10,8 @@
 //! its trait (an omitted method would silently inherit the contract's default).
 //!
 //! Ported so far: [`ProjectStore`](crate::neo4j::traits::ProjectStore)
-//! (`project.rs`).
+//! (`project.rs`), and [`WorkspaceStore`](crate::neo4j::traits::WorkspaceStore)
+//! (`workspace.rs`, 35 of its 45 methods; the rest are refused by name).
 //!
 //! # How obrain is used
 //!
@@ -61,6 +62,7 @@
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
 mod project;
+mod workspace;
 
 #[cfg(any(test, feature = "mock-store"))]
 pub use mesure::{Durabilite, Interruption};
@@ -105,7 +107,20 @@ pub fn methodes_portees() -> &'static [&'static str] {
 /// The hand-written methods that REFUSE (`GraphStore::get_progress_batch`: its
 /// contract default loops over getters of other domains). They are in
 /// [`methodes_portees`] because they are written, not because they work.
-pub const REFUS_ECRITS_A_LA_MAIN: &[&str] = &["GraphStore::get_progress_batch"];
+pub const REFUS_ECRITS_A_LA_MAIN: &[&str] = &[
+    "GraphStore::get_progress_batch",
+    // WorkspaceStore: the domains they read (plan, cross-workspace listing) are not ported.
+    "WorkspaceStore::list_all_workspace_milestones_filtered",
+    "WorkspaceStore::count_all_workspace_milestones",
+    "WorkspaceStore::add_task_to_workspace_milestone",
+    "WorkspaceStore::remove_task_from_workspace_milestone",
+    "WorkspaceStore::link_plan_to_workspace_milestone",
+    "WorkspaceStore::unlink_plan_from_workspace_milestone",
+    "WorkspaceStore::get_workspace_milestone_progress",
+    "WorkspaceStore::get_workspace_milestone_tasks",
+    "WorkspaceStore::get_workspace_milestone_steps",
+    "WorkspaceStore::compute_coupling_matrix",
+];
 
 /// The methods that really serve something: the ported methods of the domains,
 /// without the hand-written refusals and without `GraphStore`'s own manifest.
@@ -212,6 +227,7 @@ struct Interne {
 #[derive(Default)]
 struct Etat {
     projets: project::IndexProjets,
+    espaces: workspace::IndexEspaces,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -443,14 +459,19 @@ impl ObrainGraphStore {
                 )
             })?;
         }
-        let (etat, rapport) = project::IndexProjets::reconstruire(&db)
-            .map(|(projets, rapport)| (Etat { projets }, rapport))
-            .with_context(|| {
+        let (etat, rapport) = {
+            let contexte = || {
                 format!(
                     "reconstruction des index de la base obrain {}",
                     chemin.display()
                 )
-            })?;
+            };
+            let (projets, mut rapport) =
+                project::IndexProjets::reconstruire(&db).with_context(contexte)?;
+            let espaces = workspace::IndexEspaces::reconstruire(&db, &projets, &mut rapport)
+                .with_context(contexte)?;
+            (Etat { projets, espaces }, rapport)
+        };
         let store = Self {
             interne: Arc::new(Interne {
                 db,
