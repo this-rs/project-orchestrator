@@ -2106,68 +2106,76 @@ pub mod conformance {
         store.delete_mcp_server(s.id).await.unwrap();
     }
 
-    /// Servers of a project come out by `(server_id, id)`, the tools of a server by
-    /// `(name, id)`: a total order, the id breaking the ties of the first key.
+    /// Servers come out sorted by `server_id`, the tools of a server by `name`:
+    /// what Neo4j states (`ORDER BY s.server_id`, `ORDER BY t.name, t.id`). A tie on
+    /// `server_id` has no order in the contract, so the order WITHIN a tie is not
+    /// asserted here; the obrain order, total, is checked in
+    /// `obrain_federation_specifique`.
     pub async fn check_mcp_list_order(store: &dyn GraphStore) {
         let project = Uuid::new_v4();
         let tag = Uuid::new_v4();
         let sid = |x: &str| format!("conformance-ord-{tag}-{x}");
 
-        // The contract promises no total order on these listings: `traits.rs`
-        // documents them as "List MCP servers for a project" / "List tools for an MCP
-        // server", and the Neo4j reference sorts servers by `server_id` alone (no
-        // tie-break). Two servers sharing a `server_id` — or two tools sharing a name
-        // — are therefore interchangeable: assert the set of ids, not their order.
         let servers = vec![
             an_mcp_server(project, &sid("zeta")),
             an_mcp_server(project, &sid("alpha")),
+            an_mcp_server(project, &sid("mu")),
             an_mcp_server(project, &sid("alpha")),
         ];
         for s in &servers {
             store.create_mcp_server(s).await.unwrap();
         }
         let expected: HashSet<Uuid> = servers.iter().map(|s| s.id).collect();
-        let listed: HashSet<Uuid> = store
-            .list_mcp_servers(project)
-            .await
-            .unwrap()
-            .iter()
-            .map(|s| s.id)
-            .collect();
-        assert_eq!(listed, expected, "list_mcp_servers: the same servers");
-        let all: HashSet<Uuid> = store
+        let listed = store.list_mcp_servers(project).await.unwrap();
+        assert_eq!(
+            id_set(&listed, |s| s.id),
+            expected,
+            "list_mcp_servers: the same servers"
+        );
+        let keys: Vec<&str> = listed.iter().map(|s| s.server_id.as_str()).collect();
+        assert!(
+            keys.windows(2).all(|w| w[0] <= w[1]),
+            "list_mcp_servers by server_id: {keys:?}"
+        );
+        let all: Vec<_> = store
             .list_all_mcp_servers()
             .await
             .unwrap()
-            .iter()
-            .map(|s| s.id)
-            .filter(|id| expected.contains(id))
+            .into_iter()
+            .filter(|s| expected.contains(&s.id))
             .collect();
         assert_eq!(
-            all, expected,
+            id_set(&all, |s| s.id),
+            expected,
             "list_all_mcp_servers: the same servers among ours"
+        );
+        let keys: Vec<&str> = all.iter().map(|s| s.server_id.as_str()).collect();
+        assert!(
+            keys.windows(2).all(|w| w[0] <= w[1]),
+            "list_all_mcp_servers by server_id: {keys:?}"
         );
 
         let tools_sid = sid("tools");
         let tools = vec![
             an_mcp_tool(&tools_sid, "write"),
             an_mcp_tool(&tools_sid, "read"),
+            an_mcp_tool(&tools_sid, "list"),
             an_mcp_tool(&tools_sid, "read"),
         ];
         for t in &tools {
             store.create_mcp_tool(t).await.unwrap();
         }
-        let expected_tools: HashSet<Uuid> = tools.iter().map(|t| t.id).collect();
-        let listed_tools: HashSet<Uuid> = store
-            .list_mcp_tools_for_server(&tools_sid)
-            .await
-            .unwrap()
-            .iter()
-            .map(|t| t.id)
-            .collect();
+        let listed_tools = store.list_mcp_tools_for_server(&tools_sid).await.unwrap();
         assert_eq!(
-            listed_tools, expected_tools,
+            id_set(&listed_tools, |t| t.id),
+            tools.iter().map(|t| t.id).collect::<HashSet<_>>(),
             "list_mcp_tools_for_server: the same tools"
+        );
+        let names: Vec<&str> = listed_tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["list", "read", "read", "write"],
+            "list_mcp_tools_for_server by name"
         );
 
         for s in &servers {
@@ -5664,6 +5672,170 @@ mod obrain_release_specifique {
             "{err:#}"
         );
         assert_eq!(s.noeuds_de_label_pour_test("Deployment"), 1);
+    }
+}
+
+/// What only the obrain adapter does for the federation: the total order of the
+/// lists, the drafts and the duplicates.
+#[cfg(feature = "obrain-backend")]
+mod obrain_federation_specifique {
+    use chrono::{TimeZone, Utc};
+    use project_orchestrator::neo4j::traits::FederationStore;
+    use project_orchestrator::obrain::{Creation, Interruption, ObrainGraphStore, ValeurBrute};
+    use uuid::Uuid;
+
+    /// Servers by `(server_id, most recent created_at, id)`, tools by `(name, id)`:
+    /// the exact order, ties included. The two servers `alpha` are the case of a
+    /// server connected again after a failed reconnection: the newer comes first,
+    /// whatever their ids, so startup restores the latest configuration.
+    #[tokio::test]
+    async fn the_lists_follow_the_total_order() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let project = Uuid::new_v4();
+        let mk = |sid: &str, id: u128, t: i64| {
+            let mut s = super::conformance::an_mcp_server(project, sid);
+            s.id = Uuid::from_u128(id);
+            s.created_at = Utc.timestamp_opt(1_700_000_000 + t, 0).unwrap();
+            s
+        };
+        let ancien = mk("alpha", 1, 0);
+        let recent = mk("alpha", 2, 100);
+        let meme_instant_a = mk("beta", 3, 0);
+        let meme_instant_b = mk("beta", 4, 0);
+        let zeta = mk("zeta", 5, 0);
+        for s in [&zeta, &meme_instant_b, &ancien, &recent, &meme_instant_a] {
+            store.create_mcp_server(s).await.unwrap();
+        }
+        let attendu = vec![
+            recent.id,
+            ancien.id,
+            meme_instant_a.id,
+            meme_instant_b.id,
+            zeta.id,
+        ];
+        let ids = |v: Vec<project_orchestrator::neo4j::models::McpServerNode>| {
+            v.into_iter().map(|s| s.id).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(store.list_all_mcp_servers().await.unwrap()), attendu);
+        assert_eq!(ids(store.list_mcp_servers(project).await.unwrap()), attendu);
+
+        // `delete_mcp_server_by_server_id` still finds every server of the id.
+        store.delete_mcp_server_by_server_id("alpha").await.unwrap();
+        assert_eq!(
+            ids(store.list_all_mcp_servers().await.unwrap()),
+            vec![meme_instant_a.id, meme_instant_b.id, zeta.id]
+        );
+
+        let mut tools = Vec::new();
+        for (name, id) in [("read", 9u128), ("write", 1), ("read", 7)] {
+            let mut t = super::conformance::an_mcp_tool("outils", name);
+            t.id = Uuid::from_u128(id);
+            store.create_mcp_tool(&t).await.unwrap();
+            tools.push(t);
+        }
+        let listed: Vec<Uuid> = store
+            .list_mcp_tools_for_server("outils")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            listed,
+            vec![Uuid::from_u128(7), Uuid::from_u128(9), Uuid::from_u128(1)]
+        );
+    }
+
+    /// A server or tool creation stopped before its commit point is a draft: deleted
+    /// at open, counted, absent.
+    #[tokio::test]
+    async fn an_interrupted_creation_is_a_draft_deleted_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let s = super::conformance::an_mcp_server(Uuid::nil(), "brouillon");
+        let t = super::conformance::an_mcp_tool("brouillon", "read");
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.interrompre_au_prochain(Interruption::ApresLaPropriete(3));
+            assert!(store.create_mcp_server(&s).await.is_err());
+            store.interrompre_au_prochain(Interruption::AvantLeRetraitDuMarqueur);
+            assert!(store.create_mcp_tool(&t).await.is_err());
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert_eq!(store.rapport_d_ouverture().brouillons_supprimes, 2);
+        assert!(store.get_mcp_server(s.id).await.unwrap().is_none());
+        assert!(store.list_all_mcp_servers().await.unwrap().is_empty());
+        assert!(store
+            .list_mcp_tools_for_server("brouillon")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A second creation with a taken id is refused and writes nothing; a duplicate
+    /// found at open (a corrupted base) is quarantined and named, the first kept.
+    #[tokio::test]
+    async fn a_duplicate_id_is_refused_and_quarantined_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let s = super::conformance::an_mcp_server(Uuid::nil(), "double");
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_mcp_server(&s).await.unwrap();
+            let mut autre = super::conformance::an_mcp_server(Uuid::nil(), "autre");
+            autre.id = s.id;
+            let e = store.create_mcp_server(&autre).await.unwrap_err();
+            assert!(format!("{e:#}").contains("existe déjà"), "{e:#}");
+            assert_eq!(store.noeuds_de_label_pour_test("McpServer"), 1);
+            // The duplicate a corrupted base would hold, written behind the index.
+            let id = s.id.to_string();
+            let cree = s.created_at.to_rfc3339();
+            store.creer_noeud_brut_pour_test(
+                "McpServer",
+                &[
+                    ("id", ValeurBrute::Texte(&id)),
+                    ("project_id", ValeurBrute::Texte(&Uuid::nil().to_string())),
+                    ("server_id", ValeurBrute::Texte("intrus")),
+                    ("created_at", ValeurBrute::Texte(&cree)),
+                ],
+            );
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert_eq!(
+            store.get_mcp_server(s.id).await.unwrap().unwrap().server_id,
+            "double",
+            "the first created is kept"
+        );
+        assert!(store
+            .rapport_d_ouverture()
+            .en_quarantaine
+            .iter()
+            .any(|q| q.contains("McpServer") && q.contains("déjà pris")));
+    }
+
+    /// An unreadable optional timestamp reads as absent (Neo4j's `.ok()`): the
+    /// server is still served and reconnected at startup.
+    #[tokio::test]
+    async fn an_unreadable_optional_timestamp_reads_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let s = super::conformance::an_mcp_server(Uuid::nil(), "horodatage");
+        {
+            let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+            store.create_mcp_server(&s).await.unwrap();
+            assert!(store.ecrire_propriete_brute_pour_test(
+                "McpServer",
+                s.id,
+                "last_connected_at",
+                Some(ValeurBrute::Texte("pas une date"))
+            ));
+            store.close().await.unwrap();
+        }
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        let lu = store.get_mcp_server(s.id).await.unwrap().expect("served");
+        assert_eq!(lu.last_connected_at, None);
     }
 }
 
