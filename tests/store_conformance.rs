@@ -3425,8 +3425,8 @@ project_checks!(obrain_project, ObrainFactory);
 mod obrain_workspace_specifique {
     use chrono::Utc;
     use project_orchestrator::neo4j::models::{
-        ComponentNode, ComponentType, DerivedComponentWrite, MilestoneStatus, ProjectNode,
-        ProjectProfile, ResourceNode, ResourceType, WorkspaceMilestoneNode, WorkspaceNode,
+        ComponentType, DerivedComponentWrite, MilestoneStatus, ProjectNode, ProjectProfile,
+        ResourceNode, ResourceType, WorkspaceMilestoneNode, WorkspaceNode,
     };
     use project_orchestrator::neo4j::traits::{ProjectStore, WorkspaceStore};
     use project_orchestrator::obrain::{Creation, NonPorte, ObrainGraphStore};

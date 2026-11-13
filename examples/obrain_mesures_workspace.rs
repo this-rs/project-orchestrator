@@ -38,7 +38,7 @@ fn jalon(workspace_id: Uuid, i: usize) -> WorkspaceMilestoneNode {
         workspace_id,
         title: format!("jalon {i:05}"),
         description: Some(format!("jalon de mesure {i}")),
-        status: if i % 3 == 0 {
+        status: if i.is_multiple_of(3) {
             MilestoneStatus::Completed
         } else {
             MilestoneStatus::Open

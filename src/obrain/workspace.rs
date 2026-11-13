@@ -325,7 +325,7 @@ fn charger<T>(
     db: &ObrainDB,
     etiquette: &str,
     rapport: &mut RapportOuverture,
-    decoder: fn(&dyn Fn(&str) -> Option<Value>) -> Result<(Uuid, T)>,
+    decoder: Decodeur<T>,
 ) -> Result<Vec<(NodeId, Uuid, T)>> {
     let store = db.store();
     let mut out = Vec::new();
@@ -395,6 +395,9 @@ fn lire_dependance(db: &ObrainDB, eid: EdgeId) -> (String, bool) {
 // ============================================================================
 
 type Get<'a> = &'a dyn Fn(&str) -> Option<Value>;
+
+/// A decoder of one node: its domain id and value, from a property lookup.
+type Decodeur<T> = fn(Get<'_>) -> Result<(Uuid, T)>;
 
 fn chaine(get: Get<'_>, cle: &str) -> Option<String> {
     get(cle).and_then(|v| v.as_str().map(str::to_string))
@@ -550,11 +553,7 @@ fn decoder_composant(get: Get<'_>) -> Result<(Uuid, ComponentNode)> {
 }
 
 /// Decode the node `noeud` now (after its writes), as the index will hold it.
-fn relire<T>(
-    db: &ObrainDB,
-    noeud: NodeId,
-    decoder: fn(Get<'_>) -> Result<(Uuid, T)>,
-) -> Result<(Uuid, T)> {
+fn relire<T>(db: &ObrainDB, noeud: NodeId, decoder: Decodeur<T>) -> Result<(Uuid, T)> {
     let get = project::noeud_lisible(db, noeud)?;
     decoder(&get)
 }
