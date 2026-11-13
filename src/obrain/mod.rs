@@ -10,7 +10,9 @@
 //! its trait (an omitted method would silently inherit the contract's default).
 //!
 //! Ported so far: [`ProjectStore`](crate::neo4j::traits::ProjectStore)
-//! (`project.rs`).
+//! (`project.rs`), and the feature graph node of
+//! [`FeatureGraphStore`](crate::neo4j::traits::FeatureGraphStore) (`feature_graph.rs`,
+//! partial: its entity methods read the unported Code domain and are refused).
 //!
 //! # How obrain is used
 //!
@@ -60,6 +62,7 @@
 
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
+mod feature_graph;
 mod project;
 
 #[cfg(any(test, feature = "mock-store"))]
@@ -171,6 +174,9 @@ pub struct RapportOuverture {
     /// draft marker still there, or nothing on the node): deleted, whatever they
     /// held (`project.rs`, "Atomicity").
     pub brouillons_supprimes: usize,
+    /// `FeatureGraph` nodes of a creation that never reached its commit point:
+    /// deleted, whatever they held (`feature_graph.rs`, "Atomicity").
+    pub graphes_brouillons_supprimes: usize,
     /// Projects whose path trio (`root_path`, `declared_path`,
     /// `canonical_path`) was torn by an interrupted update: recomputed from
     /// `root_path`, which is written last.
@@ -212,6 +218,7 @@ struct Interne {
 #[derive(Default)]
 struct Etat {
     projets: project::IndexProjets,
+    graphes: feature_graph::IndexGraphes,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -443,14 +450,17 @@ impl ObrainGraphStore {
                 )
             })?;
         }
-        let (etat, rapport) = project::IndexProjets::reconstruire(&db)
-            .map(|(projets, rapport)| (Etat { projets }, rapport))
-            .with_context(|| {
-                format!(
-                    "reconstruction des index de la base obrain {}",
-                    chemin.display()
-                )
-            })?;
+        let contexte_index = || {
+            format!(
+                "reconstruction des index de la base obrain {}",
+                chemin.display()
+            )
+        };
+        let (projets, mut rapport) =
+            project::IndexProjets::reconstruire(&db).with_context(contexte_index)?;
+        let graphes = feature_graph::IndexGraphes::reconstruire(&db, &mut rapport)
+            .with_context(contexte_index)?;
+        let etat = Etat { projets, graphes };
         let store = Self {
             interne: Arc::new(Interne {
                 db,
