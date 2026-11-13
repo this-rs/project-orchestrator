@@ -16,6 +16,10 @@
 //! [`ReleaseStore`](crate::neo4j::traits::ReleaseStore)
 //! for releases, environments, deployments and milestones (`release.rs`), whose
 //! refusals (tasks, plans, commits) are listed in `release::REFUSEES`,
+//! [`ProtocolStore`](crate::neo4j::traits::ProtocolStore) (`protocol.rs`, all 11
+//! methods) and [`ProtocolRunStore`](crate::neo4j::traits::ProtocolRunStore)
+//! (`protocolrun.rs`, 14 of its 18; the four that name notes, decisions or
+//! reasoning trees are refused by name),
 //! [`WorkspaceStore`](crate::neo4j::traits::WorkspaceStore)
 //! (`workspace.rs`, 35 of its 45 methods; the rest are refused by name), the note
 //! node of [`NoteStore`](crate::neo4j::traits::NoteStore) (`note.rs`: 13 of its 41
@@ -81,6 +85,8 @@ mod mesure;
 mod note;
 mod plan;
 mod project;
+mod protocol;
+mod protocolrun;
 mod release;
 mod workspace;
 
@@ -158,6 +164,12 @@ pub fn refusees_plan() -> &'static [&'static str] {
     plan::REFUSEES
 }
 
+/// The methods of `ProtocolRunStore` refused by name (the runs' links to notes,
+/// decisions and reasoning trees).
+pub fn refusees_protocolrun() -> &'static [&'static str] {
+    protocolrun::REFUSEES
+}
+
 /// The hand-written methods that REFUSE: `GraphStore::get_progress_batch` (its
 /// contract default loops over getters of other domains), the five
 /// `FederationStore` methods whose relation writes and backfills are not ported
@@ -197,6 +209,7 @@ pub fn methodes_qui_servent() -> Vec<&'static str> {
                 && !chat::REFUSEES.contains(m)
                 && !decision::REFUSEES.contains(m)
                 && !plan::REFUSEES.contains(m)
+                && !protocolrun::REFUSEES.contains(m)
                 && !m.starts_with("GraphStore::")
         })
         .collect()
@@ -302,6 +315,8 @@ struct Interne {
 struct Etat {
     projets: project::IndexProjets,
     plans: plan::IndexPlans,
+    protocoles: protocol::IndexProtocoles,
+    runs: protocolrun::IndexRuns,
     auth: auth::IndexAuth,
     releases: release::IndexReleases,
     espaces: workspace::IndexEspaces,
@@ -609,6 +624,8 @@ impl ObrainGraphStore {
             plan::IndexPlans::reconstruire(&db, &projets).with_context(contexte)?;
         rapport.brouillons_supprimes += brouillons;
         rapport.en_quarantaine.extend(quarantaine);
+        let protocoles = protocol::IndexProtocoles::reconstruire(&db, &mut rapport);
+        let runs = protocolrun::IndexRuns::reconstruire(&db, &protocoles, &mut rapport);
         let auth = auth::IndexAuth::reconstruire(&db, &mut rapport);
         let (releases, rapport_releases) =
             release::IndexReleases::reconstruire(&db).with_context(contexte)?;
@@ -636,6 +653,8 @@ impl ObrainGraphStore {
         let etat = Etat {
             projets,
             plans,
+            protocoles,
+            runs,
             auth,
             releases,
             espaces,

@@ -98,7 +98,7 @@ mod with_the_feature {
     use project_orchestrator::neo4j::traits::*;
     use project_orchestrator::obrain::{
         defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees,
-        refusees_chat, refusees_decision, refusees_note, refusees_plan, refusees_release, Creation,
+        refusees_chat, refusees_decision, refusees_note, refusees_plan, refusees_protocolrun, refusees_release, Creation,
         Durabilite, Interruption, NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture,
         MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
     };
@@ -1687,6 +1687,191 @@ mod with_the_feature {
         );
     }
 
+    /// A protocol is started, a run walks it from state to state, a runtime state is
+    /// generated: all of it — the protocol, its states and transition, the run at its
+    /// current state with its history and version, the runtime state — survives a
+    /// close and a reopen. Then the cascade of `delete_protocol` is durable too.
+    #[tokio::test]
+    async fn a_protocol_run_advances_and_is_found_in_its_state_after_a_reopen() {
+        use project_orchestrator::protocol::{
+            Protocol, ProtocolRun, ProtocolState, ProtocolTransition, RunStatus, RuntimeState,
+            StateType, StateVisit,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+
+        let project = a_project("protocol owner");
+        store.create_project(&project).await.unwrap();
+        let start = ProtocolState::start(Uuid::new_v4(), "start");
+        let work = ProtocolState::new(start.protocol_id, "work");
+        let mut done = ProtocolState::new(start.protocol_id, "done");
+        done.state_type = StateType::Terminal;
+        done.state_timeout_secs = Some(90);
+        let mut protocol = Protocol::new(Some(project.id), "e2e protocol", start.id);
+        protocol.id = start.protocol_id;
+        protocol.terminal_states = vec![done.id];
+        store.upsert_protocol(&protocol).await.unwrap();
+        for s in [&start, &work, &done] {
+            store.upsert_protocol_state(s).await.unwrap();
+        }
+        let go = ProtocolTransition::new(protocol.id, start.id, work.id, "begin");
+        let finish = ProtocolTransition::new(protocol.id, work.id, done.id, "finish");
+        for t in [&go, &finish] {
+            store.upsert_protocol_transition(t).await.unwrap();
+        }
+
+        // Start the run, then advance it twice (each update is a compare-and-swap).
+        let mut run = ProtocolRun::new(protocol.id, start.id, "start");
+        run.project_id = Some(project.id);
+        store.create_protocol_run(&run).await.unwrap();
+        let visit = |state: &ProtocolState, trigger: &str| StateVisit {
+            state_id: state.id,
+            state_name: state.name.clone(),
+            entered_at: Utc::now(),
+            exited_at: None,
+            duration_ms: None,
+            trigger: Some(trigger.to_string()),
+            progress_snapshot: None,
+        };
+        run.current_state = work.id;
+        run.states_visited.push(visit(&work, "begin"));
+        store.update_protocol_run(&mut run).await.unwrap();
+        let runtime = RuntimeState::new(run.id, work.id, "generated", 0);
+        store.create_runtime_state(&runtime).await.unwrap();
+        run.current_state = done.id;
+        run.states_visited.push(visit(&done, "finish"));
+        run.status = RunStatus::Completed;
+        run.completed_at = Some(Utc::now());
+        store.update_protocol_run(&mut run).await.unwrap();
+        assert_eq!(run.version, 2);
+        // A second root run is refused while one runs; none runs now.
+        assert!(store
+            .find_active_run_for_project(project.id)
+            .await
+            .unwrap()
+            .is_none());
+        store.close().await.unwrap();
+
+        let store = open(&base).await;
+        assert_eq!(
+            store.rapport_d_ouverture(),
+            &RapportOuverture::default(),
+            "nothing to repair, nothing quarantined"
+        );
+        let found = store.get_protocol_run(run.id).await.unwrap().unwrap();
+        assert_eq!(
+            found.current_state, done.id,
+            "the run is in the state it reached"
+        );
+        assert_eq!(found.status, RunStatus::Completed);
+        assert_eq!(found.version, 2);
+        assert_eq!(found.project_id, Some(project.id));
+        let path: Vec<&str> = found
+            .states_visited
+            .iter()
+            .map(|v| v.state_name.as_str())
+            .collect();
+        assert_eq!(path, ["start", "work", "done"]);
+        assert_eq!(found.states_visited[2].trigger.as_deref(), Some("finish"));
+        assert_eq!(
+            store
+                .get_protocol(protocol.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .terminal_states,
+            vec![done.id]
+        );
+        let states = store.get_protocol_states(protocol.id).await.unwrap();
+        assert_eq!(states.len(), 3);
+        assert_eq!(
+            states
+                .iter()
+                .find(|s| s.id == done.id)
+                .unwrap()
+                .state_timeout_secs,
+            Some(90)
+        );
+        assert_eq!(
+            states
+                .iter()
+                .find(|s| s.id == start.id)
+                .unwrap()
+                .state_timeout_secs,
+            None
+        );
+        let triggers: Vec<String> = store
+            .get_protocol_transitions(protocol.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.trigger)
+            .collect();
+        assert_eq!(triggers, ["begin", "finish"]);
+        let runtime_states = store.get_runtime_states(run.id).await.unwrap();
+        assert_eq!(runtime_states.len(), 1);
+        assert_eq!(runtime_states[0].generated_by, work.id);
+        assert_eq!(
+            store
+                .list_completed_runs_for_project(project.id, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // The version survived: a stale writer still loses after the reopen.
+        let mut stale = found.clone();
+        stale.version = 1;
+        assert!(store.update_protocol_run(&mut stale).await.is_err());
+
+        // The cascade is durable: protocol, states, transitions, runs, runtime states.
+        assert!(store.delete_protocol(protocol.id).await.unwrap());
+        store.close().await.unwrap();
+        let store = open(&base).await;
+        assert_eq!(store.rapport_d_ouverture(), &RapportOuverture::default());
+        assert!(store.get_protocol(protocol.id).await.unwrap().is_none());
+        assert!(store.get_protocol_run(run.id).await.unwrap().is_none());
+        assert!(store.get_runtime_states(run.id).await.unwrap().is_empty());
+        assert!(store
+            .get_protocol_states(protocol.id)
+            .await
+            .unwrap()
+            .is_empty());
+        // Nothing of the protocol domain is left in the base: the project can go.
+        store
+            .delete_project(project.id, &project.name)
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+    }
+
+    /// What of `ProtocolRunStore` is not ported refuses by name; `ProtocolStore`
+    /// refuses nothing.
+    #[tokio::test]
+    async fn the_run_methods_that_name_other_domains_refuse_by_name() {
+        let store = temporary(Durabilite::Wal).await;
+        let id = Uuid::new_v4();
+        assert_eq!(
+            not_ported(store.get_run_outcomes(id).await),
+            NonPorte("ProtocolRunStore::get_run_outcomes")
+        );
+        assert_eq!(
+            not_ported(store.create_produced_during("note", id, id).await),
+            NonPorte("ProtocolRunStore::create_produced_during")
+        );
+        assert_eq!(
+            not_ported(store.get_run_reasoning_tree_id(id).await),
+            NonPorte("ProtocolRunStore::get_run_reasoning_tree_id")
+        );
+        assert!(refusees_protocolrun()
+            .iter()
+            .all(|m| m.starts_with("ProtocolRunStore::")));
+        assert!(!methodes_refusees()
+            .iter()
+            .any(|m| m.starts_with("ProtocolStore::")));
+    }
+
     /// A note with a project, a link to the project and to another note, a
     /// succession and a confirmation: all of it survives a close and a reopen, with
     /// the same values, the same links and the same order.
@@ -2915,7 +3100,7 @@ mod with_the_feature {
         assert!(refusees_chat().iter().all(|m| written.contains(m)));
         assert!(refusees_decision().iter().all(|m| written.contains(m)));
         assert!(refusees_plan().iter().all(|m| written.contains(m)));
-
+        assert!(refusees_protocolrun().iter().all(|m| written.contains(m)));
         assert!(REFUS_ECRITS_A_LA_MAIN.iter().all(|m| written.contains(m)));
         // What keeps a default is known and justified where it is declared.
         assert_eq!(kept, ["AnalyticsStore::run_data_migrations"]);
