@@ -10,7 +10,8 @@
 //! its trait (an omitted method would silently inherit the contract's default).
 //!
 //! Ported so far: [`ProjectStore`](crate::neo4j::traits::ProjectStore)
-//! (`project.rs`).
+//! (`project.rs`), and the protocol domain — [`ProtocolStore`](crate::neo4j::traits::ProtocolStore)
+//! and [`ProtocolRunStore`](crate::neo4j::traits::ProtocolRunStore) (`protocol.rs`).
 //!
 //! # How obrain is used
 //!
@@ -61,6 +62,7 @@
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
 mod project;
+mod protocol;
 
 #[cfg(any(test, feature = "mock-store"))]
 pub use mesure::{Durabilite, Interruption};
@@ -102,10 +104,17 @@ pub fn methodes_portees() -> &'static [&'static str] {
     PORTEES
 }
 
-/// The hand-written methods that REFUSE (`GraphStore::get_progress_batch`: its
-/// contract default loops over getters of other domains). They are in
+/// The hand-written methods that REFUSE: `GraphStore::get_progress_batch` (its
+/// contract default loops over getters of other domains), and the protocol-run methods
+/// that need the Note, Decision or Reasoning domains. They are in
 /// [`methodes_portees`] because they are written, not because they work.
-pub const REFUS_ECRITS_A_LA_MAIN: &[&str] = &["GraphStore::get_progress_batch"];
+pub const REFUS_ECRITS_A_LA_MAIN: &[&str] = &[
+    "GraphStore::get_progress_batch",
+    "ProtocolRunStore::create_produced_during",
+    "ProtocolRunStore::get_run_outcomes",
+    "ProtocolRunStore::persist_reasoning_tree",
+    "ProtocolRunStore::get_run_reasoning_tree_id",
+];
 
 /// The methods that really serve something: the ported methods of the domains,
 /// without the hand-written refusals and without `GraphStore`'s own manifest.
@@ -169,7 +178,8 @@ pub enum Creation {
 pub struct RapportOuverture {
     /// `Project` nodes of a creation that never reached its commit point (the
     /// draft marker still there, or nothing on the node): deleted, whatever they
-    /// held (`project.rs`, "Atomicity").
+    /// held (`project.rs`, "Atomicity"). Also counts the protocol-domain drafts and
+    /// orphans deleted at open (`protocol.rs`).
     pub brouillons_supprimes: usize,
     /// Projects whose path trio (`root_path`, `declared_path`,
     /// `canonical_path`) was torn by an interrupted update: recomputed from
@@ -212,6 +222,7 @@ struct Interne {
 #[derive(Default)]
 struct Etat {
     projets: project::IndexProjets,
+    protocoles: protocol::IndexProtocoles,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -443,14 +454,25 @@ impl ObrainGraphStore {
                 )
             })?;
         }
-        let (etat, rapport) = project::IndexProjets::reconstruire(&db)
-            .map(|(projets, rapport)| (Etat { projets }, rapport))
-            .with_context(|| {
+        let (projets, mut rapport) = project::IndexProjets::reconstruire(&db).with_context(|| {
+            format!(
+                "reconstruction des index de la base obrain {}",
+                chemin.display()
+            )
+        })?;
+        let (protocoles, rapport_protocoles) =
+            protocol::IndexProtocoles::reconstruire(&db).with_context(|| {
                 format!(
-                    "reconstruction des index de la base obrain {}",
+                    "reconstruction des index des protocoles de la base obrain {}",
                     chemin.display()
                 )
             })?;
+        rapport.brouillons_supprimes += rapport_protocoles.supprimes;
+        rapport.en_quarantaine.extend(rapport_protocoles.en_quarantaine);
+        let etat = Etat {
+            projets,
+            protocoles,
+        };
         let store = Self {
             interne: Arc::new(Interne {
                 db,

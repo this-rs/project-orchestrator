@@ -165,6 +165,12 @@ pub(super) struct IndexProjets {
 }
 
 impl IndexProjets {
+    /// Does this backend address a project with this id? (Used by the protocol domain,
+    /// which refuses to attach a protocol to a project it does not hold.)
+    pub(super) fn existe(&self, id: Uuid) -> bool {
+        self.par_id.contains_key(&id)
+    }
+
     #[cfg(any(test, feature = "mock-store"))]
     pub(super) fn noeud_de(&self, id: Uuid) -> Option<NodeId> {
         self.par_id.get(&id).map(|e| e.noeud)

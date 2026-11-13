@@ -1515,20 +1515,26 @@ mod with_the_feature {
             in_contracts
         );
 
-        // This lot: ProjectStore's nine methods, plus the two of GraphStore.
+        // Ported: ProjectStore's nine methods, the two of GraphStore, the eleven of
+        // ProtocolStore, and the eighteen of ProtocolRunStore less its four refusals.
         let domains: std::collections::BTreeSet<&str> = written
             .iter()
             .map(|m| m.split("::").next().unwrap())
             .collect();
         assert_eq!(
             domains.into_iter().collect::<Vec<_>>(),
-            ["GraphStore", "ProjectStore"]
+            ["GraphStore", "ProjectStore", "ProtocolRunStore", "ProtocolStore"]
         );
         let servent = methodes_qui_servent();
-        assert_eq!(servent.len(), 9, "{servent:?}");
-        assert!(servent.iter().all(|m| m.starts_with("ProjectStore::")));
+        assert_eq!(servent.len(), 9 + 11 + 14, "{servent:?}");
+        assert!(servent.iter().all(|m| {
+            m.starts_with("ProjectStore::")
+                || m.starts_with("ProtocolStore::")
+                || m.starts_with("ProtocolRunStore::")
+        }));
         // The written refusals are written, and are not counted as serving.
-        assert_eq!(REFUS_ECRITS_A_LA_MAIN, ["GraphStore::get_progress_batch"]);
+        assert_eq!(REFUS_ECRITS_A_LA_MAIN.len(), 5);
+        assert!(REFUS_ECRITS_A_LA_MAIN.contains(&"GraphStore::get_progress_batch"));
         assert!(REFUS_ECRITS_A_LA_MAIN.iter().all(|m| written.contains(m)));
         // What keeps a default is known and justified where it is declared.
         assert_eq!(kept, ["AnalyticsStore::run_data_migrations"]);
