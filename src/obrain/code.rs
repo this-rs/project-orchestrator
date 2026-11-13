@@ -1,31 +1,39 @@
 //! `CodeStore` on obrain — the core of the code domain: the `File` nodes, their
 //! membership of a project, and the three project switches the contract keeps here.
 //!
-//! What is ported (14 of the 85 methods): the files read and maintained (`get_file`,
-//! `get_file_language`, `find_files_by_path_suffix`, `list_project_files`,
-//! `count_project_files`, `get_project_file_paths`, `link_file_to_project`,
-//! `delete_file`, `delete_stale_files`), the two language statistics, and
-//! `set_scaffolding_override` / `set_watch_enabled` / `set_default_note_energy` (they
-//! write a property of the `Project` node, owned by `project.rs`). What is refused by
-//! name ([`REFUSEES`], 71 methods): everything that writes or reads a symbol
-//! (`Function`, `Struct`, `Trait`, `Enum`, `Impl`, `Import`), an `IMPORTS` / `CALLS` /
-//! `EXTENDS` / … edge, a process, a graph-analytics metric, the `CO_CHANGED` edges —
-//! and the two file WRITES, `upsert_file` and `batch_upsert_files`. Each refusal carries
-//! its reason, and `mod.rs` keeps the list apart from the methods that serve
+//! What is ported (6 of the 85 methods): `link_file_to_project`, `delete_file`,
+//! `delete_stale_files`, and `set_scaffolding_override` / `set_watch_enabled` /
+//! `set_default_note_energy` (they write a property of the `Project` node, owned by
+//! `project.rs`). What is refused by name ([`REFUSEES`], 79 methods): everything that
+//! writes or reads a symbol (`Function`, `Struct`, `Trait`, `Enum`, `Impl`, `Import`),
+//! an `IMPORTS` / `CALLS` / `EXTENDS` / … edge, a process, a graph-analytics metric, the
+//! `CO_CHANGED` edges — and the FILE DOMAIN itself: its two writes (`upsert_file`,
+//! `batch_upsert_files`) and its eight reads (`get_file`, `get_file_language`,
+//! `find_files_by_path_suffix`, `list_project_files`, `count_project_files`,
+//! `get_project_file_paths`, the two language statistics). Each refusal carries its
+//! reason, and `mod.rs` keeps the list apart from the methods that serve
 //! (`methodes_qui_servent`). A port that answered those with an empty list would be a
 //! false success.
 //!
-//! # Why the file writes are refused while the symbols are
+//! # Why the file domain is refused whole while the symbols are
 //!
 //! The sync (`src/orchestrator/runner.rs`, `store_parsed_file_for_project_with_ctx` and
 //! the batched store) writes the `File` WITH ITS HASH first, then its symbols. If the
 //! file write served and the symbol writes refused, the sync would fail after the hash
 //! is stored, and every later sync would skip the file as unchanged (`get_file` → same
-//! hash): it would never be parsed again, even once the symbols are ported. Refusing the
-//! file write too keeps the hash unwritten, so the first sync after the symbols are
-//! ported parses everything. The writer is complete and tested (`ecrire_fichiers`, test
-//! builds only: [`ObrainGraphStore::semer_fichiers_pour_essai`]); it is plugged back into
-//! `upsert_file` / `batch_upsert_files` together with the symbol writes.
+//! hash): it would never be parsed again, even once the symbols are ported. So the file
+//! writes refuse; the sync stops on that refusal, by name, before it indexes anything
+//! in Meilisearch (`runner.rs`, `est_un_refus_du_backend`).
+//!
+//! With the writes refused, nothing can put a `File` in a production base, so every
+//! file read would answer empty — indistinguishable from "a project with no files", the
+//! false success above. The reads refuse too. What still serves is honest on an empty
+//! base: a link or a deletion of a file that is not there is the no-op Neo4j makes of it.
+//!
+//! The whole domain is written and tested: a test build can open it on one store
+//! ([`ObrainGraphStore::ouvrir_les_fichiers_pour_essai`]), and every method then serves
+//! with the code that is plugged in, unchanged, when the symbol writes are ported. In
+//! a production build that switch does not exist and the gate always refuses.
 //!
 //! # Storage
 //!
@@ -116,6 +124,14 @@ const BROUILLON: &str = "_brouillon";
 pub const REFUSEES: &[&str] = &[
     "CodeStore::upsert_file",
     "CodeStore::batch_upsert_files",
+    "CodeStore::get_file",
+    "CodeStore::get_file_language",
+    "CodeStore::find_files_by_path_suffix",
+    "CodeStore::list_project_files",
+    "CodeStore::count_project_files",
+    "CodeStore::get_project_file_paths",
+    "CodeStore::get_language_stats",
+    "CodeStore::get_language_stats_for_project",
     "CodeStore::count_orphan_files",
     "CodeStore::count_co_change_pairs",
     "CodeStore::count_protocol_states_transitions",
@@ -187,11 +203,11 @@ pub const REFUSEES: &[&str] = &[
     "CodeStore::get_type_impl_blocks_detailed",
 ];
 
-/// Why `upsert_file` / `batch_upsert_files` refuse (see the module header).
-const RAISON_ECRITURE_FICHIER: &str = "la synchro écrit le File avec son hash PUIS ses symboles, \
-     qui ne sont pas portés : le hash écrit, l'échec qui suit ferait sauter ce fichier par \
-     hash à toutes les synchros suivantes, et il ne serait jamais reparsé. Refusé tant que \
-     les écritures de symboles le sont";
+/// Why the file domain refuses (see the module header).
+const RAISON_DOMAINE_FICHIERS: &str = "domaine des fichiers fermé tant que les écritures de \
+     symboles refusent : la synchro écrit le File avec son hash PUIS ses symboles, un hash écrit \
+     ferait sauter ce fichier à toutes les synchros suivantes ; et sans écriture, une lecture de \
+     fichiers répondrait vide, indiscernable d'un projet sans fichiers";
 
 /// A property lookup over one node: `None` for an absent or null property.
 type Lecture<'a> = &'a dyn Fn(&str) -> Option<Value>;
@@ -224,9 +240,23 @@ pub(super) struct IndexCode {
     /// `project → quarantined paths it CONTAINS` (what `delete_stale_files` cannot
     /// see in `contenus` and must not silently leave behind).
     quarantaine_contenue: HashMap<Uuid, BTreeSet<String>>,
+    /// Test builds only: the file domain is open on this store (see the module
+    /// header). Never set in production, where the field does not exist.
+    #[cfg(any(test, feature = "mock-store"))]
+    ouvert: bool,
 }
 
 impl IndexCode {
+    /// The gate of the file domain: refuses `methode` by name, unless a test build
+    /// opened the domain on this store.
+    fn ferme(&self, methode: &'static str) -> Result<()> {
+        #[cfg(any(test, feature = "mock-store"))]
+        if self.ouvert {
+            return Ok(());
+        }
+        refus(methode, RAISON_DOMAINE_FICHIERS)
+    }
+
     /// Refuse by name when one of `paths` is in quarantine: nothing is written.
     fn refus_si_quarantaine<'a>(
         &self,
@@ -270,8 +300,15 @@ impl IndexCode {
             };
             if get(BROUILLON).is_some() || (n.properties.is_empty() && store.out_degree(noeud) == 0)
             {
-                db.delete_node(noeud);
-                rapport.brouillons_supprimes += 1;
+                if db.delete_node(noeud) {
+                    rapport.brouillons_supprimes += 1;
+                } else {
+                    // Not deleted: it is still there, and it is not a file. Said, not
+                    // counted as repaired.
+                    rapport.en_quarantaine.push(format!(
+                        "nœud File {noeud:?} : brouillon que le moteur refuse de supprimer"
+                    ));
+                }
                 continue;
             }
             match lire_fichier(&get) {
@@ -355,7 +392,6 @@ fn lire_fichier(get: Lecture<'_>) -> Result<FileNode> {
     })
 }
 
-#[cfg(any(test, feature = "mock-store"))]
 fn props_fichier(f: &FileNode) -> Vec<(&'static str, Value)> {
     vec![
         ("path", Value::from(f.path.clone())),
@@ -370,7 +406,6 @@ fn props_fichier(f: &FileNode) -> Vec<(&'static str, Value)> {
 }
 
 /// Decode a node once it has been written (the index is then published from this).
-#[cfg(any(test, feature = "mock-store"))]
 fn relire(db: &ObrainDB, noeud: NodeId) -> Result<FileNode> {
     let n = db
         .get_node(noeud)
@@ -385,13 +420,11 @@ fn relire(db: &ObrainDB, noeud: NodeId) -> Result<FileNode> {
 
 /// Does this value go to a blob column (a string above the threshold)? Such a value
 /// is not recovered by the WAL: see `mod.rs` (`SEUIL_COLONNE_BLOB`).
-#[cfg(any(test, feature = "mock-store"))]
 fn valeur_en_blob(v: &Value) -> bool {
     v.as_str()
         .is_some_and(|s| s.len() > super::SEUIL_COLONNE_BLOB)
 }
 
-#[cfg(any(test, feature = "mock-store"))]
 fn fichier_en_blob(f: &FileNode) -> bool {
     props_fichier(f).iter().any(|(_, v)| valeur_en_blob(v))
 }
@@ -400,16 +433,20 @@ fn fichier_en_blob(f: &FileNode) -> bool {
 // The store
 // ============================================================================
 
-#[cfg(any(test, feature = "mock-store"))]
 impl ObrainGraphStore {
     /// Create or update `files` (last one wins on a repeated path), link each to its
     /// project when that project exists, and make it all durable ONCE.
     ///
-    /// Not reachable from the contract while the symbol writes refuse (see the
-    /// module header): compiled for test builds only, through
-    /// [`ObrainGraphStore::semer_fichiers_pour_essai`]. Each engine write is preceded
-    /// by a crash point (`Interruption::ApresEtape`).
-    async fn ecrire_fichiers(&self, files: Vec<FileNode>) -> Result<()> {
+    /// Behind the gate of the file domain (refused in production, see the module
+    /// header). Each engine write is preceded by a crash point
+    /// (`Interruption::ApresEtape`).
+    async fn ecrire_fichiers(
+        &self,
+        methode: &'static str,
+        en_quarantaine: &'static str,
+        files: Vec<FileNode>,
+    ) -> Result<()> {
+        self.lire(|_, etat| etat.code.ferme(methode))?;
         if files.is_empty() {
             return Ok(());
         }
@@ -422,10 +459,8 @@ impl ObrainGraphStore {
                     let etat = w.index()?;
                     // A quarantined path would get a SECOND File beside the one held
                     // back: refused before anything is written.
-                    etat.code.refus_si_quarantaine(
-                        "CodeStore::upsert_file (quarantaine)",
-                        files.iter().map(|f| &f.path),
-                    )?;
+                    etat.code
+                        .refus_si_quarantaine(en_quarantaine, files.iter().map(|f| &f.path))?;
                     let mut existants: HashMap<String, (NodeId, bool)> = HashMap::new();
                     let mut projets: HashMap<Uuid, NodeId> = HashMap::new();
                     let mut membres: HashSet<(Uuid, String)> = HashSet::new();
@@ -523,13 +558,18 @@ impl ObrainGraphStore {
         )
         .await
     }
+}
 
-    /// Write files through the writer the contract does not expose yet (see the
-    /// module header): what the tests of the reads, the deletions and the crash
-    /// points start from. Test builds only.
+#[cfg(any(test, feature = "mock-store"))]
+impl ObrainGraphStore {
+    /// Open the file domain on THIS store: its writes and reads then serve, with the
+    /// code production will plug in (see the module header). Test builds only; the
+    /// switch lives in the index, so a reopened store starts closed again.
     #[doc(hidden)]
-    pub async fn semer_fichiers_pour_essai(&self, files: &[FileNode]) -> Result<()> {
-        self.ecrire_fichiers(files.to_vec()).await
+    pub fn ouvrir_les_fichiers_pour_essai(&self) {
+        if let Ok(mut etat) = self.interne.etat.write() {
+            etat.code.ouvert = true;
+        }
     }
 
     /// Outgoing edges of a project's node as the ENGINE counts them (a draft deleted
@@ -598,6 +638,7 @@ impl CodeStore for ObrainGraphStore {
 
     async fn get_project_file_paths(&self, project_id: Uuid) -> Result<Vec<String>> {
         self.lire(|_, etat| {
+            etat.code.ferme("CodeStore::get_project_file_paths")?;
             if !etat.projets.contient(project_id) {
                 return Ok(Vec::new());
             }
@@ -737,6 +778,7 @@ impl CodeStore for ObrainGraphStore {
                     }
                     (f, p)
                 };
+                w.etape()?;
                 let _ = w.db.create_edge(projet, fichier, CONTIENT);
                 w.rendre_durable()?;
                 w.index_mut()?
@@ -751,16 +793,29 @@ impl CodeStore for ObrainGraphStore {
         .await
     }
 
-    async fn upsert_file(&self, _file: &FileNode) -> Result<()> {
-        refus("CodeStore::upsert_file", RAISON_ECRITURE_FICHIER)
+    async fn upsert_file(&self, file: &FileNode) -> Result<()> {
+        self.ecrire_fichiers(
+            "CodeStore::upsert_file",
+            "CodeStore::upsert_file (quarantaine)",
+            vec![file.clone()],
+        )
+        .await
     }
 
-    async fn batch_upsert_files(&self, _files: &[FileNode]) -> Result<()> {
-        refus("CodeStore::batch_upsert_files", RAISON_ECRITURE_FICHIER)
+    async fn batch_upsert_files(&self, files: &[FileNode]) -> Result<()> {
+        self.ecrire_fichiers(
+            "CodeStore::batch_upsert_files",
+            "CodeStore::batch_upsert_files (quarantaine)",
+            files.to_vec(),
+        )
+        .await
     }
 
     async fn get_file(&self, path: &str) -> Result<Option<FileNode>> {
-        self.lire(|_, etat| Ok(etat.code.fichiers.get(path).map(|f| f.valeur.clone())))
+        self.lire(|_, etat| {
+            etat.code.ferme("CodeStore::get_file")?;
+            Ok(etat.code.fichiers.get(path).map(|f| f.valeur.clone()))
+        })
     }
 
     async fn find_files_by_path_suffix(
@@ -769,6 +824,7 @@ impl CodeStore for ObrainGraphStore {
         limit: usize,
     ) -> Result<Vec<(String, Option<Uuid>)>> {
         self.lire(|_, etat| {
+            etat.code.ferme("CodeStore::find_files_by_path_suffix")?;
             let mut v: Vec<(String, Option<Uuid>)> = etat
                 .code
                 .fichiers
@@ -784,6 +840,7 @@ impl CodeStore for ObrainGraphStore {
 
     async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>> {
         self.lire(|_, etat| {
+            etat.code.ferme("CodeStore::list_project_files")?;
             if !etat.projets.contient(project_id) {
                 return Ok(Vec::new());
             }
@@ -805,6 +862,7 @@ impl CodeStore for ObrainGraphStore {
 
     async fn count_project_files(&self, project_id: Uuid) -> Result<i64> {
         self.lire(|_, etat| {
+            etat.code.ferme("CodeStore::count_project_files")?;
             if !etat.projets.contient(project_id) {
                 return Ok(0);
             }
@@ -818,6 +876,7 @@ impl CodeStore for ObrainGraphStore {
 
     async fn get_file_language(&self, path: &str) -> Result<Option<String>> {
         self.lire(|_, etat| {
+            etat.code.ferme("CodeStore::get_file_language")?;
             Ok(etat
                 .code
                 .fichiers
@@ -827,7 +886,10 @@ impl CodeStore for ObrainGraphStore {
     }
 
     async fn get_language_stats(&self) -> Result<Vec<LanguageStatsNode>> {
-        self.lire(|_, etat| Ok(stats_de(etat.code.fichiers.values().map(|f| &f.valeur))))
+        self.lire(|_, etat| {
+            etat.code.ferme("CodeStore::get_language_stats")?;
+            Ok(stats_de(etat.code.fichiers.values().map(|f| &f.valeur)))
+        })
     }
 
     async fn get_language_stats_for_project(
@@ -835,6 +897,8 @@ impl CodeStore for ObrainGraphStore {
         project_id: Uuid,
     ) -> Result<Vec<LanguageStatsNode>> {
         self.lire(|_, etat| {
+            etat.code
+                .ferme("CodeStore::get_language_stats_for_project")?;
             // By the `project_id` PROPERTY, as the query does (not by the edge).
             Ok(stats_de(
                 etat.code

@@ -2045,6 +2045,13 @@ mod with_the_feature {
     // CodeStore: the files, their membership, the project switches
     // ------------------------------------------------------------------
 
+    /// The file domain opened on `store` (test builds only): its writes and reads are
+    /// refused in production until the symbol writes are ported (see `code.rs`).
+    fn ouvert(store: ObrainGraphStore) -> ObrainGraphStore {
+        store.ouvrir_les_fichiers_pour_essai();
+        store
+    }
+
     fn a_file(path: &str, language: &str, project: Option<Uuid>) -> FileNode {
         FileNode {
             path: path.to_string(),
@@ -2065,7 +2072,7 @@ mod with_the_feature {
     async fn files_and_project_switches_survive_a_close_and_a_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
-        let store = open(&base).await;
+        let store = ouvert(open(&base).await);
         let (p1, p2) = (a_project("code one"), a_project("code two"));
         store.create_project(&p1).await.unwrap();
         store.create_project(&p2).await.unwrap();
@@ -2073,10 +2080,8 @@ mod with_the_feature {
         let ghost = Uuid::new_v4();
         // A path above the blob threshold: the write that carries it pays the full flush.
         let long = format!("src/{}/deep.rs", "d".repeat(300));
-        // The contract's file writes refuse (see `src/obrain/code.rs`): the writer is
-        // reached through its test door.
         store
-            .semer_fichiers_pour_essai(&[
+            .batch_upsert_files(&[
                 a_file("src/b.rs", "rust", Some(p1.id)),
                 a_file("src/a.rs", "rust", Some(p1.id)),
                 a_file("web/x.ts", "typescript", Some(p1.id)),
@@ -2093,7 +2098,7 @@ mod with_the_feature {
         // An update (new hash, new language) and a link to a second project.
         let mut updated = a_file("src/a.rs", "rust", Some(p1.id));
         updated.hash = "hash-v2".to_string();
-        store.semer_fichiers_pour_essai(&[updated]).await.unwrap();
+        store.upsert_file(&updated).await.unwrap();
         store.link_file_to_project("src/a.rs", p2.id).await.unwrap();
         // Linking twice, an unknown file, an unknown project: no second edge, no error.
         store.link_file_to_project("src/a.rs", p2.id).await.unwrap();
@@ -2168,7 +2173,7 @@ mod with_the_feature {
         store.close().await.unwrap();
         drop(store);
 
-        let store = open(&base).await;
+        let store = ouvert(open(&base).await);
         assert_eq!(
             *store.rapport_d_ouverture(),
             RapportOuverture::default(),
@@ -2296,7 +2301,7 @@ mod with_the_feature {
             })
             .await;
         }
-        let store = open(&base).await;
+        let store = ouvert(open(&base).await);
         let rapport = store.rapport_d_ouverture();
         assert_eq!(rapport.brouillons_supprimes, 1, "{rapport:?}");
         assert_eq!(rapport.en_quarantaine.len(), 1, "{rapport:?}");
@@ -2336,12 +2341,13 @@ mod with_the_feature {
         store.close().await.unwrap();
     }
 
-    /// Finding 1 of the review: the sync writes the File WITH ITS HASH, then its
-    /// symbols. With the symbols refused, a served file write would store the hash
-    /// and the next sync would skip the file as unchanged, forever. So both file
-    /// writes refuse by name, and nothing — no node, no hash — is written.
+    /// Findings 1 of both reviews: the sync writes the File WITH ITS HASH, then its
+    /// symbols. With the symbols refused, a served file write would store the hash and
+    /// the next sync would skip the file as unchanged, forever; and with no write, a
+    /// served read would answer empty on a base nothing can fill. So the whole file
+    /// domain refuses by name — two writes, eight reads — and nothing is written.
     #[tokio::test]
-    async fn the_file_writes_refuse_while_the_symbol_writes_do_and_store_no_hash() {
+    async fn the_file_domain_refuses_whole_while_the_symbol_writes_do() {
         let store = ObrainGraphStore::open_temporary().unwrap();
         let p = a_project("sync");
         store.create_project(&p).await.unwrap();
@@ -2355,19 +2361,91 @@ mod with_the_feature {
             not_ported(store.batch_upsert_files(std::slice::from_ref(&f)).await),
             NonPorte("CodeStore::batch_upsert_files")
         );
+        assert_eq!(
+            not_ported(store.batch_upsert_files(&[]).await),
+            NonPorte("CodeStore::batch_upsert_files"),
+            "even an empty batch: the refusal does not depend on the input"
+        );
         // The symbol write the sync makes next refuses too: the pair is consistent.
         assert_eq!(
             not_ported(store.batch_upsert_functions(&[]).await),
             NonPorte("CodeStore::batch_upsert_functions")
         );
-        // The hash the sync compares against was never stored: the file will be parsed.
-        assert!(store.get_file("src/main.rs").await.unwrap().is_none());
-        assert_eq!(store.count_project_files(p.id).await.unwrap(), 0);
+        // The reads: never an empty answer that looks like "no files".
+        assert_eq!(
+            not_ported(store.get_file("src/main.rs").await),
+            NonPorte("CodeStore::get_file")
+        );
+        assert_eq!(
+            not_ported(store.get_file_language("src/main.rs").await),
+            NonPorte("CodeStore::get_file_language")
+        );
+        assert_eq!(
+            not_ported(store.find_files_by_path_suffix(".rs", 10).await),
+            NonPorte("CodeStore::find_files_by_path_suffix")
+        );
+        assert_eq!(
+            not_ported(store.list_project_files(p.id).await),
+            NonPorte("CodeStore::list_project_files")
+        );
+        assert_eq!(
+            not_ported(store.count_project_files(p.id).await),
+            NonPorte("CodeStore::count_project_files")
+        );
+        assert_eq!(
+            not_ported(store.get_project_file_paths(p.id).await),
+            NonPorte("CodeStore::get_project_file_paths")
+        );
+        assert_eq!(
+            not_ported(store.get_language_stats().await),
+            NonPorte("CodeStore::get_language_stats")
+        );
+        assert_eq!(
+            not_ported(store.get_language_stats_for_project(p.id).await),
+            NonPorte("CodeStore::get_language_stats_for_project")
+        );
         assert_eq!(store.noeuds_pour_mesure(), noeuds, "nothing written");
-        for m in ["CodeStore::upsert_file", "CodeStore::batch_upsert_files"] {
-            assert!(refusees_code().contains(&m), "{m}");
-            assert!(!methodes_qui_servent().contains(&m), "{m}");
-        }
+        // What still serves is honest on a base with no files.
+        store
+            .link_file_to_project("src/main.rs", p.id)
+            .await
+            .unwrap();
+        store.delete_file("src/main.rs").await.unwrap();
+        assert_eq!(
+            store.delete_stale_files(p.id, &[]).await.unwrap(),
+            (0, 0, vec![])
+        );
+        assert_eq!(store.noeuds_pour_mesure(), noeuds, "nothing written");
+        store.close().await.unwrap();
+    }
+
+    /// A link interrupted before its edge (second review, minor): the crash point
+    /// exists, and a reopened base holds no edge.
+    #[tokio::test]
+    async fn a_link_crashed_before_its_edge_leaves_no_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = ouvert(open(&base).await);
+        let (p1, p2) = (a_project("link one"), a_project("link two"));
+        store.create_project(&p1).await.unwrap();
+        store.create_project(&p2).await.unwrap();
+        store
+            .upsert_file(&a_file("src/a.rs", "rust", Some(p1.id)))
+            .await
+            .unwrap();
+        store.interrompre_au_prochain(Interruption::ApresEtape(1));
+        let issue = store.link_file_to_project("src/a.rs", p2.id).await;
+        assert!(
+            format!("{:#}", issue.expect_err("the crash point before the edge"))
+                .contains("interruption injectée")
+        );
+        store.close().await.unwrap();
+        drop(store);
+        let store = ouvert(open(&base).await);
+        assert_eq!(store.aretes_sortantes_du_projet_pour_essai(p2.id), Some(0));
+        assert!(store.list_project_files(p2.id).await.unwrap().is_empty());
+        store.link_file_to_project("src/a.rs", p2.id).await.unwrap();
+        assert_eq!(store.aretes_sortantes_du_projet_pour_essai(p2.id), Some(1));
         store.close().await.unwrap();
     }
 
@@ -2379,11 +2457,11 @@ mod with_the_feature {
     #[tokio::test]
     async fn a_deletion_the_engine_refuses_leaves_the_store_indeterminate() {
         // delete_stale_files: the first file goes, the engine refuses the second.
-        let store = ObrainGraphStore::open_temporary().unwrap();
+        let store = ouvert(ObrainGraphStore::open_temporary().unwrap());
         let p = a_project("stale");
         store.create_project(&p).await.unwrap();
         store
-            .semer_fichiers_pour_essai(&[
+            .batch_upsert_files(&[
                 a_file("src/a.rs", "rust", Some(p.id)),
                 a_file("src/b.rs", "rust", Some(p.id)),
             ])
@@ -2401,11 +2479,11 @@ mod with_the_feature {
         assert!(store.count_project_files(p.id).await.is_err());
 
         // delete_file: one node, but its edges went before the refusal.
-        let store = ObrainGraphStore::open_temporary().unwrap();
+        let store = ouvert(ObrainGraphStore::open_temporary().unwrap());
         let p = a_project("one");
         store.create_project(&p).await.unwrap();
         store
-            .semer_fichiers_pour_essai(&[a_file("src/a.rs", "rust", Some(p.id))])
+            .batch_upsert_files(&[a_file("src/a.rs", "rust", Some(p.id))])
             .await
             .unwrap();
         assert!(store.retirer_du_moteur_pour_essai("src/a.rs"));
@@ -2461,7 +2539,7 @@ mod with_the_feature {
             })
             .await;
         }
-        let store = open(&base).await;
+        let store = ouvert(open(&base).await);
         assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 2);
         let indexed = store.get_file("src/dup.rs").await.unwrap().unwrap().hash;
         let noeuds = store.noeuds_pour_mesure();
@@ -2471,21 +2549,21 @@ mod with_the_feature {
         assert_eq!(
             not_ported(
                 store
-                    .semer_fichiers_pour_essai(&[a_file("src/bad.rs", "rust", Some(pid))])
+                    .batch_upsert_files(&[a_file("src/bad.rs", "rust", Some(pid))])
                     .await
             ),
-            NonPorte("CodeStore::upsert_file (quarantaine)")
+            NonPorte("CodeStore::batch_upsert_files (quarantaine)")
         );
         assert_eq!(
             not_ported(
                 store
-                    .semer_fichiers_pour_essai(&[
+                    .batch_upsert_files(&[
                         a_file("src/new.rs", "rust", Some(pid)),
                         a_file("src/dup.rs", "rust", Some(pid)),
                     ])
                     .await
             ),
-            NonPorte("CodeStore::upsert_file (quarantaine)"),
+            NonPorte("CodeStore::batch_upsert_files (quarantaine)"),
             "a batch that touches one is refused whole"
         );
         // Deleting the indexed node of a duplicated path, or the quarantined one.
@@ -2534,7 +2612,7 @@ mod with_the_feature {
         assert_eq!(store.aretes_sortantes_du_projet_pour_essai(pid), degre);
         store.close().await.unwrap();
         drop(store);
-        let store = open(&base).await;
+        let store = ouvert(open(&base).await);
         assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 2);
         assert_eq!(store.noeuds_pour_mesure(), noeuds);
         assert_eq!(
@@ -2559,14 +2637,12 @@ mod with_the_feature {
         let mut atteints = 0;
         for k in 1..=20 {
             let base = dir.path().join(format!("base-{k}"));
-            let store = open(&base).await;
+            let store = ouvert(open(&base).await);
             let p = a_project("crash");
             store.create_project(&p).await.unwrap();
             let f = a_file("src/lib.rs", "rust", Some(p.id));
             store.interrompre_au_prochain(Interruption::ApresEtape(k));
-            let issue = store
-                .semer_fichiers_pour_essai(std::slice::from_ref(&f))
-                .await;
+            let issue = store.upsert_file(&f).await;
             if issue.is_ok() {
                 // Past the last engine write: nothing to interrupt any more.
                 store.close().await.unwrap();
@@ -2580,7 +2656,7 @@ mod with_the_feature {
             store.close().await.unwrap();
             drop(store);
 
-            let store = open(&base).await;
+            let store = ouvert(open(&base).await);
             let rapport = store.rapport_d_ouverture().clone();
             assert!(rapport.en_quarantaine.is_empty(), "k={k}: {rapport:?}");
             assert_eq!(
@@ -2599,10 +2675,7 @@ mod with_the_feature {
                 "k={k}: the draft's CONTAINS edge went with it"
             );
             // And the write goes through on the repaired base.
-            store
-                .semer_fichiers_pour_essai(std::slice::from_ref(&f))
-                .await
-                .unwrap();
+            store.upsert_file(&f).await.unwrap();
             assert_eq!(store.aretes_sortantes_du_projet_pour_essai(p.id), Some(1));
             assert_eq!(
                 store.get_project_file_paths(p.id).await.unwrap(),
@@ -2615,6 +2688,104 @@ mod with_the_feature {
             atteints, 9,
             "every engine write of a linked creation is a crash point"
         );
+    }
+
+    const ENV_KILL9_FICHIERS: &str = "OBRAIN_PO_TEST_ENFANT_KILL9_FICHIERS";
+
+    /// Files whose path and hash go to a blob column (> 256 bytes), written then
+    /// REPLACED by a short hash, with the child killed by SIGKILL — no `close()`, so no
+    /// final flush hides a missing one. Every file the child acknowledged is there after
+    /// the kill, with the last hash it acknowledged: the writer pays the full flush for
+    /// a blob-sized value AND for the replacement of one (as `project.rs` / `plan.rs`).
+    #[tokio::test]
+    async fn kill9_during_file_writes_loses_no_acknowledged_blob_sized_file() {
+        if let Ok(dir) = std::env::var(ENV_KILL9_FICHIERS) {
+            let dir = std::path::PathBuf::from(dir);
+            let store = {
+                let base = dir.join("base");
+                tokio::task::spawn_blocking(move || {
+                    ObrainGraphStore::open_avec(base, Creation::Permise, Durabilite::Wal)
+                })
+                .await
+                .unwrap()
+                .unwrap()
+            };
+            store.ouvrir_les_fichiers_pour_essai();
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("acquittes"))
+                .unwrap();
+            use std::io::Write as _;
+            loop {
+                let mut f = a_file(
+                    &format!("src/{}/{}.rs", "d".repeat(300), Uuid::new_v4()),
+                    "rust",
+                    None,
+                );
+                f.hash = format!("{}{}", "h".repeat(300), Uuid::new_v4());
+                store.upsert_file(&f).await.unwrap();
+                writeln!(log, "{}\t{}", f.path, f.hash).unwrap();
+                f.hash = format!("court-{}", Uuid::new_v4());
+                store.upsert_file(&f).await.unwrap();
+                writeln!(log, "{}\t{}", f.path, f.hash).unwrap();
+            }
+        }
+
+        const TOURS: u64 = 6;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let acquittes = dir.path().join("acquittes");
+        let compte = || std::fs::read_to_string(&acquittes).map_or(0, |s| s.lines().count());
+        let mut vus = 0usize;
+        for tour in 0..TOURS {
+            let avant = compte();
+            let mut child = lancer_enfant(
+                "with_the_feature::kill9_during_file_writes_loses_no_acknowledged_blob_sized_file",
+                ENV_KILL9_FICHIERS,
+                dir.path(),
+                &[],
+            );
+            for _ in 0..2400 {
+                if compte() >= avant + 6 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(
+                compte() >= avant + 6,
+                "round {tour}: the child acknowledged no write in 60 s"
+            );
+            tokio::time::sleep(Duration::from_micros(1_500 * (tour % 9 + 1))).await;
+            child.kill().unwrap();
+            child.wait().unwrap();
+
+            let store = ouvert(open(&base).await);
+            let rapport = store.rapport_d_ouverture().clone();
+            assert!(
+                rapport.en_quarantaine.is_empty(),
+                "round {tour}: a file write killed half-way is repaired, never quarantined: \
+                 {rapport:?}"
+            );
+            let mut derniers: std::collections::HashMap<String, String> = Default::default();
+            for ligne in std::fs::read_to_string(&acquittes).unwrap().lines() {
+                let (path, hash) = ligne.split_once('\t').unwrap();
+                derniers.insert(path.to_string(), hash.to_string());
+            }
+            for (path, hash) in &derniers {
+                let f =
+                    store.get_file(path).await.unwrap().unwrap_or_else(|| {
+                        panic!("round {tour}: acknowledged file {path} is gone")
+                    });
+                assert_eq!(
+                    &f.hash, hash,
+                    "round {tour}: the last acknowledged hash of {path}"
+                );
+            }
+            vus = derniers.len();
+            store.close().await.unwrap();
+        }
+        assert!(vus >= 6, "files checked: {vus}");
     }
 
     /// What the code domain does not port refuses by name, with a reason, and never
@@ -2649,14 +2820,11 @@ mod with_the_feature {
         );
         let err = store.count_co_change_pairs(p, 1).await.unwrap_err();
         assert!(format!("{err:#}").contains("CommitStore::compute_co_changed"));
-        assert_eq!(refusees_code().len(), 71);
+        assert_eq!(refusees_code().len(), 79);
         assert!(refusees_code().iter().all(|m| m.starts_with("CodeStore::")));
         assert!(refusees_code()
             .iter()
             .all(|m| methodes_portees().contains(m)));
-        assert!(refusees_code()
-            .iter()
-            .all(|m| !methodes_qui_servent().contains(m)));
     }
 
     /// The generator skips nothing: every `async fn` of the two contracts is

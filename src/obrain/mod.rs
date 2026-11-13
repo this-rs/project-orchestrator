@@ -22,9 +22,10 @@
 //! methods; the others are refused by name there), and the node part of
 //! [`FederationStore`](crate::neo4j::traits::FederationStore)
 //! (`federation.rs`: the five relation writes and the two backfills are refused by name),
-//! and the files of [`CodeStore`](crate::neo4j::traits::CodeStore) (`code.rs`: 16 of
-//! its 85 methods — files, language statistics, three project switches; the symbols,
-//! their edges, the processes and the graph analytics are refused by name there).
+//! and part of [`CodeStore`](crate::neo4j::traits::CodeStore) (`code.rs`: 6 of its 85
+//! methods — the link and the deletions of files, three project switches; the file
+//! writes and reads, the symbols, their edges, the processes and the graph analytics are
+//! refused by name there, the file domain until the symbol writes are ported).
 //!
 //! # How obrain is used
 //!
@@ -153,8 +154,8 @@ pub fn refusees_plan() -> &'static [&'static str] {
 
 /// The methods of `CodeStore` refused on every call, as `CodeStore::<method>`
 /// (`code.rs`): symbols, their edges, processes, graph analytics, `CO_CHANGED`,
-/// and the two file writes (`upsert_file`, `batch_upsert_files`) that would store a
-/// hash before the refused symbols.
+/// and the file domain (its two writes, which would store a hash before the refused
+/// symbols, and its eight reads, which would answer empty on a base nothing can fill).
 pub fn refusees_code() -> &'static [&'static str] {
     code::REFUSEES
 }

@@ -140,6 +140,38 @@ impl FeatureGraphProposal {
     }
 }
 
+/// Is `e` a refusal BY NAME of the storage backend (obrain's [`NonPorte`], anywhere in
+/// its chain)? Such a refusal is permanent for this build — retrying, or counting it
+/// as a per-file error and going on, would only hide it. Always `false` without the
+/// `obrain-backend` feature, so the Neo4j semantics are unchanged.
+///
+/// [`NonPorte`]: crate::obrain::NonPorte
+fn est_un_refus_du_backend(e: &anyhow::Error) -> bool {
+    #[cfg(feature = "obrain-backend")]
+    {
+        e.chain().any(|c| c.is::<crate::obrain::NonPorte>())
+    }
+    #[cfg(not(feature = "obrain-backend"))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+/// The stale cleanup failed. A refusal by name (on obrain: a project that contains a
+/// quarantined path, which blocks the cleanup of the WHOLE project until the base is
+/// repaired) is an ERROR, not a passing warning; anything else stays a warning, as it
+/// always was.
+fn journaliser_echec_du_nettoyage(e: &anyhow::Error) {
+    if est_un_refus_du_backend(e) {
+        tracing::error!(
+            "stale-file cleanup refused by the storage backend, nothing deleted: {e:#}"
+        );
+    } else {
+        tracing::warn!("Failed to clean up stale files: {}", e);
+    }
+}
+
 /// Main orchestrator for coordinating AI agents
 pub struct Orchestrator {
     state: AppState,
@@ -1862,6 +1894,17 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             Ok(stored) => {
                 result.files_synced = stored;
             }
+            // A backend that refuses to store files BY NAME (obrain, file domain not
+            // ported) is not a partial failure to count and carry on from: indexing
+            // Meilisearch would put there what the graph will never hold, and no later
+            // stale cleanup could remove it. The sync stops here and says why, so the
+            // caller answers an error: no `last_synced`, no `Synced`, no post-sync.
+            Err(e) if est_un_refus_du_backend(&e) => {
+                return Err(e.context(
+                    "synchronisation arrêtée avant l'indexation : le backend refuse par son nom \
+                     d'écrire les fichiers ; rien n'est indexé dans Meilisearch",
+                ));
+            }
             Err(e) => {
                 tracing::error!("Batch store failed: {}", e);
                 result.errors = parse_count;
@@ -1960,9 +2003,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to clean up stale files: {}", e);
-                }
+                Err(e) => journaliser_echec_du_nettoyage(&e),
             }
         }
 
@@ -5959,6 +6000,58 @@ pub struct SyncResult {
 
 #[cfg(test)]
 mod tests {
+
+    /// A stale cleanup refused BY NAME by the backend (obrain: a quarantined path the
+    /// project contains blocks the cleanup of the whole project) is logged as an ERROR;
+    /// any other failure stays the warning it always was.
+    #[cfg(feature = "obrain-backend")]
+    #[test]
+    fn a_cleanup_refused_by_name_is_logged_as_an_error() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let refus = anyhow::Error::new(crate::obrain::NonPorte(
+                "CodeStore::delete_stale_files (quarantaine)",
+            ))
+            .context("un chemin en quarantaine");
+            journaliser_echec_du_nettoyage(&refus);
+            journaliser_echec_du_nettoyage(&anyhow::anyhow!("panne passagère"));
+        });
+        let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let ligne = |motif: &str| {
+            logs.lines()
+                .find(|l| l.contains(motif))
+                .unwrap_or_else(|| panic!("no log line with {motif}: {logs}"))
+                .to_string()
+        };
+        assert!(
+            ligne("delete_stale_files (quarantaine)").contains("ERROR"),
+            "{logs}"
+        );
+        assert!(ligne("panne passagère").contains("WARN"), "{logs}");
+    }
     use super::*;
     use crate::events::{CrudAction, EntityType as EventEntityType, EventBus, HybridEmitter};
     #[allow(unused_imports)]

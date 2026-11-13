@@ -893,6 +893,60 @@ mod tests {
     use crate::neo4j::traits::*;
     use std::sync::Arc;
 
+    /// On obrain the file domain is refused by name (`src/obrain/code.rs`). A sync
+    /// must then FAIL, visibly: an error answer, no `last_synced`, nothing indexed in
+    /// Meilisearch — not a 200 that counts N "errors" and indexes files the graph will
+    /// never hold.
+    #[cfg(feature = "obrain-backend")]
+    #[tokio::test]
+    async fn a_sync_on_obrain_stops_on_the_named_refusal_before_meilisearch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let graph = Arc::new(crate::obrain::ObrainGraphStore::open_temporary().unwrap());
+        let meili = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let mut app = crate::test_helpers::mock_app_state();
+        app.neo4j = graph.clone();
+        app.meili = meili.clone();
+        let mut project = crate::test_helpers::test_project_named("obrain sync");
+        project.root_path = dir.path().to_string_lossy().into_owned();
+        graph.create_project(&project).await.unwrap();
+        let state = crate::api::handlers::tests::mock_server_state_from(app).await;
+
+        let answer = sync_project(
+            State(state),
+            Path(project.slug.clone()),
+            Query(SyncProjectQuery::default()),
+        )
+        .await;
+        let Err(AppError::Internal(err)) = answer else {
+            panic!(
+                "a sync on obrain must fail, got {:?}",
+                answer.map(|j| j.0.files_synced)
+            );
+        };
+        assert_eq!(
+            err.chain()
+                .find_map(|c| c.downcast_ref::<crate::obrain::NonPorte>())
+                .copied(),
+            Some(crate::obrain::NonPorte("CodeStore::batch_upsert_files")),
+            "the refusal is named: {err:#}"
+        );
+        assert!(
+            meili.code_documents.read().await.is_empty(),
+            "nothing indexed in Meilisearch"
+        );
+        assert_eq!(
+            graph
+                .get_project(project.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_synced,
+            None,
+            "last_synced not set"
+        );
+    }
+
     #[test]
     fn test_slugify() {
         assert_eq!(slugify("My Project"), "my-project");
