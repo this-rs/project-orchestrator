@@ -94,13 +94,15 @@ mod with_the_feature {
     use chrono::Utc;
     use obrain_common::types::Value;
     use project_orchestrator::meilisearch::SearchStore;
-    use project_orchestrator::neo4j::models::{ProgressKind, ProjectNode, ProjectProfile};
+    use project_orchestrator::neo4j::models::{
+        FileNode, ProgressKind, ProjectNode, ProjectProfile,
+    };
     use project_orchestrator::neo4j::traits::*;
     use project_orchestrator::obrain::{
         defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees,
-        refusees_chat, refusees_note, refusees_plan, refusees_release, Creation, Durabilite,
-        Interruption, NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture, MARQUEUR_PO,
-        REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
+        refusees_chat, refusees_code, refusees_note, refusees_plan, refusees_release, Creation,
+        Durabilite, Interruption, NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture,
+        MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1445,8 +1447,8 @@ mod with_the_feature {
             NonPorte("PlanStore::get_plan_tasks")
         );
         assert_eq!(
-            not_ported(store.list_project_files(id).await),
-            NonPorte("CodeStore::list_project_files")
+            not_ported(store.count_co_change_pairs(id, 1).await),
+            NonPorte("CodeStore::count_co_change_pairs")
         );
         assert_eq!(
             not_ported(store.propagate_structural_links(id).await),
@@ -2039,6 +2041,331 @@ mod with_the_feature {
         assert!(store.get_note(n.id).await.unwrap().is_none());
     }
 
+    // ------------------------------------------------------------------
+    // CodeStore: the files, their membership, the project switches
+    // ------------------------------------------------------------------
+
+    fn a_file(path: &str, language: &str, project: Option<Uuid>) -> FileNode {
+        FileNode {
+            path: path.to_string(),
+            language: language.to_string(),
+            hash: format!("hash-of-{path}"),
+            last_parsed: chrono::DateTime::parse_from_rfc3339("2026-03-04T05:06:07.123456+00:00")
+                .unwrap()
+                .with_timezone(&Utc),
+            project_id: project,
+        }
+    }
+
+    /// The end-to-end proof of the code domain: write every kind of file operation,
+    /// CLOSE, REOPEN, read back. A passing test here means the files, their edges to
+    /// the projects, the updates, the deletions and the three project switches are on
+    /// disk, not only in the index of the process that wrote them.
+    #[tokio::test]
+    async fn files_and_project_switches_survive_a_close_and_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let (p1, p2) = (a_project("code one"), a_project("code two"));
+        store.create_project(&p1).await.unwrap();
+        store.create_project(&p2).await.unwrap();
+
+        let ghost = Uuid::new_v4();
+        // A path above the blob threshold: the write that carries it pays the full flush.
+        let long = format!("src/{}/deep.rs", "d".repeat(300));
+        store
+            .batch_upsert_files(&[
+                a_file("src/b.rs", "rust", Some(p1.id)),
+                a_file("src/a.rs", "rust", Some(p1.id)),
+                a_file("web/x.ts", "typescript", Some(p1.id)),
+                a_file(&long, "rust", Some(p1.id)),
+                a_file("lib/only2.py", "python", Some(p2.id)),
+                a_file("loose.md", "markdown", None),
+                // A project that does not exist: the node is written, nothing contains it.
+                a_file("ghost.rs", "rust", Some(ghost)),
+                // Repeated in the batch: the last one wins.
+                a_file("src/b.rs", "go", Some(p1.id)),
+            ])
+            .await
+            .unwrap();
+        // An update (new hash, new language) and a link to a second project.
+        let mut updated = a_file("src/a.rs", "rust", Some(p1.id));
+        updated.hash = "hash-v2".to_string();
+        store.upsert_file(&updated).await.unwrap();
+        store.link_file_to_project("src/a.rs", p2.id).await.unwrap();
+        // Linking twice, an unknown file, an unknown project: no second edge, no error.
+        store.link_file_to_project("src/a.rs", p2.id).await.unwrap();
+        store
+            .link_file_to_project("absent.rs", p2.id)
+            .await
+            .unwrap();
+        store
+            .link_file_to_project("src/a.rs", Uuid::new_v4())
+            .await
+            .unwrap();
+        // Two deletions: one by path, the stale ones of a project.
+        store.delete_file("loose.md").await.unwrap();
+        let (files, symbols, paths) = store
+            .delete_stale_files(
+                p1.id,
+                &["src/a.rs".to_string(), "src/b.rs".to_string(), long.clone()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (files, symbols, paths),
+            (1, 0, vec!["web/x.ts".to_string()])
+        );
+        // The three switches, with the clamps of the Neo4j adapter.
+        store
+            .set_scaffolding_override(p1.id, Some(9))
+            .await
+            .unwrap();
+        store
+            .set_default_note_energy(p1.id, Some(0.4))
+            .await
+            .unwrap();
+        store.set_watch_enabled(p1.id, true).await.unwrap();
+        store
+            .set_scaffolding_override(p2.id, Some(2))
+            .await
+            .unwrap();
+        store.set_scaffolding_override(p2.id, None).await.unwrap(); // cleared
+                                                                    // A missing project is a silent no-op.
+        store.set_watch_enabled(Uuid::new_v4(), true).await.unwrap();
+
+        let snapshot = |s: ObrainGraphStore| async move {
+            let paths = |v: Vec<FileNode>| v.into_iter().map(|f| f.path).collect::<Vec<_>>();
+            let one = s.list_project_files(p1.id).await.unwrap();
+            assert!(one.iter().all(|f| f.project_id == Some(p1.id)));
+            let two = s.list_project_files(p2.id).await.unwrap();
+            // The edge decides what a project lists; the property decides the rest.
+            assert!(two.iter().all(|f| f.project_id == Some(p2.id)));
+            (
+                paths(one),
+                paths(two),
+                s.count_project_files(p1.id).await.unwrap(),
+                s.count_project_files(p2.id).await.unwrap(),
+                s.get_project_file_paths(p1.id).await.unwrap(),
+                s.get_file("src/a.rs").await.unwrap().unwrap(),
+                s.get_file("src/b.rs").await.unwrap().unwrap(),
+                s.get_file("ghost.rs").await.unwrap().map(|f| f.project_id),
+                s.get_file("loose.md").await.unwrap().is_some(),
+                s.get_file("web/x.ts").await.unwrap().is_some(),
+                s.get_file_language("lib/only2.py").await.unwrap(),
+                s.find_files_by_path_suffix(".rs", 10).await.unwrap(),
+                s.get_language_stats().await.unwrap(),
+                s.get_language_stats_for_project(p1.id).await.unwrap(),
+                s.get_project(p1.id).await.unwrap().unwrap(),
+                s.get_project(p2.id).await.unwrap().unwrap(),
+                s,
+            )
+        };
+        let before = snapshot(store).await;
+        let store = before.16;
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = open(&base).await;
+        assert_eq!(
+            *store.rapport_d_ouverture(),
+            RapportOuverture::default(),
+            "nothing quarantined, no draft left"
+        );
+        let after = snapshot(store).await;
+
+        // What was written, read after the reopen.
+        assert_eq!(
+            after.0,
+            ["src/a.rs", "src/b.rs", long.as_str()],
+            "sorted by path, the stale one gone"
+        );
+        assert_eq!(
+            after.1,
+            ["lib/only2.py", "src/a.rs"],
+            "src/a.rs was linked to two"
+        );
+        assert_eq!((after.2, after.3), (3, 2));
+        assert_eq!(after.4, after.0);
+        assert_eq!(after.5.hash, "hash-v2", "the update is on disk");
+        assert_eq!(
+            after.5.project_id,
+            Some(p1.id),
+            "link leaves the property alone"
+        );
+        assert_eq!(after.6.language, "go", "last one of the batch wins");
+        assert_eq!(
+            after.5.last_parsed,
+            a_file("x", "x", None).last_parsed,
+            "microseconds survive"
+        );
+        assert_eq!(after.7, Some(Some(ghost)), "written, contained by nobody");
+        assert!(!after.8, "deleted by path");
+        assert!(!after.9, "deleted as stale");
+        assert_eq!(after.10.as_deref(), Some("python"));
+        assert_eq!(
+            after.11,
+            [
+                ("ghost.rs".to_string(), Some(ghost)),
+                ("src/a.rs".to_string(), Some(p1.id)),
+                ("src/b.rs".to_string(), Some(p1.id)),
+                (long.clone(), Some(p1.id)),
+            ]
+        );
+        assert_eq!(
+            after
+                .12
+                .iter()
+                .map(|s| (s.language.as_str(), s.file_count))
+                .collect::<Vec<_>>(),
+            [("rust", 3), ("go", 1), ("python", 1)]
+        );
+        assert_eq!(
+            after
+                .13
+                .iter()
+                .map(|s| (s.language.as_str(), s.file_count))
+                .collect::<Vec<_>>(),
+            [("rust", 2), ("go", 1)]
+        );
+        // The switches.
+        assert_eq!(after.14.scaffolding_override, Some(4), "clamped to 4");
+        assert_eq!(after.14.default_note_energy, Some(0.4));
+        assert!(after.14.watch_enabled);
+        assert_eq!(
+            after.15.scaffolding_override, None,
+            "cleared, and still cleared"
+        );
+        // And everything the first process read is what the second one reads.
+        assert_eq!(
+            (&before.0, &before.1, before.2, before.3, &before.4),
+            (&after.0, &after.1, after.2, after.3, &after.4)
+        );
+        assert_eq!(fields(&before.14), fields(&after.14));
+        assert_eq!(before.11, after.11);
+        assert_eq!(before.12.len(), after.12.len());
+        after.16.close().await.unwrap();
+    }
+
+    /// A base written by something else: files linked by an edge, a file that does not
+    /// decode, a draft, a file that holds a symbol. Open indexes what it can read, says
+    /// what it could not, and refuses to delete a file that would orphan a symbol.
+    #[tokio::test]
+    async fn a_foreign_base_is_indexed_quarantined_and_never_orphans_a_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let pid = Uuid::new_v4();
+        {
+            let slug = format!("foreign-{pid}");
+            write_foreign(&base, move |db| {
+                let projet = db.create_node_with_props(
+                    &["Project"],
+                    vec![
+                        ("id", Value::from(pid.to_string())),
+                        ("name", Value::from("foreign")),
+                        ("slug", Value::from(slug)),
+                        ("created_at", Value::from("2026-01-02T03:04:05+00:00")),
+                    ],
+                );
+                let file = |path: &str, parsed: &str| {
+                    db.create_node_with_props(
+                        &["File"],
+                        vec![
+                            ("path", Value::from(path)),
+                            ("language", Value::from("rust")),
+                            ("hash", Value::from("h")),
+                            ("last_parsed", Value::from(parsed)),
+                            ("project_id", Value::from(pid.to_string())),
+                        ],
+                    )
+                };
+                let good = file("src/good.rs", "2026-03-04T05:06:07+00:00");
+                let with_symbol = file("src/sym.rs", "2026-03-04T05:06:07+00:00");
+                let bad = file("src/bad.rs", "yesterday");
+                db.create_edge(projet, good, "CONTAINS");
+                db.create_edge(projet, with_symbol, "CONTAINS");
+                db.create_edge(projet, bad, "CONTAINS");
+                let function =
+                    db.create_node_with_props(&["Function"], vec![("name", Value::from("f"))]);
+                db.create_edge(with_symbol, function, "CONTAINS");
+                // A draft: a creation killed before its marker went.
+                let draft = file("src/draft.rs", "2026-03-04T05:06:07+00:00");
+                db.set_node_property(draft, "_brouillon", Value::from(true));
+            })
+            .await;
+        }
+        let store = open(&base).await;
+        let rapport = store.rapport_d_ouverture();
+        assert_eq!(rapport.brouillons_supprimes, 1, "{rapport:?}");
+        assert_eq!(rapport.en_quarantaine.len(), 1, "{rapport:?}");
+        assert!(
+            rapport.en_quarantaine[0].contains("last_parsed"),
+            "{rapport:?}"
+        );
+        assert_eq!(
+            store.get_project_file_paths(pid).await.unwrap(),
+            ["src/good.rs", "src/sym.rs"],
+            "the undecodable file counts in no read"
+        );
+        assert!(store.get_file("src/draft.rs").await.unwrap().is_none());
+
+        // Nothing is deleted when one of the files holds a symbol.
+        let refused = not_ported(store.delete_file("src/sym.rs").await);
+        assert_eq!(refused, NonPorte("CodeStore::delete_file (symboles)"));
+        let refused = not_ported(store.delete_stale_files(pid, &[]).await);
+        assert_eq!(refused, NonPorte("CodeStore::delete_file (symboles)"));
+        assert_eq!(store.count_project_files(pid).await.unwrap(), 2);
+        // A file with no symbol is deleted.
+        store.delete_file("src/good.rs").await.unwrap();
+        assert_eq!(
+            store.get_project_file_paths(pid).await.unwrap(),
+            ["src/sym.rs"]
+        );
+        store.close().await.unwrap();
+    }
+
+    /// What the code domain does not port refuses by name, with a reason, and never
+    /// answers an empty list.
+    #[tokio::test]
+    async fn the_unported_code_methods_refuse_by_name() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let p = Uuid::new_v4();
+        assert_eq!(
+            not_ported(store.count_co_change_pairs(p, 1).await),
+            NonPorte("CodeStore::count_co_change_pairs")
+        );
+        assert_eq!(
+            not_ported(store.count_orphan_files(p).await),
+            NonPorte("CodeStore::count_orphan_files")
+        );
+        assert_eq!(
+            not_ported(store.get_class_hierarchy("T", 2).await),
+            NonPorte("CodeStore::get_class_hierarchy")
+        );
+        assert_eq!(
+            not_ported(store.list_processes(p).await),
+            NonPorte("CodeStore::list_processes")
+        );
+        assert_eq!(
+            not_ported(store.get_function_caller_count("f", None).await),
+            NonPorte("CodeStore::get_function_caller_count")
+        );
+        assert_eq!(
+            not_ported(store.cleanup_builtin_calls().await),
+            NonPorte("CodeStore::cleanup_builtin_calls")
+        );
+        let err = store.count_co_change_pairs(p, 1).await.unwrap_err();
+        assert!(format!("{err:#}").contains("CommitStore::compute_co_changed"));
+        assert_eq!(refusees_code().len(), 69);
+        assert!(refusees_code().iter().all(|m| m.starts_with("CodeStore::")));
+        assert!(refusees_code()
+            .iter()
+            .all(|m| methodes_portees().contains(m)));
+        assert!(refusees_code()
+            .iter()
+            .all(|m| !methodes_qui_servent().contains(m)));
+    }
+
     /// The generator skips nothing: every `async fn` of the two contracts is
     /// either refused, or written by hand (and the build has checked that it IS
     /// written), or one of the few that cannot refuse and keep the contract's
@@ -2116,6 +2443,7 @@ mod with_the_feature {
         }
         // The written refusals are written, and are not counted as serving.
         assert!(refusees_note().iter().all(|m| written.contains(m)));
+        assert!(refusees_code().iter().all(|m| written.contains(m)));
         assert!(refusees_release().iter().all(|m| written.contains(m)));
         assert!(refusees_chat().iter().all(|m| written.contains(m)));
         assert!(refusees_plan().iter().all(|m| written.contains(m)));
