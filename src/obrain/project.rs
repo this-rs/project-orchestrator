@@ -406,6 +406,9 @@ impl ProjectStore for ObrainGraphStore {
                     w.db.set_node_property(noeud, cle, valeur);
                     #[cfg(any(test, feature = "mock-store"))]
                     w.point(Interruption::ApresLaPropriete(n + 1))?;
+                    // Only the test hook reads the rank.
+                    #[cfg(not(any(test, feature = "mock-store")))]
+                    let _ = n;
                 }
                 // A value in a blob column is only recovered by the full flush: it
                 // must be on disk BEFORE the marker says the project is complete.
@@ -539,6 +542,9 @@ impl ProjectStore for ObrainGraphStore {
                         w.db.set_node_property(noeud, cle, valeur);
                         #[cfg(any(test, feature = "mock-store"))]
                         w.point(Interruption::ApresLeChemin(n + 1))?;
+                        // Only the test hook reads the rank.
+                        #[cfg(not(any(test, feature = "mock-store")))]
+                        let _ = n;
                     }
                 }
                 let entree = w.apres_ecriture(Entree::decoder(w.db, noeud))?;

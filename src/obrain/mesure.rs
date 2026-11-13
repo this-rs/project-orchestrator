@@ -40,9 +40,16 @@ pub enum Interruption {
     ApresLeChemin(usize),
     /// `delete_project`: the node deleted, before the fsync.
     ApresLaSuppression,
-    /// After the k-th engine write of a multi-write (notes: supersede, rescope, delete,
-    /// update, confirm, link). Each such write is a separate record, with no marker.
-    ApresEtape(usize),
+    /// BEFORE the k-th engine write of a multi-write (notes: supersede, rescope, delete,
+    /// update, confirm, link). Each such write is a separate record, with no marker: the
+    /// crash leaves the k-1 first writes on disk.
+    AvantEtape(usize),
+    /// The next note deletion answers "not deleted" without the engine call (the branch of
+    /// a refused deletion, after its edges are gone). See `Ecriture::suppression_echouee`.
+    SuppressionEchouee,
+    /// The next edge deletion of a note write (`delete_note`, `unlink_note_from_entity`)
+    /// answers "not deleted" without the engine call. See `Ecriture::refus_simule`.
+    SuppressionDAreteEchouee,
 }
 
 /// A property value for the raw-write hooks below, so that a test never names

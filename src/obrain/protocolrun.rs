@@ -1249,7 +1249,7 @@ mod tests {
             maj.current_state = Uuid::new_v4();
             maj.error = Some("boom".to_string());
             maj.completed_at = Some(a(9));
-            store.interrompre_au_prochain(Interruption::ApresEtape(k));
+            store.interrompre_au_prochain(Interruption::AvantEtape(k));
             let issue = store.update_protocol_run(&mut maj).await;
             store.close().await.unwrap();
             drop(store);

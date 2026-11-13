@@ -27,7 +27,21 @@
 //!   and `Note`) is refused: the entity may exist in the Neo4j world, and an
 //!   edge to it cannot be written here without losing it silently;
 //! - a link to a `Project` or `Note` that this backend does not hold is a
-//!   no-op answered `Ok`, as Neo4j's `MATCH … MERGE` does.
+//!   no-op answered `Ok`, as Neo4j's `MATCH … MERGE` does;
+//! - an entity id is canonical (lowercase, hyphenated UUID) on both sides. A
+//!   request with another spelling is refused. A target STORED with another
+//!   spelling (a migrated `ABC…`) is the node `abc…`: `get_note_anchors` answers
+//!   `abc…` where Neo4j answers the stored value, and `link` /
+//!   `get_notes_for_entity` with `abc…` find it where Neo4j's exact match finds
+//!   nothing;
+//! - a base holding two `LINKED_TO` edges from one note to one target (Neo4j's
+//!   `MERGE` never writes that, a migration could) is not representable in the
+//!   index: `get_note_anchors` of the note, `link` / `unlink` of that target and
+//!   `get_notes_for_entity` of that target are refused by name. Deleting a `Note`
+//!   target removes both edges and lifts the refusal; for a `Project` target it
+//!   stays, as long as `delete_project` is refused;
+//! - an edge to a node quarantined at open (for instance an id already taken by
+//!   another node) is not a link of the indexed node: it counts as unresolved.
 //!
 //! # Reads are served from memory, a write is visible once durable
 //!
@@ -48,7 +62,7 @@
 //! `src/obrain/mod.rs`, issue obrain #120).
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
@@ -137,6 +151,33 @@ fn id_entite_canonique(t: &EntityType, id: &str) -> Result<()> {
                  minuscules, avec tirets) : refusé pour qu'un même nœud ne reçoive pas deux liens"
             );
         }
+    }
+    Ok(())
+}
+
+/// `link` / `unlink` to a target the base links with several edges (see
+/// `EntreeNote::doublons`): refused by name, before any write.
+fn refus_doublon<T>(methode: &'static str) -> Result<T> {
+    refus(
+        methode,
+        "la base a plusieurs arêtes LINKED_TO de cette note vers cette entité : l'index n'en \
+         garde qu'une, les autres resteraient sur disque",
+    )
+}
+
+/// Delete one edge of a note write. The engine refusing it means the index named an edge
+/// the base does not delete: base and index disagree, so the store is indeterminate until a
+/// restart rebuilds the index (same contract as `apres_ecriture`), and the call fails.
+fn supprimer_arete(w: &mut Ecriture<'_>, arete: EdgeId, methode: &str) -> Result<()> {
+    let supprimee = !w.suppression_d_arete_refusee() && w.db.delete_edge(arete);
+    if !supprimee {
+        w.interne
+            .indetermine
+            .store(true, std::sync::atomic::Ordering::Release);
+        bail!(
+            "obrain a refusé la suppression de l'arête {arete:?} ({methode}) : base \
+             indéterminée, redémarrer"
+        );
     }
     Ok(())
 }
@@ -319,6 +360,12 @@ pub(super) struct EntreeNote {
     /// Links on disk that this backend does not resolve (an unported domain, or a
     /// missing target). Their presence makes `get_note_anchors` refuse by name.
     non_resolus: usize,
+    /// Targets `(entity type, entity id)` that a base migrated from Neo4j links with more
+    /// than one `LINKED_TO` edge. The index keeps one; `link` and `unlink` would leave the
+    /// others on disk (stale hashes, or a link back at the next open), so they refuse by
+    /// name for those targets.
+    /// The value is the number of extra edges (counted in `non_resolus` too).
+    doublons: BTreeMap<(String, String), usize>,
     noeud: NodeId,
     note: Note,
     mise_a_jour: Option<DateTime<Utc>>,
@@ -332,6 +379,7 @@ impl EntreeNote {
         let (note, mise_a_jour) = lire_note(&get)?;
         Ok(Self {
             non_resolus: 0,
+            doublons: BTreeMap::new(),
             noeud,
             note,
             mise_a_jour,
@@ -442,26 +490,6 @@ fn lire_note(get: &dyn Fn(&str) -> Option<Value>) -> Result<(Note, Option<DateTi
             .unwrap_or_default(),
     };
     Ok((note, instant("updated_at")))
-}
-
-/// What an index sorts a note by (the fields of `NOTE_SORT_FIELDS`).
-#[derive(PartialEq)]
-enum Valeur {
-    Instant(DateTime<Utc>),
-    Nombre(f64),
-    Texte(String),
-}
-
-impl Valeur {
-    /// The variant's rank: values of one field always share a variant, so this only
-    /// orders what could never meet, and keeps the order total.
-    fn rang(&self) -> u8 {
-        match self {
-            Valeur::Instant(_) => 0,
-            Valeur::Nombre(_) => 1,
-            Valeur::Texte(_) => 2,
-        }
-    }
 }
 
 /// The index of the notes.
@@ -593,6 +621,7 @@ impl IndexNotes {
             let id = note.id;
             index.inscrire(EntreeNote {
                 non_resolus: 0,
+                doublons: BTreeMap::new(),
                 noeud,
                 note,
                 mise_a_jour: maj,
@@ -602,10 +631,12 @@ impl IndexNotes {
         }
 
         // The links: the out-edges `LINKED_TO` of every indexed note.
-        let mut liens_par_note: Vec<(Uuid, Vec<Lien>, usize)> = Vec::new();
+        type LiensLus = (Uuid, Vec<Lien>, usize, BTreeMap<(String, String), usize>);
+        let mut liens_par_note: Vec<LiensLus> = Vec::new();
         for (noeud, id) in &vus {
-            let mut liens = Vec::new();
+            let mut liens: Vec<Lien> = Vec::new();
             let mut non_resolus = 0usize;
+            let mut doublons = BTreeMap::new();
             for (cible, arete) in store.edges_from(*noeud, Direction::Outgoing) {
                 let Some(e) = db.get_edge(arete) else {
                     continue;
@@ -633,26 +664,49 @@ impl IndexNotes {
                     }
                 };
                 let cible_existe = match &entite {
+                    // The id must name THIS node: a node quarantined for an id already
+                    // taken carries the id of an indexed one, and an edge to it is not a
+                    // link to the indexed node (deleting that one would leave the edge).
                     EntityType::Project => cible_id
                         .as_deref()
                         .and_then(|s| s.parse::<Uuid>().ok())
-                        .is_some_and(|u| projets.noeud_de(u).is_some()),
+                        .is_some_and(|u| projets.noeud_de(u) == Some(cible)),
                     _ => cible_id
                         .as_deref()
                         .and_then(|s| s.parse::<Uuid>().ok())
-                        .is_some_and(|u| index.par_id.contains_key(&u)),
+                        .is_some_and(|u| index.par_id.get(&u).is_some_and(|e| e.noeud == cible)),
                 };
                 let Some(id_cible) = cible_id.filter(|_| cible_existe) else {
                     non_resolus += 1;
                     continue;
                 };
+                // Canonical form, as every link written here: a migrated `ABC…` id is the
+                // same node as `abc…`, so the index must key on the canonical string.
+                let id_entite = match id_cible.parse::<Uuid>() {
+                    Ok(u) => u.to_string(),
+                    Err(_) => {
+                        non_resolus += 1;
+                        continue;
+                    }
+                };
+                // A second edge to a node already linked cannot be represented (the index
+                // keys on the target): the note's anchors are refused, and so are `link`
+                // and `unlink` to that target.
+                if liens
+                    .iter()
+                    .any(|l| l.entite == entite && l.id_entite == id_entite)
+                {
+                    non_resolus += 1;
+                    *doublons.entry((entite.to_string(), id_entite)).or_insert(0) += 1;
+                    continue;
+                }
                 let texte = |cle: &str| {
                     e.get_property(cle)
                         .and_then(|v| v.as_str().map(str::to_string))
                 };
                 liens.push(Lien {
                     entite,
-                    id_entite: id_cible,
+                    id_entite,
                     arete,
                     signature_hash: texte("signature_hash").filter(|s| !s.is_empty()),
                     body_hash: texte("body_hash").filter(|s| !s.is_empty()),
@@ -661,11 +715,12 @@ impl IndexNotes {
                         .unwrap_or_else(Utc::now),
                 });
             }
-            liens_par_note.push((*id, liens, non_resolus));
+            liens_par_note.push((*id, liens, non_resolus, doublons));
         }
-        for (id, liens, nr) in liens_par_note {
+        for (id, liens, nr, doublons) in liens_par_note {
             if let Some(mut e) = index.desinscrire(id) {
                 e.non_resolus = nr;
+                e.doublons = doublons;
                 e.liens = liens;
                 index.inscrire(e);
             }
@@ -685,6 +740,7 @@ impl ObrainGraphStore {
     fn relire(w: &Ecriture<'_>, e: &EntreeNote) -> Result<EntreeNote> {
         let mut r = w.apres_ecriture(EntreeNote::decoder(w.db, e.noeud, e.liens.clone()))?;
         r.non_resolus = e.non_resolus;
+        r.doublons = e.doublons.clone();
         Ok(r)
     }
 
@@ -864,6 +920,9 @@ impl NoteStore for ObrainGraphStore {
                     w.db.set_node_property(noeud, cle, valeur);
                     #[cfg(any(test, feature = "mock-store"))]
                     w.point(Interruption::ApresLaPropriete(k + 1))?;
+                    // Only the test hook reads the rank.
+                    #[cfg(not(any(test, feature = "mock-store")))]
+                    let _ = k;
                 }
                 if let Some(projet) = projet_noeud {
                     let _ = w.db.create_edge(projet, noeud, APPARTIENT);
@@ -1030,10 +1089,11 @@ impl NoteStore for ObrainGraphStore {
                         .collect();
                 for a in aretes {
                     w.etape()?;
-                    w.db.delete_edge(a);
+                    supprimer_arete(w, a, "delete_note")?;
                 }
                 w.etape()?;
-                if !w.db.delete_node(noeud) {
+                let supprime = !w.suppression_de_noeud_refusee() && w.db.delete_node(noeud);
+                if !supprime {
                     // The edges are already gone: what is on disk is no longer the state
                     // before this call. Same contract as `apres_ecriture`: everything is
                     // refused until a restart rebuilds the index from the base.
@@ -1065,6 +1125,13 @@ impl NoteStore for ObrainGraphStore {
                         s.liens.retain(|l| {
                             !(l.entite == EntityType::Note && l.id_entite == id.to_string())
                         });
+                        // Its extra edges to this note went with it too (DETACH).
+                        if let Some(n) = s
+                            .doublons
+                            .remove(&(EntityType::Note.to_string(), id.to_string()))
+                        {
+                            s.non_resolus -= n;
+                        }
                         idx.inscrire(s);
                     }
                 }
@@ -1156,6 +1223,11 @@ impl NoteStore for ObrainGraphStore {
                 let Some(mut e) = Self::entree_de(w, note_id)? else {
                     return Ok(());
                 };
+                if e.doublons
+                    .contains_key(&(entite.to_string(), id_entite.clone()))
+                {
+                    return refus_doublon("NoteStore::link_note_to_entity");
+                }
                 // The target must exist in this backend, else nothing is written (Neo4j's MATCH).
                 let cible = {
                     let etat = w.index()?;
@@ -1310,6 +1382,11 @@ impl NoteStore for ObrainGraphStore {
                 let Some(mut e) = Self::entree_de(w, note_id)? else {
                     return Ok(());
                 };
+                if e.doublons
+                    .contains_key(&(entite.to_string(), id_entite.clone()))
+                {
+                    return refus_doublon("NoteStore::unlink_note_from_entity");
+                }
                 let Some(k) = e
                     .liens
                     .iter()
@@ -1319,7 +1396,7 @@ impl NoteStore for ObrainGraphStore {
                 };
                 let arete = e.liens.remove(k).arete;
                 w.etape()?;
-                w.db.delete_edge(arete);
+                supprimer_arete(w, arete, "unlink_note_from_entity")?;
                 w.rendre_durable()?;
                 w.index_mut()?.notes.publier(e);
                 Ok(())
@@ -1339,13 +1416,21 @@ impl NoteStore for ObrainGraphStore {
         id_entite_canonique(entity_type, entity_id)?;
         let cle = (entity_type.to_string(), entity_id.to_string());
         self.lire(|_, etat| {
-            let mut notes: Vec<&Note> = etat
+            let entrees: Vec<&EntreeNote> = etat
                 .notes
                 .par_entite
                 .get(&cle)
                 .into_iter()
                 .flatten()
                 .filter_map(|id| etat.notes.par_id.get(id))
+                .collect();
+            // Neo4j's MATCH has no DISTINCT: a note with two edges to the entity comes back
+            // twice. The index holds one; answering once would be a short answer, silently.
+            if entrees.iter().any(|e| e.doublons.contains_key(&cle)) {
+                return refus_doublon("NoteStore::get_notes_for_entity");
+            }
+            let mut notes: Vec<&Note> = entrees
+                .into_iter()
                 .map(|e| &e.note)
                 .filter(|n| matches!(n.status, NoteStatus::Active | NoteStatus::NeedsReview))
                 .collect();
@@ -1538,8 +1623,7 @@ impl NoteStore for ObrainGraphStore {
                 .collect();
             // ORDER BY staleness_score DESC, importance DESC, id DESC LIMIT 500.
             notes.sort_by(|a, b| {
-                b.staleness_score
-                    .total_cmp(&a.staleness_score)
+                cmp_nombre(b.staleness_score, a.staleness_score)
                     .then_with(|| b.importance.to_string().cmp(&a.importance.to_string()))
                     .then_with(|| b.id.cmp(&a.id))
             });
@@ -1654,36 +1738,57 @@ fn note_ordre_desc(requested: Option<&str>) -> bool {
     !matches!(requested.map(|d| d.trim().to_ascii_lowercase()), Some(d) if d == "asc")
 }
 
-/// The sort value of a note for one field. `None` is a null property.
-fn valeur_de_tri(e: &EntreeNote, champ: &str) -> Option<Valeur> {
-    let n = &e.note;
-    match champ {
-        "created_at" => Some(Valeur::Instant(n.created_at)),
-        "updated_at" => e.mise_a_jour.map(Valeur::Instant),
-        "importance" => Some(Valeur::Texte(n.importance.to_string())),
-        "status" => Some(Valeur::Texte(n.status.to_string())),
-        "note_type" => Some(Valeur::Texte(n.note_type.to_string())),
-        "staleness_score" => Some(Valeur::Nombre(n.staleness_score)),
-        "energy" => Some(Valeur::Nombre(n.energy)),
-        "last_confirmed_at" => n.last_confirmed_at.map(Valeur::Instant),
-        "last_activated" => n.last_activated.map(Valeur::Instant),
-        "scar_intensity" => Some(Valeur::Nombre(n.scar_intensity)),
-        _ => Some(Valeur::Instant(n.created_at)),
+/// Compares two numbers as Neo4j's `ORDER BY` does (`FloatingPointValue::compareTo`,
+/// that is Java's `Double.compare`): `-0.0` before `0.0`, and every NaN after every
+/// number, whatever its sign bit. `f64::total_cmp` alone puts a negative NaN first. A NaN
+/// is refused at the write, but a migrated base can hold one.
+fn cmp_nombre(a: f64, b: f64) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.total_cmp(&b),
     }
 }
 
-/// The ascending order of a list: by the field, nulls LAST (as Cypher ascending),
-/// then by id. The caller reverses it for `DESC`, which puts nulls first, as Cypher.
-fn cmp_tri(a: &EntreeNote, b: &EntreeNote, champ: &str) -> Ordering {
-    let va = valeur_de_tri(a, champ);
-    let vb = valeur_de_tri(b, champ);
-    let par_champ = match (&va, &vb) {
-        (Some(x), Some(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+/// Ascending comparison of a nullable value: nulls LAST (as Cypher ascending).
+fn ord_nullable<T>(x: Option<&T>, y: Option<&T>, cmp: impl Fn(&T, &T) -> Ordering) -> Ordering {
+    match (x, y) {
+        (Some(a), Some(b)) => cmp(a, b),
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Greater,
         (Some(_), None) => Ordering::Less,
+    }
+}
+
+/// The ascending order of a list: by the field (nulls LAST), then by id. The caller
+/// reverses it for `DESC`, which puts nulls first, as Cypher does.
+fn cmp_tri(a: &EntreeNote, b: &EntreeNote, champ: &str) -> Ordering {
+    let (na, nb) = (&a.note, &b.note);
+    let par_champ = match champ {
+        "updated_at" => ord_nullable(a.mise_a_jour.as_ref(), b.mise_a_jour.as_ref(), |x, y| {
+            x.cmp(y)
+        }),
+        "last_confirmed_at" => ord_nullable(
+            na.last_confirmed_at.as_ref(),
+            nb.last_confirmed_at.as_ref(),
+            |x, y| x.cmp(y),
+        ),
+        "last_activated" => ord_nullable(
+            na.last_activated.as_ref(),
+            nb.last_activated.as_ref(),
+            |x, y| x.cmp(y),
+        ),
+        "importance" => na.importance.to_string().cmp(&nb.importance.to_string()),
+        "status" => na.status.to_string().cmp(&nb.status.to_string()),
+        "note_type" => na.note_type.to_string().cmp(&nb.note_type.to_string()),
+        "staleness_score" => cmp_nombre(na.staleness_score, nb.staleness_score),
+        "energy" => cmp_nombre(na.energy, nb.energy),
+        "scar_intensity" => cmp_nombre(na.scar_intensity, nb.scar_intensity),
+        // `note_order_field` only yields NOTE_SORT_FIELDS; `created_at` is its default.
+        _ => na.created_at.cmp(&nb.created_at),
     };
-    par_champ.then_with(|| a.note.id.cmp(&b.note.id))
+    par_champ.then_with(|| na.id.cmp(&nb.id))
 }
 
 /// The predicates of `list_notes` (`build_note_where`), on the decoded note.
@@ -1725,17 +1830,4 @@ fn filtre_note(n: &Note, f: &NoteFilters) -> bool {
         }
     }
     true
-}
-
-impl PartialOrd for Valeur {
-    /// Total: `f64::total_cmp` for numbers (a NaN is refused at the write, but the order
-    /// stays total if one comes from a migrated base).
-    fn partial_cmp(&self, autre: &Self) -> Option<Ordering> {
-        Some(match (self, autre) {
-            (Valeur::Instant(a), Valeur::Instant(b)) => a.cmp(b),
-            (Valeur::Nombre(a), Valeur::Nombre(b)) => a.total_cmp(b),
-            (Valeur::Texte(a), Valeur::Texte(b)) => a.cmp(b),
-            (a, b) => a.rang().cmp(&b.rang()),
-        })
-    }
 }
