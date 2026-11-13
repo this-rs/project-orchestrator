@@ -56,11 +56,16 @@ pub mod conformance {
     use project_orchestrator::ingress::{ExternalEvent, IngressOutcome};
     use project_orchestrator::neo4j::file_uid::PathPolicy;
     use project_orchestrator::neo4j::models::{
-        AlertNode, AlertSeverity, FileNode, PlanNode, PlanStatus, ProjectNode, ProjectProfile,
-        StepNode, StepStatus, TaskNode, TaskStatus,
+        AlertNode, AlertSeverity, ComponentType, ComponentUpdate, DeploymentNode, DeploymentStatus,
+        DerivedComponentWrite, EnvironmentKind, EnvironmentNode, FileNode, MilestoneNode,
+        MilestoneStatus, PlanNode, PlanStatus, ProjectNode, ProjectProfile, ReleaseNode,
+        ReleaseStatus, ResourceNode, ResourceType, StepNode, StepStatus, TaskNode, TaskStatus,
+        WorkspaceMilestoneNode, WorkspaceNode,
     };
     use project_orchestrator::neo4j::GraphStore;
-    use project_orchestrator::notes::{Note, NoteFilters, NoteStatus, NoteType};
+    use project_orchestrator::notes::{
+        EntityType, Note, NoteFilters, NoteImportance, NoteScope, NoteStatus, NoteType,
+    };
     use project_orchestrator::plan::models::UpdateTaskRequest;
     use project_orchestrator::protocol::{Protocol, ProtocolRun, RunStatus};
     use std::collections::HashSet;
@@ -1976,6 +1981,271 @@ pub mod conformance {
         format!("/nonexistent/conformance-{}", Uuid::new_v4())
     }
 
+    // ------------------------------------------------------------------
+    // Federation (MCP servers and their tools): the checks that call nothing
+    // but `FederationStore`, run by `federation_checks!`.
+    // ------------------------------------------------------------------
+
+    pub fn an_mcp_server(
+        project_id: Uuid,
+        server_id: &str,
+    ) -> project_orchestrator::neo4j::models::McpServerNode {
+        project_orchestrator::neo4j::models::McpServerNode {
+            id: Uuid::new_v4(),
+            project_id,
+            server_id: server_id.to_string(),
+            display_name: format!("conformance {server_id}"),
+            transport_type: "stdio".to_string(),
+            transport_url: None,
+            transport_command: Some("conformance-cmd".to_string()),
+            transport_args: Some("[\"--flag\"]".to_string()),
+            transport_secrets: None,
+            status: "disconnected".to_string(),
+            protocol_version: None,
+            server_name: Some("conformance".to_string()),
+            tool_count: 0,
+            created_at: Utc::now(),
+            updated_at: None,
+            last_connected_at: None,
+        }
+    }
+
+    pub fn an_mcp_tool(
+        server_id: &str,
+        name: &str,
+    ) -> project_orchestrator::neo4j::models::McpToolNode {
+        project_orchestrator::neo4j::models::McpToolNode {
+            id: Uuid::new_v4(),
+            server_id: server_id.to_string(),
+            name: name.to_string(),
+            fqn: format!("{server_id}::{name}"),
+            description: "conformance tool".to_string(),
+            input_schema: "{}".to_string(),
+            category: "query".to_string(),
+            embedding: None,
+            created_at: Utc::now(),
+            updated_at: None,
+        }
+    }
+
+    /// Every field but the timestamps, compared WITHOUT printing them: the
+    /// stdio secrets of a server must never reach a test log.
+    fn same_server(
+        a: &project_orchestrator::neo4j::models::McpServerNode,
+        b: &project_orchestrator::neo4j::models::McpServerNode,
+    ) -> bool {
+        a.id == b.id
+            && a.project_id == b.project_id
+            && a.server_id == b.server_id
+            && a.display_name == b.display_name
+            && a.transport_type == b.transport_type
+            && a.transport_url == b.transport_url
+            && a.transport_command == b.transport_command
+            && a.transport_args == b.transport_args
+            && a.transport_secrets == b.transport_secrets
+            && a.status == b.status
+            && a.protocol_version == b.protocol_version
+            && a.server_name == b.server_name
+            && a.tool_count == b.tool_count
+            && a.last_connected_at == b.last_connected_at
+    }
+
+    /// A server and a tool come back with the values written; the absent
+    /// optional values read back absent; the absent ids read as absent.
+    pub async fn check_mcp_roundtrip(store: &dyn GraphStore) {
+        let project = Uuid::new_v4();
+        let sid = format!("conformance-rt-{}", Uuid::new_v4());
+        let mut s = an_mcp_server(project, &sid);
+        s.transport_secrets = Some("{\"env\":{\"K\":\"v\"}}".to_string());
+        store.create_mcp_server(&s).await.unwrap();
+
+        let back = store
+            .get_mcp_server(s.id)
+            .await
+            .unwrap()
+            .expect("read by id");
+        assert!(
+            same_server(&back, &s),
+            "the server read back differs (secrets not printed)"
+        );
+        assert_eq!(
+            back.transport_url, None,
+            "an absent value reads back absent"
+        );
+        let listed = store.list_mcp_servers(project).await.unwrap();
+        assert_eq!(listed.len(), 1, "list_mcp_servers of its project");
+        assert!(same_server(&listed[0], &s), "the listed server differs");
+        assert!(store
+            .list_mcp_servers(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .get_mcp_server(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none());
+
+        let t = an_mcp_tool(&sid, "read");
+        store.create_mcp_tool(&t).await.unwrap();
+        let tools = store.list_mcp_tools_for_server(&sid).await.unwrap();
+        assert_eq!(tools.len(), 1, "one tool for the server");
+        assert_eq!(tools[0].id, t.id);
+        assert_eq!(tools[0].fqn, t.fqn);
+        assert_eq!(tools[0].description, t.description);
+        assert_eq!(
+            tools[0].embedding, None,
+            "an absent embedding reads back absent"
+        );
+        assert!(store
+            .list_mcp_tools_for_server(&format!("absent-{}", Uuid::new_v4()))
+            .await
+            .unwrap()
+            .is_empty());
+
+        store.delete_mcp_server(s.id).await.unwrap();
+    }
+
+    /// Servers of a project come out by `(server_id, id)`, the tools of a server by
+    /// `(name, id)`: a total order, the id breaking the ties of the first key.
+    pub async fn check_mcp_list_order(store: &dyn GraphStore) {
+        let project = Uuid::new_v4();
+        let tag = Uuid::new_v4();
+        let sid = |x: &str| format!("conformance-ord-{tag}-{x}");
+
+        // The contract promises no total order on these listings: `traits.rs`
+        // documents them as "List MCP servers for a project" / "List tools for an MCP
+        // server", and the Neo4j reference sorts servers by `server_id` alone (no
+        // tie-break). Two servers sharing a `server_id` — or two tools sharing a name
+        // — are therefore interchangeable: assert the set of ids, not their order.
+        let servers = vec![
+            an_mcp_server(project, &sid("zeta")),
+            an_mcp_server(project, &sid("alpha")),
+            an_mcp_server(project, &sid("alpha")),
+        ];
+        for s in &servers {
+            store.create_mcp_server(s).await.unwrap();
+        }
+        let expected: HashSet<Uuid> = servers.iter().map(|s| s.id).collect();
+        let listed: HashSet<Uuid> = store
+            .list_mcp_servers(project)
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(listed, expected, "list_mcp_servers: the same servers");
+        let all: HashSet<Uuid> = store
+            .list_all_mcp_servers()
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .filter(|id| expected.contains(id))
+            .collect();
+        assert_eq!(
+            all, expected,
+            "list_all_mcp_servers: the same servers among ours"
+        );
+
+        let tools_sid = sid("tools");
+        let tools = vec![
+            an_mcp_tool(&tools_sid, "write"),
+            an_mcp_tool(&tools_sid, "read"),
+            an_mcp_tool(&tools_sid, "read"),
+        ];
+        for t in &tools {
+            store.create_mcp_tool(t).await.unwrap();
+        }
+        let expected_tools: HashSet<Uuid> = tools.iter().map(|t| t.id).collect();
+        let listed_tools: HashSet<Uuid> = store
+            .list_mcp_tools_for_server(&tools_sid)
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            listed_tools, expected_tools,
+            "list_mcp_tools_for_server: the same tools"
+        );
+
+        for s in &servers {
+            store.delete_mcp_server(s.id).await.unwrap();
+        }
+        store.delete_mcp_tools_for_server(&tools_sid).await.unwrap();
+    }
+
+    /// A status update is read back, and is a no-op on an absent server. Deleting
+    /// a server takes its tools with it; by `server_id` it takes every server with
+    /// that id; deleting what is absent is not an error.
+    pub async fn check_mcp_status_and_deletion(store: &dyn GraphStore) {
+        let project = Uuid::new_v4();
+        let sid = format!("conformance-del-{}", Uuid::new_v4());
+        let s = an_mcp_server(project, &sid);
+        store.create_mcp_server(&s).await.unwrap();
+        store
+            .create_mcp_tool(&an_mcp_tool(&sid, "a"))
+            .await
+            .unwrap();
+        store
+            .create_mcp_tool(&an_mcp_tool(&sid, "b"))
+            .await
+            .unwrap();
+
+        store
+            .update_mcp_server_status(s.id, "connected")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_mcp_server(s.id).await.unwrap().unwrap().status,
+            "connected"
+        );
+        store
+            .update_mcp_server_status(Uuid::new_v4(), "error")
+            .await
+            .unwrap();
+
+        store.delete_mcp_server(s.id).await.unwrap();
+        assert!(store.get_mcp_server(s.id).await.unwrap().is_none());
+        assert!(store
+            .list_mcp_tools_for_server(&sid)
+            .await
+            .unwrap()
+            .is_empty());
+        store.delete_mcp_server(s.id).await.unwrap();
+
+        let again = an_mcp_server(project, &sid);
+        store.create_mcp_server(&again).await.unwrap();
+        store
+            .create_mcp_tool(&an_mcp_tool(&sid, "c"))
+            .await
+            .unwrap();
+        store.delete_mcp_server_by_server_id(&sid).await.unwrap();
+        assert!(store.get_mcp_server(again.id).await.unwrap().is_none());
+        assert!(store
+            .list_mcp_tools_for_server(&sid)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store.list_mcp_servers(project).await.unwrap().is_empty());
+        store
+            .delete_mcp_server_by_server_id(&format!("absent-{}", Uuid::new_v4()))
+            .await
+            .unwrap();
+
+        store
+            .create_mcp_tool(&an_mcp_tool(&sid, "d"))
+            .await
+            .unwrap();
+        store.delete_mcp_tools_for_server(&sid).await.unwrap();
+        assert!(store
+            .list_mcp_tools_for_server(&sid)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     /// What is created reads back identical, by id and by slug, down to the
     /// nanosecond of `created_at`; what was never created reads as absent.
     pub async fn check_project_roundtrip(store: &dyn GraphStore) {
@@ -2548,13 +2818,1253 @@ pub mod conformance {
             store.delete_project(p.id, &p.name).await.unwrap();
         }
     }
+
+    // ------------------------------------------------------------------
+    // Release domain: releases, environments, deployments, milestones, and the
+    // project list the release store serves (`list_projects_filtered`).
+    // Timestamps are whole seconds so that every backend stores the same value.
+    // ------------------------------------------------------------------
+
+    fn a_release(project_id: Uuid, version: &str, created: i64) -> ReleaseNode {
+        ReleaseNode {
+            id: Uuid::new_v4(),
+            version: version.to_string(),
+            title: None,
+            description: None,
+            status: ReleaseStatus::Planned,
+            target_date: None,
+            released_at: None,
+            created_at: at(created),
+            project_id,
+        }
+    }
+
+    fn json<T: serde::Serialize>(v: &T) -> serde_json::Value {
+        serde_json::to_value(v).unwrap()
+    }
+
+    /// A release reads back the values it was created with, `update_release` changes
+    /// exactly the fields it is given, an update on an unknown id is a no-op, and a
+    /// deleted release is gone.
+    pub async fn check_release_roundtrip(store: &dyn GraphStore) {
+        let p = a_project("release-roundtrip");
+        store.create_project(&p).await.unwrap();
+
+        let mut r = a_release(p.id, "1.0.0", 10);
+        r.title = Some("first".to_string());
+        r.description = None;
+        r.target_date = Some(at(100));
+        store.create_release(&r).await.unwrap();
+
+        let got = store.get_release(r.id).await.unwrap().unwrap();
+        assert_eq!(
+            json(&got),
+            json(&r),
+            "a release reads back what was created"
+        );
+        // An absent description is stored as "" and reads back as "" or None, but never
+        // as a value of its own: the title and the dates stay as they were given.
+        assert_eq!(got.title.as_deref(), Some("first"));
+        assert_eq!(got.target_date, Some(at(100)));
+        assert_eq!(got.released_at, None);
+
+        store
+            .update_release(
+                r.id,
+                Some(ReleaseStatus::InProgress),
+                None,
+                None,
+                None,
+                Some("notes".to_string()),
+            )
+            .await
+            .unwrap();
+        let got = store.get_release(r.id).await.unwrap().unwrap();
+        assert_eq!(got.status, ReleaseStatus::InProgress, "status changed");
+        assert_eq!(
+            got.description.as_deref(),
+            Some("notes"),
+            "description changed"
+        );
+        assert_eq!(got.title.as_deref(), Some("first"), "title untouched");
+        assert_eq!(got.target_date, Some(at(100)), "target_date untouched");
+
+        // Unknown id: nothing is created, nothing fails.
+        store
+            .update_release(
+                Uuid::new_v4(),
+                Some(ReleaseStatus::Released),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A release of a project that does not exist is refused.
+        let ghost = a_release(Uuid::new_v4(), "9.9.9", 1);
+        assert!(store.create_release(&ghost).await.is_err());
+        assert!(store.get_release(ghost.id).await.unwrap().is_none());
+
+        store.delete_release(r.id).await.unwrap();
+        assert!(store.get_release(r.id).await.unwrap().is_none());
+        assert!(store
+            .list_project_releases(p.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|x| x.id != r.id));
+        store.delete_release(r.id).await.unwrap(); // second delete: no-op
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    /// `list_project_releases` is newest first, ties broken by id descending;
+    /// `list_releases_filtered` filters by status (any case), sorts by the field asked
+    /// (id ascending as the tie-break) and pages with the total.
+    pub async fn check_release_list_order(store: &dyn GraphStore) {
+        let p = a_project("release-order");
+        store.create_project(&p).await.unwrap();
+        let mut a = a_release(p.id, "1.0.0", 30);
+        let mut b = a_release(p.id, "1.1.0", 20);
+        let mut c = a_release(p.id, "2.0.0", 20);
+        a.status = ReleaseStatus::Released;
+        b.status = ReleaseStatus::Planned;
+        c.status = ReleaseStatus::InProgress;
+        b.target_date = Some(at(500));
+        for r in [&a, &b, &c] {
+            store.create_release(r).await.unwrap();
+        }
+
+        // Newest first; the tie on created_at (b, c) is broken by id, descending.
+        let mut tie = [b.id, c.id];
+        tie.sort();
+        tie.reverse();
+        let expected = vec![a.id, tie[0], tie[1]];
+        let listed: Vec<Uuid> = store
+            .list_project_releases(p.id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(listed, expected, "newest first, then id descending");
+
+        let (all, total) = store
+            .list_releases_filtered(p.id, None, 10, 0, None, "desc")
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+        // The filtered list breaks a tie on created_at by id ASCENDING (not descending
+        // as the project list does): `b` and `c` share created_at.
+        let (low, high) = if b.id < c.id {
+            (b.id, c.id)
+        } else {
+            (c.id, b.id)
+        };
+        assert_eq!(
+            ids(&all, |r| r.id),
+            vec![a.id, low, high],
+            "default sort: created_at desc, then id asc"
+        );
+
+        let (in_progress, total) = store
+            .list_releases_filtered(
+                p.id,
+                Some(vec!["in_progress".to_string()]),
+                10,
+                0,
+                None,
+                "desc",
+            )
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "a status filter counts its matches");
+        assert_eq!(ids(&in_progress, |r| r.id), vec![c.id]);
+
+        // Sorted by version ascending, then one row per page: the total stays 3.
+        let (page1, total) = store
+            .list_releases_filtered(p.id, None, 1, 0, Some("version"), "asc")
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(ids(&page1, |r| r.id), vec![a.id], "version 1.0.0 first");
+        let (page2, _) = store
+            .list_releases_filtered(p.id, None, 1, 1, Some("version"), "asc")
+            .await
+            .unwrap();
+        assert_eq!(ids(&page2, |r| r.id), vec![b.id], "then 1.1.0");
+
+        // A target_date sort puts the release without one first, ascending.
+        let (by_target, _) = store
+            .list_releases_filtered(p.id, None, 10, 0, Some("target_date"), "asc")
+            .await
+            .unwrap();
+        assert_eq!(by_target.last().map(|r| r.id), Some(b.id));
+
+        for r in [&a, &b, &c] {
+            store.delete_release(r.id).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    /// Environments: names are unique within a project, listed oldest first, updated
+    /// field by field (an empty string clears an optional one), and deleting one
+    /// deletes its deployments.
+    pub async fn check_environment_lifecycle(store: &dyn GraphStore) {
+        let p = a_project("env-lifecycle");
+        store.create_project(&p).await.unwrap();
+        let env = |name: &str, created: i64| EnvironmentNode {
+            id: Uuid::new_v4(),
+            project_id: p.id,
+            name: name.to_string(),
+            kind: EnvironmentKind::Staging,
+            url: Some("https://example.test".to_string()),
+            description: None,
+            config: None,
+            created_at: at(created),
+        };
+        let late = env("late", 50);
+        let early = env("early", 10);
+        store.create_environment(&late).await.unwrap();
+        store.create_environment(&early).await.unwrap();
+
+        let dup = EnvironmentNode {
+            id: Uuid::new_v4(),
+            ..env("late", 60)
+        };
+        assert!(
+            store.create_environment(&dup).await.is_err(),
+            "a second environment with the same name in the project is refused"
+        );
+
+        let listed = store.list_project_environments(p.id).await.unwrap();
+        assert_eq!(
+            ids(&listed, |e| e.id),
+            vec![early.id, late.id],
+            "oldest first"
+        );
+
+        store
+            .update_environment(
+                early.id,
+                None,
+                Some(EnvironmentKind::Production),
+                Some(String::new()),
+                Some("the live one".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        let got = store.get_environment(early.id).await.unwrap().unwrap();
+        assert_eq!(got.kind, EnvironmentKind::Production);
+        assert_eq!(got.url, None, "an empty string clears url");
+        assert_eq!(got.description.as_deref(), Some("the live one"));
+        assert_eq!(got.name, "early", "name untouched");
+
+        let dep = DeploymentNode {
+            id: Uuid::new_v4(),
+            environment_id: early.id,
+            version: Some("1.0.0".to_string()),
+            commit_sha: None,
+            status: DeploymentStatus::Pending,
+            notes: None,
+            created_by: "tester".to_string(),
+            started_at: at(70),
+            finished_at: None,
+        };
+        store.create_deployment(&dep).await.unwrap();
+        store.delete_environment(early.id).await.unwrap();
+        assert!(store.get_environment(early.id).await.unwrap().is_none());
+        assert!(
+            store.get_deployment(dep.id).await.unwrap().is_none(),
+            "its deployments go with it"
+        );
+
+        let orphan = DeploymentNode {
+            id: Uuid::new_v4(),
+            environment_id: early.id,
+            ..dep.clone()
+        };
+        assert!(
+            store.create_deployment(&orphan).await.is_err(),
+            "a deployment of an unknown environment is refused"
+        );
+
+        store.delete_environment(late.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    /// Deployments: newest first with the total, paged; the matrix gives each
+    /// environment its latest deployment and the statuses of its last five.
+    pub async fn check_deployment_matrix(store: &dyn GraphStore) {
+        let p = a_project("deploy-matrix");
+        store.create_project(&p).await.unwrap();
+        let prod = EnvironmentNode {
+            id: Uuid::new_v4(),
+            project_id: p.id,
+            name: "prod".to_string(),
+            kind: EnvironmentKind::Production,
+            url: None,
+            description: None,
+            config: None,
+            created_at: at(1),
+        };
+        let dev = EnvironmentNode {
+            id: Uuid::new_v4(),
+            name: "dev".to_string(),
+            kind: EnvironmentKind::Dev,
+            created_at: at(2),
+            ..prod.clone()
+        };
+        store.create_environment(&prod).await.unwrap();
+        store.create_environment(&dev).await.unwrap();
+
+        let statuses = [
+            DeploymentStatus::Succeeded,
+            DeploymentStatus::Failed,
+            DeploymentStatus::Running,
+            DeploymentStatus::Succeeded,
+            DeploymentStatus::RolledBack,
+            DeploymentStatus::Pending,
+            DeploymentStatus::Succeeded,
+        ];
+        let mut made = Vec::new();
+        for (i, s) in statuses.iter().enumerate() {
+            let d = DeploymentNode {
+                id: Uuid::new_v4(),
+                environment_id: prod.id,
+                version: None,
+                commit_sha: None,
+                status: *s,
+                notes: None,
+                created_by: "ci".to_string(),
+                started_at: at(100 + i as i64),
+                finished_at: None,
+            };
+            store.create_deployment(&d).await.unwrap();
+            made.push(d);
+        }
+
+        let (page, total) = store
+            .list_environment_deployments(prod.id, 3, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 7);
+        let newest_first: Vec<Uuid> = made.iter().rev().map(|d| d.id).collect();
+        assert_eq!(
+            ids(&page, |d| d.id),
+            newest_first[..3].to_vec(),
+            "newest first"
+        );
+        let (rest, _) = store
+            .list_environment_deployments(prod.id, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&rest, |d| d.id),
+            newest_first[5..].to_vec(),
+            "offset pages"
+        );
+
+        let matrix = store.get_deployment_matrix(p.id).await.unwrap();
+        assert_eq!(matrix.len(), 2);
+        assert_eq!(
+            matrix[0].environment.name, "prod",
+            "environments oldest first"
+        );
+        assert_eq!(matrix[1].environment.name, "dev");
+        assert_eq!(
+            matrix[0].latest_deployment.as_ref().map(|d| d.id),
+            Some(made[6].id)
+        );
+        assert_eq!(
+            matrix[0].recent_statuses,
+            statuses.iter().rev().take(5).copied().collect::<Vec<_>>(),
+            "the last five statuses, newest first"
+        );
+        assert!(matrix[1].latest_deployment.is_none());
+        assert!(matrix[1].recent_statuses.is_empty());
+
+        store.delete_environment(prod.id).await.unwrap();
+        store.delete_environment(dev.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    /// Milestones: created, read, listed by target date (undated ones first), updated
+    /// field by field, filtered by status, and deleted.
+    pub async fn check_milestone_lifecycle(store: &dyn GraphStore) {
+        let p = a_project("milestone");
+        store.create_project(&p).await.unwrap();
+        let jalon = |title: &str, target: Option<i64>, created: i64| MilestoneNode {
+            id: Uuid::new_v4(),
+            title: title.to_string(),
+            description: None,
+            status: MilestoneStatus::Open,
+            target_date: target.map(at),
+            closed_at: None,
+            created_at: at(created),
+            project_id: p.id,
+        };
+        let later = jalon("later", Some(900), 1);
+        let sooner = jalon("sooner", Some(300), 2);
+        let undated = jalon("undated", None, 3);
+        for j in [&later, &sooner, &undated] {
+            store.create_milestone(j).await.unwrap();
+        }
+        assert_eq!(
+            json(&store.get_milestone(later.id).await.unwrap().unwrap()),
+            json(&later)
+        );
+
+        let listed = store.list_project_milestones(p.id).await.unwrap();
+        assert_eq!(
+            ids(&listed, |j| j.id),
+            vec![undated.id, sooner.id, later.id],
+            "target_date ascending, an absent one first"
+        );
+
+        store
+            .update_milestone(
+                later.id,
+                Some(MilestoneStatus::InProgress),
+                None,
+                None,
+                Some("renamed".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        let got = store.get_milestone(later.id).await.unwrap().unwrap();
+        assert_eq!(got.status, MilestoneStatus::InProgress);
+        assert_eq!(got.title, "renamed");
+        assert_eq!(got.target_date, Some(at(900)), "target_date untouched");
+
+        let (open, total) = store
+            .list_milestones_filtered(p.id, Some(vec!["open".to_string()]), 10, 0, None, "desc")
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(open.len(), 2);
+
+        store.delete_milestone(later.id).await.unwrap();
+        assert!(store.get_milestone(later.id).await.unwrap().is_none());
+        store.delete_milestone(sooner.id).await.unwrap();
+        store.delete_milestone(undated.id).await.unwrap();
+
+        let ghost = jalon("ghost", None, 4);
+        let ghost = MilestoneNode {
+            project_id: Uuid::new_v4(),
+            ..ghost
+        };
+        assert!(store.create_milestone(&ghost).await.is_err());
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    /// `list_projects_filtered`: the search matches the description (case-insensitively),
+    /// the sort is by name by default, and the total counts the matches before the page.
+    pub async fn check_project_list_filtered(store: &dyn GraphStore) {
+        let tag = Uuid::new_v4();
+        let mut a = a_project("filtered-a");
+        a.name = format!("filtered {tag} b");
+        a.description = Some(format!("Marker {tag}"));
+        let mut b = a_project("filtered-b");
+        b.name = format!("filtered {tag} a");
+        b.description = Some(format!("other {tag}"));
+        store.create_project(&a).await.unwrap();
+        store.create_project(&b).await.unwrap();
+
+        // Both carry the tag in their description, so the search lists both, sorted by
+        // name ascending (`… a` is `b`, `… b` is `a`). The shared instance may hold many
+        // projects: the page is the whole set of the tag, so a small page is enough.
+        let (all, total) = store
+            .list_projects_filtered(Some(&tag.to_string()), 50, 0, Some("name"), "asc")
+            .await
+            .unwrap();
+        assert_eq!(total, 2, "the total counts the matches of the search");
+        assert_eq!(ids(&all, |p| p.id), vec![b.id, a.id], "name ascending");
+        let (upper, _) = store
+            .list_projects_filtered(Some(&format!("MARKER {tag}")), 50, 0, None, "asc")
+            .await
+            .unwrap();
+        assert_eq!(ids(&upper, |p| p.id), vec![a.id], "the match ignores case");
+
+        store.delete_project(a.id, &a.name).await.unwrap();
+        store.delete_project(b.id, &b.name).await.unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // The workspace domain (`WorkspaceStore`), on its own.
+    //
+    // Same discipline as the project checks: they call nothing but the
+    // workspace contract and `create_project` / `delete_project` for the
+    // projects they attach. Neo4j is the reference; where the obrain adapter
+    // is strict (a duplicate slug, a duplicate component name) no check here
+    // asserts the Neo4j laxity.
+    // ------------------------------------------------------------------
+
+    fn a_workspace(label: &str) -> WorkspaceNode {
+        let id = Uuid::new_v4();
+        WorkspaceNode {
+            id,
+            name: format!("conformance ws {label} {id}"),
+            slug: format!("conformance-ws-{label}-{}", id.simple()),
+            description: None,
+            created_at: at(0),
+            updated_at: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    /// Created workspaces read back identical by id and by slug; an absent one
+    /// reads as absent; `updated_at` stays unset until an update sets it.
+    pub async fn check_workspace_roundtrip(store: &dyn GraphStore) {
+        let mut ws = a_workspace("roundtrip");
+        ws.description = Some("une description — avec un accent : é".to_string());
+        ws.created_at = at(7) + Duration::nanoseconds(123_456_789);
+        ws.metadata = serde_json::json!({"lane": "backend", "n": 3});
+        store.create_workspace(&ws).await.unwrap();
+
+        let by_id = store.get_workspace(ws.id).await.unwrap().expect("by id");
+        assert_eq!(
+            serde_json::to_value(&by_id).unwrap(),
+            serde_json::to_value(&ws).unwrap()
+        );
+        let by_slug = store
+            .get_workspace_by_slug(&ws.slug)
+            .await
+            .unwrap()
+            .expect("by slug");
+        assert_eq!(by_slug.id, ws.id);
+        assert!(by_id.updated_at.is_none(), "updated_at unset by create");
+        assert!(store.get_workspace(Uuid::new_v4()).await.unwrap().is_none());
+        assert!(store
+            .get_workspace_by_slug(&format!("conformance-absent-{}", Uuid::new_v4()))
+            .await
+            .unwrap()
+            .is_none());
+        store.delete_workspace(ws.id).await.unwrap();
+        assert!(store.get_workspace(ws.id).await.unwrap().is_none());
+    }
+
+    /// `list_workspaces` is ordered by name then id, ascending, and total: three
+    /// workspaces sharing one name come out by id.
+    pub async fn check_workspace_list_order(store: &dyn GraphStore) {
+        let mut made = Vec::new();
+        for _ in 0..3 {
+            let mut ws = a_workspace("order");
+            ws.name = "conformance ws same-name".to_string();
+            store.create_workspace(&ws).await.unwrap();
+            made.push(ws);
+        }
+        let mut expected: Vec<Uuid> = made.iter().map(|w| w.id).collect();
+        expected.sort();
+        let listed: Vec<Uuid> = store
+            .list_workspaces()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|w| w.id)
+            .filter(|id| expected.contains(id))
+            .collect();
+        assert_eq!(listed, expected, "name then id, ascending");
+        for ws in &made {
+            store.delete_workspace(ws.id).await.unwrap();
+        }
+    }
+
+    /// A slug is validated on update, its uniqueness is checked against the
+    /// OTHER workspaces, and a changed slug is the only one that resolves.
+    pub async fn check_workspace_slug_rules(store: &dyn GraphStore) {
+        let a = a_workspace("slug-a");
+        let b = a_workspace("slug-b");
+        store.create_workspace(&a).await.unwrap();
+        store.create_workspace(&b).await.unwrap();
+
+        let invalid = store
+            .update_workspace(a.id, None, None, None, Some("Bad_Slug".into()))
+            .await;
+        assert!(invalid.is_err(), "an invalid slug is refused");
+
+        let taken = store
+            .update_workspace(a.id, None, None, None, Some(b.slug.clone()))
+            .await
+            .expect_err("a slug of another workspace is refused");
+        assert!(taken.to_string().contains("CONFLICT"), "{taken}");
+
+        let fresh = format!("conformance-ws-renamed-{}", a.id.simple());
+        store
+            .update_workspace(
+                a.id,
+                Some("renamed".into()),
+                None,
+                None,
+                Some(fresh.clone()),
+            )
+            .await
+            .unwrap();
+        let moved = store
+            .get_workspace_by_slug(&fresh)
+            .await
+            .unwrap()
+            .expect("new slug");
+        assert_eq!(moved.id, a.id);
+        assert_eq!(moved.name, "renamed");
+        assert!(moved.updated_at.is_some(), "an update sets updated_at");
+        assert!(store
+            .get_workspace_by_slug(&a.slug)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Keeping one's own slug is not a conflict.
+        store
+            .update_workspace(a.id, None, Some("again".into()), None, Some(fresh.clone()))
+            .await
+            .unwrap();
+        store.delete_workspace(a.id).await.unwrap();
+        store.delete_workspace(b.id).await.unwrap();
+    }
+
+    /// Membership is a set: adding twice counts once, removing takes it away,
+    /// an unknown project is a silent no-op, and deleting the workspace keeps
+    /// the projects.
+    pub async fn check_workspace_membership(store: &dyn GraphStore) {
+        let ws = a_workspace("members");
+        let p = a_project("member-p");
+        let q = a_project("member-q");
+        store.create_workspace(&ws).await.unwrap();
+        store.create_project(&p).await.unwrap();
+        store.create_project(&q).await.unwrap();
+
+        store.add_project_to_workspace(ws.id, p.id).await.unwrap();
+        store.add_project_to_workspace(ws.id, p.id).await.unwrap();
+        store
+            .add_project_to_workspace(ws.id, Uuid::new_v4())
+            .await
+            .unwrap();
+        let listed = store.list_workspace_projects(ws.id).await.unwrap();
+        assert_eq!(listed.iter().map(|x| x.id).collect::<Vec<_>>(), vec![p.id]);
+        assert_eq!(
+            store
+                .get_project_workspace(p.id)
+                .await
+                .unwrap()
+                .map(|w| w.id),
+            Some(ws.id)
+        );
+
+        store
+            .remove_project_from_workspace(ws.id, p.id)
+            .await
+            .unwrap();
+        assert!(store
+            .list_workspace_projects(ws.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store.get_project_workspace(p.id).await.unwrap().is_none());
+
+        store.add_project_to_workspace(ws.id, q.id).await.unwrap();
+        store.delete_workspace(ws.id).await.unwrap();
+        assert!(
+            store.get_project(q.id).await.unwrap().is_some(),
+            "the project survives"
+        );
+        assert!(store.get_project_workspace(q.id).await.unwrap().is_none());
+        store.delete_project(p.id, &p.name).await.unwrap();
+        store.delete_project(q.id, &q.name).await.unwrap();
+    }
+
+    /// Milestones: ordered by target date (absent first), then title, then id;
+    /// the status filter pages with a total; an update answers whether the id
+    /// exists; a milestone under an absent workspace is not created.
+    pub async fn check_workspace_milestones(store: &dyn GraphStore) {
+        let ws = a_workspace("milestones");
+        store.create_workspace(&ws).await.unwrap();
+        let mk = |title: &str, day: Option<i64>, status: MilestoneStatus| WorkspaceMilestoneNode {
+            id: Uuid::new_v4(),
+            workspace_id: ws.id,
+            title: title.to_string(),
+            description: Some(format!("about {title}")),
+            status,
+            target_date: day.map(at),
+            closed_at: None,
+            created_at: at(1),
+            tags: vec!["t".into()],
+        };
+        let late = mk("late", Some(900), MilestoneStatus::Open);
+        let soon = mk("soon", Some(100), MilestoneStatus::Completed);
+        let undated = mk("undated", None, MilestoneStatus::Open);
+        for m in [&late, &soon, &undated] {
+            store.create_workspace_milestone(m).await.unwrap();
+        }
+
+        let order: Vec<Uuid> = store
+            .list_workspace_milestones(ws.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(
+            order,
+            vec![undated.id, soon.id, late.id],
+            "target date, absent first"
+        );
+
+        let (page, total) = store
+            .list_workspace_milestones_filtered(ws.id, Some("open"), 1, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 2, "two open milestones");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, undated.id);
+        let (page, total) = store
+            .list_workspace_milestones_filtered(ws.id, Some("open"), 10, 1)
+            .await
+            .unwrap();
+        assert_eq!((total, page.len()), (2, 1));
+        assert_eq!(page[0].id, late.id);
+
+        assert!(store
+            .update_workspace_milestone(
+                soon.id,
+                Some("sooner".into()),
+                None,
+                Some(MilestoneStatus::InProgress),
+                None
+            )
+            .await
+            .unwrap());
+        let read = store
+            .get_workspace_milestone(soon.id)
+            .await
+            .unwrap()
+            .expect("updated");
+        assert_eq!(read.title, "sooner");
+        assert_eq!(read.status, MilestoneStatus::InProgress);
+        assert!(!store
+            .update_workspace_milestone(Uuid::new_v4(), Some("x".into()), None, None, None)
+            .await
+            .unwrap());
+
+        let orphan = WorkspaceMilestoneNode {
+            workspace_id: Uuid::new_v4(),
+            ..mk("orphan", None, MilestoneStatus::Open)
+        };
+        store.create_workspace_milestone(&orphan).await.unwrap();
+        assert!(store
+            .get_workspace_milestone(orphan.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        store.delete_workspace_milestone(late.id).await.unwrap();
+        assert!(store
+            .get_workspace_milestone(late.id)
+            .await
+            .unwrap()
+            .is_none());
+        store.delete_workspace(ws.id).await.unwrap();
+        assert!(
+            store
+                .get_workspace_milestone(undated.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "cascade"
+        );
+    }
+
+    /// Resources: listed by name then id per workspace; a project implementing
+    /// or using one is listed by it; deleting it removes the links.
+    pub async fn check_workspace_resources(store: &dyn GraphStore) {
+        let ws = a_workspace("resources");
+        let p = a_project("resource-user");
+        store.create_workspace(&ws).await.unwrap();
+        store.create_project(&p).await.unwrap();
+        let mk = |name: &str| ResourceNode {
+            id: Uuid::new_v4(),
+            workspace_id: Some(ws.id),
+            project_id: None,
+            name: name.to_string(),
+            resource_type: ResourceType::ApiContract,
+            file_path: format!("specs/{name}.yaml"),
+            url: None,
+            format: None,
+            version: Some("1".into()),
+            description: None,
+            created_at: at(2),
+            updated_at: None,
+            metadata: serde_json::json!({}),
+        };
+        let beta = mk("beta");
+        let alpha = mk("alpha");
+        store.create_resource(&beta).await.unwrap();
+        store.create_resource(&alpha).await.unwrap();
+
+        let names: Vec<String> = store
+            .list_workspace_resources(ws.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+
+        store
+            .link_project_implements_resource(p.id, alpha.id)
+            .await
+            .unwrap();
+        store
+            .link_project_uses_resource(p.id, alpha.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_resource_implementers(alpha.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.get_resource_consumers(alpha.id).await.unwrap().len(),
+            1
+        );
+        assert!(store
+            .get_resource_consumers(beta.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        assert!(store
+            .update_resource(alpha.id, None, None, None, Some("2".into()), None)
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .get_resource(alpha.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .version
+                .as_deref(),
+            Some("2")
+        );
+        assert!(!store
+            .update_resource(Uuid::new_v4(), None, None, None, None, None)
+            .await
+            .unwrap());
+
+        store.delete_resource(alpha.id).await.unwrap();
+        assert!(store.get_resource(alpha.id).await.unwrap().is_none());
+        assert!(store
+            .get_resource_implementers(alpha.id)
+            .await
+            .unwrap()
+            .is_empty());
+        store.delete_workspace(ws.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    /// Components: upsert is keyed by (workspace, name) and returns the same id
+    /// on the second call; dependencies and mappings show in the topology with
+    /// their protocol and flag; deleting a component detaches it.
+    pub async fn check_workspace_components(store: &dyn GraphStore) {
+        let ws = a_workspace("components");
+        let p = a_project("component-home");
+        store.create_workspace(&ws).await.unwrap();
+        store.create_project(&p).await.unwrap();
+        let api = store
+            .upsert_derived_component(DerivedComponentWrite {
+                workspace_id: ws.id,
+                name: "api".into(),
+                component_type: ComponentType::Service,
+                description: Some("the api".into()),
+                runtime: Some("rust".into()),
+                tags: vec!["core".into()],
+                config: serde_json::json!({"port": 8080}),
+            })
+            .await
+            .unwrap();
+        let again = store
+            .upsert_derived_component(DerivedComponentWrite {
+                workspace_id: ws.id,
+                name: "api".into(),
+                component_type: ComponentType::Service,
+                description: None,
+                runtime: None,
+                tags: vec![],
+                config: serde_json::json!({"port": 9090}),
+            })
+            .await
+            .unwrap();
+        assert_eq!(again, api, "upsert is keyed by (workspace, name)");
+        let kept = store.get_component(api).await.unwrap().expect("api");
+        assert_eq!(
+            kept.runtime.as_deref(),
+            Some("rust"),
+            "an empty runtime keeps the stored one"
+        );
+        assert_eq!(
+            kept.tags,
+            vec!["core".to_string()],
+            "tags kept when present"
+        );
+        assert_eq!(
+            kept.config,
+            serde_json::json!({"port": 9090}),
+            "config always replaced"
+        );
+
+        let db = store
+            .upsert_derived_component(DerivedComponentWrite {
+                workspace_id: ws.id,
+                name: "db".into(),
+                component_type: ComponentType::Database,
+                description: None,
+                runtime: None,
+                tags: vec![],
+                config: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        store
+            .add_component_dependency(api, db, Some("sql".into()), false)
+            .await
+            .unwrap();
+        store.map_component_to_project(api, p.id).await.unwrap();
+
+        let topo = store.get_workspace_topology(ws.id).await.unwrap();
+        let (_, project_name, deps) = topo
+            .iter()
+            .find(|(c, _, _)| c.id == api)
+            .expect("api in the topology");
+        assert_eq!(project_name.as_deref(), Some(p.name.as_str()));
+        assert_eq!(deps.len(), 1);
+        assert_eq!(
+            (deps[0].to_id, deps[0].protocol.as_deref(), deps[0].required),
+            (db, Some("sql"), false)
+        );
+        let (_, none, _) = topo
+            .iter()
+            .find(|(c, _, _)| c.id == db)
+            .expect("db in the topology");
+        assert!(none.is_none(), "an unmapped component has no project");
+
+        store.remove_component_dependency(api, db).await.unwrap();
+        let topo = store.get_workspace_topology(ws.id).await.unwrap();
+        assert!(
+            topo.iter().all(|(_, _, d)| d.is_empty()),
+            "dependency removed"
+        );
+
+        assert!(store
+            .update_component(
+                db,
+                ComponentUpdate {
+                    name: Some("database".into()),
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap());
+        assert_eq!(store.list_components(ws.id).await.unwrap().len(), 2);
+
+        store.delete_component(api).await.unwrap();
+        assert!(store.get_component(api).await.unwrap().is_none());
+        store.delete_workspace(ws.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // The note domain (NoteStore, the ported part). Each check works on fresh
+    // ids and deletes what it created. Neo4j is the reference.
+    // ------------------------------------------------------------------
+
+    /// A note with a project: every field the write path stores is set to a
+    /// value that is not the default, so a lossy round-trip shows.
+    pub async fn check_note_roundtrip(store: &dyn GraphStore) {
+        let p = a_project("note-rt");
+        store.create_project(&p).await.unwrap();
+        let mut n = a_note(Some(p.id), "une note « avec accents » et\nun saut de ligne");
+        n.importance = NoteImportance::High;
+        n.tags = vec!["alpha".into(), "beta".into()];
+        n.confidence = Some(0.25);
+        n.staleness_score = 0.5;
+        n.valid_from = Some(Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap());
+        n.scope = NoteScope::File("src/lib.rs".into());
+        store.create_note(&n).await.unwrap();
+        let got = store
+            .get_note(n.id)
+            .await
+            .unwrap()
+            .expect("the note reads back");
+        assert_eq!(got.id, n.id);
+        assert_eq!(got.project_id, Some(p.id));
+        assert_eq!(got.content, n.content);
+        assert_eq!(got.importance, NoteImportance::High);
+        assert_eq!(got.status, n.status);
+        assert_eq!(got.tags, n.tags);
+        assert_eq!(got.confidence, Some(0.25));
+        assert!((got.staleness_score - 0.5).abs() < 1e-12);
+        assert_eq!(got.valid_from, n.valid_from);
+        assert_eq!(got.scope, NoteScope::File("src/lib.rs".into()));
+        assert_eq!(got.created_at, n.created_at);
+        assert_eq!(got.created_by, n.created_by);
+        assert!(store.get_note(Uuid::new_v4()).await.unwrap().is_none());
+        store.delete_note(n.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.ok();
+    }
+
+    /// Update, rescope (both ways), delete, and the absent-note answers.
+    pub async fn check_note_update_rescope_delete(store: &dyn GraphStore) {
+        let p = a_project("note-urd");
+        store.create_project(&p).await.unwrap();
+        let n = a_note(None, "orpheline");
+        store.create_note(&n).await.unwrap();
+        // Global until rescoped (no global listing: a shared Neo4j may hold legacy notes).
+        assert_eq!(
+            store.get_note(n.id).await.unwrap().unwrap().project_id,
+            None
+        );
+        store.rescope_note(n.id, Some(p.id)).await.unwrap();
+        let (dans_p, total) = store
+            .list_notes(Some(p.id), None, &NoteFilters::default())
+            .await
+            .unwrap();
+        assert!(dans_p.iter().any(|x| x.id == n.id) && total >= 1);
+        store.rescope_note(n.id, None).await.unwrap();
+        assert_eq!(
+            store.get_note(n.id).await.unwrap().unwrap().project_id,
+            None
+        );
+        let u = store
+            .update_note(
+                n.id,
+                Some("nouveau contenu".into()),
+                Some(NoteImportance::Critical),
+                Some(NoteStatus::NeedsReview),
+                Some(vec!["t".into()]),
+                Some(0.75),
+            )
+            .await
+            .unwrap()
+            .expect("the note is updated");
+        assert_eq!(u.content, "nouveau contenu");
+        assert_eq!(u.importance, NoteImportance::Critical);
+        assert_eq!(u.status, NoteStatus::NeedsReview);
+        assert_eq!(u.tags, vec!["t".to_string()]);
+        assert!((u.staleness_score - 0.75).abs() < 1e-12);
+        assert!(store
+            .update_note(Uuid::new_v4(), Some("x".into()), None, None, None, None)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.delete_note(n.id).await.unwrap());
+        assert!(!store.delete_note(n.id).await.unwrap());
+        assert!(store.get_note(n.id).await.unwrap().is_none());
+        store.delete_project(p.id, &p.name).await.ok();
+    }
+
+    /// Sort by a field, a total order (id breaks ties), and paging over a tie.
+    pub async fn check_note_list_order_and_paging(store: &dyn GraphStore) {
+        let p = a_project("note-list");
+        store.create_project(&p).await.unwrap();
+        let mut ids = Vec::new();
+        for (k, s) in [0.3, 0.1, 0.3, 0.9, 0.5].iter().enumerate() {
+            let mut n = a_note(Some(p.id), &format!("note {k}"));
+            n.staleness_score = *s;
+            store.create_note(&n).await.unwrap();
+            ids.push(n.id);
+        }
+        let f = NoteFilters {
+            sort_by: Some("staleness_score".into()),
+            sort_order: Some("asc".into()),
+            ..Default::default()
+        };
+        let (liste, total) = store.list_notes(Some(p.id), None, &f).await.unwrap();
+        assert_eq!(total, 5);
+        let scores: Vec<f64> = liste.iter().map(|n| n.staleness_score).collect();
+        assert_eq!(scores, vec![0.1, 0.3, 0.3, 0.5, 0.9]);
+        // Ties on 0.3 are ordered by id: the page boundary does not move.
+        let tie: Vec<Uuid> = liste
+            .iter()
+            .filter(|n| n.staleness_score == 0.3)
+            .map(|n| n.id)
+            .collect();
+        let mut tie_sorted = tie.clone();
+        tie_sorted.sort();
+        assert_eq!(tie, tie_sorted);
+        let page = |offset: i64| NoteFilters {
+            sort_by: Some("staleness_score".into()),
+            sort_order: Some("asc".into()),
+            limit: Some(2),
+            offset: Some(offset),
+            ..Default::default()
+        };
+        let (p1, _) = store.list_notes(Some(p.id), None, &page(0)).await.unwrap();
+        let (p2, _) = store.list_notes(Some(p.id), None, &page(2)).await.unwrap();
+        let joined: Vec<Uuid> = p1.iter().chain(p2.iter()).map(|n| n.id).collect();
+        assert_eq!(
+            joined,
+            liste.iter().take(4).map(|n| n.id).collect::<Vec<_>>()
+        );
+        for id in ids {
+            store.delete_note(id).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.ok();
+    }
+
+    /// Links to a project and to a note: created, read back with their hashes,
+    /// updated in place (MERGE), removed; a link to an absent target is a no-op.
+    pub async fn check_note_entity_links(store: &dyn GraphStore) {
+        let p = a_project("note-links");
+        store.create_project(&p).await.unwrap();
+        let n = a_note(Some(p.id), "lie au projet");
+        let m = a_note(Some(p.id), "lie à une note");
+        store.create_note(&n).await.unwrap();
+        store.create_note(&m).await.unwrap();
+        store
+            .link_note_to_entity(
+                n.id,
+                &EntityType::Project,
+                &p.id.to_string(),
+                Some("sig"),
+                None,
+            )
+            .await
+            .unwrap();
+        let for_p = store
+            .get_notes_for_entity(&EntityType::Project, &p.id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(ids(&for_p, |x| x.id), vec![n.id]);
+        // Updated in place: one link, new hash.
+        store
+            .link_note_to_entity(
+                n.id,
+                &EntityType::Project,
+                &p.id.to_string(),
+                Some("sig2"),
+                Some("body"),
+            )
+            .await
+            .unwrap();
+        let anchors = store.get_note_anchors(n.id).await.unwrap();
+        assert_eq!(anchors.len(), 1, "MERGE: one edge per pair");
+        assert_eq!(anchors[0].signature_hash.as_deref(), Some("sig2"));
+        assert_eq!(anchors[0].body_hash.as_deref(), Some("body"));
+        assert!(anchors[0].is_valid);
+        store
+            .link_note_to_entity(n.id, &EntityType::Note, &m.id.to_string(), None, None)
+            .await
+            .unwrap();
+        let for_m = store
+            .get_notes_for_entity(&EntityType::Note, &m.id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(ids(&for_m, |x| x.id), vec![n.id]);
+        // An absent target: no edge, no error (Neo4j's MATCH finds nothing).
+        store
+            .link_note_to_entity(
+                n.id,
+                &EntityType::Project,
+                &Uuid::new_v4().to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.get_note_anchors(n.id).await.unwrap().len(), 2);
+        store
+            .unlink_note_from_entity(n.id, &EntityType::Note, &m.id.to_string())
+            .await
+            .unwrap();
+        assert!(store
+            .get_notes_for_entity(&EntityType::Note, &m.id.to_string())
+            .await
+            .unwrap()
+            .is_empty());
+        store.delete_note(n.id).await.unwrap();
+        store.delete_note(m.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.ok();
+    }
+
+    /// Supersession archives the old note, names its successor, and a
+    /// confirmation does not resurrect it; confirming the successor makes it active.
+    pub async fn check_note_supersede_and_confirm(store: &dyn GraphStore) {
+        let p = a_project("note-supersede");
+        store.create_project(&p).await.unwrap();
+        let old = a_note(Some(p.id), "ancienne");
+        let new = a_note(Some(p.id), "nouvelle");
+        store.create_note(&old).await.unwrap();
+        store.create_note(&new).await.unwrap();
+        store.supersede_note(old.id, new.id).await.unwrap();
+        let o = store.get_note(old.id).await.unwrap().unwrap();
+        let w = store.get_note(new.id).await.unwrap().unwrap();
+        assert_eq!(o.status, NoteStatus::Archived);
+        assert_eq!(o.superseded_by, Some(new.id));
+        assert_eq!(w.supersedes, Some(old.id));
+        let c = store.confirm_note(old.id, "alice").await.unwrap().unwrap();
+        assert_eq!(
+            c.status,
+            NoteStatus::Archived,
+            "a superseded note is not resurrected"
+        );
+        assert_eq!(c.human_confirmed_by.as_deref(), Some("alice"));
+        assert_eq!(c.staleness_score, 0.0);
+        let cw = store
+            .confirm_note(new.id, "system/heuristic")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cw.status, NoteStatus::Active);
+        assert_eq!(cw.human_confirmed_by, None, "a heuristic never signs");
+        assert_eq!(cw.staleness_score, 0.0);
+        assert!(store
+            .confirm_note(Uuid::new_v4(), "alice")
+            .await
+            .unwrap()
+            .is_none());
+        store.delete_note(old.id).await.unwrap();
+        store.delete_note(new.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.ok();
+    }
+
+    /// The review queue: only `stale` and `needs_review` notes of the project.
+    pub async fn check_note_needing_review(store: &dyn GraphStore) {
+        let p = a_project("note-review");
+        store.create_project(&p).await.unwrap();
+        let mut a = a_note(Some(p.id), "stale");
+        a.status = NoteStatus::Stale;
+        let mut b = a_note(Some(p.id), "active");
+        b.status = NoteStatus::Active;
+        let mut c = a_note(Some(p.id), "review");
+        c.status = NoteStatus::NeedsReview;
+        for n in [&a, &b, &c] {
+            store.create_note(n).await.unwrap();
+        }
+        let liste = store
+            .get_notes_needing_review(Some(p.id), None)
+            .await
+            .unwrap();
+        let mut got = ids(&liste, |x| x.id);
+        got.sort();
+        let mut want = vec![a.id, c.id];
+        want.sort();
+        assert_eq!(got, want);
+        for n in [a, b, c] {
+            store.delete_note(n.id).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.ok();
+    }
 }
 
-// ======================================================================
-// Factories: one per backend.
-// ======================================================================
-
-/// Opens a store for one check. `None` means the backend is unavailable here:
+// ===============================================================// Factories: one per backend.
+// ========================================================/// Opens a store for one check. `None` means the backend is unavailable here:
 /// the check is skipped (the factory decides whether that is allowed).
 #[async_trait]
 pub trait StoreFactory: Send + Sync {
@@ -2628,11 +4138,8 @@ impl StoreFactory for ObrainFactory {
     }
 }
 
-// ======================================================================
-// Expected divergences (P0.2 fixes them; the mock converges towards Neo4j).
-// ======================================================================
-
-/// A known gap between a backend and the contract the checks state.
+// ===============================================================// Expected divergences (P0.2 fixes them; the mock converges towards Neo4j).
+// ========================================================/// A known gap between a backend and the contract the checks state.
 pub struct Divergence {
     pub backend: &'static str,
     pub check: &'static str,
@@ -2668,6 +4175,32 @@ const fn neo4j(check: &'static str, why: &'static str, deterministic: bool) -> D
 /// itself, found by this suite, where the mock is right and Neo4j is not; they
 /// are not for P0.2 and are not hidden either.
 const EXPECTED_DIVERGENCES: &[Divergence] = &[
+    Divergence {
+        backend: "mock",
+        check: "check_workspace_list_order",
+        why: "list_workspaces returns the mock's map order (it changes from one run to the next); Neo4j: name then id",
+        deterministic: false,
+    },
+    mock(
+        "check_workspace_slug_rules",
+        "the mock stores a slug without validating its shape and without the CONFLICT check on update (Neo4j: refuses both)",
+    ),
+    mock(
+        "check_workspace_membership",
+        "add_project_to_workspace has no MERGE: adding the same project twice lists it twice (Neo4j: once)",
+    ),
+    mock(
+        "check_workspace_milestones",
+        "list_workspace_milestones does not order by target_date, title, id (Neo4j: that order, absent dates first)",
+    ),
+    mock(
+        "check_workspace_resources",
+        "list_workspace_resources returns the mock's map order, not name then id (Neo4j: name then id)",
+    ),
+    mock(
+        "check_workspace_components",
+        "get_workspace_topology names the mapped project by its slug, not its name (Neo4j: p.name)",
+    ),
     mock(
         "check_uniqueness",
         "upsert_file does not link the file to its project (list_project_files/count_project_files see nothing); \
@@ -2875,7 +4408,314 @@ macro_rules! project_checks {
     };
 }
 
+macro_rules! workspace_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [
+                check_workspace_roundtrip,
+                check_workspace_list_order,
+                check_workspace_slug_rules,
+                check_workspace_membership,
+                check_workspace_milestones,
+                check_workspace_resources,
+                check_workspace_components,
+            ]
+        );
+    };
+}
+
+workspace_checks!(mock_workspace, MockFactory);
+workspace_checks!(neo4j_workspace, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+workspace_checks!(obrain_workspace, ObrainFactory);
+
 project_checks!(mock_project, MockFactory);
 project_checks!(neo4j_project, Neo4jFactory);
 #[cfg(feature = "obrain-backend")]
 project_checks!(obrain_project, ObrainFactory);
+
+/// The federation domain: the checks that call only `FederationStore`, on the
+/// same fixtures for every backend ported to it.
+macro_rules! federation_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [
+                check_mcp_roundtrip,
+                check_mcp_list_order,
+                check_mcp_status_and_deletion,
+            ]
+        );
+    };
+}
+
+federation_checks!(mock_federation, MockFactory);
+federation_checks!(neo4j_federation, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+federation_checks!(obrain_federation, ObrainFactory);
+
+/// The release domain: releases, environments, deployments, milestones and the
+/// project list of the release store. Same checks, same fixtures, on each backend
+/// that has ported them (see `release_checks!`).
+macro_rules! release_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [
+                check_release_roundtrip,
+                check_release_list_order,
+                check_environment_lifecycle,
+                check_deployment_matrix,
+                check_milestone_lifecycle,
+                check_project_list_filtered,
+            ]
+        );
+    };
+}
+
+release_checks!(mock_release, MockFactory);
+release_checks!(neo4j_release, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+release_checks!(obrain_release, ObrainFactory);
+
+/// What only the obrain adapter does: the refusals of the workspace methods it
+/// does not port are named (a `NonPorte` downcast), and what it writes is read
+/// back, identical, after a close and an open of the same base (the index is
+/// rebuilt from the base at open).
+#[cfg(feature = "obrain-backend")]
+mod obrain_workspace_specifique {
+    use chrono::Utc;
+    use project_orchestrator::neo4j::models::{
+        ComponentType, DerivedComponentWrite, MilestoneStatus, ProjectNode, ProjectProfile,
+        ResourceNode, ResourceType, WorkspaceMilestoneNode, WorkspaceNode,
+    };
+    use project_orchestrator::neo4j::traits::{ProjectStore, WorkspaceStore};
+    use project_orchestrator::obrain::{Creation, NonPorte, ObrainGraphStore};
+    use uuid::Uuid;
+
+    fn erreur<T>(r: anyhow::Result<T>) -> anyhow::Error {
+        match r {
+            Err(e) => e,
+            Ok(_) => panic!("this method must refuse on obrain"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_the_unported_methods_by_name() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let id = Uuid::new_v4();
+        let cas: Vec<(anyhow::Error, &str)> = vec![
+            (
+                erreur(
+                    store
+                        .list_all_workspace_milestones_filtered(None, None, 10, 0)
+                        .await,
+                ),
+                "WorkspaceStore::list_all_workspace_milestones_filtered",
+            ),
+            (
+                erreur(store.count_all_workspace_milestones(None, None).await),
+                "WorkspaceStore::count_all_workspace_milestones",
+            ),
+            (
+                erreur(store.add_task_to_workspace_milestone(id, id).await),
+                "WorkspaceStore::add_task_to_workspace_milestone",
+            ),
+            (
+                erreur(store.remove_task_from_workspace_milestone(id, id).await),
+                "WorkspaceStore::remove_task_from_workspace_milestone",
+            ),
+            (
+                erreur(store.link_plan_to_workspace_milestone(id, id).await),
+                "WorkspaceStore::link_plan_to_workspace_milestone",
+            ),
+            (
+                erreur(store.unlink_plan_from_workspace_milestone(id, id).await),
+                "WorkspaceStore::unlink_plan_from_workspace_milestone",
+            ),
+            (
+                erreur(store.get_workspace_milestone_progress(id).await),
+                "WorkspaceStore::get_workspace_milestone_progress",
+            ),
+            (
+                erreur(store.get_workspace_milestone_tasks(id).await),
+                "WorkspaceStore::get_workspace_milestone_tasks",
+            ),
+            (
+                erreur(store.get_workspace_milestone_steps(id).await),
+                "WorkspaceStore::get_workspace_milestone_steps",
+            ),
+            (
+                erreur(store.compute_coupling_matrix(id).await),
+                "WorkspaceStore::compute_coupling_matrix",
+            ),
+        ];
+        for (err, nom) in cas {
+            assert_eq!(
+                err.downcast_ref::<NonPorte>(),
+                Some(&NonPorte(nom)),
+                "{nom}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_graph_survives_close_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let chemin = dir.path().join("base");
+        let now = Utc::now();
+        let p = ProjectNode {
+            id: Uuid::new_v4(),
+            name: "reopen project".into(),
+            slug: format!("reopen-{}", Uuid::new_v4().simple()),
+            root_path: String::new(),
+            description: None,
+            created_at: now,
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+            watch_enabled: true,
+            profile: ProjectProfile::default(),
+        };
+        let ws = WorkspaceNode {
+            id: Uuid::new_v4(),
+            name: "reopen workspace".into(),
+            slug: format!("reopen-ws-{}", Uuid::new_v4().simple()),
+            description: Some("kept".into()),
+            created_at: now,
+            updated_at: None,
+            metadata: serde_json::json!({"k": 1}),
+        };
+        let jalon = WorkspaceMilestoneNode {
+            id: Uuid::new_v4(),
+            workspace_id: ws.id,
+            title: "jalon".into(),
+            description: None,
+            status: MilestoneStatus::Open,
+            target_date: Some(now),
+            closed_at: None,
+            created_at: now,
+            tags: vec!["a".into()],
+        };
+        let res = ResourceNode {
+            id: Uuid::new_v4(),
+            workspace_id: Some(ws.id),
+            project_id: None,
+            name: "contrat".into(),
+            resource_type: ResourceType::ApiContract,
+            file_path: "api.yaml".into(),
+            url: None,
+            format: None,
+            version: None,
+            description: None,
+            created_at: now,
+            updated_at: None,
+            metadata: serde_json::json!({}),
+        };
+
+        let store = ObrainGraphStore::open(&chemin, Creation::Permise).unwrap();
+        store.create_project(&p).await.unwrap();
+        store.create_workspace(&ws).await.unwrap();
+        store.add_project_to_workspace(ws.id, p.id).await.unwrap();
+        store.create_workspace_milestone(&jalon).await.unwrap();
+        store.create_resource(&res).await.unwrap();
+        store
+            .link_project_implements_resource(p.id, res.id)
+            .await
+            .unwrap();
+        let mut comps = Vec::new();
+        for name in ["api", "db"] {
+            let id = store
+                .upsert_derived_component(DerivedComponentWrite {
+                    workspace_id: ws.id,
+                    name: name.into(),
+                    component_type: ComponentType::Service,
+                    description: None,
+                    runtime: None,
+                    tags: vec![],
+                    config: serde_json::json!({}),
+                })
+                .await
+                .unwrap();
+            comps.push((name, id));
+        }
+        let c_api = comps[0].1;
+        let c_db = comps[1].1;
+        store
+            .add_component_dependency(c_api, c_db, Some("sql".into()), true)
+            .await
+            .unwrap();
+        store.map_component_to_project(c_api, p.id).await.unwrap();
+        store.close().await.unwrap();
+
+        let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
+        assert_eq!(store.rapport_d_ouverture().brouillons_supprimes, 0);
+        assert_eq!(
+            serde_json::to_value(store.get_workspace(ws.id).await.unwrap().unwrap()).unwrap(),
+            serde_json::to_value(&ws).unwrap(),
+            "the workspace reads back identical"
+        );
+        assert_eq!(
+            store
+                .list_workspace_projects(ws.id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|x| x.id)
+                .collect::<Vec<_>>(),
+            vec![p.id],
+            "membership comes back from the edges"
+        );
+        assert_eq!(
+            store.list_workspace_milestones(ws.id).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store.list_workspace_resources(ws.id).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store.get_resource_implementers(res.id).await.unwrap().len(),
+            1
+        );
+        let topo = store.get_workspace_topology(ws.id).await.unwrap();
+        let (_, nom, deps) = topo.iter().find(|(c, _, _)| c.id == c_api).unwrap();
+        assert_eq!(nom.as_deref(), Some("reopen project"));
+        assert_eq!(deps.len(), 1);
+        assert_eq!(
+            (deps[0].to_id, deps[0].protocol.as_deref(), deps[0].required),
+            (c_db, Some("sql"), true)
+        );
+        store.close().await.unwrap();
+    }
+}
+
+/// The note domain: the checks that call nothing but `NoteStore` (and the
+/// project they attach to). Run on the obrain backend for the ported methods.
+macro_rules! note_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [
+                check_note_roundtrip,
+                check_note_update_rescope_delete,
+                check_note_list_order_and_paging,
+                check_note_entity_links,
+                check_note_supersede_and_confirm,
+                check_note_needing_review,
+            ]
+        );
+    };
+}
+
+note_checks!(neo4j_note, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+note_checks!(obrain_note, ObrainFactory);

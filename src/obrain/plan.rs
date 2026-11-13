@@ -61,6 +61,58 @@ const LABEL: &str = "Plan";
 /// The draft marker: present from the first record of a creation to the last.
 const BROUILLON: &str = "_brouillon";
 
+/// The methods of `PlanStore` refused on every call, as `PlanStore::<method>`:
+/// tasks, steps, constraints, the day plan, dependencies, the graphs and
+/// waves, the enrichment, and the HAS_PLAN links that a plan can have with
+/// several projects. They are refused by name, never answered empty.
+pub const REFUSEES: &[&str] = &[
+    "PlanStore::link_plan_to_project",
+    "PlanStore::list_plan_project_slugs",
+    "PlanStore::unlink_plan_from_project",
+    "PlanStore::create_task",
+    "PlanStore::get_plan_tasks",
+    "PlanStore::get_task_with_full_details",
+    "PlanStore::analyze_task_impact",
+    "PlanStore::find_blocked_tasks",
+    "PlanStore::update_task_status",
+    "PlanStore::interrupt_task",
+    "PlanStore::assign_task",
+    "PlanStore::add_task_dependency",
+    "PlanStore::remove_task_dependency",
+    "PlanStore::get_task_blockers",
+    "PlanStore::get_tasks_blocked_by",
+    "PlanStore::get_task_dependencies",
+    "PlanStore::get_plan_dependency_graph",
+    "PlanStore::get_task_enrichment_counts",
+    "PlanStore::get_task_enrichment_data",
+    "PlanStore::get_plan_critical_path",
+    "PlanStore::compute_waves",
+    "PlanStore::get_next_available_task",
+    "PlanStore::get_task",
+    "PlanStore::update_task",
+    "PlanStore::update_task_enrichment",
+    "PlanStore::delete_task",
+    "PlanStore::get_project_for_task",
+    "PlanStore::get_plan_id_for_task",
+    "PlanStore::get_day_plan",
+    "PlanStore::set_day_plan",
+    "PlanStore::add_to_day",
+    "PlanStore::remove_from_day",
+    "PlanStore::create_step",
+    "PlanStore::get_task_steps",
+    "PlanStore::update_step",
+    "PlanStore::update_step_status",
+    "PlanStore::get_task_step_progress",
+    "PlanStore::get_step",
+    "PlanStore::delete_step",
+    "PlanStore::complete_pending_steps_for_task",
+    "PlanStore::create_constraint",
+    "PlanStore::get_plan_constraints",
+    "PlanStore::get_constraint",
+    "PlanStore::update_constraint",
+    "PlanStore::delete_constraint",
+];
+
 /// Does this value go to a blob column (a string above the threshold)?
 fn va_en_colonne_blob(v: &Value) -> bool {
     v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)

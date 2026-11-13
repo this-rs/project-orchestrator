@@ -38,6 +38,9 @@ pub enum Interruption {
     ApresLeChemin(usize),
     /// `delete_project`: the node deleted, before the fsync.
     ApresLaSuppression,
+    /// After the k-th engine write of a multi-write (notes: supersede, rescope, delete,
+    /// update, confirm, link). Each such write is a separate record, with no marker.
+    ApresEtape(usize),
 }
 
 /// What makes a write durable, once per write. Only `Wal` exists in production
