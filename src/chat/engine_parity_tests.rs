@@ -1085,32 +1085,96 @@ const ENGINE_RESULT_WAIT: Duration = Duration::from_secs(90);
 /// Result` — naming no cause at all. It now fails at once, on the message the
 /// engine emitted, and a real timeout appends the tail of the fake's own record
 /// (what it received), which is where the answer usually is.
+///
+/// The `Result` is ALSO looked for in the store. `rx` is subscribed AFTER the
+/// call that starts the turn (`create_session`, `switch_session_provider`)
+/// returns — the switch makes a new channel, there is nothing to subscribe to
+/// before — and a broadcast only hands a receiver what is sent after its
+/// `subscribe`. The scripted fake answers in milliseconds, so on a loaded runner
+/// the whole turn, `Result` included, could be over before the test subscribed:
+/// the receiver then heard only the trailing events and waited 180 s for a
+/// `Result` already gone (CI 13/11/2026, job 131952359580: `run_codex_column/codex:
+/// no event for 180s, after 2 event(s)` while the fake's record shows `turn/start`
+/// received, so the fake had played the whole turn). The agent engine stores
+/// every `Result` it broadcasts, so a `Result` past `results_before` in the store
+/// is this turn's answer, whenever it was sent.
+///
+/// Returns how many `Result`s the store holds once this one is in it, the
+/// `results_before` of the next turn of the same session.
 async fn await_turn_result(
     rx: &mut tokio::sync::broadcast::Receiver<ChatEvent>,
     phase: &str,
     deadline: Duration,
     record: &Path,
-) {
+    graph: &MockGraphStore,
+    sid: &str,
+    results_before: usize,
+) -> usize {
     let mut seen = 0usize;
+    let mut heard_result = false;
+    let mut last_event = tokio::time::Instant::now();
     loop {
-        match tokio::time::timeout(deadline, rx.recv()).await {
-            Ok(Ok(ChatEvent::Result { .. })) => return,
+        let stored = stored_results(graph, sid).await;
+        if stored > results_before {
+            return stored;
+        }
+        if heard_result {
+            // Heard live: its write is awaited right behind the broadcast
+            // (`emit_one`), so it lands within the poll — unless it was lost.
+            if last_event.elapsed() >= STORED_RESULT_WAIT {
+                panic!(
+                    "{phase}: a Result was broadcast but never stored ({stored} stored, {results_before} before)"
+                );
+            }
+            tokio::time::sleep(STORED_RESULT_POLL).await;
+            continue;
+        }
+        match tokio::time::timeout(STORED_RESULT_POLL, rx.recv()).await {
+            Ok(Ok(ChatEvent::Result { .. })) => {
+                heard_result = true;
+                last_event = tokio::time::Instant::now();
+            }
             Ok(Ok(ChatEvent::Error { message, code, .. })) => panic!(
                 "{phase}: the engine reported an error instead of a Result: {message} (code: {code:?})\n{}",
                 record_tail(record)
             ),
-            Ok(Ok(_)) => seen += 1,
+            Ok(Ok(_)) => {
+                seen += 1;
+                last_event = tokio::time::Instant::now();
+            }
             Ok(Err(err)) => panic!(
                 "{phase}: the event channel closed after {seen} event(s): {err}\n{}",
                 record_tail(record)
             ),
-            Err(_) => panic!(
-                "{phase}: no event for {}s, after {seen} event(s)\n{}",
+            Err(_) if last_event.elapsed() >= deadline => panic!(
+                "{phase}: no event for {}s, after {seen} event(s), and no Result stored ({stored} stored, {results_before} before)\n{}",
                 deadline.as_secs(),
                 record_tail(record)
             ),
+            Err(_) => {}
         }
     }
+}
+
+/// How often [`await_turn_result`] looks at the store between two live events.
+const STORED_RESULT_POLL: Duration = Duration::from_millis(200);
+
+/// How long a `Result` heard live may take to show in the store.
+const STORED_RESULT_WAIT: Duration = Duration::from_secs(10);
+
+/// The `Result`s the store holds for `sid`.
+async fn stored_results(graph: &MockGraphStore, sid: &str) -> usize {
+    let Ok(uuid) = Uuid::parse_str(sid) else {
+        return 0;
+    };
+    graph
+        .get_chat_events(uuid, 0, 5_000)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| serde_json::from_str::<ChatEvent>(&r.data).ok())
+        .filter(|e| matches!(e, ChatEvent::Result { .. }))
+        .count()
 }
 
 /// The last lines the fake wrote: the requests it received, so a stuck turn
@@ -5537,11 +5601,14 @@ async fn run_acp_column() -> Measures {
         .unwrap_or_else(|e| panic!("run_acp_column: native create_session failed: {e:#}"));
     let sid = created.session_id;
     let mut rx = manager.subscribe(&sid).await.unwrap();
-    await_turn_result(
+    let results = await_turn_result(
         &mut rx,
         "run_acp_column/native",
         ENGINE_RESULT_WAIT,
         &record_path,
+        &graph,
+        &sid,
+        0,
     )
     .await;
 
@@ -5560,6 +5627,9 @@ async fn run_acp_column() -> Measures {
         "run_acp_column/acp",
         ENGINE_SWITCH_RESULT_WAIT,
         &record_path,
+        &graph,
+        &sid,
+        results,
     )
     .await;
 
@@ -5733,11 +5803,14 @@ async fn run_codex_column() -> Measures {
         .unwrap_or_else(|e| panic!("run_codex_column: native create_session failed: {e:#}"));
     let sid = created.session_id;
     let mut rx = manager.subscribe(&sid).await.unwrap();
-    await_turn_result(
+    let results = await_turn_result(
         &mut rx,
         "run_codex_column/native",
         ENGINE_RESULT_WAIT,
         &record_path,
+        &graph,
+        &sid,
+        0,
     )
     .await;
 
@@ -5756,6 +5829,9 @@ async fn run_codex_column() -> Measures {
         "run_codex_column/codex",
         ENGINE_SWITCH_RESULT_WAIT,
         &record_path,
+        &graph,
+        &sid,
+        results,
     )
     .await;
 
