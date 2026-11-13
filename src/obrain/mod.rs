@@ -70,6 +70,7 @@
 //! on the blocking pool.
 
 mod auth;
+mod chat;
 mod federation;
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
@@ -132,6 +133,12 @@ pub fn refusees_release() -> &'static [&'static str] {
     release::REFUSEES
 }
 
+/// The methods of `ChatStore` refused on every call, as `ChatStore::<method>`
+/// (`chat.rs`).
+pub fn refusees_chat() -> &'static [&'static str] {
+    chat::REFUSEES
+}
+
 /// The methods of `PlanStore` refused on every call, as `PlanStore::<method>`
 /// (`plan.rs`): tasks, steps, constraints, the day plan, dependencies, the
 /// graphs and waves, the enrichment, and the HAS_PLAN links to several
@@ -176,6 +183,7 @@ pub fn methodes_qui_servent() -> Vec<&'static str> {
             !REFUS_ECRITS_A_LA_MAIN.contains(m)
                 && !release::REFUSEES.contains(m)
                 && !note::REFUSEES.contains(m)
+                && !chat::REFUSEES.contains(m)
                 && !plan::REFUSEES.contains(m)
                 && !m.starts_with("GraphStore::")
         })
@@ -282,6 +290,7 @@ struct Etat {
     releases: release::IndexReleases,
     espaces: workspace::IndexEspaces,
     notes: note::IndexNotes,
+    chat: chat::IndexChat,
     federation: federation::IndexFederation,
 }
 
@@ -553,6 +562,7 @@ impl ObrainGraphStore {
             .with_context(contexte)?;
         let notes =
             note::IndexNotes::reconstruire(&db, &projets, &mut rapport).with_context(contexte)?;
+        let chat = chat::IndexChat::reconstruire(&db, &mut rapport).with_context(contexte)?;
         let (federation, brouillons, quarantaine) = federation::IndexFederation::reconstruire(&db)
             .with_context(|| {
                 format!(
@@ -569,6 +579,7 @@ impl ObrainGraphStore {
             releases,
             espaces,
             notes,
+            chat,
             federation,
         };
         let store = Self {

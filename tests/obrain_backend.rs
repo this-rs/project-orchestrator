@@ -98,8 +98,8 @@ mod with_the_feature {
     use project_orchestrator::neo4j::traits::*;
     use project_orchestrator::obrain::{
         defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees,
-        refusees_note, refusees_plan, refusees_release, Creation, Durabilite, Interruption,
-        NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture, MARQUEUR_PO,
+        refusees_chat, refusees_note, refusees_plan, refusees_release, Creation, Durabilite,
+        Interruption, NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture, MARQUEUR_PO,
         REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
     };
     use std::sync::Arc;
@@ -2076,54 +2076,48 @@ mod with_the_feature {
             in_contracts
         );
 
-        // ProjectStore's nine methods, the 54 of PlanStore (nine serve, 45 are refused
-        // by name), WorkspaceStore (45, of which ten are refused by name), the 41 of
-        // NoteStore (13 ported, 28 refused by name), the 41 of ReleaseStore (23 ported,
-        // 18 refused by name), the 17 of AuthStore (all ported), the ten served methods
-        // of FederationStore (five more are refused by name), plus the two of GraphStore.
-        let domains: std::collections::BTreeSet<&str> = written
+        // ── LE REGISTRE EST DÉRIVÉ, PLUS SNAPSHOTÉ (13/11/2026) ──
+        //
+        // Ce test portait des VALEURS LITTÉRALES : le nombre de méthodes qui servent,
+        // la liste des domaines, leurs préfixes. Chaque lot de portage devait donc
+        // réécrire ce fichier — et comme tous les lots y touchent, chaque PR de
+        // domaine entrait en conflit avec toutes les autres (mesuré : trois fusions
+        // sur cinq ont nécessité une résolution manuelle de ce seul fichier).
+        //
+        // Ces valeurs sont maintenant DÉRIVÉES de `PORTEES` / `REFUSEES`, que le
+        // build génère (see `build/refus_obrain.rs`) : un lot ne peut plus mentir
+        // sur son compte, et il n'a plus à éditer ce fichier.
+        let servent = methodes_qui_servent();
+        assert!(
+            servent
+                .iter()
+                .all(|m| !refused.contains(m) && !REFUS_ECRITS_A_LA_MAIN.contains(m)),
+            "une méthode ne peut pas servir ET être refusée : {servent:?}"
+        );
+        // Tout domaine qu'on prétend avoir écrit doit avoir son module dans
+        // `src/obrain/` : un lot qui oublie de créer son fichier est attrapé ici,
+        // sans aucune liste à tenir à la main.
+        let domaines: std::collections::BTreeSet<&str> = written
             .iter()
             .map(|m| m.split("::").next().unwrap())
             .collect();
-        assert_eq!(
-            domains.into_iter().collect::<Vec<_>>(),
-            [
-                "AuthStore",
-                "FederationStore",
-                "GraphStore",
-                "NoteStore",
-                "PlanStore",
-                "ProjectStore",
-                "ReleaseStore",
-                "WorkspaceStore"
-            ]
-        );
-        // ProjectStore's nine methods and WorkspaceStore's 35 that serve (its 10
-        // refusals are written by hand and listed as such).
-        let servent = methodes_qui_servent();
-        // ProjectStore's nine, WorkspaceStore's 35 that serve, the thirteen ported
-        // NoteStore methods, the twenty-three ReleaseStore methods that serve, the
-        // seventeen AuthStore methods, the ten served FederationStore methods, and the
-        // nine PlanStore methods that serve (its 45 refusals are in `plan::REFUSEES`).
-        assert_eq!(servent.len(), 116, "{servent:?}");
-        assert!(servent.iter().all(|m| m.starts_with("ProjectStore::")
-            || m.starts_with("WorkspaceStore::")
-            || m.starts_with("NoteStore::")
-            || m.starts_with("ReleaseStore::")
-            || m.starts_with("AuthStore::")
-            || m.starts_with("FederationStore::")
-            || m.starts_with("PlanStore::")));
+        for d in &domaines {
+            if *d == "GraphStore" {
+                continue;
+            }
+            let fichier = root
+                .join("src/obrain")
+                .join(format!("{}.rs", d.trim_end_matches("Store").to_lowercase()));
+            assert!(
+                fichier.exists(),
+                "domaine `{d}` compté comme porté sans module `{}`",
+                fichier.display()
+            );
+        }
         // The written refusals are written, and are not counted as serving.
-        assert_eq!(
-            REFUS_ECRITS_A_LA_MAIN.len(),
-            16,
-            "{REFUS_ECRITS_A_LA_MAIN:?}"
-        );
-        assert_eq!(refusees_note().len(), 28);
         assert!(refusees_note().iter().all(|m| written.contains(m)));
-        assert_eq!(refusees_release().len(), 18);
         assert!(refusees_release().iter().all(|m| written.contains(m)));
-        assert_eq!(refusees_plan().len(), 45);
+        assert!(refusees_chat().iter().all(|m| written.contains(m)));
         assert!(refusees_plan().iter().all(|m| written.contains(m)));
         assert!(REFUS_ECRITS_A_LA_MAIN.iter().all(|m| written.contains(m)));
         // What keeps a default is known and justified where it is declared.
@@ -2140,6 +2134,235 @@ mod with_the_feature {
             written.len(),
             servent.len(),
             kept.len()
+        );
+    }
+
+    /// Chat noyau : sessions, événements, ancres et réglages — écrits, relus,
+    /// puis relus APRÈS une fermeture et une réouverture (persistance), et enfin
+    /// supprimés. Le jalon « chat de bout en bout » sur obrain.
+    #[tokio::test]
+    async fn chat_noyau_survit_une_reouverture() {
+        use project_orchestrator::chat::anchor::{
+            AnchorActor, AnchorError, AnchorOp, AnchorRole, AnchorTargetType, NewAnchor,
+        };
+        use project_orchestrator::chat::provider::policy::SessionAccess;
+        use project_orchestrator::chat::types::SpawnedBy;
+        use project_orchestrator::neo4j::models::{
+            ChatEventRecord, ChatSessionNode, ExecutionPlace,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+
+        let now = Utc::now();
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mk = |id: Uuid, spawned_by: Option<String>| ChatSessionNode {
+            id,
+            cli_session_id: None,
+            project_slug: Some("p".to_string()),
+            workspace_slug: None,
+            cwd: "/tmp".to_string(),
+            title: None,
+            model: "sonnet".to_string(),
+            created_at: now,
+            updated_at: now,
+            message_count: 0,
+            total_cost_usd: None,
+            conversation_id: None,
+            preview: None,
+            permission_mode: None,
+            add_dirs: None,
+            spawned_by,
+            provider_id: None,
+            routed_by: None,
+            routing_mode: None,
+            routing_pool: None,
+            capabilities: None,
+            engine: None,
+            resume_token: None,
+            execution_place: ExecutionPlace::Project,
+            project_inferred: false,
+            access: SessionAccess::Normal,
+            owner: None,
+            file_scope_lifted: false,
+            mirror_of: None,
+        };
+
+        store.create_chat_session(&mk(parent, None)).await.unwrap();
+        store
+            .create_chat_session(&mk(
+                child,
+                Some(
+                    SpawnedBy::Conversation {
+                        parent_session_id: parent,
+                        tool_use_id: None,
+                    }
+                    .to_json_string(),
+                ),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get_chat_session(parent).await.unwrap().unwrap().model,
+            "sonnet"
+        );
+        let (liste, total) = store
+            .list_chat_sessions(None, None, 10, 0, true)
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(liste.len(), 2);
+
+        // Lignée, portée par le JSON `spawned_by`.
+        let enfants = store.get_session_children(parent).await.unwrap();
+        assert_eq!(enfants.len(), 1);
+        assert_eq!(enfants[0].id, child);
+        let racine = store
+            .get_session_root(&child.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(racine, parent.to_string());
+        assert_eq!(
+            store
+                .get_session_tree(&parent.to_string())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Événements.
+        let ev = ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: parent,
+            seq: 1,
+            event_type: "user_message".to_string(),
+            data: r#"{"content":"bonjour"}"#.to_string(),
+            created_at: now,
+        };
+        store.store_chat_events(parent, vec![ev]).await.unwrap();
+        assert_eq!(store.count_chat_events(parent).await.unwrap(), 1);
+        assert_eq!(store.get_latest_chat_event_seq(parent).await.unwrap(), 1);
+        assert_eq!(store.get_chat_events(parent, 0, 10).await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .get_chat_events_paginated(parent, 0, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Mise à jour partielle.
+        let upd = store
+            .update_chat_session(
+                parent,
+                None,
+                Some("titre".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(upd.title.as_deref(), Some("titre"));
+
+        // Ancres.
+        let ancre = store
+            .add_anchor(
+                parent,
+                NewAnchor::new(
+                    AnchorTargetType::File,
+                    "src/main.rs",
+                    [AnchorRole::Focus],
+                    AnchorActor::User,
+                    "moi",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ancre.target_id, "src/main.rs");
+        let jeu = store.get_anchor_set(parent).await.unwrap().unwrap();
+        assert_eq!(jeu.version, 1);
+        assert_eq!(jeu.anchors.len(), 1);
+        let retrait = AnchorOp::Remove {
+            anchor_id: ancre.id,
+            expected_version: 1,
+            by: AnchorActor::User,
+            actor: "moi".to_string(),
+        };
+        // Un If-Match périmé refuse sans rien écrire.
+        let conflit = store
+            .apply_anchor_op_if(parent, retrait.clone(), Some(99))
+            .await
+            .unwrap_err();
+        assert!(conflit.downcast_ref::<AnchorError>().is_some());
+        assert_eq!(
+            store.get_anchor_set(parent).await.unwrap().unwrap().version,
+            1
+        );
+        // La bonne version passe.
+        store
+            .apply_anchor_op_if(parent, retrait, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(store.list_session_anchors(parent).await.unwrap().len(), 0);
+        assert_eq!(
+            store.get_anchor_set(parent).await.unwrap().unwrap().version,
+            2
+        );
+
+        // Réglages du harness.
+        store.put_llm_setting("global", "k", "v").await.unwrap();
+        assert_eq!(
+            store
+                .get_llm_setting("global", "k")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("v")
+        );
+        assert_eq!(
+            store.list_llm_settings("global", "").await.unwrap().len(),
+            1
+        );
+        assert!(store.delete_llm_setting("global", "k").await.unwrap());
+        assert_eq!(store.get_llm_setting("global", "k").await.unwrap(), None);
+
+        // Réouverture : tout ce qui précède est durable.
+        store.close().await.unwrap();
+        drop(store);
+        let store = open(&base).await;
+        assert_eq!(
+            store
+                .get_chat_session(parent)
+                .await
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("titre")
+        );
+        assert_eq!(store.count_chat_events(parent).await.unwrap(), 1);
+        assert_eq!(store.get_session_children(parent).await.unwrap().len(), 1);
+
+        // Suppression, et le cascade attendu.
+        assert!(store.delete_chat_session(child).await.unwrap());
+        assert!(store.delete_chat_session(parent).await.unwrap());
+        assert_eq!(store.get_chat_session(parent).await.unwrap(), None);
+        assert_eq!(
+            store
+                .list_chat_sessions(None, None, 10, 0, true)
+                .await
+                .unwrap()
+                .1,
+            0
         );
     }
 }
