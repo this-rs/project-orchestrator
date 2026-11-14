@@ -4867,6 +4867,198 @@ pub mod conformance {
         store.delete_feature_graph(new.id).await.unwrap();
         store.delete_project(p.id, &p.name).await.ok();
     }
+
+    // ------------------------------------------------------------------
+    // Plan: constraints, and the HAS_PLAN links to projects.
+    // ------------------------------------------------------------------
+
+    /// The constraints of a plan: created under an existing plan only, one id
+    /// once, read back by id and by plan, updated field by field (nothing to set
+    /// and a missing constraint are no-ops), deleted. `get_plan_constraints`
+    /// states no order: compared as sets.
+    pub async fn check_plan_constraints(store: &dyn GraphStore) {
+        use project_orchestrator::neo4j::models::{ConstraintNode, ConstraintType};
+        let p = a_project("constraints");
+        store.create_project(&p).await.unwrap();
+        let plan = a_plan(p.id, "constraints plan", 1, Utc::now());
+        let other = a_plan(p.id, "other plan", 1, Utc::now());
+        store.create_plan(&plan).await.unwrap();
+        store.create_plan(&other).await.unwrap();
+        let c = |t: ConstraintType, d: &str, e: Option<&str>| ConstraintNode {
+            id: Uuid::new_v4(),
+            constraint_type: t,
+            description: d.to_string(),
+            enforced_by: e.map(str::to_string),
+        };
+        let a = c(
+            ConstraintType::Security,
+            "no secrets in logs",
+            Some("review"),
+        );
+        let b = c(ConstraintType::Performance, "p99 under 50 ms", None);
+        let o = c(ConstraintType::Style, "other plan", None);
+        store.create_constraint(plan.id, &a).await.unwrap();
+        store.create_constraint(plan.id, &b).await.unwrap();
+        store.create_constraint(other.id, &o).await.unwrap();
+
+        assert!(
+            store
+                .create_constraint(Uuid::new_v4(), &c(ConstraintType::Other, "x", None))
+                .await
+                .is_err(),
+            "a constraint under a missing plan is refused"
+        );
+        assert!(
+            store.create_constraint(plan.id, &a).await.is_err(),
+            "Constraint.id is unique"
+        );
+
+        let got = store.get_constraint(a.id).await.unwrap().unwrap();
+        assert_eq!(
+            (got.constraint_type, got.description, got.enforced_by),
+            (
+                ConstraintType::Security,
+                "no secrets in logs".to_string(),
+                Some("review".to_string())
+            )
+        );
+        assert_eq!(
+            store
+                .get_constraint(b.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .enforced_by,
+            None,
+            "an absent enforced_by reads back None"
+        );
+        let mut of_plan = ids(&store.get_plan_constraints(plan.id).await.unwrap(), |x| {
+            x.id
+        });
+        of_plan.sort();
+        let mut want = vec![a.id, b.id];
+        want.sort();
+        assert_eq!(of_plan, want);
+        assert!(store
+            .get_plan_constraints(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_empty());
+
+        store
+            .update_constraint(b.id, None, Some(ConstraintType::Testing), Some("ci".into()))
+            .await
+            .unwrap();
+        store
+            .update_constraint(b.id, None, None, None)
+            .await
+            .unwrap();
+        store
+            .update_constraint(Uuid::new_v4(), Some("nobody".into()), None, None)
+            .await
+            .unwrap();
+        let got = store.get_constraint(b.id).await.unwrap().unwrap();
+        assert_eq!(
+            (got.constraint_type, got.description, got.enforced_by),
+            (
+                ConstraintType::Testing,
+                "p99 under 50 ms".to_string(),
+                Some("ci".to_string())
+            )
+        );
+
+        store.delete_constraint(a.id).await.unwrap();
+        store.delete_constraint(a.id).await.unwrap();
+        assert!(store.get_constraint(a.id).await.unwrap().is_none());
+        assert_eq!(
+            ids(&store.get_plan_constraints(plan.id).await.unwrap(), |x| x
+                .id),
+            vec![b.id]
+        );
+
+        for x in [b.id, o.id] {
+            store.delete_constraint(x).await.unwrap();
+        }
+        for x in [plan.id, other.id] {
+            store.delete_plan(x).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
+    /// `link_plan_to_project` adds a project (it is not a move), overwrites
+    /// `project_id`, and linking twice changes nothing; the project-scoped reads
+    /// see the plan in every project it is linked to; `unlink_plan_from_project`
+    /// removes every link and clears `project_id`; a missing plan or project is
+    /// a no-op.
+    pub async fn check_plan_project_links(store: &dyn GraphStore) {
+        let a = a_project("links-a");
+        let b = a_project("links-b");
+        store.create_project(&a).await.unwrap();
+        store.create_project(&b).await.unwrap();
+        let plan = a_plan(a.id, "linked plan", 1, Utc::now());
+        store.create_plan(&plan).await.unwrap();
+        assert_eq!(
+            store.list_plan_project_slugs(plan.id).await.unwrap(),
+            vec![a.slug.clone()]
+        );
+
+        store.link_plan_to_project(plan.id, b.id).await.unwrap();
+        store.link_plan_to_project(plan.id, b.id).await.unwrap();
+        store
+            .link_plan_to_project(Uuid::new_v4(), b.id)
+            .await
+            .unwrap();
+        store
+            .link_plan_to_project(plan.id, Uuid::new_v4())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_plan(plan.id).await.unwrap().unwrap().project_id,
+            Some(b.id),
+            "project_id names the last project linked"
+        );
+        let mut want = vec![a.slug.clone(), b.slug.clone()];
+        want.sort();
+        assert_eq!(store.list_plan_project_slugs(plan.id).await.unwrap(), want);
+        assert!(store
+            .list_plan_project_slugs(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_empty());
+        for proj in [a.id, b.id] {
+            assert_eq!(
+                ids(&store.list_project_plans(proj).await.unwrap(), |x| x.id),
+                vec![plan.id]
+            );
+            assert_eq!(store.count_project_plans(proj).await.unwrap(), 1);
+            let (plans, total) = store
+                .list_plans_for_project(proj, None, 10, 0)
+                .await
+                .unwrap();
+            assert_eq!((ids(&plans, |x| x.id), total), (vec![plan.id], 1));
+        }
+
+        store.unlink_plan_from_project(plan.id).await.unwrap();
+        store.unlink_plan_from_project(plan.id).await.unwrap();
+        assert_eq!(
+            store.get_plan(plan.id).await.unwrap().unwrap().project_id,
+            None
+        );
+        assert!(store
+            .list_plan_project_slugs(plan.id)
+            .await
+            .unwrap()
+            .is_empty());
+        for proj in [a.id, b.id] {
+            assert_eq!(store.count_project_plans(proj).await.unwrap(), 0);
+            assert!(store.list_project_plans(proj).await.unwrap().is_empty());
+        }
+
+        store.delete_plan(plan.id).await.unwrap();
+        for proj in [&a, &b] {
+            store.delete_project(proj.id, &proj.name).await.unwrap();
+        }
+    }
 }
 
 // ======================================================================
@@ -5767,8 +5959,8 @@ mod obrain_workspace_specifique {
 /// What only the obrain adapter does for plans: the deletion of a plan does not
 /// depend on the other domains' nodes, a creation stopped at any point of its
 /// protocol reopens as nothing or as the whole plan, the status is read as Neo4j
-/// reads it, and a migrated plan whose `HAS_PLAN` edges disagree with its
-/// `project_id` is quarantined.
+/// reads it, and a migrated plan linked by `HAS_PLAN` to several projects is
+/// served under each of them, as on Neo4j.
 #[cfg(feature = "obrain-backend")]
 mod obrain_plan_specifique {
     use chrono::{TimeZone, Utc};
@@ -5968,10 +6160,10 @@ mod obrain_plan_specifique {
     }
 
     /// A migrated plan linked by `HAS_PLAN` to A and to B (`project_id = B`):
-    /// Neo4j lists it under both, this backend could only list it under B. It is
-    /// quarantined and named.
+    /// Neo4j lists it under both, and so does this backend now that the links are
+    /// ported (`constraint.rs`). It is not quarantined.
     #[tokio::test]
-    async fn a_plan_linked_to_several_projects_is_quarantined() {
+    async fn a_plan_linked_to_several_projects_is_served_under_each() {
         let dir = tempfile::tempdir().unwrap();
         let chemin = dir.path().join("base");
         let a = projet("plan-a");
@@ -5994,22 +6186,25 @@ mod obrain_plan_specifique {
             store.close().await.unwrap();
         }
         let store = ObrainGraphStore::open(&chemin, Creation::Interdite).unwrap();
-        assert!(store.get_plan(x.id).await.unwrap().is_none());
-        assert!(store
-            .rapport_d_ouverture()
-            .en_quarantaine
-            .iter()
-            .any(|q| q.contains(&x.id.to_string()) && q.contains("HAS_PLAN")));
-        // The edge that agrees with `project_id` is the migrated base's normal case.
+        assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
+        let ids = |v: Vec<PlanNode>| {
+            let mut v: Vec<Uuid> = v.into_iter().map(|p| p.id).collect();
+            v.sort();
+            v
+        };
         assert_eq!(
-            store
-                .list_project_plans(b.id)
-                .await
-                .unwrap()
-                .iter()
-                .map(|p| p.id)
-                .collect::<Vec<_>>(),
-            vec![seul.id]
+            ids(store.list_project_plans(a.id).await.unwrap()),
+            vec![x.id]
+        );
+        let mut sous_b = vec![x.id, seul.id];
+        sous_b.sort();
+        assert_eq!(ids(store.list_project_plans(b.id).await.unwrap()), sous_b);
+        let mut slugs = vec![a.slug.clone(), b.slug.clone()];
+        slugs.sort();
+        assert_eq!(store.list_plan_project_slugs(x.id).await.unwrap(), slugs);
+        assert_eq!(
+            store.get_plan(x.id).await.unwrap().unwrap().project_id,
+            Some(b.id)
         );
     }
 
@@ -6663,3 +6858,20 @@ macro_rules! ingress_checks {
 ingress_checks!(mock_ingress, MockFactory);
 #[cfg(feature = "obrain-backend")]
 ingress_checks!(obrain_ingress, ObrainFactory);
+
+/// The plan's constraints and its links to projects: same checks, same
+/// fixtures, on each backend that has ported them.
+macro_rules! plan_constraint_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [check_plan_constraints, check_plan_project_links]
+        );
+    };
+}
+
+plan_constraint_checks!(mock_plan_constraint, MockFactory);
+plan_constraint_checks!(neo4j_plan_constraint, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+plan_constraint_checks!(obrain_plan_constraint, ObrainFactory);

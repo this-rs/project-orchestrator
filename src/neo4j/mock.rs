@@ -10431,6 +10431,10 @@ impl PlanStore for MockGraphStore {
             );
         }
         let cid = constraint.id;
+        // Neo4j: `CREATE CONSTRAINT constraint_id ... REQUIRE c.id IS UNIQUE`.
+        if self.constraints.read().await.contains_key(&cid) {
+            anyhow::bail!("Constraint {cid} already exists (Constraint.id is unique)");
+        }
         self.plan_constraints
             .write()
             .await

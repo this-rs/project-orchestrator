@@ -11,7 +11,8 @@
 //!
 //! Ported so far: [`ProjectStore`](crate::neo4j::traits::ProjectStore)
 //! (`project.rs`), the core of [`PlanStore`](crate::neo4j::traits::PlanStore)
-//! (`plan.rs`: no tasks, steps, constraints or day plan yet),
+//! (`plan.rs`: no tasks, steps or day plan yet; its constraints and its links
+//! to projects are written in `constraint.rs`),
 //! [`AuthStore`](crate::neo4j::traits::AuthStore) (`auth.rs`),
 //! [`ReleaseStore`](crate::neo4j::traits::ReleaseStore)
 //! for releases, environments, deployments and milestones (`release.rs`), whose
@@ -79,6 +80,7 @@
 mod auth;
 mod chat;
 mod commit;
+mod constraint;
 mod decision;
 mod featuregraph;
 mod federation;
@@ -169,9 +171,8 @@ pub fn refusees_decision() -> &'static [&'static str] {
 }
 
 /// The methods of `PlanStore` refused on every call, as `PlanStore::<method>`
-/// (`plan.rs`): tasks, steps, constraints, the day plan, dependencies, the
-/// graphs and waves, the enrichment, and the HAS_PLAN links to several
-/// projects.
+/// (`plan.rs`): tasks, steps, the day plan, dependencies, the graphs and
+/// waves, and the enrichment.
 pub fn refusees_plan() -> &'static [&'static str] {
     plan::REFUSEES
 }
@@ -323,6 +324,9 @@ pub struct RapportOuverture {
     /// `slug`/`created_at`, or an id or slug already taken): left untouched,
     /// ignored, named here.
     pub en_quarantaine: Vec<String>,
+    /// Plans whose `unlink_plan_from_project` was interrupted after its marker:
+    /// finished at open (`constraint.rs`).
+    pub deliaisons_achevees: usize,
 }
 
 /// The graph store on obrain.
@@ -359,6 +363,8 @@ struct Etat {
     plans: plan::IndexPlans,
     protocoles: protocol::IndexProtocoles,
     runs: protocolrun::IndexRuns,
+
+    contraintes: constraint::IndexContraintes,
     auth: auth::IndexAuth,
     releases: release::IndexReleases,
     espaces: workspace::IndexEspaces,
@@ -710,12 +716,15 @@ impl ObrainGraphStore {
         };
         let (projets, mut rapport) =
             project::IndexProjets::reconstruire(&db).with_context(contexte)?;
+        constraint::achever_les_deliaisons(&db, &mut rapport);
         let (plans, brouillons, quarantaine) =
             plan::IndexPlans::reconstruire(&db, &projets).with_context(contexte)?;
         rapport.brouillons_supprimes += brouillons;
         rapport.en_quarantaine.extend(quarantaine);
         let protocoles = protocol::IndexProtocoles::reconstruire(&db, &mut rapport);
         let runs = protocolrun::IndexRuns::reconstruire(&db, &protocoles, &mut rapport);
+
+        let contraintes = constraint::IndexContraintes::reconstruire(&db, &plans, &mut rapport);
         let auth = auth::IndexAuth::reconstruire(&db, &mut rapport);
         let (releases, rapport_releases) =
             release::IndexReleases::reconstruire(&db).with_context(contexte)?;
@@ -756,6 +765,8 @@ impl ObrainGraphStore {
             plans,
             protocoles,
             runs,
+
+            contraintes,
             auth,
             releases,
             espaces,
