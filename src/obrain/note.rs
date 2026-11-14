@@ -508,6 +508,20 @@ pub(super) struct IndexNotes {
 }
 
 impl IndexNotes {
+    /// The node of a note this backend holds (for the persona domain's `USES` edges).
+    pub(super) fn noeud_de(&self, id: Uuid) -> Option<NodeId> {
+        self.par_id.get(&id).map(|e| e.noeud)
+    }
+
+    /// Whether a held note is current knowledge, as `get_persona_subgraph` reads it in
+    /// Neo4j: status `active` or `needs_review`, and not superseded.
+    pub(super) fn est_courante(&self, id: Uuid) -> bool {
+        self.par_id.get(&id).is_some_and(|e| {
+            matches!(e.note.status, NoteStatus::Active | NoteStatus::NeedsReview)
+                && e.note.superseded_by.is_none()
+        })
+    }
+
     /// Insert an entry, and its memberships.
     fn inscrire(&mut self, e: EntreeNote) {
         let id = e.note.id;
@@ -1135,6 +1149,8 @@ impl NoteStore for ObrainGraphStore {
                         idx.inscrire(s);
                     }
                 }
+                // The personas that USED this note lost that edge too (`persona.rs`).
+                etat.personas.oublier_note(id);
                 Ok(true)
             },
         )

@@ -80,10 +80,12 @@ mod auth;
 mod chat;
 mod commit;
 mod decision;
+mod featuregraph;
 mod federation;
 #[cfg(any(test, feature = "mock-store"))]
 mod mesure;
 mod note;
+mod persona;
 mod plan;
 mod planrun;
 mod project;
@@ -187,6 +189,21 @@ pub fn refusees_planrun() -> &'static [&'static str] {
     planrun::REFUSEES
 }
 
+/// The methods of `PersonaStore` refused on every call, as `PersonaStore::<method>`
+/// (`persona.rs`): skills, protocols, decisions, files and functions, and every
+/// matching that reads the code graph or the note synapses. `get_persona_subgraph`
+/// refuses only for a persona with an edge this backend does not resolve.
+pub fn refusees_persona() -> &'static [&'static str] {
+    persona::REFUSEES
+}
+
+/// The methods of `FeatureGraphStore` refused on every call, as
+/// `FeatureGraphStore::<method>` (`featuregraph.rs`): they read or write the code
+/// graph. `get_feature_graph_detail` refuses only for a graph that includes entities.
+pub fn refusees_featuregraph() -> &'static [&'static str] {
+    featuregraph::REFUSEES
+}
+
 /// The hand-written methods that REFUSE: `GraphStore::get_progress_batch` (its
 /// contract default loops over getters of other domains), the five
 /// `FederationStore` methods whose relation writes and backfills are not ported
@@ -229,6 +246,8 @@ pub fn methodes_qui_servent() -> Vec<&'static str> {
                 && !plan::REFUSEES.contains(m)
                 && !protocolrun::REFUSEES.contains(m)
                 && !planrun::REFUSEES.contains(m)
+                && !persona::REFUSEES.contains(m)
+                && !featuregraph::REFUSEES.contains(m)
                 && !m.starts_with("GraphStore::")
         })
         .collect()
@@ -288,9 +307,10 @@ pub struct RapportOuverture {
     /// its commit point (the draft marker still there, or nothing on the node):
     /// deleted, whatever they held (`project.rs`, "Atomicity").
     pub brouillons_supprimes: usize,
-    /// Deletions that had started and not finished (a `Workspace` or an
-    /// `Environment` carrying the `_suppression` marker, `workspace.rs` and
-    /// `release.rs`): finished at open, the node and what it held.
+    /// Deletions that had started and not finished (a `Workspace`, an `Environment`,
+    /// a `Persona` or a `FeatureGraph` carrying the `_suppression` marker,
+    /// `workspace.rs`, `release.rs`, `persona.rs`, `featuregraph.rs`): finished at
+    /// open, the node and what it held.
     pub suppressions_achevees: usize,
     /// Projects whose path trio (`root_path`, `declared_path`,
     /// `canonical_path`) was torn by an interrupted update: recomputed from
@@ -350,6 +370,9 @@ struct Etat {
 
     surveillance: trigger::IndexSurveillance,
     executions: planrun::IndexExecutions,
+
+    graphes: featuregraph::IndexGraphes,
+    personas: persona::IndexPersonas,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -723,6 +746,11 @@ impl ObrainGraphStore {
         let surveillance = trigger::IndexSurveillance::reconstruire(&db, &mut rapport);
         let executions = planrun::IndexExecutions::reconstruire(&db, &plans, &mut rapport)
             .with_context(contexte)?;
+
+        // After the notes: a persona's edges are resolved against the notes and the
+        // feature graphs.
+        let graphes = featuregraph::IndexGraphes::reconstruire(&db, &mut rapport);
+        let personas = persona::IndexPersonas::reconstruire(&db, &notes, &graphes, &mut rapport);
         let etat = Etat {
             projets,
             plans,
@@ -739,6 +767,9 @@ impl ObrainGraphStore {
 
             surveillance,
             executions,
+
+            graphes,
+            personas,
         };
         let store = Self {
             interne: Arc::new(Interne {

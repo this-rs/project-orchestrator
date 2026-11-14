@@ -4701,6 +4701,172 @@ pub mod conformance {
             .await
             .unwrap();
     }
+
+    // ------------------------------------------------------------------
+    // Persona and feature graph: the node part every backend serves.
+    // ------------------------------------------------------------------
+
+    fn a_persona(
+        project: Option<Uuid>,
+        label: &str,
+        energy: f64,
+    ) -> project_orchestrator::neo4j::models::PersonaNode {
+        use project_orchestrator::neo4j::models::{PersonaNode, PersonaOrigin, PersonaStatus};
+        PersonaNode {
+            id: Uuid::new_v4(),
+            project_id: project,
+            name: format!("conformance persona {label}"),
+            description: format!("{label} description"),
+            status: PersonaStatus::Active,
+            complexity_default: Some("complex".to_string()),
+            timeout_secs: Some(600),
+            max_cost_usd: Some(1.5),
+            model_preference: Some("opus".to_string()),
+            system_prompt_override: None,
+            energy,
+            cohesion: 0.25,
+            activation_count: 2,
+            success_rate: 0.75,
+            avg_duration_secs: 30.0,
+            // Neo4j's CREATE writes neither of these: absent here, absent back.
+            last_activated: None,
+            energy_boost_accumulated: 0.125,
+            energy_history: vec![0.5, 0.75],
+            origin: PersonaOrigin::AutoBuild,
+            created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            updated_at: None,
+        }
+    }
+
+    /// A persona reads back as written; the project listing sorts by energy
+    /// (distinct here), filters by status and pages; the update replaces the
+    /// mutable fields; the deletion answers whether it deleted.
+    pub async fn check_persona_roundtrip(store: &dyn GraphStore) {
+        use project_orchestrator::neo4j::models::PersonaStatus;
+        let p = a_project("persona");
+        store.create_project(&p).await.unwrap();
+        let mut a = a_persona(Some(p.id), "a", 0.25);
+        let b = a_persona(Some(p.id), "b", 0.75);
+        let mut c = a_persona(Some(p.id), "c", 0.5);
+        c.status = PersonaStatus::Dormant;
+        let g = a_persona(None, "global", 0.5);
+        for x in [&a, &b, &c, &g] {
+            store.create_persona(x).await.unwrap();
+        }
+        let back = store.get_persona(a.id).await.unwrap().expect("read by id");
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(&a).unwrap(),
+            "the persona read back differs"
+        );
+        assert!(store.get_persona(Uuid::new_v4()).await.unwrap().is_none());
+
+        let (listed, total) = store.list_personas(p.id, None, 10, 0).await.unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(
+            ids(&listed, |x| x.id),
+            vec![b.id, c.id, a.id],
+            "energy DESC"
+        );
+        let (listed, total) = store
+            .list_personas(p.id, Some(PersonaStatus::Dormant), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!((ids(&listed, |x| x.id), total), (vec![c.id], 1));
+        let (listed, total) = store.list_personas(p.id, None, 1, 1).await.unwrap();
+        assert_eq!((ids(&listed, |x| x.id), total), (vec![c.id], 3));
+        let globals = store.list_global_personas().await.unwrap();
+        assert!(globals.iter().any(|x| x.id == g.id));
+        assert!(globals.iter().all(|x| x.project_id.is_none()));
+
+        a.name = format!("{} renamed", a.name);
+        a.energy = 0.875;
+        store.update_persona(&a).await.unwrap();
+        let back = store.get_persona(a.id).await.unwrap().unwrap();
+        assert_eq!((back.name.as_str(), back.energy), (a.name.as_str(), 0.875));
+        let (listed, _) = store.list_personas(p.id, None, 10, 0).await.unwrap();
+        assert_eq!(ids(&listed, |x| x.id), vec![a.id, b.id, c.id]);
+
+        assert!(store.delete_persona(a.id).await.unwrap());
+        assert!(!store.delete_persona(a.id).await.unwrap());
+        assert!(store.get_persona(a.id).await.unwrap().is_none());
+        for x in [b.id, c.id, g.id] {
+            store.delete_persona(x).await.unwrap();
+        }
+        store.delete_project(p.id, &p.name).await.ok();
+    }
+
+    fn a_feature_graph(
+        project: Uuid,
+        label: &str,
+        at: i64,
+    ) -> project_orchestrator::neo4j::models::FeatureGraphNode {
+        // Whole seconds: Neo4j sorts `updated_at` as a string.
+        let t = Utc.timestamp_opt(1_700_000_000 + at, 0).unwrap();
+        project_orchestrator::neo4j::models::FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: format!("conformance fg {label}"),
+            description: Some(format!("{label} description")),
+            project_id: project,
+            created_at: t,
+            updated_at: t,
+            entity_count: None,
+            // Every option set: Neo4j stores an absent one as "" / 0.
+            entry_function: Some("main".to_string()),
+            build_depth: Some(2),
+            include_relations: Some(vec!["CALLS".to_string()]),
+        }
+    }
+
+    /// A feature graph reads back as written; a project's graphs list by
+    /// `updated_at DESC` with their entity count; an empty graph's detail is empty;
+    /// the deletion answers whether it deleted.
+    pub async fn check_feature_graph_roundtrip(store: &dyn GraphStore) {
+        let p = a_project("featuregraph");
+        store.create_project(&p).await.unwrap();
+        let old = a_feature_graph(p.id, "old", 0);
+        let new = a_feature_graph(p.id, "new", 60);
+        for g in [&old, &new] {
+            store.create_feature_graph(g).await.unwrap();
+        }
+        let back = store
+            .get_feature_graph(old.id)
+            .await
+            .unwrap()
+            .expect("read by id");
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(&old).unwrap(),
+            "the feature graph read back differs"
+        );
+        assert!(store
+            .get_feature_graph(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none());
+        let listed = store.list_feature_graphs(Some(p.id)).await.unwrap();
+        assert_eq!(ids(&listed, |x| x.id), vec![new.id, old.id]);
+        assert!(listed.iter().all(|g| g.entity_count == Some(0)));
+        assert!(store
+            .list_feature_graphs(None)
+            .await
+            .unwrap()
+            .iter()
+            .any(|g| g.id == old.id));
+        let detail = store
+            .get_feature_graph_detail(old.id)
+            .await
+            .unwrap()
+            .expect("detail");
+        assert!(detail.entities.is_empty() && detail.relations.is_empty());
+        assert_eq!(detail.graph.id, old.id);
+
+        assert!(store.delete_feature_graph(old.id).await.unwrap());
+        assert!(!store.delete_feature_graph(old.id).await.unwrap());
+        assert!(store.get_feature_graph(old.id).await.unwrap().is_none());
+        store.delete_feature_graph(new.id).await.unwrap();
+        store.delete_project(p.id, &p.name).await.ok();
+    }
 }
 
 // ======================================================================
@@ -5192,6 +5358,24 @@ auth_checks!(mock_auth, MockFactory);
 auth_checks!(neo4j_auth, Neo4jFactory);
 #[cfg(feature = "obrain-backend")]
 auth_checks!(obrain_auth, ObrainFactory);
+
+/// The persona and feature-graph domains: the node part, which every backend
+/// serves (the edges to the code graph are refused by name on obrain, see
+/// `tests/obrain_backend.rs`).
+macro_rules! persona_featuregraph_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [check_persona_roundtrip, check_feature_graph_roundtrip]
+        );
+    };
+}
+
+persona_featuregraph_checks!(mock_persona_featuregraph, MockFactory);
+persona_featuregraph_checks!(neo4j_persona_featuregraph, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+persona_featuregraph_checks!(obrain_persona_featuregraph, ObrainFactory);
 
 /// What only the obrain adapter does: the refusals of the workspace methods it
 /// does not port are named (a `NonPorte` downcast), and what it writes is read
