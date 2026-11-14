@@ -13,6 +13,9 @@
 //! (`project.rs`), the core of [`PlanStore`](crate::neo4j::traits::PlanStore)
 //! (`plan.rs`: no tasks, steps or day plan yet; its constraints and its links
 //! to projects are written in `constraint.rs`),
+//! (`project.rs`), [`PlanStore`](crate::neo4j::traits::PlanStore) (`plan.rs`;
+//! tasks, dependencies, waves and day plan in `task.rs`, steps in `step.rs`;
+//! no constraints yet),
 //! [`AuthStore`](crate::neo4j::traits::AuthStore) (`auth.rs`),
 //! [`ReleaseStore`](crate::neo4j::traits::ReleaseStore)
 //! for releases, environments, deployments and milestones (`release.rs`), whose
@@ -102,6 +105,8 @@ mod protocolrun;
 mod release;
 mod sharing;
 mod skill;
+mod step;
+mod task;
 mod trigger;
 mod workspace;
 
@@ -193,6 +198,7 @@ pub fn refusees_sharing() -> &'static [&'static str] {
 /// The methods of `PlanStore` refused on every call, as `PlanStore::<method>`
 /// (`plan.rs`): tasks, steps, the day plan, dependencies, the graphs and
 /// waves, and the enrichment.
+/// (`plan.rs`; the causes of the task-side ones are in `task::REFUS`).
 pub fn refusees_plan() -> &'static [&'static str] {
     plan::REFUSEES
 }
@@ -387,6 +393,7 @@ struct Etat {
     runs: protocolrun::IndexRuns,
 
     contraintes: constraint::IndexContraintes,
+    taches: task::IndexTaches,
     auth: auth::IndexAuth,
     releases: release::IndexReleases,
     espaces: workspace::IndexEspaces,
@@ -749,6 +756,8 @@ impl ObrainGraphStore {
         let runs = protocolrun::IndexRuns::reconstruire(&db, &protocoles, &mut rapport);
 
         let contraintes = constraint::IndexContraintes::reconstruire(&db, &plans, &mut rapport);
+        let taches =
+            task::IndexTaches::reconstruire(&db, &plans, &mut rapport).with_context(contexte)?;
         let auth = auth::IndexAuth::reconstruire(&db, &mut rapport);
         let (releases, rapport_releases) =
             release::IndexReleases::reconstruire(&db).with_context(contexte)?;
@@ -796,6 +805,7 @@ impl ObrainGraphStore {
             runs,
 
             contraintes,
+            taches,
             auth,
             releases,
             espaces,

@@ -1648,8 +1648,8 @@ mod with_the_feature {
             NonPorte("WorkspaceStore::get_workspace_milestone_progress")
         );
         assert_eq!(
-            not_ported(store.get_plan_tasks(id).await),
-            NonPorte("PlanStore::get_plan_tasks")
+            not_ported(store.analyze_task_impact(id).await),
+            NonPorte("PlanStore::analyze_task_impact")
         );
         assert_eq!(
             not_ported(store.list_project_files(id).await),

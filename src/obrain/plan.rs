@@ -13,6 +13,13 @@
 //! REFUSED by name (`NonPorte`): everything that touches tasks, steps, the day
 //! plan, dependencies, the graphs and waves, and the enrichment. They are
 //! refused, not answered empty.
+//! Tasks, dependencies, graphs, waves and the day plan are served by `task.rs`,
+//! steps by `step.rs`: the methods here delegate to them.
+//!
+//! REFUSED by name (`NonPorte`): constraints, the HAS_PLAN links that a plan can
+//! have with SEVERAL projects (`link_plan_to_project`, `unlink_plan_from_project`,
+//! `list_plan_project_slugs`), and the four task methods of `task::REFUS` (with
+//! their cause). They are refused, not answered empty.
 //!
 //! # Layout
 //!
@@ -92,7 +99,7 @@ use uuid::Uuid;
 use super::project::IndexProjets;
 #[cfg(any(test, feature = "mock-store"))]
 use super::Interruption;
-use super::{constraint, Ecriture, NonPorte, ObrainGraphStore, SEUIL_COLONNE_BLOB};
+use super::{constraint, task, Ecriture, NonPorte, ObrainGraphStore, SEUIL_COLONNE_BLOB};
 use crate::neo4j::client::pascal_to_snake_case;
 use crate::neo4j::models::*;
 use crate::neo4j::plan::plan_status_values;
@@ -103,48 +110,9 @@ const LABEL: &str = "Plan";
 /// The draft marker: present from the first record of a creation to the last.
 const BROUILLON: &str = "_brouillon";
 
-/// The methods of `PlanStore` refused on every call, as `PlanStore::<method>`:
-/// tasks, steps, the day plan, dependencies, the graphs and waves, and the
-/// enrichment. They are refused by name, never answered empty.
-pub const REFUSEES: &[&str] = &[
-    "PlanStore::create_task",
-    "PlanStore::get_plan_tasks",
-    "PlanStore::get_task_with_full_details",
-    "PlanStore::analyze_task_impact",
-    "PlanStore::find_blocked_tasks",
-    "PlanStore::update_task_status",
-    "PlanStore::interrupt_task",
-    "PlanStore::assign_task",
-    "PlanStore::add_task_dependency",
-    "PlanStore::remove_task_dependency",
-    "PlanStore::get_task_blockers",
-    "PlanStore::get_tasks_blocked_by",
-    "PlanStore::get_task_dependencies",
-    "PlanStore::get_plan_dependency_graph",
-    "PlanStore::get_task_enrichment_counts",
-    "PlanStore::get_task_enrichment_data",
-    "PlanStore::get_plan_critical_path",
-    "PlanStore::compute_waves",
-    "PlanStore::get_next_available_task",
-    "PlanStore::get_task",
-    "PlanStore::update_task",
-    "PlanStore::update_task_enrichment",
-    "PlanStore::delete_task",
-    "PlanStore::get_project_for_task",
-    "PlanStore::get_plan_id_for_task",
-    "PlanStore::get_day_plan",
-    "PlanStore::set_day_plan",
-    "PlanStore::add_to_day",
-    "PlanStore::remove_from_day",
-    "PlanStore::create_step",
-    "PlanStore::get_task_steps",
-    "PlanStore::update_step",
-    "PlanStore::update_step_status",
-    "PlanStore::get_task_step_progress",
-    "PlanStore::get_step",
-    "PlanStore::delete_step",
-    "PlanStore::complete_pending_steps_for_task",
-];
+/// The methods of `PlanStore` refused on every call, as `PlanStore::<method>`.
+/// Now empty: tasks, steps, constraints and links are all ported.
+pub const REFUSEES: &[&str] = &[];
 
 /// Does this value go to a blob column (a string above the threshold)?
 fn va_en_colonne_blob(v: &Value) -> bool {
@@ -363,11 +331,6 @@ impl IndexPlans {
         }
         Ok((index, brouillons, quarantaine))
     }
-}
-
-/// Refuses a method of the plan domain that obrain does not port, by name.
-fn refus<T>(methode: &'static str) -> Result<T> {
-    Err(anyhow::Error::new(NonPorte(methode)))
 }
 
 // The refusals keep their parameters' names for the reader; they are unused by design.
@@ -622,99 +585,99 @@ impl PlanStore for ObrainGraphStore {
     }
 
     async fn create_task(&self, plan_id: Uuid, task: &TaskNode) -> Result<()> {
-        refus("PlanStore::create_task")
+        self.tache_creer(plan_id, task).await
     }
 
     async fn get_plan_tasks(&self, plan_id: Uuid) -> Result<Vec<TaskNode>> {
-        refus("PlanStore::get_plan_tasks")
+        self.taches_du_plan(plan_id).await
     }
 
     async fn get_task_with_full_details(&self, task_id: Uuid) -> Result<Option<TaskDetails>> {
-        refus("PlanStore::get_task_with_full_details")
+        self.tache_details(task_id).await
     }
 
     async fn analyze_task_impact(&self, task_id: Uuid) -> Result<Vec<String>> {
-        refus("PlanStore::analyze_task_impact")
+        task::refus("PlanStore::analyze_task_impact")
     }
 
     async fn find_blocked_tasks(&self, plan_id: Uuid) -> Result<Vec<(TaskNode, Vec<TaskNode>)>> {
-        refus("PlanStore::find_blocked_tasks")
+        self.taches_bloquees(plan_id).await
     }
 
     async fn update_task_status(&self, task_id: Uuid, status: TaskStatus) -> Result<()> {
-        refus("PlanStore::update_task_status")
+        self.tache_statut(task_id, status).await
     }
 
     async fn interrupt_task(&self, task_id: Uuid, reason: &str) -> Result<bool> {
-        refus("PlanStore::interrupt_task")
+        self.tache_interrompre(task_id, reason).await
     }
 
     async fn assign_task(&self, task_id: Uuid, agent_id: &str) -> Result<()> {
-        refus("PlanStore::assign_task")
+        task::refus("PlanStore::assign_task")
     }
 
     async fn add_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()> {
-        refus("PlanStore::add_task_dependency")
+        self.dependance_ajouter(task_id, depends_on_id).await
     }
 
     async fn remove_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()> {
-        refus("PlanStore::remove_task_dependency")
+        self.dependance_retirer(task_id, depends_on_id).await
     }
 
     async fn get_task_blockers(&self, task_id: Uuid) -> Result<Vec<TaskNode>> {
-        refus("PlanStore::get_task_blockers")
+        self.bloqueurs_de(task_id).await
     }
 
     async fn get_tasks_blocked_by(&self, task_id: Uuid) -> Result<Vec<TaskNode>> {
-        refus("PlanStore::get_tasks_blocked_by")
+        self.bloquees_par(task_id).await
     }
 
     async fn get_task_dependencies(&self, task_id: Uuid) -> Result<Vec<TaskNode>> {
-        refus("PlanStore::get_task_dependencies")
+        self.dependances_de(task_id).await
     }
 
     async fn get_plan_dependency_graph(
         &self,
         plan_id: Uuid,
     ) -> Result<(Vec<TaskNode>, Vec<(Uuid, Uuid)>)> {
-        refus("PlanStore::get_plan_dependency_graph")
+        self.graphe_du_plan(plan_id).await
     }
 
     async fn get_task_enrichment_counts(
         &self,
         task_ids: &[String],
     ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentCounts>> {
-        refus("PlanStore::get_task_enrichment_counts")
+        task::refus("PlanStore::get_task_enrichment_counts")
     }
 
     async fn get_task_enrichment_data(
         &self,
         task_ids: &[String],
     ) -> Result<std::collections::HashMap<String, crate::neo4j::plan::TaskEnrichmentData>> {
-        refus("PlanStore::get_task_enrichment_data")
+        task::refus("PlanStore::get_task_enrichment_data")
     }
 
     async fn get_plan_critical_path(&self, plan_id: Uuid) -> Result<Vec<TaskNode>> {
-        refus("PlanStore::get_plan_critical_path")
+        self.chemin_critique(plan_id).await
     }
 
     async fn compute_waves(
         &self,
         plan_id: Uuid,
     ) -> Result<crate::neo4j::plan::WaveComputationResult> {
-        refus("PlanStore::compute_waves")
+        self.vagues(plan_id).await
     }
 
     async fn get_next_available_task(&self, plan_id: Uuid) -> Result<Option<TaskNode>> {
-        refus("PlanStore::get_next_available_task")
+        self.tache_suivante(plan_id).await
     }
 
     async fn get_task(&self, task_id: Uuid) -> Result<Option<TaskNode>> {
-        refus("PlanStore::get_task")
+        self.tache_lire(task_id).await
     }
 
     async fn update_task(&self, task_id: Uuid, updates: &UpdateTaskRequest) -> Result<()> {
-        refus("PlanStore::update_task")
+        self.tache_maj(task_id, updates).await
     }
 
     async fn update_task_enrichment(
@@ -724,67 +687,68 @@ impl PlanStore for ObrainGraphStore {
         persona: Option<&str>,
         prompt_cache: Option<&str>,
     ) -> Result<()> {
-        refus("PlanStore::update_task_enrichment")
+        self.tache_enrichissement(task_id, execution_context, persona, prompt_cache)
+            .await
     }
 
     async fn delete_task(&self, task_id: Uuid) -> Result<()> {
-        refus("PlanStore::delete_task")
+        self.tache_supprimer(task_id).await
     }
 
     async fn get_project_for_task(&self, task_id: Uuid) -> Result<Option<ProjectNode>> {
-        refus("PlanStore::get_project_for_task")
+        self.tache_projet(task_id).await
     }
 
     async fn get_plan_id_for_task(&self, task_id: Uuid) -> Result<Option<Uuid>> {
-        refus("PlanStore::get_plan_id_for_task")
+        self.tache_plan(task_id).await
     }
 
     async fn get_day_plan(&self, user_id: Uuid, date: &str) -> Result<Vec<(Uuid, u32)>> {
-        refus("PlanStore::get_day_plan")
+        self.jour_lire(user_id, date).await
     }
 
     async fn set_day_plan(&self, user_id: Uuid, date: &str, ids: &[Uuid]) -> Result<()> {
-        refus("PlanStore::set_day_plan")
+        self.jour_fixer(user_id, date, ids).await
     }
 
     async fn add_to_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()> {
-        refus("PlanStore::add_to_day")
+        self.jour_ajouter(user_id, date, task_id).await
     }
 
     async fn remove_from_day(&self, user_id: Uuid, date: &str, task_id: Uuid) -> Result<()> {
-        refus("PlanStore::remove_from_day")
+        self.jour_retirer(user_id, date, task_id).await
     }
 
     async fn create_step(&self, task_id: Uuid, step: &StepNode) -> Result<()> {
-        refus("PlanStore::create_step")
+        self.etape_creer(task_id, step).await
     }
 
     async fn get_task_steps(&self, task_id: Uuid) -> Result<Vec<StepNode>> {
-        refus("PlanStore::get_task_steps")
+        self.etapes_de(task_id).await
     }
 
     async fn update_step(&self, step_id: Uuid, updates: &UpdateStepRequest) -> Result<()> {
-        refus("PlanStore::update_step")
+        self.etape_maj(step_id, updates).await
     }
 
     async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> Result<()> {
-        refus("PlanStore::update_step_status")
+        self.etape_statut(step_id, status).await
     }
 
     async fn get_task_step_progress(&self, task_id: Uuid) -> Result<(u32, u32)> {
-        refus("PlanStore::get_task_step_progress")
+        self.etapes_progression(task_id).await
     }
 
     async fn get_step(&self, step_id: Uuid) -> Result<Option<StepNode>> {
-        refus("PlanStore::get_step")
+        self.etape_lire(step_id).await
     }
 
     async fn delete_step(&self, step_id: Uuid) -> Result<()> {
-        refus("PlanStore::delete_step")
+        self.etape_supprimer(step_id).await
     }
 
     async fn complete_pending_steps_for_task(&self, task_id: Uuid) -> Result<u32> {
-        refus("PlanStore::complete_pending_steps_for_task")
+        self.etapes_completer(task_id).await
     }
 
     async fn create_constraint(&self, plan_id: Uuid, constraint: &ConstraintNode) -> Result<()> {

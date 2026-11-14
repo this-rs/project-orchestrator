@@ -5059,6 +5059,449 @@ pub mod conformance {
             store.delete_project(proj.id, &proj.name).await.unwrap();
         }
     }
+
+    // ------------------------------------------------------------------
+    // Tasks, steps, dependencies, waves, day plan (PlanStore, task half).
+    // Neo4j is the reference; run on the mock and on obrain too.
+    // ------------------------------------------------------------------
+
+    fn a_full_task(title: &str, priority: i32, created: i64) -> TaskNode {
+        let mut t = a_task(Some(title));
+        t.priority = Some(priority);
+        t.created_at = at(created);
+        t.tags = vec!["t1".into(), "t2".into()];
+        t.acceptance_criteria = vec!["it works".into()];
+        t.estimated_complexity = Some(2);
+        t.estimated_minutes = Some(45);
+        t.due_date = chrono::NaiveDate::from_ymd_opt(2026, 12, 24);
+        t
+    }
+
+    fn a_step(order: u32, description: &str, verification: Option<&str>) -> StepNode {
+        StepNode {
+            id: Uuid::new_v4(),
+            order,
+            description: description.to_string(),
+            status: StepStatus::Pending,
+            verification: verification.map(str::to_string),
+            created_at: at(order as i64),
+            updated_at: None,
+            completed_at: None,
+            execution_context: None,
+            persona: None,
+        }
+    }
+
+    /// A project and a plan to hang tasks on.
+    async fn task_fixture(store: &dyn GraphStore, label: &str) -> (ProjectNode, PlanNode) {
+        let p = a_project(label);
+        store.create_project(&p).await.unwrap();
+        let plan = a_plan(p.id, label, 0, at(0));
+        store.create_plan(&plan).await.unwrap();
+        (p, plan)
+    }
+
+    async fn task_cleanup(store: &dyn GraphStore, p: &ProjectNode, plan: &PlanNode) {
+        for t in store.get_plan_tasks(plan.id).await.unwrap_or_default() {
+            store.delete_task(t.id).await.ok();
+        }
+        store.delete_plan(plan.id).await.ok();
+        store.delete_project(p.id, &p.name).await.ok();
+    }
+
+    /// A task reads back with what `create_task` stores, in the plan-task order
+    /// (priority DESC, created_at, id); its updates, status changes, interruption,
+    /// enrichment and deletion behave as Neo4j's.
+    pub async fn check_task_roundtrip_and_lifecycle(store: &dyn GraphStore) {
+        let (p, plan) = task_fixture(store, "task-rt").await;
+        let t1 = a_full_task("t1", 1, 10);
+        let t2 = a_full_task("t2", 5, 20);
+        let t3 = a_full_task("t3", 1, 5);
+        for t in [&t1, &t2, &t3] {
+            store.create_task(plan.id, t).await.unwrap();
+        }
+        let order = ids(&store.get_plan_tasks(plan.id).await.unwrap(), |t| t.id);
+        assert_eq!(order, vec![t2.id, t3.id, t1.id]);
+
+        let got = store.get_task(t1.id).await.unwrap().unwrap();
+        assert_eq!(got.title.as_deref(), Some("t1"));
+        assert_eq!(got.description, t1.description);
+        assert_eq!(got.status, TaskStatus::Pending);
+        assert_eq!(got.priority, Some(1));
+        assert_eq!(got.tags, t1.tags);
+        assert_eq!(got.acceptance_criteria, t1.acceptance_criteria);
+        assert_eq!(got.estimated_complexity, Some(2));
+        assert_eq!(got.estimated_minutes, Some(45));
+        assert_eq!(got.due_date, t1.due_date);
+        assert_eq!(got.created_at, t1.created_at);
+        assert_eq!(
+            store.get_plan_id_for_task(t1.id).await.unwrap(),
+            Some(plan.id)
+        );
+        assert_eq!(
+            store
+                .get_project_for_task(t1.id)
+                .await
+                .unwrap()
+                .map(|x| x.id),
+            Some(p.id)
+        );
+        assert!(store.get_task(Uuid::new_v4()).await.unwrap().is_none());
+        assert_eq!(
+            store.get_plan_id_for_task(Uuid::new_v4()).await.unwrap(),
+            None
+        );
+
+        store
+            .update_task(
+                t1.id,
+                &UpdateTaskRequest {
+                    title: Some("t1b".into()),
+                    priority: Some(7),
+                    tags: Some(vec!["x".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let got = store.get_task(t1.id).await.unwrap().unwrap();
+        assert_eq!(
+            (got.title.as_deref(), got.priority, got.tags.clone()),
+            (Some("t1b"), Some(7), vec!["x".to_string()])
+        );
+        assert!(got.updated_at.is_some());
+        assert_eq!(
+            ids(&store.get_plan_tasks(plan.id).await.unwrap(), |t| t.id),
+            vec![t1.id, t2.id, t3.id]
+        );
+
+        store
+            .update_task_status(t1.id, TaskStatus::InProgress)
+            .await
+            .unwrap();
+        let got = store.get_task(t1.id).await.unwrap().unwrap();
+        assert_eq!(got.status, TaskStatus::InProgress);
+        assert!(got.started_at.is_some());
+        store
+            .update_task_status(t1.id, TaskStatus::Blocked)
+            .await
+            .unwrap();
+        let got = store.get_task(t1.id).await.unwrap().unwrap();
+        assert!(
+            (got.frustration_score - 0.2).abs() < 1e-9,
+            "{}",
+            got.frustration_score
+        );
+        assert!(store.interrupt_task(t1.id, "server stopped").await.unwrap());
+        let got = store.get_task(t1.id).await.unwrap().unwrap();
+        assert_eq!(got.status, TaskStatus::Interrupted);
+        assert_eq!(got.interrupted_reason.as_deref(), Some("server stopped"));
+        assert!(got.interrupted_at.is_some());
+        store
+            .update_task_status(t1.id, TaskStatus::Completed)
+            .await
+            .unwrap();
+        let got = store.get_task(t1.id).await.unwrap().unwrap();
+        assert_eq!(got.status, TaskStatus::Completed);
+        assert!(got.completed_at.is_some());
+        assert!(got.interrupted_reason.is_none() && got.interrupted_at.is_none());
+        assert!(!store.interrupt_task(t1.id, "too late").await.unwrap());
+        assert!(!store
+            .interrupt_task(Uuid::new_v4(), "nobody")
+            .await
+            .unwrap());
+
+        store
+            .update_task_enrichment(t2.id, Some("{\"ctx\":1}"), None, Some("prompt"))
+            .await
+            .unwrap();
+        let got = store.get_task(t2.id).await.unwrap().unwrap();
+        assert_eq!(got.execution_context.as_deref(), Some("{\"ctx\":1}"));
+        assert_eq!(got.persona, None);
+        assert_eq!(got.prompt_cache.as_deref(), Some("prompt"));
+
+        store.delete_task(t3.id).await.unwrap();
+        assert!(store.get_task(t3.id).await.unwrap().is_none());
+        assert_eq!(
+            ids(&store.get_plan_tasks(plan.id).await.unwrap(), |t| t.id),
+            vec![t1.id, t2.id]
+        );
+        task_cleanup(store, &p, &plan).await;
+    }
+
+    /// Dependencies and everything computed from them: dependencies, blockers,
+    /// blocked-by (priority DESC, id DESC), blocked tasks, next available task,
+    /// the dependency graph, the critical path and the waves.
+    pub async fn check_task_dependencies_and_waves(store: &dyn GraphStore) {
+        let (p, plan) = task_fixture(store, "task-deps").await;
+        let a = a_full_task("a", 3, 1);
+        let b = a_full_task("b", 2, 2);
+        let c = a_full_task("c", 1, 3);
+        let d = a_full_task("d", 0, 4);
+        let e = a_full_task("e", 0, 5);
+        for t in [&a, &b, &c, &d, &e] {
+            store.create_task(plan.id, t).await.unwrap();
+        }
+        // b -> a, c -> a, d -> b, d -> c ("x -> y": x depends on y).
+        for (x, y) in [(&b, &a), (&c, &a), (&d, &b), (&d, &c)] {
+            store.add_task_dependency(x.id, y.id).await.unwrap();
+        }
+        assert_eq!(
+            ids(&store.get_task_dependencies(d.id).await.unwrap(), |t| t.id),
+            vec![b.id, c.id]
+        );
+        assert_eq!(
+            ids(&store.get_tasks_blocked_by(a.id).await.unwrap(), |t| t.id),
+            vec![b.id, c.id]
+        );
+        assert_eq!(
+            ids(&store.get_task_blockers(d.id).await.unwrap(), |t| t.id),
+            vec![b.id, c.id]
+        );
+        let bloquees: std::collections::HashMap<Uuid, HashSet<Uuid>> = store
+            .find_blocked_tasks(plan.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(t, bs)| (t.id, id_set(&bs, |x| x.id)))
+            .collect();
+        assert_eq!(bloquees.len(), 3);
+        assert_eq!(bloquees[&d.id], HashSet::from([b.id, c.id]));
+        assert_eq!(bloquees[&b.id], HashSet::from([a.id]));
+        assert_eq!(
+            store
+                .get_next_available_task(plan.id)
+                .await
+                .unwrap()
+                .map(|t| t.id),
+            Some(a.id)
+        );
+
+        let (taches, aretes) = store.get_plan_dependency_graph(plan.id).await.unwrap();
+        assert_eq!(id_set(&taches, |t| t.id).len(), 5);
+        let aretes: HashSet<(Uuid, Uuid)> = aretes.into_iter().collect();
+        assert_eq!(
+            aretes,
+            HashSet::from([(b.id, a.id), (c.id, a.id), (d.id, b.id), (d.id, c.id)])
+        );
+
+        let vagues = store.compute_waves(plan.id).await.unwrap();
+        let par_vague: Vec<Vec<Uuid>> = vagues
+            .waves
+            .iter()
+            .map(|w| w.tasks.iter().map(|t| t.id).collect())
+            .collect();
+        assert_eq!(
+            par_vague,
+            vec![vec![a.id, e.id], vec![b.id, c.id], vec![d.id]]
+        );
+        assert_eq!(vagues.summary.total_tasks, 5);
+        assert_eq!(vagues.summary.total_waves, 3);
+        assert_eq!(vagues.summary.max_parallel, 2);
+        assert_eq!(vagues.summary.critical_path_length, 3);
+        assert_eq!(vagues.summary.dependency_edges, 4);
+
+        // One longest chain only (no tie for the backends to break differently).
+        store.remove_task_dependency(d.id, c.id).await.unwrap();
+        assert_eq!(
+            ids(&store.get_task_dependencies(d.id).await.unwrap(), |t| t.id),
+            vec![b.id]
+        );
+        assert_eq!(
+            ids(&store.get_plan_critical_path(plan.id).await.unwrap(), |t| t
+                .id),
+            vec![a.id, b.id, d.id]
+        );
+
+        store
+            .update_task_status(a.id, TaskStatus::Completed)
+            .await
+            .unwrap();
+        assert!(store.get_task_blockers(b.id).await.unwrap().is_empty());
+        // a is done: b (priority 2) is next.
+        assert_eq!(
+            store
+                .get_next_available_task(plan.id)
+                .await
+                .unwrap()
+                .map(|t| t.id),
+            Some(b.id)
+        );
+        task_cleanup(store, &p, &plan).await;
+    }
+
+    /// Steps: order, fields, updates, status, progress, the cascade on task
+    /// completion, deletion.
+    pub async fn check_step_lifecycle(store: &dyn GraphStore) {
+        let (p, plan) = task_fixture(store, "steps").await;
+        let t = a_full_task("with steps", 1, 1);
+        store.create_task(plan.id, &t).await.unwrap();
+        let s0 = a_step(0, "first", Some("check it"));
+        let s1 = a_step(1, "second", None);
+        let s2 = a_step(2, "third", None);
+        for s in [&s2, &s0, &s1] {
+            store.create_step(t.id, s).await.unwrap();
+        }
+        assert_eq!(
+            ids(&store.get_task_steps(t.id).await.unwrap(), |s| s.id),
+            vec![s0.id, s1.id, s2.id]
+        );
+        let got = store.get_step(s0.id).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                got.order,
+                got.description.as_str(),
+                got.verification.as_deref()
+            ),
+            (0, "first", Some("check it"))
+        );
+        assert_eq!(got.status, StepStatus::Pending);
+        assert_eq!(
+            store.get_step(s1.id).await.unwrap().unwrap().verification,
+            None
+        );
+
+        store
+            .update_step(
+                s0.id,
+                &project_orchestrator::plan::models::UpdateStepRequest {
+                    description: Some("first, reworded".into()),
+                    status: None,
+                    verification: None,
+                },
+            )
+            .await
+            .unwrap();
+        let got = store.get_step(s0.id).await.unwrap().unwrap();
+        assert_eq!(got.description, "first, reworded");
+        assert!(got.updated_at.is_some());
+
+        store
+            .update_step_status(s0.id, StepStatus::InProgress)
+            .await
+            .unwrap();
+        store
+            .update_step_status(s1.id, StepStatus::Completed)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_step(s0.id).await.unwrap().unwrap().status,
+            StepStatus::InProgress
+        );
+        assert!(store
+            .get_step(s1.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .completed_at
+            .is_some());
+        assert_eq!(store.get_task_step_progress(t.id).await.unwrap(), (1, 3));
+        assert_eq!(
+            store.complete_pending_steps_for_task(t.id).await.unwrap(),
+            2
+        );
+        assert_eq!(store.get_task_step_progress(t.id).await.unwrap(), (3, 3));
+        assert_eq!(
+            store.complete_pending_steps_for_task(t.id).await.unwrap(),
+            0
+        );
+
+        store.delete_step(s2.id).await.unwrap();
+        assert!(store.get_step(s2.id).await.unwrap().is_none());
+        assert_eq!(store.get_task_step_progress(t.id).await.unwrap(), (2, 2));
+        assert_eq!(
+            store.get_task_step_progress(Uuid::new_v4()).await.unwrap(),
+            (0, 0)
+        );
+
+        // Deleting the task takes its steps with it.
+        store.delete_task(t.id).await.unwrap();
+        assert!(store.get_step(s0.id).await.unwrap().is_none());
+        task_cleanup(store, &p, &plan).await;
+    }
+
+    /// The day plan: the position in the list is the order (unknown ids skipped,
+    /// their position kept), add appends once, remove removes, dates are separate.
+    pub async fn check_day_plan(store: &dyn GraphStore) {
+        let (p, plan) = task_fixture(store, "day").await;
+        let a = a_full_task("a", 1, 1);
+        let b = a_full_task("b", 1, 2);
+        let c = a_full_task("c", 1, 3);
+        for t in [&a, &b, &c] {
+            store.create_task(plan.id, t).await.unwrap();
+        }
+        let user = Uuid::new_v4();
+        let date = "2026-11-13";
+        assert!(store.get_day_plan(user, date).await.unwrap().is_empty());
+        store
+            .set_day_plan(user, date, &[b.id, Uuid::new_v4(), a.id])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_day_plan(user, date).await.unwrap(),
+            vec![(b.id, 0), (a.id, 2)]
+        );
+        store.add_to_day(user, date, c.id).await.unwrap();
+        store.add_to_day(user, date, a.id).await.unwrap();
+        assert_eq!(
+            store.get_day_plan(user, date).await.unwrap(),
+            vec![(b.id, 0), (a.id, 2), (c.id, 3)]
+        );
+        store.remove_from_day(user, date, b.id).await.unwrap();
+        assert_eq!(
+            store.get_day_plan(user, date).await.unwrap(),
+            vec![(a.id, 2), (c.id, 3)]
+        );
+        assert!(store
+            .get_day_plan(user, "2026-11-14")
+            .await
+            .unwrap()
+            .is_empty());
+        store.set_day_plan(user, date, &[c.id]).await.unwrap();
+        assert_eq!(
+            store.get_day_plan(user, date).await.unwrap(),
+            vec![(c.id, 0)]
+        );
+        store.set_day_plan(user, date, &[]).await.unwrap();
+        task_cleanup(store, &p, &plan).await;
+    }
+
+    /// Concurrent status changes and step completions, each on its own task: every
+    /// call lands, none is lost.
+    pub async fn check_task_concurrent_status_and_steps(store: &dyn GraphStore) {
+        let (p, plan) = task_fixture(store, "task-conc").await;
+        let mut taches = Vec::new();
+        for i in 0..8 {
+            let t = a_full_task(&format!("c{i}"), 1, i);
+            store.create_task(plan.id, &t).await.unwrap();
+            for k in 0..3 {
+                store
+                    .create_step(t.id, &a_step(k, "s", None))
+                    .await
+                    .unwrap();
+            }
+            taches.push(t);
+        }
+        let statuts = join_all(
+            taches
+                .iter()
+                .map(|t| store.update_task_status(t.id, TaskStatus::Completed)),
+        );
+        let etapes = join_all(
+            taches
+                .iter()
+                .map(|t| store.complete_pending_steps_for_task(t.id)),
+        );
+        let (statuts, etapes) = futures::join!(statuts, etapes);
+        assert!(statuts.iter().all(|r| r.is_ok()));
+        assert!(etapes.iter().all(|r| matches!(r, Ok(3))), "{etapes:?}");
+        for t in &taches {
+            let got = store.get_task(t.id).await.unwrap().unwrap();
+            assert_eq!(got.status, TaskStatus::Completed);
+            assert_eq!(store.get_task_step_progress(t.id).await.unwrap(), (3, 3));
+        }
+        task_cleanup(store, &p, &plan).await;
+    }
 }
 
 // ======================================================================
@@ -5176,6 +5619,27 @@ const fn neo4j(check: &'static str, why: &'static str, deterministic: bool) -> D
 /// itself, found by this suite, where the mock is right and Neo4j is not; they
 /// are not for P0.2 and are not hidden either.
 const EXPECTED_DIVERGENCES: &[Divergence] = &[
+    neo4j(
+        "check_day_plan",
+        "set_day_plan's `OPTIONAL MATCH (dp)-[inc:INCLUDES]->(:Task) DELETE inc WITH dp UNWIND $items` keeps ONE ROW PER OLD EDGE, \
+         so replacing a day plan of two entries by [c] creates the INCLUDES edge to c twice (get_day_plan: [(c, 0), (c, 0)], \
+         seen on 2026-11-13); the obrain adapter writes the list once",
+        true,
+    ),
+    mock(
+        "check_task_roundtrip_and_lifecycle",
+        "get_plan_tasks returns the tasks in insertion order, not ORDER BY priority DESC (none = 0), created_at, id (Neo4j)",
+    ),
+    mock(
+        "check_day_plan",
+        "set_day_plan numbers the KNOWN tasks 0, 1, 2… where Neo4j's UNWIND gives each id its position in the list, an unknown id's position included (order 0, 2)",
+    ),
+    Divergence {
+        backend: "mock",
+        check: "check_task_dependencies_and_waves",
+        why: "compute_waves does not sort a wave by priority DESC then title (it keeps the HashMap order of its queue); Neo4j sorts every wave",
+        deterministic: false,
+    },
     Divergence {
         backend: "mock",
         check: "check_workspace_list_order",
@@ -6875,3 +7339,27 @@ plan_constraint_checks!(mock_plan_constraint, MockFactory);
 plan_constraint_checks!(neo4j_plan_constraint, Neo4jFactory);
 #[cfg(feature = "obrain-backend")]
 plan_constraint_checks!(obrain_plan_constraint, ObrainFactory);
+
+/// The task half of the plan domain: tasks, dependencies, graphs and waves,
+/// steps, the day plan, and concurrent writes on them. Same checks, same
+/// fixtures, on every backend that ports them.
+macro_rules! task_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [
+                check_task_roundtrip_and_lifecycle,
+                check_task_dependencies_and_waves,
+                check_step_lifecycle,
+                check_day_plan,
+                check_task_concurrent_status_and_steps,
+            ]
+        );
+    };
+}
+
+task_checks!(mock_task, MockFactory);
+task_checks!(neo4j_task, Neo4jFactory);
+#[cfg(feature = "obrain-backend")]
+task_checks!(obrain_task, ObrainFactory);
