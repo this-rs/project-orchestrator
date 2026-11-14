@@ -103,8 +103,9 @@ mod with_the_feature {
         defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees,
         refusees_chat, refusees_commit, refusees_decision, refusees_featuregraph, refusees_note,
         refusees_persona, refusees_plan, refusees_planrun, refusees_protocolrun, refusees_release,
-        Creation, Durabilite, Interruption, NonPorte, ObrainGraphStore, ObrainSearchStore,
-        RapportOuverture, MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
+        refusees_sharing, refusees_skill, Creation, Durabilite, Interruption, NonPorte,
+        ObrainGraphStore, ObrainSearchStore, RapportOuverture, MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN,
+        SCHEMA_PO,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -3612,6 +3613,9 @@ mod with_the_feature {
         assert!(refusees_protocolrun().iter().all(|m| written.contains(m)));
 
         assert!(refusees_planrun().iter().all(|m| written.contains(m)));
+
+        assert!(refusees_skill().iter().all(|m| written.contains(m)));
+        assert!(refusees_sharing().iter().all(|m| written.contains(m)));
         assert!(REFUS_ECRITS_A_LA_MAIN.iter().all(|m| written.contains(m)));
         // What keeps a default is known and justified where it is declared.
         assert_eq!(kept, ["AnalyticsStore::run_data_migrations"]);
@@ -5591,5 +5595,934 @@ mod with_the_feature {
         // The removal is applied.
         let relu = store.get_persona(prompt.id).await.unwrap().unwrap();
         assert_eq!(relu.system_prompt_override, None);
+    }
+
+    // ------------------------------------------------------------------
+    // Skills et partage
+    // ------------------------------------------------------------------
+
+    fn un_skill_publie(source: Uuid) -> project_orchestrator::skills::registry::PublishedSkill {
+        serde_json::from_value(serde_json::json!({
+            "id": Uuid::new_v4(),
+            "name": "Publié",
+            "description": "un skill du registre",
+            "tags": ["a", "b"],
+            "package": {
+                "schema_version": 3,
+                "metadata": {"format": "po-skill/v3", "exported_at": "2026-01-01T00:00:00Z",
+                    "source_project": "p",
+                    "stats": {"note_count": 0, "decision_count": 0, "trigger_count": 0,
+                        "activation_count": 0}},
+                "skill": {"name": "Publié", "description": "", "trigger_patterns": [],
+                    "context_template": null, "tags": [], "cohesion": 0.5},
+                "notes": [], "decisions": []
+            },
+            "trust_score": 0.5,
+            "trust_components": {"energy": 0.1, "cohesion": 0.2, "activation": 0.3,
+                "success_rate": 0.4, "source_projects": 0.5},
+            "trust_level": "medium",
+            "source_project_id": source,
+            "source_project_name": "p",
+            "published_by": "agent",
+            "published_at": "2026-01-01T00:00:00Z",
+            "import_count": 0
+        }))
+        .unwrap()
+    }
+
+    /// Skills (projet et transverse), membre note, activation, registre : écrits,
+    /// relus, puis relus à l'identique APRÈS fermeture et réouverture ; ensuite
+    /// rescope, retrait, suppression de la note membre (DETACH) et du skill.
+    #[tokio::test]
+    async fn skills_et_registre_survivent_une_reouverture() {
+        use project_orchestrator::notes::{Note, NoteType};
+        use project_orchestrator::skills::{SkillNode, SkillStatus, SkillTrigger};
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project("skills-reopen");
+        store.create_project(&p).await.unwrap();
+        let note = Note::new(
+            Some(p.id),
+            NoteType::Tip,
+            "membre".to_string(),
+            "alice".to_string(),
+        );
+        store.create_note(&note).await.unwrap();
+
+        let mut s = SkillNode::new(Some(p.id), "neo4j");
+        s.status = SkillStatus::Active;
+        s.energy = 0.9;
+        s.trigger_patterns = vec![SkillTrigger::regex("neo4j|cypher", 0.7)];
+        s.tags = vec!["db".into()];
+        s.context_template = Some("tpl".into());
+        store.create_skill(&s).await.unwrap();
+        let mut t = SkillNode::new(None, "transverse");
+        t.status = SkillStatus::Active;
+        t.energy = 0.1;
+        store.create_skill(&t).await.unwrap();
+
+        store.add_skill_member(s.id, "note", note.id).await.unwrap();
+        // MERGE: a second add draws no second edge.
+        store.add_skill_member(s.id, "note", note.id).await.unwrap();
+        store.increment_skill_activation(s.id).await.unwrap();
+        let publiee = un_skill_publie(p.id);
+        store.upsert_published_skill(&publiee).await.unwrap();
+        store
+            .increment_published_skill_imports(publiee.id)
+            .await
+            .unwrap();
+
+        let avant = store.get_skill(s.id).await.unwrap().unwrap();
+        assert_eq!(avant.note_count, 1);
+        assert_eq!(avant.activation_count, 1);
+        assert!(avant.last_activated.is_some());
+
+        store.close().await.unwrap();
+        drop(store);
+        let store = open(&base).await;
+        let rapport = store.rapport_d_ouverture().clone();
+        assert!(rapport.en_quarantaine.is_empty(), "{rapport:?}");
+        let apres = store.get_skill(s.id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&apres).unwrap(),
+            serde_json::to_value(&avant).unwrap()
+        );
+        let (membres, decisions) = store.get_skill_members(s.id).await.unwrap();
+        assert_eq!(membres.iter().map(|n| n.id).collect::<Vec<_>>(), [note.id]);
+        assert!(decisions.is_empty());
+        let ids = |v: Vec<SkillNode>| v.into_iter().map(|k| k.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(store.get_skills_for_note(note.id).await.unwrap()),
+            [s.id]
+        );
+        // The scope rule: a project sees its skills AND the transverse ones.
+        let (liste, total) = store.list_skills(Some(p.id), None, 10, 0).await.unwrap();
+        assert_eq!((ids(liste), total), (vec![s.id, t.id], 2));
+        assert_eq!(
+            ids(store.list_skills(None, None, 10, 0).await.unwrap().0),
+            [t.id]
+        );
+        assert_eq!(
+            ids(store.get_skills_for_project(p.id).await.unwrap()),
+            [s.id]
+        );
+        assert_eq!(
+            ids(store.get_live_skills_for_project(p.id).await.unwrap()),
+            [s.id]
+        );
+        let declenches = store
+            .match_skills_by_trigger(Some(p.id), "une requête CYPHER")
+            .await
+            .unwrap();
+        assert_eq!(
+            declenches
+                .iter()
+                .map(|(k, c)| (k.id, *c))
+                .collect::<Vec<_>>(),
+            [(s.id, 1.0)]
+        );
+        let ctx = store.activate_skill(s.id, "q").await.unwrap();
+        assert_eq!(ctx.activated_notes.len(), 1);
+        assert!(ctx.context_text.starts_with("## Skill: neo4j"));
+        assert_eq!(
+            store
+                .get_skill(s.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .activation_count,
+            2
+        );
+        let relu = store
+            .get_published_skill(publiee.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(relu.import_count, 1);
+        assert_eq!(relu.tags, publiee.tags);
+        let (trouves, total) = store
+            .search_published_skills(Some("PUBL"), Some(0.1), None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!((trouves.len(), total), (1, 1));
+        assert_eq!(
+            store
+                .search_published_skills(None, Some(0.9), None, 10, 0)
+                .await
+                .unwrap()
+                .1,
+            0
+        );
+
+        store.rescope_skill(s.id, None).await.unwrap();
+        assert_eq!(
+            store.get_skill(s.id).await.unwrap().unwrap().project_id,
+            None
+        );
+        assert!(store
+            .remove_skill_member(s.id, "note", note.id)
+            .await
+            .unwrap());
+        assert!(!store
+            .remove_skill_member(s.id, "note", note.id)
+            .await
+            .unwrap());
+        assert_eq!(store.get_skill(s.id).await.unwrap().unwrap().note_count, 0);
+        store.add_skill_member(s.id, "note", note.id).await.unwrap();
+        // Deleting the note detaches its MEMBER_OF: the skill no longer serves it.
+        assert!(store.delete_note(note.id).await.unwrap());
+        assert!(store.get_skill_members(s.id).await.unwrap().0.is_empty());
+        assert!(store.get_skills_for_note(note.id).await.unwrap().is_empty());
+        assert!(store.delete_skill(s.id).await.unwrap());
+        assert!(!store.delete_skill(s.id).await.unwrap());
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = open(&base).await;
+        assert!(store.get_skill(s.id).await.unwrap().is_none());
+        assert_eq!(
+            store.get_skill(t.id).await.unwrap().unwrap().name,
+            "transverse"
+        );
+        assert_eq!(
+            store
+                .get_published_skill(publiee.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .import_count,
+            1
+        );
+        store.close().await.unwrap();
+    }
+
+    /// Une création de skill interrompue à chacune de ses écritures : rien n'est
+    /// servi, la réouverture supprime le brouillon (et rien d'autre), et la même
+    /// création réussit ensuite.
+    #[tokio::test]
+    async fn une_creation_de_skill_interrompue_ne_laisse_qu_un_brouillon() {
+        use project_orchestrator::skills::SkillNode;
+        let dir = tempfile::tempdir().unwrap();
+        let mut touches = 0;
+        for k in 1..=60 {
+            let base = dir.path().join(format!("skill-{k}"));
+            let store = open(&base).await;
+            let p = a_project("skill-interrompu");
+            store.create_project(&p).await.unwrap();
+            let s = SkillNode::new(Some(p.id), "interrompu");
+            store.interrompre_au_prochain(Interruption::AvantEtape(k));
+            if store.create_skill(&s).await.is_ok() {
+                // Past the last write of a creation: every point was reached.
+                store.close().await.unwrap();
+                break;
+            }
+            touches += 1;
+            assert!(store.get_skill(s.id).await.unwrap().is_none(), "{k}");
+            store.close().await.unwrap();
+            drop(store);
+
+            let store = open(&base).await;
+            let rapport = store.rapport_d_ouverture().clone();
+            assert_eq!(rapport.brouillons_supprimes, 1, "{k}: {rapport:?}");
+            assert!(rapport.en_quarantaine.is_empty(), "{k}: {rapport:?}");
+            assert!(store.get_skill(s.id).await.unwrap().is_none(), "{k}");
+            assert_eq!(
+                store.list_skills(Some(p.id), None, 10, 0).await.unwrap().1,
+                0
+            );
+            store.create_skill(&s).await.unwrap();
+            store.close().await.unwrap();
+        }
+        // The marker, every property, the BELONGS_TO edge, the commit point.
+        assert!(touches >= 20, "points atteints : {touches}");
+    }
+
+    /// Une base écrite ailleurs : un skill illisible est mis en quarantaine (son id
+    /// est réservé), un skill lisible avec un membre Decision est servi mais ses
+    /// membres sont refusés par leur nom, un événement de partage sans date est en
+    /// quarantaine.
+    #[tokio::test]
+    async fn une_base_etrangere_met_en_quarantaine_ce_qu_elle_ne_lit_pas() {
+        use project_orchestrator::episodes::distill_models::{
+            PrivacyMode, SharingConsent, SharingEvent,
+        };
+        use project_orchestrator::skills::SkillNode;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        store.close().await.unwrap();
+        drop(store);
+        let illisible = Uuid::new_v4();
+        let lisible = Uuid::new_v4();
+        let maintenant = Utc::now().to_rfc3339();
+        write_foreign(&base, move |db| {
+            db.create_node_with_props(
+                &["Skill"],
+                vec![
+                    ("id", Value::from(illisible.to_string())),
+                    ("name", Value::from("illisible")),
+                    ("status", Value::from("zombie")),
+                    ("created_at", Value::from(maintenant.clone())),
+                    ("updated_at", Value::from(maintenant.clone())),
+                ],
+            );
+            let s = db.create_node_with_props(
+                &["Skill"],
+                vec![
+                    ("id", Value::from(lisible.to_string())),
+                    ("name", Value::from("lisible")),
+                    ("status", Value::from("active")),
+                    ("created_at", Value::from(maintenant.clone())),
+                    ("updated_at", Value::from(maintenant)),
+                ],
+            );
+            let d = db.create_node_with_props(
+                &["Decision"],
+                vec![("id", Value::from(Uuid::new_v4().to_string()))],
+            );
+            db.create_edge(d, s, "MEMBER_OF_SKILL");
+            db.create_node_with_props(&["SharingEvent"], vec![("id", Value::from("ev-sans-date"))]);
+        })
+        .await;
+
+        let store = open(&base).await;
+        let rapport = store.rapport_d_ouverture().clone();
+        assert!(
+            rapport.en_quarantaine.iter().any(|q| q.contains("zombie")),
+            "{rapport:?}"
+        );
+        assert!(
+            rapport
+                .en_quarantaine
+                .iter()
+                .any(|q| q.contains("SharingEvent") && q.contains("timestamp")),
+            "{rapport:?}"
+        );
+        assert_eq!(rapport.brouillons_supprimes, 0);
+        // The unreadable skill: not served, its id not reusable, not deleted blindly.
+        assert!(store.get_skill(illisible).await.unwrap().is_none());
+        let mut s = SkillNode::new(None, "nouveau");
+        s.id = illisible;
+        let err = store.create_skill(&s).await.unwrap_err();
+        assert!(format!("{err:#}").contains("réservé"), "{err:#}");
+        assert!(store.delete_skill(illisible).await.is_err());
+        // The readable one is served; its members are refused by name.
+        assert_eq!(
+            store.get_skill(lisible).await.unwrap().unwrap().name,
+            "lisible"
+        );
+        assert_eq!(
+            store
+                .get_skill_members(lisible)
+                .await
+                .unwrap_err()
+                .downcast_ref::<NonPorte>(),
+            Some(&NonPorte("SkillStore::get_skill_members"))
+        );
+        assert_eq!(
+            store
+                .activate_skill(lisible, "q")
+                .await
+                .unwrap_err()
+                .downcast_ref::<NonPorte>(),
+            Some(&NonPorte("SkillStore::activate_skill"))
+        );
+        // The event: its id is reserved.
+        let ev = SharingEvent {
+            id: "ev-sans-date".into(),
+            content_hash: "h".into(),
+            artifact_type: "note".into(),
+            action: "shared".into(),
+            source_did: "did:a".into(),
+            target_did: "broadcast".into(),
+            timestamp: Utc::now(),
+            consent: SharingConsent::NotSet,
+            privacy_mode: PrivacyMode::Standard,
+            reason: None,
+        };
+        let err = store.create_sharing_event(&ev).await.unwrap_err();
+        assert!(format!("{err:#}").contains("réservé"), "{err:#}");
+        // Removing every member deletes the Decision edge without the Decision domain;
+        // the members are then served.
+        assert_eq!(store.remove_all_skill_members(lisible).await.unwrap(), 1);
+        let (notes, decisions) = store.get_skill_members(lisible).await.unwrap();
+        assert!(notes.is_empty() && decisions.is_empty());
+        store.close().await.unwrap();
+        drop(store);
+        let store = open(&base).await;
+        assert!(store.get_skill_members(lisible).await.is_ok());
+        store.close().await.unwrap();
+    }
+
+    /// Chaque méthode des registres REFUSEES de skill.rs et sharing.rs refuse par
+    /// son nom ; les refus conditionnels aussi, et rien n'est écrit.
+    #[tokio::test]
+    async fn les_refus_skill_et_partage_sont_nommes_et_n_ecrivent_rien() {
+        use project_orchestrator::episodes::distill_models::SharingConsent;
+        use project_orchestrator::skills::SkillNode;
+        let store = temporary(Durabilite::Wal).await;
+        let id = Uuid::new_v4();
+        let mut verifiees = 0;
+        for nom in refusees_skill().iter().chain(refusees_sharing()) {
+            let resultat = match *nom {
+                "SkillStore::create_used_skill_relation" => {
+                    store.create_used_skill_relation(id, id, "success").await
+                }
+                "SharingStore::update_decision_sharing_consent" => {
+                    store
+                        .update_decision_sharing_consent(id, &SharingConsent::ExplicitAllow)
+                        .await
+                }
+                "SharingStore::list_sharing_events" => {
+                    store.list_sharing_events(id, 10, 0).await.map(|_| ())
+                }
+                autre => panic!("refus sans vérification : {autre}"),
+            };
+            assert_eq!(
+                resultat.unwrap_err().downcast_ref::<NonPorte>(),
+                Some(&NonPorte(nom))
+            );
+            verifiees += 1;
+        }
+        assert_eq!(verifiees, 3);
+
+        // Conditional refusals: a Decision member, a tags filter.
+        let p = a_project("skill-refus");
+        store.create_project(&p).await.unwrap();
+        let s = SkillNode::new(Some(p.id), "refus");
+        store.create_skill(&s).await.unwrap();
+        let avant = serde_json::to_value(store.get_skill(s.id).await.unwrap()).unwrap();
+        assert_eq!(
+            not_ported(store.add_skill_member(s.id, "decision", id).await),
+            NonPorte("SkillStore::add_skill_member")
+        );
+        assert_eq!(
+            not_ported(store.remove_skill_member(s.id, "decision", id).await),
+            NonPorte("SkillStore::remove_skill_member")
+        );
+        let tags = ["a".to_string()];
+        assert_eq!(
+            not_ported(
+                store
+                    .search_published_skills(None, None, Some(&tags), 10, 0)
+                    .await
+            ),
+            NonPorte("SkillStore::search_published_skills")
+        );
+        assert_eq!(
+            serde_json::to_value(store.get_skill(s.id).await.unwrap()).unwrap(),
+            avant
+        );
+        // Plain errors, before any write: an unknown member type, an unknown
+        // project, a published skill without source project.
+        let err = store.add_skill_member(s.id, "plan", id).await.unwrap_err();
+        assert!(err.downcast_ref::<NonPorte>().is_none());
+        let orphelin = SkillNode::new(Some(Uuid::new_v4()), "orphelin");
+        assert!(store.create_skill(&orphelin).await.is_err());
+        assert!(store.get_skill(orphelin.id).await.unwrap().is_none());
+        let mut sans_source = un_skill_publie(p.id);
+        sans_source.source_project_id = None;
+        assert!(store.upsert_published_skill(&sans_source).await.is_err());
+        assert!(store
+            .get_published_skill(sans_source.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Politique, consentement, événements et tombes : écrits, relus, puis relus
+    /// à l'identique après fermeture et réouverture.
+    #[tokio::test]
+    async fn le_partage_survit_une_reouverture() {
+        use project_orchestrator::episodes::distill_models::{
+            ConsentCounts, PrivacyMode, SharingConsent, SharingEvent, SharingPolicy,
+        };
+        use project_orchestrator::notes::{Note, NoteType};
+        use project_orchestrator::reception::anchor::SignedTombstone;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project("partage");
+        store.create_project(&p).await.unwrap();
+        assert!(store.get_sharing_policy(p.id).await.unwrap().is_none());
+        let politique = SharingPolicy {
+            min_shareability_score: 0.9,
+            ..Default::default()
+        };
+        store.update_sharing_policy(p.id, &politique).await.unwrap();
+        // An unknown project: Neo4j's MATCH, nothing written.
+        store
+            .update_sharing_policy(Uuid::new_v4(), &politique)
+            .await
+            .unwrap();
+
+        let n1 = Note::new(Some(p.id), NoteType::Tip, "a".into(), "alice".into());
+        let n2 = Note::new(None, NoteType::Tip, "b".into(), "alice".into());
+        store.create_note(&n1).await.unwrap();
+        store.create_note(&n2).await.unwrap();
+        store
+            .update_sharing_consent(n1.id, &SharingConsent::ExplicitAllow)
+            .await
+            .unwrap();
+
+        let ev = |id: &str, secondes: i64| SharingEvent {
+            id: id.into(),
+            content_hash: format!("h-{id}"),
+            artifact_type: "note".into(),
+            action: "shared".into(),
+            source_did: "did:a".into(),
+            target_did: "broadcast".into(),
+            timestamp: Utc::now() + chrono::Duration::seconds(secondes),
+            consent: SharingConsent::PolicyAuto,
+            privacy_mode: PrivacyMode::Strict,
+            reason: Some("audit".into()),
+        };
+        let (ancien, recent) = (ev("ev-1", -60), ev("ev-2", 0));
+        store.create_sharing_event(&ancien).await.unwrap();
+        store.create_sharing_event(&recent).await.unwrap();
+        assert!(store.create_sharing_event(&recent).await.is_err());
+
+        let identite = project_orchestrator::identity::InstanceIdentity::generate();
+        let vraie = project_orchestrator::sharing::tombstone::sign_tombstone(
+            &identite,
+            "hash-vrai".into(),
+            Utc::now(),
+            Some("rgpd".into()),
+        );
+        let factice = SignedTombstone {
+            content_hash: "hash-factice".into(),
+            issuer_did: "did:local:unknown".into(),
+            signature_hex: "00".into(),
+            issued_at: Utc::now(),
+            reason: None,
+        };
+        store.persist_tombstone(&vraie).await.unwrap();
+        store.persist_tombstone(&factice).await.unwrap();
+        // MERGE on the hash: a second write of the same hash replaces, never doubles.
+        store.persist_tombstone(&factice).await.unwrap();
+
+        let compte = |not_set, explicit_allow| ConsentCounts {
+            not_set,
+            explicit_allow,
+            explicit_deny: 0,
+            policy_auto: 0,
+        };
+        {
+            let passe = "avant la réouverture";
+            let relue = store.get_sharing_policy(p.id).await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(&relue).unwrap(),
+                serde_json::to_value(&politique).unwrap(),
+                "{passe}"
+            );
+            // The project index sees the policy too.
+            assert!(
+                store
+                    .get_project(p.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .sharing_policy
+                    .is_some(),
+                "{passe}"
+            );
+            assert_eq!(
+                store.get_sharing_consent(n1.id).await.unwrap(),
+                SharingConsent::ExplicitAllow,
+                "{passe}"
+            );
+            assert_eq!(
+                store
+                    .get_note(n1.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .sharing_consent,
+                SharingConsent::ExplicitAllow,
+                "{passe}"
+            );
+            assert_eq!(
+                store.get_sharing_consent(n2.id).await.unwrap(),
+                SharingConsent::NotSet
+            );
+            assert_eq!(
+                store.get_sharing_consent(Uuid::new_v4()).await.unwrap(),
+                SharingConsent::NotSet
+            );
+            assert_eq!(
+                store.count_notes_by_consent(Some(p.id)).await.unwrap(),
+                compte(0, 1),
+                "{passe}"
+            );
+            assert_eq!(
+                store.count_notes_by_consent(None).await.unwrap(),
+                compte(1, 1),
+                "{passe}"
+            );
+            let tombes = store.list_tombstones().await.unwrap();
+            assert_eq!(tombes.len(), 2, "{passe}");
+            let relue = tombes
+                .iter()
+                .find(|t| t.content_hash == "hash-vrai")
+                .unwrap();
+            assert!(project_orchestrator::sharing::tombstone::verify_tombstone(
+                relue
+            ));
+            assert!(store.is_tombstoned("hash-vrai").await.unwrap(), "{passe}");
+            assert!(!store.is_tombstoned("hash-factice").await.unwrap());
+            assert!(!store.is_tombstoned("inconnu").await.unwrap());
+        }
+        store.close().await.unwrap();
+        drop(store);
+        let store = open(&base).await;
+        assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
+        let relue = store.get_sharing_policy(p.id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&relue).unwrap(),
+            serde_json::to_value(&politique).unwrap()
+        );
+        assert_eq!(
+            store.get_sharing_consent(n1.id).await.unwrap(),
+            SharingConsent::ExplicitAllow
+        );
+        assert_eq!(
+            store.count_notes_by_consent(None).await.unwrap(),
+            compte(1, 1)
+        );
+        // The events were durable: their ids are still taken after the reopen.
+        for ev in [&ancien, &recent] {
+            let err = store.create_sharing_event(ev).await.unwrap_err();
+            assert!(format!("{err:#}").contains("existe déjà"), "{err:#}");
+        }
+        assert_eq!(store.list_tombstones().await.unwrap().len(), 2);
+        assert!(store.is_tombstoned("hash-vrai").await.unwrap());
+        assert!(!store.is_tombstoned("hash-factice").await.unwrap());
+        assert_eq!(
+            not_ported(
+                store
+                    .update_decision_sharing_consent(Uuid::new_v4(), &SharingConsent::NotSet)
+                    .await
+            ),
+            NonPorte("SharingStore::update_decision_sharing_consent")
+        );
+        store.close().await.unwrap();
+    }
+    /// Relecture de #1213 (C1, C2, C3, M4) : une base importée, écrite hors de PO,
+    /// qui ne doit jamais être lue plus permissive que la référence.
+    struct Importee {
+        _dir: tempfile::TempDir,
+        store: ObrainGraphStore,
+        projet: Uuid,
+        refus: Uuid,
+        vide: Uuid,
+        actif: Uuid,
+        ok: Uuid,
+    }
+
+    async fn base_importee() -> Importee {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project("import-strict");
+        store.create_project(&p).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+
+        let (refus, vide, actif) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (ok, corrompue, sans_energie) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let pid = p.id.to_string();
+        write_foreign(&base, move |db| {
+            let t = Utc::now().to_rfc3339();
+            let note =
+                |id: Uuid, statut: &str, energie: Option<f64>, consentement: Option<&str>| {
+                    let mut props = vec![
+                        ("id", Value::from(id.to_string())),
+                        ("status", Value::from(statut)),
+                        ("note_type", Value::from("tip")),
+                        ("created_by", Value::from("alice")),
+                        ("content", Value::from(format!("note {id}"))),
+                        ("created_at", Value::from(t.clone())),
+                        ("project_id", Value::from(pid.clone())),
+                    ];
+                    if let Some(e) = energie {
+                        props.push(("energy", Value::from(e)));
+                    }
+                    if let Some(c) = consentement {
+                        props.push(("sharing_consent", Value::from(c)));
+                    }
+                    db.create_node_with_props(&["Note"], props)
+                };
+            // C1: a refusal stored in a form the decoder does not know.
+            note(refus, "active", Some(0.5), Some("ExplicitDeny"));
+            // C2: the legacy empty scope.
+            db.create_node_with_props(
+                &["Skill"],
+                vec![
+                    ("id", Value::from(vide.to_string())),
+                    ("name", Value::from("vide")),
+                    ("status", Value::from("active")),
+                    ("project_id", Value::from("")),
+                    ("created_at", Value::from(t.clone())),
+                    ("updated_at", Value::from(t.clone())),
+                ],
+            );
+            // C3: a placeholder and the real tombstone, same hash.
+            for (emetteur, signature) in [("did:local:unknown", "00"), ("did:key:zreel", "abcd")] {
+                db.create_node_with_props(
+                    &["Tombstone"],
+                    vec![
+                        ("content_hash", Value::from("h-double")),
+                        ("issuer_did", Value::from(emetteur)),
+                        ("signature_hex", Value::from(signature)),
+                        ("issued_at", Value::from(t.clone())),
+                    ],
+                );
+            }
+            // M4: one current member, one with an unknown status, one without energy.
+            let s = db.create_node_with_props(
+                &["Skill"],
+                vec![
+                    ("id", Value::from(actif.to_string())),
+                    ("name", Value::from("actif")),
+                    ("status", Value::from("active")),
+                    ("project_id", Value::from(pid.clone())),
+                    ("created_at", Value::from(t.clone())),
+                    ("updated_at", Value::from(t.clone())),
+                ],
+            );
+            for n in [
+                note(ok, "active", Some(0.5), None),
+                note(corrompue, "archivee-corrompue", Some(0.9), None),
+                note(sans_energie, "active", None, None),
+            ] {
+                db.create_edge(n, s, "MEMBER_OF");
+            }
+        })
+        .await;
+
+        let store = open(&base).await;
+        Importee {
+            _dir: dir,
+            store,
+            projet: p.id,
+            refus,
+            vide,
+            actif,
+            ok,
+        }
+    }
+
+    /// C1 : un consentement PRÉSENT mais illisible met la note en quarantaine ; il
+    /// n'est jamais lu `NotSet` (ouvert au partage).
+    #[tokio::test]
+    async fn un_consentement_illisible_met_la_note_en_quarantaine() {
+        use project_orchestrator::neo4j::traits::NoteStore;
+        let b = base_importee().await;
+        let rapport = b.store.rapport_d_ouverture().clone();
+        assert!(
+            rapport
+                .en_quarantaine
+                .iter()
+                .any(|q| q.contains("sharing_consent")),
+            "{rapport:?}"
+        );
+        assert!(b.store.get_sharing_consent(b.refus).await.is_err());
+        assert!(b.store.get_note(b.refus).await.unwrap().is_none());
+        assert!(b.store.count_notes_by_consent(None).await.is_err());
+    }
+
+    /// C2 : un skill à `project_id` vide n'est servi à aucun projet (Neo4j ne le
+    /// sert à aucun ; lu transverse, il le serait à tous).
+    #[tokio::test]
+    async fn un_skill_a_portee_vide_n_est_servi_a_aucun_projet() {
+        let b = base_importee().await;
+        let visibles = b
+            .store
+            .list_skills(Some(b.projet), None, 50, 0)
+            .await
+            .unwrap()
+            .0;
+        assert!(visibles.iter().all(|k| k.id != b.vide), "{visibles:?}");
+        let ailleurs = b
+            .store
+            .list_skills(Some(Uuid::new_v4()), None, 50, 0)
+            .await
+            .unwrap()
+            .0;
+        assert!(ailleurs.iter().all(|k| k.id != b.vide), "{ailleurs:?}");
+        assert!(b.store.get_skill(b.vide).await.unwrap().is_none());
+    }
+
+    /// C3 : deux tombes d'un même hash (un placeholder et la vraie) : la question
+    /// « révoqué ? » répond par une erreur, jamais par `false`.
+    #[tokio::test]
+    async fn deux_tombes_d_un_meme_hash_ne_repondent_pas_non_revoque() {
+        let b = base_importee().await;
+        assert!(b.store.is_tombstoned("h-double").await.is_err());
+        assert!(b.store.list_tombstones().await.is_err());
+    }
+
+    /// M4 : l'activation ne retient que les notes courantes au sens des
+    /// propriétés brutes (statut connu, énergie présente), comme Neo4j.
+    #[tokio::test]
+    async fn l_activation_ne_retient_que_les_notes_courantes_brutes() {
+        let b = base_importee().await;
+        let ctx = b.store.activate_skill(b.actif, "q").await.unwrap();
+        assert_eq!(
+            ctx.activated_notes
+                .iter()
+                .map(|a| a.note.id)
+                .collect::<Vec<_>>(),
+            [b.ok]
+        );
+    }
+
+    /// Tant qu'obrain ne journalise pas les valeurs en colonne blob (#1190), une
+    /// écriture de skill ou de partage qui porte une valeur > 256 o — ou qui en
+    /// REMPLACE une — paie le flush complet avant d'être acquittée. Mesuré par le
+    /// compteur de fsync du moteur, sans passer par `close()`.
+    async fn store_avec_projet() -> (ObrainGraphStore, ProjectNode) {
+        let store = temporary(Durabilite::Wal).await;
+        let p = a_project("blob");
+        store.create_project(&p).await.unwrap();
+        (store, p)
+    }
+
+    /// The fsyncs one write cost.
+    macro_rules! cout {
+        ($store:expr, $e:expr) => {{
+            let t0 = $store.fsyncs_du_wal().unwrap();
+            $e.await.unwrap();
+            $store.fsyncs_du_wal().unwrap() - t0
+        }};
+    }
+
+    fn un_evenement(
+        id: &str,
+        raison: String,
+    ) -> project_orchestrator::episodes::distill_models::SharingEvent {
+        use project_orchestrator::episodes::distill_models::{
+            PrivacyMode, SharingConsent, SharingEvent,
+        };
+        SharingEvent {
+            id: id.into(),
+            content_hash: "h".into(),
+            artifact_type: "note".into(),
+            action: "shared".into(),
+            source_did: "did:a".into(),
+            target_did: "broadcast".into(),
+            timestamp: Utc::now(),
+            consent: SharingConsent::NotSet,
+            privacy_mode: PrivacyMode::Standard,
+            reason: Some(raison),
+        }
+    }
+
+    fn une_tombe(
+        hash: &str,
+        raison: String,
+    ) -> project_orchestrator::reception::anchor::SignedTombstone {
+        project_orchestrator::reception::anchor::SignedTombstone {
+            content_hash: hash.into(),
+            issuer_did: "did:key:z".into(),
+            signature_hex: "ab".into(),
+            issued_at: Utc::now(),
+            reason: Some(raison),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_skill_au_dela_du_seuil_paie_le_flush_complet() {
+        use project_orchestrator::skills::SkillNode;
+        let (store, p) = store_avec_projet().await;
+        let mut petit = SkillNode::new(Some(p.id), "petit");
+        petit.description = "x".repeat(256);
+        let mut grand = SkillNode::new(Some(p.id), "grand");
+        grand.description = "x".repeat(257);
+        let c_petit = cout!(store, store.create_skill(&petit));
+        let c_grand = cout!(store, store.create_skill(&grand));
+        assert!(c_grand > c_petit, "{c_grand} contre {c_petit}");
+    }
+
+    #[tokio::test]
+    async fn update_skill_qui_remplace_une_valeur_longue_paie_le_flush_complet() {
+        use project_orchestrator::skills::SkillNode;
+        let (store, p) = store_avec_projet().await;
+        let petit = SkillNode::new(Some(p.id), "petit");
+        let mut grand = SkillNode::new(Some(p.id), "grand");
+        grand.description = "x".repeat(257);
+        store.create_skill(&petit).await.unwrap();
+        store.create_skill(&grand).await.unwrap();
+        // The SAME small value written over a short one, and over a long one.
+        let mut a = petit.clone();
+        a.description = "y".into();
+        let mut b = grand.clone();
+        b.description = "y".into();
+        let c_petit = cout!(store, store.update_skill(&a));
+        let c_grand = cout!(store, store.update_skill(&b));
+        assert!(c_grand > c_petit, "{c_grand} contre {c_petit}");
+    }
+
+    #[tokio::test]
+    async fn create_sharing_event_au_dela_du_seuil_paie_le_flush_complet() {
+        let (store, _) = store_avec_projet().await;
+        let c_petit = cout!(
+            store,
+            store.create_sharing_event(&un_evenement("e-petit", "r".repeat(256)))
+        );
+        let c_grand = cout!(
+            store,
+            store.create_sharing_event(&un_evenement("e-grand", "r".repeat(257)))
+        );
+        assert!(c_grand > c_petit, "{c_grand} contre {c_petit}");
+    }
+
+    #[tokio::test]
+    async fn persist_tombstone_au_dela_du_seuil_et_son_remplacement_paient_le_flush_complet() {
+        let (store, _) = store_avec_projet().await;
+        let c_petit = cout!(
+            store,
+            store.persist_tombstone(&une_tombe("t-petit", "r".repeat(256)))
+        );
+        let c_grand = cout!(
+            store,
+            store.persist_tombstone(&une_tombe("t-grand", "r".repeat(257)))
+        );
+        assert!(c_grand > c_petit, "création : {c_grand} contre {c_petit}");
+        let c_petit = cout!(
+            store,
+            store.persist_tombstone(&une_tombe("t-petit", "court".into()))
+        );
+        let c_grand = cout!(
+            store,
+            store.persist_tombstone(&une_tombe("t-grand", "court".into()))
+        );
+        assert!(c_grand > c_petit, "MERGE : {c_grand} contre {c_petit}");
+    }
+
+    #[tokio::test]
+    async fn update_sharing_policy_au_dela_du_seuil_et_son_remplacement_paient_le_flush_complet() {
+        use project_orchestrator::episodes::distill_models::SharingPolicy;
+        let (store, p) = store_avec_projet().await;
+        let mut longue = SharingPolicy::default();
+        longue.type_overrides.insert(
+            "t".repeat(300),
+            serde_json::from_value(serde_json::json!("never")).unwrap(),
+        );
+        let c_petit = cout!(
+            store,
+            store.update_sharing_policy(p.id, &SharingPolicy::default())
+        );
+        let c_grand = cout!(store, store.update_sharing_policy(p.id, &longue));
+        assert!(c_grand > c_petit, "{c_grand} contre {c_petit}");
+        let c_remplace = cout!(
+            store,
+            store.update_sharing_policy(p.id, &SharingPolicy::default())
+        );
+        assert!(
+            c_remplace > c_petit,
+            "remplacement : {c_remplace} contre {c_petit}"
+        );
     }
 }
