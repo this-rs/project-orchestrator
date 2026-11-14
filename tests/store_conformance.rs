@@ -6455,3 +6455,27 @@ commit_checks!(mock_commit, MockFactory);
 commit_checks!(neo4j_commit, Neo4jFactory);
 #[cfg(feature = "obrain-backend")]
 commit_checks!(obrain_commit, ObrainFactory);
+
+/// The ingress journal and the delivery claims (`PlanRunStore`): the checks that
+/// call nothing else, on the same fixtures for every backend ported to them.
+/// Neo4j runs them in `all_checks!`; the mock runs them there too and here, next
+/// to the obrain backend, so the three are read side by side.
+macro_rules! ingress_checks {
+    ($backend:ident, $factory:ident) => {
+        conformance_suite!(
+            $backend,
+            $factory,
+            [
+                check_external_event_journal,
+                check_external_delivery_claim,
+                check_concurrent_external_delivery_claim,
+                check_external_delivery_release,
+                check_external_event_purge,
+            ]
+        );
+    };
+}
+
+ingress_checks!(mock_ingress, MockFactory);
+#[cfg(feature = "obrain-backend")]
+ingress_checks!(obrain_ingress, ObrainFactory);

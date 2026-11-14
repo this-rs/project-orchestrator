@@ -102,9 +102,9 @@ mod with_the_feature {
     use project_orchestrator::obrain::{
         defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees,
         refusees_chat, refusees_commit, refusees_decision, refusees_note, refusees_plan,
-        refusees_protocolrun, refusees_release, Creation, Durabilite, Interruption, NonPorte,
-        ObrainGraphStore, ObrainSearchStore, RapportOuverture, MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN,
-        SCHEMA_PO,
+        refusees_planrun, refusees_protocolrun, refusees_release, Creation, Durabilite,
+        Interruption, NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture, MARQUEUR_PO,
+        REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -3610,6 +3610,8 @@ mod with_the_feature {
         assert!(refusees_decision().iter().all(|m| written.contains(m)));
         assert!(refusees_plan().iter().all(|m| written.contains(m)));
         assert!(refusees_protocolrun().iter().all(|m| written.contains(m)));
+
+        assert!(refusees_planrun().iter().all(|m| written.contains(m)));
         assert!(REFUS_ECRITS_A_LA_MAIN.iter().all(|m| written.contains(m)));
         // What keeps a default is known and justified where it is declared.
         assert_eq!(kept, ["AnalyticsStore::run_data_migrations"]);
@@ -3855,5 +3857,933 @@ mod with_the_feature {
                 .1,
             0
         );
+    }
+
+    // ------------------------------------------------------------------
+    // TriggerStore (`trigger.rs`) and PlanRunStore (`planrun.rs`)
+    // ------------------------------------------------------------------
+
+    fn a_plan(project_id: Option<Uuid>) -> project_orchestrator::neo4j::models::PlanNode {
+        project_orchestrator::neo4j::models::PlanNode {
+            id: Uuid::new_v4(),
+            title: "plan of runs".to_string(),
+            description: "d".to_string(),
+            status: project_orchestrator::neo4j::models::PlanStatus::Approved,
+            created_at: Utc::now(),
+            created_by: "test".to_string(),
+            priority: 0,
+            project_id,
+            execution_context: None,
+            persona: None,
+        }
+    }
+
+    fn a_trigger(plan_id: Uuid) -> project_orchestrator::runner::Trigger {
+        project_orchestrator::runner::Trigger {
+            id: Uuid::new_v4(),
+            plan_id,
+            trigger_type: project_orchestrator::runner::TriggerType::Webhook,
+            config: serde_json::json!({"rule": {"event": "push"}}),
+            enabled: true,
+            cooldown_secs: 0,
+            last_fired: None,
+            fire_count: 0,
+            created_at: Utc::now(),
+            author: None,
+            disabled_reason: None,
+            approved_mark: None,
+        }
+    }
+
+    /// Alerts (deduplicated, acknowledged, scoped by workspace), an event trigger
+    /// and a lifecycle hook: written, closed, reopened, read back identical.
+    #[tokio::test]
+    async fn the_trigger_domain_survives_a_close_and_a_reopen() {
+        use project_orchestrator::events::trigger::EventTrigger;
+        use project_orchestrator::lifecycle::{LifecycleActionType, LifecycleHook, LifecycleScope};
+        use project_orchestrator::neo4j::models::{AlertNode, AlertSeverity, WorkspaceNode};
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let project = a_project("alerted");
+        store.create_project(&project).await.unwrap();
+        let ws = WorkspaceNode {
+            id: Uuid::new_v4(),
+            name: "ws".into(),
+            slug: format!("ws-{}", Uuid::new_v4().simple()),
+            description: None,
+            created_at: Utc::now(),
+            updated_at: None,
+            metadata: serde_json::json!({}),
+        };
+        store.create_workspace(&ws).await.unwrap();
+        store
+            .add_project_to_workspace(ws.id, project.id)
+            .await
+            .unwrap();
+        let alert = AlertNode::new_for_subject(
+            "drift".into(),
+            AlertSeverity::Critical,
+            "3 commits behind".into(),
+            Some(project.id),
+            "drift",
+        );
+        store.create_alert(&alert).await.unwrap();
+        let again = AlertNode::new_for_subject(
+            "drift".into(),
+            AlertSeverity::Critical,
+            "4 commits behind".into(),
+            Some(project.id),
+            "drift",
+        );
+        store.create_alert(&again).await.unwrap();
+        let global = AlertNode::new("other".into(), AlertSeverity::Info, "global".into(), None);
+        store.create_alert(&global).await.unwrap();
+        store.acknowledge_alert(global.id, "bob").await.unwrap();
+        let event = EventTrigger {
+            id: Uuid::new_v4(),
+            name: "on sync".into(),
+            protocol_id: Uuid::new_v4(),
+            entity_type_pattern: Some("project".into()),
+            action_pattern: Some("synced".into()),
+            payload_conditions: Some(serde_json::json!({"ok": true})),
+            cooldown_secs: 60,
+            enabled: true,
+            project_scope: Some(project.id),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.create_event_trigger(&event).await.unwrap();
+        let mut hook = LifecycleHook::new(
+            "cascade".into(),
+            LifecycleScope::Milestone,
+            "closed".into(),
+            LifecycleActionType::StartProtocol,
+            serde_json::json!({"protocol": "x"}),
+        );
+        hook.project_id = Some(project.id);
+        store.create_lifecycle_hook(&hook).await.unwrap();
+        let before_alert = store.get_alert(alert.id).await.unwrap().unwrap();
+        let before_event = store.get_event_trigger(event.id).await.unwrap().unwrap();
+        let before_hook = store.get_lifecycle_hook(hook.id).await.unwrap().unwrap();
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = open(&base).await;
+        assert_eq!(store.rapport_d_ouverture(), &RapportOuverture::default());
+        assert_eq!(
+            serde_json::to_value(store.get_alert(alert.id).await.unwrap().unwrap()).unwrap(),
+            serde_json::to_value(&before_alert).unwrap()
+        );
+        assert_eq!(before_alert.occurrence_count, 2);
+        assert_eq!(before_alert.message, "4 commits behind");
+        assert!(store.get_alert(again.id).await.unwrap().is_none());
+        let (in_ws, total) = store
+            .list_alerts(None, Some(&ws.slug), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            (in_ws.len(), total),
+            (1, 1),
+            "the global alert is no project's"
+        );
+        assert_eq!(store.list_alerts(None, None, 10, 0).await.unwrap().1, 2);
+        let pending = store.list_pending_alerts(None, 10).await.unwrap();
+        assert_eq!(pending.len(), 1, "the acknowledged alert is not pending");
+        assert_eq!(
+            serde_json::to_value(store.get_event_trigger(event.id).await.unwrap().unwrap())
+                .unwrap(),
+            serde_json::to_value(&before_event).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(store.get_lifecycle_hook(hook.id).await.unwrap().unwrap())
+                .unwrap(),
+            serde_json::to_value(&before_hook).unwrap()
+        );
+        assert_eq!(
+            store
+                .list_hooks_for_scope(&LifecycleScope::Milestone, "closed", Some(project.id))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        store.close().await.unwrap();
+    }
+
+    /// A plan run, a trigger with its firings and a reserved signal, the third-party
+    /// mark, the ingress journal and a delivery claim: written, closed, reopened,
+    /// found as they were left.
+    #[tokio::test]
+    async fn the_plan_run_domain_survives_a_close_and_a_reopen() {
+        use project_orchestrator::ingress::{ExternalEvent, IngressOutcome};
+        use project_orchestrator::runner::{
+            PlanContent, PlanRunStatus, RunnerState, SignalReservation, TriggerFiring,
+            TriggerSource,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let plan = a_plan(None);
+        store.create_plan(&plan).await.unwrap();
+        let trigger = a_trigger(plan.id);
+        store.create_trigger(&trigger).await.unwrap();
+        let mut run = RunnerState::new(
+            Uuid::new_v4(),
+            plan.id,
+            2,
+            TriggerSource::Webhook {
+                trigger_id: trigger.id,
+                payload_hash: Some("h".into()),
+            },
+        );
+        store.create_plan_run(&run).await.unwrap();
+        run.current_wave = 1;
+        run.cost_usd = 0.25;
+        store.update_plan_run(&run).await.unwrap();
+        let firing = TriggerFiring {
+            id: Uuid::new_v4(),
+            trigger_id: trigger.id,
+            plan_run_id: Some(run.run_id),
+            fired_at: Utc::now(),
+            source_payload: Some(serde_json::json!({"ref": "main"})),
+            start_error: None,
+        };
+        store.record_trigger_firing(&firing).await.unwrap();
+        assert_eq!(
+            store
+                .reserve_trigger_signal(trigger.id, "github:d-1", 0)
+                .await
+                .unwrap(),
+            SignalReservation::Reserved
+        );
+        store
+            .mark_third_party_write(PlanContent::Plan(plan.id))
+            .await
+            .unwrap();
+        let mark = store
+            .plan_third_party_written_at(plan.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let event = ExternalEvent {
+            id: Uuid::new_v4(),
+            trigger_id: trigger.id,
+            source: "github".into(),
+            outcome: IngressOutcome::Accepted,
+            reason: None,
+            delivery_id: Some("d-1".into()),
+            event_type: Some("push".into()),
+            action: None,
+            body_bytes: 12,
+            received_at: Utc::now(),
+        };
+        store.record_external_event(&event).await.unwrap();
+        assert!(store
+            .claim_external_delivery(trigger.id, "github:d-1")
+            .await
+            .unwrap());
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = open(&base).await;
+        assert_eq!(store.rapport_d_ouverture(), &RapportOuverture::default());
+        let found = store.get_plan_run(run.run_id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&found).unwrap(),
+            serde_json::to_value(&run).unwrap(),
+            "the run reads back as written, state_json included"
+        );
+        assert_eq!(found.status, PlanRunStatus::Running);
+        assert_eq!(store.list_active_plan_runs().await.unwrap().len(), 1);
+        let t = store.get_trigger(trigger.id).await.unwrap().unwrap();
+        assert_eq!(t.fire_count, 1);
+        assert!(t.last_fired.is_some(), "the reservation moved last_fired");
+        assert_eq!(
+            store
+                .reserve_trigger_signal(trigger.id, "github:d-1", 0)
+                .await
+                .unwrap(),
+            SignalReservation::Duplicate,
+            "the reserved signal survived the reopen"
+        );
+        let firings = store.list_trigger_firings(trigger.id, 10).await.unwrap();
+        assert_eq!(firings.len(), 1);
+        assert_eq!(firings[0].plan_run_id, Some(run.run_id));
+        assert_eq!(
+            store.plan_third_party_written_at(plan.id).await.unwrap(),
+            Some(mark)
+        );
+        assert_eq!(
+            store.list_external_events(trigger.id, 10).await.unwrap(),
+            vec![event]
+        );
+        assert!(
+            !store
+                .claim_external_delivery(trigger.id, "github:d-1")
+                .await
+                .unwrap(),
+            "the claim survived the reopen"
+        );
+        store.close().await.unwrap();
+    }
+
+    /// A creation interrupted at each of its steps (a hook: 13 properties, so 16
+    /// steps; an external event: 10 properties, 13 steps): once reopened, the draft
+    /// is gone (counted, except before the node exists), nothing is quarantined,
+    /// and the same creation goes through.
+    #[tokio::test]
+    async fn an_interrupted_hook_or_event_creation_reopens_to_a_consistent_base() {
+        use project_orchestrator::ingress::{ExternalEvent, IngressOutcome};
+        use project_orchestrator::lifecycle::{LifecycleActionType, LifecycleHook, LifecycleScope};
+        let dir = tempfile::tempdir().unwrap();
+        let points = (1..=16)
+            .map(|k| ("hook", k))
+            .chain((1..=13).map(|k| ("event", k)));
+        for (what, k) in points {
+            let base = dir.path().join(format!("{what}-{k}"));
+            let store = open(&base).await;
+            let hook = LifecycleHook::new(
+                "h".into(),
+                LifecycleScope::Task,
+                "completed".into(),
+                LifecycleActionType::EmitAlert,
+                serde_json::json!({}),
+            );
+            let event = ExternalEvent {
+                id: Uuid::new_v4(),
+                trigger_id: Uuid::new_v4(),
+                source: "github".into(),
+                outcome: IngressOutcome::Rejected,
+                reason: Some("invalid_signature".into()),
+                delivery_id: None,
+                event_type: None,
+                action: None,
+                body_bytes: 0,
+                received_at: Utc::now(),
+            };
+            store.interrompre_au_prochain(Interruption::AvantEtape(k));
+            let err = if what == "hook" {
+                store.create_lifecycle_hook(&hook).await.unwrap_err()
+            } else {
+                store.record_external_event(&event).await.unwrap_err()
+            };
+            assert!(
+                format!("{err:#}").contains("interruption injectée"),
+                "{what} {k}: {err:#}"
+            );
+            assert!(store.get_lifecycle_hook(hook.id).await.unwrap().is_none());
+            assert!(store
+                .list_external_events(event.trigger_id, 10)
+                .await
+                .unwrap()
+                .is_empty());
+            store.close().await.unwrap();
+            drop(store);
+
+            let store = open(&base).await;
+            let rapport = store.rapport_d_ouverture().clone();
+            assert!(rapport.en_quarantaine.is_empty(), "{what} {k}: {rapport:?}");
+            assert_eq!(
+                rapport.brouillons_supprimes,
+                usize::from(k > 1),
+                "{what} {k}: {rapport:?}"
+            );
+            assert!(store.get_lifecycle_hook(hook.id).await.unwrap().is_none());
+            assert!(store
+                .list_external_events(event.trigger_id, 10)
+                .await
+                .unwrap()
+                .is_empty());
+            store.create_lifecycle_hook(&hook).await.unwrap();
+            store.record_external_event(&event).await.unwrap();
+            store.close().await.unwrap();
+        }
+    }
+
+    /// A base written by someone else, with nodes this backend cannot decode: each
+    /// is quarantined (named, untouched, never served), the rest is served.
+    #[tokio::test]
+    async fn unreadable_trigger_and_run_nodes_of_a_foreign_base_are_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let (alert, run, hook, good) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        write_foreign(&base, move |db| {
+            let s = |x: &str| Value::from(x.to_string());
+            // A severity Neo4j cannot parse either.
+            db.create_node_with_props(
+                &["Alert"],
+                vec![
+                    ("id", s(&alert.to_string())),
+                    ("alert_type", s("t")),
+                    ("severity", s("apocalyptic")),
+                    ("message", s("m")),
+                    ("created_at", s("2026-01-01T00:00:00Z")),
+                    ("dedup_key", s("k")),
+                ],
+            );
+            // A run whose state_json is not JSON: Neo4j falls back to the flat fields.
+            db.create_node_with_props(
+                &["PlanRun"],
+                vec![
+                    ("run_id", s(&run.to_string())),
+                    ("plan_id", s(&Uuid::new_v4().to_string())),
+                    ("status", s("running")),
+                    ("started_at", s("2026-01-01T00:00:00Z")),
+                    ("state_json", s("{tronqué")),
+                ],
+            );
+            // A hook whose scope Neo4j reads as `Task` in silence.
+            db.create_node_with_props(
+                &["LifecycleHook"],
+                vec![
+                    ("id", s(&hook.to_string())),
+                    ("name", s("h")),
+                    ("scope", s("Galaxy")),
+                    ("on_status", s("done")),
+                    ("action_type", s("EmitAlert")),
+                    ("priority", Value::from(1_i64)),
+                    ("created_at", s("2026-01-01T00:00:00Z")),
+                ],
+            );
+            // A readable legacy run (no state_json): served from its flat fields.
+            db.create_node_with_props(
+                &["PlanRun"],
+                vec![
+                    ("run_id", s(&good.to_string())),
+                    ("plan_id", s(&Uuid::new_v4().to_string())),
+                    ("status", s("completed")),
+                    ("started_at", s("2026-01-01T00:00:00Z")),
+                    ("completed_tasks", s("")),
+                ],
+            );
+        })
+        .await;
+        let store = open(&base).await;
+        let rapport = store.rapport_d_ouverture().clone();
+        assert_eq!(rapport.en_quarantaine.len(), 3, "{rapport:?}");
+        for needle in ["apocalyptic", "state_json", "Galaxy"] {
+            assert!(
+                rapport.en_quarantaine.iter().any(|q| q.contains(needle)),
+                "{needle}: {rapport:?}"
+            );
+        }
+        assert!(store.get_alert(alert).await.unwrap().is_none());
+        assert!(store.get_plan_run(run).await.unwrap().is_none());
+        assert!(store.get_lifecycle_hook(hook).await.unwrap().is_none());
+        let legacy = store.get_plan_run(good).await.unwrap().unwrap();
+        assert_eq!(
+            legacy.status,
+            project_orchestrator::runner::PlanRunStatus::Completed
+        );
+        store.close().await.unwrap();
+    }
+
+    /// Every method of `PlanRunStore` listed as refused refuses BY NAME, and the
+    /// one partial refusal (`mark_third_party_write` of a task) too.
+    #[tokio::test]
+    async fn plan_run_refusals_are_named() {
+        // `CostGroupBy` is not reachable from outside the crate: the ninth refusal,
+        // `agent_execution_cost_breakdown`, is checked by the unit test of `planrun.rs`.
+        use project_orchestrator::neo4j::AgentExecutionNode;
+        use project_orchestrator::runner::PlanContent;
+        let store = temporary(Durabilite::Wal).await;
+        let id = Uuid::new_v4();
+        let ae = AgentExecutionNode::new(id, id);
+        let names: Vec<NonPorte> = vec![
+            not_ported(store.create_agent_execution(&ae).await),
+            not_ported(store.update_agent_execution(&ae).await),
+            not_ported(store.get_agent_executions_for_run(id).await),
+            not_ported(store.record_agent_execution_verification(id, "{}").await),
+            not_ported(store.list_running_agent_executions().await),
+            not_ported(store.get_all_pagerank_values(id).await),
+            not_ported(store.get_community_risk_vectors(id).await),
+            not_ported(store.get_all_risk_score_values(id).await),
+        ];
+        let expected: Vec<NonPorte> = refusees_planrun()
+            .iter()
+            .filter(|m| **m != "PlanRunStore::agent_execution_cost_breakdown")
+            .map(|m| NonPorte(m))
+            .collect();
+        assert_eq!(refusees_planrun().len(), 9);
+        assert_eq!(names, expected);
+        for content in [
+            PlanContent::Task(id),
+            PlanContent::Step(id),
+            PlanContent::Constraint(id),
+            PlanContent::Decision(id),
+        ] {
+            let e = store.mark_third_party_write(content).await.unwrap_err();
+            assert_eq!(
+                e.downcast_ref::<NonPorte>(),
+                Some(&NonPorte("PlanRunStore::mark_third_party_write")),
+                "{content:?}"
+            );
+        }
+    }
+
+    /// The guards under contention: eight concurrent reservations of one signal,
+    /// one wins; eight concurrent observations of one alert condition, one node
+    /// counting eight.
+    #[tokio::test]
+    async fn trigger_guards_hold_under_concurrency() {
+        use futures::future::join_all;
+        use project_orchestrator::neo4j::models::{AlertNode, AlertSeverity};
+        use project_orchestrator::runner::SignalReservation;
+        let store = temporary(Durabilite::Wal).await;
+        let plan = a_plan(None);
+        store.create_plan(&plan).await.unwrap();
+        let trigger = a_trigger(plan.id);
+        store.create_trigger(&trigger).await.unwrap();
+        let outcomes =
+            join_all((0..8).map(|_| store.reserve_trigger_signal(trigger.id, "race", 0))).await;
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, Ok(SignalReservation::Reserved)))
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
+        let alerts: Vec<AlertNode> = (0..8)
+            .map(|i| {
+                AlertNode::new_for_subject(
+                    "race".into(),
+                    AlertSeverity::Warning,
+                    format!("seen {i}"),
+                    None,
+                    "one-condition",
+                )
+            })
+            .collect();
+        let outcomes = join_all(alerts.iter().map(|a| store.create_alert(a))).await;
+        assert!(outcomes.iter().all(|o| o.is_ok()), "{outcomes:?}");
+        let (all, total) = store.list_alerts(None, None, 10, 0).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(all[0].occurrence_count, 8);
+    }
+
+    // ------------------------------------------------------------------
+    // Review of #1208: quarantined keys stay reserved, the cooldown race,
+    // the repair of `last_fired`, `enabled` absent, the sort of an alert
+    // without a stored priority.
+    // ------------------------------------------------------------------
+
+    /// A delivery, a signal, a run id, an alert `dedup_key` and an event-trigger id
+    /// whose nodes are on disk but unreadable stay RESERVED: claiming, reserving or
+    /// creating them again is refused by name (never `true`, `Reserved`, a new node).
+    #[tokio::test]
+    async fn quarantined_keys_stay_reserved_and_are_refused_by_name() {
+        use project_orchestrator::neo4j::models::{AlertNode, AlertSeverity};
+        use project_orchestrator::runner::{RunnerState, TriggerSource};
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let (plan, trigger, run, event_trigger) = {
+            let store = open(&base).await;
+            let plan = a_plan(None);
+            store.create_plan(&plan).await.unwrap();
+            let trigger = a_trigger(plan.id);
+            store.create_trigger(&trigger).await.unwrap();
+            store.close().await.unwrap();
+            (plan, trigger, Uuid::new_v4(), Uuid::new_v4())
+        };
+        let t = trigger.id.to_string();
+        let (r, et) = (run.to_string(), event_trigger.to_string());
+        write_foreign(&base, move |db| {
+            let s = |x: &str| Value::from(x.to_string());
+            // A claimed delivery and a reserved signal whose date is unreadable.
+            db.create_node_with_props(
+                &["ExternalDelivery"],
+                vec![
+                    ("trigger_id", s(&t)),
+                    ("delivery_key", s("github:d-1")),
+                    ("claimed_at", s("pas une date")),
+                ],
+            );
+            db.create_node_with_props(
+                &["TriggerSignal"],
+                vec![
+                    ("trigger_id", s(&t)),
+                    ("key", s("github:d-1")),
+                    ("reserved_at", s("pas une date")),
+                ],
+            );
+            // A run whose state_json is not JSON.
+            db.create_node_with_props(
+                &["PlanRun"],
+                vec![("run_id", s(&r)), ("state_json", s("{tronqué"))],
+            );
+            // An alert of an unknown severity, and an event trigger with no name.
+            db.create_node_with_props(
+                &["Alert"],
+                vec![
+                    ("id", s(&Uuid::new_v4().to_string())),
+                    ("dedup_key", s("drift:global:x")),
+                    ("severity", s("apocalyptic")),
+                ],
+            );
+            db.create_node_with_props(&["EventTrigger"], vec![("id", s(&et))]);
+        })
+        .await;
+        let store = open(&base).await;
+        assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 5);
+        let reserved = |r: anyhow::Result<String>| {
+            let e = r.expect_err("a reserved key must be refused");
+            assert!(format!("{e:#}").contains("réservé"), "{e:#}");
+        };
+        reserved(
+            store
+                .claim_external_delivery(trigger.id, "github:d-1")
+                .await
+                .map(|b| format!("{b}")),
+        );
+        reserved(
+            store
+                .release_external_delivery(trigger.id, "github:d-1")
+                .await
+                .map(|b| format!("{b}")),
+        );
+        reserved(
+            store
+                .reserve_trigger_signal(trigger.id, "github:d-1", 0)
+                .await
+                .map(|r| format!("{r:?}")),
+        );
+        reserved(
+            store
+                .create_plan_run(&RunnerState::new(run, plan.id, 1, TriggerSource::Manual))
+                .await
+                .map(|_| String::new()),
+        );
+        let mut alert = AlertNode::new("drift".into(), AlertSeverity::Warning, "x".into(), None);
+        alert.dedup_key = "drift:global:x".into();
+        reserved(store.create_alert(&alert).await.map(|_| String::new()));
+        let mut et = project_orchestrator::events::trigger::EventTrigger {
+            id: event_trigger,
+            name: "again".into(),
+            protocol_id: Uuid::new_v4(),
+            entity_type_pattern: None,
+            action_pattern: None,
+            payload_conditions: None,
+            cooldown_secs: 0,
+            enabled: true,
+            project_scope: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        reserved(store.create_event_trigger(&et).await.map(|u| u.to_string()));
+        // What is not reserved is still served.
+        et.id = Uuid::new_v4();
+        store.create_event_trigger(&et).await.unwrap();
+        assert!(store
+            .claim_external_delivery(trigger.id, "github:d-2")
+            .await
+            .unwrap());
+        assert_eq!(store.list_alerts(None, None, 10, 0).await.unwrap().1, 0);
+        store.close().await.unwrap();
+    }
+
+    /// The cooldown under contention, on a FRESH trigger: eight distinct keys at
+    /// once under a one-hour cooldown, exactly one is `Reserved`, seven `Cooldown`.
+    #[tokio::test]
+    async fn the_cooldown_holds_for_eight_concurrent_distinct_signals() {
+        use futures::future::join_all;
+        use project_orchestrator::runner::SignalReservation;
+        let store = temporary(Durabilite::Wal).await;
+        let plan = a_plan(None);
+        store.create_plan(&plan).await.unwrap();
+        let trigger = a_trigger(plan.id);
+        store.create_trigger(&trigger).await.unwrap();
+        let keys: Vec<String> = (0..8).map(|i| format!("github:d-{i}")).collect();
+        let outcomes = join_all(
+            keys.iter()
+                .map(|k| store.reserve_trigger_signal(trigger.id, k, 3600)),
+        )
+        .await;
+        let count = |r: SignalReservation| {
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, Ok(x) if *x == r))
+                .count()
+        };
+        assert_eq!(
+            (
+                count(SignalReservation::Reserved),
+                count(SignalReservation::Cooldown)
+            ),
+            (1, 7),
+            "{outcomes:?}"
+        );
+    }
+
+    /// A reservation interrupted after its signal is committed and before
+    /// `last_fired` moves: at reopen `last_fired` is repaired to the signal, so the
+    /// cooldown holds and the key stays taken.
+    #[tokio::test]
+    async fn last_fired_is_repaired_to_the_latest_signal_at_reopen() {
+        use project_orchestrator::runner::SignalReservation;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let plan = a_plan(None);
+        store.create_plan(&plan).await.unwrap();
+        let trigger = a_trigger(plan.id);
+        store.create_trigger(&trigger).await.unwrap();
+        // The signal node: before the node, before the marker, three properties,
+        // before the marker goes (6 steps); step 7 is `last_fired`.
+        store.interrompre_au_prochain(Interruption::AvantEtape(7));
+        assert!(store
+            .reserve_trigger_signal(trigger.id, "k", 3600)
+            .await
+            .is_err());
+        assert!(store
+            .get_trigger(trigger.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_fired
+            .is_none());
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = open(&base).await;
+        assert_eq!(store.rapport_d_ouverture(), &RapportOuverture::default());
+        let fired = store
+            .get_trigger(trigger.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_fired
+            .expect("last_fired repaired to the committed signal");
+        assert!((Utc::now() - fired).num_seconds() < 600, "{fired}");
+        assert_eq!(
+            store
+                .reserve_trigger_signal(trigger.id, "other", 3600)
+                .await
+                .unwrap(),
+            SignalReservation::Cooldown
+        );
+        assert_eq!(
+            store
+                .reserve_trigger_signal(trigger.id, "k", 0)
+                .await
+                .unwrap(),
+            SignalReservation::Duplicate
+        );
+        store.close().await.unwrap();
+    }
+
+    /// A hook or an event trigger without `enabled` (a foreign or old node) is not
+    /// enabled: Neo4j's `enabled = true` filters exclude it, and a hook is never
+    /// run on a guess.
+    #[tokio::test]
+    async fn a_hook_or_event_trigger_without_enabled_is_not_run() {
+        use project_orchestrator::lifecycle::LifecycleScope;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let (hook, trigger) = (Uuid::new_v4(), Uuid::new_v4());
+        write_foreign(&base, move |db| {
+            let s = |x: &str| Value::from(x.to_string());
+            db.create_node_with_props(
+                &["LifecycleHook"],
+                vec![
+                    ("id", s(&hook.to_string())),
+                    ("name", s("old hook")),
+                    ("scope", s("Task")),
+                    ("on_status", s("completed")),
+                    ("action_type", s("EmitAlert")),
+                    ("action_config", s("{}")),
+                    ("priority", Value::from(1_i64)),
+                    ("project_id", s("")),
+                    ("created_at", s("2026-01-01T00:00:00Z")),
+                ],
+            );
+            db.create_node_with_props(
+                &["EventTrigger"],
+                vec![
+                    ("id", s(&trigger.to_string())),
+                    ("name", s("old trigger")),
+                    ("protocol_id", s(&Uuid::new_v4().to_string())),
+                    ("created_at", s("2026-01-01T00:00:00Z")),
+                    ("updated_at", s("2026-01-01T00:00:00Z")),
+                ],
+            );
+        })
+        .await;
+        let store = open(&base).await;
+        assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
+        assert!(store
+            .list_hooks_for_scope(&LifecycleScope::Task, "completed", None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .list_event_triggers(None, true)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            !store
+                .get_lifecycle_hook(hook)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+        store.close().await.unwrap();
+    }
+
+    /// An alert read without a stored `priority` sorts as 0 (`coalesce(priority,
+    /// 0)`), behind an alert of a lower stored priority.
+    #[tokio::test]
+    async fn an_alert_without_a_stored_priority_sorts_as_zero() {
+        use project_orchestrator::neo4j::models::{AlertNode, AlertSeverity};
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let old = Uuid::new_v4();
+        write_foreign(&base, move |db| {
+            let s = |x: &str| Value::from(x.to_string());
+            // Critical, recent, no priority: it would compute to ~1.0.
+            let now = Utc::now().to_rfc3339();
+            db.create_node_with_props(
+                &["Alert"],
+                vec![
+                    ("id", s(&old.to_string())),
+                    ("alert_type", s("old")),
+                    ("severity", s("critical")),
+                    ("message", s("m")),
+                    ("acknowledged", Value::from(false)),
+                    ("created_at", s(&now)),
+                    ("dedup_key", s("old:global:m")),
+                ],
+            );
+        })
+        .await;
+        let store = open(&base).await;
+        let info = AlertNode::new("new".into(), AlertSeverity::Info, "i".into(), None);
+        store.create_alert(&info).await.unwrap();
+        let ids: Vec<Uuid> = store
+            .list_pending_alerts(None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![info.id, old],
+            "the stored 0.2 before the coalesced 0"
+        );
+        store.close().await.unwrap();
+    }
+
+    /// A long value (> 256 bytes: a run's `state_json`, a trigger's `config`, an
+    /// event payload, an alert message, an external event's reason) goes to a blob
+    /// column the pinned WAL does not recover: the write pays the FULL flush before
+    /// it is acknowledged, and so does a write that REPLACES such a value. Counted
+    /// with obrain's own fsync oracle, without any `close()`.
+    #[tokio::test]
+    async fn long_values_of_triggers_and_runs_pay_the_full_flush() {
+        use project_orchestrator::events::trigger::EventTrigger;
+        use project_orchestrator::ingress::{ExternalEvent, IngressOutcome};
+        use project_orchestrator::neo4j::models::{AlertNode, AlertSeverity};
+        use project_orchestrator::runner::{RunnerState, TriggerSource};
+        let store = temporary(Durabilite::Wal).await;
+        let fsyncs = || store.fsyncs_du_wal().unwrap();
+        let plan = a_plan(None);
+        store.create_plan(&plan).await.unwrap();
+        let long = "x".repeat(300);
+
+        // The cost of a write with nothing long.
+        let t0 = fsyncs();
+        assert!(store
+            .claim_external_delivery(Uuid::new_v4(), "short")
+            .await
+            .unwrap());
+        let small = fsyncs() - t0;
+        assert!(small >= 1, "the WAL fsync ran");
+        let cost = |before: u64, what: &str| {
+            let c = fsyncs() - before;
+            assert!(
+                c > small,
+                "{what}: full flush expected ({c} fsyncs against {small})"
+            );
+        };
+
+        let mut run = RunnerState::new(Uuid::new_v4(), plan.id, 1, TriggerSource::Manual);
+        assert!(serde_json::to_string(&run).unwrap().len() > 256);
+        let t = fsyncs();
+        store.create_plan_run(&run).await.unwrap();
+        cost(t, "create_plan_run (state_json)");
+        run.current_wave = 1;
+        let t = fsyncs();
+        store.update_plan_run(&run).await.unwrap();
+        cost(t, "update_plan_run (state_json)");
+
+        let mut trigger = a_trigger(plan.id);
+        trigger.config = serde_json::json!({ "rule": long });
+        let t = fsyncs();
+        store.create_trigger(&trigger).await.unwrap();
+        cost(t, "create_trigger (config)");
+
+        let mut event_trigger = EventTrigger {
+            id: Uuid::new_v4(),
+            name: "e".into(),
+            protocol_id: Uuid::new_v4(),
+            entity_type_pattern: None,
+            action_pattern: None,
+            payload_conditions: Some(serde_json::json!({ "k": long })),
+            cooldown_secs: 0,
+            enabled: true,
+            project_scope: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let t = fsyncs();
+        store.create_event_trigger(&event_trigger).await.unwrap();
+        cost(t, "create_event_trigger (payload_conditions)");
+        // The long value REPLACED by a short one: its old blob is rewritten too.
+        let t = fsyncs();
+        assert!(store
+            .update_event_trigger(
+                event_trigger.id,
+                None,
+                None,
+                None,
+                None,
+                Some(None),
+                None,
+                None
+            )
+            .await
+            .unwrap());
+        cost(t, "update_event_trigger replacing a long payload");
+        event_trigger.id = Uuid::new_v4();
+
+        let alert = AlertNode::new("long".into(), AlertSeverity::Info, long.clone(), None);
+        let t = fsyncs();
+        store.create_alert(&alert).await.unwrap();
+        cost(t, "create_alert (message)");
+
+        let event = ExternalEvent {
+            id: Uuid::new_v4(),
+            trigger_id: trigger.id,
+            source: "github".into(),
+            outcome: IngressOutcome::Rejected,
+            reason: Some(long.clone()),
+            delivery_id: None,
+            event_type: None,
+            action: None,
+            body_bytes: 0,
+            received_at: Utc::now(),
+        };
+        let t = fsyncs();
+        store.record_external_event(&event).await.unwrap();
+        cost(t, "record_external_event (reason)");
     }
 }
