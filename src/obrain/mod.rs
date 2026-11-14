@@ -85,10 +85,12 @@ mod federation;
 mod mesure;
 mod note;
 mod plan;
+mod planrun;
 mod project;
 mod protocol;
 mod protocolrun;
 mod release;
+mod trigger;
 mod workspace;
 
 #[cfg(any(test, feature = "mock-store"))]
@@ -178,6 +180,13 @@ pub fn refusees_protocolrun() -> &'static [&'static str] {
     protocolrun::REFUSEES
 }
 
+/// The methods of `PlanRunStore` refused on every call, as
+/// `PlanRunStore::<method>` (`planrun.rs`): the agent executions (they need a
+/// `Task`) and the statistics of the code graph.
+pub fn refusees_planrun() -> &'static [&'static str] {
+    planrun::REFUSEES
+}
+
 /// The hand-written methods that REFUSE: `GraphStore::get_progress_batch` (its
 /// contract default loops over getters of other domains), the five
 /// `FederationStore` methods whose relation writes and backfills are not ported
@@ -219,6 +228,7 @@ pub fn methodes_qui_servent() -> Vec<&'static str> {
                 && !decision::REFUSEES.contains(m)
                 && !plan::REFUSEES.contains(m)
                 && !protocolrun::REFUSEES.contains(m)
+                && !planrun::REFUSEES.contains(m)
                 && !m.starts_with("GraphStore::")
         })
         .collect()
@@ -337,6 +347,9 @@ struct Etat {
     decisions: decision::IndexDecisions,
     federation: federation::IndexFederation,
     commits: commit::IndexCommits,
+
+    surveillance: trigger::IndexSurveillance,
+    executions: planrun::IndexExecutions,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -706,6 +719,10 @@ impl ObrainGraphStore {
         rapport.en_quarantaine.extend(quarantaine);
         let commits =
             commit::IndexCommits::reconstruire(&db, &mut rapport).with_context(contexte)?;
+
+        let surveillance = trigger::IndexSurveillance::reconstruire(&db, &mut rapport);
+        let executions = planrun::IndexExecutions::reconstruire(&db, &plans, &mut rapport)
+            .with_context(contexte)?;
         let etat = Etat {
             projets,
             plans,
@@ -719,6 +736,9 @@ impl ObrainGraphStore {
             decisions,
             federation,
             commits,
+
+            surveillance,
+            executions,
         };
         let store = Self {
             interne: Arc::new(Interne {

@@ -247,7 +247,7 @@ fn lire_plan(get: &dyn Fn(&str) -> Option<Value>) -> Result<(PlanNode, String)> 
 /// One plan: where it lives in the base, its decoded value, and its status as
 /// stored (what the filters compare, as Neo4j's `WHERE p.status IN …`).
 pub(super) struct Entree {
-    noeud: NodeId,
+    pub(super) noeud: NodeId,
     pub(super) plan: PlanNode,
     statut: String,
 }
