@@ -101,10 +101,10 @@ mod with_the_feature {
     use project_orchestrator::neo4j::traits::*;
     use project_orchestrator::obrain::{
         defauts_conserves, methodes_portees, methodes_qui_servent, methodes_refusees,
-        refusees_chat, refusees_commit, refusees_decision, refusees_note, refusees_plan,
-        refusees_planrun, refusees_protocolrun, refusees_release, Creation, Durabilite,
-        Interruption, NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture, MARQUEUR_PO,
-        REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
+        refusees_chat, refusees_commit, refusees_decision, refusees_featuregraph, refusees_note,
+        refusees_persona, refusees_plan, refusees_planrun, refusees_protocolrun, refusees_release,
+        Creation, Durabilite, Interruption, NonPorte, ObrainGraphStore, ObrainSearchStore,
+        RapportOuverture, MARQUEUR_PO, REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -4785,5 +4785,811 @@ mod with_the_feature {
         let t = fsyncs();
         store.record_external_event(&event).await.unwrap();
         cost(t, "record_external_event (reason)");
+    }
+
+    // ------------------------------------------------------------------
+    // Persona and feature graph (persona.rs, featuregraph.rs)
+    // ------------------------------------------------------------------
+
+    fn a_persona(
+        project: Option<Uuid>,
+        name: &str,
+        energy: f64,
+    ) -> project_orchestrator::neo4j::models::PersonaNode {
+        use project_orchestrator::neo4j::models::{PersonaNode, PersonaOrigin, PersonaStatus};
+        PersonaNode {
+            id: Uuid::new_v4(),
+            project_id: project,
+            name: name.to_string(),
+            description: format!("{name}, experte"),
+            status: PersonaStatus::Active,
+            complexity_default: None,
+            timeout_secs: Some(300),
+            max_cost_usd: None,
+            model_preference: Some("opus".into()),
+            system_prompt_override: None,
+            energy,
+            cohesion: 0.0,
+            activation_count: 0,
+            success_rate: 0.0,
+            avg_duration_secs: 0.0,
+            last_activated: None,
+            energy_boost_accumulated: 0.0,
+            energy_history: vec![],
+            origin: PersonaOrigin::Manual,
+            created_at: Utc::now(),
+            updated_at: None,
+        }
+    }
+
+    fn a_feature_graph(
+        project: Uuid,
+        name: &str,
+    ) -> project_orchestrator::neo4j::models::FeatureGraphNode {
+        project_orchestrator::neo4j::models::FeatureGraphNode {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            description: Some(format!("{name} feature")),
+            project_id: project,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            entity_count: None,
+            entry_function: Some("main".into()),
+            build_depth: Some(2),
+            include_relations: Some(vec!["CALLS".into()]),
+        }
+    }
+
+    /// Personas, their edges and feature graphs written, the base closed and reopened:
+    /// everything reads back the same (the indexes are rebuilt from the base).
+    #[tokio::test]
+    async fn personas_and_feature_graphs_survive_a_reopen() {
+        use project_orchestrator::neo4j::models::PersonaStatus;
+        use project_orchestrator::notes::{Note, NoteType};
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project("personas");
+        store.create_project(&p).await.unwrap();
+        let fg = a_feature_graph(p.id, "auth");
+        store.create_feature_graph(&fg).await.unwrap();
+        let parent = a_persona(None, "parent", 0.8);
+        let mut child = a_persona(Some(p.id), "child", 0.6);
+        store.create_persona(&parent).await.unwrap();
+        store.create_persona(&child).await.unwrap();
+        let n = Note::new(
+            Some(p.id),
+            NoteType::Tip,
+            "use the vault".into(),
+            "alice".into(),
+        );
+        store.create_note(&n).await.unwrap();
+        store.add_persona_note(child.id, n.id, 0.9).await.unwrap();
+        store
+            .add_persona_extends(child.id, parent.id)
+            .await
+            .unwrap();
+        store
+            .set_persona_feature_graph(child.id, fg.id)
+            .await
+            .unwrap();
+        child.status = PersonaStatus::Dormant;
+        child.name = "child-renamed".into();
+        store.update_persona(&child).await.unwrap();
+        store.increment_persona_activation(child.id).await.unwrap();
+        let before = store.get_persona_subgraph(child.id).await.unwrap();
+        let fg_before = store.get_feature_graph(fg.id).await.unwrap().unwrap();
+        store.close().await.unwrap();
+        drop(store);
+
+        let store = open(&base).await;
+        let rapport = store.rapport_d_ouverture().clone();
+        assert_eq!(rapport, RapportOuverture::default(), "{rapport:?}");
+        let relue = store.get_persona(child.id).await.unwrap().unwrap();
+        assert_eq!(relue.name, "child-renamed");
+        assert_eq!(relue.status, PersonaStatus::Dormant);
+        assert_eq!(relue.activation_count, 1);
+        assert_eq!(relue.model_preference.as_deref(), Some("opus"));
+        assert_eq!(relue.project_id, Some(p.id));
+        let (listed, total) = store
+            .list_personas(p.id, Some(PersonaStatus::Dormant), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!((listed.len(), total), (1, 1));
+        assert_eq!(store.list_global_personas().await.unwrap()[0].id, parent.id);
+        let after = store.get_persona_subgraph(child.id).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert_eq!(after.notes[0].weight, 0.9);
+        assert_eq!(after.feature_graph_id, Some(fg.id));
+        assert_eq!(after.parents[0].entity_id, parent.id.to_string());
+        let fg_after = store.get_feature_graph(fg.id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&fg_after).unwrap(),
+            serde_json::to_value(&fg_before).unwrap()
+        );
+        let listed = store.list_feature_graphs(Some(p.id)).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].entity_count, Some(0));
+
+        // Removing the edges, then the nodes, is durable too.
+        store.remove_persona_note(child.id, n.id).await.unwrap();
+        store
+            .remove_persona_extends(child.id, parent.id)
+            .await
+            .unwrap();
+        store.remove_persona_feature_graph(child.id).await.unwrap();
+        assert!(store.delete_feature_graph(fg.id).await.unwrap());
+        assert!(store.delete_persona(parent.id).await.unwrap());
+        store.close().await.unwrap();
+        drop(store);
+        let store = open(&base).await;
+        let sg = store.get_persona_subgraph(child.id).await.unwrap();
+        assert!(sg.notes.is_empty() && sg.parents.is_empty() && sg.feature_graph_id.is_none());
+        assert!(store.get_persona(parent.id).await.unwrap().is_none());
+        assert!(store.get_feature_graph(fg.id).await.unwrap().is_none());
+    }
+
+    /// A persona creation, and a feature-graph creation, interrupted at every step
+    /// reopen to a consistent base: the draft is deleted with its edges, or the node
+    /// is whole when the commit point was passed.
+    #[tokio::test]
+    async fn an_interrupted_persona_or_feature_graph_creation_reopens_consistently() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut points = vec![Interruption::ApresLeNoeud, Interruption::ApresLeMarqueur];
+        points.extend((1..=25).map(Interruption::ApresLaPropriete));
+        points.extend([
+            Interruption::AvantLeRetraitDuMarqueur,
+            Interruption::ApresLeRetraitDuMarqueur,
+        ]);
+        let mut touches = 0;
+        for (k, point) in points.iter().copied().enumerate() {
+            for graphe in [false, true] {
+                let base = dir.path().join(format!("p-{k}-{graphe}"));
+                let store = open(&base).await;
+                let p = a_project("interrupted");
+                store.create_project(&p).await.unwrap();
+                let persona = a_persona(Some(p.id), "draft", 0.5);
+                let fg = a_feature_graph(p.id, "draft");
+                store.interrompre_au_prochain(point);
+                let issue = if graphe {
+                    store.create_feature_graph(&fg).await
+                } else {
+                    store.create_persona(&persona).await
+                };
+                if issue.is_ok() {
+                    store.close().await.unwrap();
+                    continue;
+                }
+                touches += 1;
+                assert!(store.get_persona(persona.id).await.unwrap().is_none());
+                assert!(store.get_feature_graph(fg.id).await.unwrap().is_none());
+                store.close().await.unwrap();
+                drop(store);
+
+                let store = open(&base).await;
+                let rapport = store.rapport_d_ouverture().clone();
+                assert!(rapport.en_quarantaine.is_empty(), "{point:?}: {rapport:?}");
+                let present = if graphe {
+                    store.get_feature_graph(fg.id).await.unwrap().is_some()
+                } else {
+                    store.get_persona(persona.id).await.unwrap().is_some()
+                };
+                if point == Interruption::ApresLeRetraitDuMarqueur {
+                    assert!(present, "{point:?}");
+                } else {
+                    assert_eq!(rapport.brouillons_supprimes, 1, "{point:?}: {rapport:?}");
+                    assert!(!present, "{point:?}");
+                    // The draft and its BELONGS_TO edge are gone: the id is free again.
+                    if graphe {
+                        store.create_feature_graph(&fg).await.unwrap();
+                    } else {
+                        store.create_persona(&persona).await.unwrap();
+                    }
+                }
+                store.close().await.unwrap();
+            }
+        }
+        // Persona: 16 properties written here; feature graph: 9.
+        assert!(touches >= 30, "the points were reached: {touches}");
+    }
+
+    /// A foreign base: unreadable Persona and FeatureGraph nodes are quarantined (named,
+    /// left untouched, their ids reserved); a persona that KNOWS a file and a graph that
+    /// INCLUDES an entity are served as nodes, and their code-dependent views refuse by name.
+    #[tokio::test]
+    async fn foreign_persona_and_feature_graph_nodes_are_quarantined_or_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project("foreign");
+        store.create_project(&p).await.unwrap();
+        let knows = a_persona(Some(p.id), "knows-a-file", 0.5);
+        store.create_persona(&knows).await.unwrap();
+        let fg = a_feature_graph(p.id, "includes");
+        store.create_feature_graph(&fg).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+
+        let (bad_persona, bad_graph) = (Uuid::new_v4(), Uuid::new_v4());
+        let (pid, kid, fid) = (p.id, knows.id, fg.id);
+        write_foreign(&base, move |db| {
+            // A persona with no `created_at`, a graph whose `created_at` does not parse.
+            db.create_node_with_props(
+                &["Persona"],
+                vec![
+                    ("id", Value::from(bad_persona.to_string())),
+                    ("name", Value::from("sans date")),
+                ],
+            );
+            db.create_node_with_props(
+                &["FeatureGraph"],
+                vec![
+                    ("id", Value::from(bad_graph.to_string())),
+                    ("name", Value::from("mauvaise date")),
+                    ("project_id", Value::from(pid.to_string())),
+                    ("created_at", Value::from("hier")),
+                    ("updated_at", Value::from("hier")),
+                ],
+            );
+            let file = db.create_node(&["File"]);
+            db.set_node_property(file, "path", Value::from("/src/lib.rs"));
+            let pn = db.find_nodes_by_property("id", &Value::from(kid.to_string()))[0];
+            db.create_edge_with_props(pn, file, "KNOWS", [("weight", Value::from(0.8))]);
+            let gn = db.find_nodes_by_property("id", &Value::from(fid.to_string()))[0];
+            db.create_edge(gn, file, "INCLUDES_ENTITY");
+        })
+        .await;
+
+        let store = open(&base).await;
+        let rapport = store.rapport_d_ouverture().clone();
+        assert_eq!(rapport.en_quarantaine.len(), 2, "{rapport:?}");
+        assert_eq!(rapport.brouillons_supprimes, 0, "{rapport:?}");
+        assert!(store.get_persona(bad_persona).await.unwrap().is_none());
+        assert!(store.get_feature_graph(bad_graph).await.unwrap().is_none());
+        // Their ids are reserved: no second node with the same id.
+        let mut again = a_persona(None, "reuse", 0.1);
+        again.id = bad_persona;
+        let err = store.create_persona(&again).await.unwrap_err();
+        assert!(format!("{err:#}").contains("réservé"), "{err:#}");
+        let mut again = a_feature_graph(p.id, "reuse");
+        again.id = bad_graph;
+        let err = store.create_feature_graph(&again).await.unwrap_err();
+        assert!(format!("{err:#}").contains("réservé"), "{err:#}");
+
+        // The nodes are served; what would need the code graph refuses by name.
+        assert!(store.get_persona(knows.id).await.unwrap().is_some());
+        assert_eq!(
+            not_ported(store.get_persona_subgraph(knows.id).await),
+            NonPorte("PersonaStore::get_persona_subgraph")
+        );
+        assert_eq!(
+            store.list_feature_graphs(Some(p.id)).await.unwrap()[0].entity_count,
+            Some(1)
+        );
+        assert_eq!(
+            not_ported(store.get_feature_graph_detail(fg.id).await),
+            NonPorte("FeatureGraphStore::get_feature_graph_detail")
+        );
+        // Deleting detaches every edge, the foreign ones included.
+        assert!(store.delete_persona(knows.id).await.unwrap());
+        assert!(store.delete_feature_graph(fg.id).await.unwrap());
+    }
+
+    /// Every method of `persona::REFUSEES` and `featuregraph::REFUSEES` refuses by its
+    /// own name, and writes nothing.
+    #[tokio::test]
+    async fn persona_and_feature_graph_refusals_are_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project("refus");
+        store.create_project(&p).await.unwrap();
+        let a = a_persona(Some(p.id), "a", 0.5);
+        store.create_persona(&a).await.unwrap();
+        let fg = a_feature_graph(p.id, "fg");
+        store.create_feature_graph(&fg).await.unwrap();
+        let (id, x) = (a.id, Uuid::new_v4());
+        let cas: Vec<(NonPorte, &str)> = vec![
+            (
+                not_ported(store.add_persona_skill(id, x).await),
+                "PersonaStore::add_persona_skill",
+            ),
+            (
+                not_ported(store.remove_persona_skill(id, x).await),
+                "PersonaStore::remove_persona_skill",
+            ),
+            (
+                not_ported(store.add_persona_protocol(id, x).await),
+                "PersonaStore::add_persona_protocol",
+            ),
+            (
+                not_ported(store.remove_persona_protocol(id, x).await),
+                "PersonaStore::remove_persona_protocol",
+            ),
+            (
+                not_ported(store.add_persona_file(id, "src/a.rs", 0.5).await),
+                "PersonaStore::add_persona_file",
+            ),
+            (
+                not_ported(store.remove_persona_file(id, "src/a.rs").await),
+                "PersonaStore::remove_persona_file",
+            ),
+            (
+                not_ported(store.add_persona_function(id, "f", 0.5).await),
+                "PersonaStore::add_persona_function",
+            ),
+            (
+                not_ported(store.remove_persona_function(id, "f").await),
+                "PersonaStore::remove_persona_function",
+            ),
+            (
+                not_ported(store.add_persona_decision(id, x, 0.5).await),
+                "PersonaStore::add_persona_decision",
+            ),
+            (
+                not_ported(store.remove_persona_decision(id, x).await),
+                "PersonaStore::remove_persona_decision",
+            ),
+            (
+                not_ported(store.find_personas_for_file("src/a.rs", p.id).await),
+                "PersonaStore::find_personas_for_file",
+            ),
+            (
+                not_ported(store.get_all_persona_knows(p.id).await),
+                "PersonaStore::get_all_persona_knows",
+            ),
+            (
+                not_ported(store.maintain_personas(p.id).await),
+                "PersonaStore::maintain_personas",
+            ),
+            (
+                not_ported(store.detect_personas(p.id).await),
+                "PersonaStore::detect_personas",
+            ),
+            (
+                not_ported(store.find_adjacent_personas("src/a.rs", p.id).await),
+                "PersonaStore::find_adjacent_personas",
+            ),
+            (
+                not_ported(
+                    store
+                        .find_relevant_personas_for_note(&["src/a.rs".to_string()], p.id)
+                        .await,
+                ),
+                "PersonaStore::find_relevant_personas_for_note",
+            ),
+            (
+                not_ported(store.find_relevant_personas_for_decision(x, p.id).await),
+                "PersonaStore::find_relevant_personas_for_decision",
+            ),
+            (
+                not_ported(store.auto_link_decision_to_persona(id, x, 0.5).await),
+                "PersonaStore::auto_link_decision_to_persona",
+            ),
+            (
+                not_ported(store.auto_link_file_to_persona(id, "src/a.rs", 0.5).await),
+                "PersonaStore::auto_link_file_to_persona",
+            ),
+            (
+                not_ported(store.compute_persona_affinity(id, x).await),
+                "PersonaStore::compute_persona_affinity",
+            ),
+            (
+                not_ported(store.merge_personas(id, x).await),
+                "PersonaStore::merge_personas",
+            ),
+            (
+                not_ported(store.find_synapse_linked_personas(id).await),
+                "PersonaStore::find_synapse_linked_personas",
+            ),
+            (
+                not_ported(
+                    store
+                        .add_entity_to_feature_graph(fg.id, "file", "src/a.rs", None, Some(p.id))
+                        .await,
+                ),
+                "FeatureGraphStore::add_entity_to_feature_graph",
+            ),
+            (
+                not_ported(
+                    store
+                        .remove_entity_from_feature_graph(fg.id, "file", "src/a.rs")
+                        .await,
+                ),
+                "FeatureGraphStore::remove_entity_from_feature_graph",
+            ),
+            (
+                not_ported(
+                    store
+                        .auto_build_feature_graph("x", None, p.id, "main", 2, None, None)
+                        .await,
+                ),
+                "FeatureGraphStore::auto_build_feature_graph",
+            ),
+            (
+                not_ported(store.refresh_feature_graph(fg.id).await),
+                "FeatureGraphStore::refresh_feature_graph",
+            ),
+            (
+                not_ported(store.get_top_entry_functions(p.id, 5).await),
+                "FeatureGraphStore::get_top_entry_functions",
+            ),
+            (
+                not_ported(store.get_feature_graph_statistics(fg.id).await),
+                "FeatureGraphStore::get_feature_graph_statistics",
+            ),
+            (
+                not_ported(store.compare_feature_graphs(fg.id, x).await),
+                "FeatureGraphStore::compare_feature_graphs",
+            ),
+            (
+                not_ported(store.find_overlapping_feature_graphs(fg.id, 0.5).await),
+                "FeatureGraphStore::find_overlapping_feature_graphs",
+            ),
+        ];
+        let names: Vec<&str> = cas.iter().map(|(_, n)| *n).collect();
+        for (got, name) in cas {
+            assert_eq!(got, NonPorte(name));
+        }
+        // The test covers each listed refusal, and only them.
+        let listed: Vec<&str> = refusees_persona()
+            .iter()
+            .chain(refusees_featuregraph())
+            .copied()
+            .collect();
+        assert_eq!(names, listed);
+        // Written by hand (the build checks it), not counted as serving.
+        let written = methodes_portees();
+        let servent = methodes_qui_servent();
+        assert!(listed
+            .iter()
+            .all(|m| written.contains(m) && !servent.contains(m)));
+        let persona_served = servent
+            .iter()
+            .filter(|m| m.starts_with("PersonaStore::"))
+            .count();
+        let graph_served = servent
+            .iter()
+            .filter(|m| m.starts_with("FeatureGraphStore::"))
+            .count();
+        assert_eq!((persona_served, graph_served), (15, 5));
+        // Nothing was written by the refusals: after a reopen (the unresolved edges are
+        // only seen there), nothing is quarantined and nothing refuses that served before.
+        store.close().await.unwrap();
+        drop(store);
+        let store = open(&base).await;
+        let rapport = store.rapport_d_ouverture().clone();
+        assert_eq!(rapport, RapportOuverture::default(), "{rapport:?}");
+        let sg = store.get_persona_subgraph(id).await.unwrap();
+        assert_eq!(sg.stats.total_entities, 0);
+        let detail = store
+            .get_feature_graph_detail(fg.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(detail.entities.is_empty());
+        assert_eq!(
+            store.list_feature_graphs(Some(p.id)).await.unwrap()[0].entity_count,
+            Some(0)
+        );
+    }
+
+    /// A node of a foreign base, by label and properties (no `created_at`: unreadable).
+    fn unreadable_persona(db: &obrain_engine::ObrainDB, id: Uuid) -> obrain_common::types::NodeId {
+        db.create_node_with_props(
+            &["Persona"],
+            vec![
+                ("id", Value::from(id.to_string())),
+                ("name", Value::from("illisible")),
+                ("status", Value::from("active")),
+                ("energy", Value::from(0.5)),
+            ],
+        )
+    }
+
+    fn node_of(db: &obrain_engine::ObrainDB, id: Uuid) -> obrain_common::types::NodeId {
+        db.find_nodes_by_property("id", &Value::from(id.to_string()))[0]
+    }
+
+    /// A EXTENDS B EXTENDS C, C unreadable (quarantined): A's ancestors would read [B]
+    /// where Neo4j reads [B, C]. The subgraph of A and of B refuses by name.
+    #[tokio::test]
+    async fn a_subgraph_whose_ancestor_extends_an_unreadable_persona_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let a = a_persona(None, "a", 0.5);
+        let b = a_persona(None, "b", 0.5);
+        store.create_persona(&a).await.unwrap();
+        store.create_persona(&b).await.unwrap();
+        store.add_persona_extends(a.id, b.id).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+        let (bid, c) = (b.id, Uuid::new_v4());
+        write_foreign(&base, move |db| {
+            let cn = unreadable_persona(db, c);
+            db.create_edge(node_of(db, bid), cn, "EXTENDS");
+        })
+        .await;
+        let store = open(&base).await;
+        assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+        for id in [a.id, b.id] {
+            assert_eq!(
+                not_ported(store.get_persona_subgraph(id).await),
+                NonPorte("PersonaStore::get_persona_subgraph"),
+                "{id}"
+            );
+        }
+    }
+
+    /// D, unreadable (quarantined), EXTENDS A: A's children would omit D. Refused by name.
+    #[tokio::test]
+    async fn a_subgraph_with_an_unreadable_child_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let a = a_persona(None, "a", 0.5);
+        store.create_persona(&a).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+        let (aid, d) = (a.id, Uuid::new_v4());
+        write_foreign(&base, move |db| {
+            let dn = unreadable_persona(db, d);
+            db.create_edge(dn, node_of(db, aid), "EXTENDS");
+        })
+        .await;
+        let store = open(&base).await;
+        assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 1);
+        assert_eq!(
+            not_ported(store.get_persona_subgraph(a.id).await),
+            NonPorte("PersonaStore::get_persona_subgraph")
+        );
+    }
+
+    /// A persona deletion, and a feature-graph deletion, interrupted after each of their
+    /// engine writes: the reopened base has finished the deletion. Never a node served
+    /// as whole with part of its edges gone.
+    #[tokio::test]
+    async fn an_interrupted_persona_or_feature_graph_deletion_is_finished_at_open() {
+        use project_orchestrator::notes::{Note, NoteType};
+        let dir = tempfile::tempdir().unwrap();
+        let mut atteints = 0;
+        for graphe in [false, true] {
+            for k in 1..=8 {
+                let base = dir.path().join(format!("del-{graphe}-{k}"));
+                let store = open(&base).await;
+                let p = a_project("deletion");
+                store.create_project(&p).await.unwrap();
+                let fg = a_feature_graph(p.id, "fg");
+                store.create_feature_graph(&fg).await.unwrap();
+                let parent = a_persona(None, "parent", 0.5);
+                let child = a_persona(Some(p.id), "child", 0.5);
+                store.create_persona(&parent).await.unwrap();
+                store.create_persona(&child).await.unwrap();
+                let n = Note::new(Some(p.id), NoteType::Tip, "n".into(), "alice".into());
+                store.create_note(&n).await.unwrap();
+                store.add_persona_note(child.id, n.id, 0.5).await.unwrap();
+                store
+                    .add_persona_extends(child.id, parent.id)
+                    .await
+                    .unwrap();
+                store
+                    .set_persona_feature_graph(child.id, fg.id)
+                    .await
+                    .unwrap();
+                store.interrompre_au_prochain(Interruption::AvantEtape(k));
+                let issue = if graphe {
+                    store.delete_feature_graph(fg.id).await.map(|_| ())
+                } else {
+                    store.delete_persona(child.id).await.map(|_| ())
+                };
+                if issue.is_ok() {
+                    store.close().await.unwrap();
+                    continue;
+                }
+                atteints += 1;
+                store.close().await.unwrap();
+                drop(store);
+                let store = open(&base).await;
+                let rapport = store.rapport_d_ouverture().clone();
+                assert!(rapport.en_quarantaine.is_empty(), "{k}: {rapport:?}");
+                assert_eq!(
+                    rapport.suppressions_achevees, 1,
+                    "{graphe} {k}: {rapport:?}"
+                );
+                if graphe {
+                    assert!(store.get_feature_graph(fg.id).await.unwrap().is_none());
+                    let sg = store.get_persona_subgraph(child.id).await.unwrap();
+                    assert_eq!(sg.feature_graph_id, None);
+                    assert_eq!(sg.notes.len(), 1);
+                } else {
+                    assert!(store.get_persona(child.id).await.unwrap().is_none());
+                    assert!(store
+                        .get_persona_subgraph(parent.id)
+                        .await
+                        .unwrap()
+                        .children
+                        .is_empty());
+                }
+                store.close().await.unwrap();
+            }
+        }
+        // Persona: USES, EXTENDS, SCOPED_TO, BELONGS_TO, then the node; graph: BELONGS_TO,
+        // SCOPED_TO, then the node.
+        assert!(atteints >= 6, "the crash points were reached: {atteints}");
+    }
+
+    /// Removing a link to a note or a persona that is on disk but quarantined removes the
+    /// edge (Neo4j's MATCH does not depend on the target being readable), and the
+    /// subgraph serves again after a reopen.
+    #[tokio::test]
+    async fn removing_a_link_to_a_quarantined_target_removes_the_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let a = a_persona(None, "a", 0.5);
+        store.create_persona(&a).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+        let (aid, note, parent) = (a.id, Uuid::new_v4(), Uuid::new_v4());
+        write_foreign(&base, move |db| {
+            // A note with no `created_at`, and a persona with none either.
+            let nn = db.create_node_with_props(
+                &["Note"],
+                vec![
+                    ("id", Value::from(note.to_string())),
+                    ("status", Value::from("active")),
+                    ("note_type", Value::from("tip")),
+                    ("content", Value::from("illisible")),
+                    ("created_by", Value::from("alice")),
+                ],
+            );
+            let pn = unreadable_persona(db, parent);
+            let an = node_of(db, aid);
+            db.create_edge_with_props(an, nn, "USES", [("weight", Value::from(0.5))]);
+            db.create_edge(an, pn, "EXTENDS");
+        })
+        .await;
+        let store = open(&base).await;
+        assert_eq!(store.rapport_d_ouverture().en_quarantaine.len(), 2);
+        assert!(store.get_persona_subgraph(a.id).await.is_err());
+        store.remove_persona_note(a.id, note).await.unwrap();
+        store.remove_persona_extends(a.id, parent).await.unwrap();
+        assert!(store.get_persona_subgraph(a.id).await.is_ok());
+        store.close().await.unwrap();
+        drop(store);
+        let store = open(&base).await;
+        let sg = store.get_persona_subgraph(a.id).await.unwrap();
+        assert!(sg.notes.is_empty() && sg.parents.is_empty());
+    }
+
+    /// A migrated persona whose `status` or `energy` is absent, or whose `project_id` is
+    /// not a UUID, is quarantined: Neo4j would decode it with defaults and filter / sort /
+    /// list it on the stored value, so this backend would answer differently.
+    #[tokio::test]
+    async fn an_incomplete_migrated_persona_is_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        store.close().await.unwrap();
+        drop(store);
+        let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        write_foreign(&base, move |db| {
+            let now = Value::from(Utc::now().to_rfc3339());
+            let base_props = |id: Uuid| {
+                vec![
+                    ("id", Value::from(id.to_string())),
+                    ("name", Value::from("migrée")),
+                    ("created_at", now.clone()),
+                ]
+            };
+            let mut sans_statut = base_props(ids[0]);
+            sans_statut.push(("energy", Value::from(0.5)));
+            db.create_node_with_props(&["Persona"], sans_statut);
+            let mut sans_energie = base_props(ids[1]);
+            sans_energie.push(("status", Value::from("active")));
+            db.create_node_with_props(&["Persona"], sans_energie);
+            let mut projet_illisible = base_props(ids[2]);
+            projet_illisible.extend([
+                ("status", Value::from("active")),
+                ("energy", Value::from(0.5)),
+                ("project_id", Value::from("pas-un-uuid")),
+            ]);
+            db.create_node_with_props(&["Persona"], projet_illisible);
+        })
+        .await;
+        let store = open(&base).await;
+        let rapport = store.rapport_d_ouverture().clone();
+        assert_eq!(rapport.en_quarantaine.len(), 3, "{rapport:?}");
+        for id in ids {
+            assert!(store.get_persona(id).await.unwrap().is_none());
+        }
+        assert!(store.list_global_personas().await.unwrap().is_empty());
+    }
+
+    /// Every persona and feature-graph write that carries a value past the blob threshold
+    /// (a description, a system prompt, a JSON string) — or that replaces or removes one —
+    /// pays the full flush, before the commit point for a creation. Observed through the
+    /// engine's own fsync counter: no `close()` is involved, which would flush anyway.
+    #[tokio::test]
+    async fn persona_and_feature_graph_writes_past_the_blob_threshold_pay_the_full_flush() {
+        let store = temporary(Durabilite::Wal).await;
+        let p = a_project("blob");
+        store.create_project(&p).await.unwrap();
+        let long = "x".repeat(257);
+        // Every case is checked; the failures are reported together.
+        let mut manquants: Vec<String> = Vec::new();
+        macro_rules! cout {
+            ($e:expr) => {{
+                let t0 = store.fsyncs_du_wal().unwrap();
+                $e.await.unwrap();
+                store.fsyncs_du_wal().unwrap() - t0
+            }};
+        }
+        // Creations.
+        let court = cout!(store.create_persona(&a_persona(Some(p.id), "court", 0.5)));
+        assert!(court >= 1, "the WAL fsync ran");
+        let mut desc = a_persona(Some(p.id), "desc", 0.5);
+        desc.description = long.clone();
+        let mut prompt = a_persona(Some(p.id), "prompt", 0.5);
+        prompt.system_prompt_override = Some(long.clone());
+        let mut histoire = a_persona(Some(p.id), "histoire", 0.5);
+        histoire.energy_history = vec![0.123_456_789_012_345; 30];
+        for (cas, x) in [
+            ("description", &desc),
+            ("system prompt", &prompt),
+            ("JSON", &histoire),
+        ] {
+            let c = cout!(store.create_persona(x));
+            if c <= court {
+                manquants.push(format!(
+                    "create_persona with a long {cas}: {c} fsyncs against {court}"
+                ));
+            }
+        }
+        // Updates: a new long value, an old long value replaced, an old long value removed.
+        let mut u = a_persona(Some(p.id), "maj", 0.5);
+        store.create_persona(&u).await.unwrap();
+        let court_maj = cout!(store.update_persona(&u));
+        u.model_preference = Some(long.clone());
+        let c = cout!(store.update_persona(&u));
+        if c <= court_maj {
+            manquants.push(format!("new long value: {c} against {court_maj}"));
+        }
+        let mut d = desc.clone();
+        d.description = "court".into();
+        let c = cout!(store.update_persona(&d));
+        if c <= court_maj {
+            manquants.push(format!(
+                "old long description replaced: {c} against {court_maj}"
+            ));
+        }
+        let mut q = prompt.clone();
+        q.system_prompt_override = None;
+        let c = cout!(store.update_persona(&q));
+        if c <= court_maj {
+            manquants.push(format!("old long prompt removed: {c} against {court_maj}"));
+        }
+        // Feature graphs.
+        let court_fg = cout!(store.create_feature_graph(&a_feature_graph(p.id, "court")));
+        let mut g = a_feature_graph(p.id, "desc");
+        g.description = Some(long.clone());
+        let c = cout!(store.create_feature_graph(&g));
+        if c <= court_fg {
+            manquants.push(format!("long description: {c} against {court_fg}"));
+        }
+        let mut g = a_feature_graph(p.id, "rel");
+        g.include_relations = Some(vec!["IMPLEMENTS_TRAIT".to_string(); 20]);
+        let c = cout!(store.create_feature_graph(&g));
+        if c <= court_fg {
+            manquants.push(format!("long JSON: {c} against {court_fg}"));
+        }
+        assert!(manquants.is_empty(), "no full flush for: {manquants:#?}");
+        // The removal is applied.
+        let relu = store.get_persona(prompt.id).await.unwrap().unwrap();
+        assert_eq!(relu.system_prompt_override, None);
     }
 }
