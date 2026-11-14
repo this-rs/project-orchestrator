@@ -5873,8 +5873,18 @@ mod with_the_feature {
                     ("updated_at", Value::from("hier")),
                 ],
             );
-            let file = db.create_node(&["File"]);
-            db.set_node_property(file, "path", Value::from("/src/lib.rs"));
+            // A full `File` node (the code domain decodes it, nothing to
+            // quarantine): it is the target of the KNOWS / INCLUDES_ENTITY
+            // edges below, not itself foreign.
+            let file = db.create_node_with_props(
+                &["File"],
+                vec![
+                    ("path", Value::from("/src/lib.rs")),
+                    ("language", Value::from("rust")),
+                    ("hash", Value::from("h")),
+                    ("last_parsed", Value::from("2026-03-04T05:06:07+00:00")),
+                ],
+            );
             let pn = db.find_nodes_by_property("id", &Value::from(kid.to_string()))[0];
             db.create_edge_with_props(pn, file, "KNOWS", [("weight", Value::from(0.8))]);
             let gn = db.find_nodes_by_property("id", &Value::from(fid.to_string()))[0];

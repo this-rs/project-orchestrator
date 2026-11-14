@@ -427,12 +427,14 @@ impl IndexCommits {
             }
         }
 
-        // Files (owned by the code domain; read here).
+        // Files (owned by the code domain; read here). The code domain deletes the
+        // drafts and quarantines what does not decode; this domain only needs
+        // `path` and `project_id` to resolve `TOUCHES` / `CO_CHANGED` edges, and
+        // skips whatever it cannot use (a node without a `path`, a duplicate path)
+        // without reporting it: the quarantine of a `File` node is the code
+        // domain's own report, and reporting it here too would count it twice.
         for noeud in store.nodes_by_label(ETIQUETTE_FICHIER) {
             let Some(n) = db.get_node(noeud) else {
-                rapport
-                    .en_quarantaine
-                    .push(format!("nœud File {noeud:?} : illisible"));
                 continue;
             };
             let chaine = |cle: &str| {
@@ -441,15 +443,9 @@ impl IndexCommits {
                     .filter(|s| !s.is_empty())
             };
             let Some(path) = chaine("path") else {
-                rapport
-                    .en_quarantaine
-                    .push(format!("nœud File {noeud:?} : sans `path`"));
                 continue;
             };
             if index.fichier_par_chemin.contains_key(&path) {
-                rapport
-                    .en_quarantaine
-                    .push(format!("nœud File {noeud:?} : chemin {} déjà pris", path));
                 continue;
             }
             let project_id = chaine("project_id").and_then(|s| s.parse::<Uuid>().ok());
@@ -576,10 +572,13 @@ impl IndexCommits {
 
 #[cfg(any(test, feature = "mock-store"))]
 impl ObrainGraphStore {
-    /// Test hook: write a `File` node the way the code domain will (`File`,
-    /// `path`, `project_id`), publishing it to the commit index. The commit
-    /// domain only READS `File` nodes; this lets its tests and the end-to-end
-    /// proof exercise TOUCHES and CO_CHANGED before the code domain is linked.
+    /// Test hook: write a `File` node the way the code domain writes it
+    /// (`File {path, language, hash, last_parsed, project_id}`), publishing it to
+    /// the commit index. The commit domain only READS `File` nodes; this lets its
+    /// tests and the end-to-end proof exercise TOUCHES and CO_CHANGED before the
+    /// code domain is linked. The extra properties matter: the code domain (now
+    /// ported) quarantines a `File` node it cannot decode, so a minimal node
+    /// (`path` + `project_id` only) would be quarantined at the next open.
     /// Absent from production builds.
     #[doc(hidden)]
     pub async fn ecrire_fichier_pour_test(&self, chemin: &str, projet: Option<Uuid>) -> Result<()> {
@@ -589,6 +588,13 @@ impl ObrainGraphStore {
             move |(), w: &mut Ecriture<'_>| {
                 let noeud = w.db.create_node(&[ETIQUETTE_FICHIER]);
                 w.db.set_node_property(noeud, "path", Value::from(chemin.clone()));
+                w.db.set_node_property(noeud, "language", Value::from("rust"));
+                w.db.set_node_property(noeud, "hash", Value::from("h"));
+                w.db.set_node_property(
+                    noeud,
+                    "last_parsed",
+                    Value::from("2026-03-04T05:06:07+00:00"),
+                );
                 w.db.set_node_property(
                     noeud,
                     "project_id",
