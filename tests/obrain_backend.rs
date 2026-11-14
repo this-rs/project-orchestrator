@@ -3848,9 +3848,38 @@ mod with_the_feature {
         );
         assert_eq!(store.count_chat_events(parent).await.unwrap(), 1);
         assert_eq!(store.get_session_children(parent).await.unwrap().len(), 1);
+        // Le journal d'ancres a survécu (ajout puis retrait).
+        assert_eq!(store.list_anchor_events(parent).await.unwrap().len(), 2);
+
+        // Les deux sessions ancrées sur la même cible ; le journal se lit tout de suite.
+        let cible = || {
+            NewAnchor::new(
+                AnchorTargetType::File,
+                "src/lib.rs",
+                [AnchorRole::Focus],
+                AnchorActor::User,
+                "moi",
+            )
+        };
+        let ancre_parent = store.add_anchor(parent, cible()).await.unwrap();
+        store.add_anchor(child, cible()).await.unwrap();
+        assert_eq!(store.list_anchor_events(parent).await.unwrap().len(), 3);
+        assert_eq!(store.list_anchor_events(child).await.unwrap().len(), 1);
+        async fn page(store: &ObrainGraphStore) -> Vec<project_orchestrator::chat::anchor::Anchor> {
+            store
+                .list_sessions_for_target(AnchorTargetType::File, "src/lib.rs", None, 50, None)
+                .await
+                .unwrap()
+                .items
+        }
 
         // Suppression, et le cascade attendu.
         assert!(store.delete_chat_session(child).await.unwrap());
+        // La page de la cible garde l'ancre de l'autre session.
+        let restantes = page(&store).await;
+        assert_eq!(restantes.len(), 1);
+        assert_eq!(restantes[0].id, ancre_parent.id);
+        assert!(store.list_anchor_events(child).await.unwrap().is_empty());
         assert!(store.delete_chat_session(parent).await.unwrap());
         assert_eq!(store.get_chat_session(parent).await.unwrap(), None);
         assert_eq!(
@@ -3859,6 +3888,25 @@ mod with_the_feature {
                 .await
                 .unwrap()
                 .1,
+            0
+        );
+
+        // Et après une réouverture, rien de ce qui appartenait aux sessions ne revient.
+        store.close().await.unwrap();
+        drop(store);
+        let store = open(&base).await;
+        assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
+        for sid in [parent, child] {
+            assert!(store.list_anchor_events(sid).await.unwrap().is_empty());
+            assert!(store.list_session_anchors(sid).await.unwrap().is_empty());
+            assert_eq!(store.count_chat_events(sid).await.unwrap(), 0);
+        }
+        assert!(page(&store).await.is_empty());
+        assert_eq!(
+            store
+                .mark_anchors_dangling(AnchorTargetType::File, "src/lib.rs")
+                .await
+                .unwrap(),
             0
         );
     }
