@@ -86,7 +86,7 @@
 //! A creation follows the draft-marker protocol of `project.rs`: the node, its
 //! properties and its `HAS_DECISION` edge are written under the marker
 //! `_brouillon`, the marker is removed last (the commit point), and opening
-//! deletes any draft with its edges. A value above [`SEUIL_COLONNE_BLOB`] — a
+//! deletes any draft with its edges. A value above `SEUIL_COLONNE_BLOB` — a
 //! long `description` or `rationale` — makes the creation pay the FULL flush
 //! before the marker goes.
 //!
@@ -98,7 +98,7 @@
 //! converges: the writes are idempotent, the edge is drawn once, and an edge
 //! found without its `created_at` gets it.
 //!
-//! Durability of long values: a value above [`SEUIL_COLONNE_BLOB`] is not
+//! Durability of long values: a value above `SEUIL_COLONNE_BLOB` is not
 //! recovered by the WAL alone, so every write that puts one — or REPLACES one
 //! that sat there — pays the full flush: the creation (any property, list
 //! elements included), and `update_decision` for `description`, `rationale`
@@ -124,7 +124,7 @@ use uuid::Uuid;
 
 #[cfg(any(test, feature = "mock-store"))]
 use super::Interruption;
-use super::{project, Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
+use super::{project, Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::episodes::distill_models::SharingConsent;
 use crate::neo4j::models::{
     AffectsRelation, DecisionListItem, DecisionNode, DecisionStatus, DecisionTimelineEntry,
@@ -163,16 +163,6 @@ pub const REFUSEES: &[&str] = &[
 /// A refusal, by name, with the reason it is not ported.
 fn refus<T>(methode: &'static str, raison: &'static str) -> Result<T> {
     Err(anyhow::Error::new(NonPorte(methode)).context(raison))
-}
-
-/// Does this value go to a blob column (a string above the threshold, or a
-/// string inside a list)?
-fn va_en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-        || v.as_list().is_some_and(|l| {
-            l.iter()
-                .any(|e| e.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB))
-        })
 }
 
 /// The properties `create_decision_global` writes, as Neo4j names them; the
@@ -483,24 +473,22 @@ impl DecisionStore for ObrainGraphStore {
                     };
                     (projet, proprietes_de_creation(&d))
                 };
-                w.flush_complet = proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
                 let noeud = w.db.create_node(&[LABEL]);
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeNoeud)?;
                 w.etape()?;
-                w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+                w.poser(noeud, BROUILLON, Value::from(true));
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeMarqueur)?;
                 for (k, (cle, valeur)) in proprietes.into_iter().enumerate() {
                     w.etape()?;
-                    w.db.set_node_property(noeud, cle, valeur);
+                    w.poser(noeud, cle, valeur);
                     #[cfg(any(test, feature = "mock-store"))]
                     w.point(Interruption::ApresLaPropriete(k + 1))?;
                 }
                 if let Some(projet) = projet_noeud {
                     let _ = w.db.create_edge(projet, noeud, APPARTIENT);
                 }
-                w.rendre_durable_avant_le_marqueur()?;
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::AvantLeRetraitDuMarqueur)?;
                 w.etape()?;
@@ -583,39 +571,22 @@ impl DecisionStore for ObrainGraphStore {
                 };
                 // The OLD value too: replacing a value that sat in a blob column clears
                 // that slot, which the WAL does not recover (as in note.rs).
-                w.flush_complet = ancienne.decision.description.len() > SEUIL_COLONNE_BLOB
-                    || ancienne.decision.rationale.len() > SEUIL_COLONNE_BLOB
-                    || description
-                        .as_ref()
-                        .is_some_and(|c| c.len() > SEUIL_COLONNE_BLOB)
-                    || rationale
-                        .as_ref()
-                        .is_some_and(|c| c.len() > SEUIL_COLONNE_BLOB)
-                    // `chosen_option` is a free string too: its old and its new value.
-                    || ancienne
-                        .decision
-                        .chosen_option
-                        .as_ref()
-                        .is_some_and(|c| c.len() > SEUIL_COLONNE_BLOB)
-                    || chosen_option
-                        .as_ref()
-                        .is_some_and(|c| c.len() > SEUIL_COLONNE_BLOB);
                 let noeud = ancienne.noeud;
                 if let Some(c) = &description {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "description", Value::from(c.clone()));
+                    w.poser(noeud, "description", Value::from(c.clone()));
                 }
                 if let Some(c) = &rationale {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "rationale", Value::from(c.clone()));
+                    w.poser(noeud, "rationale", Value::from(c.clone()));
                 }
                 if let Some(c) = &chosen_option {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "chosen_option", Value::from(c.clone()));
+                    w.poser(noeud, "chosen_option", Value::from(c.clone()));
                 }
                 if let Some(s) = status {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "status", Value::from(s.to_string()));
+                    w.poser(noeud, "status", Value::from(s.to_string()));
                 }
                 let entree = Self::relire_decision(w, &ancienne)?;
                 w.rendre_durable()?;
@@ -639,7 +610,7 @@ impl DecisionStore for ObrainGraphStore {
                 // The draft marker first: from here a crash leaves a draft, which
                 // opening deletes with whatever edges remain (see the module doc).
                 w.etape()?;
-                w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+                w.poser(noeud, BROUILLON, Value::from(true));
                 // DETACH DELETE: every edge of the decision goes with it, both ways.
                 let aretes: Vec<EdgeId> =
                     w.db.store()
@@ -797,7 +768,7 @@ impl DecisionStore for ObrainGraphStore {
                     return Ok(());
                 };
                 w.etape()?;
-                w.db.set_node_property(
+                w.poser(
                     ancienne.noeud,
                     "status",
                     Value::from(DecisionStatus::Superseded.to_string()),
@@ -828,11 +799,7 @@ impl DecisionStore for ObrainGraphStore {
                 // edge and its `created_at` is finished by the retry.
                 if !deja.is_some_and(|(_, date)| date) {
                     w.etape()?;
-                    w.db.set_edge_property(
-                        arete,
-                        "created_at",
-                        Value::from(Utc::now().to_rfc3339()),
-                    );
+                    w.poser_arete(arete, "created_at", Value::from(Utc::now().to_rfc3339()));
                 }
                 let entree = Self::relire_decision(w, &ancienne)?;
                 w.rendre_durable()?;

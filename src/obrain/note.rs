@@ -56,10 +56,7 @@
 //! The creation carries the draft marker `_brouillon` (see `project.rs`): the
 //! node, its properties and its `HAS_NOTE` edge are written under it, the marker
 //! is removed last (the commit point), and opening deletes any draft with its
-//! edges. A value above [`SEUIL_COLONNE_BLOB`] — a note's `content` usually is —
-//! makes the creation pay the FULL flush (`commit_wal`) before the marker goes:
-//! its cost is proportional to the base (see the PR's measures and
-//! `src/obrain/mod.rs`, issue obrain #120).
+//! edges.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -74,7 +71,7 @@ use uuid::Uuid;
 
 #[cfg(any(test, feature = "mock-store"))]
 use super::Interruption;
-use super::{project, Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
+use super::{project, Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::neo4j::document::{Document, DocumentChunk, DocumentChunkHit};
 use crate::neo4j::traits::NoteStore;
 use crate::notes::provenance;
@@ -185,16 +182,6 @@ fn supprimer_arete(w: &mut Ecriture<'_>, arete: EdgeId, methode: &str) -> Result
 /// A refusal, by name, with the reason it is not ported.
 fn refus<T>(methode: &'static str, raison: &'static str) -> Result<T> {
     Err(anyhow::Error::new(NonPorte(methode)).context(raison))
-}
-
-/// Does this value go to a blob column (a string above the threshold, or a
-/// string inside a list)?
-fn va_en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-        || v.as_list().is_some_and(|l| {
-            l.iter()
-                .any(|e| e.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB))
-        })
 }
 
 /// `project_id` of the scope a note is attached to, as Neo4j stores the scope.
@@ -808,12 +795,8 @@ pub(super) fn ecrire_propriete_de_note(
         return Ok(false);
     };
     // The new value, or the one it replaces, in a blob column: the full flush.
-    w.flush_complet = va_en_colonne_blob(&valeur)
-        || w.db
-            .get_node(ancienne.noeud)
-            .is_some_and(|n| n.get_property(cle).is_some_and(va_en_colonne_blob));
     w.etape()?;
-    w.db.set_node_property(ancienne.noeud, cle, valeur);
+    w.poser(ancienne.noeud, cle, valeur);
     let entree = ObrainGraphStore::relire(w, &ancienne)?;
     w.rendre_durable()?;
     w.index_mut()?.notes.publier(entree);
@@ -998,17 +981,16 @@ impl NoteStore for ObrainGraphStore {
                     };
                     (projet, proprietes_de_creation(&n)?)
                 };
-                w.flush_complet = proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
                 let noeud = w.db.create_node(&[LABEL]);
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeNoeud)?;
                 w.etape()?;
-                w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+                w.poser(noeud, BROUILLON, Value::from(true));
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeMarqueur)?;
                 for (k, (cle, valeur)) in proprietes.into_iter().enumerate() {
                     w.etape()?;
-                    w.db.set_node_property(noeud, cle, valeur);
+                    w.poser(noeud, cle, valeur);
                     #[cfg(any(test, feature = "mock-store"))]
                     w.point(Interruption::ApresLaPropriete(k + 1))?;
                     // Only the test hook reads the rank.
@@ -1018,7 +1000,6 @@ impl NoteStore for ObrainGraphStore {
                 if let Some(projet) = projet_noeud {
                     let _ = w.db.create_edge(projet, noeud, APPARTIENT);
                 }
-                w.rendre_durable_avant_le_marqueur()?;
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::AvantLeRetraitDuMarqueur)?;
                 w.etape()?;
@@ -1061,32 +1042,25 @@ impl NoteStore for ObrainGraphStore {
                     return Ok(None);
                 };
                 let staleness = staleness_score.filter(|v| v.is_finite());
-                // The OLD content too: replacing a value that sat in a blob column clears
-                // that slot, which the WAL does not recover (as in project.rs).
-                w.flush_complet = ancienne.note.content.len() > SEUIL_COLONNE_BLOB
-                    || content
-                        .as_ref()
-                        .is_some_and(|c| c.len() > SEUIL_COLONNE_BLOB)
-                    || tags.iter().flatten().any(|t| t.len() > SEUIL_COLONNE_BLOB);
                 let noeud = ancienne.noeud;
                 let maj = Utc::now();
                 w.etape()?;
-                w.db.set_node_property(noeud, "updated_at", Value::from(maj.to_rfc3339()));
+                w.poser(noeud, "updated_at", Value::from(maj.to_rfc3339()));
                 if let Some(c) = &content {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "content", Value::from(c.clone()));
+                    w.poser(noeud, "content", Value::from(c.clone()));
                 }
                 if let Some(i) = importance {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "importance", Value::from(i.to_string()));
+                    w.poser(noeud, "importance", Value::from(i.to_string()));
                 }
                 if let Some(s) = status {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "status", Value::from(s.to_string()));
+                    w.poser(noeud, "status", Value::from(s.to_string()));
                 }
                 if let Some(t) = &tags {
                     w.etape()?;
-                    w.db.set_node_property(
+                    w.poser(
                         noeud,
                         "tags",
                         Value::List(
@@ -1099,7 +1073,7 @@ impl NoteStore for ObrainGraphStore {
                 }
                 if let Some(s) = staleness {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "staleness_score", Value::from(s));
+                    w.poser(noeud, "staleness_score", Value::from(s));
                 }
                 let entree = Self::relire(w, &ancienne)?;
                 w.rendre_durable()?;
@@ -1142,7 +1116,7 @@ impl NoteStore for ObrainGraphStore {
                 match project_id {
                     Some(p) => {
                         w.etape()?;
-                        w.db.set_node_property(noeud, "project_id", Value::from(p.to_string()))
+                        w.poser(noeud, "project_id", Value::from(p.to_string()))
                     }
                     None => {
                         w.etape()?;
@@ -1334,18 +1308,6 @@ impl NoteStore for ObrainGraphStore {
                     return Ok(());
                 };
                 let maintenant = Utc::now();
-                // The hashes are strings too: above the blob threshold the full flush runs
-                // (new values, and those of the link they replace).
-                let long = |s: &str| s.len() > SEUIL_COLONNE_BLOB;
-                w.flush_complet = long(&signature)
-                    || long(&corps)
-                    || e.liens
-                        .iter()
-                        .filter(|l| l.entite == entite && l.id_entite == id_entite)
-                        .any(|l| {
-                            l.signature_hash.as_deref().is_some_and(long)
-                                || l.body_hash.as_deref().is_some_and(long)
-                        });
                 let arete = match e
                     .liens
                     .iter()
@@ -1355,15 +1317,11 @@ impl NoteStore for ObrainGraphStore {
                     None => w.db.create_edge(e.noeud, noeud_cible, LIEN),
                 };
                 w.etape()?;
-                w.db.set_edge_property(arete, "signature_hash", Value::from(signature.clone()));
+                w.poser_arete(arete, "signature_hash", Value::from(signature.clone()));
                 w.etape()?;
-                w.db.set_edge_property(arete, "body_hash", Value::from(corps.clone()));
+                w.poser_arete(arete, "body_hash", Value::from(corps.clone()));
                 w.etape()?;
-                w.db.set_edge_property(
-                    arete,
-                    "last_verified",
-                    Value::from(maintenant.to_rfc3339()),
-                );
+                w.poser_arete(arete, "last_verified", Value::from(maintenant.to_rfc3339()));
                 let lien = Lien {
                     entite: entite.clone(),
                     id_entite: id_entite.clone(),
@@ -1578,15 +1536,15 @@ impl NoteStore for ObrainGraphStore {
                     return Ok(());
                 };
                 w.etape()?;
-                w.db.set_node_property(vieille.noeud, "status", Value::from("archived"));
+                w.poser(vieille.noeud, "status", Value::from("archived"));
                 w.etape()?;
-                w.db.set_node_property(
+                w.poser(
                     vieille.noeud,
                     "superseded_by",
                     Value::from(new_note_id.to_string()),
                 );
                 w.etape()?;
-                w.db.set_node_property(
+                w.poser(
                     nouvelle.noeud,
                     "supersedes",
                     Value::from(old_note_id.to_string()),
@@ -1637,41 +1595,35 @@ impl NoteStore for ObrainGraphStore {
                         .into_iter()
                         .any(|(_, a)| w.db.get_edge(a).is_some_and(|x| &*x.edge_type == SUCCEDE));
                 let maintenant = Utc::now();
-                // Strings above the blob threshold are not WAL-covered: the full flush runs
-                // before the answer, as for a creation (new values and replaced ones).
-                let long = |s: &str| s.len() > SEUIL_COLONNE_BLOB;
-                w.flush_complet = long(&par)
-                    || e.note.human_confirmed_by.as_deref().is_some_and(long)
-                    || e.note.last_confirmed_by.as_deref().is_some_and(long);
                 w.etape()?;
-                w.db.set_node_property(
+                w.poser(
                     noeud,
                     "last_confirmed_at",
                     Value::from(maintenant.to_rfc3339()),
                 );
                 w.etape()?;
-                w.db.set_node_property(noeud, "last_confirmed_by", Value::from(par.clone()));
+                w.poser(noeud, "last_confirmed_by", Value::from(par.clone()));
                 if par_humain {
                     w.etape()?;
-                    w.db.set_node_property(
+                    w.poser(
                         noeud,
                         "human_confirmed_at",
                         Value::from(maintenant.to_rfc3339()),
                     );
                     w.etape()?;
-                    w.db.set_node_property(noeud, "human_confirmed_by", Value::from(par.clone()));
+                    w.poser(noeud, "human_confirmed_by", Value::from(par.clone()));
                 }
                 w.etape()?;
-                w.db.set_node_property(noeud, "staleness_score", Value::from(0.0_f64));
+                w.poser(noeud, "staleness_score", Value::from(0.0_f64));
                 if !remplacee {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "status", Value::from("active"));
+                    w.poser(noeud, "status", Value::from("active"));
                     let energie = e.note.energy + 0.3;
                     w.etape()?;
-                    w.db.set_node_property(noeud, "energy", Value::from(energie.min(1.0)));
+                    w.poser(noeud, "energy", Value::from(energie.min(1.0)));
                 }
                 w.etape()?;
-                w.db.set_node_property(
+                w.poser(
                     noeud,
                     "last_activated",
                     Value::from(maintenant.to_rfc3339()),

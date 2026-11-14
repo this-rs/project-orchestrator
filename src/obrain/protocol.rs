@@ -83,7 +83,7 @@ use obrain_engine::ObrainDB;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-use super::{Ecriture, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
+use super::{Ecriture, ObrainGraphStore, RapportOuverture};
 use crate::neo4j::traits::ProtocolStore;
 use crate::protocol::{Protocol, ProtocolCategory, ProtocolState, ProtocolTransition};
 
@@ -104,15 +104,6 @@ pub(super) type Lecteur<'a> = &'a dyn Fn(&str) -> Option<Value>;
 pub(super) struct Fiche<T> {
     pub(super) noeud: NodeId,
     pub(super) valeur: T,
-}
-
-/// Does this value go to a blob column (a string above the threshold)?
-pub(super) fn va_en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-}
-
-pub(super) fn a_un_blob(proprietes: &[(&'static str, Value)]) -> bool {
-    proprietes.iter().any(|(_, v)| va_en_colonne_blob(v))
 }
 
 /// A string property as stored, the empty string included (absent: `None`).
@@ -342,16 +333,14 @@ pub(super) fn creer<T>(
     proprietes: Vec<(&'static str, Value)>,
     decoder: &dyn Fn(Lecteur) -> Result<T>,
 ) -> Result<Fiche<T>> {
-    w.flush_complet = a_un_blob(&proprietes);
     w.etape()?;
     let noeud = w.db.create_node(&[label]);
     w.etape()?;
-    w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+    w.poser(noeud, BROUILLON, Value::from(true));
     for (cle, valeur) in proprietes {
         w.etape()?;
-        w.db.set_node_property(noeud, cle, valeur);
+        w.poser(noeud, cle, valeur);
     }
-    w.rendre_durable_avant_le_marqueur()?;
     w.etape()?;
     // The commit point.
     w.db.remove_node_property(noeud, BROUILLON);
@@ -367,13 +356,11 @@ pub(super) fn reecrire<T>(
     w: &mut Ecriture<'_>,
     noeud: NodeId,
     proprietes: Vec<(&'static str, Value)>,
-    ancien_en_blob: bool,
     decoder: &dyn Fn(Lecteur) -> Result<T>,
 ) -> Result<Fiche<T>> {
-    w.flush_complet = ancien_en_blob || a_un_blob(&proprietes);
     for (cle, valeur) in proprietes {
         w.etape()?;
-        w.db.set_node_property(noeud, cle, valeur);
+        w.poser(noeud, cle, valeur);
     }
     let fiche = w.apres_ecriture(relire(w.db, noeud, decoder))?;
     w.rendre_durable()?;
@@ -714,14 +701,13 @@ impl ProtocolStore for ObrainGraphStore {
                 };
                 let fiche = match existant {
                     None => creer(w, PROTOCOLE, proprietes, &lire_protocole)?,
-                    Some((noeud, ancien)) => {
-                        let ancien_en_blob = a_un_blob(&proprietes_protocole(&ancien)?);
+                    Some((noeud, _)) => {
                         // `created_at` is set on creation only (`ON CREATE SET`).
                         let maj = proprietes
                             .into_iter()
                             .filter(|(k, _)| !matches!(*k, "id" | "created_at"))
                             .collect();
-                        reecrire(w, noeud, maj, ancien_en_blob, &lire_protocole)?
+                        reecrire(w, noeud, maj, &lire_protocole)?
                     }
                 };
                 w.index_mut()?.protocoles.protocoles.insert(p.id, fiche);
@@ -917,10 +903,9 @@ impl ProtocolStore for ObrainGraphStore {
                 };
                 let fiche = match existant {
                     None => creer(w, ETAT, proprietes, &lire_etat)?,
-                    Some((noeud, ancien)) => {
-                        let ancien_en_blob = a_un_blob(&proprietes_etat(&ancien)?);
+                    Some((noeud, _)) => {
                         let maj = proprietes.into_iter().filter(|(k, _)| *k != "id").collect();
-                        reecrire(w, noeud, maj, ancien_en_blob, &lire_etat)?
+                        reecrire(w, noeud, maj, &lire_etat)?
                     }
                 };
                 w.index_mut()?.protocoles.etats.insert(s.id, fiche);
@@ -1010,10 +995,9 @@ impl ProtocolStore for ObrainGraphStore {
                 };
                 let fiche = match existant {
                     None => creer(w, TRANSITION, proprietes, &lire_transition)?,
-                    Some((noeud, ancien)) => {
-                        let ancien_en_blob = a_un_blob(&proprietes_transition(&ancien)?);
+                    Some((noeud, _)) => {
                         let maj = proprietes.into_iter().filter(|(k, _)| *k != "id").collect();
-                        reecrire(w, noeud, maj, ancien_en_blob, &lire_transition)?
+                        reecrire(w, noeud, maj, &lire_transition)?
                     }
                 };
                 w.index_mut()?.protocoles.transitions.insert(t.id, fiche);

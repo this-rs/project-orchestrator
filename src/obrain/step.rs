@@ -346,7 +346,7 @@ impl ObrainGraphStore {
                 };
                 ecritures(w, |w| {
                     w.etape()?;
-                    w.db.set_node_property(noeud, SUPPRESSION, Value::from(true));
+                    w.poser(noeud, SUPPRESSION, Value::from(true));
                     detacher(w, noeud)
                 })?;
                 w.rendre_durable()?;

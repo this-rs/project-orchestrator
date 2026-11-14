@@ -163,7 +163,7 @@ use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
 use super::project::poser_horodatage;
-use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
+use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::neo4j::models::*;
 use crate::neo4j::traits::CommitStore;
 
@@ -202,26 +202,9 @@ const SANS_FICHIER: &str = "s'appuie sur les nœuds File, qu'aucun code de produ
      obrain (domaine code non porté) : servie, elle répondrait Ok en jetant les fichiers, ou une \
      liste vide — une fausse réussite. Son code est prêt (commit.rs), derrière ce refus";
 
-#[cfg_attr(not(test), allow(dead_code))]
 /// "Now", as Neo4j's `toString(datetime())` writes it: RFC 3339, UTC, `Z`.
 fn maintenant() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::AutoSi, true)
-}
-
-/// Does this value go to a blob column (a string above the threshold, or a
-/// string inside a list — as in `note.rs`)?
-fn va_en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-        || v.as_list().is_some_and(|l| {
-            l.iter()
-                .any(|e| e.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB))
-        })
-}
-
-/// A list of strings with one above the blob threshold.
-#[cfg_attr(not(test), allow(dead_code))]
-fn liste_en_colonne_blob(l: &[String]) -> bool {
-    l.iter().any(|s| s.len() > SEUIL_COLONNE_BLOB)
 }
 
 /// The refusal of a hash reserved by a quarantined node (see `IndexCommits::reserves`).
@@ -588,8 +571,12 @@ impl ObrainGraphStore {
             || (),
             move |(), w: &mut Ecriture<'_>| {
                 let noeud = w.db.create_node(&[ETIQUETTE_FICHIER]);
-                w.db.set_node_property(noeud, "path", Value::from(chemin.clone()));
-                w.db.set_node_property(
+                w.poser(noeud, "path", Value::from(chemin.clone()));
+                // The code domain refuses, at open, a File it cannot decode.
+                w.poser(noeud, "language", Value::from("rust"));
+                w.poser(noeud, "hash", Value::from("h"));
+                w.poser(noeud, "last_parsed", Value::from(Utc::now().to_rfc3339()));
+                w.poser(
                     noeud,
                     "project_id",
                     Value::from(projet.map(|p| p.to_string()).unwrap_or_default()),
@@ -676,32 +663,20 @@ impl CommitStore for ObrainGraphStore {
                 // not fail — a re-sync of the same history stops on the first commit
                 // it meets twice — and it must not make a second node, or
                 // `get_commit` answers whichever one it meets first.
-                let (existant, ancien_en_blob) = {
+                let existant = {
                     let etat = w.index()?;
                     if etat.commits.reserves.contains(&c.hash) {
                         return refus_reserve("CommitStore::create_commit", &c.hash);
                     }
-                    match etat.commits.par_hash.get(&c.hash) {
-                        Some(e) => (
-                            Some(e.noeud),
-                            // Replacing a value that WAS in a blob column clears
-                            // that slot, which the WAL does not recover either: the
-                            // old value counts too.
-                            e.commit.message.len() > SEUIL_COLONNE_BLOB
-                                || e.commit.author.len() > SEUIL_COLONNE_BLOB,
-                        ),
-                        None => (None, false),
-                    }
+                    etat.commits.par_hash.get(&c.hash).map(|e| e.noeud)
                 };
-                w.flush_complet =
-                    ancien_en_blob || proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
                 if let Some(noeud) = existant {
                     // A rewrite has no draft marker to lean on, and the properties
                     // are separate engine writes: a crash between them can leave
                     // some new values next to some old ones (each whole). The
                     // commit still reads; the next registration rewrites it.
                     for (cle, valeur) in proprietes {
-                        w.db.set_node_property(noeud, cle, valeur);
+                        w.poser(noeud, cle, valeur);
                     }
                     w.rendre_durable()?;
                     let entree = w.apres_ecriture(EntreeCommit::decoder(w.db, noeud))?;
@@ -712,11 +687,10 @@ impl CommitStore for ObrainGraphStore {
                     return Ok(());
                 }
                 let noeud = w.db.create_node(&[LABEL]);
-                w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+                w.poser(noeud, BROUILLON, Value::from(true));
                 for (cle, valeur) in proprietes {
-                    w.db.set_node_property(noeud, cle, valeur);
+                    w.poser(noeud, cle, valeur);
                 }
-                w.rendre_durable_avant_le_marqueur()?;
                 w.db.remove_node_property(noeud, BROUILLON);
                 let entree = w.apres_ecriture(EntreeCommit::decoder(w.db, noeud))?;
                 w.rendre_durable()?;
@@ -995,7 +969,6 @@ impl ObrainGraphStore {
                 // A path above the blob threshold (`file_path` of the edge) is
                 // not recovered by the WAL: the full flush. The value it replaces
                 // on an existing edge is the same path.
-                w.flush_complet = fichiers.iter().any(|f| f.path.len() > SEUIL_COLONNE_BLOB);
                 // Everything read from the index, before any write.
                 let (commit_noeud, noeuds, mut touches) = {
                     let etat = w.index()?;
@@ -1026,15 +999,15 @@ impl ObrainGraphStore {
                             deletions: None,
                         }),
                     };
-                    w.db.set_edge_property(touche.arete, "file_path", Value::from(f.path.clone()));
+                    w.poser_arete(touche.arete, "file_path", Value::from(f.path.clone()));
                     // Each on its own (module doc: Neo4j drops `deletions` when
                     // `additions` is absent).
                     if let Some(a) = f.additions.filter(|a| *a >= 0) {
-                        w.db.set_edge_property(touche.arete, "additions", Value::from(a));
+                        w.poser_arete(touche.arete, "additions", Value::from(a));
                         touche.additions = Some(a);
                     }
                     if let Some(d) = f.deletions.filter(|d| *d >= 0) {
-                        w.db.set_edge_property(touche.arete, "deletions", Value::from(d));
+                        w.poser_arete(touche.arete, "deletions", Value::from(d));
                         touche.deletions = Some(d);
                     }
                 }
@@ -1193,13 +1166,9 @@ impl ObrainGraphStore {
                         None => (w.db.create_edge(na, nb, CO_CHANGE), 0),
                     };
                     let nouveau = ancien + co_count;
-                    w.db.set_edge_property(arete, "count", Value::from(nouveau));
-                    w.db.set_edge_property(arete, "last_at", Value::from(maintenant.clone()));
-                    w.db.set_edge_property(
-                        arete,
-                        "project_id",
-                        Value::from(project_id.to_string()),
-                    );
+                    w.poser_arete(arete, "count", Value::from(nouveau));
+                    w.poser_arete(arete, "last_at", Value::from(maintenant.clone()));
+                    w.poser_arete(arete, "project_id", Value::from(project_id.to_string()));
                     etat_projet.insert(
                         (path_a.clone(), path_b.clone()),
                         EntreeCoChangee {
@@ -1351,13 +1320,9 @@ impl ObrainGraphStore {
                         .filter(|((pid, _, _), _)| *pid == project_id)
                         .map(|(_, e)| e)
                         .collect();
-                    // An old `via` in a blob column: its slot is cleared with the
-                    // edge, which the WAL does not recover either.
-                    let ancien_en_blob = anciennes.iter().any(|e| liste_en_colonne_blob(&e.via));
                     let a_supprimer: Vec<EdgeId> = anciennes.iter().map(|e| e.arete).collect();
                     drop(anciennes);
                     drop(etat);
-                    w.flush_complet = ancien_en_blob;
                     for arete in a_supprimer {
                         w.db.delete_edge(arete);
                     }
@@ -1482,15 +1447,11 @@ impl ObrainGraphStore {
                         (fa.noeud, fb.noeud)
                     };
                     let arete = w.db.create_edge(na, nb, CO_CHANGE_TRANSITIF);
-                    w.db.set_edge_property(
-                        arete,
-                        "project_id",
-                        Value::from(project_id.to_string()),
-                    );
-                    w.db.set_edge_property(arete, "score", Value::from(score));
-                    w.db.set_edge_property(arete, "depth", Value::from(depth));
-                    w.db.set_edge_property(arete, "via", Value::from(via.clone()));
-                    w.db.set_edge_property(arete, "computed_at", Value::from(maintenant.clone()));
+                    w.poser_arete(arete, "project_id", Value::from(project_id.to_string()));
+                    w.poser_arete(arete, "score", Value::from(score));
+                    w.poser_arete(arete, "depth", Value::from(depth));
+                    w.poser_arete(arete, "via", Value::from(via.clone()));
+                    w.poser_arete(arete, "computed_at", Value::from(maintenant.clone()));
                     nouvelles.push(EntreeCoChangeeTransitive {
                         arete,
                         path_a,
@@ -1502,7 +1463,6 @@ impl ObrainGraphStore {
                 }
                 let total = nouvelles.len() as i64;
                 // A new `via` above the blob threshold: the full flush.
-                w.flush_complet |= nouvelles.iter().any(|e| liste_en_colonne_blob(&e.via));
 
                 w.rendre_durable()?;
                 {
@@ -1682,7 +1642,7 @@ mod tests {
                             ("author", "a"),
                             ("timestamp", "pas une date"),
                         ] {
-                            w.db.set_node_property(n, cle, Value::from(valeur));
+                            w.poser(n, cle, Value::from(valeur));
                         }
                         w.rendre_durable()
                     },
@@ -2239,7 +2199,7 @@ mod tests {
     /// creation; and a rewrite that REPLACES a long message by a short one pays
     /// it too (the old slot is cleared).
     #[tokio::test]
-    async fn un_message_long_paie_le_flush_complet() {
+    async fn un_message_long_ne_paie_pas_de_flush_complet() {
         let store = ObrainGraphStore::open_temporary().unwrap();
         let mut court = un_commit("court", 0);
         court.message = "x".repeat(256);
@@ -2251,7 +2211,7 @@ mod tests {
         let t = fsyncs(&store);
         store.create_commit(&long).await.unwrap();
         let cout_long = fsyncs(&store) - t;
-        assert!(cout_long > cout_court, "{cout_long} contre {cout_court}");
+        assert_eq!(cout_long, cout_court, "{cout_long} contre {cout_court}");
         long.message = "court désormais".to_string();
         let t = fsyncs(&store);
         store.create_commit(&long).await.unwrap();
@@ -2259,8 +2219,8 @@ mod tests {
         let t = fsyncs(&store);
         store.create_commit(&court).await.unwrap(); // short over short
         let cout_court_sur_court = fsyncs(&store) - t;
-        assert!(
-            cout_remplacement > cout_court_sur_court,
+        assert_eq!(
+            cout_remplacement, cout_court_sur_court,
             "l'ancienne valeur longue compte : {cout_remplacement} contre {cout_court_sur_court}"
         );
     }
@@ -2268,7 +2228,7 @@ mod tests {
     /// A TOUCHES edge carries the path (`file_path`): a path above the threshold
     /// pays the full flush.
     #[tokio::test]
-    async fn un_chemin_long_dans_touches_paie_le_flush_complet() {
+    async fn un_chemin_long_dans_touches_ne_paie_pas_de_flush_complet() {
         let store = ObrainGraphStore::open_temporary().unwrap();
         let court = "c".repeat(256);
         let long = "l".repeat(257);
@@ -2287,14 +2247,14 @@ mod tests {
             .await
             .unwrap();
         let cout_long = fsyncs(&store) - t;
-        assert!(cout_long > cout_court, "{cout_long} contre {cout_court}");
+        assert_eq!(cout_long, cout_court, "{cout_long} contre {cout_court}");
     }
 
     /// A transitive edge carries `via`, a list of paths: one path above the
     /// threshold pays the full flush — when it is written, and when the next
     /// recompute deletes the edge that holds it.
     #[tokio::test]
-    async fn un_via_long_paie_le_flush_complet() {
+    async fn un_via_long_ne_paie_pas_de_flush_complet() {
         async fn cout(intermediaire: &str) -> (u64, u64) {
             let store = ObrainGraphStore::open_temporary().unwrap();
             let projet = historique(
@@ -2330,12 +2290,12 @@ mod tests {
         }
         let (ecriture_courte, purge_courte) = cout(&"b".repeat(256)).await;
         let (ecriture_longue, purge_longue) = cout(&"b".repeat(257)).await;
-        assert!(
-            ecriture_longue > ecriture_courte,
+        assert_eq!(
+            ecriture_longue, ecriture_courte,
             "écriture : {ecriture_longue} contre {ecriture_courte}"
         );
-        assert!(
-            purge_longue > purge_courte,
+        assert_eq!(
+            purge_longue, purge_courte,
             "purge de l'ancienne valeur : {purge_longue} contre {purge_courte}"
         );
     }

@@ -634,12 +634,14 @@ impl IndexExecutions {
         for (id, f) in index.declencheurs.iter_mut() {
             let tirs = tirs_par_declencheur.get(id).copied().unwrap_or(0);
             if f.valeur.fire_count < tirs {
+                // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
                 db.set_node_property(f.noeud, "fire_count", Value::from(i64::try_from(tirs)?));
                 f.valeur.fire_count = tirs;
                 repares += 1;
             }
             if let Some(&d) = dernier_signal.get(id) {
                 if f.valeur.last_fired.is_none_or(|l| l < d) {
+                    // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
                     db.set_node_property(f.noeud, "last_fired", instant(d));
                     f.valeur.last_fired = Some(d);
                     repares += 1;
@@ -1802,9 +1804,11 @@ mod tests {
             let db = &store.interne.db;
             let n = db.create_node(&[DECLENCHEUR]);
             for (k, v) in proprietes_declencheur(&mauvais, None).unwrap() {
+                // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
                 db.set_node_property(n, k, v);
             }
             // An author Neo4j would read as `None`: the run would start as nobody.
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             db.set_node_property(n, "author", Value::from("{pas du json"));
             db.commit_wal().unwrap();
             store.close().await.unwrap();

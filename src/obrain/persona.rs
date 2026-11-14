@@ -83,7 +83,7 @@
 //! deletion interrupted after the marker is FINISHED at open
 //! (`RapportOuverture::suppressions_achevees`), never served as a persona with
 //! part of its edges gone. A write that carries a string above
-//! [`SEUIL_COLONNE_BLOB`](super::SEUIL_COLONNE_BLOB) (a description, a system
+//! `SEUIL_COLONNE_BLOB`(super::SEUIL_COLONNE_BLOB) (a description, a system
 //! prompt, the `energy_history` JSON), or that replaces or removes one, pays the
 //! FULL flush, before the marker is removed for a creation (the pattern of
 //! `plan.rs` and `note.rs`, until #1190 retires it). Reads come from the
@@ -101,9 +101,7 @@ use uuid::Uuid;
 
 #[cfg(any(test, feature = "mock-store"))]
 use super::Interruption;
-use super::{
-    featuregraph, note, Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB,
-};
+use super::{featuregraph, note, Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::neo4j::models::{
     PersonaNode, PersonaStatus, PersonaSubgraph, PersonaSubgraphStats, PersonaWeightedRelation,
 };
@@ -330,16 +328,6 @@ fn aretes_vers_id(db: &ObrainDB, de: NodeId, vers: Uuid, type_: &str) -> Vec<Edg
         })
         .map(|(_, a)| a)
         .collect()
-}
-
-/// Does this value go to a blob column (a string above the threshold)? Such a write
-/// pays the full flush (`flush_complet`), as in `plan.rs` and `note.rs`.
-fn va_en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-        || v.as_list().is_some_and(|l| {
-            l.iter()
-                .any(|e| e.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB))
-        })
 }
 
 /// A finite weight, or a refusal before any write.
@@ -614,11 +602,12 @@ impl ObrainGraphStore {
                             Some(v) if max && v >= poids => v,
                             _ => poids,
                         };
-                        w.db.set_edge_property(*a, "weight", Value::from(nouveau));
+                        w.poser_arete(*a, "weight", Value::from(nouveau));
                         e.notes.insert(note_id, (*a, nouveau));
                         *a
                     }
                     None => {
+                        // hors-poser: an edge whose only property is one small number (weight/order): never out of the WAL
                         let a = w.db.create_edge_with_props(
                             e.noeud,
                             cible,
@@ -726,15 +715,14 @@ impl PersonaStore for ObrainGraphStore {
                         None => None,
                     }
                 };
-                w.flush_complet = proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
                 let noeud = w.db.create_node(&[LABEL]);
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeNoeud)?;
-                w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+                w.poser(noeud, BROUILLON, Value::from(true));
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeMarqueur)?;
                 for (_k, (cle, valeur)) in proprietes.into_iter().enumerate() {
-                    w.db.set_node_property(noeud, cle, valeur);
+                    w.poser(noeud, cle, valeur);
                     #[cfg(any(test, feature = "mock-store"))]
                     w.point(Interruption::ApresLaPropriete(_k + 1))?;
                 }
@@ -743,7 +731,6 @@ impl PersonaStore for ObrainGraphStore {
                 }
                 // A blob-sized value is recovered only by the full flush: on disk
                 // BEFORE the marker says the persona is complete.
-                w.rendre_durable_avant_le_marqueur()?;
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::AvantLeRetraitDuMarqueur)?;
                 // The commit point.
@@ -805,24 +792,9 @@ impl PersonaStore for ObrainGraphStore {
                     None => a_retirer.push("last_activated"),
                 }
                 fixes.push(("updated_at", Value::from(Utc::now().to_rfc3339())));
-                // The full flush when a NEW value goes to a blob column, or when an OLD
-                // one (replaced or removed) is there.
-                let ancienne = &e.persona;
-                let ancien_en_blob = [
-                    Some(ancienne.name.as_str()),
-                    Some(ancienne.description.as_str()),
-                    ancienne.complexity_default.as_deref(),
-                    ancienne.model_preference.as_deref(),
-                    ancienne.system_prompt_override.as_deref(),
-                ]
-                .into_iter()
-                .flatten()
-                .any(|s| s.len() > SEUIL_COLONNE_BLOB);
-                w.flush_complet =
-                    ancien_en_blob || fixes.iter().any(|(_, v)| va_en_colonne_blob(v));
                 for (cle, valeur) in fixes {
                     w.etape()?;
-                    w.db.set_node_property(noeud, cle, valeur);
+                    w.poser(noeud, cle, valeur);
                 }
                 for cle in a_retirer {
                     w.etape()?;
@@ -848,7 +820,7 @@ impl PersonaStore for ObrainGraphStore {
                 // The deletion marker first: from here on, a crash leaves a node that
                 // opening finishes deleting, never a persona served with part of its
                 // edges gone.
-                w.db.set_node_property(noeud, SUPPRESSION, Value::from(true));
+                w.poser(noeud, SUPPRESSION, Value::from(true));
                 // DETACH DELETE: every edge, in both directions.
                 let aretes: Vec<EdgeId> =
                     w.db.store()
@@ -953,15 +925,15 @@ impl PersonaStore for ObrainGraphStore {
                 };
                 let maintenant = Value::from(Utc::now().to_rfc3339());
                 w.etape()?;
-                w.db.set_node_property(
+                w.poser(
                     e.noeud,
                     "activation_count",
                     Value::from(e.persona.activation_count + 1),
                 );
                 w.etape()?;
-                w.db.set_node_property(e.noeud, "last_activated", maintenant.clone());
+                w.poser(e.noeud, "last_activated", maintenant.clone());
                 w.etape()?;
-                w.db.set_node_property(e.noeud, "updated_at", maintenant);
+                w.poser(e.noeud, "updated_at", maintenant);
                 let entree = w.apres_ecriture(EntreePersona::decoder(w.db, e.noeud, Some(&e)))?;
                 w.rendre_durable()?;
                 w.index_mut()?.personas.par_id.insert(persona_id, entree);

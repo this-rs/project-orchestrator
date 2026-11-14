@@ -84,7 +84,6 @@ use obrain_core::graph::Direction;
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
-use super::skill::{ancienne_en_colonne_blob, en_colonne_blob};
 use super::{note, project, Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::episodes::distill_models::{
     ConsentCounts, PrivacyMode, SharingConsent, SharingEvent, SharingPolicy,
@@ -492,15 +491,13 @@ impl SharingStore for ObrainGraphStore {
                         );
                     }
                 }
-                w.flush_complet = proprietes.iter().any(|(_, v)| en_colonne_blob(v));
                 let noeud = w.db.create_node(&[EVENEMENT]);
                 w.etape()?;
-                w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+                w.poser(noeud, BROUILLON, Value::from(true));
                 for (cle, valeur) in proprietes {
                     w.etape()?;
-                    w.db.set_node_property(noeud, cle, valeur);
+                    w.poser(noeud, cle, valeur);
                 }
-                w.rendre_durable_avant_le_marqueur()?;
                 w.etape()?;
                 w.db.remove_node_property(noeud, BROUILLON);
                 let lu = lecteur(w.db, noeud).and_then(|get| lire_evenement(&get));
@@ -548,28 +545,23 @@ impl SharingStore for ObrainGraphStore {
                     etat.partage.tombes.get(&t.content_hash).map(|e| e.noeud)
                 };
                 let proprietes = proprietes_tombe(&t);
-                w.flush_complet = proprietes.iter().any(|(_, v)| en_colonne_blob(v))
-                    || existante.is_some_and(|n| {
-                        ancienne_en_colonne_blob(w.db, n, proprietes.iter().map(|(k, _)| *k))
-                    });
                 let noeud = match existante {
                     // MERGE on the hash, then SET: `content_hash` itself stays.
                     Some(n) => {
                         for (cle, valeur) in proprietes.into_iter().skip(1) {
                             w.etape()?;
-                            w.db.set_node_property(n, cle, valeur);
+                            w.poser(n, cle, valeur);
                         }
                         n
                     }
                     None => {
                         let n = w.db.create_node(&[TOMBE]);
                         w.etape()?;
-                        w.db.set_node_property(n, BROUILLON, Value::from(true));
+                        w.poser(n, BROUILLON, Value::from(true));
                         for (cle, valeur) in proprietes {
                             w.etape()?;
-                            w.db.set_node_property(n, cle, valeur);
+                            w.poser(n, cle, valeur);
                         }
-                        w.rendre_durable_avant_le_marqueur()?;
                         w.etape()?;
                         w.db.remove_node_property(n, BROUILLON);
                         n

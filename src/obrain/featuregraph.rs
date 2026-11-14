@@ -52,7 +52,7 @@
 //! compare as strings, not as instants: Neo4j's order, kept). The
 //! creation follows the draft-marker protocol of `project.rs`, and pays the FULL
 //! flush before the marker is removed when it carries a string above
-//! [`SEUIL_COLONNE_BLOB`](super::SEUIL_COLONNE_BLOB) (description, the
+//! `SEUIL_COLONNE_BLOB`(super::SEUIL_COLONNE_BLOB) (description, the
 //! `include_relations` JSON), as `plan.rs` does until #1190 retires it; reads come from
 //! the in-memory index, which a write publishes only once durable.
 
@@ -68,7 +68,7 @@ use uuid::Uuid;
 
 #[cfg(any(test, feature = "mock-store"))]
 use super::Interruption;
-use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
+use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::neo4j::models::{
     FeatureGraphComparison, FeatureGraphDetail, FeatureGraphNode, FeatureGraphOverlap,
     FeatureGraphStatistics,
@@ -136,16 +136,6 @@ fn proprietes_de_creation(g: &FeatureGraphNode) -> Vec<(&'static str, Value)> {
             ),
         ),
     ]
-}
-
-/// Does this value go to a blob column (a string above the threshold)? Such a write
-/// pays the full flush (`flush_complet`), as in `plan.rs` and `note.rs`.
-fn va_en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-        || v.as_list().is_some_and(|l| {
-            l.iter()
-                .any(|e| e.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB))
-        })
 }
 
 /// The domain value of a `FeatureGraph` node: the counterpart of
@@ -363,22 +353,20 @@ impl FeatureGraphStore for ObrainGraphStore {
                     })?
                 };
                 let proprietes = proprietes_de_creation(&g);
-                w.flush_complet = proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
                 let noeud = w.db.create_node(&[LABEL]);
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeNoeud)?;
-                w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+                w.poser(noeud, BROUILLON, Value::from(true));
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeMarqueur)?;
                 for (_k, (cle, valeur)) in proprietes.into_iter().enumerate() {
-                    w.db.set_node_property(noeud, cle, valeur);
+                    w.poser(noeud, cle, valeur);
                     #[cfg(any(test, feature = "mock-store"))]
                     w.point(Interruption::ApresLaPropriete(_k + 1))?;
                 }
                 w.db.create_edge(noeud, projet, APPARTIENT);
                 // A blob-sized value is recovered only by the full flush: on disk
                 // BEFORE the marker says the graph is complete.
-                w.rendre_durable_avant_le_marqueur()?;
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::AvantLeRetraitDuMarqueur)?;
                 // The commit point.
@@ -451,7 +439,7 @@ impl FeatureGraphStore for ObrainGraphStore {
                 // The deletion marker first: from here on, a crash leaves a node that
                 // opening finishes deleting, never a graph served with part of its
                 // entities gone.
-                w.db.set_node_property(noeud, SUPPRESSION, Value::from(true));
+                w.poser(noeud, SUPPRESSION, Value::from(true));
                 // DETACH DELETE: every edge, in both directions (INCLUDES_ENTITY,
                 // BELONGS_TO, the personas' SCOPED_TO).
                 let aretes: Vec<EdgeId> =

@@ -95,10 +95,9 @@ use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
 use super::protocol::{
-    a_un_blob, chaine, charger, creer, date_facultative, date_requise, enumeration,
-    enumeration_requise, facultative, json_attendu, non_signe, relire, requise, supprimer,
-    supprimer_detache, texte_attendu, uuid_facultatif, uuid_requis, va_en_colonne_blob, Fiche,
-    Lecteur,
+    chaine, charger, creer, date_facultative, date_requise, enumeration, enumeration_requise,
+    facultative, json_attendu, non_signe, relire, requise, supprimer, supprimer_detache,
+    texte_attendu, uuid_facultatif, uuid_requis, Fiche, Lecteur,
 };
 use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::neo4j::protocol::ProducedArtefact;
@@ -334,6 +333,7 @@ fn achever_les_mises_a_jour(db: &ObrainDB) -> usize {
             continue;
         };
         for (cle, v) in valeurs {
+            // hors-poser: recovery at open, outside a write closure (no `Ecriture`); open flushes after
             db.set_node_property(noeud, &cle, v);
         }
         db.remove_node_property(noeud, MARQUEUR_MAJ);
@@ -630,7 +630,6 @@ impl ProtocolRunStore for ObrainGraphStore {
                         }
                         (f.noeud, f.valeur.clone())
                     };
-                    let ancien_en_blob = a_un_blob(&proprietes_run(&ancien)?);
                     let nouvelle = r
                         .version
                         .checked_add(1)
@@ -662,15 +661,12 @@ impl ProtocolRunStore for ObrainGraphStore {
                     maj.sort_by_key(|(k, _)| *k != "version");
                     // The update marker first, removed last (module doc).
                     let marqueur = encoder_maj(&maj)?;
-                    w.flush_complet =
-                        ancien_en_blob || a_un_blob(&maj) || va_en_colonne_blob(&marqueur);
                     w.etape()?;
-                    w.db.set_node_property(noeud, MARQUEUR_MAJ, marqueur);
+                    w.poser(noeud, MARQUEUR_MAJ, marqueur);
                     for (cle, valeur) in maj {
                         w.etape()?;
-                        w.db.set_node_property(noeud, cle, valeur);
+                        w.poser(noeud, cle, valeur);
                     }
-                    w.rendre_durable_avant_le_marqueur()?;
                     w.etape()?;
                     w.db.remove_node_property(noeud, MARQUEUR_MAJ);
                     let fiche = w.apres_ecriture(relire(w.db, noeud, &lire_run))?;
@@ -1315,6 +1311,7 @@ mod tests {
             p = protocole(&store).await.0;
             q = protocole(&store).await.0;
             // Running, root, and unreadable (no `current_state`): quarantined.
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             store.interne.db.create_node_with_props(
                 &[RUN],
                 vec![
@@ -1325,6 +1322,7 @@ mod tests {
                 ],
             );
             // No status at all: counted as running (fail closed).
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             store.interne.db.create_node_with_props(
                 &[RUN],
                 vec![
@@ -1442,6 +1440,7 @@ mod tests {
             let noeud_p = store.interne.etat.read().unwrap().protocoles.protocoles[&p.id].noeud;
             let db = &store.interne.db;
             // A state of p, unreadable (no `name`).
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             db.create_node_with_props(
                 &["ProtocolState"],
                 vec![
@@ -1450,6 +1449,7 @@ mod tests {
                 ],
             );
             // A transition whose property names another protocol, linked to p by edge.
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             let t = db.create_node_with_props(
                 &["ProtocolTransition"],
                 vec![
@@ -1464,6 +1464,7 @@ mod tests {
             db.create_edge(noeud_p, t, "HAS_TRANSITION");
             // A run of p, unreadable, and its runtime state.
             let run_id = Uuid::new_v4();
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             db.create_node_with_props(
                 &[RUN],
                 vec![
@@ -1472,6 +1473,7 @@ mod tests {
                     ("status", Value::from("completed")),
                 ],
             );
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             db.create_node_with_props(
                 &[ETAT_RUNTIME],
                 vec![
@@ -1496,7 +1498,7 @@ mod tests {
     /// counted in fsyncs, without any `close()`. For a run update (`error`), a
     /// state upsert (`prompt_fragment`) and a protocol upsert (`description`).
     #[tokio::test]
-    async fn une_valeur_longue_paie_le_flush_complet_sans_close() {
+    async fn une_valeur_longue_ne_paie_pas_de_flush_complet_sans_close() {
         let store = ObrainGraphStore::open_temporary().unwrap();
         let fsyncs = || store.fsyncs_du_wal().unwrap();
         let (mut p, mut etat) = protocole(&store).await;
@@ -1520,12 +1522,9 @@ mod tests {
         let long = cout!(store.update_protocol_run(&mut r));
         r.error = None;
         let remplace = cout!(store.update_protocol_run(&mut r));
-        assert!(
-            long > wal_seul,
-            "run, long value: {long} against {wal_seul}"
-        );
-        assert!(
-            remplace > wal_seul,
+        assert_eq!(long, wal_seul, "run, long value: {long} against {wal_seul}");
+        assert_eq!(
+            remplace, wal_seul,
             "run, long value replaced: {remplace} against {wal_seul}"
         );
 
@@ -1535,9 +1534,9 @@ mod tests {
         let long = cout!(store.upsert_protocol_state(&etat));
         etat.prompt_fragment = None;
         let remplace = cout!(store.upsert_protocol_state(&etat));
-        assert!(long > court, "state, long value: {long} against {court}");
-        assert!(
-            remplace > court,
+        assert_eq!(long, court, "state, long value: {long} against {court}");
+        assert_eq!(
+            remplace, court,
             "state, long value replaced: {remplace} against {court}"
         );
 
@@ -1546,9 +1545,9 @@ mod tests {
         let long = cout!(store.upsert_protocol(&p));
         p.description = String::new();
         let remplace = cout!(store.upsert_protocol(&p));
-        assert!(long > court, "protocol, long value: {long} against {court}");
-        assert!(
-            remplace > court,
+        assert_eq!(long, court, "protocol, long value: {long} against {court}");
+        assert_eq!(
+            remplace, court,
             "protocol, long value replaced: {remplace} against {court}"
         );
     }

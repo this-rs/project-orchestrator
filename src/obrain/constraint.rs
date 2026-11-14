@@ -98,7 +98,7 @@ use obrain_core::graph::Direction;
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
-use super::{plan, project, Ecriture, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
+use super::{plan, project, Ecriture, ObrainGraphStore, RapportOuverture};
 use crate::neo4j::models::{ConstraintNode, ConstraintType};
 
 const LABEL: &str = "Constraint";
@@ -110,11 +110,6 @@ const BROUILLON: &str = "_brouillon";
 const DELIAISON: &str = "_deliaison";
 const CONTRAINT_PAR: &str = "CONSTRAINED_BY";
 const A_LE_PLAN: &str = "HAS_PLAN";
-
-/// Does this value go to a blob column (a string above the threshold)?
-fn va_en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-}
 
 /// The Neo4j reading of a stored type: lowercased, an unknown value is `Other`.
 fn type_depuis(s: &str) -> ConstraintType {
@@ -224,6 +219,7 @@ pub(super) fn achever_les_deliaisons(db: &ObrainDB, rapport: &mut RapportOuvertu
         for (a, _) in aretes_entrantes(db, noeud, A_LE_PLAN) {
             db.delete_edge(a);
         }
+        // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
         db.set_node_property(noeud, "project_id", Value::from(""));
         db.remove_node_property(noeud, DELIAISON);
         rapport.deliaisons_achevees += 1;
@@ -377,18 +373,16 @@ impl ObrainGraphStore {
                 ];
                 // A value past the blob threshold is not recovered by the WAL: the
                 // full flush runs before the marker goes (as in plan.rs / note.rs).
-                w.flush_complet = proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
                 let noeud = w.db.create_node(&[LABEL]);
                 w.etape()?;
-                w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+                w.poser(noeud, BROUILLON, Value::from(true));
                 w.etape()?;
                 for (cle, valeur) in proprietes {
-                    w.db.set_node_property(noeud, cle, valeur);
+                    w.poser(noeud, cle, valeur);
                     w.etape()?;
                 }
                 w.db.create_edge(noeud_plan, noeud, CONTRAINT_PAR);
                 w.etape()?;
-                w.rendre_durable_avant_le_marqueur()?;
                 // The commit point.
                 w.db.remove_node_property(noeud, BROUILLON);
                 let entree = w.apres_ecriture(
@@ -446,35 +440,25 @@ impl ObrainGraphStore {
             || (),
             move |(), w: &mut Ecriture<'_>| {
                 // A missing constraint is a silent no-op, as in Neo4j.
-                let Some((noeud, plan, ancien_en_blob)) =
-                    w.index()?.contraintes.par_id.get(&id).map(|e| {
-                        let c = &e.contrainte;
-                        let ancien = c.description.len() > SEUIL_COLONNE_BLOB
-                            || c.enforced_by
-                                .as_ref()
-                                .is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB);
-                        (e.noeud, e.plan, ancien)
-                    })
+                let Some((noeud, plan)) = w
+                    .index()?
+                    .contraintes
+                    .par_id
+                    .get(&id)
+                    .map(|e| (e.noeud, e.plan))
                 else {
                     return Ok(());
                 };
-                // The OLD values too: replacing a value that sat in a blob column
-                // clears that slot, which the WAL does not recover (as in plan.rs).
-                w.flush_complet = ancien_en_blob
-                    || description
-                        .iter()
-                        .chain(enforced_by.iter())
-                        .any(|s| s.len() > SEUIL_COLONNE_BLOB);
                 if let Some(d) = description {
-                    w.db.set_node_property(noeud, "description", Value::from(d));
+                    w.poser(noeud, "description", Value::from(d));
                     w.etape()?;
                 }
                 if let Some(t) = constraint_type {
-                    w.db.set_node_property(noeud, "constraint_type", Value::from(t.to_string()));
+                    w.poser(noeud, "constraint_type", Value::from(t.to_string()));
                     w.etape()?;
                 }
                 if let Some(e) = enforced_by {
-                    w.db.set_node_property(noeud, "enforced_by", Value::from(e));
+                    w.poser(noeud, "enforced_by", Value::from(e));
                     w.etape()?;
                 }
                 let entree = w.apres_ecriture(EntreeContrainte::decoder(w.db, noeud, plan))?;
@@ -571,11 +555,7 @@ impl ObrainGraphStore {
                         .and_then(|n| n.get_property("project_id").cloned())
                         .and_then(|v| v.as_str().map(str::to_string));
                 if actuel.as_deref() != Some(projet.to_string().as_str()) {
-                    w.db.set_node_property(
-                        noeud_plan,
-                        "project_id",
-                        Value::from(projet.to_string()),
-                    );
+                    w.poser(noeud_plan, "project_id", Value::from(projet.to_string()));
                     w.etape()?;
                     ecrit = true;
                 }
@@ -612,13 +592,13 @@ impl ObrainGraphStore {
                     }
                     p.noeud
                 };
-                w.db.set_node_property(noeud_plan, DELIAISON, Value::from(true));
+                w.poser(noeud_plan, DELIAISON, Value::from(true));
                 w.etape()?;
                 for (a, _) in aretes_entrantes(w.db, noeud_plan, A_LE_PLAN) {
                     w.db.delete_edge(a);
                     w.etape()?;
                 }
-                w.db.set_node_property(noeud_plan, "project_id", Value::from(""));
+                w.poser(noeud_plan, "project_id", Value::from(""));
                 w.etape()?;
                 w.db.remove_node_property(noeud_plan, DELIAISON);
                 w.etape()?;
@@ -1032,6 +1012,7 @@ mod tests {
         let n = db.get_node(noeud).unwrap();
         let copie = db.create_node(&[label]);
         for (k, v) in n.properties.iter() {
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             db.set_node_property(copie, k.as_ref(), v.clone());
         }
         copie
@@ -1064,8 +1045,11 @@ mod tests {
             let double = dupliquer(&store, original, LABEL_PLAN);
             let db = &store.interne.db;
             let n = db.create_node(&[LABEL]);
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             db.set_node_property(n, "id", Value::from(c.id.to_string()));
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             db.set_node_property(n, "constraint_type", Value::from("security"));
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             db.set_node_property(n, "description", Value::from("du double"));
             db.create_edge(double, n, CONTRAINT_PAR);
             store.close().await.unwrap();
@@ -1211,18 +1195,18 @@ mod tests {
         assert_eq!(store.interne.db.store().node_count(), 0);
     }
 
-    /// Decision e5713801: a constraint carrying a value past the blob threshold
-    /// pays the FULL flush, at creation and at update (new value, or the old one
-    /// it replaces). Observed without any close, through the engine's counter of
-    /// fsyncs: a full flush runs more of them than the WAL fsync alone.
+    /// A constraint carrying a value past 256 bytes is journaled in the WAL with
+    /// its value (obrain #123): it pays the SAME single WAL fsync as a short one,
+    /// at creation and at update, no full flush. Observed without any close,
+    /// through the engine's counter of fsyncs.
     #[tokio::test]
-    async fn une_valeur_en_colonne_blob_paie_le_flush_complet() {
+    async fn une_valeur_longue_paie_le_meme_fsync_qu_une_courte() {
         let store = ObrainGraphStore::open_temporary().unwrap();
         let fsyncs = || store.fsyncs_du_wal().unwrap();
         let p = un_plan(None);
         store.create_plan(&p).await.unwrap();
-        let court = contrainte(&"x".repeat(SEUIL_COLONNE_BLOB));
-        let long = contrainte(&"x".repeat(SEUIL_COLONNE_BLOB + 1));
+        let court = contrainte(&"x".repeat(256));
+        let long = contrainte(&"x".repeat(257));
 
         let t = fsyncs();
         store.create_constraint(p.id, &court).await.unwrap();
@@ -1231,44 +1215,28 @@ mod tests {
         store.create_constraint(p.id, &long).await.unwrap();
         let cout_long = fsyncs() - t;
         assert!(cout_court >= 1, "the WAL fsync ran");
-        assert!(
-            cout_long > cout_court,
-            "create: {cout_long} fsyncs for 257 bytes against {cout_court} for 256"
+        assert_eq!(
+            cout_long, cout_court,
+            "create: no full flush for a long value"
         );
 
-        // Update: a short value over a short one is the baseline.
         let maj = |id: Uuid, d: String| store.update_constraint(id, Some(d), None, None);
         let t = fsyncs();
         maj(court.id, "y".into()).await.unwrap();
         let base = fsyncs() - t;
-        // A short value REPLACING a long one: the blob slot is cleared.
+        // Replacing a long value, writing a long one, a long enforced_by: same cost.
         let t = fsyncs();
         maj(long.id, "y".into()).await.unwrap();
-        let remplace = fsyncs() - t;
-        assert!(
-            remplace > base,
-            "update over a blob: {remplace} against {base}"
-        );
-        // A long value written: the blob is new.
+        assert_eq!(fsyncs() - t, base, "short over long");
         let t = fsyncs();
-        maj(court.id, "z".repeat(SEUIL_COLONNE_BLOB + 1))
-            .await
-            .unwrap();
-        let ecrit = fsyncs() - t;
-        assert!(ecrit > base, "update to a blob: {ecrit} against {base}");
-        // A long enforced_by counts too.
+        maj(court.id, "z".repeat(257)).await.unwrap();
+        assert_eq!(fsyncs() - t, base, "update to a long value");
         let t = fsyncs();
         store
-            .update_constraint(
-                long.id,
-                None,
-                None,
-                Some("e".repeat(SEUIL_COLONNE_BLOB + 1)),
-            )
+            .update_constraint(long.id, None, None, Some("e".repeat(257)))
             .await
             .unwrap();
-        let par = fsyncs() - t;
-        assert!(par > base, "long enforced_by: {par} against {base}");
+        assert_eq!(fsyncs() - t, base, "long enforced_by");
         assert_eq!(
             store
                 .get_constraint(court.id)
@@ -1277,7 +1245,7 @@ mod tests {
                 .unwrap()
                 .description
                 .len(),
-            SEUIL_COLONNE_BLOB + 1
+            257
         );
     }
 
