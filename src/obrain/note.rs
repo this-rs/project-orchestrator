@@ -485,13 +485,32 @@ fn lire_note(get: &dyn Fn(&str) -> Option<Value>) -> Result<(Note, Option<DateTi
         reactivation_count: entier("reactivation_count").unwrap_or(0),
         last_reactivated: instant("last_reactivated"),
         freshness_pinged_at: instant("freshness_pinged_at"),
-        sharing_consent: chaine("sharing_consent")
-            .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
-            .unwrap_or_default(),
+        sharing_consent: consentement_lu(get, id)?,
     };
     Ok((note, instant("updated_at")))
 }
 
+/// The sharing consent of a note node. ABSENT is `NotSet` (a note written before
+/// consent existed). PRESENT but unreadable — an unknown value, an empty string, a
+/// non-string — is an error, so the note is quarantined: reading it `NotSet` would
+/// open to sharing a note whose refusal is stored in a form this decoder does not know.
+/// Neo4j reads it `NotSet` (`from_db_str`): a divergence on the strict side.
+fn consentement_lu(
+    get: &dyn Fn(&str) -> Option<Value>,
+    id: Uuid,
+) -> Result<crate::episodes::distill_models::SharingConsent> {
+    use crate::episodes::distill_models::SharingConsent;
+    let Some(v) = get("sharing_consent") else {
+        return Ok(SharingConsent::NotSet);
+    };
+    match v.as_str() {
+        Some("not_set") => Ok(SharingConsent::NotSet),
+        Some("explicit_allow") => Ok(SharingConsent::ExplicitAllow),
+        Some("explicit_deny") => Ok(SharingConsent::ExplicitDeny),
+        Some("policy_auto") => Ok(SharingConsent::PolicyAuto),
+        _ => bail!("note {id} : `sharing_consent` illisible ({v:?}) : la note est mise en quarantaine plutôt que lue `NotSet`"),
+    }
+}
 /// The index of the notes.
 #[derive(Default)]
 pub(super) struct IndexNotes {
@@ -505,6 +524,9 @@ pub(super) struct IndexNotes {
     globales: BTreeSet<Uuid>,
     /// Notes linked to an entity, by `(entity type, entity id)`.
     par_entite: HashMap<(String, String), BTreeSet<Uuid>>,
+    /// `Note` nodes left on disk at open because they could not be read (quarantined):
+    /// a count over every note would miss them (see `sharing.rs`).
+    en_quarantaine: usize,
 }
 
 impl IndexNotes {
@@ -590,6 +612,7 @@ impl IndexNotes {
         let mut vus: Vec<(NodeId, Uuid)> = Vec::new();
         for noeud in store.nodes_by_label(LABEL) {
             let Some(n) = db.get_node(noeud) else {
+                index.en_quarantaine += 1;
                 rapport
                     .en_quarantaine
                     .push(format!("nœud Note {noeud:?} : illisible"));
@@ -620,6 +643,7 @@ impl IndexNotes {
                     {
                         index.reserves.insert(id);
                     }
+                    index.en_quarantaine += 1;
                     rapport
                         .en_quarantaine
                         .push(format!("nœud Note {noeud:?} : {e}"));
@@ -627,6 +651,7 @@ impl IndexNotes {
                 }
             };
             if index.par_id.contains_key(&note.id) {
+                index.en_quarantaine += 1;
                 rapport
                     .en_quarantaine
                     .push(format!("nœud Note {noeud:?} : id {} déjà pris", note.id));
@@ -741,6 +766,58 @@ impl IndexNotes {
         }
         Ok(index)
     }
+}
+
+/// What the domains that point at a note (`skill.rs`, `sharing.rs`) may read of
+/// the note index. Read-only: a note is written by this module.
+impl IndexNotes {
+    /// The decoded note of `id`, its node, and how many of its links this backend
+    /// does not resolve (an anchor it could not serve).
+    pub(super) fn consulter(&self, id: Uuid) -> Option<(&Note, NodeId, usize)> {
+        self.par_id
+            .get(&id)
+            .map(|e| (&e.note, e.noeud, e.non_resolus))
+    }
+
+    /// Every note this backend holds.
+    pub(super) fn toutes(&self) -> impl Iterator<Item = &Note> + '_ {
+        self.par_id.values().map(|e| &e.note)
+    }
+
+    /// Whether a node of this id is on disk but was quarantined at open.
+    pub(super) fn est_reservee(&self, id: Uuid) -> bool {
+        self.reserves.contains(&id)
+    }
+
+    /// How many `Note` nodes were quarantined at open.
+    pub(super) fn en_quarantaine(&self) -> usize {
+        self.en_quarantaine
+    }
+}
+
+/// Write ONE property that another domain keeps on a note node (`sharing_consent`,
+/// `sharing.rs`), then publish the re-decoded note after the durability step.
+/// `Ok(false)`: this backend holds no note of that id (nothing written).
+pub(super) fn ecrire_propriete_de_note(
+    w: &mut Ecriture<'_>,
+    id: Uuid,
+    cle: &'static str,
+    valeur: Value,
+) -> Result<bool> {
+    let Some(ancienne) = ObrainGraphStore::entree_de(w, id)? else {
+        return Ok(false);
+    };
+    // The new value, or the one it replaces, in a blob column: the full flush.
+    w.flush_complet = va_en_colonne_blob(&valeur)
+        || w.db
+            .get_node(ancienne.noeud)
+            .is_some_and(|n| n.get_property(cle).is_some_and(va_en_colonne_blob));
+    w.etape()?;
+    w.db.set_node_property(ancienne.noeud, cle, valeur);
+    let entree = ObrainGraphStore::relire(w, &ancienne)?;
+    w.rendre_durable()?;
+    w.index_mut()?.notes.publier(entree);
+    Ok(true)
 }
 
 impl ObrainGraphStore {

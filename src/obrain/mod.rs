@@ -30,6 +30,12 @@
 //! and the decision node of [`DecisionStore`](crate::neo4j::traits::DecisionStore)
 //! (`decision.rs`: the node, its direct project and its supersession are ported;
 //! the task-bound creation, the AFFECTS edges and the embeddings are refused by name).
+//! (`federation.rs`: the five relation writes and the two backfills are refused by name),
+//! [`SkillStore`](crate::neo4j::traits::SkillStore) (`skill.rs`: skills, their note
+//! members, activation and the published-skill registry; `create_used_skill_relation` is
+//! refused by name, and some calls that reach a Decision are refused in context) and
+//! [`SharingStore`](crate::neo4j::traits::SharingStore) (`sharing.rs`: policy, note
+//! consent, events, tombstones; the decision consent is refused by name).
 //!
 //! # How obrain is used
 //!
@@ -94,6 +100,8 @@ mod project;
 mod protocol;
 mod protocolrun;
 mod release;
+mod sharing;
+mod skill;
 mod trigger;
 mod workspace;
 
@@ -168,6 +176,18 @@ pub fn refusees_chat() -> &'static [&'static str] {
 /// AFFECTS edges to code entities, and the three embedding methods.
 pub fn refusees_decision() -> &'static [&'static str] {
     decision::REFUSEES
+}
+
+/// The methods of `SkillStore` refused on every call, as `SkillStore::<method>`
+/// (`skill.rs`). Some more refuse only in context (a Decision member).
+pub fn refusees_skill() -> &'static [&'static str] {
+    skill::REFUSEES
+}
+
+/// The methods of `SharingStore` refused on every call, as
+/// `SharingStore::<method>` (`sharing.rs`).
+pub fn refusees_sharing() -> &'static [&'static str] {
+    sharing::REFUSEES
 }
 
 /// The methods of `PlanStore` refused on every call, as `PlanStore::<method>`
@@ -249,6 +269,8 @@ pub fn methodes_qui_servent() -> Vec<&'static str> {
                 && !planrun::REFUSEES.contains(m)
                 && !persona::REFUSEES.contains(m)
                 && !featuregraph::REFUSEES.contains(m)
+                && !skill::REFUSEES.contains(m)
+                && !sharing::REFUSEES.contains(m)
                 && !m.starts_with("GraphStore::")
         })
         .collect()
@@ -379,6 +401,8 @@ struct Etat {
 
     graphes: featuregraph::IndexGraphes,
     personas: persona::IndexPersonas,
+    skills: skill::IndexSkills,
+    partage: sharing::IndexPartage,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -740,6 +764,11 @@ impl ObrainGraphStore {
         let chat = chat::IndexChat::reconstruire(&db, &mut rapport).with_context(contexte)?;
         let decisions = decision::IndexDecisions::reconstruire(&db, &projets, &mut rapport)
             .with_context(contexte)?;
+        // After the notes: a skill's memberships resolve against the note index.
+        let skills =
+            skill::IndexSkills::reconstruire(&db, &notes, &mut rapport).with_context(contexte)?;
+        let partage =
+            sharing::IndexPartage::reconstruire(&db, &mut rapport).with_context(contexte)?;
         let (federation, brouillons, quarantaine) = federation::IndexFederation::reconstruire(&db)
             .with_context(|| {
                 format!(
@@ -781,6 +810,8 @@ impl ObrainGraphStore {
 
             graphes,
             personas,
+            skills,
+            partage,
         };
         let store = Self {
             interne: Arc::new(Interne {

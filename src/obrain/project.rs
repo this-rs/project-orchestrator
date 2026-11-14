@@ -666,6 +666,8 @@ const LABELS_PAR_DOMAINE: &[(&str, &[&str])] = &[
         ],
     ),
     ("fédération", &["McpServer", "McpTool"]),
+    ("skills", &["Skill", "PublishedSkill"]),
+    ("partage", &["SharingEvent", "Tombstone"]),
 ];
 
 /// What the nodes outside the addressed projects and plans are, by domain:
@@ -753,6 +755,32 @@ pub(super) fn poser_horodatage(
     w.db.set_node_property(noeud, cle, Value::from(Utc::now().to_rfc3339()));
     let entree = w.apres_ecriture(Entree::decoder(w.db, noeud))?;
     Ok(Some(Horodatage { id, entree }))
+}
+
+/// Write ONE property that another domain keeps on the project node
+/// (`sharing_policy`, `sharing.rs`), then publish the re-decoded project after the
+/// durability step. `Ok(false)`: this backend holds no project of that id.
+pub(super) fn ecrire_propriete_de_projet(
+    w: &mut Ecriture<'_>,
+    id: Uuid,
+    cle: &'static str,
+    valeur: Value,
+) -> Result<bool> {
+    let Some(noeud) = w.index()?.projets.par_id.get(&id).map(|e| e.noeud) else {
+        return Ok(false);
+    };
+    // The new value (a policy JSON can pass the threshold), or the one it replaces,
+    // in a blob column: the full flush.
+    w.flush_complet = va_en_colonne_blob(&valeur)
+        || w.db
+            .get_node(noeud)
+            .is_some_and(|n| n.get_property(cle).is_some_and(va_en_colonne_blob));
+    w.etape()?;
+    w.db.set_node_property(noeud, cle, valeur);
+    let entree = w.apres_ecriture(Entree::decoder(w.db, noeud))?;
+    w.rendre_durable()?;
+    w.index_mut()?.projets.par_id.insert(id, entree);
+    Ok(true)
 }
 
 impl ObrainGraphStore {
