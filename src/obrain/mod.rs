@@ -88,6 +88,7 @@
 
 mod auth;
 mod chat;
+mod code;
 mod commit;
 mod constraint;
 mod decision;
@@ -231,6 +232,14 @@ pub fn refusees_featuregraph() -> &'static [&'static str] {
     featuregraph::REFUSEES
 }
 
+/// The methods of `CodeStore` refused on every call, as `CodeStore::<method>`
+/// (`code.rs`): symbols, their edges, processes, graph analytics, `CO_CHANGED`,
+/// and the file domain (its two writes, which would store a hash before the refused
+/// symbols, and its eight reads, which would answer empty on a base nothing can fill).
+pub fn refusees_code() -> &'static [&'static str] {
+    code::REFUSEES
+}
+
 /// The hand-written methods that REFUSE: `GraphStore::get_progress_batch` (its
 /// contract default loops over getters of other domains), the five
 /// `FederationStore` methods whose relation writes and backfills are not ported
@@ -277,6 +286,7 @@ pub fn methodes_qui_servent() -> Vec<&'static str> {
                 && !featuregraph::REFUSEES.contains(m)
                 && !skill::REFUSEES.contains(m)
                 && !sharing::REFUSEES.contains(m)
+                && !code::REFUSEES.contains(m)
                 && !m.starts_with("GraphStore::")
         })
         .collect()
@@ -410,6 +420,8 @@ struct Etat {
     personas: persona::IndexPersonas,
     skills: skill::IndexSkills,
     partage: sharing::IndexPartage,
+
+    code: code::IndexCode,
 }
 
 /// What a write closure is given: the engine, the indexes, and the durability
@@ -798,6 +810,8 @@ impl ObrainGraphStore {
         // feature graphs.
         let graphes = featuregraph::IndexGraphes::reconstruire(&db, &mut rapport);
         let personas = persona::IndexPersonas::reconstruire(&db, &notes, &graphes, &mut rapport);
+
+        let code = code::IndexCode::reconstruire(&db, &projets, &mut rapport);
         let etat = Etat {
             projets,
             plans,
@@ -822,6 +836,8 @@ impl ObrainGraphStore {
             personas,
             skills,
             partage,
+
+            code,
         };
         let store = Self {
             interne: Arc::new(Interne {
