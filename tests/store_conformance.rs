@@ -5494,7 +5494,7 @@ mod obrain_workspace_specifique {
                 store.create_workspace_milestone(j).await.unwrap();
             }
             // Step 1 is the marker, step 2 the first child deleted.
-            store.interrompre_au_prochain(Interruption::ApresEtape(2));
+            store.interrompre_au_prochain(Interruption::AvantEtape(2));
             assert!(store.delete_workspace(ws.id).await.is_err());
             store.close().await.unwrap();
         }
@@ -6183,7 +6183,7 @@ mod obrain_release_specifique {
                 s.create_deployment(d).await.unwrap();
             }
             // Step 1 is the marker, step 2 the first deployment deleted.
-            s.interrompre_au_prochain(Interruption::ApresEtape(2));
+            s.interrompre_au_prochain(Interruption::AvantEtape(2));
             assert!(s.delete_environment(e.id).await.is_err());
             s.close().await.unwrap();
         }

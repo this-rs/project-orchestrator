@@ -432,6 +432,9 @@ fn creer_noeud(
         w.db.set_node_property(noeud, cle, valeur);
         #[cfg(any(test, feature = "mock-store"))]
         w.point(Interruption::ApresLaPropriete(n + 1))?;
+        // Only the test hook reads the rank.
+        #[cfg(not(any(test, feature = "mock-store")))]
+        let _ = n;
     }
     w.rendre_durable_avant_le_marqueur()?;
     #[cfg(any(test, feature = "mock-store"))]

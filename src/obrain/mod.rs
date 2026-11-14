@@ -349,7 +349,7 @@ struct Ecriture<'a> {
     /// [`SEUIL_COLONNE_BLOB`]): the WAL fsync is not enough, the full flush runs.
     flush_complet: bool,
     /// How many engine writes of this closure have been made (the test hook
-    /// `Interruption::ApresEtape` counts them).
+    /// `Interruption::AvantEtape` counts them).
     #[cfg_attr(not(any(test, feature = "mock-store")), allow(dead_code))]
     etapes: usize,
 }
@@ -387,16 +387,57 @@ impl Ecriture<'_> {
         Ok(())
     }
 
-    /// A test hook after each engine write of a multi-write (see `note.rs`): a crash
-    /// simulation at the k-th write. Nothing in production.
+    /// A test hook at each `etape()` call: a crash simulation at the k-th call. Where that
+    /// is relative to the write depends on the call site: `note.rs` calls it BEFORE each
+    /// write (the k-th write not yet made), `workspace.rs` and `release.rs` AFTER each
+    /// delete. The variant name keeps the note convention. Nothing in production.
     fn etape(&mut self) -> Result<()> {
         #[cfg(any(test, feature = "mock-store"))]
         {
             self.etapes += 1;
             let n = self.etapes;
-            self.point(Interruption::ApresEtape(n))?;
+            self.point(Interruption::AvantEtape(n))?;
         }
         Ok(())
+    }
+
+    /// Test hook: when `quoi` is armed (`Interruption::SuppressionEchouee`,
+    /// `Interruption::SuppressionDAreteEchouee`), the next deletion of that kind answers
+    /// "not deleted" without calling the engine. The engine does not produce that answer on
+    /// a healthy base; this reaches the branches that handle it. Nothing in production.
+    #[cfg(any(test, feature = "mock-store"))]
+    fn refus_simule(&mut self, quoi: Interruption) -> bool {
+        let Ok(mut arme) = self.interne.interruption.lock() else {
+            return false;
+        };
+        if *arme == Some(quoi) {
+            *arme = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `Interruption::SuppressionEchouee` armed: the next node deletion is refused.
+    #[cfg(any(test, feature = "mock-store"))]
+    fn suppression_de_noeud_refusee(&mut self) -> bool {
+        self.refus_simule(Interruption::SuppressionEchouee)
+    }
+
+    #[cfg(not(any(test, feature = "mock-store")))]
+    fn suppression_de_noeud_refusee(&mut self) -> bool {
+        false
+    }
+
+    /// `Interruption::SuppressionDAreteEchouee` armed: the next edge deletion is refused.
+    #[cfg(any(test, feature = "mock-store"))]
+    fn suppression_d_arete_refusee(&mut self) -> bool {
+        self.refus_simule(Interruption::SuppressionDAreteEchouee)
+    }
+
+    #[cfg(not(any(test, feature = "mock-store")))]
+    fn suppression_d_arete_refusee(&mut self) -> bool {
+        false
     }
 
     /// A failure AFTER the engine was written to (decoding what was just written)
