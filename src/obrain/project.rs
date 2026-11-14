@@ -578,7 +578,7 @@ impl ProjectStore for ObrainGraphStore {
                         .plans
                         .par_id
                         .values()
-                        .filter(|p| p.plan.project_id == Some(id))
+                        .filter(|p| p.appartient_a(id))
                         .count();
                     (
                         e.noeud,
