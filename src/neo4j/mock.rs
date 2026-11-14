@@ -6493,7 +6493,12 @@ impl ProjectStore for MockGraphStore {
         {
             anyhow::bail!("list_projects is set to fail (test)");
         }
-        Ok(self.projects.read().await.values().cloned().collect())
+        // Neo4j: `ORDER BY p.name, p.id ASC` — a total order, where the map
+        // order differed on every run.
+        let mut projects: Vec<ProjectNode> = self.projects.read().await.values().cloned().collect();
+        // `Uuid` order is the order of its canonical string (fixed-width lowercase hex).
+        projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        Ok(projects)
     }
 
     async fn update_project(
@@ -10426,6 +10431,10 @@ impl PlanStore for MockGraphStore {
             );
         }
         let cid = constraint.id;
+        // Neo4j: `CREATE CONSTRAINT constraint_id ... REQUIRE c.id IS UNIQUE`.
+        if self.constraints.read().await.contains_key(&cid) {
+            anyhow::bail!("Constraint {cid} already exists (Constraint.id is unique)");
+        }
         self.plan_constraints
             .write()
             .await
@@ -11191,10 +11200,17 @@ impl ReleaseStore for MockGraphStore {
         let pr = self.project_releases.read().await;
         let releases = self.releases.read().await;
         let ids = pr.get(&project_id).cloned().unwrap_or_default();
-        Ok(ids
+        let mut out: Vec<ReleaseNode> = ids
             .iter()
             .filter_map(|id| releases.get(id).cloned())
-            .collect())
+            .collect();
+        // ORDER BY r.created_at DESC, r.id DESC, as Neo4j does.
+        out.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        Ok(out)
     }
 
     async fn update_release(
@@ -11501,10 +11517,22 @@ impl ReleaseStore for MockGraphStore {
         let pm = self.project_milestones.read().await;
         let milestones = self.milestones.read().await;
         let ids = pm.get(&project_id).cloned().unwrap_or_default();
-        Ok(ids
+        let mut out: Vec<MilestoneNode> = ids
             .iter()
             .filter_map(|id| milestones.get(id).cloned())
-            .collect())
+            .collect();
+        // ORDER BY m.target_date ASC, m.created_at ASC, m.id ASC — target_date compared
+        // as the stored string (`""` when absent, so first), as Neo4j does.
+        let raw = |d: Option<chrono::DateTime<chrono::Utc>>| {
+            d.map(|d| d.to_rfc3339()).unwrap_or_default()
+        };
+        out.sort_by(|a, b| {
+            raw(a.target_date)
+                .cmp(&raw(b.target_date))
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(out)
     }
 
     async fn update_milestone(
@@ -11938,11 +11966,11 @@ impl ReleaseStore for MockGraphStore {
         statuses: Option<Vec<String>>,
         limit: usize,
         offset: usize,
-        _sort_by: Option<&str>,
-        _sort_order: &str,
+        sort_by: Option<&str>,
+        sort_order: &str,
     ) -> Result<(Vec<ReleaseNode>, usize)> {
         let all = self.list_project_releases(project_id).await?;
-        let filtered: Vec<ReleaseNode> = all
+        let mut filtered: Vec<ReleaseNode> = all
             .into_iter()
             .filter(|r| {
                 if let Some(ref sts) = statuses {
@@ -11956,6 +11984,26 @@ impl ReleaseStore for MockGraphStore {
                 }
             })
             .collect();
+        // ORDER BY <field> <dir>, r.id ASC. Date fields compare as their stored strings.
+        let raw = |d: Option<chrono::DateTime<chrono::Utc>>| {
+            d.map(|d| d.to_rfc3339()).unwrap_or_default()
+        };
+        let desc = sort_order != "asc";
+        filtered.sort_by(|a, b| {
+            let primaire = match sort_by {
+                Some("version") => a.version.cmp(&b.version),
+                Some("target_date") => raw(a.target_date).cmp(&raw(b.target_date)),
+                Some("released_at") => raw(a.released_at).cmp(&raw(b.released_at)),
+                Some("title") => a
+                    .title
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.title.as_deref().unwrap_or("")),
+                _ => a.created_at.cmp(&b.created_at),
+            };
+            let primaire = if desc { primaire.reverse() } else { primaire };
+            primaire.then_with(|| a.id.cmp(&b.id))
+        });
         let total = filtered.len();
         Ok((paginate(&filtered, limit, offset), total))
     }
@@ -11966,11 +12014,11 @@ impl ReleaseStore for MockGraphStore {
         statuses: Option<Vec<String>>,
         limit: usize,
         offset: usize,
-        _sort_by: Option<&str>,
-        _sort_order: &str,
+        sort_by: Option<&str>,
+        sort_order: &str,
     ) -> Result<(Vec<MilestoneNode>, usize)> {
         let all = self.list_project_milestones(project_id).await?;
-        let filtered: Vec<MilestoneNode> = all
+        let mut filtered: Vec<MilestoneNode> = all
             .into_iter()
             .filter(|m| {
                 if let Some(ref sts) = statuses {
@@ -11984,6 +12032,20 @@ impl ReleaseStore for MockGraphStore {
                 }
             })
             .collect();
+        // ORDER BY <field> <dir>, m.id ASC. The default key is target_date (stored string).
+        let raw = |d: Option<chrono::DateTime<chrono::Utc>>| {
+            d.map(|d| d.to_rfc3339()).unwrap_or_default()
+        };
+        let desc = sort_order != "asc";
+        filtered.sort_by(|a, b| {
+            let primaire = match sort_by {
+                Some("title") => a.title.cmp(&b.title),
+                Some("created_at") => a.created_at.cmp(&b.created_at),
+                _ => raw(a.target_date).cmp(&raw(b.target_date)),
+            };
+            let primaire = if desc { primaire.reverse() } else { primaire };
+            primaire.then_with(|| a.id.cmp(&b.id))
+        });
         let total = filtered.len();
         Ok((paginate(&filtered, limit, offset), total))
     }
@@ -11993,28 +12055,42 @@ impl ReleaseStore for MockGraphStore {
         search: Option<&str>,
         limit: usize,
         offset: usize,
-        _sort_by: Option<&str>,
-        _sort_order: &str,
+        sort_by: Option<&str>,
+        sort_order: &str,
     ) -> Result<(Vec<ProjectNode>, usize)> {
         let projects = self.projects.read().await;
-        let filtered: Vec<ProjectNode> = projects
+        // Same as Neo4j's `add_search_filter("p", …)`: a case-insensitive CONTAINS on the
+        // description only (projects have no `title`), and a blank search is no search.
+        let recherche = search
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_lowercase());
+        let mut filtered: Vec<ProjectNode> = projects
             .values()
-            .filter(|p| {
-                if let Some(q) = search {
-                    let q = q.to_lowercase();
-                    p.name.to_lowercase().contains(&q)
-                        || p.slug.to_lowercase().contains(&q)
-                        || p.description
-                            .as_deref()
-                            .unwrap_or("")
-                            .to_lowercase()
-                            .contains(&q)
-                } else {
-                    true
-                }
+            .filter(|p| match &recherche {
+                None => true,
+                Some(q) => p
+                    .description
+                    .as_deref()
+                    .is_some_and(|d| d.to_lowercase().contains(q.as_str())),
             })
             .cloned()
             .collect();
+        // ORDER BY <field> <dir>, p.id ASC. `last_synced` absent sorts last ascending.
+        let desc = sort_order != "asc";
+        filtered.sort_by(|a, b| {
+            let primaire = match sort_by {
+                Some("created_at") => a.created_at.cmp(&b.created_at),
+                Some("last_synced") => match (a.last_synced, b.last_synced) {
+                    (Some(x), Some(y)) => x.cmp(&y),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                },
+                _ => a.name.cmp(&b.name),
+            };
+            let primaire = if desc { primaire.reverse() } else { primaire };
+            primaire.then_with(|| a.id.cmp(&b.id))
+        });
         let total = filtered.len();
         Ok((paginate(&filtered, limit, offset), total))
     }
@@ -16865,6 +16941,10 @@ impl AuthStore for MockGraphStore {
     async fn upsert_user(&self, user: &UserNode) -> Result<UserNode> {
         use crate::neo4j::models::AuthProvider;
 
+        // As the Neo4j adapter: an OIDC user has no MERGE key without it.
+        if user.auth_provider == AuthProvider::Oidc && user.external_id.is_none() {
+            anyhow::bail!("OIDC user must have external_id");
+        }
         let mut users = self.users.write().await;
 
         // Find existing user based on auth provider strategy
@@ -16974,7 +17054,10 @@ impl AuthStore for MockGraphStore {
     }
 
     async fn list_users(&self) -> Result<Vec<UserNode>> {
-        Ok(self.users.read().await.values().cloned().collect())
+        let mut users: Vec<UserNode> = self.users.read().await.values().cloned().collect();
+        // ORDER BY u.created_at DESC, u.id DESC, as the Cypher.
+        users.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        Ok(users)
     }
 
     // Refresh Tokens
@@ -17039,11 +17122,13 @@ impl AuthStore for MockGraphStore {
                 return Ok(None);
             };
             let was_valid = !token.revoked && token.expires_at > chrono::Utc::now();
+            // The state observed BEFORE the revoke, as the Neo4j statement returns it.
+            let observed = token.clone();
             token.revoked = true;
             if !was_valid {
                 return Ok(None);
             }
-            token.clone()
+            observed
         };
 
         let user = self.users.read().await.get(&consumed.user_id).cloned();
@@ -17107,11 +17192,15 @@ impl AuthStore for MockGraphStore {
         user_id: Uuid,
     ) -> Result<Vec<crate::neo4j::models::McpTokenNode>> {
         let tokens = self.mcp_tokens.read().await;
-        Ok(tokens
+        let mut tokens: Vec<_> = tokens
             .values()
             .filter(|t| t.user_id == user_id)
             .cloned()
-            .collect())
+            .collect();
+        // ORDER BY mt.created_at DESC, as the Cypher (its tie-break on `mt.id`, a
+        // property never written, is undefined: `jti` here, as the obrain adapter).
+        tokens.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.jti.cmp(&a.jti)));
+        Ok(tokens)
     }
 
     async fn purge_mcp_tokens(&self, user_id: Uuid) -> Result<u64> {

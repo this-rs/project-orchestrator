@@ -141,6 +141,11 @@ pub fn mock_app_state() -> AppState {
             registry_remote_url: None,
             documents_storage_dir: None,
             storage_backend: crate::storage::DEFAULT_BACKEND.to_string(),
+            storage_obrain_path: None,
+            storage_obrain_create: false,
+            events_transport: crate::events::chat_transport::DEFAULT_TRANSPORT.to_string(),
+            events_journal_path: None,
+            events_max_events: crate::events::chat_transport::DEFAULT_MAX_EVENTS,
             log: Default::default(),
             neural_routing: Default::default(),
             config_yaml_path: None,
@@ -202,6 +207,11 @@ pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> Ap
             registry_remote_url: None,
             documents_storage_dir: None,
             storage_backend: crate::storage::DEFAULT_BACKEND.to_string(),
+            storage_obrain_path: None,
+            storage_obrain_create: false,
+            events_transport: crate::events::chat_transport::DEFAULT_TRANSPORT.to_string(),
+            events_journal_path: None,
+            events_max_events: crate::events::chat_transport::DEFAULT_MAX_EVENTS,
             log: Default::default(),
             neural_routing: Default::default(),
             config_yaml_path: None,
@@ -263,6 +273,11 @@ pub fn mock_app_state_with_graph(graph: Arc<MockGraphStore>) -> AppState {
             registry_remote_url: None,
             documents_storage_dir: None,
             storage_backend: crate::storage::DEFAULT_BACKEND.to_string(),
+            storage_obrain_path: None,
+            storage_obrain_create: false,
+            events_transport: crate::events::chat_transport::DEFAULT_TRANSPORT.to_string(),
+            events_journal_path: None,
+            events_max_events: crate::events::chat_transport::DEFAULT_MAX_EVENTS,
             log: Default::default(),
             neural_routing: Default::default(),
             config_yaml_path: None,
@@ -329,6 +344,11 @@ pub fn mock_app_state_with_stores() -> (AppState, Arc<MockGraphStore>, Arc<MockS
             registry_remote_url: None,
             documents_storage_dir: None,
             storage_backend: crate::storage::DEFAULT_BACKEND.to_string(),
+            storage_obrain_path: None,
+            storage_obrain_create: false,
+            events_transport: crate::events::chat_transport::DEFAULT_TRANSPORT.to_string(),
+            events_journal_path: None,
+            events_max_events: crate::events::chat_transport::DEFAULT_MAX_EVENTS,
             log: Default::default(),
             neural_routing: Default::default(),
             config_yaml_path: None,
@@ -698,6 +718,17 @@ pub async fn server_state_with_chat(
     manager: Arc<crate::chat::manager::ChatManager>,
     graph: Arc<MockGraphStore>,
 ) -> Arc<crate::api::handlers::ServerState> {
+    server_state_with_chat_and_transport(manager, graph, None).await
+}
+
+/// [`server_state_with_chat`], with the chat transport the WebSocket replay and
+/// the NATS-relay paths read (`state.nats_emitter`): a test that exercises the
+/// journal reconnect hands the [`crate::events::JournalTransport`] here.
+pub async fn server_state_with_chat_and_transport(
+    manager: Arc<crate::chat::manager::ChatManager>,
+    graph: Arc<MockGraphStore>,
+    transport: Option<Arc<dyn crate::events::ChatTransport>>,
+) -> Arc<crate::api::handlers::ServerState> {
     use crate::api::handlers::ServerState;
     use crate::orchestrator::watcher::FileWatcher;
     use crate::orchestrator::Orchestrator;
@@ -714,7 +745,7 @@ pub async fn server_state_with_chat(
         event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
             crate::events::EventBus::default(),
         ))),
-        nats_emitter: None,
+        nats_emitter: transport,
         auth_config: None,
         serve_frontend: false,
         frontend_path: "./dist".to_string(),
@@ -745,7 +776,17 @@ pub async fn serve_chat(
     manager: Arc<crate::chat::manager::ChatManager>,
     graph: Arc<MockGraphStore>,
 ) -> std::net::SocketAddr {
-    let state = server_state_with_chat(manager, graph).await;
+    serve_chat_with_transport(manager, graph, None).await
+}
+
+/// [`serve_chat`], with the chat transport handed to the server state: a test
+/// that needs the WebSocket reconnect path to read from a [`crate::events::JournalTransport`].
+pub async fn serve_chat_with_transport(
+    manager: Arc<crate::chat::manager::ChatManager>,
+    graph: Arc<MockGraphStore>,
+    transport: Option<Arc<dyn crate::events::ChatTransport>>,
+) -> std::net::SocketAddr {
+    let state = server_state_with_chat_and_transport(manager, graph, transport).await;
     let app = crate::api::routes::create_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

@@ -81,6 +81,36 @@ meilisearch:
 #   url: "nats://localhost:4222"     # NATS_URL env override
 
 # -----------------------------------------------------------------------------
+# Storage — backend selection
+# -----------------------------------------------------------------------------
+# Which adapter builds the stores. The keys are NESTED under `storage:`.
+#   default  (default) — Neo4j + Meilisearch
+#   memory   — in-memory stores, nothing persisted (test builds only)
+#   obrain   — embedded obrain base; needs a binary built with
+#              `--features obrain-backend`, and `obrain_path`. Ported one domain
+#              at a time: a method not ported yet answers a named error.
+# An unknown value fails startup (naming the accepted values).
+# storage:
+#   backend: "default"               # STORAGE_BACKEND env override (default|memory|obrain)
+#   obrain_path: "/var/lib/po/obrain" # STORAGE_OBRAIN_PATH env override (obrain only; absolute; no default)
+#   obrain_create: false             # STORAGE_OBRAIN_CREATE env override; true = create the base if the
+#                                    # directory is absent or empty (otherwise refused, so that a typo
+#                                    # in obrain_path cannot become a new empty base)
+
+# -----------------------------------------------------------------------------
+# Events — chat transport selection
+# -----------------------------------------------------------------------------
+# Which transport carries chat events between instances (and persists them).
+#   nats     (default) — current behaviour: sync over NATS when nats.url is set,
+#                        local-only otherwise
+#   journal  — append-only file, replayable after a restart, bounded retention
+#   memory   — single instance, in-memory, no persistence
+# An unknown value fails startup (naming the accepted values).
+# events:
+#   transport: "nats"                # EVENTS_TRANSPORT env override (nats|journal|memory)
+#   journal_path: "chat-journal.log" # EVENTS_JOURNAL_PATH env override (journal transport only)
+
+# -----------------------------------------------------------------------------
 # Remote MCP — Streamable HTTP transport + OAuth 2.1 Authorization Server
 # -----------------------------------------------------------------------------
 # Exposes the PO MCP server to remote Claude clients (Claude Code CLI over a

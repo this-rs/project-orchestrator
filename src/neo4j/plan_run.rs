@@ -197,7 +197,7 @@ impl Neo4jClient {
             r#"
             MATCH (r:PlanRun {status: 'running'})
             RETURN r
-            ORDER BY r.started_at DESC
+            ORDER BY r.started_at DESC, r.run_id DESC
             "#,
         );
 
@@ -252,7 +252,7 @@ impl Neo4jClient {
             r#"
             MATCH (r:PlanRun {plan_id: $plan_id})
             RETURN r
-            ORDER BY r.started_at DESC
+            ORDER BY r.started_at DESC, r.run_id DESC
             LIMIT $limit
             "#,
         )

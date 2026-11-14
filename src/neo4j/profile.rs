@@ -147,7 +147,7 @@ impl Neo4jClient {
                 MATCH (ap:AnalysisProfile)
                 WHERE ap.project_id = "" OR ap.project_id IS NULL OR ap.project_id = $project_id
                 RETURN ap
-                ORDER BY ap.is_builtin DESC, ap.name ASC
+                ORDER BY ap.is_builtin DESC, ap.name ASC, ap.id ASC
                 "#,
             )
             .param("project_id", pid.to_string())
@@ -157,7 +157,7 @@ impl Neo4jClient {
                 MATCH (ap:AnalysisProfile)
                 WHERE ap.project_id = "" OR ap.project_id IS NULL
                 RETURN ap
-                ORDER BY ap.is_builtin DESC, ap.name ASC
+                ORDER BY ap.is_builtin DESC, ap.name ASC, ap.id ASC
                 "#,
             )
         };
@@ -360,7 +360,7 @@ impl Neo4jClient {
             r#"
             MATCH (up:UserProfile {user_id: $user_id})-[r:WORKS_ON]->(p:Project)
             RETURN p.id AS project_id, r.frequency AS frequency, r.last_active AS last_active
-            ORDER BY r.last_active DESC
+            ORDER BY r.last_active DESC, p.id DESC
             "#,
         )
         .param("user_id", user_id.to_string());

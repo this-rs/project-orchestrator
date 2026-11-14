@@ -441,14 +441,14 @@ impl Neo4jClient {
             MATCH (d:Document {sha256: $sha256})
             WHERE d.project_id = $project_id
             RETURN d
-            ORDER BY d.created_at ASC
+            ORDER BY d.created_at ASC, d.id ASC
             LIMIT 1
             "#
         } else {
             r#"
             MATCH (d:Document {sha256: $sha256})
             RETURN d
-            ORDER BY d.created_at ASC
+            ORDER BY d.created_at ASC, d.id ASC
             LIMIT 1
             "#
         };
@@ -473,7 +473,7 @@ impl Neo4jClient {
             r#"
             MATCH (p:Project {id: $project_id})-[:HAS_DOCUMENT]->(d:Document)
             RETURN d
-            ORDER BY d.created_at DESC
+            ORDER BY d.created_at DESC, d.id DESC
             "#,
         )
         .param("project_id", project_id.to_string());
@@ -493,7 +493,7 @@ impl Neo4jClient {
             r#"
             MATCH (:Document {id: $document_id})-[:HAS_CHUNK]->(c:DocumentChunk)
             RETURN c
-            ORDER BY c.ordinal ASC
+            ORDER BY c.ordinal ASC, c.id ASC
             "#,
         )
         .param("document_id", document_id.to_string());
@@ -636,7 +636,7 @@ impl Neo4jClient {
                 MATCH (d:Document)-[:LINKED_TO]-(e:{})
                 WHERE e.{} ENDS WITH $entity_id
                 RETURN DISTINCT d
-                ORDER BY d.created_at DESC
+                ORDER BY d.created_at DESC, d.id DESC
                 "#,
                 label, field
             )
@@ -645,7 +645,7 @@ impl Neo4jClient {
                 r#"
                 MATCH (d:Document)-[:LINKED_TO]-(e:{} {{{}: $entity_id}})
                 RETURN DISTINCT d
-                ORDER BY d.created_at DESC
+                ORDER BY d.created_at DESC, d.id DESC
                 "#,
                 label, field
             )
@@ -696,6 +696,8 @@ impl Neo4jClient {
         project_id: Option<Uuid>,
         min_similarity: Option<f64>,
     ) -> Result<Vec<DocumentChunkHit>> {
+        self.capabilities()
+            .require("Neo4j", Capability::VectorSearch)?;
         let embedding_f64: Vec<f64> = embedding.iter().map(|&v| v as f64).collect();
 
         // Over-fetch, since project filtering and the similarity floor are
@@ -713,7 +715,7 @@ impl Neo4jClient {
             MATCH (d:Document)-[:HAS_CHUNK]->(c)
             WHERE d.project_id = $project_id
             RETURN d.id AS document_id, d.filename AS filename, c, score
-            ORDER BY score DESC
+            ORDER BY score DESC, c.id DESC
             LIMIT $limit
             "#
         } else {
@@ -722,7 +724,7 @@ impl Neo4jClient {
             YIELD node AS c, score
             MATCH (d:Document)-[:HAS_CHUNK]->(c)
             RETURN d.id AS document_id, d.filename AS filename, c, score
-            ORDER BY score DESC
+            ORDER BY score DESC, c.id DESC
             LIMIT $limit
             "#
         };

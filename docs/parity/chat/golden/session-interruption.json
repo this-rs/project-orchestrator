@@ -1,0 +1,9 @@
+[
+  {"$client": "user_message", "content": "Endors 60 secondes."},
+  {"type": "user_message", "content": "Endors 60 secondes.", "seq": 0, "created_at": "<ts>"},
+  {"type": "tool_use", "id": "<tool-call-1>", "tool": "Bash", "input": {"command": "sleep 60"}, "category": "command", "canonical": "bash", "seq": 0, "created_at": "<ts>"},
+  {"$client": "interrupt"},
+  {"type": "tool_cancelled", "id": "<tool-call-1>", "seq": 0, "created_at": "<ts>"},
+  {"type": "tool_timing", "id": "<tool-call-1>", "started_at": "<ts>", "ended_at": "<ts>", "cancelled": true, "seq": 0, "created_at": "<ts>"},
+  {"type": "result", "session_id": "<session>", "duration_ms": "<dur>", "cost_usd": "<cost>", "subtype": "success", "is_error": false, "num_turns": 1, "usage": "<usage>", "model": "<model>", "stop_reason": "interrupted", "seq": 0, "created_at": "<ts>"}
+]

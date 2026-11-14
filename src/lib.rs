@@ -37,6 +37,9 @@ pub mod meilisearch;
 pub mod neo4j;
 pub mod neurons;
 pub mod notes;
+/// The obrain storage backend — only with the `obrain-backend` feature.
+#[cfg(feature = "obrain-backend")]
+pub mod obrain;
 pub mod orchestrator;
 pub mod parser;
 pub mod pipeline;
@@ -226,6 +229,9 @@ pub struct YamlConfig {
     /// Storage backend selection (optional — which adapter builds the stores).
     #[serde(default)]
     pub storage: StorageYamlConfig,
+    /// Event transport section (optional — which transport carries chat events).
+    #[serde(default)]
+    pub events: EventsYamlConfig,
     /// Log file section (optional — persistent, rotated, secret-masked traces).
     #[serde(default)]
     pub log: logging::LogYamlConfig,
@@ -249,6 +255,30 @@ pub struct StorageYamlConfig {
     /// Which storage backend builds the stores. Absent ⇒
     /// [`crate::storage::DEFAULT_BACKEND`].
     pub backend: Option<String>,
+    /// Directory of the obrain base, for `backend: obrain`. No default: the
+    /// `obrain` backend refuses to start without it rather than guess a
+    /// location (a guessed path is how a test binary once opened a live base).
+    pub obrain_path: Option<String>,
+    /// Whether the `obrain` backend may CREATE its base when the directory holds
+    /// none. Absent or false: an absent or empty directory is refused, so that a
+    /// typo in `obrain_path` cannot become a new empty base.
+    pub obrain_create: Option<bool>,
+}
+
+/// Event transport selection.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct EventsYamlConfig {
+    /// Which transport carries chat events between instances. Absent => the
+    /// default (`nats`): [`crate::events::chat_transport::DEFAULT_TRANSPORT`].
+    pub transport: Option<String>,
+    /// Journal file path for the `journal` transport. Absent => the default:
+    /// [`crate::events::chat_transport::DEFAULT_JOURNAL_PATH`].
+    pub journal_path: Option<String>,
+    /// Journal retention bound for the `journal` transport: how many chat
+    /// events the journal keeps before truncating the oldest. Absent =>
+    /// [`crate::events::chat_transport::DEFAULT_MAX_EVENTS`].
+    pub max_events: Option<usize>,
 }
 
 /// MCP Federation configuration section.
@@ -552,6 +582,32 @@ pub(crate) fn parse_env_flag(value: &str) -> Option<bool> {
 /// ([`parse_env_flag`]): an unknown value falls back to the YAML.
 pub(crate) fn env_flag_over(env: Option<&str>, yaml: Option<bool>) -> Option<bool> {
     env.and_then(parse_env_flag).or(yaml)
+}
+
+/// Resolve the journal retention bound for the `journal` chat transport.
+///
+/// Priority: `EVENTS_MAX_EVENTS` (strict — a set-but-unparseable, negative, or
+/// zero value fails the boot and names the value) > YAML `events.max_events` >
+/// [`crate::events::chat_transport::DEFAULT_MAX_EVENTS`]. The env var is the
+/// only source that can carry a value `usize` cannot represent (a negative or a
+/// non-numeric string), so it is validated here instead of being silently
+/// dropped; the YAML value is typed `Option<usize>` and its zero/negative cases
+/// are rejected at boot in [`start_server`] (negative fails serde first).
+fn resolve_events_max_events(yaml_max: Option<usize>) -> anyhow::Result<usize> {
+    const ACCEPTED: &str = "accepted values: a whole number >= 1 (e.g. 100000)";
+    let raw = match std::env::var("EVENTS_MAX_EVENTS") {
+        Ok(raw) => raw,
+        Err(_) => {
+            return Ok(yaml_max.unwrap_or(crate::events::chat_transport::DEFAULT_MAX_EVENTS));
+        }
+    };
+    let parsed = raw.trim().parse::<usize>().map_err(|_| {
+        anyhow::anyhow!("invalid EVENTS_MAX_EVENTS={raw:?}: not a positive integer ({ACCEPTED})")
+    })?;
+    if parsed == 0 {
+        anyhow::bail!("invalid EVENTS_MAX_EVENTS={raw:?}: must be at least 1 ({ACCEPTED})");
+    }
+    Ok(parsed)
 }
 
 /// The startup warning for a configured Obscura executable (`OBSCURA_BIN` / `chat.obscura_path`)
@@ -992,6 +1048,30 @@ pub struct Config {
     /// Priority: env var (STORAGE_BACKEND) > YAML (storage.backend) > default.
     pub storage_backend: String,
 
+    /// Directory of the obrain base, read only by the `obrain` storage backend.
+    /// Priority: env var (STORAGE_OBRAIN_PATH) > YAML (storage.obrain_path) >
+    /// None, in which case that backend refuses to start. Stored unexpanded.
+    pub storage_obrain_path: Option<String>,
+
+    /// Whether the obrain backend may create its base. Priority: env var
+    /// (STORAGE_OBRAIN_CREATE=true|1) > YAML (storage.obrain_create) > false.
+    pub storage_obrain_create: bool,
+
+    /// Chat transport selection: which transport carries chat events between
+    /// instances. Priority: env var (EVENTS_TRANSPORT) > YAML (events.transport)
+    /// > default ("nats").
+    pub events_transport: String,
+
+    /// Journal file path for the `journal` chat transport. Priority: env var
+    /// (EVENTS_JOURNAL_PATH) > YAML (events.journal_path) > default.
+    pub events_journal_path: Option<String>,
+
+    /// Journal retention bound for the `journal` chat transport: how many chat
+    /// events the journal keeps before truncating the oldest. Priority: env var
+    /// (EVENTS_MAX_EVENTS) > YAML (events.max_events) > default
+    /// ([`crate::events::chat_transport::DEFAULT_MAX_EVENTS`]).
+    pub events_max_events: usize,
+
     /// Persistent log file (dir, level, retention). Priority: env > YAML `log:` > defaults.
     pub log: logging::LogSettings,
 
@@ -1018,6 +1098,13 @@ impl Config {
         let (yaml, resolved_path) = Self::load_yaml_with_path(yaml_path)?;
 
         // 2. Build Config with env var overrides
+
+        // Journal retention bound: the env var is strict (a set-but-unparseable,
+        // negative, or zero value fails the boot naming the value), else YAML,
+        // else the default. Resolved here so `from_yaml_and_env` returns an Err
+        // instead of silently dropping a bad `EVENTS_MAX_EVENTS`.
+        let events_max_events = resolve_events_max_events(yaml.events.max_events)?;
+
         Ok(Self {
             setup_completed: yaml.setup_completed,
             neo4j_uri: std::env::var("NEO4J_URI").unwrap_or(yaml.neo4j.uri),
@@ -1138,6 +1225,23 @@ impl Config {
                     .backend
                     .unwrap_or_else(|| crate::storage::DEFAULT_BACKEND.to_string())
             }),
+            // Obrain base directory (env var > YAML > None ⇒ the obrain backend refuses)
+            storage_obrain_path: std::env::var("STORAGE_OBRAIN_PATH")
+                .ok()
+                .or(yaml.storage.obrain_path),
+            storage_obrain_create: match std::env::var("STORAGE_OBRAIN_CREATE") {
+                Ok(v) => v == "true" || v == "1",
+                Err(_) => yaml.storage.obrain_create.unwrap_or(false),
+            },
+            events_transport: std::env::var("EVENTS_TRANSPORT").unwrap_or_else(|_| {
+                yaml.events
+                    .transport
+                    .unwrap_or_else(|| crate::events::chat_transport::DEFAULT_TRANSPORT.to_string())
+            }),
+            events_journal_path: std::env::var("EVENTS_JOURNAL_PATH")
+                .ok()
+                .or(yaml.events.journal_path),
+            events_max_events,
             // Neural routing config (env var overrides > YAML > defaults)
             neural_routing: {
                 let mut nr = yaml.neural_routing;
@@ -1468,6 +1572,22 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         .ingress
         .validate()
         .map_err(|e| anyhow::anyhow!("Invalid ingress config: {e}"))?;
+    // Fail-fast: reject an unknown events.transport before any expensive init.
+    let transport_kind = events::chat_transport::select_transport(&config.events_transport)
+        .map_err(|e| anyhow::anyhow!("Invalid events config: {e}"))?;
+    // Fail-fast: reject an absurd journal retention (0, or a negative number that
+    // could not even be parsed into `usize`) before any expensive init, naming the
+    // value and the accepted values instead of failing late inside
+    // `JournalTransport::open`. The env var was already validated strictly at
+    // config load; this catches a YAML `events.max_events: 0` (a negative YAML
+    // value fails serde before it ever reaches a `Config`).
+    if config.events_max_events == 0 {
+        anyhow::bail!(
+            "invalid events.max_events={}: must be a whole number >= 1 \
+             (accepted values: a whole number >= 1, e.g. 100000)",
+            config.events_max_events
+        );
+    }
     if config.ingress.enabled {
         tracing::info!(
             max_body_bytes = config.ingress.max_body_bytes,
@@ -1487,9 +1607,13 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         tracing::info!("Remote MCP transport disabled (opt-in) — /mcp routes not mounted");
     }
 
-    // Initialize application state
-    tracing::info!("Connecting to Neo4j at {}...", config.neo4j_uri);
-    tracing::info!("Connecting to Meilisearch at {}...", config.meilisearch_url);
+    // Initialize application state. Only the default backend actually connects
+    // to Neo4j/Meilisearch here; the in-memory and obrain backends touch neither
+    // (each says so itself), so the "Connecting…" lines would lie for them.
+    if config.storage_backend == crate::storage::DEFAULT_BACKEND {
+        tracing::info!("Connecting to Neo4j at {}...", config.neo4j_uri);
+        tracing::info!("Connecting to Meilisearch at {}...", config.meilisearch_url);
+    }
 
     boot.start("databases");
     let state = AppState::new(config.clone()).await.inspect_err(|e| {
@@ -1545,6 +1669,18 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     event_bus.start_nats_bridge();
     // Same for graph events (events.graph): cross-instance graph mutations.
     event_bus.start_graph_nats_bridge();
+
+    // Build the chat transport selected above. The `nats` kind reuses the CRUD
+    // NATS emitter (current behaviour); `journal` and `memory` are single-
+    // instance transports that make the choice explicit and decouple chat from
+    // the CRUD event bus.
+    let chat_transport: Option<Arc<dyn events::ChatTransport>> =
+        events::chat_transport::build_chat_transport(
+            transport_kind,
+            nats_emitter.clone(),
+            config.events_journal_path.as_deref(),
+            config.events_max_events,
+        )?;
 
     // Extract neural_router, trajectory_collector, trajectory_store
     // and mcp_registry before state is moved into Orchestrator
@@ -1949,8 +2085,8 @@ pub async fn start_server(mut config: Config) -> Result<()> {
             // The gate READS the quota registry the router and the sessions share.
             .with_quota(quota_registry.clone()),
         ));
-        if let Some(ref nats) = nats_emitter {
-            cm = cm.with_nats(nats.clone());
+        if let Some(ref transport) = chat_transport {
+            cm = cm.with_nats(transport.clone());
         }
         if let Some(ref tc) = *trajectory_collector.read().unwrap() {
             cm = cm.with_trajectory_collector(tc.clone());
@@ -2409,7 +2545,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         watcher,
         chat_manager,
         event_bus,
-        nats_emitter,
+        nats_emitter: chat_transport,
         auth_config: config.auth_config.clone(),
         serve_frontend: config.serve_frontend,
         frontend_path: config.frontend_path.clone(),
@@ -3237,6 +3373,40 @@ server:
     // ========================================================================
     // New auth config format tests
     // ========================================================================
+
+    /// The journal retention env var is strict: a set-but-absurd value (0,
+    /// negative, non-numeric) fails the boot naming the value and the accepted
+    /// values, instead of being silently dropped onto the YAML/default.
+    #[test]
+    fn test_events_max_events_resolution_is_strict() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("EVENTS_MAX_EVENTS");
+
+        // Unset: the YAML value wins, else the default.
+        assert_eq!(
+            resolve_events_max_events(None).unwrap(),
+            crate::events::chat_transport::DEFAULT_MAX_EVENTS
+        );
+        assert_eq!(resolve_events_max_events(Some(42)).unwrap(), 42);
+
+        // A valid env var overrides the YAML.
+        std::env::set_var("EVENTS_MAX_EVENTS", "7");
+        assert_eq!(resolve_events_max_events(Some(42)).unwrap(), 7);
+
+        // Absurd values fail, naming the value and the accepted values.
+        for bad in ["0", "-5", "abc", "1.5"] {
+            std::env::set_var("EVENTS_MAX_EVENTS", bad);
+            let msg = resolve_events_max_events(Some(42)).unwrap_err().to_string();
+            assert!(
+                msg.contains("EVENTS_MAX_EVENTS"),
+                "var name missing: {msg:?}"
+            );
+            assert!(msg.contains(bad), "value {bad:?} missing: {msg:?}");
+            assert!(msg.contains(">= 1"), "accepted values missing: {msg:?}");
+        }
+
+        std::env::remove_var("EVENTS_MAX_EVENTS");
+    }
 
     #[test]
     fn test_new_auth_format_root_account_only() {

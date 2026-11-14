@@ -150,4 +150,6 @@ unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/this-rs/nexus.git",
+    # The obrain engine, for the optional `obrain-backend` feature.
+    "https://github.com/obrain-db/obrain.git",
 ]

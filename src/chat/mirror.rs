@@ -462,7 +462,7 @@ impl MirrorRegistry {
 pub(crate) struct MirrorDeps {
     pub graph: Arc<dyn GraphStore>,
     pub event_emitter: Option<Arc<dyn crate::events::EventEmitter>>,
-    pub nats: Option<Arc<crate::events::NatsEmitter>>,
+    pub nats: Option<Arc<dyn crate::events::ChatTransport>>,
     pub registry: Arc<MirrorRegistry>,
 }
 

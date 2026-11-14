@@ -256,84 +256,98 @@ async fn handle_ws_chat_loop(
     const SKIP_REPLAY_THRESHOLD: i64 = 1_000_000_000_000;
 
     if last_event < SKIP_REPLAY_THRESHOLD {
-        let events = chat_manager
-            .get_events_since(&session_id, last_event)
-            .await
-            .unwrap_or_default();
-
-        // Track the highest seq replayed in Phase 1. Currently used for logging/diagnostics.
-        // NATS events don't carry seq numbers, so active dedup uses snapshot_skip_remaining counter instead.
-        // Kept for future use if NATS events get seq headers.
-        let mut _max_replayed_seq: i64 = last_event;
-
-        if !events.is_empty() {
-            // New format: replay ChatEventRecord from Neo4j
-            debug!(
-                session_id = %session_id,
-                count = events.len(),
-                "Replaying persisted ChatEventRecord"
-            );
-            for event in events {
-                // Track highest seq for diagnostics / future dedup watermark
-                if event.seq > _max_replayed_seq {
-                    _max_replayed_seq = event.seq;
-                }
-
-                // Normalize to flat format matching Phase 1.5 / live events.
-                // ChatEventRecord.data is a serde-serialized ChatEvent which already
-                // contains the "type" tag. We parse it, inject seq + replaying +
-                // created_at, and send it flat — so the frontend always receives the
-                // same JSON shape regardless of whether the event comes from replay,
-                // snapshot, or live.
-                // A `tool_result_spill` record holds the full text of a spilled
-                // tool result, server-side only: it is never replayed as a client
-                // frame (which would be typeless and leak the full text).
-                if let Some(msg) = replayed_frame(&event) {
-                    if ws_sender
-                        .send(Message::Text(msg.to_string().into()))
-                        .await
-                        .is_err()
-                    {
-                        debug!("Client disconnected during replay");
-                        return;
-                    }
-                }
-            }
-        } else if last_event == 0 {
-            // Fallback: Load from Nexus SDK for pre-migration sessions
-            debug!(
-                session_id = %session_id,
-                "No ChatEventRecord found, falling back to Nexus message history"
-            );
-            match chat_manager
-                .get_session_messages(&session_id, None, None)
+        // A `journal` transport replays from the journal (its own durable cursor
+        // space), not from Neo4j. The journal is the source of truth for chat
+        // events persisted by that transport; Neo4j replay stays for the other
+        // transports (`nats`, `memory`), whose event history still lives in the
+        // graph. The choice is explicit: no silent fallback between stores.
+        if let Some(journal) = state
+            .nats_emitter
+            .as_ref()
+            .and_then(|transport| transport.as_journal())
+            .cloned()
+        {
+            replay_from_journal(&mut ws_sender, &journal, &session_id, last_event).await;
+        } else {
+            let events = chat_manager
+                .get_events_since(&session_id, last_event)
                 .await
-            {
-                Ok(loaded) => {
-                    debug!(
-                        session_id = %session_id,
-                        count = loaded.events.len(),
-                        "Replaying message history (fallback)"
-                    );
-                    for event in &loaded.events {
-                        if let Some(msg) = replayed_frame(event) {
-                            if ws_sender
-                                .send(Message::Text(msg.to_string().into()))
-                                .await
-                                .is_err()
-                            {
-                                debug!("Client disconnected during fallback replay");
-                                return;
-                            }
+                .unwrap_or_default();
+
+            // Track the highest seq replayed in Phase 1. Currently used for logging/diagnostics.
+            // NATS events don't carry seq numbers, so active dedup uses snapshot_skip_remaining counter instead.
+            // Kept for future use if NATS events get seq headers.
+            let mut _max_replayed_seq: i64 = last_event;
+
+            if !events.is_empty() {
+                // New format: replay ChatEventRecord from Neo4j
+                debug!(
+                    session_id = %session_id,
+                    count = events.len(),
+                    "Replaying persisted ChatEventRecord"
+                );
+                for event in events {
+                    // Track highest seq for diagnostics / future dedup watermark
+                    if event.seq > _max_replayed_seq {
+                        _max_replayed_seq = event.seq;
+                    }
+
+                    // Normalize to flat format matching Phase 1.5 / live events.
+                    // ChatEventRecord.data is a serde-serialized ChatEvent which already
+                    // contains the "type" tag. We parse it, inject seq + replaying +
+                    // created_at, and send it flat — so the frontend always receives the
+                    // same JSON shape regardless of whether the event comes from replay,
+                    // snapshot, or live.
+                    // A `tool_result_spill` record holds the full text of a spilled
+                    // tool result, server-side only: it is never replayed as a client
+                    // frame (which would be typeless and leak the full text).
+                    if let Some(msg) = replayed_frame(&event) {
+                        if ws_sender
+                            .send(Message::Text(msg.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            debug!("Client disconnected during replay");
+                            return;
                         }
                     }
                 }
-                Err(e) => {
-                    warn!(
-                        session_id = %session_id,
-                        error = %e,
-                        "Failed to load message history for replay"
-                    );
+            } else if last_event == 0 {
+                // Fallback: Load from Nexus SDK for pre-migration sessions
+                debug!(
+                    session_id = %session_id,
+                    "No ChatEventRecord found, falling back to Nexus message history"
+                );
+                match chat_manager
+                    .get_session_messages(&session_id, None, None)
+                    .await
+                {
+                    Ok(loaded) => {
+                        debug!(
+                            session_id = %session_id,
+                            count = loaded.events.len(),
+                            "Replaying message history (fallback)"
+                        );
+                        for event in &loaded.events {
+                            if let Some(msg) = replayed_frame(event) {
+                                if ws_sender
+                                    .send(Message::Text(msg.to_string().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    debug!("Client disconnected during fallback replay");
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            session_id = %session_id,
+                            error = %e,
+                            "Failed to load message history for replay"
+                        );
+                    }
                 }
             }
         }
@@ -1217,6 +1231,68 @@ fn replayed_frame(record: &crate::neo4j::models::ChatEventRecord) -> Option<serd
         }),
     };
     Some(frame)
+}
+
+/// Replay a session's persisted events from the journal transport, sending one
+/// frame per retained event after `since` (the client's last-seen cursor, or 0).
+///
+/// A cursor below the journal's retained window is a typed error frame
+/// (`code: "cursor_too_old"`, with `oldest` and `requested`) — the loss is
+/// explicit, never a silently amputated stream. Only events of this session are
+/// replayed: the journal is a single durable cursor space shared by all
+/// sessions, so a session's client sees only its own events.
+async fn replay_from_journal(
+    ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    journal: &crate::events::chat_transport::JournalTransport,
+    session_id: &str,
+    since: i64,
+) {
+    let since = u64::try_from(since.max(0)).unwrap_or(0);
+    match journal.replay(since) {
+        Ok(events) => {
+            for entry in events {
+                if entry.session_id != session_id {
+                    continue;
+                }
+                if let Some(msg) = journal_frame(&entry) {
+                    if ws_sender
+                        .send(Message::Text(msg.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        debug!("Client disconnected during journal replay");
+                        return;
+                    }
+                }
+            }
+        }
+        Err(crate::events::chat_transport::ReplayError::CursorTooOld { oldest, requested }) => {
+            let err = serde_json::json!({
+                "type": "error",
+                "code": "cursor_too_old",
+                "message": format!(
+                    "replay cursor {requested} is older than the journal's retained window                      (oldest retained cursor {oldest}); a replay would be silently truncated"
+                ),
+                "oldest": oldest,
+                "requested": requested,
+            });
+            let _ = ws_sender.send(Message::Text(err.to_string().into())).await;
+        }
+    }
+}
+
+/// A journal entry as a replay frame: the `ChatEvent` payload, flat, plus
+/// `seq` (the journal cursor) and `replaying`. The journal stores the typed
+/// `ChatEvent` itself (not a `ChatEventRecord`), so there is no `created_at`
+/// and no `tool_result_spill` record to filter: spill records never enter the
+/// journal, they are written to the graph only.
+fn journal_frame(entry: &crate::events::chat_transport::JournalEvent) -> Option<serde_json::Value> {
+    let mut val = serde_json::to_value(&entry.event).ok()?;
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("seq".to_string(), serde_json::json!(entry.cursor));
+        obj.insert("replaying".to_string(), serde_json::json!(true));
+    }
+    Some(val)
 }
 
 /// A live event (local broadcast or relayed over NATS) as a frame: its payload

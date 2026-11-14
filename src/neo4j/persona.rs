@@ -374,7 +374,7 @@ impl Neo4jClient {
     /// List global personas (project_id IS NULL).
     pub async fn list_global_personas(&self) -> Result<Vec<PersonaNode>> {
         let q =
-            query("MATCH (p:Persona) WHERE p.project_id IS NULL RETURN p ORDER BY p.energy DESC");
+            query("MATCH (p:Persona) WHERE p.project_id IS NULL RETURN p ORDER BY p.energy DESC, p.id DESC");
         let mut result = self
             .graph
             .execute(q)
@@ -731,7 +731,7 @@ impl Neo4jClient {
                 r#"
                 MATCH (p:Persona {id: $pid})-[r:KNOWS]->(f:File)
                 RETURN f.path AS entity_id, r.weight AS weight
-                ORDER BY r.weight DESC
+                ORDER BY r.weight DESC, entity_id DESC
                 "#,
             )
             .param("pid", pid.clone());
@@ -744,7 +744,7 @@ impl Neo4jClient {
                 r#"
                 MATCH (p:Persona {id: $pid})-[r:KNOWS]->(fn:Function)
                 RETURN fn.id AS entity_id, r.weight AS weight
-                ORDER BY r.weight DESC
+                ORDER BY r.weight DESC, entity_id DESC
                 "#,
             )
             .param("pid", pid.clone());
@@ -761,7 +761,7 @@ impl Neo4jClient {
                 // every file access — old instructions kept coming back.
                 WHERE n.status IN ['active', 'needs_review'] AND n.superseded_by IS NULL
                 RETURN n.id AS entity_id, r.weight AS weight
-                ORDER BY r.weight DESC
+                ORDER BY r.weight DESC, entity_id DESC
                 "#,
             )
             .param("pid", pid.clone());
@@ -775,7 +775,7 @@ impl Neo4jClient {
                 MATCH (p:Persona {id: $pid})-[r:USES]->(d:Decision)
                 WHERE coalesce(d.status, 'accepted') IN ['proposed', 'accepted']
                 RETURN d.id AS entity_id, r.weight AS weight
-                ORDER BY r.weight DESC
+                ORDER BY r.weight DESC, entity_id DESC
                 "#,
             )
             .param("pid", pid.clone());
@@ -788,7 +788,7 @@ impl Neo4jClient {
                 r#"
                 MATCH (p:Persona {id: $pid})-[:MASTERS]->(s:Skill)
                 RETURN s.id AS entity_id, 1.0 AS weight
-                ORDER BY s.name ASC
+                ORDER BY s.name ASC, s.id ASC
                 "#,
             )
             .param("pid", pid.clone());
@@ -801,7 +801,7 @@ impl Neo4jClient {
                 r#"
                 MATCH (p:Persona {id: $pid})-[:FOLLOWS]->(pr:Protocol)
                 RETURN pr.id AS entity_id, 1.0 AS weight
-                ORDER BY pr.name ASC
+                ORDER BY pr.name ASC, pr.id ASC
                 "#,
             )
             .param("pid", pid.clone());
@@ -832,7 +832,7 @@ impl Neo4jClient {
                 r#"
                 MATCH path = (p:Persona {id: $pid})-[:EXTENDS*1..10]->(ancestor:Persona)
                 WITH ancestor, length(path) AS depth
-                ORDER BY depth ASC
+                ORDER BY depth ASC, ancestor.id ASC
                 RETURN DISTINCT ancestor.id AS entity_id, 1.0 AS weight
                 "#,
             )
@@ -922,7 +922,7 @@ impl Neo4jClient {
             }
             WITH p, max(weight) AS weight
             RETURN p, weight
-            ORDER BY weight DESC
+            ORDER BY weight DESC, p.id DESC
             "#
         } else {
             r#"
@@ -937,7 +937,7 @@ impl Neo4jClient {
             }
             WITH p, max(weight) AS weight
             RETURN p, weight
-            ORDER BY weight DESC
+            ORDER BY weight DESC, p.id DESC
             "#
         };
         let q = query(cypher)
@@ -970,7 +970,7 @@ impl Neo4jClient {
             MATCH (p:Persona {project_id: $project_id})-[r:KNOWS]->(f:File)
             WHERE p.status <> 'archived'
             RETURN p, f.path AS file_path, r.weight AS weight
-            ORDER BY p.name, weight DESC
+            ORDER BY p.name, weight DESC, p.id DESC, file_path DESC
         "#;
         let q = query(cypher).param("project_id", project_id.to_string());
 
@@ -1017,14 +1017,14 @@ impl Neo4jClient {
             MATCH (p:Persona {project_id: $project_id})-[r:KNOWS]->(f:File)
             WHERE p.status <> 'archived' AND COALESCE(f.fabric_community_id, f.community_id) IS NOT NULL
             WITH p, COALESCE(f.fabric_community_id, f.community_id) AS cid, count(f) AS file_count, sum(r.weight) AS total_weight
-            ORDER BY p.id, file_count DESC, total_weight DESC
+            ORDER BY p.id, file_count DESC, total_weight DESC, cid DESC
             WITH p, collect({cid: cid, cnt: file_count})[0] AS dominant
             WITH p, dominant.cid AS dominant_cid
             WHERE dominant_cid IS NOT NULL
             MATCH (fg:FeatureGraph {project_id: $project_id})-[:INCLUDES_ENTITY]->(f2:File)
             WHERE COALESCE(f2.fabric_community_id, f2.community_id) = dominant_cid
             WITH p, fg, count(f2) AS overlap
-            ORDER BY p.id, overlap DESC
+            ORDER BY p.id, overlap DESC, fg.id DESC
             WITH p, collect(fg)[0] AS best_fg
             WHERE best_fg IS NOT NULL
             OPTIONAL MATCH (p)-[old:SCOPED_TO]->()
@@ -1059,7 +1059,7 @@ impl Neo4jClient {
               AND NOT (p)-[:SCOPED_TO]->()
             WITH p, COALESCE(f.fabric_community_id, f.community_id) AS cid,
                  count(f) AS file_count, sum(r.weight) AS total_weight
-            ORDER BY p.id, file_count DESC, total_weight DESC
+            ORDER BY p.id, file_count DESC, total_weight DESC, cid DESC
             WITH p, collect({cid: cid, cnt: file_count})[0] AS dominant
             WITH p, dominant.cid AS dominant_cid
             WHERE dominant_cid IS NOT NULL
@@ -1480,7 +1480,7 @@ impl Neo4jClient {
                  count(DISTINCT persona) AS existing_personas
             WHERE existing_personas = 0
             RETURN cid, label, files, file_count
-            ORDER BY file_count DESC
+            ORDER BY file_count DESC, cid DESC
             LIMIT 10
             "#,
         )
@@ -1559,7 +1559,7 @@ impl Neo4jClient {
             WHERE f.path ENDS WITH fp
             WITH p, count(DISTINCT f) AS overlap, avg(k.weight) AS avg_weight
             RETURN p.id AS persona_id, overlap, avg_weight
-            ORDER BY overlap DESC, avg_weight DESC
+            ORDER BY overlap DESC, avg_weight DESC, p.id DESC
             "#,
         )
         .param("file_paths", normalized)
@@ -1605,7 +1605,7 @@ impl Neo4jClient {
             MATCH (p:Persona {project_id: $project_id, status: "active"})-[k:KNOWS]->(af)
             WITH p, count(DISTINCT af) AS overlap, avg(k.weight) AS avg_weight
             RETURN p.id AS persona_id, overlap, avg_weight
-            ORDER BY overlap DESC, avg_weight DESC
+            ORDER BY overlap DESC, avg_weight DESC, p.id DESC
             "#,
         )
         .param("decision_id", decision_id.to_string())
@@ -1766,7 +1766,7 @@ impl Neo4jClient {
             MATCH (f:File {path: $file_path})-[cc:CO_CHANGED]-(neighbor:File)
             WHERE cc.count >= $min_count
             WITH neighbor, cc.count AS co_count
-            ORDER BY co_count DESC
+            ORDER BY co_count DESC, neighbor.path DESC
             LIMIT $max_files
             MATCH (p:Persona {id: $persona_id})
             MERGE (p)-[k:KNOWS]->(neighbor)
@@ -1912,7 +1912,7 @@ impl Neo4jClient {
             WITH b, avg(syn.weight) AS avg_weight, count(syn) AS syn_count
             WHERE avg_weight >= 0.3 AND syn_count >= 2
             RETURN b.id AS pid, b.name AS name, avg_weight
-            ORDER BY avg_weight DESC
+            ORDER BY avg_weight DESC, b.id DESC
             LIMIT 3
         "#)
         .param("pid", persona_id.to_string());

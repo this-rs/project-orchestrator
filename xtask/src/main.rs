@@ -8,28 +8,40 @@
 //! up to date), 1 = a divergence was CONSTATED, 2 = could not verify (missing
 //! clone, unreachable backend, bad arguments). None of them acts on anything.
 
+mod containment;
 mod git;
 mod in_service;
+mod parity;
+mod path_pins;
 mod pins;
 mod storage_boundary;
 #[cfg(test)]
 mod testrepo;
+mod ts_dto;
 
 const USAGE: &str = "\
 usage: cargo xtask <subcommand> [options]
 
+  containment       does this branch contain the remote's main? (drift guard)
+  path-pins         are the sibling checkouts at their pinned commits?
   in-service        is the running backend the current main? (AM-1)
+  parity            is the committed contract inventory still what the source mounts?
   pins              did main of each git-pinned repo reach Cargo.toml? (AM-2)
   storage-boundary  where do the storage drivers leak out of their adapters?
+  ts-dto           are the TypeScript DTOs still what the backend serde types say?
 
 `cargo xtask <subcommand> --help` lists the options of a subcommand.";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
+        Some("containment") => containment::run(&args[1..]),
+        Some("path-pins") => path_pins::run(&args[1..]),
         Some("in-service") => in_service::run(&args[1..]),
+        Some("parity") => parity::run(&args[1..]),
         Some("pins") => pins::run(&args[1..]),
         Some("storage-boundary") => storage_boundary::run(&args[1..]),
+        Some("ts-dto") => ts_dto::run(&args[1..]),
         Some("-h") | Some("--help") | Some("help") => {
             println!("{USAGE}");
             0

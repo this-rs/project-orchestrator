@@ -96,7 +96,7 @@ impl Neo4jClient {
             MATCH (a:Alert)
             WHERE a.acknowledged = false AND a.project_id = $project_id
             RETURN a
-            ORDER BY coalesce(a.priority, 0.0) DESC, coalesce(a.last_seen, a.created_at) DESC
+            ORDER BY coalesce(a.priority, 0.0) DESC, coalesce(a.last_seen, a.created_at) DESC, a.id DESC
             LIMIT $limit
             "#
         } else {
@@ -104,7 +104,7 @@ impl Neo4jClient {
             MATCH (a:Alert)
             WHERE a.acknowledged = false
             RETURN a
-            ORDER BY coalesce(a.priority, 0.0) DESC, coalesce(a.last_seen, a.created_at) DESC
+            ORDER BY coalesce(a.priority, 0.0) DESC, coalesce(a.last_seen, a.created_at) DESC, a.id DESC
             LIMIT $limit
             "#
         };
@@ -209,7 +209,7 @@ impl Neo4jClient {
             MATCH (a:Alert)
             {}
             RETURN a
-            ORDER BY coalesce(a.priority, 0.0) DESC, coalesce(a.last_seen, a.created_at) DESC
+            ORDER BY coalesce(a.priority, 0.0) DESC, coalesce(a.last_seen, a.created_at) DESC, a.id DESC
             SKIP $offset LIMIT $limit
             "#,
             scope

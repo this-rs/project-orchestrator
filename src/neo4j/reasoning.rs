@@ -148,7 +148,7 @@ impl Neo4jClient {
             r#"
             MATCH (t:PersistedReasoningTree)-[:REASONING_FOR]->(r:ProtocolRun {id: $run_id})
             RETURN t
-            ORDER BY t.persisted_at DESC
+            ORDER BY t.persisted_at DESC, t.id DESC
             LIMIT 1
             "#,
         )
@@ -177,7 +177,7 @@ impl Neo4jClient {
             WHERE t.project_id = $project_id
             OPTIONAL MATCH (t)-[:REASONING_FOR]->(e)
             RETURN t, labels(e) AS entity_labels, e.id AS entity_id
-            ORDER BY t.persisted_at DESC
+            ORDER BY t.persisted_at DESC, t.id DESC
             LIMIT $limit
             "#
         } else {
@@ -185,7 +185,7 @@ impl Neo4jClient {
             MATCH (t:PersistedReasoningTree)
             OPTIONAL MATCH (t)-[:REASONING_FOR]->(e)
             RETURN t, labels(e) AS entity_labels, e.id AS entity_id
-            ORDER BY t.persisted_at DESC
+            ORDER BY t.persisted_at DESC, t.id DESC
             LIMIT $limit
             "#
         };

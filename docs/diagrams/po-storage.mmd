@@ -1,5 +1,5 @@
 %% name: po-storage
-%% covers: backend:src/storage.rs backend:src/neo4j/trajectory.rs backend:docs/storage/** backend:src/neo4j/graph_sampler.rs backend:src/neo4j/unsigned.rs
+%% covers: backend:src/storage.rs backend:src/neo4j/trajectory.rs backend:docs/storage/** backend:src/neo4j/graph_sampler.rs backend:src/obrain/** backend:src/neo4j/unsigned.rs
 %% verified: 1c5451eb
 %% ---
 %% PROUVE : ce que la couche de stockage PROMET au reste du backend.
@@ -8,7 +8,10 @@
 %%   Le perimetre de la promesse est borne par un controle executable, pas par une note.
 %% ---
 %% SOURCES LUES :
-%%   src/storage.rs            — StorageBackend::from_config, select_backend, DEFAULT_BACKEND
+%%   src/storage.rs            — StorageBackend::from_config, select_backend, BackendKind {Default, Memory, Obrain}
+%%   src/obrain/mod.rs         — ObrainGraphStore (ecrivain unique + index sous verrou court, fsync WAL par ecriture, flush complet pour les valeurs en colonne blob, garde-fou d ouverture), NonPorte, magasins qui refusent
+%%   src/obrain/project.rs     — ProjectStore porte par l API Rust d obrain, creation atomique par ordre (marqueur brouillon pose en premier, retire en dernier), index Uuid vers NodeId reconstruit a l ouverture qui repare et met en quarantaine
+%%   build/refus_obrain.rs     — genere, depuis les contrats, les impl de refus des traits non portes ; echoue si un impl ecrit a la main omet une methode
 %%   src/neo4j/traits.rs       — trait GraphStore + StoreCapabilities (10 capacites)
 %%   src/neo4j/trajectory.rs   — pool dedie + amorcage de l'index vectoriel, dans l'adaptateur
 %%   src/api/handlers.rs       — /health publie storage_capabilities, garde le champ neo4j
@@ -32,6 +35,17 @@ flowchart TD
     APP["managers, handlers, runner, CLI"] -. "ne nomment que des traits" .-> G
     APP -.-> S
     APP -.-> T
+
+    subgraph obrain["backend obrain (feature obrain-backend, storage.backend = obrain)"]
+        OG["ObrainGraphStore<br/>src/obrain/mod.rs<br/>base embarquee, PO ecrivain unique"]
+        OP["ProjectStore porte<br/>src/obrain/project.rs<br/>API Rust, index Uuid vers NodeId"]
+        OR["tout le reste : NonPorte<br/>impl generes par build/refus_obrain.rs<br/>depuis les contrats"]
+        OG --> OP
+        OG --> OR
+    end
+    FAB -- "BackendKind::Obrain<br/>chemin absolu : storage.obrain_path, sans defaut ;<br/>creation : storage.obrain_create seulement" --> OG
+    OG -. "est un" .-> G
+    OR -. "recherche et trajectoires refusent aussi :<br/>ni Neo4j ni Meilisearch ouverts" .-> S
 
     HEALTH["/health"] --> CAPS
     HEALTH --> TS["TransportState<br/>Disabled / Connected / Disconnected / Unknown"]

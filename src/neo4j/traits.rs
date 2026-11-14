@@ -85,6 +85,76 @@ impl Default for StoreCapabilities {
     }
 }
 
+/// A single capability a caller can require of a store, drawn from the three
+/// whose absence would otherwise yield silently-wrong results rather than a
+/// loud failure. Deliberately narrower than the full [`StoreCapabilities`]
+/// manifest: these are the only capabilities a method must assert before
+/// building a query that depends on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    /// The engine can search by embedding similarity (a vector index or an
+    /// in-memory cosine scan both qualify).
+    VectorSearch,
+    /// The engine enforces composite (multi-property) uniqueness constraints.
+    CompositeUnique,
+    /// The engine performs datetime arithmetic inside queries
+    /// (`datetime() - duration(...)`).
+    DatetimeArithmetic,
+}
+
+impl Capability {
+    /// The manifest key this capability corresponds to, for diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Capability::VectorSearch => "vector_search",
+            Capability::CompositeUnique => "composite_unique",
+            Capability::DatetimeArithmetic => "datetime_arithmetic",
+        }
+    }
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A required capability the backend does not provide. Names the backend *and*
+/// the capability, so the failure is loud and attributable instead of a silent
+/// wrong answer.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("backend `{backend}` does not support the `{capability}` capability")]
+pub struct MissingCapability {
+    /// The name of the backend that refused (e.g. `"Neo4j"`, `"mock"`).
+    pub backend: String,
+    /// The capability that was required but is not supported.
+    pub capability: Capability,
+}
+
+impl StoreCapabilities {
+    /// Whether this manifest declares the given capability.
+    pub fn supports(&self, cap: Capability) -> bool {
+        match cap {
+            Capability::VectorSearch => self.vector_search,
+            Capability::CompositeUnique => self.composite_unique,
+            Capability::DatetimeArithmetic => self.datetime_arithmetic,
+        }
+    }
+
+    /// Assert that `cap` is supported, naming `backend` in the error so the
+    /// refusal is attributable.
+    pub fn require(&self, backend: &str, cap: Capability) -> Result<(), MissingCapability> {
+        if self.supports(cap) {
+            Ok(())
+        } else {
+            Err(MissingCapability {
+                backend: backend.to_owned(),
+                capability: cap,
+            })
+        }
+    }
+}
+
 /// Abstract interface for all graph database operations.
 ///
 /// Every public async method of `Neo4jClient` (excluding `new`, `init_schema`,
@@ -5081,5 +5151,82 @@ mod tests {
                 .expect("bool");
             assert!(!v, "default capability `{key}` must be false");
         }
+    }
+
+    #[test]
+    fn require_refuses_and_names_backend_and_capability() {
+        let caps = StoreCapabilities::default(); // everything false
+        let err = caps
+            .require("test-backend", Capability::DatetimeArithmetic)
+            .expect_err("a missing capability must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("test-backend"),
+            "error must name the backend: {msg}"
+        );
+        assert!(
+            msg.contains("datetime_arithmetic"),
+            "error must name the capability: {msg}"
+        );
+    }
+
+    #[test]
+    fn require_accepts_a_supported_capability() {
+        let caps = StoreCapabilities {
+            vector_search: true,
+            ..Default::default()
+        };
+        assert!(
+            caps.require("test-backend", Capability::VectorSearch)
+                .is_ok(),
+            "a supported capability must be accepted"
+        );
+        assert!(
+            caps.require("test-backend", Capability::CompositeUnique)
+                .is_err(),
+            "an unsupported capability must still refuse"
+        );
+    }
+
+    #[test]
+    fn supports_mirrors_the_manifest_flags() {
+        let empty = StoreCapabilities::default();
+        assert!(!empty.supports(Capability::VectorSearch));
+        assert!(!empty.supports(Capability::CompositeUnique));
+        assert!(!empty.supports(Capability::DatetimeArithmetic));
+        let caps = StoreCapabilities {
+            vector_search: true,
+            composite_unique: true,
+            datetime_arithmetic: true,
+            ..Default::default()
+        };
+        assert!(caps.supports(Capability::VectorSearch));
+        assert!(caps.supports(Capability::CompositeUnique));
+        assert!(caps.supports(Capability::DatetimeArithmetic));
+    }
+
+    #[test]
+    fn mock_backend_refuses_what_it_does_not_do() {
+        // The mock advertises no datetime arithmetic and no composite
+        // uniqueness (it is an in-memory store); `require` must refuse them by
+        // name, while accepting the vector search it does perform.
+        let caps = crate::neo4j::mock::MockGraphStore::default().capabilities();
+        let err = caps
+            .require("mock", Capability::CompositeUnique)
+            .expect_err("the mock must refuse composite uniqueness");
+        assert!(err.to_string().contains("mock"), "names the backend: {err}");
+        assert!(
+            err.to_string().contains("composite_unique"),
+            "names the capability: {err}"
+        );
+        assert!(
+            caps.require("mock", Capability::DatetimeArithmetic)
+                .is_err(),
+            "the mock must refuse datetime arithmetic"
+        );
+        assert!(
+            caps.require("mock", Capability::VectorSearch).is_ok(),
+            "the mock does perform vector search"
+        );
     }
 }

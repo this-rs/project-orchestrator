@@ -76,7 +76,7 @@ impl Neo4jClient {
             r#"
             MATCH (p:Plan {id: $plan_id})-[:HAS_TASK]->(t:Task)
             RETURN t
-            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at
+            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at, t.id ASC
             "#,
         )
         .param("plan_id", plan_id.to_string());
@@ -105,7 +105,7 @@ impl Neo4jClient {
             UNWIND $ids AS pid
             MATCH (p:Plan {id: pid})-[:HAS_TASK]->(t:Task)
             RETURN p.id AS plan_id, t
-            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at
+            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at, t.id ASC
             "#,
         )
         .param("ids", ids.clone());
@@ -502,7 +502,7 @@ impl Neo4jClient {
             MATCH (t:Task {id: $task_id})-[:DEPENDS_ON]->(blocker:Task)
             WHERE blocker.status <> 'Completed'
             RETURN blocker
-            ORDER BY COALESCE(blocker.priority, 0) DESC
+            ORDER BY COALESCE(blocker.priority, 0) DESC, blocker.id DESC
             "#,
         )
         .param("task_id", task_id.to_string());
@@ -524,7 +524,7 @@ impl Neo4jClient {
             r#"
             MATCH (blocked:Task)-[:DEPENDS_ON]->(t:Task {id: $task_id})
             RETURN blocked
-            ORDER BY COALESCE(blocked.priority, 0) DESC
+            ORDER BY COALESCE(blocked.priority, 0) DESC, blocked.id DESC
             "#,
         )
         .param("task_id", task_id.to_string());
@@ -546,7 +546,7 @@ impl Neo4jClient {
             r#"
             MATCH (t:Task {id: $task_id})-[:DEPENDS_ON]->(dep:Task)
             RETURN dep
-            ORDER BY COALESCE(dep.priority, 0) DESC
+            ORDER BY COALESCE(dep.priority, 0) DESC, dep.id DESC
             "#,
         )
         .param("task_id", task_id.to_string());
@@ -572,7 +572,7 @@ impl Neo4jClient {
                 WHERE dep.status <> 'Completed'
             }
             RETURN t
-            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at
+            ORDER BY COALESCE(t.priority, 0) DESC, t.created_at, t.id ASC
             LIMIT 1
             "#,
         )
@@ -929,7 +929,7 @@ impl Neo4jClient {
             {}
             RETURN t, p.id AS plan_id, p.title AS plan_title,
                    COALESCE(p.status, '') AS plan_status
-            ORDER BY {} {}
+            ORDER BY {} {}, t.id
             SKIP {}
             LIMIT {}
             "#,

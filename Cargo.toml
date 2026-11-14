@@ -181,6 +181,17 @@ nexus-claude = { git = "https://github.com/this-rs/nexus.git", rev = "9710c9866f
 # left trust exactly as the server would (decision fce98b8a; the same resolver, not a second one
 # that could drift: P11b point 8). Same pin as nexus-claude.
 nexus-tools = { git = "https://github.com/this-rs/nexus.git", rev = "9710c9866f35ed24d47576146cbaa516bf15ce39" }
+
+# The obrain graph engine, for the `obrain` storage backend (src/obrain/). OPTIONAL, behind the
+# `obrain-backend` feature and absent from the default features: a default build neither compiles
+# nor links it. Pinned by git rev like nexus (the repo is public, so cargo fetches it without a
+# sibling checkout); `pins.toml` carries the same sha for the local checkout. `obrain-common` is
+# direct because the adapter names its types (`Value`, `NodeId`).
+obrain-engine = { git = "https://github.com/obrain-db/obrain.git", rev = "c4b6ada9b29707ac329eeebc09850de308f336ff", optional = true }
+obrain-common = { git = "https://github.com/obrain-db/obrain.git", rev = "c4b6ada9b29707ac329eeebc09850de308f336ff", optional = true }
+# `obrain-core` is direct for ONE name the engine does not re-export: `graph::Direction`, the
+# argument of `GraphStore::edges_from` (note.rs enumerates the edges of a node). Same rev as above.
+obrain-core = { git = "https://github.com/obrain-db/obrain.git", rev = "c4b6ada9b29707ac329eeebc09850de308f336ff", optional = true }
 tokio-stream = { workspace = true }
 
 # Auth
@@ -310,6 +321,17 @@ pdf = ["dep:pdf_oxide", "dep:office_oxide"]
 # Not a shipping feature: the dev-dependency of the crate on itself (below) turns it on for every
 # test build, and nothing else does.
 mock-store = []
+# The obrain storage backend (`storage.backend = "obrain"`, src/obrain/). Off by default: without
+# it, asking for `obrain` is a startup error that says so. The build-dependencies are the generator
+# of the refusals (build.rs reads the store contracts and writes, for every method no domain has
+# ported yet, an implementation that returns a named error).
+obrain-backend = ["dep:obrain-engine", "dep:obrain-common", "dep:obrain-core", "dep:syn", "dep:quote", "dep:proc-macro2"]
+
+[build-dependencies]
+# Only for the `obrain-backend` feature (see above): build.rs parses the store contracts.
+syn = { version = "2", features = ["full"], optional = true }
+quote = { version = "1", optional = true }
+proc-macro2 = { version = "1", optional = true }
 
 [dev-dependencies]
 # The crate itself, with the in-memory GraphStore compiled in for the test targets (see the
@@ -453,6 +475,20 @@ systemd = "*"
 name = "mem_embed"
 required-features = ["local-embeddings"]
 
+
+
+# Measures of the obrain backend at scale (cost per write, per read, open time, on a base of N
+# nodes): `cargo run --release --features obrain-backend,mock-store --example obrain_mesures -- <nodes> <edges>`.
+# Writes only into a temporary directory it creates. It needs the measure hooks of src/obrain/mesure.rs,
+# which exist in test builds only (`mock-store`): without that feature the target is skipped, so
+# `cargo clippy --all-targets` passes with and without `--all-features`.
+[[example]]
+name = "obrain_mesures"
+required-features = ["obrain-backend", "mock-store"]
+
+[[example]]
+name = "obrain_mesures_workspace"
+required-features = ["obrain-backend", "mock-store"]
 
 # neo4rs 0.8.0 decodes a Bolt TINY_INT marker with `marker as i64` on a `u8`:
 # every stored integer in -16..=-1 is read 240..=255, so the backend's `-1`

@@ -183,7 +183,7 @@ impl Neo4jClient {
                             AND n.assertion_rule_json <> 'null') \
                         OR n.note_type = 'assertion' \
                      RETURN n \
-                     ORDER BY coalesce(n.last_checked_at, n.created_at) ASC LIMIT $limit",
+                     ORDER BY coalesce(n.last_checked_at, n.created_at) ASC, n.id ASC LIMIT $limit",
                 )
                 .param("limit", limit as i64),
             )
