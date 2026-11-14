@@ -1287,6 +1287,13 @@ pub struct Attachment {
     /// The temporary directory of this session's `nexus-tools` (`TMPDIR`, [`session_temp_dir`]):
     /// its command outputs live below it, so it is part of the session's directories.
     pub temp_dir: Option<PathBuf>,
+    /// Directories the session was offered but that are not on THIS machine, left out of the
+    /// engine's scope. Handed over anyway, each one ends the session before the handshake
+    /// (`nexus-tools`: `cannot use the session directories`), and the harness can only report a
+    /// dead process. A workspace member living on another machine (its `root_path` is a path of
+    /// that machine, `/home/...`) is the usual cause. The caller reports them: a scope quietly
+    /// narrower than what the human asked for must be said, not discovered.
+    pub missing_dirs: Vec<PathBuf>,
 }
 
 /// Resolves the key of a search provider for THAT provider: the vault is asked under the grant
@@ -1644,8 +1651,21 @@ pub async fn attach(
     let token = SessionToolsToken::mint_with(input.session_id, &tools, exp, unscoped);
     crate::auth::agent_tokens::register_tools(input.session_id);
     crate::auth::agent_tokens::set_launched_unscoped(input.session_id, unscoped);
+    // A directory that is not there is not part of the scope. `nexus-tools` exits before the
+    // handshake on one (`cannot use the session directories: No such file or directory`), and
+    // the harness reports the death and nothing else: a workspace member of another machine
+    // (measured on the `obrain` workspace, whose `obrain-llm-trainer` project sits under
+    // `/home/triviere/...`, a DGX path) made every native session of that workspace die at its
+    // first turn, under a message that named no directory. The engine is given the directories
+    // that exist; the others are reported back.
+    let (extra_dirs, missing_dirs): (Vec<PathBuf>, Vec<PathBuf>) = input
+        .extra_dirs
+        .iter()
+        .cloned()
+        .partition(|dir| dir.is_dir());
+    attachment.missing_dirs = missing_dirs;
     let mut args = vec!["--cwd".to_owned(), input.cwd.display().to_string()];
-    for dir in input.extra_dirs {
+    for dir in &extra_dirs {
         args.push("--add-dir".to_owned());
         args.push(dir.display().to_string());
     }
@@ -1885,6 +1905,49 @@ mod tests {
         );
         // No `gh` login under this home, so no token — and never an empty variable.
         assert!(!env.contains_key("NEXUS_TOOLS_GH_TOKEN"));
+    }
+
+    /// A workspace member can live on ANOTHER machine: its `root_path` is a path of that machine
+    /// (`/home/...`, measured on `obrain`'s `obrain-llm-trainer`). Handed to `nexus-tools` as
+    /// `--add-dir`, it ends the process before the handshake — `cannot use the session
+    /// directories: No such file or directory`, exit 2 — and the harness reports the death and
+    /// nothing else: every native session of that workspace died at its first turn under
+    /// "the provider process stopped unexpectedly". The directory that is not there is left out
+    /// of the scope, and named back to the caller.
+    #[tokio::test]
+    async fn a_scope_directory_that_is_not_on_this_machine_is_left_out_and_reported() {
+        let here = tempfile::tempdir().unwrap();
+        let elsewhere = here.path().join("not-created");
+        let extra = vec![here.path().to_path_buf(), elsewhere.clone()];
+        let graph = Arc::new(MockGraphStore::new());
+        let consents = GraphConsents(graph.clone());
+        let policy = ask();
+        let a = attach(
+            &config(),
+            &consents,
+            None,
+            AttachInput {
+                extra_dirs: &extra,
+                ..input("scope-missing", &policy, None)
+            },
+        )
+        .await;
+        let (_, args, _) = stdio(&a, NEXUS_TOOLS_SERVER);
+        let handed: Vec<String> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--add-dir")
+            .map(|pair| pair[1].clone())
+            .collect();
+        assert_eq!(
+            handed,
+            vec![here.path().display().to_string()],
+            "only the directory that exists is handed to the engine"
+        );
+        assert_eq!(
+            a.missing_dirs,
+            vec![elsewhere],
+            "the one that is not there is reported, not silently dropped"
+        );
     }
 
     // ---- (3) the consent of the project, by origin -------------------------------------

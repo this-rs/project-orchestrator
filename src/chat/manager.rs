@@ -17817,6 +17817,18 @@ impl ChatManager {
                             "search engine left out of the session"
                         );
                     }
+                    // A directory of the scope that is not on this machine: left out, so that a
+                    // stale workspace member cannot kill the session, and said here because the
+                    // engine would report nothing but its own death.
+                    for dir in &attachment.missing_dirs {
+                        warn!(
+                            session_id,
+                            directory = %dir.display(),
+                            "a directory of the session's scope does not exist on this machine: \
+                             left out of the native engine's file scope (a workspace member whose \
+                             root_path belongs to another machine?)"
+                        );
+                    }
                     attach_native_servers(&mut spec.mcp_servers, attachment.servers)?;
                     gate_temp_dir = attachment.temp_dir.clone();
                     // The list the gate checks a SEARCH against, kept where the runtime can read
@@ -23527,7 +23539,9 @@ mod tests {
         // Hermetic: the host's own credentials (mirrored when present) are not this test's subject.
         manager.host_home = None;
         let claims = crate::auth::jwt::Claims::service_account("nexus");
-        let add_dirs = vec!["/tmp/extra".to_string()];
+        let extra_dir = tempfile::tempdir().unwrap();
+        let extra_dir_str = extra_dir.path().display().to_string();
+        let add_dirs = vec![extra_dir_str.clone()];
         let spec_for = |kind: ProviderKind| {
             let manager = &manager;
             let claims = &claims;
@@ -23597,7 +23611,9 @@ mod tests {
                 "{tool} must not be served: {tools:?}"
             );
         }
-        assert!(args.windows(2).any(|w| w == ["--add-dir", "/tmp/extra"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--add-dir", extra_dir_str.as_str()]));
         assert!(
             !args.iter().any(|a| a.contains("eyJ")),
             "no token on the command line"
