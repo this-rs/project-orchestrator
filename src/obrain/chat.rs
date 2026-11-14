@@ -21,27 +21,64 @@
 //!   The tree / root / children reads use the `spawned_by` JSON (the canonical
 //!   source, as the mock and the Neo4j fallback agree); the edge is kept for
 //!   `get_run_sessions`.
-//! - `(:ChatSession)-[:HAS_EVENT]->(:ChatEvent)` — the events, one node each.
-//! - `(:SessionEpisode)-[:EPISODE_OF]->(:ChatSession)` — one episode per session.
 //!
-//! The `HAS_CHAT_SESSION` edge (project → session) is NOT written: it is read
-//! only by refused methods (`get_discussed_co_changers`). A named divergence —
-//! and one of the three entries that keep `get_discussed_co_changers` refused,
-//! with `DISCUSSED → File` and the `File` nodes the code domain would write. The
-//! `CO_CHANGED` edge it also reads has its code in the commit domain
-//! (`commit.rs`), refused by name there too until the code domain writes `File`.
+//! Edges NOT written, each a named divergence:
+//!
+//! - `(:ChatSession)-[:HAS_EVENT]->(:ChatEvent)`: an event is a bare node that
+//!   carries its `session_id`, which is what every event read goes through;
+//! - `(:SessionEpisode)-[:EPISODE_OF]->(:ChatSession)`: the episode carries its
+//!   `session_id`, and is deleted with its session;
+//! - `(:ConversationSegment)-[:PRECEDES]->(:ConversationSegment)`: no read of
+//!   the contract follows it;
+//! - `(:Agent)-[:LIVED]->(:SessionEpisode)`: Neo4j makes the agent node and the
+//!   edge best effort at `save_session_episode`; the agent domain is not ported,
+//!   so nothing is written and nothing is refused (an episode is worth more than
+//!   the edge that names it, as on Neo4j);
+//! - `HAS_CHAT_SESSION` (project → session): read only by refused methods
+//!   (`get_discussed_co_changers`).
+//!
+//! # Creations
+//!
+//! Every node a write CREATES carries the draft marker `_brouillon` first and
+//! loses it last (the commit point); opening deletes a draft, and a node with
+//! neither property nor edge. A creation interrupted half-way is therefore never
+//! read back with default values in place of what was not written.
 //!
 //! # Differences, all on the strict side or named
 //!
 //! - a session whose `id` is already taken is refused (Neo4j would create a
 //!   second node with the same id);
-//! - an anchor write is not atomic across its node, its journal entry and the
-//!   `anchor_seq` bump (obrain has no multi-write transaction): an interruption
-//!   can leave an anchor written without its journal entry. Each state is valid;
-//!   a restart rebuilds the index from what is on disk.
+//! - a write that UPDATES several properties of an existing node is not atomic
+//!   (obrain has no multi-write transaction; Neo4j does it in one statement).
+//!   The intermediate states an interruption can leave, each named:
+//!   - an anchor operation writes `anchor_seq` FIRST, then the anchor, then its
+//!     journal entry: an interruption leaves a gap in the numbering (the version
+//!     moved, nothing changed), or an anchor changed without its journal entry —
+//!     never two journal entries with the same `seq`. An existing anchor is
+//!     rewritten property by property: an interruption can leave some properties
+//!     new and others old (each one valid);
+//!   - `update_chat_session_provider` clears `resume_token`, `capabilities` and
+//!     `cli_session_id` FIRST: an interruption can leave the old provider with
+//!     no resume handle (the next turn starts fresh), or the new `provider_id`
+//!     beside the old `model` / `routed_by` / `engine` — never a resume handle of
+//!     one provider family under another provider. `restore_chat_session_provider`
+//!     writes the resume handles LAST, for the same reason;
+//!   - the other session updates write their properties one by one; each is valid
+//!     alone;
+//! - `delete_chat_session` also deletes the session's `ChatEvent`s (Neo4j leaves
+//!   them orphaned: its `DETACH DELETE` takes the session and its episode only);
+//! - `create_spawned_by_relation` for a child whose `SPAWNED_BY` edge points to
+//!   ANOTHER parent is refused (Neo4j's `MERGE` would add a second lineage edge;
+//!   the index holds one parent per session);
+//! - a segment or boundary node that cannot be read at open is quarantined, and
+//!   `get_segments` / `get_boundaries` of its conversation refuse until a `put`
+//!   replaces the set (Neo4j fails the read the same way);
+//! - `get_chat_events` with a negative `limit` returns nothing (Neo4j errs);
 //! - `search_episodes_by_embedding` is refused by name: obrain does not
 //!   journal vector values in its WAL (trame `VecColumnWrite` without value),
-//!   so an embedding acknowledged could not be guaranteed durable.
+//!   so an embedding acknowledged could not be guaranteed durable. The embedding
+//!   of an episode is therefore neither written nor served
+//!   (`list_session_episodes` reads the payload, which has no vector, as on Neo4j).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -341,9 +378,13 @@ fn lire_evenement(get: &dyn Fn(&str) -> Option<Value>) -> Result<ChatEventRecord
         session_id: chaine("session_id")
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| anyhow!("événement sans `session_id` lisible"))?,
-        seq: get("seq").and_then(|v| v.as_int64()).unwrap_or(0),
-        event_type: chaine("event_type").unwrap_or_default(),
-        data: chaine("data").unwrap_or_default(),
+        // Required, as `parse_chat_event_node` requires them: a default `seq` or
+        // an empty `event_type` would replay an event nobody wrote.
+        seq: get("seq")
+            .and_then(|v| v.as_int64())
+            .ok_or_else(|| anyhow!("événement sans `seq`"))?,
+        event_type: chaine("event_type").ok_or_else(|| anyhow!("événement sans `event_type`"))?,
+        data: chaine("data").ok_or_else(|| anyhow!("événement sans `data`"))?,
         created_at: chaine("created_at")
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(Utc::now),
@@ -497,8 +538,13 @@ fn proprietes_lieu(e: &ExecutionPlaceEvent) -> Vec<(&'static str, Value)> {
         ("base_sha", Value::from(e.base_sha.clone())),
         ("branch", Value::from(e.branch.clone())),
         ("detail", Value::from(e.detail.clone().unwrap_or_default())),
-        ("at", Value::from(e.at.to_rfc3339())),
+        ("at", Value::from(format_lieu_at(e.at))),
     ]
+}
+
+/// `at` as Neo4j writes it (`create_execution_place_event`): microseconds, `Z`.
+fn format_lieu_at(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
 fn lire_lieu(get: &dyn Fn(&str) -> Option<Value>) -> Result<ExecutionPlaceEvent> {
@@ -611,8 +657,14 @@ pub(super) struct IndexChat {
     evenements_lieu: HashMap<Uuid, Vec<EntreeLieu>>,
     /// conversation → segment id → entry.
     segments: HashMap<String, BTreeMap<String, EntreeSegment>>,
+    /// conversation → its segment nodes that could not be read at open
+    /// (quarantined). The conversation's segments are refused until a `put`
+    /// replaces the set (and deletes these nodes).
+    segments_illisibles: HashMap<String, Vec<NodeId>>,
     /// conversation → key (`dimension#at_turn`) → boundary.
     frontieres: HashMap<String, BTreeMap<String, EntreeFrontiere>>,
+    /// Same as `segments_illisibles`, for the boundaries.
+    frontieres_illisibles: HashMap<String, Vec<NodeId>>,
     racine_agent: Option<Uuid>,
     noeud_racine_agent: Option<NodeId>,
 }
@@ -673,6 +725,31 @@ impl EntreeSession {
     }
 }
 
+/// At open: a node left by an interrupted creation — its draft marker still set,
+/// or neither property nor edge — is deleted (edges first) and counted. Returns
+/// whether it was.
+fn purger_brouillon(db: &ObrainDB, noeud: NodeId, rapport: &mut RapportOuverture) -> bool {
+    let store = db.store();
+    let Some(n) = db.get_node(noeud) else {
+        return false;
+    };
+    let brouillon = n
+        .get_property(BROUILLON)
+        .is_some_and(|v| !matches!(v, Value::Null));
+    if !brouillon && (!n.properties.is_empty() || store.out_degree(noeud) != 0) {
+        return false;
+    }
+    for (_, arete) in store.edges_from(noeud, Direction::Outgoing) {
+        db.delete_edge(arete);
+    }
+    for (_, arete) in store.edges_from(noeud, Direction::Incoming) {
+        db.delete_edge(arete);
+    }
+    db.delete_node(noeud);
+    rapport.brouillons_supprimes += 1;
+    true
+}
+
 impl IndexChat {
     fn inscrire_session(&mut self, e: EntreeSession) {
         let id = e.session.id;
@@ -720,16 +797,7 @@ impl IndexChat {
                     .filter(|v| !matches!(v, Value::Null))
                     .cloned()
             };
-            if get(BROUILLON).is_some() || (n.properties.is_empty() && store.out_degree(noeud) == 0)
-            {
-                for (_, arete) in store.edges_from(noeud, Direction::Outgoing) {
-                    db.delete_edge(arete);
-                }
-                for (_, arete) in store.edges_from(noeud, Direction::Incoming) {
-                    db.delete_edge(arete);
-                }
-                db.delete_node(noeud);
-                rapport.brouillons_supprimes += 1;
+            if purger_brouillon(db, noeud, rapport) {
                 continue;
             }
             match EntreeSession::decoder(db, noeud, None) {
@@ -807,6 +875,9 @@ impl IndexChat {
         // Events.
         let mut evenements: Vec<(Uuid, EntreeEvenement)> = Vec::new();
         for noeud in store.nodes_by_label(EVENEMENT) {
+            if purger_brouillon(db, noeud, rapport) {
+                continue;
+            }
             let Some(n) = db.get_node(noeud) else {
                 continue;
             };
@@ -837,6 +908,9 @@ impl IndexChat {
 
         // LlmSetting.
         for noeud in store.nodes_by_label(REGLAGE) {
+            if purger_brouillon(db, noeud, rapport) {
+                continue;
+            }
             let Some(n) = db.get_node(noeud) else {
                 continue;
             };
@@ -846,23 +920,26 @@ impl IndexChat {
                     .cloned()
             };
             let texte = |cle: &str| get(cle).and_then(|v| v.as_str().map(str::to_string));
-            let (Some(scope), Some(key)) = (texte("scope"), texte("key")) else {
-                rapport
-                    .en_quarantaine
-                    .push(format!("nœud LlmSetting {noeud:?} : sans scope ni key"));
+            // `value` is required: a setting read back `""` would be a value nobody
+            // wrote (Neo4j writes the three in one `MERGE … SET`).
+            let (Some(scope), Some(key), Some(valeur)) =
+                (texte("scope"), texte("key"), texte("value"))
+            else {
+                rapport.en_quarantaine.push(format!(
+                    "nœud LlmSetting {noeud:?} : sans scope, key ou value"
+                ));
                 continue;
             };
-            index.reglages.insert(
-                (scope, key),
-                EntreeReglage {
-                    noeud,
-                    valeur: texte("value").unwrap_or_default(),
-                },
-            );
+            index
+                .reglages
+                .insert((scope, key), EntreeReglage { noeud, valeur });
         }
 
         // Episodes.
         for noeud in store.nodes_by_label(EPISODE) {
+            if purger_brouillon(db, noeud, rapport) {
+                continue;
+            }
             let Some(n) = db.get_node(noeud) else {
                 continue;
             };
@@ -872,27 +949,28 @@ impl IndexChat {
                     .cloned()
             };
             let texte = |cle: &str| get(cle).and_then(|v| v.as_str().map(str::to_string));
-            let (Some(sid), Some(projet), Some(payload)) =
-                (texte("session_id"), texte("project_id"), texte("payload"))
-            else {
+            let (Some(sid), Some(payload)) = (texte("session_id"), texte("payload")) else {
                 rapport
                     .en_quarantaine
                     .push(format!("nœud SessionEpisode {noeud:?} : incomplet"));
                 continue;
             };
             let Ok(sid) = sid.parse::<Uuid>() else {
-                continue;
-            };
-            let Ok(projet) = projet.parse::<Uuid>() else {
+                rapport.en_quarantaine.push(format!(
+                    "nœud SessionEpisode {noeud:?} : session_id illisible"
+                ));
                 continue;
             };
             match serde_json::from_str::<Episode>(&payload) {
                 Ok(episode) => {
+                    // The project is the payload's, not the `project_id` copy: a
+                    // rewrite interrupted between the two cannot list the episode
+                    // under a project its payload does not name.
                     index.episodes.insert(
                         sid,
                         EntreeEpisode {
                             noeud,
-                            projet,
+                            projet: episode.project_id,
                             episode,
                         },
                     );
@@ -908,6 +986,9 @@ impl IndexChat {
         // Anchors.
         let mut ancres: Vec<EntreeAncre> = Vec::new();
         for noeud in store.nodes_by_label(ANCRE) {
+            if purger_brouillon(db, noeud, rapport) {
+                continue;
+            }
             let Some(n) = db.get_node(noeud) else {
                 continue;
             };
@@ -945,6 +1026,9 @@ impl IndexChat {
         // Anchor journal.
         let mut evt_ancres: Vec<EntreeEvenementAncre> = Vec::new();
         for noeud in store.nodes_by_label(EVENEMENT_ANCRE) {
+            if purger_brouillon(db, noeud, rapport) {
+                continue;
+            }
             let Some(n) = db.get_node(noeud) else {
                 continue;
             };
@@ -983,6 +1067,9 @@ impl IndexChat {
         // Execution-place events.
         let mut lieux: Vec<EntreeLieu> = Vec::new();
         for noeud in store.nodes_by_label(LIEU) {
+            if purger_brouillon(db, noeud, rapport) {
+                continue;
+            }
             let Some(n) = db.get_node(noeud) else {
                 continue;
             };
@@ -1010,6 +1097,9 @@ impl IndexChat {
 
         // Segments.
         for noeud in store.nodes_by_label(SEGMENT) {
+            if purger_brouillon(db, noeud, rapport) {
+                continue;
+            }
             let Some(n) = db.get_node(noeud) else {
                 continue;
             };
@@ -1019,22 +1109,44 @@ impl IndexChat {
                     .cloned()
             };
             let texte = |cle: &str| get(cle).and_then(|v| v.as_str().map(str::to_string));
-            let (Some(conversation), Some(id), Some(json)) =
-                (texte("conversation"), texte("id"), texte("json"))
-            else {
+            let Some(conversation) = texte("conversation") else {
+                rapport.en_quarantaine.push(format!(
+                    "nœud ConversationSegment {noeud:?} : sans conversation"
+                ));
                 continue;
             };
-            if let Ok(segment) = serde_json::from_str::<Segment>(&json) {
-                index
-                    .segments
-                    .entry(conversation)
-                    .or_default()
-                    .insert(id, EntreeSegment { noeud, segment });
+            // An unreadable segment is an ERROR for its conversation, never a
+            // silently shorter history (as `get_segments_impl` on Neo4j).
+            let lu = texte("id")
+                .zip(texte("json"))
+                .ok_or_else(|| anyhow!("sans id ou json"))
+                .and_then(|(id, json)| Ok((id, serde_json::from_str::<Segment>(&json)?)));
+            match lu {
+                Ok((id, segment)) => {
+                    index
+                        .segments
+                        .entry(conversation)
+                        .or_default()
+                        .insert(id, EntreeSegment { noeud, segment });
+                }
+                Err(e) => {
+                    rapport.en_quarantaine.push(format!(
+                        "nœud ConversationSegment {noeud:?} ({conversation}) : {e}"
+                    ));
+                    index
+                        .segments_illisibles
+                        .entry(conversation)
+                        .or_default()
+                        .push(noeud);
+                }
             }
         }
 
         // Boundaries.
         for noeud in store.nodes_by_label(FRONTIERE) {
+            if purger_brouillon(db, noeud, rapport) {
+                continue;
+            }
             let Some(n) = db.get_node(noeud) else {
                 continue;
             };
@@ -1044,25 +1156,42 @@ impl IndexChat {
                     .cloned()
             };
             let texte = |cle: &str| get(cle).and_then(|v| v.as_str().map(str::to_string));
-            let (Some(conversation), Some(json)) = (texte("conversation"), texte("json")) else {
+            let Some(conversation) = texte("conversation") else {
+                rapport.en_quarantaine.push(format!(
+                    "nœud ConversationBoundary {noeud:?} : sans conversation"
+                ));
                 continue;
             };
-            let cle = {
-                let dim = texte("dimension").unwrap_or_default();
-                let at = get("at_turn").and_then(|v| v.as_int64()).unwrap_or(0);
-                format!("{dim}#{at}")
-            };
-            if let Ok(frontiere) = serde_json::from_str::<Boundary>(&json) {
-                index
-                    .frontieres
-                    .entry(conversation)
-                    .or_default()
-                    .insert(cle, EntreeFrontiere { noeud, frontiere });
+            let lu = texte("json")
+                .ok_or_else(|| anyhow!("sans json"))
+                .and_then(|json| Ok(serde_json::from_str::<Boundary>(&json)?));
+            match lu {
+                Ok(frontiere) => {
+                    let cle = format!("{}#{}", frontiere.dimension.as_str(), frontiere.at_turn);
+                    index
+                        .frontieres
+                        .entry(conversation)
+                        .or_default()
+                        .insert(cle, EntreeFrontiere { noeud, frontiere });
+                }
+                Err(e) => {
+                    rapport.en_quarantaine.push(format!(
+                        "nœud ConversationBoundary {noeud:?} ({conversation}) : {e}"
+                    ));
+                    index
+                        .frontieres_illisibles
+                        .entry(conversation)
+                        .or_default()
+                        .push(noeud);
+                }
             }
         }
 
         // Agent identity root.
         for noeud in store.nodes_by_label(RACINE_AGENT) {
+            if purger_brouillon(db, noeud, rapport) {
+                continue;
+            }
             let Some(n) = db.get_node(noeud) else {
                 continue;
             };
@@ -1097,6 +1226,40 @@ impl ObrainGraphStore {
     fn noeud_session(w: &Ecriture<'_>, id: Uuid) -> Result<Option<NodeId>> {
         Ok(w.index()?.chat.sessions.get(&id).map(|e| e.noeud))
     }
+}
+
+/// Create a node the way a creation must (see the module doc): the draft marker
+/// first, the properties, the marker removed last (the commit point). A step
+/// before each engine write, for the interruption tests.
+fn creer_noeud(
+    w: &mut Ecriture<'_>,
+    etiquette: &'static str,
+    proprietes: Vec<(&'static str, Value)>,
+) -> Result<NodeId> {
+    let noeud = w.db.create_node(&[etiquette]);
+    w.etape()?;
+    w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+    for (cle, valeur) in proprietes {
+        w.etape()?;
+        w.db.set_node_property(noeud, cle, valeur);
+    }
+    w.rendre_durable_avant_le_marqueur()?;
+    w.etape()?;
+    w.db.remove_node_property(noeud, BROUILLON);
+    Ok(noeud)
+}
+
+/// Write properties of an existing node, a step before each.
+fn poser(
+    w: &mut Ecriture<'_>,
+    noeud: NodeId,
+    proprietes: Vec<(&'static str, Value)>,
+) -> Result<()> {
+    for (cle, valeur) in proprietes {
+        w.etape()?;
+        w.db.set_node_property(noeud, cle, valeur);
+    }
+    Ok(())
 }
 
 /// DETACH DELETE of a node: its edges go first, then the node itself.
@@ -1308,10 +1471,21 @@ impl ChatStore for ObrainGraphStore {
                     else {
                         return Ok(());
                     };
-                    (c.noeud, p.noeud, c.parent.as_ref().map(|x| x.arete))
+                    (
+                        c.noeud,
+                        p.noeud,
+                        c.parent.as_ref().map(|x| (x.arete, x.parent_id)),
+                    )
                 };
+                // The index holds ONE parent per session: an edge to another parent
+                // is refused, never repointed in the index alone (see module doc).
+                if let Some((_, autre)) = existant.filter(|(_, p)| *p != pid) {
+                    bail!(
+                        "la session {cid} a déjà un SPAWNED_BY vers {autre} : un second parent                          ({pid}) est refusé"
+                    );
+                }
                 let arete = match existant {
-                    Some(a) => a,
+                    Some((a, _)) => a,
                     None => {
                         let a = w.db.create_edge(cnoeud, pnoeud, ARETE_SPAWNED);
                         w.etape()?;
@@ -1404,18 +1578,24 @@ impl ChatStore for ObrainGraphStore {
             while !frontier.is_empty() && depth < 10 {
                 depth += 1;
                 let mut next = Vec::new();
-                for parent in &frontier {
-                    let mut children: Vec<&EntreeSession> = sessions
-                        .values()
-                        .filter(|e| parent_de(&e.session).0.as_deref() == Some(parent.as_str()))
-                        .filter(|e| !seen.contains(&e.session.id.to_string()))
-                        .collect();
-                    children.sort_by_key(|e| e.session.created_at);
-                    for child in children {
-                        seen.insert(child.session.id.to_string());
-                        nodes.push(node_of(child, depth));
-                        next.push(child.session.id.to_string());
-                    }
+                // The whole depth at once, ordered as Neo4j orders it:
+                // `depth, created_at, id` (never by parent, never by map order).
+                let parents: HashSet<&str> = frontier.iter().map(String::as_str).collect();
+                let mut children: Vec<&EntreeSession> = sessions
+                    .values()
+                    .filter(|e| {
+                        parent_de(&e.session)
+                            .0
+                            .as_deref()
+                            .is_some_and(|p| parents.contains(p))
+                    })
+                    .filter(|e| !seen.contains(&e.session.id.to_string()))
+                    .collect();
+                children.sort_by_key(|e| (e.session.created_at, e.session.id));
+                for child in children {
+                    seen.insert(child.session.id.to_string());
+                    nodes.push(node_of(child, depth));
+                    next.push(child.session.id.to_string());
                 }
                 frontier = next;
             }
@@ -1568,14 +1748,20 @@ impl ChatStore for ObrainGraphStore {
                 let Some(noeud) = Self::noeud_session(w, id)? else {
                     return Ok(());
                 };
-                w.etape()?;
-                w.db.set_node_property(noeud, "permission_mode", Value::from(m.clone()));
-                w.db.set_node_property(noeud, "updated_at", Value::from(Utc::now().to_rfc3339()));
+                let maintenant = Utc::now();
+                poser(
+                    w,
+                    noeud,
+                    vec![
+                        ("permission_mode", Value::from(m.clone())),
+                        ("updated_at", Value::from(maintenant.to_rfc3339())),
+                    ],
+                )?;
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 if let Some(e) = etat.chat.sessions.get_mut(&id) {
                     e.session.permission_mode = if m.is_empty() { None } else { Some(m) };
-                    e.session.updated_at = Utc::now();
+                    e.session.updated_at = maintenant;
                 }
                 Ok(())
             },
@@ -1666,14 +1852,20 @@ impl ChatStore for ObrainGraphStore {
                 let Some(noeud) = Self::noeud_session(w, id)? else {
                     return Ok(());
                 };
-                w.etape()?;
-                w.db.set_node_property(noeud, "file_scope_lifted", Value::from(lifted));
-                w.db.set_node_property(noeud, "updated_at", Value::from(Utc::now().to_rfc3339()));
+                let maintenant = Utc::now();
+                poser(
+                    w,
+                    noeud,
+                    vec![
+                        ("file_scope_lifted", Value::from(lifted)),
+                        ("updated_at", Value::from(maintenant.to_rfc3339())),
+                    ],
+                )?;
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 if let Some(e) = etat.chat.sessions.get_mut(&id) {
                     e.session.file_scope_lifted = lifted;
-                    e.session.updated_at = Utc::now();
+                    e.session.updated_at = maintenant;
                 }
                 Ok(())
             },
@@ -1689,14 +1881,20 @@ impl ChatStore for ObrainGraphStore {
                 let Some(noeud) = Self::noeud_session(w, id)? else {
                     return Ok(());
                 };
-                w.etape()?;
-                w.db.set_node_property(noeud, "model", Value::from(m.clone()));
-                w.db.set_node_property(noeud, "updated_at", Value::from(Utc::now().to_rfc3339()));
+                let maintenant = Utc::now();
+                poser(
+                    w,
+                    noeud,
+                    vec![
+                        ("model", Value::from(m.clone())),
+                        ("updated_at", Value::from(maintenant.to_rfc3339())),
+                    ],
+                )?;
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 if let Some(e) = etat.chat.sessions.get_mut(&id) {
                     e.session.model = m;
-                    e.session.updated_at = Utc::now();
+                    e.session.updated_at = maintenant;
                 }
                 Ok(())
             },
@@ -1722,18 +1920,24 @@ impl ChatStore for ObrainGraphStore {
                 let Some(noeud) = Self::noeud_session(w, id)? else {
                     return Ok(false);
                 };
-                w.etape()?;
-                w.db.set_node_property(noeud, "routing_mode", Value::from(rm.clone()));
-                w.db.set_node_property(noeud, "routing_pool", Value::from(rp.clone()));
-                w.db.set_node_property(noeud, "routed_by", Value::from(rb.clone()));
-                w.db.set_node_property(noeud, "updated_at", Value::from(Utc::now().to_rfc3339()));
+                let maintenant = Utc::now();
+                poser(
+                    w,
+                    noeud,
+                    vec![
+                        ("routing_mode", Value::from(rm.clone())),
+                        ("routing_pool", Value::from(rp.clone())),
+                        ("routed_by", Value::from(rb.clone())),
+                        ("updated_at", Value::from(maintenant.to_rfc3339())),
+                    ],
+                )?;
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 if let Some(e) = etat.chat.sessions.get_mut(&id) {
                     e.session.routing_mode = if rm.is_empty() { None } else { Some(rm) };
                     e.session.routing_pool = if rp.is_empty() { None } else { Some(rp) };
                     e.session.routed_by = if rb.is_empty() { None } else { Some(rb) };
-                    e.session.updated_at = Utc::now();
+                    e.session.updated_at = maintenant;
                 }
                 Ok(true)
             },
@@ -1761,26 +1965,35 @@ impl ChatStore for ObrainGraphStore {
                 let Some(noeud) = Self::noeud_session(w, id)? else {
                     return Ok(false);
                 };
-                w.etape()?;
-                w.db.set_node_property(noeud, "provider_id", Value::from(pid.clone()));
-                w.db.set_node_property(noeud, "model", Value::from(m.clone()));
-                w.db.set_node_property(noeud, "routed_by", Value::from(rb.clone()));
-                w.db.set_node_property(noeud, "resume_token", Value::from(""));
-                w.db.set_node_property(noeud, "capabilities", Value::from(""));
-                w.db.set_node_property(noeud, "cli_session_id", Value::from(""));
-                w.db.set_node_property(noeud, "engine", Value::from(eng.clone()));
-                w.db.set_node_property(noeud, "updated_at", Value::from(Utc::now().to_rfc3339()));
+                let maintenant = Utc::now();
+                // The resume handles of the old provider go FIRST: an interruption
+                // never leaves them under the new provider (see module doc).
+                poser(
+                    w,
+                    noeud,
+                    vec![
+                        ("resume_token", Value::from("")),
+                        ("capabilities", Value::from("")),
+                        ("cli_session_id", Value::from("")),
+                        ("provider_id", Value::from(pid.clone())),
+                        ("model", Value::from(m.clone())),
+                        ("routed_by", Value::from(rb.clone())),
+                        ("engine", Value::from(eng.clone())),
+                        ("updated_at", Value::from(maintenant.to_rfc3339())),
+                    ],
+                )?;
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 if let Some(e) = etat.chat.sessions.get_mut(&id) {
-                    e.session.provider_id = Some(pid);
+                    // `""` is written, `None` is what a re-read serves: publish that.
+                    e.session.provider_id = opt_non_vide(Some(pid));
                     e.session.model = m;
-                    e.session.routed_by = Some(rb);
+                    e.session.routed_by = opt_non_vide(Some(rb));
                     e.session.resume_token = None;
                     e.session.capabilities = None;
                     e.session.cli_session_id = None;
-                    e.session.engine = Some(eng);
-                    e.session.updated_at = Utc::now();
+                    e.session.engine = opt_non_vide(Some(eng));
+                    e.session.updated_at = maintenant;
                 }
                 Ok(true)
             },
@@ -1800,46 +2013,46 @@ impl ChatStore for ObrainGraphStore {
                 let Some(noeud) = Self::noeud_session(w, n.id)? else {
                     return Ok(false);
                 };
-                w.etape()?;
-                w.db.set_node_property(noeud, "provider_id", Value::from(pid.clone()));
-                w.db.set_node_property(noeud, "model", Value::from(n.model.clone()));
-                w.db.set_node_property(
+                let maintenant = Utc::now();
+                // The provider first, its resume handles LAST: an interruption never
+                // leaves a handle under a provider it does not belong to.
+                poser(
+                    w,
                     noeud,
-                    "routed_by",
-                    Value::from(n.routed_by.clone().unwrap_or_default()),
-                );
-                w.db.set_node_property(
-                    noeud,
-                    "resume_token",
-                    Value::from(n.resume_token.clone().unwrap_or_default()),
-                );
-                w.db.set_node_property(
-                    noeud,
-                    "capabilities",
-                    Value::from(n.capabilities.clone().unwrap_or_default()),
-                );
-                w.db.set_node_property(
-                    noeud,
-                    "cli_session_id",
-                    Value::from(n.cli_session_id.clone().unwrap_or_default()),
-                );
-                w.db.set_node_property(
-                    noeud,
-                    "engine",
-                    Value::from(n.engine.clone().unwrap_or_default()),
-                );
-                w.db.set_node_property(noeud, "updated_at", Value::from(Utc::now().to_rfc3339()));
+                    vec![
+                        ("provider_id", Value::from(pid.clone())),
+                        ("model", Value::from(n.model.clone())),
+                        (
+                            "routed_by",
+                            Value::from(n.routed_by.clone().unwrap_or_default()),
+                        ),
+                        ("engine", Value::from(n.engine.clone().unwrap_or_default())),
+                        ("updated_at", Value::from(maintenant.to_rfc3339())),
+                        (
+                            "capabilities",
+                            Value::from(n.capabilities.clone().unwrap_or_default()),
+                        ),
+                        (
+                            "cli_session_id",
+                            Value::from(n.cli_session_id.clone().unwrap_or_default()),
+                        ),
+                        (
+                            "resume_token",
+                            Value::from(n.resume_token.clone().unwrap_or_default()),
+                        ),
+                    ],
+                )?;
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 if let Some(e) = etat.chat.sessions.get_mut(&n.id) {
-                    e.session.provider_id = Some(pid);
+                    e.session.provider_id = opt_non_vide(Some(pid));
                     e.session.model = n.model.clone();
-                    e.session.routed_by = n.routed_by.clone();
-                    e.session.resume_token = n.resume_token.clone();
-                    e.session.capabilities = n.capabilities.clone();
-                    e.session.cli_session_id = n.cli_session_id.clone();
-                    e.session.engine = n.engine.clone();
-                    e.session.updated_at = Utc::now();
+                    e.session.routed_by = opt_non_vide(n.routed_by.clone());
+                    e.session.resume_token = opt_non_vide(n.resume_token.clone());
+                    e.session.capabilities = opt_non_vide(n.capabilities.clone());
+                    e.session.cli_session_id = opt_non_vide(n.cli_session_id.clone());
+                    e.session.engine = opt_non_vide(n.engine.clone());
+                    e.session.updated_at = maintenant;
                 }
                 Ok(true)
             },
@@ -1863,20 +2076,27 @@ impl ChatStore for ObrainGraphStore {
                     .reglages
                     .get(&(s.clone(), k.clone()))
                     .map(|e| e.noeud);
+                w.flush_complet = v.len() > SEUIL_COLONNE_BLOB;
+                let valeur = vec![
+                    ("value", Value::from(v.clone())),
+                    ("updated_at", Value::from(Utc::now().to_rfc3339())),
+                ];
+                // A creation is a draft until its value is written: an interruption
+                // never leaves a setting that reads back `""`.
                 let noeud = match existant {
-                    Some(n) => n,
-                    None => {
-                        let n = w.db.create_node(&[REGLAGE]);
-                        w.etape()?;
-                        w.db.set_node_property(n, "scope", Value::from(s.clone()));
-                        w.db.set_node_property(n, "key", Value::from(k.clone()));
+                    Some(n) => {
+                        poser(w, n, valeur)?;
                         n
                     }
+                    None => {
+                        let mut proprietes = vec![
+                            ("scope", Value::from(s.clone())),
+                            ("key", Value::from(k.clone())),
+                        ];
+                        proprietes.extend(valeur);
+                        creer_noeud(w, REGLAGE, proprietes)?
+                    }
                 };
-                w.flush_complet = v.len() > SEUIL_COLONNE_BLOB;
-                w.etape()?;
-                w.db.set_node_property(noeud, "value", Value::from(v.clone()));
-                w.db.set_node_property(noeud, "updated_at", Value::from(Utc::now().to_rfc3339()));
                 w.rendre_durable()?;
                 w.index_mut()?
                     .chat
@@ -1942,14 +2162,16 @@ impl ChatStore for ObrainGraphStore {
                 let Some(noeud) = Self::noeud_session(w, id)? else {
                     return Ok(());
                 };
-                w.etape()?;
+                let maintenant = Utc::now();
+                let mut proprietes = Vec::new();
                 if let Some(c) = &cap {
-                    w.db.set_node_property(noeud, "capabilities", Value::from(c.clone()));
+                    proprietes.push(("capabilities", Value::from(c.clone())));
                 }
                 if let Some(t) = &tok {
-                    w.db.set_node_property(noeud, "resume_token", Value::from(t.clone()));
+                    proprietes.push(("resume_token", Value::from(t.clone())));
                 }
-                w.db.set_node_property(noeud, "updated_at", Value::from(Utc::now().to_rfc3339()));
+                proprietes.push(("updated_at", Value::from(maintenant.to_rfc3339())));
+                poser(w, noeud, proprietes)?;
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 if let Some(e) = etat.chat.sessions.get_mut(&id) {
@@ -1959,7 +2181,7 @@ impl ChatStore for ObrainGraphStore {
                     if let Some(t) = tok {
                         e.session.resume_token = if t.is_empty() { None } else { Some(t) };
                     }
-                    e.session.updated_at = Utc::now();
+                    e.session.updated_at = maintenant;
                 }
                 Ok(())
             },
@@ -1976,13 +2198,21 @@ impl ChatStore for ObrainGraphStore {
                     return Ok(());
                 };
                 w.flush_complet = fp.len() > SEUIL_COLONNE_BLOB;
-                w.etape()?;
-                w.db.set_node_property(noeud, "resume_fingerprint", Value::from(fp.clone()));
-                w.db.set_node_property(noeud, "updated_at", Value::from(Utc::now().to_rfc3339()));
+                let maintenant = Utc::now();
+                poser(
+                    w,
+                    noeud,
+                    vec![
+                        ("resume_fingerprint", Value::from(fp.clone())),
+                        ("updated_at", Value::from(maintenant.to_rfc3339())),
+                    ],
+                )?;
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 if let Some(e) = etat.chat.sessions.get_mut(&id) {
                     e.resume_fingerprint = if fp.is_empty() { None } else { Some(fp) };
+                    // Written above, so published: `list_chat_sessions` sorts on it.
+                    e.session.updated_at = maintenant;
                 }
                 Ok(())
             },
@@ -2096,18 +2326,29 @@ impl ChatStore for ObrainGraphStore {
                 };
                 let noeud = entree.noeud;
                 // Anchors + their journal, the episode, the events, then the session.
-                let ancres: Vec<NodeId> = {
+                let ancres: Vec<(Uuid, NodeId, (String, String))> = {
                     let etat = w.index()?;
                     etat.chat
                         .ancres_par_session
                         .get(&id)
                         .into_iter()
                         .flatten()
-                        .filter_map(|aid| etat.chat.ancres.get(aid).map(|e| e.noeud))
+                        .filter_map(|aid| {
+                            etat.chat.ancres.get(aid).map(|e| {
+                                (
+                                    *aid,
+                                    e.noeud,
+                                    (
+                                        e.ancre.target_type.as_str().to_string(),
+                                        e.ancre.target_id.clone(),
+                                    ),
+                                )
+                            })
+                        })
                         .collect()
                 };
-                for a in ancres {
-                    detacher(w, a)?;
+                for (_, a, _) in &ancres {
+                    detacher(w, *a)?;
                 }
                 let evt_ancres: Vec<NodeId> = {
                     let etat = w.index()?;
@@ -2161,10 +2402,16 @@ impl ChatStore for ObrainGraphStore {
                 }
                 idx.desinscrire_session(id);
                 idx.ancres_par_session.remove(&id);
-                idx.ancres_par_cible.retain(|_, s| {
-                    s.retain(|aid| !idx.ancres.contains_key(aid));
-                    !s.is_empty()
-                });
+                // Only THIS session's anchors leave the target pages, by their key.
+                for (aid, _, cible) in ancres {
+                    idx.ancres.remove(&aid);
+                    if let Some(s) = idx.ancres_par_cible.get_mut(&cible) {
+                        s.remove(&aid);
+                        if s.is_empty() {
+                            idx.ancres_par_cible.remove(&cible);
+                        }
+                    }
+                }
                 idx.evenements_ancre.remove(&id);
                 idx.evenements.remove(&id);
                 idx.episodes.remove(&id);
@@ -2227,6 +2474,12 @@ impl ChatStore for ObrainGraphStore {
                 if let Some(ev) = change.event.as_mut() {
                     ev.seq = seq;
                 }
+                // `anchor_seq` FIRST: an interruption leaves a gap in the numbering,
+                // never two journal entries with the same `seq` (see module doc).
+                if change.event.is_some() {
+                    w.etape()?;
+                    w.db.set_node_property(noeud_session, "anchor_seq", Value::from(seq as i64));
+                }
                 let mut noeud_ancre: Option<NodeId> = None;
                 if change.deleted {
                     let cible = w
@@ -2242,28 +2495,21 @@ impl ChatStore for ObrainGraphStore {
                     let a = &change.anchor;
                     let existant = w.index()?.chat.ancres.get(&a.id).map(|e| e.noeud);
                     let noeud = match existant {
-                        Some(n) => n,
-                        None => {
-                            let n = w.db.create_node(&[ANCRE]);
-                            w.etape()?;
+                        Some(n) => {
+                            poser(w, n, proprietes_ancre(a))?;
                             n
                         }
+                        None => creer_noeud(w, ANCRE, proprietes_ancre(a))?,
                     };
                     noeud_ancre = Some(noeud);
-                    for (cle, valeur) in proprietes_ancre(a) {
-                        w.etape()?;
-                        w.db.set_node_property(noeud, cle, valeur);
-                    }
                 }
+                let mut entree_journal: Option<EntreeEvenementAncre> = None;
                 if let Some(ev) = &change.event {
-                    let n = w.db.create_node(&[EVENEMENT_ANCRE]);
-                    for (cle, valeur) in proprietes_evenement_ancre(ev) {
-                        w.etape()?;
-                        w.db.set_node_property(n, cle, valeur);
-                    }
-                }
-                if change.event.is_some() {
-                    w.db.set_node_property(noeud_session, "anchor_seq", Value::from(seq as i64));
+                    let noeud = creer_noeud(w, EVENEMENT_ANCRE, proprietes_evenement_ancre(ev))?;
+                    entree_journal = Some(EntreeEvenementAncre {
+                        noeud,
+                        evenement: ev.clone(),
+                    });
                 }
                 w.rendre_durable()?;
                 {
@@ -2273,6 +2519,14 @@ impl ChatStore for ObrainGraphStore {
                         if let Some(e) = idx.sessions.get_mut(&session_id) {
                             e.anchor_seq = seq;
                         }
+                    }
+                    // The journal entry is published with the change it records:
+                    // `seq` grows under the writer lock, so appending keeps the order.
+                    if let Some(entree) = entree_journal {
+                        idx.evenements_ancre
+                            .entry(session_id)
+                            .or_default()
+                            .push(entree);
                     }
                     if change.deleted {
                         let a = &change.anchor;
@@ -2510,22 +2764,17 @@ impl ChatStore for ObrainGraphStore {
         let e = event.clone();
         self.ecrire(
             move || e,
-            move |e, w: &mut Ecriture<'_>| {
-                let noeud = w.db.create_node(&[LIEU]);
-                w.etape()?;
-                for (cle, valeur) in proprietes_lieu(&e) {
-                    w.etape()?;
-                    w.db.set_node_property(noeud, cle, valeur);
-                }
+            move |mut e, w: &mut Ecriture<'_>| {
+                creer_noeud(w, LIEU, proprietes_lieu(&e))?;
                 w.rendre_durable()?;
+                // What is published is what a re-read serves: `at` to the microsecond.
+                e.at = parse_ts(&format_lieu_at(e.at))?;
                 w.index_mut()?
                     .chat
                     .evenements_lieu
                     .entry(e.task_id)
                     .or_default()
-                    .push(EntreeLieu {
-                        evenement: e.clone(),
-                    });
+                    .push(EntreeLieu { evenement: e });
                 Ok(())
             },
         )
@@ -2619,12 +2868,7 @@ impl ChatStore for ObrainGraphStore {
                 }
                 let mut nouvelles = Vec::with_capacity(events.len());
                 for ev in &events {
-                    let noeud = w.db.create_node(&[EVENEMENT]);
-                    w.etape()?;
-                    for (cle, valeur) in proprietes_evenement(session_id, ev) {
-                        w.etape()?;
-                        w.db.set_node_property(noeud, cle, valeur);
-                    }
+                    let noeud = creer_noeud(w, EVENEMENT, proprietes_evenement(session_id, ev))?;
                     nouvelles.push(EntreeEvenement {
                         noeud,
                         evenement: ev.clone(),
@@ -2658,9 +2902,8 @@ impl ChatStore for ObrainGraphStore {
                 .map(|e| e.evenement.clone())
                 .collect();
             v.sort_by(|a, b| a.seq.cmp(&b.seq));
-            if limit > 0 {
-                v.truncate(limit as usize);
-            }
+            // `LIMIT 0` is no row, as on Neo4j (a negative limit too: see module doc).
+            v.truncate(usize::try_from(limit).unwrap_or(0));
             Ok(v)
         })
     }
@@ -2780,7 +3023,6 @@ impl ChatStore for ObrainGraphStore {
         let pid = episode.project_id;
         let at = episode.collected_at;
         let eid = episode.id;
-        let episode_clone = episode.clone();
         self.ecrire(
             move || (),
             move |(), w: &mut Ecriture<'_>| {
@@ -2789,28 +3031,29 @@ impl ChatStore for ObrainGraphStore {
                     return Ok(false);
                 }
                 let existant = w.index()?.chat.episodes.get(&sid).map(|e| e.noeud);
+                w.flush_complet = payload.len() > SEUIL_COLONNE_BLOB;
+                let proprietes = vec![
+                    ("id", Value::from(eid.to_string())),
+                    ("project_id", Value::from(pid.to_string())),
+                    ("collected_at", Value::from(at.to_rfc3339())),
+                    ("session_id", Value::from(sid.to_string())),
+                    ("payload", Value::from(payload)),
+                ];
                 let noeud = match existant {
-                    Some(n) => n,
-                    None => {
-                        let n = w.db.create_node(&[EPISODE]);
-                        w.etape()?;
+                    Some(n) => {
+                        poser(w, n, proprietes)?;
                         n
                     }
+                    None => creer_noeud(w, EPISODE, proprietes)?,
                 };
-                w.flush_complet = payload.len() > SEUIL_COLONNE_BLOB;
-                w.etape()?;
-                w.db.set_node_property(noeud, "id", Value::from(eid.to_string()));
-                w.db.set_node_property(noeud, "project_id", Value::from(pid.to_string()));
-                w.db.set_node_property(noeud, "collected_at", Value::from(at.to_rfc3339()));
-                w.db.set_node_property(noeud, "session_id", Value::from(sid.to_string()));
-                w.db.set_node_property(noeud, "payload", Value::from(payload));
                 w.rendre_durable()?;
+                // What was written, so what a re-read serves: no vector.
                 w.index_mut()?.chat.episodes.insert(
                     sid,
                     EntreeEpisode {
                         noeud,
                         projet: pid,
-                        episode: episode_clone,
+                        episode: sans_vecteur,
                     },
                 );
                 Ok(true)
@@ -2845,10 +3088,17 @@ impl ChatStore for ObrainGraphStore {
                     return Ok(ns);
                 }
                 let ns = Uuid::new_v4();
-                let noeud = w.db.create_node(&[RACINE_AGENT]);
-                w.etape()?;
-                w.db.set_node_property(noeud, "key", Value::from("root"));
-                w.db.set_node_property(noeud, "namespace", Value::from(ns.to_string()));
+                // A draft until its namespace is written: an interruption never
+                // leaves a root that reads as absent and makes the next call create
+                // a second one.
+                let noeud = creer_noeud(
+                    w,
+                    RACINE_AGENT,
+                    vec![
+                        ("key", Value::from("root")),
+                        ("namespace", Value::from(ns.to_string())),
+                    ],
+                )?;
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 etat.chat.racine_agent = Some(ns);
@@ -2879,33 +3129,21 @@ impl ChatStore for ObrainGraphStore {
                         .segments
                         .get(&conversation)
                         .and_then(|m| m.get(&id).map(|e| e.noeud));
+                    w.flush_complet |= json.len() > SEUIL_COLONNE_BLOB;
+                    let proprietes = vec![
+                        ("conversation", Value::from(conversation.clone())),
+                        ("id", Value::from(id.clone())),
+                        ("dimension", Value::from(segment.dimension.as_str())),
+                        ("start_turn", Value::from(i64::from(segment.start_turn))),
+                        ("json", Value::from(json)),
+                    ];
                     let noeud = match existant {
-                        Some(n) => n,
-                        None => {
-                            let n = w.db.create_node(&[SEGMENT]);
-                            w.etape()?;
+                        Some(n) => {
+                            poser(w, n, proprietes)?;
                             n
                         }
+                        None => creer_noeud(w, SEGMENT, proprietes)?,
                     };
-                    w.flush_complet |= json.len() > SEUIL_COLONNE_BLOB;
-                    w.etape()?;
-                    w.db.set_node_property(
-                        noeud,
-                        "conversation",
-                        Value::from(conversation.clone()),
-                    );
-                    w.db.set_node_property(noeud, "id", Value::from(id.clone()));
-                    w.db.set_node_property(
-                        noeud,
-                        "dimension",
-                        Value::from(segment.dimension.as_str()),
-                    );
-                    w.db.set_node_property(
-                        noeud,
-                        "start_turn",
-                        Value::from(i64::from(segment.start_turn)),
-                    );
-                    w.db.set_node_property(noeud, "json", Value::from(json));
                     ecrites.push((id, noeud, segment.clone()));
                 }
                 // prune what the conversation no longer has
@@ -2921,6 +3159,16 @@ impl ChatStore for ObrainGraphStore {
                     .filter(|(id, _)| !ids.contains(*id))
                     .map(|(_, e)| e.noeud)
                     .collect();
+                // The unreadable nodes of the conversation go too: `put` replaces the
+                // set, and these were in it (healed, as Neo4j's MERGE would).
+                let illisibles: Vec<NodeId> = w
+                    .index()?
+                    .chat
+                    .segments_illisibles
+                    .get(&conversation)
+                    .cloned()
+                    .unwrap_or_default();
+                let a_supprimer: Vec<NodeId> = a_supprimer.into_iter().chain(illisibles).collect();
                 for n in a_supprimer {
                     detacher(w, n)?;
                 }
@@ -2929,7 +3177,9 @@ impl ChatStore for ObrainGraphStore {
                     .into_iter()
                     .map(|(id, noeud, segment)| (id, EntreeSegment { noeud, segment }))
                     .collect();
-                w.index_mut()?.chat.segments.insert(conversation, carte);
+                let mut etat = w.index_mut()?;
+                etat.chat.segments_illisibles.remove(&conversation);
+                etat.chat.segments.insert(conversation, carte);
                 Ok(())
             },
         )
@@ -2939,6 +3189,13 @@ impl ChatStore for ObrainGraphStore {
     async fn get_segments(&self, conversation: &str) -> Result<Vec<Segment>> {
         let c = conversation.to_string();
         self.lire(move |_, etat| {
+            if let Some(n) = etat.chat.segments_illisibles.get(&c) {
+                bail!(
+                    "conversation {c} : {} segment(s) illisible(s) en quarantaine ; un historique \
+                     tronqué n'est jamais servi",
+                    n.len()
+                );
+            }
             let mut v: Vec<Segment> = etat
                 .chat
                 .segments
@@ -2968,42 +3225,22 @@ impl ChatStore for ObrainGraphStore {
                         .frontieres
                         .get(&conversation)
                         .and_then(|m| m.get(&cle).map(|e| e.noeud));
+                    w.flush_complet |= json.len() > SEUIL_COLONNE_BLOB;
+                    let proprietes = vec![
+                        ("conversation", Value::from(conversation.clone())),
+                        ("dimension", Value::from(frontiere.dimension.as_str())),
+                        ("at_turn", Value::from(i64::from(frontiere.at_turn))),
+                        ("from", Value::from(frontiere.from.as_str().to_string())),
+                        ("to", Value::from(frontiere.to.as_str().to_string())),
+                        ("json", Value::from(json)),
+                    ];
                     let noeud = match existant {
-                        Some(n) => n,
-                        None => {
-                            let n = w.db.create_node(&[FRONTIERE]);
-                            w.etape()?;
+                        Some(n) => {
+                            poser(w, n, proprietes)?;
                             n
                         }
+                        None => creer_noeud(w, FRONTIERE, proprietes)?,
                     };
-                    w.flush_complet |= json.len() > SEUIL_COLONNE_BLOB;
-                    w.etape()?;
-                    w.db.set_node_property(
-                        noeud,
-                        "conversation",
-                        Value::from(conversation.clone()),
-                    );
-                    w.db.set_node_property(
-                        noeud,
-                        "dimension",
-                        Value::from(frontiere.dimension.as_str()),
-                    );
-                    w.db.set_node_property(
-                        noeud,
-                        "at_turn",
-                        Value::from(i64::from(frontiere.at_turn)),
-                    );
-                    w.db.set_node_property(
-                        noeud,
-                        "from",
-                        Value::from(frontiere.from.as_str().to_string()),
-                    );
-                    w.db.set_node_property(
-                        noeud,
-                        "to",
-                        Value::from(frontiere.to.as_str().to_string()),
-                    );
-                    w.db.set_node_property(noeud, "json", Value::from(json));
                     ecrites.push((cle, noeud, frontiere.clone()));
                 }
                 let keys: HashSet<String> = boundaries
@@ -3020,6 +3257,14 @@ impl ChatStore for ObrainGraphStore {
                     .filter(|(k, _)| !keys.contains(*k))
                     .map(|(_, e)| e.noeud)
                     .collect();
+                let illisibles: Vec<NodeId> = w
+                    .index()?
+                    .chat
+                    .frontieres_illisibles
+                    .get(&conversation)
+                    .cloned()
+                    .unwrap_or_default();
+                let a_supprimer: Vec<NodeId> = a_supprimer.into_iter().chain(illisibles).collect();
                 for n in a_supprimer {
                     detacher(w, n)?;
                 }
@@ -3028,7 +3273,9 @@ impl ChatStore for ObrainGraphStore {
                     .into_iter()
                     .map(|(cle, noeud, frontiere)| (cle, EntreeFrontiere { noeud, frontiere }))
                     .collect();
-                w.index_mut()?.chat.frontieres.insert(conversation, carte);
+                let mut etat = w.index_mut()?;
+                etat.chat.frontieres_illisibles.remove(&conversation);
+                etat.chat.frontieres.insert(conversation, carte);
                 Ok(())
             },
         )
@@ -3038,6 +3285,13 @@ impl ChatStore for ObrainGraphStore {
     async fn get_boundaries(&self, conversation: &str) -> Result<Vec<Boundary>> {
         let c = conversation.to_string();
         self.lire(move |_, etat| {
+            if let Some(n) = etat.chat.frontieres_illisibles.get(&c) {
+                bail!(
+                    "conversation {c} : {} frontière(s) illisible(s) en quarantaine ; une liste \
+                     tronquée n'est jamais servie",
+                    n.len()
+                );
+            }
             let mut v: Vec<Boundary> = etat
                 .chat
                 .frontieres
@@ -3210,5 +3464,707 @@ impl ChatStore for ObrainGraphStore {
             "ChatStore::search_episodes_by_embedding",
             "obrain ne journalise pas la valeur des vecteurs dans son WAL",
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Each test names the finding of the post-merge review of #1193 it proves
+    //! (B = blocking, C = to fix, M = minor).
+    use super::*;
+    use crate::chat::anchor::NewAnchor;
+    use crate::chat::provider::cognitive::segment::{
+        Dimension, Fingerprint, Observation, SegmentPolicy, Segmenter,
+    };
+    use crate::chat::types::SpawnedBy;
+    use crate::episodes::models::{
+        FeedbackType, Outcome, Process, SessionTrace, Stimulus, StimulusTrigger, Validation,
+    };
+    use crate::obrain::{Creation, Interruption};
+    use std::path::Path;
+
+    fn session(id: Uuid) -> ChatSessionNode {
+        let now = Utc::now();
+        ChatSessionNode {
+            id,
+            cli_session_id: None,
+            project_slug: Some("p".to_string()),
+            workspace_slug: None,
+            cwd: "/tmp".to_string(),
+            title: None,
+            model: "sonnet".to_string(),
+            created_at: now,
+            updated_at: now,
+            message_count: 0,
+            total_cost_usd: None,
+            conversation_id: None,
+            preview: None,
+            permission_mode: None,
+            add_dirs: None,
+            spawned_by: None,
+            provider_id: None,
+            routed_by: None,
+            routing_mode: None,
+            routing_pool: None,
+            capabilities: None,
+            engine: None,
+            resume_token: None,
+            execution_place: ExecutionPlace::Project,
+            project_inferred: false,
+            access: SessionAccess::Normal,
+            owner: None,
+            file_scope_lifted: false,
+            mirror_of: None,
+        }
+    }
+
+    fn enfant_de(id: Uuid, parent: Uuid, created_at: DateTime<Utc>) -> ChatSessionNode {
+        let mut s = session(id);
+        s.created_at = created_at;
+        s.spawned_by = Some(
+            SpawnedBy::Conversation {
+                parent_session_id: parent,
+                tool_use_id: None,
+            }
+            .to_json_string(),
+        );
+        s
+    }
+
+    fn ouvrir(chemin: &Path) -> ObrainGraphStore {
+        ObrainGraphStore::open(chemin, Creation::Permise).unwrap()
+    }
+
+    fn ancre(cible: &str) -> NewAnchor {
+        NewAnchor::new(
+            AnchorTargetType::File,
+            cible,
+            [AnchorRole::Focus],
+            AnchorActor::User,
+            "moi",
+        )
+    }
+
+    fn evenement(session_id: Uuid, seq: i64) -> ChatEventRecord {
+        ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id,
+            seq,
+            event_type: "user_message".to_string(),
+            data: r#"{"content":"bonjour"}"#.to_string(),
+            created_at: Utc::now(),
+        }
+    }
+
+    fn noeuds(store: &ObrainGraphStore, etiquette: &str) -> usize {
+        store.interne.db.store().nodes_by_label(etiquette).len()
+    }
+
+    fn segmentation() -> Segmenter {
+        let obs = |turn: u32, id: &str| Observation {
+            turn,
+            prints: [(Dimension::Harness, Fingerprint::new([id]))]
+                .into_iter()
+                .collect(),
+        };
+        Segmenter::replay(
+            SegmentPolicy::default(),
+            7,
+            &[obs(0, "deepseek"), obs(1, "claude-code")],
+        )
+        .unwrap()
+    }
+
+    /// B1: deleting a session takes ITS anchors out of the target pages, and
+    /// only them.
+    #[tokio::test]
+    async fn b1_supprimer_une_session_garde_les_ancres_des_autres_sur_la_cible() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        for id in [a, b] {
+            store.create_chat_session(&session(id)).await.unwrap();
+            store.add_anchor(id, ancre("src/main.rs")).await.unwrap();
+        }
+        assert!(store.delete_chat_session(b).await.unwrap());
+        let page = store
+            .list_sessions_for_target(AnchorTargetType::File, "src/main.rs", None, 50, None)
+            .await
+            .unwrap();
+        let sessions: Vec<Uuid> = page.items.iter().map(|x| x.session_id).collect();
+        assert_eq!(sessions, vec![a]);
+        // The deleted session's anchors left the index, not only its pages.
+        assert_eq!(store.interne.etat.read().unwrap().chat.ancres.len(), 1);
+        assert_eq!(
+            store
+                .mark_anchors_dangling(AnchorTargetType::File, "src/main.rs")
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// B2: the anchor journal is served as soon as the change it records.
+    #[tokio::test]
+    async fn b2_journal_d_ancre_lu_sans_reouverture() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let s = Uuid::new_v4();
+        store.create_chat_session(&session(s)).await.unwrap();
+        let a = store.add_anchor(s, ancre("src/lib.rs")).await.unwrap();
+        let journal = store.list_anchor_events(s).await.unwrap();
+        assert_eq!(journal.len(), 1);
+        assert_eq!(
+            (journal[0].seq, journal[0].anchor_id, journal[0].kind),
+            (1, a.id, AnchorEventKind::Added)
+        );
+        store
+            .set_anchor_state(
+                s,
+                a.id,
+                AnchorState::Dangling,
+                None,
+                AnchorActor::User,
+                "moi",
+            )
+            .await
+            .unwrap();
+        let seqs: Vec<u64> = store
+            .list_anchor_events(s)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(seqs, vec![1, 2]);
+    }
+
+    /// B2: the journal of a deleted session is deleted with it (on disk too).
+    #[tokio::test]
+    async fn b2_journal_d_ancre_supprime_avec_sa_session_apres_reouverture() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = ouvrir(&base);
+        let s = Uuid::new_v4();
+        store.create_chat_session(&session(s)).await.unwrap();
+        store.add_anchor(s, ancre("src/lib.rs")).await.unwrap();
+        assert!(store.delete_chat_session(s).await.unwrap());
+        assert!(store.list_anchor_events(s).await.unwrap().is_empty());
+        store.close().await.unwrap();
+        drop(store);
+        let store = ouvrir(&base);
+        assert!(store.list_anchor_events(s).await.unwrap().is_empty());
+        assert_eq!(noeuds(&store, EVENEMENT_ANCRE), 0);
+    }
+
+    /// C1: an event whose creation was interrupted is never replayed with
+    /// default values; it is absent, or whole.
+    #[tokio::test]
+    async fn c1_evenement_interrompu_absent_ou_entier() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut atteints = 0;
+        for k in 1..=20 {
+            let base = dir.path().join(format!("b{k}"));
+            let store = ouvrir(&base);
+            let s = Uuid::new_v4();
+            store.create_chat_session(&session(s)).await.unwrap();
+            store.interrompre_au_prochain(Interruption::AvantEtape(k));
+            let issue = store.store_chat_events(s, vec![evenement(s, 1)]).await;
+            store.close().await.unwrap();
+            drop(store);
+            if issue.is_ok() {
+                break;
+            }
+            atteints += 1;
+            let store = ouvrir(&base);
+            assert!(
+                store.rapport_d_ouverture().en_quarantaine.is_empty(),
+                "k={k} : {:?}",
+                store.rapport_d_ouverture().en_quarantaine
+            );
+            let evts = store.get_chat_events(s, 0, 10).await.unwrap();
+            assert!(
+                evts.is_empty() || evts[0].event_type == "user_message",
+                "k={k} : {evts:?}"
+            );
+            assert_eq!(store.count_chat_events(s).await.unwrap(), evts.len() as i64);
+            store.close().await.unwrap();
+        }
+        assert!(atteints >= 7, "{atteints} points atteints");
+    }
+
+    /// C2: a setting whose creation was interrupted never reads back `""`.
+    #[tokio::test]
+    async fn c2_reglage_interrompu_jamais_lu_vide() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut atteints = 0;
+        for k in 1..=20 {
+            let base = dir.path().join(format!("b{k}"));
+            let store = ouvrir(&base);
+            store.interrompre_au_prochain(Interruption::AvantEtape(k));
+            let issue = store.put_llm_setting("global", "cle", "valeur").await;
+            store.close().await.unwrap();
+            drop(store);
+            if issue.is_ok() {
+                break;
+            }
+            atteints += 1;
+            let store = ouvrir(&base);
+            assert!(
+                store.rapport_d_ouverture().en_quarantaine.is_empty(),
+                "k={k}"
+            );
+            let lu = store.get_llm_setting("global", "cle").await.unwrap();
+            assert!(
+                lu.is_none() || lu.as_deref() == Some("valeur"),
+                "k={k} : {lu:?}"
+            );
+            store.close().await.unwrap();
+        }
+        assert!(atteints >= 2, "{atteints} points atteints");
+    }
+
+    /// C3 (a): a provider change interrupted at any write never leaves the old
+    /// resume handles under the new provider; a restore interrupted never leaves
+    /// the restored handles under the provider it replaces.
+    #[tokio::test]
+    async fn c3_changement_de_fournisseur_interrompu_sans_jeton_d_une_autre_famille() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ancienne = session(Uuid::new_v4());
+        ancienne.provider_id = Some("ancien".to_string());
+        ancienne.resume_token = Some("jeton-ancien".to_string());
+        ancienne.cli_session_id = Some("cli-ancien".to_string());
+        let mut atteints = 0;
+        for k in 1..=20 {
+            let base = dir.path().join(format!("u{k}"));
+            let store = ouvrir(&base);
+            store.create_chat_session(&ancienne).await.unwrap();
+            store.interrompre_au_prochain(Interruption::AvantEtape(k));
+            let issue = store
+                .update_chat_session_provider(ancienne.id, "nouveau", "m2", "r", "e")
+                .await;
+            store.close().await.unwrap();
+            drop(store);
+            if issue.is_ok() {
+                break;
+            }
+            atteints += 1;
+            let store = ouvrir(&base);
+            let s = store.get_chat_session(ancienne.id).await.unwrap().unwrap();
+            if s.provider_id.as_deref() == Some("nouveau") {
+                assert_eq!((s.resume_token, s.cli_session_id), (None, None), "k={k}");
+            }
+            store.close().await.unwrap();
+        }
+        assert!(atteints >= 8, "{atteints} points atteints (changement)");
+        let mut atteints = 0;
+        for k in 1..=20 {
+            let base = dir.path().join(format!("r{k}"));
+            let store = ouvrir(&base);
+            store.create_chat_session(&ancienne).await.unwrap();
+            store
+                .update_chat_session_provider(ancienne.id, "nouveau", "m2", "r", "e")
+                .await
+                .unwrap();
+            store.interrompre_au_prochain(Interruption::AvantEtape(k));
+            let issue = store
+                .restore_chat_session_provider(&ancienne, "ancien")
+                .await;
+            store.close().await.unwrap();
+            drop(store);
+            if issue.is_ok() {
+                break;
+            }
+            atteints += 1;
+            let store = ouvrir(&base);
+            let s = store.get_chat_session(ancienne.id).await.unwrap().unwrap();
+            if s.resume_token.is_some() || s.cli_session_id.is_some() {
+                assert_eq!(s.provider_id.as_deref(), Some("ancien"), "k={k}");
+            }
+            store.close().await.unwrap();
+        }
+        assert!(atteints >= 8, "{atteints} points atteints (restauration)");
+    }
+
+    /// C3 (b): an anchor operation interrupted at any write never leaves two
+    /// journal entries with the same `seq`.
+    #[tokio::test]
+    async fn c3_operation_d_ancre_interrompue_sans_seq_en_double() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut atteints = 0;
+        for k in 1..=60 {
+            let base = dir.path().join(format!("b{k}"));
+            let store = ouvrir(&base);
+            let s = Uuid::new_v4();
+            store.create_chat_session(&session(s)).await.unwrap();
+            store.add_anchor(s, ancre("a.rs")).await.unwrap();
+            store.interrompre_au_prochain(Interruption::AvantEtape(k));
+            let issue = store.add_anchor(s, ancre("b.rs")).await;
+            store.close().await.unwrap();
+            drop(store);
+            if issue.is_ok() {
+                break;
+            }
+            atteints += 1;
+            let store = ouvrir(&base);
+            assert!(
+                store.rapport_d_ouverture().en_quarantaine.is_empty(),
+                "k={k} : {:?}",
+                store.rapport_d_ouverture().en_quarantaine
+            );
+            store.add_anchor(s, ancre("c.rs")).await.unwrap();
+            let seqs: Vec<u64> = store
+                .list_anchor_events(s)
+                .await
+                .unwrap()
+                .iter()
+                .map(|e| e.seq)
+                .collect();
+            let uniques: BTreeSet<u64> = seqs.iter().copied().collect();
+            assert_eq!(uniques.len(), seqs.len(), "k={k} : {seqs:?}");
+            store.close().await.unwrap();
+        }
+        assert!(atteints >= 10, "{atteints} points atteints");
+    }
+
+    /// C4: an unreadable segment or boundary fails the read of its conversation
+    /// (never a shorter history), is quarantined, and a `put` heals it.
+    #[tokio::test]
+    async fn c4_segment_et_frontiere_illisibles_refusent_la_lecture() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let seg = segmentation();
+        let (segments, frontieres) = (seg.segments(), seg.boundaries().to_vec());
+        assert!(!frontieres.is_empty());
+        let store = ouvrir(&base);
+        store.put_segments("conv", &segments).await.unwrap();
+        store.put_boundaries("conv", &frontieres).await.unwrap();
+        // What a corruption leaves: a node of the conversation whose JSON is unreadable.
+        {
+            let db = &store.interne.db;
+            let n = db.create_node(&[SEGMENT]);
+            db.set_node_property(n, "conversation", Value::from("conv"));
+            db.set_node_property(n, "id", Value::from("abime"));
+            db.set_node_property(n, "json", Value::from("{pas du json"));
+            let f = db.create_node(&[FRONTIERE]);
+            db.set_node_property(f, "conversation", Value::from("conv"));
+            db.set_node_property(f, "dimension", Value::from("topic"));
+        }
+        store.close().await.unwrap();
+        drop(store);
+        let store = ouvrir(&base);
+        let quarantaine = &store.rapport_d_ouverture().en_quarantaine;
+        assert!(
+            quarantaine
+                .iter()
+                .any(|q| q.contains("ConversationSegment"))
+                && quarantaine
+                    .iter()
+                    .any(|q| q.contains("ConversationBoundary")),
+            "{quarantaine:?}"
+        );
+        assert!(store.get_segments("conv").await.is_err());
+        assert!(store.get_boundaries("conv").await.is_err());
+        assert!(store.get_segments("autre").await.unwrap().is_empty());
+        // `put` replaces the set: the unreadable nodes go with it.
+        store.put_segments("conv", &segments).await.unwrap();
+        store.put_boundaries("conv", &frontieres).await.unwrap();
+        assert_eq!(store.get_segments("conv").await.unwrap(), segments);
+        assert_eq!(store.get_boundaries("conv").await.unwrap(), frontieres);
+        store.close().await.unwrap();
+        drop(store);
+        let store = ouvrir(&base);
+        assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
+        assert_eq!(store.get_segments("conv").await.unwrap(), segments);
+        assert_eq!(store.get_boundaries("conv").await.unwrap(), frontieres);
+    }
+
+    /// C5: the `updated_at` a fingerprint write puts on disk is the one served,
+    /// before and after a restart.
+    #[tokio::test]
+    async fn c5_empreinte_publie_le_updated_at_ecrit() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = ouvrir(&base);
+        let s = session(Uuid::new_v4());
+        store.create_chat_session(&s).await.unwrap();
+        let avant = store
+            .get_chat_session(s.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        store
+            .set_chat_session_fingerprint(s.id, "fp")
+            .await
+            .unwrap();
+        let publie = store
+            .get_chat_session(s.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at;
+        assert!(publie > avant);
+        store.update_chat_session_model(s.id, "opus").await.unwrap();
+        let publie = store
+            .get_chat_session(s.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at;
+        store.close().await.unwrap();
+        drop(store);
+        let store = ouvrir(&base);
+        assert_eq!(
+            store
+                .get_chat_session(s.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .updated_at,
+            publie
+        );
+    }
+
+    /// C6: an empty `routed_by` / `engine` is served `None`, as a re-read does.
+    #[tokio::test]
+    async fn c6_fournisseur_chaines_vides_servies_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = ouvrir(&base);
+        let s = session(Uuid::new_v4());
+        store.create_chat_session(&s).await.unwrap();
+        store
+            .update_chat_session_provider(s.id, "p", "m", "", "")
+            .await
+            .unwrap();
+        let publie = store.get_chat_session(s.id).await.unwrap().unwrap();
+        assert_eq!(
+            (publie.routed_by.clone(), publie.engine.clone()),
+            (None, None)
+        );
+        store.close().await.unwrap();
+        drop(store);
+        let store = ouvrir(&base);
+        assert_eq!(store.get_chat_session(s.id).await.unwrap().unwrap(), publie);
+    }
+
+    /// C7: the episode served is the one written: without its vector.
+    #[tokio::test]
+    async fn c7_episode_servi_sans_le_vecteur_non_ecrit() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let s = Uuid::new_v4();
+        store.create_chat_session(&session(s)).await.unwrap();
+        let projet = Uuid::new_v4();
+        let episode = Episode {
+            id: Uuid::new_v4(),
+            project_id: projet,
+            stimulus: Stimulus {
+                request: "r".to_string(),
+                trigger: StimulusTrigger::UserRequest,
+                timestamp: Utc::now(),
+                context_hash: None,
+            },
+            process: Process {
+                reasoning_tree_id: None,
+                states_visited: vec![],
+                state_visits: vec![],
+                duration_ms: None,
+            },
+            outcome: Outcome {
+                note_ids: vec![],
+                decision_ids: vec![],
+                commit_shas: vec![],
+                files_modified: 0,
+            },
+            validation: Validation {
+                feedback_type: FeedbackType::None,
+                score: None,
+                evidence_count: 0,
+            },
+            lesson: None,
+            collected_at: Utc::now(),
+            source_run_id: None,
+            session: Some(SessionTrace {
+                session_id: s,
+                message_count: 1,
+                close_reason: "closed".to_string(),
+                total_cost_usd: None,
+                agent_id: None,
+            }),
+            embedding: Some(vec![0.5; 4]),
+        };
+        assert!(store.save_session_episode(&episode).await.unwrap());
+        let liste = store.list_session_episodes(projet, 10).await.unwrap();
+        assert_eq!(liste.len(), 1);
+        assert_eq!(liste[0].embedding, None);
+    }
+
+    /// M2: a lineage edge to another parent is refused, never repointed in the
+    /// index alone.
+    #[tokio::test]
+    async fn m2_spawned_by_vers_un_autre_parent_refuse() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        store.create_chat_session(&session(a)).await.unwrap();
+        store.create_chat_session(&session(b)).await.unwrap();
+        store
+            .create_chat_session(&enfant_de(c, a, Utc::now()))
+            .await
+            .unwrap();
+        let run = Uuid::new_v4();
+        assert!(store
+            .create_spawned_by_relation(&c.to_string(), &b.to_string(), "runner", Some(run), None)
+            .await
+            .is_err());
+        assert!(store.get_run_sessions(run).await.unwrap().is_empty());
+        // The same parent still fills the edge.
+        store
+            .create_spawned_by_relation(&c.to_string(), &a.to_string(), "runner", Some(run), None)
+            .await
+            .unwrap();
+        assert_eq!(store.get_run_sessions(run).await.unwrap().len(), 1);
+    }
+
+    /// M3: the tree is ordered `depth, created_at, id` across the whole depth.
+    #[tokio::test]
+    async fn m3_arbre_ordonne_par_profondeur_date_puis_id() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let t = Utc::now();
+        let s = |n: i64| t + chrono::Duration::seconds(n);
+        let (r, c1, c2, g1, g2) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        store.create_chat_session(&session(r)).await.unwrap();
+        store
+            .create_chat_session(&enfant_de(c1, r, s(2)))
+            .await
+            .unwrap();
+        store
+            .create_chat_session(&enfant_de(c2, r, s(1)))
+            .await
+            .unwrap();
+        // g1 is younger than g2 but hangs under the later parent.
+        store
+            .create_chat_session(&enfant_de(g1, c1, s(3)))
+            .await
+            .unwrap();
+        store
+            .create_chat_session(&enfant_de(g2, c2, s(4)))
+            .await
+            .unwrap();
+        let ordre: Vec<String> = store
+            .get_session_tree(&r.to_string())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|n| n.session_id)
+            .collect();
+        let attendu: Vec<String> = [r, c2, c1, g1, g2].iter().map(Uuid::to_string).collect();
+        assert_eq!(ordre, attendu);
+    }
+
+    /// M4: `limit = 0` is no row, as Neo4j's `LIMIT 0`.
+    #[tokio::test]
+    async fn m4_get_chat_events_limit_zero_ne_rend_rien() {
+        let store = ObrainGraphStore::open_temporary().unwrap();
+        let s = Uuid::new_v4();
+        store.create_chat_session(&session(s)).await.unwrap();
+        store
+            .store_chat_events(s, vec![evenement(s, 1), evenement(s, 2)])
+            .await
+            .unwrap();
+        assert!(store.get_chat_events(s, 0, 0).await.unwrap().is_empty());
+        assert_eq!(store.get_chat_events(s, 0, 1).await.unwrap().len(), 1);
+    }
+
+    /// M5: an execution-place event's `at` is written as Neo4j writes it
+    /// (microseconds, `Z`), and served as a re-read serves it.
+    #[tokio::test]
+    async fn m5_lieu_at_a_la_microseconde() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = ouvrir(&base);
+        let at = DateTime::parse_from_rfc3339("2026-01-02T03:04:05.123456789+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let e = ExecutionPlaceEvent {
+            id: Uuid::new_v4(),
+            placement_id: Uuid::new_v4(),
+            kind: ExecutionPlaceEventKind::Requested,
+            task_id: Uuid::new_v4(),
+            plan_id: Uuid::new_v4(),
+            requested_by: "person:moi".to_string(),
+            owner: "moi".to_string(),
+            actor: None,
+            session_id: None,
+            path: "/x".to_string(),
+            repository: "r".to_string(),
+            base_ref: "main".to_string(),
+            base_sha: "abc".to_string(),
+            branch: "b".to_string(),
+            detail: None,
+            at,
+        };
+        store.create_execution_place_event(&e).await.unwrap();
+        let attendu = DateTime::parse_from_rfc3339("2026-01-02T03:04:05.123456Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let publie = store.list_execution_place_events(e.task_id).await.unwrap();
+        assert_eq!(publie[0].at, attendu);
+        let brut = store
+            .interne
+            .db
+            .store()
+            .nodes_by_label(LIEU)
+            .into_iter()
+            .next()
+            .and_then(|n| store.interne.db.get_node(n))
+            .and_then(|n| {
+                n.get_property("at")
+                    .and_then(|v| v.as_str().map(str::to_string))
+            })
+            .unwrap();
+        assert_eq!(brut, "2026-01-02T03:04:05.123456Z");
+        store.close().await.unwrap();
+        drop(store);
+        let store = ouvrir(&base);
+        assert_eq!(
+            store.list_execution_place_events(e.task_id).await.unwrap(),
+            publie
+        );
+    }
+
+    /// M7: an agent root whose creation was interrupted never makes the next
+    /// call create a second one.
+    #[tokio::test]
+    async fn m7_racine_d_agent_interrompue_reste_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut atteints = 0;
+        for k in 1..=10 {
+            let base = dir.path().join(format!("b{k}"));
+            let store = ouvrir(&base);
+            store.interrompre_au_prochain(Interruption::AvantEtape(k));
+            let issue = store.agent_identity_namespace().await;
+            store.close().await.unwrap();
+            drop(store);
+            if issue.is_ok() {
+                break;
+            }
+            atteints += 1;
+            let store = ouvrir(&base);
+            assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
+            let ns = store.agent_identity_namespace().await.unwrap();
+            store.close().await.unwrap();
+            drop(store);
+            let store = ouvrir(&base);
+            assert_eq!(noeuds(&store, RACINE_AGENT), 1, "k={k}");
+            assert_eq!(store.agent_identity_namespace().await.unwrap(), ns, "k={k}");
+            store.close().await.unwrap();
+        }
+        assert!(atteints >= 1);
     }
 }
