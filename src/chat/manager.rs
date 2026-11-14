@@ -17817,6 +17817,18 @@ impl ChatManager {
                             "search engine left out of the session"
                         );
                     }
+                    // A directory of the scope that is not on this machine: left out, so that a
+                    // stale workspace member cannot kill the session, and said here because the
+                    // engine would report nothing but its own death.
+                    for dir in &attachment.missing_dirs {
+                        warn!(
+                            session_id,
+                            directory = %dir.display(),
+                            "a directory of the session's scope does not exist on this machine: \
+                             left out of the native engine's file scope (a workspace member whose \
+                             root_path belongs to another machine?)"
+                        );
+                    }
                     attach_native_servers(&mut spec.mcp_servers, attachment.servers)?;
                     gate_temp_dir = attachment.temp_dir.clone();
                     // The list the gate checks a SEARCH against, kept where the runtime can read
