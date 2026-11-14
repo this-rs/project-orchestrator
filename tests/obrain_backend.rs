@@ -4181,14 +4181,9 @@ mod with_the_feature {
 
     /// Files whose path and hash go to a blob column (> 256 bytes), written then
     /// REPLACED by a short hash, with the child killed by SIGKILL — no `close()`, so no
-    /// final flush hides a missing one. The child logs each INTENTION before the write
-    /// (never after), so a log line no longer proves the write reached the disk: the
-    /// kill can land between the line and the durability of the write, leaving the
-    /// store on the previous value. The oracle accepts, per path, the last logged hash
-    /// OR the one before it — a value the child acknowledged (its `upsert_file` returned)
-    /// is never lost, the log is just one step ahead of the disk. The writer pays the
-    /// full flush for a blob-sized value AND for the replacement of one (as
-    /// `project.rs` / `plan.rs`).
+    /// final flush hides a missing one. Every file the child acknowledged is there after
+    /// the kill, with the last hash it acknowledged: the writer pays the full flush for
+    /// a blob-sized value AND for the replacement of one (as `project.rs` / `plan.rs`).
     #[tokio::test]
     async fn kill9_during_file_writes_loses_no_acknowledged_blob_sized_file() {
         if let Ok(dir) = std::env::var(ENV_KILL9_FICHIERS) {
@@ -4216,11 +4211,11 @@ mod with_the_feature {
                     None,
                 );
                 f.hash = format!("{}{}", "h".repeat(300), Uuid::new_v4());
-                writeln!(log, "{}\t{}", f.path, f.hash).unwrap();
                 store.upsert_file(&f).await.unwrap();
+                writeln!(log, "{}\t{}", f.path, f.hash).unwrap();
                 f.hash = format!("court-{}", Uuid::new_v4());
-                writeln!(log, "{}\t{}", f.path, f.hash).unwrap();
                 store.upsert_file(&f).await.unwrap();
+                writeln!(log, "{}\t{}", f.path, f.hash).unwrap();
             }
         }
 
@@ -4259,37 +4254,22 @@ mod with_the_feature {
                 "round {tour}: a file write killed half-way is repaired, never quarantined: \
                  {rapport:?}"
             );
-            // Two levels of intention per path: the last hash the child logged and the
-            // one before it. The child logs an intention before each write, so the kill
-            // can land between the line and the durability of the write — the store then
-            // still holds the previous value, and the oracle must accept it too.
-            let mut dernier: std::collections::HashMap<String, String> = Default::default();
-            let mut avant_dernier: std::collections::HashMap<String, String> = Default::default();
+            let mut derniers: std::collections::HashMap<String, String> = Default::default();
             for ligne in std::fs::read_to_string(&acquittes).unwrap().lines() {
                 let (path, hash) = ligne.split_once('\t').unwrap();
-                if let Some(ancien) = dernier.insert(path.to_string(), hash.to_string()) {
-                    avant_dernier.insert(path.to_string(), ancien);
-                }
+                derniers.insert(path.to_string(), hash.to_string());
             }
-            for (path, hash) in &dernier {
-                match store.get_file(path).await.unwrap() {
-                    Some(f) => assert!(
-                        &f.hash == hash || avant_dernier.get(path).is_some_and(|h| h == &f.hash),
-                        "round {tour}: {path} holds {:?}, neither the last ({hash}) nor the \
-                         previous ({}) intention",
-                        f.hash,
-                        avant_dernier.get(path).map(String::as_str).unwrap_or("—")
-                    ),
-                    // A file whose FIRST write never reached the disk is absent (its draft
-                    // is deleted at open). Once the second intention is logged the first
-                    // write has acknowledged, so the file can no longer be gone.
-                    None => assert!(
-                        !avant_dernier.contains_key(path),
-                        "round {tour}: {path} was written twice yet is gone"
-                    ),
-                }
+            for (path, hash) in &derniers {
+                let f =
+                    store.get_file(path).await.unwrap().unwrap_or_else(|| {
+                        panic!("round {tour}: acknowledged file {path} is gone")
+                    });
+                assert_eq!(
+                    &f.hash, hash,
+                    "round {tour}: the last acknowledged hash of {path}"
+                );
             }
-            vus = dernier.len();
+            vus = derniers.len();
             store.close().await.unwrap();
         }
         assert!(vus >= 6, "files checked: {vus}");
