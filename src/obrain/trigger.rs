@@ -74,7 +74,7 @@ use obrain_common::types::{NodeId, Value};
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
-use super::{Ecriture, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
+use super::{Ecriture, ObrainGraphStore, RapportOuverture};
 use crate::events::trigger::EventTrigger;
 use crate::lifecycle::{
     LifecycleActionType, LifecycleHook, LifecycleScope, UpdateLifecycleHookRequest,
@@ -346,15 +346,6 @@ pub(super) fn indexer<K: std::hash::Hash + Eq + std::fmt::Display, T>(
     index
 }
 
-/// Does this value go to a blob column (a string above the threshold, or a list
-/// holding one)? Those values are not recovered by the WAL of the pinned obrain:
-/// a write that carries one pays the full flush (`mod.rs`, [`SEUIL_COLONNE_BLOB`]).
-pub(super) fn va_en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-        || v.as_list()
-            .is_some_and(|l| l.iter().any(va_en_colonne_blob))
-}
-
 /// Writes a creation up to its commit point: the node, the draft marker, the
 /// properties, then the marker removed. A value that goes to a blob column makes
 /// the FULL flush run before the marker goes (as `plan.rs`): a crash before it
@@ -365,16 +356,14 @@ pub(super) fn creer_noeud(
     label: &str,
     proprietes: Vec<(&'static str, Value)>,
 ) -> Result<NodeId> {
-    w.flush_complet |= proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
     w.etape()?;
     let noeud = w.db.create_node(&[label]);
     w.etape()?;
-    w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+    w.poser(noeud, BROUILLON, Value::from(true));
     for (cle, valeur) in proprietes {
         w.etape()?;
-        w.db.set_node_property(noeud, cle, valeur);
+        w.poser(noeud, cle, valeur);
     }
-    w.rendre_durable_avant_le_marqueur()?;
     w.etape()?;
     // The commit point.
     w.db.remove_node_property(noeud, BROUILLON);
@@ -403,19 +392,10 @@ pub(super) fn poser(
     noeud: NodeId,
     proprietes: Vec<(&'static str, Option<Value>)>,
 ) -> Result<()> {
-    let ancien_en_blob = w.db.get_node(noeud).is_some_and(|n| {
-        proprietes
-            .iter()
-            .any(|(cle, _)| n.get_property(cle).is_some_and(va_en_colonne_blob))
-    });
-    w.flush_complet |= ancien_en_blob
-        || proprietes
-            .iter()
-            .any(|(_, v)| v.as_ref().is_some_and(va_en_colonne_blob));
     for (cle, valeur) in proprietes {
         w.etape()?;
         match valeur {
-            Some(v) => w.db.set_node_property(noeud, cle, v),
+            Some(v) => w.poser(noeud, cle, v),
             None => {
                 w.db.remove_node_property(noeud, cle);
             }
@@ -1516,18 +1496,24 @@ mod tests {
             let n = db.create_node(&[CROCHET]);
             for (k, v) in proprietes_crochet(&crochet("mauvais", LifecycleScope::Task, 2)).unwrap()
             {
+                // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
                 db.set_node_property(n, k, v);
             }
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             db.set_node_property(n, "scope", Value::from("Galaxy"));
             // An alert with an unknown severity.
             let n = db.create_node(&[ALERTE]);
             for (k, v) in proprietes_alerte(&alerte("x", "y")) {
+                // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
                 db.set_node_property(n, k, v);
             }
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             db.set_node_property(n, "severity", Value::from("apocalyptic"));
             // A draft event trigger: deleted at open.
             let n = db.create_node(&[DECLENCHEUR]);
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             db.set_node_property(n, BROUILLON, Value::from(true));
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             db.set_node_property(n, "id", Value::from(Uuid::new_v4().to_string()));
             db.commit_wal().unwrap();
             store.close().await.unwrap();

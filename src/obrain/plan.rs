@@ -99,7 +99,7 @@ use uuid::Uuid;
 use super::project::IndexProjets;
 #[cfg(any(test, feature = "mock-store"))]
 use super::Interruption;
-use super::{constraint, task, Ecriture, NonPorte, ObrainGraphStore, SEUIL_COLONNE_BLOB};
+use super::{constraint, task, Ecriture, NonPorte, ObrainGraphStore};
 use crate::neo4j::client::pascal_to_snake_case;
 use crate::neo4j::models::*;
 use crate::neo4j::plan::plan_status_values;
@@ -113,11 +113,6 @@ const BROUILLON: &str = "_brouillon";
 /// The methods of `PlanStore` refused on every call, as `PlanStore::<method>`.
 /// Now empty: tasks, steps, constraints and links are all ported.
 pub const REFUSEES: &[&str] = &[];
-
-/// Does this value go to a blob column (a string above the threshold)?
-fn va_en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-}
 
 /// The Neo4j spelling of a status: the Rust variant name.
 fn nom_statut(s: &PlanStatus) -> &'static str {
@@ -366,19 +361,17 @@ impl PlanStore for ObrainGraphStore {
                         }
                     }
                 }
-                w.flush_complet = proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
                 let noeud = w.db.create_node(&[LABEL]);
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeNoeud)?;
-                w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+                w.poser(noeud, BROUILLON, Value::from(true));
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::ApresLeMarqueur)?;
                 for (n, (cle, valeur)) in proprietes.into_iter().enumerate() {
-                    w.db.set_node_property(noeud, cle, valeur);
+                    w.poser(noeud, cle, valeur);
                     #[cfg(any(test, feature = "mock-store"))]
                     w.point(Interruption::ApresLaPropriete(n + 1))?;
                 }
-                w.rendre_durable_avant_le_marqueur()?;
                 #[cfg(any(test, feature = "mock-store"))]
                 w.point(Interruption::AvantLeRetraitDuMarqueur)?;
                 // The commit point.
@@ -486,29 +479,22 @@ impl PlanStore for ObrainGraphStore {
         self.ecrire(
             || (),
             move |(), w: &mut Ecriture<'_>| {
-                let (noeud, ancien_en_blob) = {
+                let noeud = {
                     let etat = w.index()?;
                     // A missing plan is a silent no-op, as in Neo4j.
                     let Some(e) = etat.plans.par_id.get(&id) else {
                         return Ok(());
                     };
-                    let ancien = e.plan.title.len() > SEUIL_COLONNE_BLOB
-                        || e.plan.description.len() > SEUIL_COLONNE_BLOB;
-                    (e.noeud, ancien)
+                    e.noeud
                 };
-                w.flush_complet = ancien_en_blob
-                    || u.title
-                        .iter()
-                        .chain(u.description.iter())
-                        .any(|s| s.len() > SEUIL_COLONNE_BLOB);
                 if let Some(titre) = u.title {
-                    w.db.set_node_property(noeud, "title", Value::from(titre));
+                    w.poser(noeud, "title", Value::from(titre));
                 }
                 if let Some(description) = u.description {
-                    w.db.set_node_property(noeud, "description", Value::from(description));
+                    w.poser(noeud, "description", Value::from(description));
                 }
                 if let Some(priorite) = u.priority {
-                    w.db.set_node_property(noeud, "priority", Value::from(priorite as i64));
+                    w.poser(noeud, "priority", Value::from(priorite as i64));
                 }
                 let entree = w.apres_ecriture(Entree::relire(w, noeud))?;
                 w.rendre_durable()?;
@@ -527,7 +513,7 @@ impl PlanStore for ObrainGraphStore {
                 let Some(noeud) = w.index()?.plans.par_id.get(&id).map(|e| e.noeud) else {
                     return Ok(());
                 };
-                w.db.set_node_property(noeud, "status", Value::from(nom_statut(&status)));
+                w.poser(noeud, "status", Value::from(nom_statut(&status)));
                 let entree = w.apres_ecriture(Entree::relire(w, noeud))?;
                 w.rendre_durable()?;
                 w.index_mut()?.plans.par_id.insert(id, entree);

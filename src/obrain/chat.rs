@@ -90,7 +90,7 @@ use obrain_core::graph::Direction;
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
-use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
+use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::chat::anchor::{
     self, Anchor, AnchorActor, AnchorError, AnchorEvent, AnchorEventKind, AnchorOp, AnchorPage,
     AnchorRole, AnchorSet, AnchorSetChange, AnchorState, AnchorTargetType,
@@ -159,16 +159,6 @@ fn non_signe(v: i64) -> u64 {
 
 fn opt_non_vide(s: Option<String>) -> Option<String> {
     s.filter(|v| !v.is_empty())
-}
-
-/// Does this value go to a blob column (a string above the threshold, or a
-/// string inside a list)?
-fn va_en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-        || v.as_list().is_some_and(|l| {
-            l.iter()
-                .any(|e| e.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB))
-        })
 }
 
 /// A property lookup over one hydration of a node.
@@ -1238,12 +1228,11 @@ fn creer_noeud(
 ) -> Result<NodeId> {
     let noeud = w.db.create_node(&[etiquette]);
     w.etape()?;
-    w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+    w.poser(noeud, BROUILLON, Value::from(true));
     for (cle, valeur) in proprietes {
         w.etape()?;
-        w.db.set_node_property(noeud, cle, valeur);
+        w.poser(noeud, cle, valeur);
     }
-    w.rendre_durable_avant_le_marqueur()?;
     w.etape()?;
     w.db.remove_node_property(noeud, BROUILLON);
     Ok(noeud)
@@ -1257,7 +1246,7 @@ fn poser(
 ) -> Result<()> {
     for (cle, valeur) in proprietes {
         w.etape()?;
-        w.db.set_node_property(noeud, cle, valeur);
+        w.poser(noeud, cle, valeur);
     }
     Ok(())
 }
@@ -1319,13 +1308,12 @@ impl ChatStore for ObrainGraphStore {
                     }
                 }
                 let proprietes = proprietes_session(&n);
-                w.flush_complet = proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
                 let noeud = w.db.create_node(&[SESSION]);
                 w.etape()?;
-                w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+                w.poser(noeud, BROUILLON, Value::from(true));
                 for (cle, valeur) in proprietes {
                     w.etape()?;
-                    w.db.set_node_property(noeud, cle, valeur);
+                    w.poser(noeud, cle, valeur);
                 }
                 // The lineage edge, from the `spawned_by` JSON (bare: created_at only).
                 let parent = n
@@ -1339,11 +1327,7 @@ impl ChatStore for ObrainGraphStore {
                     if let Some(pnoeud) = pnoeud {
                         let arete = w.db.create_edge(noeud, pnoeud, ARETE_SPAWNED);
                         w.etape()?;
-                        w.db.set_edge_property(
-                            arete,
-                            "created_at",
-                            Value::from(Utc::now().to_rfc3339()),
-                        );
+                        w.poser_arete(arete, "created_at", Value::from(Utc::now().to_rfc3339()));
                         parentage = Some(Parentage {
                             arete,
                             parent_id: pid,
@@ -1353,7 +1337,6 @@ impl ChatStore for ObrainGraphStore {
                         });
                     }
                 }
-                w.rendre_durable_avant_le_marqueur()?;
                 w.etape()?;
                 w.db.remove_node_property(noeud, BROUILLON);
                 let entree = EntreeSession::decoder(w.db, noeud, parentage).and_then(|e| {
@@ -1489,7 +1472,7 @@ impl ChatStore for ObrainGraphStore {
                     None => {
                         let a = w.db.create_edge(cnoeud, pnoeud, ARETE_SPAWNED);
                         w.etape()?;
-                        w.db.set_edge_property(
+                        w.poser_arete(
                             a,
                             "created_at",
                             Value::from(Utc::now().to_rfc3339()),
@@ -1515,15 +1498,15 @@ impl ChatStore for ObrainGraphStore {
                 let task_final = task_id.or_else(|| ancien.as_ref().and_then(|p| p.task_id));
                 if let Some(t) = &type_final {
                     w.etape()?;
-                    w.db.set_edge_property(arete, "type", Value::from(t.clone()));
+                    w.poser_arete(arete, "type", Value::from(t.clone()));
                 }
                 if let Some(r) = run_final {
                     w.etape()?;
-                    w.db.set_edge_property(arete, "run_id", Value::from(r.to_string()));
+                    w.poser_arete(arete, "run_id", Value::from(r.to_string()));
                 }
                 if let Some(k) = task_final {
                     w.etape()?;
-                    w.db.set_edge_property(arete, "task_id", Value::from(k.to_string()));
+                    w.poser_arete(arete, "task_id", Value::from(k.to_string()));
                 }
                 w.rendre_durable()?;
                 let parentage = Parentage {
@@ -1696,39 +1679,31 @@ impl ChatStore for ObrainGraphStore {
                     return Ok(None);
                 };
                 let noeud = ancienne.noeud;
-                w.flush_complet = preview
-                    .as_ref()
-                    .is_some_and(|p| p.len() > SEUIL_COLONNE_BLOB)
-                    || ancienne
-                        .session
-                        .preview
-                        .as_ref()
-                        .is_some_and(|p| p.len() > SEUIL_COLONNE_BLOB);
                 w.etape()?;
-                w.db.set_node_property(noeud, "updated_at", Value::from(Utc::now().to_rfc3339()));
+                w.poser(noeud, "updated_at", Value::from(Utc::now().to_rfc3339()));
                 if let Some(v) = cli_session_id {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "cli_session_id", Value::from(v));
+                    w.poser(noeud, "cli_session_id", Value::from(v));
                 }
                 if let Some(v) = title {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "title", Value::from(v));
+                    w.poser(noeud, "title", Value::from(v));
                 }
                 if let Some(v) = message_count {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "message_count", Value::from(v));
+                    w.poser(noeud, "message_count", Value::from(v));
                 }
                 if let Some(v) = total_cost_usd.filter(|v| v.is_finite()) {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "total_cost_usd", Value::from(v));
+                    w.poser(noeud, "total_cost_usd", Value::from(v));
                 }
                 if let Some(v) = conversation_id {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "conversation_id", Value::from(v));
+                    w.poser(noeud, "conversation_id", Value::from(v));
                 }
                 if let Some(v) = preview {
                     w.etape()?;
-                    w.db.set_node_property(noeud, "preview", Value::from(v));
+                    w.poser(noeud, "preview", Value::from(v));
                 }
                 let entree = Self::relire_session(w, &ancienne)?;
                 w.rendre_durable()?;
@@ -1786,8 +1761,8 @@ impl ChatStore for ObrainGraphStore {
                     return Ok(false);
                 }
                 w.etape()?;
-                w.db.set_node_property(ancienne.noeud, "project_slug", Value::from(slug.clone()));
-                w.db.set_node_property(
+                w.poser(ancienne.noeud, "project_slug", Value::from(slug.clone()));
+                w.poser(
                     ancienne.noeud,
                     "updated_at",
                     Value::from(Utc::now().to_rfc3339()),
@@ -1822,7 +1797,7 @@ impl ChatStore for ObrainGraphStore {
                     .unwrap_or(0.0);
                 let total = ancien + delta;
                 w.etape()?;
-                w.db.set_node_property(noeud, "children_cost_usd", Value::from(total));
+                w.poser(noeud, "children_cost_usd", Value::from(total));
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 if let Some(e) = etat.chat.sessions.get_mut(&id) {
@@ -2076,7 +2051,6 @@ impl ChatStore for ObrainGraphStore {
                     .reglages
                     .get(&(s.clone(), k.clone()))
                     .map(|e| e.noeud);
-                w.flush_complet = v.len() > SEUIL_COLONNE_BLOB;
                 let valeur = vec![
                     ("value", Value::from(v.clone())),
                     ("updated_at", Value::from(Utc::now().to_rfc3339())),
@@ -2197,7 +2171,6 @@ impl ChatStore for ObrainGraphStore {
                 let Some(noeud) = Self::noeud_session(w, id)? else {
                     return Ok(());
                 };
-                w.flush_complet = fp.len() > SEUIL_COLONNE_BLOB;
                 let maintenant = Utc::now();
                 poser(
                     w,
@@ -2238,7 +2211,7 @@ impl ChatStore for ObrainGraphStore {
                     return Ok(());
                 };
                 w.etape()?;
-                w.db.set_node_property(noeud, "shell_moved", Value::from(true));
+                w.poser(noeud, "shell_moved", Value::from(true));
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 if let Some(e) = etat.chat.sessions.get_mut(&id) {
@@ -2294,11 +2267,10 @@ impl ChatStore for ObrainGraphStore {
                     let Some(ancienne) = Self::entree_session_de(w, *sid)? else {
                         continue;
                     };
-                    w.flush_complet = preview.len() > SEUIL_COLONNE_BLOB;
                     w.etape()?;
-                    w.db.set_node_property(ancienne.noeud, "title", Value::from(title.clone()));
-                    w.db.set_node_property(ancienne.noeud, "preview", Value::from(preview.clone()));
-                    w.db.set_node_property(
+                    w.poser(ancienne.noeud, "title", Value::from(title.clone()));
+                    w.poser(ancienne.noeud, "preview", Value::from(preview.clone()));
+                    w.poser(
                         ancienne.noeud,
                         "updated_at",
                         Value::from(Utc::now().to_rfc3339()),
@@ -2478,7 +2450,7 @@ impl ChatStore for ObrainGraphStore {
                 // never two journal entries with the same `seq` (see module doc).
                 if change.event.is_some() {
                     w.etape()?;
-                    w.db.set_node_property(noeud_session, "anchor_seq", Value::from(seq as i64));
+                    w.poser(noeud_session, "anchor_seq", Value::from(seq as i64));
                 }
                 let mut noeud_ancre: Option<NodeId> = None;
                 if change.deleted {
@@ -3031,7 +3003,6 @@ impl ChatStore for ObrainGraphStore {
                     return Ok(false);
                 }
                 let existant = w.index()?.chat.episodes.get(&sid).map(|e| e.noeud);
-                w.flush_complet = payload.len() > SEUIL_COLONNE_BLOB;
                 let proprietes = vec![
                     ("id", Value::from(eid.to_string())),
                     ("project_id", Value::from(pid.to_string())),
@@ -3129,7 +3100,6 @@ impl ChatStore for ObrainGraphStore {
                         .segments
                         .get(&conversation)
                         .and_then(|m| m.get(&id).map(|e| e.noeud));
-                    w.flush_complet |= json.len() > SEUIL_COLONNE_BLOB;
                     let proprietes = vec![
                         ("conversation", Value::from(conversation.clone())),
                         ("id", Value::from(id.clone())),
@@ -3225,7 +3195,6 @@ impl ChatStore for ObrainGraphStore {
                         .frontieres
                         .get(&conversation)
                         .and_then(|m| m.get(&cle).map(|e| e.noeud));
-                    w.flush_complet |= json.len() > SEUIL_COLONNE_BLOB;
                     let proprietes = vec![
                         ("conversation", Value::from(conversation.clone())),
                         ("dimension", Value::from(frontiere.dimension.as_str())),
@@ -3841,11 +3810,16 @@ mod tests {
         {
             let db = &store.interne.db;
             let n = db.create_node(&[SEGMENT]);
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             db.set_node_property(n, "conversation", Value::from("conv"));
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             db.set_node_property(n, "id", Value::from("abime"));
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             db.set_node_property(n, "json", Value::from("{pas du json"));
             let f = db.create_node(&[FRONTIERE]);
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             db.set_node_property(f, "conversation", Value::from("conv"));
+            // hors-poser: test fixture writing a raw node on purpose (hostile or hand-made data)
             db.set_node_property(f, "dimension", Value::from("topic"));
         }
         store.close().await.unwrap();

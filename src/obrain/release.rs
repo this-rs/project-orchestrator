@@ -57,9 +57,8 @@
 //! at open and after each write, exactly like the projects (see `project.rs`).
 //!
 //! Writes go through the same `ecrire` as the projects: one WAL fsync per write, the
-//! full flush for a value in a blob column, the draft marker `_brouillon` removed
-//! last (a creation killed half-way is deleted at open), publication to the index
-//! only after the durability step.
+//! draft marker `_brouillon` removed last (a creation killed half-way is deleted at
+//! open), publication to the index only after the durability step.
 //!
 //! Costs: a get is a hash lookup; a list of a project's releases is O(k log k) in
 //! its releases k; `list_projects_filtered` is O(P log P) in the number of projects
@@ -80,7 +79,7 @@ use uuid::Uuid;
 
 #[cfg(any(test, feature = "mock-store"))]
 use super::Interruption;
-use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
+use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::neo4j::client::{pascal_to_snake_case, status_variants};
 use crate::neo4j::models::*;
 use crate::neo4j::traits::ReleaseStore;
@@ -618,43 +617,30 @@ fn props_jalon(j: &MilestoneNode) -> Vec<(&'static str, Value)> {
 }
 
 // ============================================================================
-// Writes: the draft marker, the blob rule, the publication
+// Writes: the draft marker and the publication
 // ============================================================================
 
-/// Does this value go to a blob column (a string above the threshold)? Such a
-/// value is not recovered by the WAL: see `mod.rs` (`SEUIL_COLONNE_BLOB`).
-fn valeur_en_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-}
-
-fn texte_en_blob(s: &str) -> bool {
-    s.len() > SEUIL_COLONNE_BLOB
-}
-
 /// Create a node with its properties, under the draft marker. The marker is removed
-/// last (the commit point). A value in a blob column is flushed fully before the
-/// marker goes (`Ecriture::rendre_durable_avant_le_marqueur`).
+/// last (the commit point).
 fn creer_noeud(
     w: &mut Ecriture<'_>,
     etiquette: &str,
     proprietes: Vec<(&'static str, Value)>,
 ) -> Result<NodeId> {
-    w.flush_complet = proprietes.iter().any(|(_, v)| valeur_en_blob(v));
     let noeud = w.db.create_node(&[etiquette]);
     #[cfg(any(test, feature = "mock-store"))]
     w.point(Interruption::ApresLeNoeud)?;
-    w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+    w.poser(noeud, BROUILLON, Value::from(true));
     #[cfg(any(test, feature = "mock-store"))]
     w.point(Interruption::ApresLeMarqueur)?;
     for (n, (cle, valeur)) in proprietes.into_iter().enumerate() {
-        w.db.set_node_property(noeud, cle, valeur);
+        w.poser(noeud, cle, valeur);
         #[cfg(any(test, feature = "mock-store"))]
         w.point(Interruption::ApresLaPropriete(n + 1))?;
         // Only the test hook reads the rank.
         #[cfg(not(any(test, feature = "mock-store")))]
         let _ = n;
     }
-    w.rendre_durable_avant_le_marqueur()?;
     #[cfg(any(test, feature = "mock-store"))]
     w.point(Interruption::AvantLeRetraitDuMarqueur)?;
     w.db.remove_node_property(noeud, BROUILLON);
@@ -663,61 +649,11 @@ fn creer_noeud(
     Ok(noeud)
 }
 
-/// Overwrite some properties of an existing node. `ancien_en_blob` says whether the
-/// value being replaced was itself in a blob column (its clearing is not in the WAL
-/// either).
-fn ecrire_champs(
-    w: &mut Ecriture<'_>,
-    noeud: NodeId,
-    ancien_en_blob: bool,
-    champs: Vec<(&'static str, Value)>,
-) {
-    w.flush_complet = ancien_en_blob || champs.iter().any(|(_, v)| valeur_en_blob(v));
+/// Overwrite some properties of an existing node.
+fn ecrire_champs(w: &mut Ecriture<'_>, noeud: NodeId, champs: Vec<(&'static str, Value)>) {
     for (cle, valeur) in champs {
-        w.db.set_node_property(noeud, cle, valeur);
+        w.poser(noeud, cle, valeur);
     }
-}
-
-fn blob_release(r: &ReleaseNode) -> bool {
-    [
-        Some(r.version.as_str()),
-        r.title.as_deref(),
-        r.description.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .any(texte_en_blob)
-}
-
-fn blob_environnement(e: &EnvironmentNode) -> bool {
-    [
-        Some(e.name.as_str()),
-        e.url.as_deref(),
-        e.description.as_deref(),
-        e.config.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .any(texte_en_blob)
-}
-
-fn blob_deploiement(d: &DeploymentNode) -> bool {
-    [
-        d.version.as_deref(),
-        d.commit_sha.as_deref(),
-        d.notes.as_deref(),
-        Some(d.created_by.as_str()),
-    ]
-    .into_iter()
-    .flatten()
-    .any(texte_en_blob)
-}
-
-fn blob_jalon(j: &MilestoneNode) -> bool {
-    [Some(j.title.as_str()), j.description.as_deref()]
-        .into_iter()
-        .flatten()
-        .any(texte_en_blob)
 }
 
 // ============================================================================
@@ -802,7 +738,6 @@ impl ObrainGraphStore {
         champs: Vec<(&'static str, Value)>,
         lecture: fn(&IndexReleases) -> &HashMap<Uuid, Entree<T>>,
         acces: fn(&mut IndexReleases) -> &mut HashMap<Uuid, Entree<T>>,
-        blob: fn(&T) -> bool,
         decodeur: fn(Lecture<'_>) -> Result<T>,
     ) -> Result<()> {
         if champs.is_empty() {
@@ -811,14 +746,14 @@ impl ObrainGraphStore {
         self.ecrire(
             || (),
             move |(), w: &mut Ecriture<'_>| {
-                let (noeud, ancien_blob) = {
+                let noeud = {
                     let etat = w.index()?;
                     let Some(e) = lecture(&etat.releases).get(&id) else {
                         return Ok(());
                     };
-                    (e.noeud, blob(&e.valeur))
+                    e.noeud
                 };
-                ecrire_champs(w, noeud, ancien_blob, champs);
+                ecrire_champs(w, noeud, champs);
                 let valeur = w.apres_ecriture(relire(w.db, noeud, decodeur))?;
                 w.rendre_durable()?;
                 acces(&mut w.index_mut()?.releases).insert(id, Entree { noeud, valeur });
@@ -924,7 +859,6 @@ impl ReleaseStore for ObrainGraphStore {
             champs,
             |i| &i.releases,
             |i| &mut i.releases,
-            blob_release,
             lire_release,
         )
         .await
@@ -1143,7 +1077,6 @@ impl ReleaseStore for ObrainGraphStore {
             champs,
             |i| &i.environnements,
             |i| &mut i.environnements,
-            blob_environnement,
             lire_environnement,
         )
         .await
@@ -1186,7 +1119,7 @@ impl ReleaseStore for ObrainGraphStore {
                 noeuds.push(noeud);
                 let quoi = format!("suppression de l'environnement {id}");
                 w.verifier_vivants(&noeuds, &quoi)?;
-                w.db.set_node_property(noeud, SUPPRESSION, Value::from(true));
+                w.poser(noeud, SUPPRESSION, Value::from(true));
                 w.etape()?;
                 // Past the marker, a failure leaves a deletion that the next open
                 // finishes: what the base holds is no longer what the index serves.
@@ -1312,7 +1245,6 @@ impl ReleaseStore for ObrainGraphStore {
             champs,
             |i| &i.deploiements,
             |i| &mut i.deploiements,
-            blob_deploiement,
             lire_deploiement,
         )
         .await
@@ -1458,15 +1390,8 @@ impl ReleaseStore for ObrainGraphStore {
         if let Some(d) = description {
             champs.push(("description", Value::from(d)));
         }
-        self.modifier_entite(
-            id,
-            champs,
-            |i| &i.jalons,
-            |i| &mut i.jalons,
-            blob_jalon,
-            lire_jalon,
-        )
-        .await
+        self.modifier_entite(id, champs, |i| &i.jalons, |i| &mut i.jalons, lire_jalon)
+            .await
     }
 
     async fn delete_milestone(&self, milestone_id: Uuid) -> Result<()> {

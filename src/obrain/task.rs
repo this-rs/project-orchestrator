@@ -115,9 +115,7 @@ use obrain_core::graph::Direction;
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
-use super::{
-    plan, step, Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB,
-};
+use super::{plan, step, Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::neo4j::models::*;
 use crate::neo4j::plan::{compute_waves_from_graph, WaveComputationResult};
 use crate::plan::models::{TaskDetails, UpdateTaskRequest};
@@ -205,18 +203,6 @@ fn liste(v: &[String]) -> Value {
             .collect::<Vec<_>>()
             .into(),
     )
-}
-
-/// Does this value go to obrain's blob column (a string above
-/// [`SEUIL_COLONNE_BLOB`], or a list holding one)? Such a value is not recovered by
-/// the WAL: the write that carries it, or that replaces it, pays the full flush
-/// (`mod.rs`), as in `plan.rs` and `note.rs`.
-pub(super) fn va_en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-        || v.as_list().is_some_and(|l| {
-            l.iter()
-                .any(|e| e.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB))
-        })
 }
 
 /// A list property: absent reads empty (Neo4j's `unwrap_or_default`); anything
@@ -972,20 +958,10 @@ pub(super) fn poser(
     noeud: NodeId,
     champs: Vec<(&'static str, Option<Value>)>,
 ) -> Result<()> {
-    // The NEW value going to the blob column, or the OLD one it replaces or
-    // removes (clearing that slot is not recovered by the WAL either): the full
-    // flush runs before the write is acknowledged.
-    let ancien = lecteur(w.db, noeud, "indexé")?;
-    if champs.iter().any(|(cle, v)| {
-        v.as_ref().is_some_and(va_en_colonne_blob)
-            || ancien(cle).is_some_and(|o| va_en_colonne_blob(&o))
-    }) {
-        w.flush_complet = true;
-    }
     for (cle, valeur) in champs {
         w.etape()?;
         match valeur {
-            Some(v) => w.db.set_node_property(noeud, cle, v),
+            Some(v) => w.poser(noeud, cle, v),
             None => {
                 w.db.remove_node_property(noeud, cle);
             }
@@ -1002,14 +978,13 @@ pub(super) fn creer_sous_brouillon(
     proprietes: Vec<(&'static str, Value)>,
     parent: Option<(NodeId, &str)>,
 ) -> Result<NodeId> {
-    w.flush_complet = proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
     w.etape()?;
     let noeud = w.db.create_node(&[etiquette]);
     w.etape()?;
-    w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+    w.poser(noeud, BROUILLON, Value::from(true));
     for (cle, valeur) in proprietes {
         w.etape()?;
-        w.db.set_node_property(noeud, cle, valeur);
+        w.poser(noeud, cle, valeur);
     }
     if let Some((source, type_arete)) = parent {
         w.etape()?;
@@ -1017,7 +992,6 @@ pub(super) fn creer_sous_brouillon(
     }
     // A blob-sized value reaches the disk BEFORE the commit point: a crash before
     // the flush leaves a draft (deleted at open), never a node missing a value.
-    w.rendre_durable_avant_le_marqueur()?;
     w.etape()?;
     w.db.remove_node_property(noeud, BROUILLON);
     Ok(noeud)
@@ -1381,13 +1355,13 @@ impl ObrainGraphStore {
                 };
                 ecritures(w, |w| {
                     w.etape()?;
-                    w.db.set_node_property(noeud, SUPPRESSION, Value::from(true));
+                    w.poser(noeud, SUPPRESSION, Value::from(true));
                     // Each step is marked too BEFORE any edge goes: a step whose
                     // HAS_STEP is already gone is then still recognised at open as a
                     // deletion to finish, never an orphan to quarantine.
                     for s in &etapes {
                         w.etape()?;
-                        w.db.set_node_property(*s, SUPPRESSION, Value::from(true));
+                        w.poser(*s, SUPPRESSION, Value::from(true));
                     }
                     for s in etapes {
                         detacher(w, s)?;
@@ -1692,6 +1666,7 @@ impl ObrainGraphStore {
                     let mut inclus = Vec::new();
                     for (tache, cible, ordre) in cibles {
                         w.etape()?;
+                        // hors-poser: an edge whose only property is one small number (weight/order): never out of the WAL
                         let arete = w.db.create_edge_with_props(
                             noeud,
                             cible,
@@ -1747,6 +1722,7 @@ impl ObrainGraphStore {
                     let nouvelle = match cible {
                         Some(c) => {
                             w.etape()?;
+                            // hors-poser: an edge whose only property is one small number (weight/order): never out of the WAL
                             Some(w.db.create_edge_with_props(
                                 noeud,
                                 c,

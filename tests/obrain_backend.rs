@@ -104,8 +104,9 @@ mod with_the_feature {
         refusees_chat, refusees_code, refusees_commit, refusees_decision, refusees_featuregraph,
         refusees_note, refusees_persona, refusees_plan, refusees_planrun, refusees_protocolrun,
         refusees_release, refusees_sharing, refusees_skill, Creation, Durabilite, Interruption,
-        NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture, MARQUEUR_PO,
-        REFUS_ECRITS_A_LA_MAIN, SCHEMA_PO,
+        NonPorte, ObrainGraphStore, ObrainSearchStore, RapportOuverture,
+        FLUSH_COMPLET_APRES_OCTETS, MARQUEUR_PO, PLAFOND_WAL_OBRAIN, REFUS_ECRITS_A_LA_MAIN,
+        SCHEMA_PO,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -673,12 +674,12 @@ mod with_the_feature {
         ran("purge_mcp_tokens");
     }
 
-    /// A value past the blob threshold is not recovered by the WAL: the write
-    /// that carries it must run the full flush too (measured: lost after SIGKILL
-    /// otherwise, see `SEUIL_COLONNE_BLOB`). Observed through the engine's own
-    /// counter of fsyncs: a flush runs more of them than the WAL fsync alone.
+    /// A value past the blob threshold is journaled in the WAL with its value
+    /// (obrain #123), so the write that carries it must pay the SAME WAL fsync as
+    /// a short write — no full flush. Observed through the engine's own counter
+    /// of fsyncs: a full flush would run more of them than the WAL fsync alone.
     #[tokio::test]
-    async fn a_write_past_the_blob_threshold_pays_the_full_flush() {
+    async fn a_write_past_the_blob_threshold_pays_no_full_flush() {
         let store = temporary(Durabilite::Wal).await;
         let fsyncs = || store.fsyncs_du_wal().unwrap();
         let mut small = a_project("small");
@@ -692,10 +693,134 @@ mod with_the_feature {
         store.create_project(&big).await.unwrap();
         let big_cost = fsyncs() - t1;
         assert!(small_cost >= 1, "256 bytes: the WAL fsync ran");
-        assert!(
-            big_cost > small_cost,
-            "257 bytes: the full flush too ({big_cost} fsyncs against {small_cost})"
+        assert_eq!(
+            big_cost, small_cost,
+            "257 bytes must cost only the WAL fsync, not a full flush ({big_cost} against {small_cost})"
         );
+    }
+
+    /// A value obrain's WAL does not journal (a blob longer than its
+    /// `BLOB_WAL_MAX_BYTES`) pays ONE full flush, at the single pass point of a
+    /// property write — whichever domain writes it — and a value at the cap pays
+    /// none. Whether the value then survives a kill is
+    /// `kill9_after_a_value_past_obrain_s_wal_cap_keeps_it`.
+    #[tokio::test]
+    async fn a_value_past_obrain_s_wal_cap_pays_one_full_flush_and_one_at_the_cap_none() {
+        use project_orchestrator::notes::{Note, NoteType};
+        let store = temporary(Durabilite::Wal).await;
+        let p = a_project("cap");
+        store.create_project(&p).await.unwrap();
+        let f0 = store.flushs_complets();
+        // One type byte, then the bytes: `PLAFOND_WAL_OBRAIN - 1` bytes is AT the cap.
+        let au_plafond = "a".repeat(PLAFOND_WAL_OBRAIN - 1);
+        store
+            .update_project(p.id, None, Some(Some(au_plafond)), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.flushs_complets(),
+            f0,
+            "a journaled value: no full flush"
+        );
+        let au_dela = "E".repeat(PLAFOND_WAL_OBRAIN + 1);
+        store
+            .update_project(p.id, None, Some(Some(au_dela.clone())), None, None)
+            .await
+            .unwrap();
+        assert_eq!(store.flushs_complets(), f0 + 1, "32 MiB + 1 in a project");
+        let n = Note::new(Some(p.id), NoteType::Tip, au_dela, "cap".into());
+        store.create_note(&n).await.unwrap();
+        assert_eq!(store.flushs_complets(), f0 + 2, "32 MiB + 1 in a note");
+        store
+            .update_project(p.id, None, Some(Some("court".into())), None, None)
+            .await
+            .unwrap();
+        assert_eq!(store.flushs_complets(), f0 + 2, "a short value after: none");
+    }
+
+    /// [`FLUSH_COMPLET_TOUS_LES`] counts writes; a full flush also runs once
+    /// [`FLUSH_COMPLET_APRES_OCTETS`] bytes of values have been written since the
+    /// last one, and the count starts again from there.
+    #[tokio::test]
+    async fn a_full_flush_also_runs_once_enough_bytes_were_written_since_the_last_one() {
+        assert_eq!(FLUSH_COMPLET_APRES_OCTETS, 64 * 1024 * 1024);
+        let store = temporary(Durabilite::Wal).await;
+        let p = a_project("bytes");
+        store.create_project(&p).await.unwrap();
+        let f0 = store.flushs_complets();
+        // 30 MiB each: journaled (under the cap), and the third crosses 64 MiB.
+        let trente = 30 * 1024 * 1024;
+        let mut apres = Vec::new();
+        for c in ['a', 'b', 'c', 'd'] {
+            store
+                .update_project(
+                    p.id,
+                    None,
+                    Some(Some(c.to_string().repeat(trente))),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            apres.push(store.flushs_complets() - f0);
+        }
+        assert_eq!(
+            apres,
+            vec![0, 0, 1, 1],
+            "full flushes after each 30 MiB write: none until 64 MiB, one, then none"
+        );
+    }
+
+    /// The value past the cap is made durable before the write is acknowledged: a
+    /// child creates a project with a 32 MiB + 1 description and updates another
+    /// one to such a value, says so, and is killed with SIGKILL; the reopen (no
+    /// close, no flush by the child) reads both back whole.
+    #[tokio::test]
+    async fn kill9_after_a_value_past_obrain_s_wal_cap_keeps_it() {
+        let longueur = PLAFOND_WAL_OBRAIN + 1;
+        if let Ok(dir) = std::env::var(ENV_PLAFOND) {
+            let dir = std::path::PathBuf::from(dir);
+            let store = open(&dir.join("base")).await;
+            let mut a = a_project("created past the cap");
+            a.description = Some("A".repeat(longueur));
+            store.create_project(&a).await.unwrap();
+            let b = a_project("updated past the cap");
+            store.create_project(&b).await.unwrap();
+            store
+                .update_project(b.id, None, Some(Some("B".repeat(longueur))), None, None)
+                .await
+                .unwrap();
+            std::fs::write(dir.join("pret.tmp"), format!("{}\t{}", a.id, b.id)).unwrap();
+            std::fs::rename(dir.join("pret.tmp"), dir.join("pret")).unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = lancer_enfant(
+            "with_the_feature::kill9_after_a_value_past_obrain_s_wal_cap_keeps_it",
+            ENV_PLAFOND,
+            dir.path(),
+            &[],
+        );
+        attendre(&dir.path().join("pret"), "its marker").await;
+        child.kill().unwrap(); // SIGKILL: no close, no flush
+        child.wait().unwrap();
+        let ids = std::fs::read_to_string(dir.path().join("pret")).unwrap();
+        let (a, b) = ids.split_once('\t').unwrap();
+        let (a, b): (Uuid, Uuid) = (a.parse().unwrap(), b.parse().unwrap());
+
+        let store = open(&dir.path().join("base")).await;
+        for (id, c) in [(a, 'A'), (b, 'B')] {
+            let d = store.get_project(id).await.unwrap().unwrap().description;
+            let d = d.unwrap_or_default();
+            assert!(
+                d.len() == longueur && d.chars().all(|x| x == c),
+                "project {c}: the acknowledged 32 MiB + 1 description must survive the kill \
+                 (read {} bytes)",
+                d.len()
+            );
+        }
     }
 
     /// If the fsync fails, the write is applied in memory and the disk is in an
@@ -875,6 +1000,7 @@ mod with_the_feature {
 
     const ENV_VERROU: &str = "OBRAIN_PO_TEST_ENFANT_VERROU";
     const ENV_KILL9: &str = "OBRAIN_PO_TEST_ENFANT_KILL9";
+    const ENV_PLAFOND: &str = "OBRAIN_PO_TEST_ENFANT_PLAFOND";
 
     fn lancer_enfant(
         cas: &str,
@@ -956,7 +1082,12 @@ mod with_the_feature {
     ///
     /// - `wal` (production durability): every project the child ACKNOWLEDGED is
     ///   there, whole, after the kill — long descriptions (blob column) and short
-    ///   ones alike;
+    ///   ones alike. The child also creates a note per project and then UPDATES
+    ///   acknowledged projects and notes, each one twice: long → short → long, or
+    ///   short → long → short. Every acknowledged update reads back after the kill,
+    ///   on a reopen with no close in between (so from the WAL replay, not from a
+    ///   full flush): an update that was in flight may read old or new, nothing
+    ///   else;
     /// - `aucune` (no fsync, no flush: the child is mostly INSIDE a creation when
     ///   the kill lands): nothing acknowledged is promised, but the base must
     ///   reopen, repair what was interrupted, quarantine nothing, and list.
@@ -965,6 +1096,7 @@ mod with_the_feature {
     /// does is obrain's guarantee.
     #[tokio::test]
     async fn kill9_during_creations_loses_no_acknowledged_project_and_never_blocks_the_reopen() {
+        use project_orchestrator::notes::{Note, NoteType};
         if let Ok(dir) = std::env::var(ENV_KILL9) {
             let dir = std::path::PathBuf::from(dir);
             let mode = std::env::var("OBRAIN_PO_TEST_ENFANT_MODE").unwrap();
@@ -987,15 +1119,54 @@ mod with_the_feature {
                 .append(true)
                 .open(dir.join(format!("acquittes-{mode}")))
                 .unwrap();
+            let mut maj = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(format!("maj-{mode}")))
+                .unwrap();
+            // What the `wal` child updates: (kind, id, long now, version).
+            let mut cibles: Vec<(&str, Uuid, bool, u32)> = Vec::new();
             let mut i = 0u32;
             loop {
+                use std::io::Write as _;
                 let mut p = a_project("kill9");
                 p.name = format!("kill9 {}", p.id);
                 p.description = Some(description_du_test(p.id, i, mode == "wal"));
+                let long = p.description.as_ref().unwrap().len() > 256;
                 i += 1;
                 store.create_project(&p).await.unwrap();
-                use std::io::Write as _;
                 writeln!(log, "{}\t{}", p.id, i - 1).unwrap();
+                if mode != "wal" {
+                    continue;
+                }
+                let mut n = Note::new(Some(p.id), NoteType::Tip, String::new(), "kill9".into());
+                let note_longue = i.is_multiple_of(2);
+                n.content = valeur_maj(n.id, 0, note_longue);
+                store.create_note(&n).await.unwrap();
+                writeln!(maj, "ack\tnote\t{}\t0\t{note_longue}", n.id).unwrap();
+                // The two targets of the previous round flip a first time, the two of
+                // the round before a second time (back to what they were created with).
+                for c in cibles.iter_mut().rev().take(4) {
+                    let (genre, id) = (c.0, c.1);
+                    let (k, long) = (c.3 + 1, !c.2);
+                    let v = valeur_maj(id, k, long);
+                    writeln!(maj, "intent\t{genre}\t{id}\t{k}\t{long}").unwrap();
+                    if genre == "projet" {
+                        store
+                            .update_project(id, None, Some(Some(v)), None, None)
+                            .await
+                            .unwrap();
+                    } else {
+                        store
+                            .update_note(id, Some(v), None, None, None, None)
+                            .await
+                            .unwrap();
+                    }
+                    writeln!(maj, "ack\t{genre}\t{id}\t{k}\t{long}").unwrap();
+                    (c.2, c.3) = (long, k);
+                }
+                cibles.push(("projet", p.id, long, 0));
+                cibles.push(("note", n.id, note_longue, 0));
             }
         }
 
@@ -1004,11 +1175,15 @@ mod with_the_feature {
         let base = dir.path().join("base");
         let (mut repares, mut quarantaine) = (RapportOuverture::default(), 0usize);
         let (mut vus_wal, mut longues) = (0usize, 0usize);
+        // Acknowledged updates checked right after a kill, by direction.
+        let (mut long_vers_court, mut court_vers_long) = (0usize, 0usize);
         for tour in 0..TOURS {
             let mode = if tour % 2 == 0 { "wal" } else { "aucune" };
             let acquittes = dir.path().join(format!("acquittes-{mode}"));
             let compte = || std::fs::read_to_string(&acquittes).map_or(0, |s| s.lines().count());
             let avant = compte();
+            // Where this round's updates start in the update log.
+            let debut_maj = std::fs::metadata(dir.path().join("maj-wal")).map_or(0, |m| m.len());
             let mut child = lancer_enfant(
                 "with_the_feature::kill9_during_creations_loses_no_acknowledged_project_and_never_blocks_the_reopen",
                 ENV_KILL9,
@@ -1044,6 +1219,13 @@ mod with_the_feature {
             );
 
             if mode == "wal" {
+                // Each value the child wrote and acknowledged — a project's
+                // description from its creation, then each acknowledged update, and a
+                // note's content likewise — or, for the one write the kill may have
+                // cut, the value that write carried. Read on this reopen, with no
+                // close in between: what the WAL replay gives back.
+                let mut etat: std::collections::HashMap<(&str, Uuid), MajVue> =
+                    std::collections::HashMap::new();
                 let log = std::fs::read_to_string(&acquittes).unwrap();
                 for ligne in log.lines() {
                     let (id, i) = ligne.split_once('\t').unwrap();
@@ -1053,15 +1235,89 @@ mod with_the_feature {
                     });
                     assert_eq!(p.name, format!("kill9 {id}"));
                     assert_eq!(p.slug, format!("obrain-{id}"));
-                    let attendue = description_du_test(id, i, true);
-                    longues += usize::from(attendue.len() > 256);
-                    assert_eq!(
-                        p.description.as_deref(),
-                        Some(attendue.as_str()),
-                        "round {tour}: description of {id} ({} bytes) must survive the kill",
-                        attendue.len()
+                    let creation = description_du_test(id, i, true);
+                    longues += usize::from(creation.len() > 256);
+                    let long = creation.len() > 256;
+                    etat.insert(
+                        ("projet", id),
+                        MajVue {
+                            acquitte: Some((creation, long)),
+                            ..MajVue::default()
+                        },
                     );
                     vus_wal += 1;
+                }
+                let maj = std::fs::read_to_string(dir.path().join("maj-wal")).unwrap_or_default();
+                let mut position = 0u64;
+                for ligne in maj.lines() {
+                    let ce_tour = position >= debut_maj;
+                    position += ligne.len() as u64 + 1;
+                    let champs: Vec<&str> = ligne.split('\t').collect();
+                    let [quoi, genre, id, k, long] = champs[..] else {
+                        continue; // a line the kill cut
+                    };
+                    let (Ok(id), Ok(k), Ok(long)) = (id.parse::<Uuid>(), k.parse(), long.parse())
+                    else {
+                        continue;
+                    };
+                    let genre = if genre == "projet" { "projet" } else { "note" };
+                    let valeur = valeur_maj(id, k, long);
+                    let e = etat.entry((genre, id)).or_default();
+                    match quoi {
+                        "intent" => e.en_vol = Some(valeur),
+                        "ack" => {
+                            e.sens = e
+                                .acquitte
+                                .as_ref()
+                                .map(|(_, avant)| (*avant, long, ce_tour));
+                            e.acquitte = Some((valeur, long));
+                            e.en_vol = None;
+                        }
+                        _ => {}
+                    }
+                }
+                for ((genre, id), vue) in &etat {
+                    // Nothing acknowledged (a note whose creation the kill cut): nothing
+                    // promised.
+                    let Some((acquittee, _)) = &vue.acquitte else {
+                        continue;
+                    };
+                    let actuelle = if *genre == "projet" {
+                        store
+                            .get_project(*id)
+                            .await
+                            .unwrap()
+                            .and_then(|p| p.description)
+                    } else {
+                        store.get_note(*id).await.unwrap().map(|n| n.content)
+                    };
+                    let actuelle = actuelle.unwrap_or_else(|| {
+                        panic!(
+                            "round {tour}: acknowledged {genre} {id} lost its value after the kill"
+                        )
+                    });
+                    let permises: Vec<&String> = std::iter::once(acquittee)
+                        .chain(vue.en_vol.as_ref())
+                        .collect();
+                    assert!(
+                        permises.contains(&&actuelle),
+                        "round {tour}: {genre} {id} reads {} bytes ({}…), not its acknowledged \
+                         value ({} bytes{})",
+                        actuelle.len(),
+                        actuelle.chars().take(60).collect::<String>(),
+                        acquittee.len(),
+                        vue.en_vol.as_ref().map_or(String::new(), |v| format!(
+                            ", or the in-flight {} bytes",
+                            v.len()
+                        ))
+                    );
+                    // Counted when the value just checked came from an update
+                    // acknowledged in THIS round.
+                    match vue.sens {
+                        Some((true, false, true)) => long_vers_court += 1,
+                        Some((false, true, true)) => court_vers_long += 1,
+                        _ => {}
+                    }
                 }
             }
             // Whatever the round was, every project the base lists is WHOLE: a creation
@@ -1090,6 +1346,11 @@ mod with_the_feature {
         }
         assert!(vus_wal >= 30, "the child made progress ({vus_wal} checks)");
         assert!(longues > 0, "long descriptions were part of the check");
+        assert!(
+            long_vers_court > 0 && court_vers_long > 0,
+            "acknowledged updates in both directions were checked after a kill \
+             ({long_vers_court} long → short, {court_vers_long} short → long)"
+        );
         // At least one kill landed inside a creation and its draft was found and
         // deleted: without this, a run where every kill fell between two creations
         // would prove nothing about the marker. (The exact step of each kill is
@@ -1100,8 +1361,9 @@ mod with_the_feature {
         );
         eprintln!(
             "kill -9 over {TOURS} rounds: {vus_wal} acknowledged-project checks ({longues} with a \
-             description past the blob threshold); at open: {} interrupted creations deleted, {} \
-             torn paths repaired, {quarantaine} quarantined",
+             description past the blob threshold), acknowledged updates checked: \
+             {long_vers_court} long → short, {court_vers_long} short → long; at open: {} \
+             interrupted creations deleted, {} torn paths repaired, {quarantaine} quarantined",
             repares.brouillons_supprimes, repares.chemins_repares
         );
     }
@@ -1211,13 +1473,39 @@ mod with_the_feature {
         assert!(vus >= 20, "the child made progress ({vus} checks)");
     }
 
+    /// What the `wal` child of the kill -9 test logged about one updated value.
+    #[derive(Default)]
+    struct MajVue {
+        /// The last acknowledged value, and whether it is long.
+        acquitte: Option<(String, bool)>,
+        /// The value of a write logged as started and never acknowledged (the kill
+        /// cut it).
+        en_vol: Option<String>,
+        /// The change that produced the last acknowledged value: (was long, is
+        /// long, acknowledged in the round being checked).
+        sens: Option<(bool, bool, bool)>,
+    }
+
+    /// The value of version `k` of an updated description or note content: long
+    /// (multi-byte, well past the 256-byte blob threshold) or short.
+    fn valeur_maj(id: Uuid, k: u32, long: bool) -> String {
+        if long {
+            format!("{id} maj{k} é-long ").repeat(20)
+        } else {
+            format!("short {id} maj{k}")
+        }
+    }
+
     /// Short, then long (multi-byte, past the 256-byte blob threshold), in turn. The
-    /// `aucune` rounds only ever write SHORT values: a blob-sized write that is never
-    /// flushed leaves an index row in the page cache pointing past the data the engine
-    /// recovers, and a LATER write reuses that space — the first project then reads
-    /// another project's description (measured, round 2 of this very test; an obrain
-    /// defect, see the PR). `aucune` rounds exist to be killed inside a creation, not
-    /// to exercise that.
+    /// `aucune` rounds only ever write SHORT values. Measured on obrain `c4b6ada9`
+    /// (round 2 of this very test): a blob-sized write never flushed left an index
+    /// row pointing past the data the engine recovered, a LATER write reused that
+    /// space, and the first project read another project's description — obrain
+    /// issue #120, fixed by obrain #123 (the value is journaled in the WAL with its
+    /// bytes and replayed), which the `wal` rounds exercise. An `aucune` round runs
+    /// no fsync at all, so it is promised nothing about a blob value; it exists to
+    /// be killed inside a creation, and keeping its values short keeps it about the
+    /// draft marker.
     fn description_du_test(id: Uuid, i: u32, avec_blob: bool) -> String {
         if !avec_blob || i.is_multiple_of(3) {
             format!("short {id}")
@@ -1491,7 +1779,10 @@ mod with_the_feature {
             store.create_project(&witness).await.unwrap();
 
             let mut p = a_project("interrupted");
-            // Past the blob threshold: the full flush before the marker is exercised too.
+            // Past the blob threshold: the value goes to a blob column (and its
+            // `BlobColumnWrite` frame), so each interruption point also leaves a
+            // half-written blob for the reopen to cope with. No full flush runs here
+            // (the base is closed below, which flushes).
             p.description = Some("é-long ".repeat(60));
             store.interrompre_au_prochain(point);
             let err = store.create_project(&p).await.unwrap_err();
@@ -3101,36 +3392,6 @@ mod with_the_feature {
         store.delete_decision(Uuid::new_v4()).await.unwrap();
     }
 
-    /// An update that puts a `chosen_option` above the blob threshold, or replaces
-    /// one that sat there, pays the FULL flush: counted in fsyncs, with no
-    /// `close()` (the WAL alone does not recover such a value).
-    #[tokio::test]
-    async fn a_long_chosen_option_pays_the_full_flush_without_close() {
-        use project_orchestrator::neo4j::traits::DecisionStore;
-        let store = temporary(Durabilite::Wal).await;
-        let fsyncs = || store.fsyncs_du_wal().unwrap();
-        let d = a_decision("courte");
-        store.create_decision_global(&d, None).await.unwrap();
-        let mut cout = Vec::new();
-        for option in ["a".to_string(), "x".repeat(300), "b".to_string()] {
-            let t = fsyncs();
-            store
-                .update_decision(d.id, None, None, Some(option), None)
-                .await
-                .unwrap();
-            cout.push(fsyncs() - t);
-        }
-        let [court, long, remplace] = cout[..] else {
-            unreachable!()
-        };
-        assert!(court >= 1, "the WAL fsync ran");
-        assert!(long > court, "long chosen_option: {long} against {court}");
-        assert!(
-            remplace > court,
-            "long chosen_option replaced: {remplace} against {court}"
-        );
-    }
-
     /// `supersede_decision` crashed after its k-th engine write (status, edge,
     /// `created_at`): the retry converges to ONE edge that carries its `created_at`.
     #[tokio::test]
@@ -4182,8 +4443,15 @@ mod with_the_feature {
     /// Files whose path and hash go to a blob column (> 256 bytes), written then
     /// REPLACED by a short hash, with the child killed by SIGKILL — no `close()`, so no
     /// final flush hides a missing one. Every file the child acknowledged is there after
-    /// the kill, with the last hash it acknowledged: the writer pays the full flush for
-    /// a blob-sized value AND for the replacement of one (as `project.rs` / `plan.rs`).
+    /// the kill, with the last hash it acknowledged OR the hash of the write begun after
+    /// it (its commit may be crossed before the kill) — never an older one, never none.
+    ///
+    /// What this test does NOT prove: the engine's blob → inline replacement window
+    /// (obrain#172, fixed by obrain#175). The kill lands at a random instant, and this
+    /// test passes 10/10 on the pin before the fix (d9ddd1e9) as on the fix itself. The
+    /// deterministic guard of that window lives in the engine:
+    /// `crates/obrain-engine/tests/remplacement_blob_kill9.rs` (crash points, 20/20 red
+    /// without the fix, 20/20 green with it). This test guards PO's own write protocol.
     #[tokio::test]
     async fn kill9_during_file_writes_loses_no_acknowledged_blob_sized_file() {
         if let Ok(dir) = std::env::var(ENV_KILL9_FICHIERS) {
@@ -4204,6 +4472,15 @@ mod with_the_feature {
                 .open(dir.join("acquittes"))
                 .unwrap();
             use std::io::Write as _;
+            // One `write` per line, so a kill can never cut a line in two. The journal
+            // carries the INTENT before each write and the ACKNOWLEDGEMENT after it: a
+            // durable value that is the write in flight is legitimate (the commit was
+            // crossed before the kill), a durable value OLDER than the last
+            // acknowledgement is a loss.
+            let mut note = |genre: &str, f: &FileNode| {
+                let ligne = format!("{genre}\t{}\t{}\n", f.path, f.hash);
+                log.write_all(ligne.as_bytes()).unwrap();
+            };
             loop {
                 let mut f = a_file(
                     &format!("src/{}/{}.rs", "d".repeat(300), Uuid::new_v4()),
@@ -4211,11 +4488,13 @@ mod with_the_feature {
                     None,
                 );
                 f.hash = format!("{}{}", "h".repeat(300), Uuid::new_v4());
+                note("intention", &f);
                 store.upsert_file(&f).await.unwrap();
-                writeln!(log, "{}\t{}", f.path, f.hash).unwrap();
+                note("acquitte", &f);
                 f.hash = format!("court-{}", Uuid::new_v4());
+                note("intention", &f);
                 store.upsert_file(&f).await.unwrap();
-                writeln!(log, "{}\t{}", f.path, f.hash).unwrap();
+                note("acquitte", &f);
             }
         }
 
@@ -4223,7 +4502,13 @@ mod with_the_feature {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
         let acquittes = dir.path().join("acquittes");
-        let compte = || std::fs::read_to_string(&acquittes).map_or(0, |s| s.lines().count());
+        // Only ACKNOWLEDGEMENT lines count as progress (each acknowledged write also leaves
+        // an intent line before it).
+        let compte = || {
+            std::fs::read_to_string(&acquittes).map_or(0, |s| {
+                s.lines().filter(|l| l.starts_with("acquitte\t")).count()
+            })
+        };
         let mut vus = 0usize;
         for tour in 0..TOURS {
             let avant = compte();
@@ -4254,22 +4539,44 @@ mod with_the_feature {
                 "round {tour}: a file write killed half-way is repaired, never quarantined: \
                  {rapport:?}"
             );
-            let mut derniers: std::collections::HashMap<String, String> = Default::default();
+            // path -> (last acknowledged hash, hash of a write begun after it, if any).
+            // A line without its three fields was cut by the kill: ignored.
+            let mut derniers: std::collections::HashMap<String, (Option<String>, Option<String>)> =
+                Default::default();
             for ligne in std::fs::read_to_string(&acquittes).unwrap().lines() {
-                let (path, hash) = ligne.split_once('\t').unwrap();
-                derniers.insert(path.to_string(), hash.to_string());
+                let champs: Vec<&str> = ligne.split('\t').collect();
+                let [genre, path, hash] = champs[..] else {
+                    continue;
+                };
+                let e = derniers.entry(path.to_string()).or_default();
+                match genre {
+                    "intention" => e.1 = Some(hash.to_string()),
+                    "acquitte" => {
+                        e.0 = Some(hash.to_string());
+                        e.1 = None;
+                    }
+                    _ => {}
+                }
             }
-            for (path, hash) in &derniers {
+            let mut controles = 0usize;
+            for (path, (acquitte, entame)) in &derniers {
+                let Some(acquitte) = acquitte else { continue };
                 let f =
                     store.get_file(path).await.unwrap().unwrap_or_else(|| {
                         panic!("round {tour}: acknowledged file {path} is gone")
                     });
-                assert_eq!(
-                    &f.hash, hash,
-                    "round {tour}: the last acknowledged hash of {path}"
+                // The durable value is the last acknowledged one, or the write begun
+                // after it (its commit was crossed before the kill). Never an older
+                // value, never nothing.
+                assert!(
+                    &f.hash == acquitte || entame.as_deref() == Some(f.hash.as_str()),
+                    "round {tour}: the durable hash of {path} is {:?}, neither the last \
+                     acknowledged {acquitte:?} nor the write begun after it {entame:?}",
+                    f.hash
                 );
+                controles += 1;
             }
-            vus = derniers.len();
+            vus = controles;
             store.close().await.unwrap();
         }
         assert!(vus >= 6, "files checked: {vus}");
@@ -5521,111 +5828,6 @@ mod with_the_feature {
         store.close().await.unwrap();
     }
 
-    /// A long value (> 256 bytes: a run's `state_json`, a trigger's `config`, an
-    /// event payload, an alert message, an external event's reason) goes to a blob
-    /// column the pinned WAL does not recover: the write pays the FULL flush before
-    /// it is acknowledged, and so does a write that REPLACES such a value. Counted
-    /// with obrain's own fsync oracle, without any `close()`.
-    #[tokio::test]
-    async fn long_values_of_triggers_and_runs_pay_the_full_flush() {
-        use project_orchestrator::events::trigger::EventTrigger;
-        use project_orchestrator::ingress::{ExternalEvent, IngressOutcome};
-        use project_orchestrator::neo4j::models::{AlertNode, AlertSeverity};
-        use project_orchestrator::runner::{RunnerState, TriggerSource};
-        let store = temporary(Durabilite::Wal).await;
-        let fsyncs = || store.fsyncs_du_wal().unwrap();
-        let plan = a_plan(None);
-        store.create_plan(&plan).await.unwrap();
-        let long = "x".repeat(300);
-
-        // The cost of a write with nothing long.
-        let t0 = fsyncs();
-        assert!(store
-            .claim_external_delivery(Uuid::new_v4(), "short")
-            .await
-            .unwrap());
-        let small = fsyncs() - t0;
-        assert!(small >= 1, "the WAL fsync ran");
-        let cost = |before: u64, what: &str| {
-            let c = fsyncs() - before;
-            assert!(
-                c > small,
-                "{what}: full flush expected ({c} fsyncs against {small})"
-            );
-        };
-
-        let mut run = RunnerState::new(Uuid::new_v4(), plan.id, 1, TriggerSource::Manual);
-        assert!(serde_json::to_string(&run).unwrap().len() > 256);
-        let t = fsyncs();
-        store.create_plan_run(&run).await.unwrap();
-        cost(t, "create_plan_run (state_json)");
-        run.current_wave = 1;
-        let t = fsyncs();
-        store.update_plan_run(&run).await.unwrap();
-        cost(t, "update_plan_run (state_json)");
-
-        let mut trigger = a_trigger(plan.id);
-        trigger.config = serde_json::json!({ "rule": long });
-        let t = fsyncs();
-        store.create_trigger(&trigger).await.unwrap();
-        cost(t, "create_trigger (config)");
-
-        let mut event_trigger = EventTrigger {
-            id: Uuid::new_v4(),
-            name: "e".into(),
-            protocol_id: Uuid::new_v4(),
-            entity_type_pattern: None,
-            action_pattern: None,
-            payload_conditions: Some(serde_json::json!({ "k": long })),
-            cooldown_secs: 0,
-            enabled: true,
-            project_scope: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        let t = fsyncs();
-        store.create_event_trigger(&event_trigger).await.unwrap();
-        cost(t, "create_event_trigger (payload_conditions)");
-        // The long value REPLACED by a short one: its old blob is rewritten too.
-        let t = fsyncs();
-        assert!(store
-            .update_event_trigger(
-                event_trigger.id,
-                None,
-                None,
-                None,
-                None,
-                Some(None),
-                None,
-                None
-            )
-            .await
-            .unwrap());
-        cost(t, "update_event_trigger replacing a long payload");
-        event_trigger.id = Uuid::new_v4();
-
-        let alert = AlertNode::new("long".into(), AlertSeverity::Info, long.clone(), None);
-        let t = fsyncs();
-        store.create_alert(&alert).await.unwrap();
-        cost(t, "create_alert (message)");
-
-        let event = ExternalEvent {
-            id: Uuid::new_v4(),
-            trigger_id: trigger.id,
-            source: "github".into(),
-            outcome: IngressOutcome::Rejected,
-            reason: Some(long.clone()),
-            delivery_id: None,
-            event_type: None,
-            action: None,
-            body_bytes: 0,
-            received_at: Utc::now(),
-        };
-        let t = fsyncs();
-        store.record_external_event(&event).await.unwrap();
-        cost(t, "record_external_event (reason)");
-    }
-
     // ------------------------------------------------------------------
     // Persona and feature graph (persona.rs, featuregraph.rs)
     // ------------------------------------------------------------------
@@ -5884,7 +6086,7 @@ mod with_the_feature {
 
         let store = open(&base).await;
         let rapport = store.rapport_d_ouverture().clone();
-        assert_eq!(rapport.en_quarantaine.len(), 2, "{rapport:?}");
+        assert_eq!(rapport.en_quarantaine.len(), 3, "{rapport:?}");
         assert_eq!(rapport.brouillons_supprimes, 0, "{rapport:?}");
         assert!(store.get_persona(bad_persona).await.unwrap().is_none());
         assert!(store.get_feature_graph(bad_graph).await.unwrap().is_none());
@@ -6347,89 +6549,6 @@ mod with_the_feature {
             assert!(store.get_persona(id).await.unwrap().is_none());
         }
         assert!(store.list_global_personas().await.unwrap().is_empty());
-    }
-
-    /// Every persona and feature-graph write that carries a value past the blob threshold
-    /// (a description, a system prompt, a JSON string) — or that replaces or removes one —
-    /// pays the full flush, before the commit point for a creation. Observed through the
-    /// engine's own fsync counter: no `close()` is involved, which would flush anyway.
-    #[tokio::test]
-    async fn persona_and_feature_graph_writes_past_the_blob_threshold_pay_the_full_flush() {
-        let store = temporary(Durabilite::Wal).await;
-        let p = a_project("blob");
-        store.create_project(&p).await.unwrap();
-        let long = "x".repeat(257);
-        // Every case is checked; the failures are reported together.
-        let mut manquants: Vec<String> = Vec::new();
-        macro_rules! cout {
-            ($e:expr) => {{
-                let t0 = store.fsyncs_du_wal().unwrap();
-                $e.await.unwrap();
-                store.fsyncs_du_wal().unwrap() - t0
-            }};
-        }
-        // Creations.
-        let court = cout!(store.create_persona(&a_persona(Some(p.id), "court", 0.5)));
-        assert!(court >= 1, "the WAL fsync ran");
-        let mut desc = a_persona(Some(p.id), "desc", 0.5);
-        desc.description = long.clone();
-        let mut prompt = a_persona(Some(p.id), "prompt", 0.5);
-        prompt.system_prompt_override = Some(long.clone());
-        let mut histoire = a_persona(Some(p.id), "histoire", 0.5);
-        histoire.energy_history = vec![0.123_456_789_012_345; 30];
-        for (cas, x) in [
-            ("description", &desc),
-            ("system prompt", &prompt),
-            ("JSON", &histoire),
-        ] {
-            let c = cout!(store.create_persona(x));
-            if c <= court {
-                manquants.push(format!(
-                    "create_persona with a long {cas}: {c} fsyncs against {court}"
-                ));
-            }
-        }
-        // Updates: a new long value, an old long value replaced, an old long value removed.
-        let mut u = a_persona(Some(p.id), "maj", 0.5);
-        store.create_persona(&u).await.unwrap();
-        let court_maj = cout!(store.update_persona(&u));
-        u.model_preference = Some(long.clone());
-        let c = cout!(store.update_persona(&u));
-        if c <= court_maj {
-            manquants.push(format!("new long value: {c} against {court_maj}"));
-        }
-        let mut d = desc.clone();
-        d.description = "court".into();
-        let c = cout!(store.update_persona(&d));
-        if c <= court_maj {
-            manquants.push(format!(
-                "old long description replaced: {c} against {court_maj}"
-            ));
-        }
-        let mut q = prompt.clone();
-        q.system_prompt_override = None;
-        let c = cout!(store.update_persona(&q));
-        if c <= court_maj {
-            manquants.push(format!("old long prompt removed: {c} against {court_maj}"));
-        }
-        // Feature graphs.
-        let court_fg = cout!(store.create_feature_graph(&a_feature_graph(p.id, "court")));
-        let mut g = a_feature_graph(p.id, "desc");
-        g.description = Some(long.clone());
-        let c = cout!(store.create_feature_graph(&g));
-        if c <= court_fg {
-            manquants.push(format!("long description: {c} against {court_fg}"));
-        }
-        let mut g = a_feature_graph(p.id, "rel");
-        g.include_relations = Some(vec!["IMPLEMENTS_TRAIT".to_string(); 20]);
-        let c = cout!(store.create_feature_graph(&g));
-        if c <= court_fg {
-            manquants.push(format!("long JSON: {c} against {court_fg}"));
-        }
-        assert!(manquants.is_empty(), "no full flush for: {manquants:#?}");
-        // The removal is applied.
-        let relu = store.get_persona(prompt.id).await.unwrap().unwrap();
-        assert_eq!(relu.system_prompt_override, None);
     }
 
     // ------------------------------------------------------------------
@@ -7210,154 +7329,6 @@ mod with_the_feature {
                 .map(|a| a.note.id)
                 .collect::<Vec<_>>(),
             [b.ok]
-        );
-    }
-
-    /// Tant qu'obrain ne journalise pas les valeurs en colonne blob (#1190), une
-    /// écriture de skill ou de partage qui porte une valeur > 256 o — ou qui en
-    /// REMPLACE une — paie le flush complet avant d'être acquittée. Mesuré par le
-    /// compteur de fsync du moteur, sans passer par `close()`.
-    async fn store_avec_projet() -> (ObrainGraphStore, ProjectNode) {
-        let store = temporary(Durabilite::Wal).await;
-        let p = a_project("blob");
-        store.create_project(&p).await.unwrap();
-        (store, p)
-    }
-
-    /// The fsyncs one write cost.
-    macro_rules! cout {
-        ($store:expr, $e:expr) => {{
-            let t0 = $store.fsyncs_du_wal().unwrap();
-            $e.await.unwrap();
-            $store.fsyncs_du_wal().unwrap() - t0
-        }};
-    }
-
-    fn un_evenement(
-        id: &str,
-        raison: String,
-    ) -> project_orchestrator::episodes::distill_models::SharingEvent {
-        use project_orchestrator::episodes::distill_models::{
-            PrivacyMode, SharingConsent, SharingEvent,
-        };
-        SharingEvent {
-            id: id.into(),
-            content_hash: "h".into(),
-            artifact_type: "note".into(),
-            action: "shared".into(),
-            source_did: "did:a".into(),
-            target_did: "broadcast".into(),
-            timestamp: Utc::now(),
-            consent: SharingConsent::NotSet,
-            privacy_mode: PrivacyMode::Standard,
-            reason: Some(raison),
-        }
-    }
-
-    fn une_tombe(
-        hash: &str,
-        raison: String,
-    ) -> project_orchestrator::reception::anchor::SignedTombstone {
-        project_orchestrator::reception::anchor::SignedTombstone {
-            content_hash: hash.into(),
-            issuer_did: "did:key:z".into(),
-            signature_hex: "ab".into(),
-            issued_at: Utc::now(),
-            reason: Some(raison),
-        }
-    }
-
-    #[tokio::test]
-    async fn create_skill_au_dela_du_seuil_paie_le_flush_complet() {
-        use project_orchestrator::skills::SkillNode;
-        let (store, p) = store_avec_projet().await;
-        let mut petit = SkillNode::new(Some(p.id), "petit");
-        petit.description = "x".repeat(256);
-        let mut grand = SkillNode::new(Some(p.id), "grand");
-        grand.description = "x".repeat(257);
-        let c_petit = cout!(store, store.create_skill(&petit));
-        let c_grand = cout!(store, store.create_skill(&grand));
-        assert!(c_grand > c_petit, "{c_grand} contre {c_petit}");
-    }
-
-    #[tokio::test]
-    async fn update_skill_qui_remplace_une_valeur_longue_paie_le_flush_complet() {
-        use project_orchestrator::skills::SkillNode;
-        let (store, p) = store_avec_projet().await;
-        let petit = SkillNode::new(Some(p.id), "petit");
-        let mut grand = SkillNode::new(Some(p.id), "grand");
-        grand.description = "x".repeat(257);
-        store.create_skill(&petit).await.unwrap();
-        store.create_skill(&grand).await.unwrap();
-        // The SAME small value written over a short one, and over a long one.
-        let mut a = petit.clone();
-        a.description = "y".into();
-        let mut b = grand.clone();
-        b.description = "y".into();
-        let c_petit = cout!(store, store.update_skill(&a));
-        let c_grand = cout!(store, store.update_skill(&b));
-        assert!(c_grand > c_petit, "{c_grand} contre {c_petit}");
-    }
-
-    #[tokio::test]
-    async fn create_sharing_event_au_dela_du_seuil_paie_le_flush_complet() {
-        let (store, _) = store_avec_projet().await;
-        let c_petit = cout!(
-            store,
-            store.create_sharing_event(&un_evenement("e-petit", "r".repeat(256)))
-        );
-        let c_grand = cout!(
-            store,
-            store.create_sharing_event(&un_evenement("e-grand", "r".repeat(257)))
-        );
-        assert!(c_grand > c_petit, "{c_grand} contre {c_petit}");
-    }
-
-    #[tokio::test]
-    async fn persist_tombstone_au_dela_du_seuil_et_son_remplacement_paient_le_flush_complet() {
-        let (store, _) = store_avec_projet().await;
-        let c_petit = cout!(
-            store,
-            store.persist_tombstone(&une_tombe("t-petit", "r".repeat(256)))
-        );
-        let c_grand = cout!(
-            store,
-            store.persist_tombstone(&une_tombe("t-grand", "r".repeat(257)))
-        );
-        assert!(c_grand > c_petit, "création : {c_grand} contre {c_petit}");
-        let c_petit = cout!(
-            store,
-            store.persist_tombstone(&une_tombe("t-petit", "court".into()))
-        );
-        let c_grand = cout!(
-            store,
-            store.persist_tombstone(&une_tombe("t-grand", "court".into()))
-        );
-        assert!(c_grand > c_petit, "MERGE : {c_grand} contre {c_petit}");
-    }
-
-    #[tokio::test]
-    async fn update_sharing_policy_au_dela_du_seuil_et_son_remplacement_paient_le_flush_complet() {
-        use project_orchestrator::episodes::distill_models::SharingPolicy;
-        let (store, p) = store_avec_projet().await;
-        let mut longue = SharingPolicy::default();
-        longue.type_overrides.insert(
-            "t".repeat(300),
-            serde_json::from_value(serde_json::json!("never")).unwrap(),
-        );
-        let c_petit = cout!(
-            store,
-            store.update_sharing_policy(p.id, &SharingPolicy::default())
-        );
-        let c_grand = cout!(store, store.update_sharing_policy(p.id, &longue));
-        assert!(c_grand > c_petit, "{c_grand} contre {c_petit}");
-        let c_remplace = cout!(
-            store,
-            store.update_sharing_policy(p.id, &SharingPolicy::default())
-        );
-        assert!(
-            c_remplace > c_petit,
-            "remplacement : {c_remplace} contre {c_petit}"
         );
     }
 }

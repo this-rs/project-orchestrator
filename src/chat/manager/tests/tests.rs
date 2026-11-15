@@ -2174,7 +2174,9 @@ async fn a_native_session_gets_the_nexus_tools_server_bounded_by_its_policy() {
     // Hermetic: the host's own credentials (mirrored when present) are not this test's subject.
     manager.host_home = None;
     let claims = crate::auth::jwt::Claims::service_account("nexus");
-    let add_dirs = vec!["/tmp/extra".to_string()];
+    let extra_dir = tempfile::tempdir().unwrap();
+    let extra_dir_str = extra_dir.path().display().to_string();
+    let add_dirs = vec![extra_dir_str.clone()];
     let spec_for = |kind: ProviderKind| {
         let manager = &manager;
         let claims = &claims;
@@ -2243,7 +2245,9 @@ async fn a_native_session_gets_the_nexus_tools_server_bounded_by_its_policy() {
             "{tool} must not be served: {tools:?}"
         );
     }
-    assert!(args.windows(2).any(|w| w == ["--add-dir", "/tmp/extra"]));
+    assert!(args
+        .windows(2)
+        .any(|w| w == ["--add-dir", extra_dir_str.as_str()]));
     assert!(
         !args.iter().any(|a| a.contains("eyJ")),
         "no token on the command line"

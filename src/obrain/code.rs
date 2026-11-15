@@ -48,9 +48,8 @@
 //!
 //! Writes follow the pattern of the other domains: one writer, the draft marker
 //! `_brouillon` removed last (a creation killed half-way is deleted at open, with its
-//! edge), one WAL fsync per call, a full flush BEFORE the marker is removed when a value
-//! goes to a blob column (see `SEUIL_COLONNE_BLOB`), publication to the index only
-//! after durability. A batch is ONE writer section and ONE fsync.
+//! edge), one WAL fsync per call (a value the WAL does not recover is flushed by
+//! `Ecriture::poser`, see `mod.rs`), publication to the index only after durability. A batch is ONE writer section and ONE fsync.
 //!
 //! # Differences with the Neo4j adapter (`src/neo4j/code.rs`), all named
 //!
@@ -418,17 +417,6 @@ fn relire(db: &ObrainDB, noeud: NodeId) -> Result<FileNode> {
     lire_fichier(&get)
 }
 
-/// Does this value go to a blob column (a string above the threshold)? Such a value
-/// is not recovered by the WAL: see `mod.rs` (`SEUIL_COLONNE_BLOB`).
-fn valeur_en_blob(v: &Value) -> bool {
-    v.as_str()
-        .is_some_and(|s| s.len() > super::SEUIL_COLONNE_BLOB)
-}
-
-fn fichier_en_blob(f: &FileNode) -> bool {
-    props_fichier(f).iter().any(|(_, v)| valeur_en_blob(v))
-}
-
 // ============================================================================
 // The store
 // ============================================================================
@@ -461,12 +449,12 @@ impl ObrainGraphStore {
                     // back: refused before anything is written.
                     etat.code
                         .refus_si_quarantaine(en_quarantaine, files.iter().map(|f| &f.path))?;
-                    let mut existants: HashMap<String, (NodeId, bool)> = HashMap::new();
+                    let mut existants: HashMap<String, NodeId> = HashMap::new();
                     let mut projets: HashMap<Uuid, NodeId> = HashMap::new();
                     let mut membres: HashSet<(Uuid, String)> = HashSet::new();
                     for f in &files {
                         if let Some(e) = etat.code.fichiers.get(&f.path) {
-                            existants.insert(f.path.clone(), (e.noeud, fichier_en_blob(&e.valeur)));
+                            existants.insert(f.path.clone(), e.noeud);
                         }
                         if let Some(p) = f.project_id {
                             if let Some(n) = etat.projets.noeud_de(p) {
@@ -489,23 +477,16 @@ impl ObrainGraphStore {
                 let mut crees: Vec<NodeId> = Vec::new();
                 let mut ajoutes: Vec<(Uuid, String)> = Vec::new();
                 let mut dernier: HashMap<String, FileNode> = HashMap::new();
-                let mut flush = false;
                 for f in &files {
-                    flush |= fichier_en_blob(f);
                     let noeud = match noeuds.get(&f.path).copied() {
                         Some(n) => n,
                         None => match existants.get(&f.path) {
-                            Some((n, ancien_en_blob)) => {
-                                // Replacing a value that was in a blob column clears that
-                                // slot, which the WAL does not recover either.
-                                flush |= *ancien_en_blob;
-                                *n
-                            }
+                            Some(n) => *n,
                             None => {
                                 w.etape()?;
                                 let n = w.db.create_node(&[ETIQUETTE_FICHIER]);
                                 w.etape()?;
-                                w.db.set_node_property(n, BROUILLON, Value::from(true));
+                                w.poser(n, BROUILLON, Value::from(true));
                                 crees.push(n);
                                 n
                             }
@@ -513,7 +494,7 @@ impl ObrainGraphStore {
                     };
                     for (cle, valeur) in props_fichier(f) {
                         w.etape()?;
-                        w.db.set_node_property(noeud, cle, valeur);
+                        w.poser(noeud, cle, valeur);
                     }
                     noeuds.insert(f.path.clone(), noeud);
                     if let Some(p) = f.project_id {
@@ -528,12 +509,6 @@ impl ObrainGraphStore {
                         }
                     }
                     dernier.insert(f.path.clone(), f.clone());
-                }
-                // A value in a blob column reaches the disk at the full flush: do it
-                // BEFORE the markers go, so a crash leaves drafts, never a half file.
-                if flush {
-                    w.flush_complet = true;
-                    w.rendre_durable_avant_le_marqueur()?;
                 }
                 for n in &crees {
                     w.etape()?;
