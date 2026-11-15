@@ -80,7 +80,7 @@
 //! by one, without a marker: after a crash the node holds some new and some old
 //! values, each a valid skill (as in `note.rs`).
 //!
-//! A write that carries a value above [`SEUIL_COLONNE_BLOB`] (a description, a
+//! A write that carries a value above `SEUIL_COLONNE_BLOB` (a description, a
 //! context template, the trigger JSON, a package JSON…) — or that REPLACES or
 //! removes one — pays the full flush (`flush_complet`), and a creation pays it
 //! BEFORE the marker is removed (`rendre_durable_avant_le_marqueur`): until obrain
@@ -99,7 +99,7 @@ use obrain_engine::ObrainDB;
 use regex::RegexBuilder;
 use uuid::Uuid;
 
-use super::{note, Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
+use super::{note, Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::analytics::distribution::adaptive_threshold;
 use crate::neo4j::models::DecisionNode;
 use crate::neo4j::traits::SkillStore;
@@ -142,33 +142,6 @@ fn lecteur(db: &ObrainDB, noeud: NodeId) -> Result<impl Fn(&str) -> Option<Value
             .filter(|v| !matches!(v, Value::Null))
             .cloned()
     })
-}
-
-/// Does this value go to a blob column (a string above [`SEUIL_COLONNE_BLOB`], or a
-/// list holding one)? Until obrain journals those values (#1190), a write that
-/// carries one — or REPLACES one — pays the full flush (`flush_complet`), exactly
-/// as in `note.rs` / `plan.rs`.
-pub(super) fn en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-        || v.as_list().is_some_and(|l| {
-            l.iter()
-                .any(|e| e.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB))
-        })
-}
-
-/// Does one of these properties of `noeud` hold, NOW, a blob-sized value? Replacing
-/// (or removing) such a value clears its slot in the blob column, which the WAL
-/// does not recover either.
-pub(super) fn ancienne_en_colonne_blob<'a>(
-    db: &ObrainDB,
-    noeud: NodeId,
-    cles: impl IntoIterator<Item = &'a str>,
-) -> bool {
-    let Some(n) = db.get_node(noeud) else {
-        return false;
-    };
-    cles.into_iter()
-        .any(|k| n.get_property(k).is_some_and(en_colonne_blob))
 }
 
 /// Typed reads of a property: ABSENT is `None`, PRESENT with another type is an
@@ -956,20 +929,18 @@ impl SkillStore for ObrainGraphStore {
                         None => None,
                     }
                 };
-                w.flush_complet = proprietes.iter().any(|(_, v)| en_colonne_blob(v));
                 let noeud = w.db.create_node(&[LABEL]);
                 w.etape()?;
-                w.db.set_node_property(noeud, BROUILLON, Value::from(true));
+                w.poser(noeud, BROUILLON, Value::from(true));
                 for (cle, valeur) in proprietes {
                     w.etape()?;
-                    w.db.set_node_property(noeud, cle, valeur);
+                    w.poser(noeud, cle, valeur);
                 }
                 if let Some(p) = projet {
                     w.etape()?;
                     w.db.create_edge(noeud, p, APPARTIENT);
                 }
                 // A blob-sized value is made durable BEFORE the commit point.
-                w.rendre_durable_avant_le_marqueur()?;
                 // The commit point.
                 w.etape()?;
                 w.db.remove_node_property(noeud, BROUILLON);
@@ -1010,19 +981,11 @@ impl SkillStore for ObrainGraphStore {
                     bail!("Skill not found: {}", s.id);
                 };
                 // New values, and the old ones they replace or remove.
-                w.flush_complet = proprietes
-                    .iter()
-                    .any(|(_, v)| v.as_ref().is_some_and(en_colonne_blob))
-                    || ancienne_en_colonne_blob(
-                        w.db,
-                        ancienne.noeud,
-                        proprietes.iter().map(|(k, _)| *k),
-                    );
                 for (cle, valeur) in proprietes {
                     w.etape()?;
                     match valeur {
                         Some(v) => {
-                            w.db.set_node_property(ancienne.noeud, cle, v);
+                            w.poser(ancienne.noeud, cle, v);
                         }
                         None => {
                             w.db.remove_node_property(ancienne.noeud, cle);
@@ -1075,7 +1038,7 @@ impl SkillStore for ObrainGraphStore {
                 w.etape()?;
                 match project_id {
                     Some(p) => {
-                        w.db.set_node_property(noeud, "project_id", Value::from(p.to_string()));
+                        w.poser(noeud, "project_id", Value::from(p.to_string()));
                     }
                     None => {
                         w.db.remove_node_property(noeud, "project_id");
@@ -1212,9 +1175,9 @@ impl SkillStore for ObrainGraphStore {
                 }
                 let compte = aretes_entrantes(w.db, ancienne.noeud, MEMBRE, "Note").len() as i64;
                 w.etape()?;
-                w.db.set_node_property(ancienne.noeud, "note_count", Value::from(compte));
+                w.poser(ancienne.noeud, "note_count", Value::from(compte));
                 w.etape()?;
-                w.db.set_node_property(
+                w.poser(
                     ancienne.noeud,
                     "updated_at",
                     Value::from(Utc::now().to_rfc3339()),
@@ -1258,9 +1221,9 @@ impl SkillStore for ObrainGraphStore {
                 // As Neo4j: the count and `updated_at` are set even when nothing was removed.
                 let compte = aretes_entrantes(w.db, ancienne.noeud, MEMBRE, "Note").len() as i64;
                 w.etape()?;
-                w.db.set_node_property(ancienne.noeud, "note_count", Value::from(compte));
+                w.poser(ancienne.noeud, "note_count", Value::from(compte));
                 w.etape()?;
-                w.db.set_node_property(
+                w.poser(
                     ancienne.noeud,
                     "updated_at",
                     Value::from(Utc::now().to_rfc3339()),
@@ -1305,7 +1268,7 @@ impl SkillStore for ObrainGraphStore {
                     ("updated_at", Value::from(Utc::now().to_rfc3339())),
                 ] {
                     w.etape()?;
-                    w.db.set_node_property(ancienne.noeud, cle, v);
+                    w.poser(ancienne.noeud, cle, v);
                 }
                 let nouvelle = relire(w, &ancienne)?;
                 w.rendre_durable()?;
@@ -1535,7 +1498,7 @@ impl SkillStore for ObrainGraphStore {
                     ("updated_at", maintenant),
                 ] {
                     w.etape()?;
-                    w.db.set_node_property(ancienne.noeud, cle, v);
+                    w.poser(ancienne.noeud, cle, v);
                 }
                 let nouvelle = relire(w, &ancienne)?;
                 w.rendre_durable()?;
@@ -1624,28 +1587,23 @@ impl SkillStore for ObrainGraphStore {
                     }
                     etat.skills.publiees.get(&p.id).map(|e| e.noeud)
                 };
-                w.flush_complet = proprietes.iter().any(|(_, v)| en_colonne_blob(v))
-                    || existante.is_some_and(|n| {
-                        ancienne_en_colonne_blob(w.db, n, proprietes.iter().map(|(k, _)| *k))
-                    });
                 let noeud = match existante {
                     // MERGE on an existing node: the SET, property by property.
                     Some(n) => {
                         for (cle, valeur) in proprietes {
                             w.etape()?;
-                            w.db.set_node_property(n, cle, valeur);
+                            w.poser(n, cle, valeur);
                         }
                         n
                     }
                     None => {
                         let n = w.db.create_node(&[PUBLIEE]);
                         w.etape()?;
-                        w.db.set_node_property(n, BROUILLON, Value::from(true));
+                        w.poser(n, BROUILLON, Value::from(true));
                         for (cle, valeur) in proprietes {
                             w.etape()?;
-                            w.db.set_node_property(n, cle, valeur);
+                            w.poser(n, cle, valeur);
                         }
-                        w.rendre_durable_avant_le_marqueur()?;
                         w.etape()?;
                         w.db.remove_node_property(n, BROUILLON);
                         n
@@ -1731,7 +1689,7 @@ impl SkillStore for ObrainGraphStore {
                     return Ok(());
                 };
                 w.etape()?;
-                w.db.set_node_property(noeud, "import_count", Value::from(n + 1));
+                w.poser(noeud, "import_count", Value::from(n + 1));
                 let lu = lecteur(w.db, noeud).and_then(|get| lire_publiee(&get));
                 let publiee = w.apres_ecriture(lu)?;
                 w.rendre_durable()?;

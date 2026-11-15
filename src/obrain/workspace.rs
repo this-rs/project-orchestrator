@@ -71,8 +71,7 @@
 //!
 //! As for `project.rs`: a creation sets the draft marker `_brouillon` first and
 //! removes it LAST, after its edges; opening deletes every draft of these four
-//! labels. A value above [`SEUIL_COLONNE_BLOB`](super::SEUIL_COLONNE_BLOB) makes
-//! the full flush run before the marker goes, as there. Multi-property updates
+//! labels. Multi-property updates
 //! are not atomic (obrain has no multi-property write): an interruption can leave
 //! some of the properties of one update and not the others; each state is a
 //! valid value of the node.
@@ -111,7 +110,7 @@ use obrain_engine::ObrainDB;
 use uuid::Uuid;
 
 use super::project::{self, IndexProjets};
-use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture, SEUIL_COLONNE_BLOB};
+use super::{Ecriture, NonPorte, ObrainGraphStore, RapportOuverture};
 use crate::neo4j::client::{pascal_to_snake_case, status_variants};
 use crate::neo4j::models::{
     ComponentDependency, ComponentNode, ComponentType, ComponentUpdate, CouplingMatrix,
@@ -648,10 +647,6 @@ fn relire<T>(db: &ObrainDB, noeud: NodeId, decoder: Decodeur<T>) -> Result<(Uuid
     decoder(&get)
 }
 
-fn va_en_colonne_blob(v: &Value) -> bool {
-    v.as_str().is_some_and(|s| s.len() > SEUIL_COLONNE_BLOB)
-}
-
 /// Create a node of `etiquette` as a draft: the marker first, the properties,
 /// the edges (`liens`), then the marker removed last — the commit point. Returns
 /// the node; the caller decodes and publishes it once durable.
@@ -661,15 +656,13 @@ fn creer_noeud(
     proprietes: Vec<(&'static str, Value)>,
     liens: impl FnOnce(&ObrainDB, NodeId),
 ) -> Result<NodeId> {
-    w.flush_complet = proprietes.iter().any(|(_, v)| va_en_colonne_blob(v));
     let db = w.db;
     let noeud = db.create_node(&[etiquette]);
-    db.set_node_property(noeud, BROUILLON, Value::from(true));
+    w.poser(noeud, BROUILLON, Value::from(true));
     for (cle, valeur) in proprietes {
-        db.set_node_property(noeud, cle, valeur);
+        w.poser(noeud, cle, valeur);
     }
     liens(db, noeud);
-    w.rendre_durable_avant_le_marqueur()?;
     db.remove_node_property(noeud, BROUILLON);
     Ok(noeud)
 }
@@ -838,21 +831,19 @@ impl WorkspaceStore for ObrainGraphStore {
                 };
                 let db = w.db;
                 if let Some(n) = &name {
-                    w.flush_complet |= n.len() > SEUIL_COLONNE_BLOB;
-                    db.set_node_property(noeud, "name", Value::from(n.clone()));
+                    w.poser(noeud, "name", Value::from(n.clone()));
                 }
                 if let Some(d) = &description {
-                    w.flush_complet |= d.len() > SEUIL_COLONNE_BLOB;
-                    db.set_node_property(noeud, "description", Value::from(d.clone()));
+                    w.poser(noeud, "description", Value::from(d.clone()));
                 }
                 if let Some(m) = &metadata {
-                    db.set_node_property(noeud, "metadata", Value::from(m.to_string()));
+                    w.poser(noeud, "metadata", Value::from(m.to_string()));
                 }
                 if let Some(s) = &slug {
-                    db.set_node_property(noeud, "slug", Value::from(s.clone()));
+                    w.poser(noeud, "slug", Value::from(s.clone()));
                 }
                 // Neo4j always sets `updated_at`, even for an empty update.
-                db.set_node_property(noeud, "updated_at", Value::from(Utc::now().to_rfc3339()));
+                w.poser(noeud, "updated_at", Value::from(Utc::now().to_rfc3339()));
                 let (nouvel_id, valeur) = w.apres_ecriture(relire(db, noeud, decoder_espace))?;
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
@@ -922,7 +913,7 @@ impl WorkspaceStore for ObrainGraphStore {
                 noeuds.push(noeud);
                 let quoi = format!("suppression du workspace {id}");
                 w.verifier_vivants(&noeuds, &quoi)?;
-                w.db.set_node_property(noeud, SUPPRESSION, Value::from(true));
+                w.poser(noeud, SUPPRESSION, Value::from(true));
                 w.etape()?;
                 // Past the marker, a failure leaves a deletion the next open finishes:
                 // the index no longer says what the base holds (indeterminate).
@@ -1232,18 +1223,16 @@ impl WorkspaceStore for ObrainGraphStore {
                 };
                 let db = w.db;
                 if let Some(t) = &title {
-                    w.flush_complet |= t.len() > SEUIL_COLONNE_BLOB;
-                    db.set_node_property(noeud, "title", Value::from(t.clone()));
+                    w.poser(noeud, "title", Value::from(t.clone()));
                 }
                 if let Some(d) = &description {
-                    w.flush_complet |= d.len() > SEUIL_COLONNE_BLOB;
-                    db.set_node_property(noeud, "description", Value::from(d.clone()));
+                    w.poser(noeud, "description", Value::from(d.clone()));
                 }
                 if let Some(s) = status {
-                    db.set_node_property(noeud, "status", Value::from(s.to_string()));
+                    w.poser(noeud, "status", Value::from(s.to_string()));
                 }
                 if let Some(td) = target_date {
-                    db.set_node_property(noeud, "target_date", Value::from(td.to_rfc3339()));
+                    w.poser(noeud, "target_date", Value::from(td.to_rfc3339()));
                 }
                 let (nid, valeur) = w.apres_ecriture(relire(db, noeud, decoder_jalon))?;
                 w.rendre_durable()?;
@@ -1471,8 +1460,7 @@ impl WorkspaceStore for ObrainGraphStore {
                     ("description", description),
                 ] {
                     if let Some(v) = v {
-                        w.flush_complet |= v.len() > SEUIL_COLONNE_BLOB;
-                        db.set_node_property(noeud, cle, Value::from(v));
+                        w.poser(noeud, cle, Value::from(v));
                     }
                 }
                 let (rid, valeur) = w.apres_ecriture(relire(db, noeud, decoder_ressource))?;
@@ -1645,25 +1633,25 @@ impl WorkspaceStore for ObrainGraphStore {
                     // MERGE matched: the SET rules of the Neo4j query, field by field.
                     Some((noeud, ancien)) => {
                         let cid = ancien.id;
-                        db.set_node_property(
+                        w.poser(
                             noeud,
                             "component_type",
                             Value::from(format!("{:?}", component_type)),
                         );
                         let runtime = runtime.unwrap_or_default();
                         if !runtime.is_empty() {
-                            db.set_node_property(noeud, "runtime", Value::from(runtime));
+                            w.poser(noeud, "runtime", Value::from(runtime));
                         }
-                        db.set_node_property(noeud, "config", Value::from(config.to_string()));
+                        w.poser(noeud, "config", Value::from(config.to_string()));
                         if ancien.description.as_deref().unwrap_or("").is_empty() {
-                            db.set_node_property(
+                            w.poser(
                                 noeud,
                                 "description",
                                 Value::from(description.unwrap_or_default()),
                             );
                         }
                         if ancien.tags.is_empty() {
-                            db.set_node_property(noeud, "tags", valeur_liste(&tags));
+                            w.poser(noeud, "tags", valeur_liste(&tags));
                         }
                         let (_, valeur) = w.apres_ecriture(relire(db, noeud, decoder_composant))?;
                         w.rendre_durable()?;
@@ -1761,23 +1749,22 @@ impl WorkspaceStore for ObrainGraphStore {
                 }
                 let db = w.db;
                 if let Some(n) = &patch.name {
-                    db.set_node_property(noeud, "name", Value::from(n.clone()));
+                    w.poser(noeud, "name", Value::from(n.clone()));
                 }
                 if let Some(t) = &patch.component_type {
-                    db.set_node_property(noeud, "component_type", Value::from(format!("{:?}", t)));
+                    w.poser(noeud, "component_type", Value::from(format!("{:?}", t)));
                 }
                 if let Some(d) = &patch.description {
-                    w.flush_complet |= d.len() > SEUIL_COLONNE_BLOB;
-                    db.set_node_property(noeud, "description", Value::from(d.clone()));
+                    w.poser(noeud, "description", Value::from(d.clone()));
                 }
                 if let Some(r) = &patch.runtime {
-                    db.set_node_property(noeud, "runtime", Value::from(r.clone()));
+                    w.poser(noeud, "runtime", Value::from(r.clone()));
                 }
                 if let Some(c) = &patch.config {
-                    db.set_node_property(noeud, "config", Value::from(c.to_string()));
+                    w.poser(noeud, "config", Value::from(c.to_string()));
                 }
                 if let Some(t) = &patch.tags {
-                    db.set_node_property(noeud, "tags", valeur_liste(t));
+                    w.poser(noeud, "tags", valeur_liste(t));
                 }
                 let (cid, valeur) = w.apres_ecriture(relire(db, noeud, decoder_composant))?;
                 w.rendre_durable()?;
@@ -1847,8 +1834,8 @@ impl WorkspaceStore for ObrainGraphStore {
                     Some(eid) => eid,
                     None => w.db.create_edge(c1, c2, DEPEND),
                 };
-                w.db.set_edge_property(eid, "protocol", Value::from(protocole.clone()));
-                w.db.set_edge_property(eid, "required", Value::from(required));
+                w.poser_arete(eid, "protocol", Value::from(protocole.clone()));
+                w.poser_arete(eid, "required", Value::from(required));
                 w.rendre_durable()?;
                 let mut etat = w.index_mut()?;
                 etat.espaces
