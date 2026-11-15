@@ -2115,7 +2115,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3330,7 +3330,10 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
+ "rayon",
 ]
 
 [[package]]
@@ -3355,7 +3358,6 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
- "rayon",
 ]
 
 [[package]]
@@ -3851,6 +3853,7 @@ checksum = "bd070e393353796e801d209ad339e89596eb4c8d430d18ede6a1cced8fafbd99"
 dependencies = [
  "autocfg",
  "hashbrown 0.12.3",
+ "rayon",
  "serde",
 ]
 
@@ -3862,7 +3865,6 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
- "rayon",
  "serde",
  "serde_core",
 ]
@@ -5219,7 +5221,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5573,7 +5575,7 @@ dependencies = [
 [[package]]
 name = "obrain-adapters"
 version = "0.0.1"
-source = "git+https://github.com/obrain-db/obrain.git?rev=d9ddd1e98ae76c8817015b7c8ab115b83136490a#d9ddd1e98ae76c8817015b7c8ab115b83136490a"
+source = "git+https://github.com/obrain-db/obrain.git?rev=98760e0dccf0a18c6dfacc8b508f74f8c99063e5#98760e0dccf0a18c6dfacc8b508f74f8c99063e5"
 dependencies = [
  "arcstr",
  "bincode",
@@ -5599,7 +5601,7 @@ dependencies = [
 [[package]]
 name = "obrain-common"
 version = "0.0.1"
-source = "git+https://github.com/obrain-db/obrain.git?rev=d9ddd1e98ae76c8817015b7c8ab115b83136490a#d9ddd1e98ae76c8817015b7c8ab115b83136490a"
+source = "git+https://github.com/obrain-db/obrain.git?rev=98760e0dccf0a18c6dfacc8b508f74f8c99063e5#98760e0dccf0a18c6dfacc8b508f74f8c99063e5"
 dependencies = [
  "arcstr",
  "bincode",
@@ -5620,7 +5622,7 @@ dependencies = [
 [[package]]
 name = "obrain-core"
 version = "0.0.1"
-source = "git+https://github.com/obrain-db/obrain.git?rev=d9ddd1e98ae76c8817015b7c8ab115b83136490a#d9ddd1e98ae76c8817015b7c8ab115b83136490a"
+source = "git+https://github.com/obrain-db/obrain.git?rev=98760e0dccf0a18c6dfacc8b508f74f8c99063e5#98760e0dccf0a18c6dfacc8b508f74f8c99063e5"
 dependencies = [
  "arcstr",
  "byteorder",
@@ -5646,7 +5648,7 @@ dependencies = [
 [[package]]
 name = "obrain-engine"
 version = "0.0.1"
-source = "git+https://github.com/obrain-db/obrain.git?rev=d9ddd1e98ae76c8817015b7c8ab115b83136490a#d9ddd1e98ae76c8817015b7c8ab115b83136490a"
+source = "git+https://github.com/obrain-db/obrain.git?rev=98760e0dccf0a18c6dfacc8b508f74f8c99063e5#98760e0dccf0a18c6dfacc8b508f74f8c99063e5"
 dependencies = [
  "anyhow",
  "arcstr",
@@ -5673,7 +5675,7 @@ dependencies = [
 [[package]]
 name = "obrain-substrate"
 version = "0.0.1"
-source = "git+https://github.com/obrain-db/obrain.git?rev=d9ddd1e98ae76c8817015b7c8ab115b83136490a#d9ddd1e98ae76c8817015b7c8ab115b83136490a"
+source = "git+https://github.com/obrain-db/obrain.git?rev=98760e0dccf0a18c6dfacc8b508f74f8c99063e5#98760e0dccf0a18c6dfacc8b508f74f8c99063e5"
 dependencies = [
  "arcstr",
  "bincode",
@@ -7362,7 +7364,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7489,8 +7491,8 @@ checksum = "54299df1d95fb17c25f9ae7f4169db76de708c231a19e29a50b7d74e87853246"
 dependencies = [
  "fixedbitset",
  "foldhash 0.1.5",
- "hashbrown 0.17.1",
- "indexmap 2.14.2",
+ "hashbrown 0.15.5",
+ "indexmap 1.9.3",
  "ndarray 0.17.2",
  "num-traits",
  "petgraph",
@@ -8927,7 +8929,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.52.0",
