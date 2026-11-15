@@ -4465,6 +4465,15 @@ mod with_the_feature {
                 .open(dir.join("acquittes"))
                 .unwrap();
             use std::io::Write as _;
+            // One `write` per line, so a kill can never cut a line in two. The journal
+            // carries the INTENT before each write and the ACKNOWLEDGEMENT after it: a
+            // durable value that is the write in flight is legitimate (the commit was
+            // crossed before the kill), a durable value OLDER than the last
+            // acknowledgement is a loss.
+            let mut note = |genre: &str, f: &FileNode| {
+                let ligne = format!("{genre}\t{}\t{}\n", f.path, f.hash);
+                log.write_all(ligne.as_bytes()).unwrap();
+            };
             loop {
                 let mut f = a_file(
                     &format!("src/{}/{}.rs", "d".repeat(300), Uuid::new_v4()),
@@ -4472,11 +4481,13 @@ mod with_the_feature {
                     None,
                 );
                 f.hash = format!("{}{}", "h".repeat(300), Uuid::new_v4());
+                note("intention", &f);
                 store.upsert_file(&f).await.unwrap();
-                writeln!(log, "{}\t{}", f.path, f.hash).unwrap();
+                note("acquitte", &f);
                 f.hash = format!("court-{}", Uuid::new_v4());
+                note("intention", &f);
                 store.upsert_file(&f).await.unwrap();
-                writeln!(log, "{}\t{}", f.path, f.hash).unwrap();
+                note("acquitte", &f);
             }
         }
 
@@ -4484,7 +4495,13 @@ mod with_the_feature {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
         let acquittes = dir.path().join("acquittes");
-        let compte = || std::fs::read_to_string(&acquittes).map_or(0, |s| s.lines().count());
+        // Only ACKNOWLEDGEMENT lines count as progress (each acknowledged write also leaves
+        // an intent line before it).
+        let compte = || {
+            std::fs::read_to_string(&acquittes).map_or(0, |s| {
+                s.lines().filter(|l| l.starts_with("acquitte\t")).count()
+            })
+        };
         let mut vus = 0usize;
         for tour in 0..TOURS {
             let avant = compte();
@@ -4515,22 +4532,44 @@ mod with_the_feature {
                 "round {tour}: a file write killed half-way is repaired, never quarantined: \
                  {rapport:?}"
             );
-            let mut derniers: std::collections::HashMap<String, String> = Default::default();
+            // path -> (last acknowledged hash, hash of a write begun after it, if any).
+            // A line without its three fields was cut by the kill: ignored.
+            let mut derniers: std::collections::HashMap<String, (Option<String>, Option<String>)> =
+                Default::default();
             for ligne in std::fs::read_to_string(&acquittes).unwrap().lines() {
-                let (path, hash) = ligne.split_once('\t').unwrap();
-                derniers.insert(path.to_string(), hash.to_string());
+                let champs: Vec<&str> = ligne.split('\t').collect();
+                let [genre, path, hash] = champs[..] else {
+                    continue;
+                };
+                let e = derniers.entry(path.to_string()).or_default();
+                match genre {
+                    "intention" => e.1 = Some(hash.to_string()),
+                    "acquitte" => {
+                        e.0 = Some(hash.to_string());
+                        e.1 = None;
+                    }
+                    _ => {}
+                }
             }
-            for (path, hash) in &derniers {
+            let mut controles = 0usize;
+            for (path, (acquitte, entame)) in &derniers {
+                let Some(acquitte) = acquitte else { continue };
                 let f =
                     store.get_file(path).await.unwrap().unwrap_or_else(|| {
                         panic!("round {tour}: acknowledged file {path} is gone")
                     });
-                assert_eq!(
-                    &f.hash, hash,
-                    "round {tour}: the last acknowledged hash of {path}"
+                // The durable value is the last acknowledged one, or the write begun
+                // after it (its commit was crossed before the kill). Never an older
+                // value, never nothing.
+                assert!(
+                    &f.hash == acquitte || entame.as_deref() == Some(f.hash.as_str()),
+                    "round {tour}: the durable hash of {path} is {:?}, neither the last \
+                     acknowledged {acquitte:?} nor the write begun after it {entame:?}",
+                    f.hash
                 );
+                controles += 1;
             }
-            vus = derniers.len();
+            vus = controles;
             store.close().await.unwrap();
         }
         assert!(vus >= 6, "files checked: {vus}");
