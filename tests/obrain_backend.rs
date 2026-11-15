@@ -4443,8 +4443,15 @@ mod with_the_feature {
     /// Files whose path and hash go to a blob column (> 256 bytes), written then
     /// REPLACED by a short hash, with the child killed by SIGKILL — no `close()`, so no
     /// final flush hides a missing one. Every file the child acknowledged is there after
-    /// the kill, with the last hash it acknowledged: the writer pays the full flush for
-    /// a blob-sized value AND for the replacement of one (as `project.rs` / `plan.rs`).
+    /// the kill, with the last hash it acknowledged OR the hash of the write begun after
+    /// it (its commit may be crossed before the kill) — never an older one, never none.
+    ///
+    /// What this test does NOT prove: the engine's blob → inline replacement window
+    /// (obrain#172, fixed by obrain#175). The kill lands at a random instant, and this
+    /// test passes 10/10 on the pin before the fix (d9ddd1e9) as on the fix itself. The
+    /// deterministic guard of that window lives in the engine:
+    /// `crates/obrain-engine/tests/remplacement_blob_kill9.rs` (crash points, 20/20 red
+    /// without the fix, 20/20 green with it). This test guards PO's own write protocol.
     #[tokio::test]
     async fn kill9_during_file_writes_loses_no_acknowledged_blob_sized_file() {
         if let Ok(dir) = std::env::var(ENV_KILL9_FICHIERS) {
