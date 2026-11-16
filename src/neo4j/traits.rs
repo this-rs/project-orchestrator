@@ -1055,8 +1055,10 @@ pub trait PlanStore: Send + Sync {
         prompt_cache: Option<&str>,
     ) -> Result<()>;
 
-    /// Delete a task and all its related data (steps, decisions)
-    async fn delete_task(&self, task_id: Uuid) -> Result<()>;
+    /// Delete a task and all its related data (steps, decisions), and report
+    /// what went with it. An id that names no task deletes nothing and reports
+    /// an empty [`TaskDeletion`](crate::neo4j::models::TaskDeletion).
+    async fn delete_task(&self, task_id: Uuid) -> Result<crate::neo4j::models::TaskDeletion>;
 
     /// Get the project that owns a task (via Task→Plan→Project chain).
     ///

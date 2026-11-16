@@ -435,24 +435,7 @@ impl ContextBuilder {
 
         // Steps
         if !context.steps.is_empty() {
-            let mut s = String::new();
-            for step in &context.steps {
-                let status = match step.status {
-                    StepStatus::Completed => "[x]",
-                    _ => "[ ]",
-                };
-                s.push_str(&format!(
-                    "{} {}. {} `[step_id: {}]`\n",
-                    status,
-                    step.order + 1,
-                    step.description,
-                    step.id
-                ));
-                if let Some(ref verification) = step.verification {
-                    s.push_str(&format!("   Verification: {}\n", verification));
-                }
-            }
-            builder = builder.with_steps(s);
+            builder = builder.with_steps(render_steps(&context.steps));
         }
 
         // Knowledge Notes
@@ -656,22 +639,7 @@ impl ContextBuilder {
         // Steps
         if !context.steps.is_empty() {
             prompt.push_str("## Steps\n");
-            for step in &context.steps {
-                let status = match step.status {
-                    StepStatus::Completed => "[x]",
-                    _ => "[ ]",
-                };
-                prompt.push_str(&format!(
-                    "{} {}. {} `[step_id: {}]`\n",
-                    status,
-                    step.order + 1,
-                    step.description,
-                    step.id
-                ));
-                if let Some(ref verification) = step.verification {
-                    prompt.push_str(&format!("   Verification: {}\n", verification));
-                }
-            }
+            prompt.push_str(&render_steps(&context.steps));
             prompt.push('\n');
         }
 
@@ -977,6 +945,49 @@ pub struct PlanEnrichmentResult {
 // ============================================================================
 // Standalone utilities
 // ============================================================================
+
+/// What the prompt says once when a step is listed as skipped.
+///
+/// The store holds one `skipped` for two things: a step someone ruled out, and a
+/// step an EARLIER runner closed because its run stopped before reaching it
+/// (steps closed that way before the runner stopped doing it are still in the
+/// database, and a task that failed then is retried now). Nothing in the data
+/// tells them apart, and guessing would either forbid pending work or resurrect
+/// excluded work. So the legend states both origins and never forbids: the
+/// acceptance criteria decide.
+pub(crate) const SKIPPED_STEPS_LEGEND: &str = "`[-]` = skipped: either ruled out, or not reached by an earlier run. If an acceptance criterion cannot hold without it, do it.\n";
+
+/// The steps of the task, as both prompt paths list them.
+///
+/// A skipped step used to be rendered `[ ]`, exactly like a pending one: the
+/// executing agent read it as work left to do (issue #1189). It keeps its line
+/// — the numbering and the `step_id` stay stable — with a mark of its own, and
+/// [`SKIPPED_STEPS_LEGEND`] follows the list when at least one step carries it.
+pub(crate) fn render_steps(steps: &[crate::neo4j::models::StepNode]) -> String {
+    let mut out = String::new();
+    for step in steps {
+        let (mark, note) = match step.status {
+            StepStatus::Completed => ("[x]", ""),
+            StepStatus::Skipped => ("[-]", " — skipped"),
+            StepStatus::Pending | StepStatus::InProgress => ("[ ]", ""),
+        };
+        out.push_str(&format!(
+            "{} {}. {}{} `[step_id: {}]`\n",
+            mark,
+            step.order + 1,
+            step.description,
+            note,
+            step.id
+        ));
+        if let Some(ref verification) = step.verification {
+            out.push_str(&format!("   Verification: {}\n", verification));
+        }
+    }
+    if steps.iter().any(|s| s.status == StepStatus::Skipped) {
+        out.push_str(SKIPPED_STEPS_LEGEND);
+    }
+    out
+}
 
 /// Pre-read affected files and format them as markdown code blocks.
 ///
@@ -1758,6 +1769,75 @@ mod tests {
             assert!(prompt.contains("Test Task"));
             assert!(prompt.contains("## Acceptance Criteria"));
             assert!(prompt.contains("- [ ] Region is named for screen readers"));
+        }
+    }
+
+    #[test]
+    fn a_skipped_step_is_not_rendered_as_work_to_do() {
+        // Issue #1189: a skipped step was rendered `[ ]`, exactly like a pending
+        // one, so the executing agent redid what had been ruled out.
+        let step = |order: u32, description: &str, status: StepStatus| StepNode {
+            id: Uuid::new_v4(),
+            order,
+            description: description.to_string(),
+            status,
+            verification: None,
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            completed_at: None,
+            execution_context: None,
+            persona: None,
+        };
+        let mut ctx = context_for(create_test_task());
+        ctx.steps = vec![
+            step(0, "Write the migration", StepStatus::Completed),
+            step(1, "Backfill the old rows", StepStatus::Skipped),
+            step(2, "Drop the column", StepStatus::Pending),
+        ];
+        let builder = mock_builder();
+
+        let plain = builder.generate_prompt(&ctx);
+        let enriched = builder.build_prompt_builder(&ctx).build();
+
+        for prompt in [&plain, &enriched] {
+            assert!(prompt.contains("[x] 1. Write the migration"), "{prompt}");
+            assert!(prompt.contains("[ ] 3. Drop the column"), "{prompt}");
+            let skipped = prompt
+                .lines()
+                .find(|l| l.contains("Backfill the old rows"))
+                .expect("the skipped step is still listed");
+            assert!(
+                !skipped.starts_with("[ ]"),
+                "a skipped step must not read as unchecked work: {skipped}"
+            );
+            assert!(
+                skipped.starts_with("[-]") && skipped.contains("skipped"),
+                "a skipped step says so: {skipped}"
+            );
+            // The legend is the exact one, shown once.
+            assert_eq!(
+                prompt.matches(SKIPPED_STEPS_LEGEND.trim_end()).count(),
+                1,
+                "the legend appears once: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_skipped_legend_never_forbids_a_step() {
+        // A `skipped` step may be one an earlier runner closed after a failed run:
+        // the legend must leave the decision to the acceptance criteria.
+        let legend = SKIPPED_STEPS_LEGEND.to_lowercase();
+        assert!(
+            legend.contains("either ruled out, or not reached by an earlier run"),
+            "{legend}"
+        );
+        assert!(
+            legend.contains("if an acceptance criterion cannot hold without it, do it"),
+            "{legend}"
+        );
+        for forbidding in ["do not", "don't", "must not", "never", "skip it"] {
+            assert!(!legend.contains(forbidding), "'{forbidding}' in: {legend}");
         }
     }
 

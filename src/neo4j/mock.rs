@@ -10197,26 +10197,32 @@ impl PlanStore for MockGraphStore {
                 task.persona = Some(p.to_string());
             }
             if let Some(pc) = prompt_cache {
-                task.prompt_cache = Some(pc.to_string());
+                // As Neo4j reads it back: an empty string is "no cache".
+                task.prompt_cache = Some(pc.to_string()).filter(|s| !s.is_empty());
             }
         }
         Ok(())
     }
 
-    async fn delete_task(&self, task_id: Uuid) -> Result<()> {
+    async fn delete_task(&self, task_id: Uuid) -> Result<crate::neo4j::models::TaskDeletion> {
+        let mut report = crate::neo4j::models::TaskDeletion::default();
         self.tasks.write().await.remove(&task_id);
         // Cascade: steps
         if let Some(step_ids) = self.task_steps.write().await.remove(&task_id) {
             let mut steps = self.steps.write().await;
             for sid in step_ids {
-                steps.remove(&sid);
+                if steps.remove(&sid).is_some() {
+                    report.steps_deleted += 1;
+                }
             }
         }
         // Cascade: decisions
         if let Some(dec_ids) = self.task_decisions.write().await.remove(&task_id) {
             let mut decisions = self.decisions.write().await;
             for did in dec_ids {
-                decisions.remove(&did);
+                if decisions.remove(&did).is_some() {
+                    report.deleted_decision_ids.push(did);
+                }
             }
         }
         self.task_dependencies.write().await.remove(&task_id);
@@ -10227,7 +10233,7 @@ impl PlanStore for MockGraphStore {
         for dep_list in deps.values_mut() {
             dep_list.retain(|id| *id != task_id);
         }
-        Ok(())
+        Ok(report)
     }
 
     async fn get_project_for_task(&self, task_id: Uuid) -> Result<Option<ProjectNode>> {
@@ -10831,11 +10837,15 @@ impl DecisionStore for MockGraphStore {
             .unwrap_or_default())
     }
 
-    async fn supersede_decision(
-        &self,
-        _new_decision_id: Uuid,
-        _old_decision_id: Uuid,
-    ) -> Result<()> {
+    async fn supersede_decision(&self, new_decision_id: Uuid, old_decision_id: Uuid) -> Result<()> {
+        // As in Neo4j (`MATCH (new) MATCH (old) SET old.status`): nothing is
+        // written unless both decisions exist. The SUPERSEDES edge is not kept.
+        let mut decisions = self.decisions.write().await;
+        if decisions.contains_key(&new_decision_id) {
+            if let Some(old) = decisions.get_mut(&old_decision_id) {
+                old.status = DecisionStatus::Superseded;
+            }
+        }
         Ok(())
     }
 
