@@ -1171,6 +1171,10 @@ async fn note_affinity(
             .neo4j()
             .get_skills_for_note(hit.note.id)
             .await
+            // INTENTIONALLY degrading, not a swallowed refusal: see the doc of
+            // `note_affinity` — the note channel is an extra signal, and its
+            // absence leaves the other channels ranking rather than failing the
+            // request. Classified "légitime" in the API-NONPORTE-MASQUE inventory.
             .unwrap_or_default()
             .into_iter()
             .map(|skill| skill.id)

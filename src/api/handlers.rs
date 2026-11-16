@@ -4837,10 +4837,7 @@ pub async fn update_fabric_scores(
 
     // Also compute churn, knowledge_density, and risk scores
     let neo = state.orchestrator.neo4j();
-    let churn = neo
-        .compute_churn_scores(project_id)
-        .await
-        .unwrap_or_default();
+    let churn = neo.compute_churn_scores(project_id).await?;
     let churn_count = churn.len();
     let _ = neo.batch_update_churn_scores(&churn).await;
 
