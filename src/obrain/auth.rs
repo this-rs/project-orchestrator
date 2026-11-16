@@ -137,9 +137,7 @@ fn requis(get: &dyn Fn(&str) -> Option<Value>, cle: &str) -> Result<String> {
 }
 
 fn instant(get: &dyn Fn(&str) -> Option<Value>, cle: &str) -> Result<DateTime<Utc>> {
-    let s = requis(get, cle)?;
-    s.parse::<DateTime<Utc>>()
-        .map_err(|e| anyhow!("`{cle}` illisible : {e}"))
+    super::date::requise(get, cle, "nœud d'authentification")
 }
 
 /// A boolean that must be one. Absent or of another type (`"true"`, `1`) is an

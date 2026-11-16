@@ -553,10 +553,10 @@ impl IndexExecutions {
             let Some(v) = n.get_property(MARQUE).filter(|v| !matches!(v, Value::Null)) else {
                 continue;
             };
-            let marque = match v.as_str().map(|s| s.parse::<DateTime<Utc>>()) {
-                Some(Ok(d)) => Marque::Lue(entree.noeud, d),
-                _ => {
-                    let raison = format!("plan {id} : `{MARQUE}` illisible ({v:?})");
+            let marque = match super::date::decoder(v) {
+                Ok(d) => Marque::Lue(entree.noeud, d),
+                Err(pourquoi) => {
+                    let raison = format!("plan {id} : `{MARQUE}` illisible : {pourquoi}");
                     rapport
                         .en_quarantaine
                         .push(format!("{raison} — le plan est servi, sa marque refusée"));

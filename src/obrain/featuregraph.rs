@@ -150,10 +150,7 @@ fn lire_graphe(get: &dyn Fn(&str) -> Option<Value>) -> Result<FeatureGraphNode> 
         chaine(cle).ok_or_else(|| anyhow!("graphe de fonctionnalité {id} sans propriété `{cle}`"))
     };
     let instant = |cle: &str| -> Result<DateTime<Utc>> {
-        let brut = requise(cle)?;
-        brut.parse().map_err(|e| {
-            anyhow!("graphe de fonctionnalité {id} : `{cle}` illisible (« {brut} ») : {e}")
-        })
+        super::date::requise(get, cle, &format!("graphe de fonctionnalité {id}"))
     };
     let project_id: Uuid = requise("project_id")?
         .parse()
@@ -205,9 +202,7 @@ impl EntreeGraphe {
             graphe: lire_graphe(&get)?,
             entites,
             inconnues: 0,
-            tri_maj: get("updated_at")
-                .and_then(|v| v.as_str().map(str::to_string))
-                .unwrap_or_default(),
+            tri_maj: super::date::en_texte(get("updated_at").as_ref()).unwrap_or_default(),
         })
     }
 
@@ -301,9 +296,7 @@ impl IndexGraphes {
                     None => inconnues += 1,
                 }
             }
-            let tri_maj = get("updated_at")
-                .and_then(|v| v.as_str().map(str::to_string))
-                .unwrap_or_default();
+            let tri_maj = super::date::en_texte(get("updated_at").as_ref()).unwrap_or_default();
             index.par_id.insert(
                 graphe.id,
                 EntreeGraphe {

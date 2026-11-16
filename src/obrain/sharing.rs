@@ -78,7 +78,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat};
 use obrain_common::types::{NodeId, Value};
 use obrain_core::graph::Direction;
 use obrain_engine::ObrainDB;
@@ -166,11 +166,7 @@ fn lire_evenement(get: &dyn Fn(&str) -> Option<Value>) -> Result<SharingEvent> {
         .ok_or_else(|| anyhow!("nœud SharingEvent sans `id`"))?;
     let quoi = format!("événement {id}");
     let texte = |cle: &str| -> Result<String> { Ok(chaine(get, &quoi, cle)?.unwrap_or_default()) };
-    let brut =
-        chaine(get, &quoi, "timestamp")?.ok_or_else(|| anyhow!("{quoi} sans `timestamp`"))?;
-    let timestamp = brut
-        .parse::<DateTime<Utc>>()
-        .map_err(|e| anyhow!("{quoi} : `timestamp` illisible ({brut}) : {e}"))?;
+    let timestamp = super::date::requise(get, "timestamp", &quoi)?;
     let consent: SharingConsent = enumere(get, &quoi, "consent")?;
     let privacy_mode: PrivacyMode = enumere(get, &quoi, "privacy_mode")?;
     Ok(SharingEvent {
@@ -211,9 +207,16 @@ fn lire_tombe(get: &dyn Fn(&str) -> Option<Value>) -> Result<SignedTombstone> {
         issuer_did: texte("issuer_did")?,
         signature_hex: texte("signature_hex")?,
         // Neo4j's stated rule (`tombstone_from_stored`): the epoch, never "now".
-        issued_at: texte("issued_at")?
-            .parse::<DateTime<Utc>>()
-            .unwrap_or(DateTime::UNIX_EPOCH),
+        // Read by the one decoder (`date.rs`), under its three forms. Absent, or a
+        // STRING that does not parse: the epoch, never "now" — Neo4j's stated rule
+        // (`tombstone_from_stored`): deterministic, and it fails the verification.
+        // Another variant is an error, as it was.
+        issued_at: match get("issued_at") {
+            None => DateTime::UNIX_EPOCH,
+            Some(v @ Value::String(_)) => super::date::decoder(&v).unwrap_or(DateTime::UNIX_EPOCH),
+            Some(v) => super::date::decoder(&v)
+                .map_err(|pourquoi| anyhow!("{quoi} : `issued_at` illisible : {pourquoi}"))?,
+        },
         reason: Some(texte("reason")?).filter(|r| !r.is_empty()),
         content_hash: hash,
     })
@@ -618,6 +621,7 @@ impl SharingStore for ObrainGraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     fn depuis(props: Vec<(&'static str, Value)>) -> impl Fn(&str) -> Option<Value> {
         move |cle: &str| {

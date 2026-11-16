@@ -155,7 +155,7 @@ pub(super) fn uuid_facultatif(get: Lecteur, cle: &str, quoi: &str) -> Result<Opt
 }
 
 pub(super) fn date_requise(get: Lecteur, cle: &str, quoi: &str) -> Result<DateTime<Utc>> {
-    analyser(&requise(get, cle, quoi)?, cle, quoi)
+    super::date::requise(get, cle, quoi)
 }
 
 pub(super) fn date_facultative(
@@ -163,9 +163,7 @@ pub(super) fn date_facultative(
     cle: &str,
     quoi: &str,
 ) -> Result<Option<DateTime<Utc>>> {
-    facultative(get, cle, quoi)?
-        .map(|b| analyser(&b, cle, quoi))
-        .transpose()
+    super::date::facultative(get, cle, quoi)
 }
 
 /// An integer property; present with another type: an error.

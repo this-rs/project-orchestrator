@@ -706,7 +706,7 @@ mod with_the_feature {
     /// `kill9_after_a_value_past_obrain_s_wal_cap_keeps_it`.
     #[tokio::test]
     async fn a_value_past_obrain_s_wal_cap_pays_one_full_flush_and_one_at_the_cap_none() {
-        use project_orchestrator::notes::{Note, NoteType};
+        use project_orchestrator::notes::models::{Note, NoteType};
         let store = temporary(Durabilite::Wal).await;
         let p = a_project("cap");
         store.create_project(&p).await.unwrap();
@@ -1096,7 +1096,7 @@ mod with_the_feature {
     /// does is obrain's guarantee.
     #[tokio::test]
     async fn kill9_during_creations_loses_no_acknowledged_project_and_never_blocks_the_reopen() {
-        use project_orchestrator::notes::{Note, NoteType};
+        use project_orchestrator::notes::models::{Note, NoteType};
         if let Ok(dir) = std::env::var(ENV_KILL9) {
             let dir = std::path::PathBuf::from(dir);
             let mode = std::env::var("OBRAIN_PO_TEST_ENFANT_MODE").unwrap();
@@ -2479,7 +2479,7 @@ mod with_the_feature {
     #[tokio::test]
     async fn an_interrupted_note_creation_reopens_consistently() {
         use project_orchestrator::neo4j::traits::NoteStore;
-        use project_orchestrator::notes::{Note, NoteType};
+        use project_orchestrator::notes::models::{Note, NoteType};
         let dir = tempfile::tempdir().unwrap();
         let mut points = vec![Interruption::ApresLeNoeud, Interruption::ApresLeMarqueur];
         points.extend((1..=40).map(Interruption::ApresLaPropriete));
@@ -2810,7 +2810,7 @@ mod with_the_feature {
     #[tokio::test]
     async fn an_id_on_disk_but_unreadable_is_reserved_for_notes() {
         use project_orchestrator::neo4j::traits::NoteStore;
-        use project_orchestrator::notes::{Note, NoteType};
+        use project_orchestrator::notes::models::{Note, NoteType};
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
         let store = open(&base).await;
@@ -2845,7 +2845,7 @@ mod with_the_feature {
     #[tokio::test]
     async fn anchors_are_refused_by_name_when_the_base_links_to_an_unported_domain() {
         use project_orchestrator::neo4j::traits::NoteStore;
-        use project_orchestrator::notes::{Note, NoteType};
+        use project_orchestrator::notes::models::{Note, NoteType};
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
         let store = open(&base).await;
@@ -2919,7 +2919,7 @@ mod with_the_feature {
     #[tokio::test]
     async fn a_non_finite_sort_key_is_refused_at_creation() {
         use project_orchestrator::neo4j::traits::NoteStore;
-        use project_orchestrator::notes::{Note, NoteType};
+        use project_orchestrator::notes::models::{Note, NoteType};
         let store = temporary(Durabilite::Wal).await;
         let mut n = Note::new(None, NoteType::Tip, "nan".into(), "alice".into());
         n.staleness_score = f64::NAN;
@@ -3680,7 +3680,7 @@ mod with_the_feature {
     #[tokio::test]
     async fn a_refused_note_deletion_after_its_edges_makes_the_base_indeterminate() {
         use project_orchestrator::neo4j::traits::NoteStore;
-        use project_orchestrator::notes::{Note, NoteType};
+        use project_orchestrator::notes::models::{Note, NoteType};
         let store = temporary(Durabilite::Wal).await;
         let p = a_project("indeterminee");
         store.create_project(&p).await.unwrap();
@@ -3699,7 +3699,7 @@ mod with_the_feature {
     #[tokio::test]
     async fn an_edge_to_a_quarantined_note_node_is_not_a_link_of_the_indexed_note() {
         use project_orchestrator::neo4j::traits::NoteStore;
-        use project_orchestrator::notes::{Note, NoteType};
+        use project_orchestrator::notes::models::{Note, NoteType};
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
         let store = open(&base).await;
@@ -5886,7 +5886,7 @@ mod with_the_feature {
     #[tokio::test]
     async fn personas_and_feature_graphs_survive_a_reopen() {
         use project_orchestrator::neo4j::models::PersonaStatus;
-        use project_orchestrator::notes::{Note, NoteType};
+        use project_orchestrator::notes::models::{Note, NoteType};
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
         let store = open(&base).await;
@@ -6395,7 +6395,7 @@ mod with_the_feature {
     /// as whole with part of its edges gone.
     #[tokio::test]
     async fn an_interrupted_persona_or_feature_graph_deletion_is_finished_at_open() {
-        use project_orchestrator::notes::{Note, NoteType};
+        use project_orchestrator::notes::models::{Note, NoteType};
         let dir = tempfile::tempdir().unwrap();
         let mut atteints = 0;
         for graphe in [false, true] {
@@ -6589,7 +6589,7 @@ mod with_the_feature {
     /// rescope, retrait, suppression de la note membre (DETACH) et du skill.
     #[tokio::test]
     async fn skills_et_registre_survivent_une_reouverture() {
-        use project_orchestrator::notes::{Note, NoteType};
+        use project_orchestrator::notes::models::{Note, NoteType};
         use project_orchestrator::skills::{SkillNode, SkillStatus, SkillTrigger};
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
@@ -6992,7 +6992,7 @@ mod with_the_feature {
         use project_orchestrator::episodes::distill_models::{
             ConsentCounts, PrivacyMode, SharingConsent, SharingEvent, SharingPolicy,
         };
-        use project_orchestrator::notes::{Note, NoteType};
+        use project_orchestrator::notes::models::{Note, NoteType};
         use project_orchestrator::reception::anchor::SignedTombstone;
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
@@ -7330,5 +7330,363 @@ mod with_the_feature {
                 .collect::<Vec<_>>(),
             [b.ok]
         );
+    }
+
+    // ------------------------------------------------------------------
+    // A date is read under its three stored forms
+    // ------------------------------------------------------------------
+
+    /// The three forms a date has in an obrain base: the ISO string this backend
+    /// writes, the `Timestamp` a Cypher `datetime()` leaves, and the
+    /// `ZonedDatetime` the Neo4j migration tool writes.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum FormeDate {
+        Iso,
+        Timestamp,
+        Zonee,
+    }
+
+    fn sous_forme(forme: FormeDate, d: chrono::DateTime<Utc>) -> Value {
+        use obrain_common::types::{Timestamp, ZonedDatetime};
+        let n = d.timestamp_nanos_opt().unwrap();
+        match forme {
+            FormeDate::Iso => Value::from(d.to_rfc3339()),
+            FormeDate::Timestamp => Value::Timestamp(Timestamp::from_nanos(n)),
+            // Exactly what the migration tool builds from a Neo4j `DateTime`.
+            FormeDate::Zonee => Value::ZonedDatetime(ZonedDatetime::from_timestamp_offset(
+                Timestamp::from_nanos(n),
+                0,
+            )),
+        }
+    }
+
+    /// Rewrites, through the engine, every string property that is a date (on
+    /// nodes and on edges) under `forme`. Returns how many were rewritten.
+    fn retyper_les_dates(db: &obrain_engine::ObrainDB, forme: FormeDate) -> usize {
+        let conv = |v: &Value| {
+            v.as_str()
+                .and_then(|s| s.parse::<chrono::DateTime<Utc>>().ok())
+                .map(|d| sous_forme(forme, d))
+        };
+        let mut n = 0;
+        for noeud in db.store().node_ids() {
+            let Some(node) = db.get_node(noeud) else {
+                continue;
+            };
+            let maj: Vec<(String, Value)> = node
+                .properties
+                .iter()
+                .filter_map(|(k, v)| conv(v).map(|v| (k.as_str().to_string(), v)))
+                .collect();
+            for (k, v) in maj {
+                db.set_node_property(noeud, &k, v);
+                n += 1;
+            }
+            for (_, arete) in db
+                .store()
+                .edges_from(noeud, obrain_core::graph::Direction::Outgoing)
+            {
+                let Some(e) = db.get_edge(arete) else {
+                    continue;
+                };
+                let maj: Vec<(String, Value)> = e
+                    .properties
+                    .iter()
+                    .filter_map(|(k, v)| conv(v).map(|v| (k.as_str().to_string(), v)))
+                    .collect();
+                for (k, v) in maj {
+                    db.set_edge_property(arete, &k, v);
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// A JSON value where every date string is replaced by its microseconds since
+    /// the epoch: two readings compare equal when their dates agree to the
+    /// microsecond (what a `ZonedDatetime` keeps).
+    fn a_la_microseconde(v: serde_json::Value) -> serde_json::Value {
+        use serde_json::Value as J;
+        match v {
+            J::String(s) => match s.parse::<chrono::DateTime<Utc>>() {
+                Ok(d) => J::String(format!("µs:{}", d.timestamp_micros())),
+                Err(_) => J::String(s),
+            },
+            J::Array(a) => J::Array(a.into_iter().map(a_la_microseconde).collect()),
+            J::Object(o) => J::Object(
+                o.into_iter()
+                    .map(|(k, v)| (k, a_la_microseconde(v)))
+                    .collect(),
+            ),
+            autre => autre,
+        }
+    }
+
+    /// A base whose dates are all under `forme`, a Project, a Plan, a Task, a Step,
+    /// a Note, a Persona and a Decision in it: it opens with nothing quarantined
+    /// and every date reads as it was written, to the microsecond.
+    async fn une_base_aux_dates_sous(forme: FormeDate) {
+        use chrono::TimeZone;
+        use project_orchestrator::neo4j::models::{StepNode, StepStatus, TaskNode, TaskStatus};
+        use project_orchestrator::notes::models::{Note, NoteType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+
+        // Sub-microsecond digits on purpose: the migration tool truncates them.
+        let cree = Utc.timestamp_opt(1_770_747_886, 858_105_123).unwrap();
+        let mut p = a_project("dates");
+        p.created_at = cree;
+        store.create_project(&p).await.unwrap();
+        store.update_project_synced(p.id).await.unwrap();
+
+        let mut plan = a_plan(Some(p.id));
+        plan.created_at = cree;
+        store.create_plan(&plan).await.unwrap();
+
+        let tache = TaskNode {
+            id: Uuid::new_v4(),
+            title: Some("tâche datée".into()),
+            description: "d".into(),
+            status: TaskStatus::Pending,
+            assigned_to: None,
+            interrupted_at: None,
+            interrupted_reason: None,
+            priority: Some(1),
+            tags: vec![],
+            acceptance_criteria: vec![],
+            affected_files: vec![],
+            estimated_complexity: None,
+            actual_complexity: None,
+            due_date: chrono::NaiveDate::from_ymd_opt(2026, 12, 1),
+            estimated_minutes: None,
+            created_at: cree,
+            updated_at: None,
+            started_at: None,
+            completed_at: None,
+            frustration_score: 0.0,
+            execution_context: None,
+            persona: None,
+            prompt_cache: None,
+        };
+        store.create_task(plan.id, &tache).await.unwrap();
+        store
+            .update_task_status(tache.id, TaskStatus::InProgress)
+            .await
+            .unwrap();
+        let etape = StepNode {
+            id: Uuid::new_v4(),
+            order: 0,
+            description: "étape datée".into(),
+            status: StepStatus::Pending,
+            verification: None,
+            created_at: cree,
+            updated_at: None,
+            completed_at: None,
+            execution_context: None,
+            persona: None,
+        };
+        store.create_step(tache.id, &etape).await.unwrap();
+        store
+            .update_step_status(etape.id, StepStatus::Completed)
+            .await
+            .unwrap();
+
+        let mut note = Note::new(
+            Some(p.id),
+            NoteType::Gotcha,
+            "une note datée".to_string(),
+            "alice".to_string(),
+        );
+        note.created_at = cree;
+        store.create_note(&note).await.unwrap();
+        store.confirm_note(note.id, "bob").await.unwrap().unwrap();
+
+        let mut persona = a_persona(Some(p.id), "datée", 0.5);
+        persona.created_at = cree;
+        store.create_persona(&persona).await.unwrap();
+        store
+            .increment_persona_activation(persona.id)
+            .await
+            .unwrap();
+
+        async fn lecture(
+            store: &ObrainGraphStore,
+            ids: (Uuid, Uuid, Uuid, Uuid, Uuid),
+        ) -> serde_json::Value {
+            let (projet, plan, tache, note, persona) = ids;
+            a_la_microseconde(serde_json::json!({
+                "projet": store.get_project(projet).await.unwrap().unwrap(),
+                "plan": store.get_plan(plan).await.unwrap().unwrap(),
+                "tache": store.get_task(tache).await.unwrap().unwrap(),
+                "etapes": store.get_task_steps(tache).await.unwrap(),
+                "note": store.get_note(note).await.unwrap().unwrap(),
+                "persona": store.get_persona(persona).await.unwrap().unwrap(),
+            }))
+        }
+        let ids = (p.id, plan.id, tache.id, note.id, persona.id);
+        let avant = lecture(&store, ids).await;
+        // Precondition: the optional dates this test is about are there to lose.
+        let persona_avant = store.get_persona(persona.id).await.unwrap().unwrap();
+        assert!(persona_avant.last_activated.is_some() && persona_avant.updated_at.is_some());
+        let tache_avant = store.get_task(tache.id).await.unwrap().unwrap();
+        assert!(tache_avant.started_at.is_some() && tache_avant.updated_at.is_some());
+        store.close().await.unwrap();
+        drop(store);
+
+        // The decision is written through the engine (its creation is not ported),
+        // then every date of the base is put under the form under test.
+        let decide = Utc.timestamp_opt(1_794_620_398, 350_634_000).unwrap();
+        let did = Uuid::new_v4();
+        let retypees = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let compte = retypees.clone();
+        write_foreign(&base, move |db| {
+            db.create_node_with_props(
+                &["Decision"],
+                vec![
+                    ("id", Value::from(did.to_string())),
+                    ("description", Value::from("d")),
+                    ("rationale", Value::from("r")),
+                    ("status", Value::from("accepted")),
+                    ("decided_by", Value::from("alice")),
+                    ("decided_at", Value::from(decide.to_rfc3339())),
+                ],
+            );
+            compte.store(
+                retyper_les_dates(db, forme),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        })
+        .await;
+        // Project 2, plan 1, task 3, step 3, note 3 at least, persona 3, decision 1.
+        let retypees = retypees.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(retypees >= 16, "{forme:?}: {retypees} dates réécrites");
+
+        let store = open(&base).await;
+        let rapport = store.rapport_d_ouverture().clone();
+        assert!(
+            rapport.en_quarantaine.is_empty(),
+            "{forme:?}: {:#?}",
+            rapport.en_quarantaine
+        );
+        let apres = lecture(&store, ids).await;
+        assert_eq!(apres, avant, "{forme:?}");
+
+        let decision = store.get_decision(did).await.unwrap().unwrap();
+        assert_eq!(decision.decided_at, decide, "{forme:?}");
+        let relue = store.get_persona(persona.id).await.unwrap().unwrap();
+        assert_eq!(
+            relue.last_activated.map(|d| d.timestamp_micros()),
+            persona_avant.last_activated.map(|d| d.timestamp_micros()),
+            "{forme:?}"
+        );
+        assert_eq!(
+            relue.updated_at.map(|d| d.timestamp_micros()),
+            persona_avant.updated_at.map(|d| d.timestamp_micros()),
+            "{forme:?}"
+        );
+        assert_eq!(relue.created_at.timestamp_micros(), cree.timestamp_micros());
+
+        // A node whose dates are under another form is still written to.
+        store
+            .increment_persona_activation(persona.id)
+            .await
+            .unwrap();
+        let reactivee = store.get_persona(persona.id).await.unwrap().unwrap();
+        assert!(reactivee.last_activated >= relue.last_activated);
+        assert_eq!(
+            reactivee.created_at.timestamp_micros(),
+            cree.timestamp_micros()
+        );
+    }
+
+    #[tokio::test]
+    async fn une_base_aux_dates_zonees_s_ouvre_sans_quarantaine_et_rend_ses_dates() {
+        une_base_aux_dates_sous(FormeDate::Zonee).await;
+    }
+
+    #[tokio::test]
+    async fn une_base_aux_dates_timestamp_s_ouvre_sans_quarantaine_et_rend_ses_dates() {
+        une_base_aux_dates_sous(FormeDate::Timestamp).await;
+    }
+
+    #[tokio::test]
+    async fn une_base_aux_dates_iso_s_ouvre_sans_quarantaine_et_rend_ses_dates() {
+        une_base_aux_dates_sous(FormeDate::Iso).await;
+    }
+
+    /// A date that is there but is not a date: the node is quarantined and the
+    /// message names the property and the variant received. Never "now", never
+    /// absent.
+    #[tokio::test]
+    async fn une_date_presente_mais_illisible_met_en_quarantaine_et_nomme_sa_variante() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project("date illisible");
+        store.create_project(&p).await.unwrap();
+        let persona = a_persona(None, "date illisible", 0.5);
+        store.create_persona(&persona).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+
+        let (pid, perso, did) = (p.id.to_string(), persona.id.to_string(), Uuid::new_v4());
+        write_foreign(&base, move |db| {
+            let noeud_de = |label: &str, id: &str| {
+                db.store()
+                    .nodes_by_label(label)
+                    .into_iter()
+                    .find(|n| {
+                        db.get_node(*n)
+                            .and_then(|n| {
+                                n.get_property("id")
+                                    .and_then(|v| v.as_str().map(|s| s == id))
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap()
+            };
+            // Required, of another type.
+            db.set_node_property(noeud_de("Project", &pid), "created_at", Value::Int64(5));
+            // Optional, of another type.
+            db.set_node_property(
+                noeud_de("Persona", &perso),
+                "updated_at",
+                Value::Float64(1.5),
+            );
+            // The one that used to read as "now".
+            db.create_node_with_props(
+                &["Decision"],
+                vec![
+                    ("id", Value::from(did.to_string())),
+                    ("description", Value::from("d")),
+                    ("rationale", Value::from("r")),
+                    ("status", Value::from("accepted")),
+                    ("decided_at", Value::Bool(true)),
+                ],
+            );
+        })
+        .await;
+
+        let store = open(&base).await;
+        let quarantaine = store.rapport_d_ouverture().en_quarantaine.clone();
+        assert_eq!(quarantaine.len(), 3, "{quarantaine:#?}");
+        for (label, propriete, variante) in [
+            ("Project", "`created_at`", "INT64"),
+            ("Persona", "`updated_at`", "FLOAT64"),
+            ("Decision", "`decided_at`", "BOOL"),
+        ] {
+            assert!(
+                quarantaine
+                    .iter()
+                    .any(|m| m.contains(label) && m.contains(propriete) && m.contains(variante)),
+                "aucun message ne nomme {label} {propriete} {variante} : {quarantaine:#?}"
+            );
+        }
+        assert!(store.get_project(p.id).await.unwrap().is_none());
+        assert!(!matches!(store.get_decision(did).await, Ok(Some(_))));
+        assert!(!matches!(store.get_persona(persona.id).await, Ok(Some(_))));
     }
 }

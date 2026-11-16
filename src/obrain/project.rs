@@ -88,7 +88,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use obrain_common::types::{NodeId, Value};
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
@@ -211,12 +211,16 @@ impl IndexProjets {
                 rapport.brouillons_supprimes += 1;
                 continue;
             }
-            let Ok(projet) = lire_projet(&get) else {
-                // Not ours: no marker, and not addressable.
-                rapport.en_quarantaine.push(format!(
-                    "nœud Project {noeud:?} : id/name/slug/created_at illisibles"
-                ));
-                continue;
+            let projet = match lire_projet(&get) {
+                Ok(projet) => projet,
+                Err(e) => {
+                    // Not ours: no marker, and not addressable. The message keeps
+                    // the cause: which property, and what was found there.
+                    rapport
+                        .en_quarantaine
+                        .push(format!("nœud Project {noeud:?} : {e:#}"));
+                    continue;
+                }
             };
 
             if index.par_id.contains_key(&projet.id) {
@@ -270,16 +274,13 @@ impl IndexProjets {
 /// answers `None` for an absent or null property.
 fn lire_projet(get: &dyn Fn(&str) -> Option<Value>) -> Result<ProjectNode> {
     let chaine = |cle: &str| get(cle).and_then(|v| v.as_str().map(str::to_string));
-    let instant = |cle: &str| chaine(cle).and_then(|s| s.parse::<DateTime<Utc>>().ok());
 
     let id: Uuid = chaine("id")
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("nœud Project sans propriété `id` lisible"))?;
-    let created_at =
-        chaine("created_at").ok_or_else(|| anyhow!("projet {id} sans propriété `created_at`"))?;
-    let created_at: DateTime<Utc> = created_at
-        .parse()
-        .map_err(|e| anyhow!("projet {id} : `created_at` illisible (« {created_at} ») : {e}"))?;
+    let quoi = format!("projet {id}");
+    let instant = |cle: &str| super::date::facultative(get, cle, &quoi);
+    let created_at = super::date::requise(get, "created_at", &quoi)?;
 
     Ok(ProjectNode {
         id,
@@ -289,9 +290,9 @@ fn lire_projet(get: &dyn Fn(&str) -> Option<Value>) -> Result<ProjectNode> {
         root_path: chaine("root_path").unwrap_or_default(),
         description: chaine("description"),
         created_at,
-        last_synced: instant("last_synced"),
-        analytics_computed_at: instant("analytics_computed_at"),
-        last_co_change_computed_at: instant("last_co_change_computed_at"),
+        last_synced: instant("last_synced")?,
+        analytics_computed_at: instant("analytics_computed_at")?,
+        last_co_change_computed_at: instant("last_co_change_computed_at")?,
         // None means default (1.0).
         default_note_energy: get("default_note_energy")
             .and_then(|v| v.as_float64())

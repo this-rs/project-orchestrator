@@ -391,21 +391,20 @@ fn lecteur(db: &ObrainDB, noeud: NodeId) -> Result<impl Fn(&str) -> Option<Value
 /// `Neo4jClient::node_to_note`. Returns the note and its `updated_at`.
 fn lire_note(get: &dyn Fn(&str) -> Option<Value>) -> Result<(Note, Option<DateTime<Utc>>)> {
     let chaine = |cle: &str| get(cle).and_then(|v| v.as_str().map(str::to_string));
-    let instant = |cle: &str| chaine(cle).and_then(|s| s.parse::<DateTime<Utc>>().ok());
     let entier = |cle: &str| get(cle).and_then(|v| v.as_int64());
     let reel = |cle: &str| get(cle).and_then(|v| v.as_float64());
 
     let id: Uuid = chaine("id")
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("nœud Note sans propriété `id` lisible"))?;
+    let quoi = format!("note {id}");
+    let instant = |cle: &str| super::date::facultative(get, cle, &quoi);
     let requis = |cle: &str| chaine(cle).ok_or_else(|| anyhow!("note {id} sans propriété `{cle}`"));
     let status_brut = requis("status")?;
     let note_type_brut = requis("note_type")?;
     let created_by = requis("created_by")?;
     let content = requis("content")?;
-    let created_at: DateTime<Utc> = requis("created_at")?
-        .parse()
-        .map_err(|e| anyhow!("note {id} : `created_at` illisible : {e}"))?;
+    let created_at = super::date::requise(get, "created_at", &quoi)?;
     let type_scope = chaine("scope_type").unwrap_or_else(|| "project".to_string());
     let chemin_scope = chaine("scope_path").unwrap_or_default();
     let tags = get("tags")
@@ -442,9 +441,9 @@ fn lire_note(get: &dyn Fn(&str) -> Option<Value>) -> Result<(Note, Option<DateTi
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| NoteAuthorKind::infer_from_created_by(&created_by)),
         confidence: reel("confidence"),
-        human_confirmed_at: instant("human_confirmed_at"),
+        human_confirmed_at: instant("human_confirmed_at")?,
         human_confirmed_by: chaine("human_confirmed_by").filter(|s| !s.is_empty()),
-        last_confirmed_at: instant("last_confirmed_at"),
+        last_confirmed_at: instant("last_confirmed_at")?,
         last_confirmed_by: chaine("last_confirmed_by"),
         staleness_score: reel("staleness_score").unwrap_or(0.0),
         energy: reel("energy").unwrap_or(1.0),
@@ -453,11 +452,11 @@ fn lire_note(get: &dyn Fn(&str) -> Option<Value>) -> Result<(Note, Option<DateTi
             .and_then(|s| s.parse().ok())
             .unwrap_or(MemoryHorizon::Consolidated),
         activation_count: entier("activation_count").unwrap_or(0),
-        last_activated: instant("last_activated"),
+        last_activated: instant("last_activated")?,
         supersedes: chaine("supersedes").and_then(|s| s.parse().ok()),
         superseded_by: chaine("superseded_by").and_then(|s| s.parse().ok()),
-        valid_from: instant("valid_from"),
-        valid_until: instant("valid_until"),
+        valid_from: instant("valid_from")?,
+        valid_until: instant("valid_until")?,
         revision: (!revision_json.is_empty())
             .then(|| serde_json::from_str(&revision_json).ok())
             .flatten(),
@@ -470,11 +469,12 @@ fn lire_note(get: &dyn Fn(&str) -> Option<Value>) -> Result<(Note, Option<DateTi
             .flatten(),
         revision_reason: chaine("revision_reason").filter(|s| !s.is_empty()),
         reactivation_count: entier("reactivation_count").unwrap_or(0),
-        last_reactivated: instant("last_reactivated"),
-        freshness_pinged_at: instant("freshness_pinged_at"),
+        last_reactivated: instant("last_reactivated")?,
+        freshness_pinged_at: instant("freshness_pinged_at")?,
         sharing_consent: consentement_lu(get, id)?,
     };
-    Ok((note, instant("updated_at")))
+    let mise_a_jour = instant("updated_at")?;
+    Ok((note, mise_a_jour))
 }
 
 /// The sharing consent of a note node. ABSENT is `NotSet` (a note written before
@@ -730,15 +730,28 @@ impl IndexNotes {
                     e.get_property(cle)
                         .and_then(|v| v.as_str().map(str::to_string))
                 };
+                let last_verified = match super::date::de_valeur(
+                    e.get_property("last_verified"),
+                    "last_verified",
+                    &format!("arête {LIEN} {arete:?} de la note {id}"),
+                ) {
+                    // ABSENT: "now", as Neo4j's decoding of an anchor.
+                    Ok(d) => d.unwrap_or_else(Utc::now),
+                    // PRESENT and not a date: the link is not served with an
+                    // invented date, and the note says it has one it cannot resolve.
+                    Err(err) => {
+                        rapport.en_quarantaine.push(format!("{err:#}"));
+                        non_resolus += 1;
+                        continue;
+                    }
+                };
                 liens.push(Lien {
                     entite,
                     id_entite,
                     arete,
                     signature_hash: texte("signature_hash").filter(|s| !s.is_empty()),
                     body_hash: texte("body_hash").filter(|s| !s.is_empty()),
-                    last_verified: texte("last_verified")
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or_else(Utc::now),
+                    last_verified,
                 });
             }
             liens_par_note.push((*id, liens, non_resolus, doublons));

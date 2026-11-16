@@ -35,9 +35,11 @@
 //! - the project-to-server edge `HAS_MCP_SERVER` (Neo4j's `MERGE (p)-[:HAS_MCP_SERVER]->(s)`)
 //!   is not written either: nothing reads it, the project is the `project_id`
 //!   property, which is `Uuid::nil()` in production;
-//! - an optional timestamp (`updated_at`, `last_connected_at`) that does not parse
-//!   reads as absent, as on Neo4j; a `created_at` that does not parse quarantines
-//!   the node;
+//! - a timestamp is read by the one decoder of `date.rs` (ISO string, `Timestamp`
+//!   or `ZonedDatetime`). An optional one (`updated_at`, `last_connected_at`)
+//!   stored as a STRING that does not parse reads as absent, as on Neo4j (the
+//!   server is still served and reconnected); stored under a variant that is not
+//!   a date, it quarantines the node, as a `created_at` that does not parse does;
 //! - two nodes with the same `id` (a corrupted base: creation refuses a duplicate)
 //!   are resolved at open in the engine's slot order (`nodes_by_label` is sorted
 //!   by node id): the first created is kept, the others are quarantined and named.
@@ -257,13 +259,18 @@ impl IndexFederation {
     }
 }
 
-fn instant(brut: Option<String>, cle: &str) -> Result<Option<DateTime<Utc>>> {
-    brut.filter(|s| !s.is_empty())
-        .map(|s| {
-            s.parse::<DateTime<Utc>>()
-                .map_err(|e| anyhow!("`{cle}` illisible (« {s} ») : {e}"))
-        })
-        .transpose()
+/// An optional timestamp, read by the one decoder (`date.rs`). A STRING that does
+/// not parse reads as absent, as Neo4j's `.ok()` (module doc); another variant
+/// that is not a date is an error.
+fn instant_facultatif(
+    get: &dyn Fn(&str) -> Option<Value>,
+    cle: &str,
+    quoi: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    match get(cle) {
+        Some(v @ Value::String(_)) => Ok(super::date::decoder(&v).ok()),
+        _ => super::date::facultative(get, cle, quoi),
+    }
 }
 
 /// A `McpServer` from a property lookup: the counterpart of
@@ -285,8 +292,9 @@ fn lire_serveur(get: &dyn Fn(&str) -> Option<Value>) -> Result<McpServerNode> {
         .map_err(|e| anyhow!("serveur MCP {id} : `project_id` illisible : {e}"))?;
     let server_id =
         texte("server_id").ok_or_else(|| anyhow!("serveur MCP {id} sans `server_id`"))?;
-    let created_at = instant(texte("created_at"), "created_at")?
-        .ok_or_else(|| anyhow!("serveur MCP {id} sans `created_at`"))?;
+    let quoi = format!("serveur MCP {id}");
+    let created_at = super::date::facultative(get, "created_at", &quoi)?
+        .ok_or_else(|| anyhow!("{quoi} sans `created_at`"))?;
 
     Ok(McpServerNode {
         id,
@@ -306,11 +314,8 @@ fn lire_serveur(get: &dyn Fn(&str) -> Option<Value>) -> Result<McpServerNode> {
             .unwrap_or(0)
             .max(0) as usize,
         created_at,
-        // Optional: unreadable reads as absent, as Neo4j's `.ok()` (module doc).
-        updated_at: instant(texte("updated_at"), "updated_at").ok().flatten(),
-        last_connected_at: instant(texte("last_connected_at"), "last_connected_at")
-            .ok()
-            .flatten(),
+        updated_at: instant_facultatif(get, "updated_at", &quoi)?,
+        last_connected_at: instant_facultatif(get, "last_connected_at", &quoi)?,
     })
 }
 
@@ -325,8 +330,9 @@ fn lire_outil(get: &dyn Fn(&str) -> Option<Value>) -> Result<McpToolNode> {
     let server_id = texte("server_id").ok_or_else(|| anyhow!("outil MCP {id} sans `server_id`"))?;
     let name = texte("name").ok_or_else(|| anyhow!("outil MCP {id} sans `name`"))?;
     let fqn = texte("fqn").ok_or_else(|| anyhow!("outil MCP {id} sans `fqn`"))?;
-    let created_at = instant(texte("created_at"), "created_at")?
-        .ok_or_else(|| anyhow!("outil MCP {id} sans `created_at`"))?;
+    let quoi = format!("outil MCP {id}");
+    let created_at = super::date::facultative(get, "created_at", &quoi)?
+        .ok_or_else(|| anyhow!("{quoi} sans `created_at`"))?;
 
     Ok(McpToolNode {
         id,
@@ -338,7 +344,7 @@ fn lire_outil(get: &dyn Fn(&str) -> Option<Value>) -> Result<McpToolNode> {
         category: texte("category").unwrap_or_else(|| "unknown".to_string()),
         embedding: texte("embedding").filter(|s| !s.is_empty()),
         created_at,
-        updated_at: instant(texte("updated_at"), "updated_at").ok().flatten(),
+        updated_at: instant_facultatif(get, "updated_at", &quoi)?,
     })
 }
 

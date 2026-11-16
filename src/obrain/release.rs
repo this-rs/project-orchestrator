@@ -412,8 +412,8 @@ fn chaine_pleine(get: Lecture<'_>, cle: &str) -> Option<String> {
     chaine(get, cle).filter(|s| !s.is_empty())
 }
 
-fn instant(get: Lecture<'_>, cle: &str) -> Option<DateTime<Utc>> {
-    chaine_pleine(get, cle).and_then(|s| s.parse().ok())
+fn instant(get: Lecture<'_>, cle: &str, de: &str) -> Result<Option<DateTime<Utc>>> {
+    super::date::facultative(get, cle, de)
 }
 
 fn uuid_requis(get: Lecture<'_>, cle: &str, de: &str) -> Result<Uuid> {
@@ -427,9 +427,7 @@ fn texte_requis(get: Lecture<'_>, cle: &str, de: &str) -> Result<String> {
 }
 
 fn instant_requis(get: Lecture<'_>, cle: &str, de: &str) -> Result<DateTime<Utc>> {
-    let brut = chaine_pleine(get, cle).ok_or_else(|| anyhow!("{de} sans `{cle}`"))?;
-    brut.parse::<DateTime<Utc>>()
-        .with_context(|| format!("{de} : `{cle}` illisible (« {brut} »)"))
+    super::date::requise(get, cle, de)
 }
 
 /// A `status` stored as snake_case (or PascalCase, from an older writer). Absent
@@ -468,8 +466,8 @@ fn lire_release(get: Lecture<'_>) -> Result<ReleaseNode> {
         title: chaine_pleine(get, "title"),
         description: chaine_pleine(get, "description"),
         status: statut_requis(get, DE)?.unwrap_or(ReleaseStatus::Planned),
-        target_date: instant(get, "target_date"),
-        released_at: instant(get, "released_at"),
+        target_date: instant(get, "target_date", DE)?,
+        released_at: instant(get, "released_at", DE)?,
         created_at: instant_requis(get, "created_at", DE)?,
         project_id: uuid_requis(get, "project_id", DE)?,
     })
@@ -504,7 +502,7 @@ fn lire_deploiement(get: Lecture<'_>) -> Result<DeploymentNode> {
         notes: chaine_pleine(get, "notes"),
         created_by: chaine(get, "created_by").unwrap_or_default(),
         started_at: instant_requis(get, "started_at", DE)?,
-        finished_at: instant(get, "finished_at"),
+        finished_at: instant(get, "finished_at", DE)?,
     })
 }
 
@@ -515,8 +513,8 @@ fn lire_jalon(get: Lecture<'_>) -> Result<MilestoneNode> {
         title: texte_requis(get, "title", DE)?,
         description: chaine_pleine(get, "description"),
         status: statut_requis(get, DE)?.unwrap_or(MilestoneStatus::Open),
-        target_date: instant(get, "target_date"),
-        closed_at: instant(get, "closed_at"),
+        target_date: instant(get, "target_date", DE)?,
+        closed_at: instant(get, "closed_at", DE)?,
         created_at: instant_requis(get, "created_at", DE)?,
         project_id: uuid_requis(get, "project_id", DE)?,
     })

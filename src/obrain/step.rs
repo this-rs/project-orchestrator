@@ -20,7 +20,7 @@
 //! nothing and answers `Ok`).
 
 use anyhow::{anyhow, bail, Result};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use obrain_common::types::{NodeId, Value};
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
@@ -56,10 +56,11 @@ fn statut_depuis(s: &str) -> Option<StepStatus> {
 /// on an unknown status and an unreadable `created_at`).
 pub(super) fn lire_etape(get: &dyn Fn(&str) -> Option<Value>) -> Result<StepNode> {
     let chaine = |cle: &str| get(cle).and_then(|v| v.as_str().map(str::to_string));
-    let instant = |cle: &str| chaine(cle).and_then(|s| s.parse::<DateTime<Utc>>().ok());
     let id: Uuid = chaine("id")
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("nœud Step sans propriété `id` lisible"))?;
+    let quoi = format!("étape {id}");
+    let instant = |cle: &str| super::date::facultative(get, cle, &quoi);
     let requise =
         |cle: &str| chaine(cle).ok_or_else(|| anyhow!("étape {id} sans propriété `{cle}`"));
     let ordre = get("order")
@@ -68,10 +69,7 @@ pub(super) fn lire_etape(get: &dyn Fn(&str) -> Option<Value>) -> Result<StepNode
     let statut_brut = requise("status")?;
     let status = statut_depuis(&statut_brut)
         .ok_or_else(|| anyhow!("étape {id} : statut inconnu « {statut_brut} »"))?;
-    let cree_brut = requise("created_at")?;
-    let created_at: DateTime<Utc> = cree_brut
-        .parse()
-        .map_err(|e| anyhow!("étape {id} : `created_at` illisible (« {cree_brut} ») : {e}"))?;
+    let created_at = super::date::requise(get, "created_at", &quoi)?;
     Ok(StepNode {
         id,
         // Neo4j's `unsigned`: a negative reads 0, too large saturates.
@@ -80,8 +78,8 @@ pub(super) fn lire_etape(get: &dyn Fn(&str) -> Option<Value>) -> Result<StepNode
         status,
         verification: chaine("verification").filter(|s| !s.is_empty()),
         created_at,
-        updated_at: instant("updated_at"),
-        completed_at: instant("completed_at"),
+        updated_at: instant("updated_at")?,
+        completed_at: instant("completed_at")?,
         execution_context: None,
         persona: None,
     })

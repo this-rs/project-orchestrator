@@ -192,9 +192,7 @@ pub(super) fn uuid_facultatif(get: Lecteur, cle: &str, quoi: &str) -> Result<Opt
 }
 
 pub(super) fn date_requise(get: Lecteur, cle: &str, quoi: &str) -> Result<DateTime<Utc>> {
-    let brut = requise(get, cle, quoi)?;
-    brut.parse()
-        .map_err(|e| anyhow!("{quoi} : `{cle}` illisible (« {brut} ») : {e}"))
+    super::date::requise(get, cle, quoi)
 }
 
 pub(super) fn date_facultative(
@@ -202,12 +200,7 @@ pub(super) fn date_facultative(
     cle: &str,
     quoi: &str,
 ) -> Result<Option<DateTime<Utc>>> {
-    facultative(get, cle)
-        .map(|brut| {
-            brut.parse()
-                .map_err(|e| anyhow!("{quoi} : `{cle}` illisible (« {brut} ») : {e}"))
-        })
-        .transpose()
+    super::date::facultative(get, cle, quoi)
 }
 
 /// An enum property: absent or empty reads as the default; an unknown spelling is

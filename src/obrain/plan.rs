@@ -91,7 +91,6 @@ use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use obrain_common::types::{NodeId, Value};
 use obrain_engine::ObrainDB;
 use uuid::Uuid;
@@ -173,10 +172,7 @@ fn lire_plan(get: &dyn Fn(&str) -> Option<Value>) -> Result<(PlanNode, String)> 
         .ok_or_else(|| anyhow!("nœud Plan sans propriété `id` lisible"))?;
     let requise =
         |cle: &str| chaine(cle).ok_or_else(|| anyhow!("plan {id} sans propriété `{cle}`"));
-    let created_at_brut = requise("created_at")?;
-    let created_at: DateTime<Utc> = created_at_brut
-        .parse()
-        .map_err(|e| anyhow!("plan {id} : `created_at` illisible (« {created_at_brut} ») : {e}"))?;
+    let created_at = super::date::requise(get, "created_at", &format!("plan {id}"))?;
     let statut = requise("status")?;
     let plan = PlanNode {
         id,
@@ -769,7 +765,7 @@ impl PlanStore for ObrainGraphStore {
 mod tests {
     use super::*;
     use crate::obrain::Creation;
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Utc};
 
     fn plan(titre: &str, priorite: i32, statut: PlanStatus, decalage: i64) -> PlanNode {
         PlanNode {

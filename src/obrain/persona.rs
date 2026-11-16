@@ -93,7 +93,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use obrain_common::types::{EdgeId, NodeId, Value};
 use obrain_core::graph::Direction;
 use obrain_engine::ObrainDB;
@@ -246,10 +246,8 @@ fn lire_persona(get: &dyn Fn(&str) -> Option<Value>) -> Result<PersonaNode> {
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("nœud Persona sans propriété `id` lisible"))?;
     let name = chaine("name").ok_or_else(|| anyhow!("persona {id} sans propriété `name`"))?;
-    let brut = chaine("created_at").ok_or_else(|| anyhow!("persona {id} sans `created_at`"))?;
-    let created_at: DateTime<Utc> = brut
-        .parse()
-        .map_err(|e| anyhow!("persona {id} : `created_at` illisible (« {brut} ») : {e}"))?;
+    let quoi = format!("persona {id}");
+    let created_at = super::date::requise(get, "created_at", &quoi)?;
     let status_brut = chaine("status").ok_or_else(|| anyhow!("persona {id} sans `status`"))?;
     let status: PersonaStatus = status_brut
         .parse()
@@ -283,7 +281,7 @@ fn lire_persona(get: &dyn Fn(&str) -> Option<Value>) -> Result<PersonaNode> {
             .unwrap_or(0),
         success_rate: reel("success_rate").unwrap_or(0.0),
         avg_duration_secs: reel("avg_duration_secs").unwrap_or(0.0),
-        last_activated: chaine("last_activated").and_then(|s| s.parse().ok()),
+        last_activated: super::date::facultative(get, "last_activated", &quoi)?,
         energy_boost_accumulated: reel("energy_boost_accumulated").unwrap_or(0.0),
         energy_history: chaine("energy_history")
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -292,7 +290,7 @@ fn lire_persona(get: &dyn Fn(&str) -> Option<Value>) -> Result<PersonaNode> {
             .and_then(|s| s.parse().ok())
             .unwrap_or_default(),
         created_at,
-        updated_at: chaine("updated_at").and_then(|s| s.parse().ok()),
+        updated_at: super::date::facultative(get, "updated_at", &quoi)?,
     })
 }
 

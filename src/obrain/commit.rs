@@ -230,9 +230,7 @@ fn lire_commit(get: &dyn Fn(&str) -> Option<Value>) -> Result<CommitNode> {
         |cle: &str| chaine(cle).ok_or_else(|| anyhow!("commit {hash} sans propriété `{cle}`"));
     let message = requise("message")?;
     let author = requise("author")?;
-    let timestamp = requise("timestamp")?
-        .parse::<DateTime<Utc>>()
-        .map_err(|e| anyhow!("commit {hash} : `timestamp` illisible : {e}"))?;
+    let timestamp = super::date::requise(get, "timestamp", &format!("commit {hash}"))?;
     Ok(CommitNode {
         hash,
         message,
@@ -506,7 +504,9 @@ impl IndexCommits {
                             path_a,
                             path_b,
                             count,
-                            last_at: texte("last_at"),
+                            // Kept as text by the domain value; a migrated
+                            // edge carries it as a temporal value.
+                            last_at: super::date::en_texte(e.get_property("last_at")),
                         },
                     );
                 } else {

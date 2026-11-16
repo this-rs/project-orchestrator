@@ -116,7 +116,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use obrain_common::types::{EdgeId, NodeId, Value};
 use obrain_core::graph::Direction;
 use obrain_engine::ObrainDB;
@@ -218,9 +218,11 @@ fn lire_decision(get: &dyn Fn(&str) -> Option<Value>) -> Result<DecisionNode> {
         .unwrap_or_default();
     let chosen_option = chaine("chosen_option").filter(|s| !s.is_empty());
     let decided_by = chaine("decided_by").unwrap_or_default();
-    let decided_at = chaine("decided_at")
-        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
-        .unwrap_or_else(Utc::now);
+    // ABSENT reads "now", as Neo4j's `node_to_decision`. PRESENT, it is read
+    // under its three forms, and a value that is not a date is an error (the
+    // node is quarantined): a stored date is never replaced by "now".
+    let decided_at =
+        super::date::ou_maintenant_si_absente(get, "decided_at", &format!("décision {id}"))?;
     // Neo4j's `node_to_decision` defaults a missing status to `Accepted`.
     let status = chaine("status")
         .and_then(|s| s.parse().ok())

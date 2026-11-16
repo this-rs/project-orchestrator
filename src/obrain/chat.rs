@@ -305,12 +305,18 @@ fn lire_session(get: &dyn Fn(&str) -> Option<Value>) -> Result<ChatSessionNode> 
         cwd,
         title: non_vide("title"),
         model,
-        created_at: chaine("created_at")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(Utc::now),
-        updated_at: chaine("updated_at")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(Utc::now),
+        // ABSENT reads "now", as Neo4j's decoding; a stored value is read under
+        // its three forms and is never replaced (see `date.rs`).
+        created_at: super::date::ou_maintenant_si_absente(
+            get,
+            "created_at",
+            &format!("session {id}"),
+        )?,
+        updated_at: super::date::ou_maintenant_si_absente(
+            get,
+            "updated_at",
+            &format!("session {id}"),
+        )?,
         message_count: get("message_count").and_then(|v| v.as_int64()).unwrap_or(0),
         total_cost_usd: if total_cost_usd == 0.0 {
             None
@@ -375,9 +381,7 @@ fn lire_evenement(get: &dyn Fn(&str) -> Option<Value>) -> Result<ChatEventRecord
             .ok_or_else(|| anyhow!("événement sans `seq`"))?,
         event_type: chaine("event_type").ok_or_else(|| anyhow!("événement sans `event_type`"))?,
         data: chaine("data").ok_or_else(|| anyhow!("événement sans `data`"))?,
-        created_at: chaine("created_at")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(Utc::now),
+        created_at: super::date::ou_maintenant_si_absente(get, "created_at", "événement")?,
     })
 }
 
@@ -459,8 +463,8 @@ fn lire_ancre(get: &dyn Fn(&str) -> Option<Value>) -> Result<Anchor> {
         snapshot_type: opt_non_vide(chaine("snapshot_type")),
         rev: opt_non_vide(chaine("rev")),
         version: non_signe(get("version").and_then(|v| v.as_int64()).unwrap_or(1)).max(1),
-        created_at: parse_ts(&requis("created_at")?)?,
-        updated_at: parse_ts(&requis("updated_at")?)?,
+        created_at: super::date::requise(get, "created_at", "ancre")?,
+        updated_at: super::date::requise(get, "updated_at", "ancre")?,
     })
 }
 
@@ -498,7 +502,7 @@ fn lire_evenement_ancre(get: &dyn Fn(&str) -> Option<Value>) -> Result<AnchorEve
         kind: AnchorEventKind::parse(&requis("kind")?).ok_or_else(|| bad("kind"))?,
         by: AnchorActor::parse(&requis("by")?).ok_or_else(|| bad("by"))?,
         actor: requis("actor")?,
-        at: parse_ts(&requis("at")?)?,
+        at: super::date::requise(get, "at", "journal d'ancre")?,
         before: json("before"),
         after: json("after"),
     })
@@ -558,7 +562,7 @@ fn lire_lieu(get: &dyn Fn(&str) -> Option<Value>) -> Result<ExecutionPlaceEvent>
         base_sha: requis("base_sha")?,
         branch: requis("branch")?,
         detail: opt_non_vide(chaine("detail")),
-        at: parse_ts(&requis("at")?)?,
+        at: super::date::requise(get, "at", "événement de lieu")?,
     })
 }
 

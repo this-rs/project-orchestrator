@@ -504,9 +504,7 @@ fn id_requis(get: Get<'_>, cle: &str, quoi: &str) -> Result<Uuid> {
 }
 
 fn date_requise(get: Get<'_>, cle: &str, quoi: &str) -> Result<DateTime<Utc>> {
-    let s = chaine(get, cle).ok_or_else(|| anyhow!("{quoi} sans propriété `{cle}`"))?;
-    s.parse()
-        .map_err(|e| anyhow!("{quoi} : `{cle}` illisible (« {s} ») : {e}"))
+    super::date::requise(get, cle, quoi)
 }
 
 fn optionnelle_id(get: Get<'_>, cle: &str) -> Option<Uuid> {
@@ -532,7 +530,7 @@ fn decoder_espace(get: Get<'_>) -> Result<(Uuid, WorkspaceNode)> {
         slug: chaine(get, "slug").ok_or_else(|| anyhow!("{quoi} sans `slug`"))?,
         description: chaine(get, "description"),
         created_at: date_requise(get, "created_at", &quoi)?,
-        updated_at: chaine(get, "updated_at").and_then(|s| s.parse().ok()),
+        updated_at: super::date::facultative(get, "updated_at", &quoi)?,
         metadata: chaine(get, "metadata")
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_else(|| serde_json::json!({})),
@@ -559,8 +557,8 @@ fn decoder_jalon(get: Get<'_>) -> Result<(Uuid, WorkspaceMilestoneNode)> {
         title: chaine(get, "title").ok_or_else(|| anyhow!("{quoi} sans `title`"))?,
         description: chaine(get, "description"),
         status,
-        target_date: chaine(get, "target_date").and_then(|s| s.parse().ok()),
-        closed_at: chaine(get, "closed_at").and_then(|s| s.parse().ok()),
+        target_date: super::date::facultative(get, "target_date", &quoi)?,
+        closed_at: super::date::facultative(get, "closed_at", &quoi)?,
         created_at: date_requise(get, "created_at", &quoi)?,
         tags: liste(get, "tags"),
     };
@@ -597,7 +595,7 @@ fn decoder_ressource(get: Get<'_>) -> Result<(Uuid, ResourceNode)> {
         version: chaine(get, "version"),
         description: chaine(get, "description"),
         created_at: date_requise(get, "created_at", &quoi)?,
-        updated_at: chaine(get, "updated_at").and_then(|s| s.parse().ok()),
+        updated_at: super::date::facultative(get, "updated_at", &quoi)?,
         metadata: chaine(get, "metadata")
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_else(|| serde_json::json!({})),
