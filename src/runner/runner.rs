@@ -7021,6 +7021,60 @@ mod tests {
         }
     }
 
+    /// The runner closes the steps a failed run did not reach as `skipped`
+    /// (the store has one status for "left out on purpose" and "not reached").
+    /// The next run's prompt must not forbid that remaining work.
+    #[tokio::test]
+    async fn steps_closed_by_a_failed_run_are_not_forbidden_in_the_next_prompt() {
+        use crate::neo4j::models::TaskStatus;
+        use crate::test_helpers::{test_plan, test_step, test_task};
+
+        let (runner, graph) = test_plan_runner_with_graph();
+        let plan = test_plan();
+        graph.create_plan(&plan).await.unwrap();
+        let mut task = test_task();
+        task.status = TaskStatus::InProgress;
+        graph.create_task(plan.id, &task).await.unwrap();
+        graph
+            .create_step(task.id, &test_step(1, "Write code"))
+            .await
+            .unwrap();
+        graph
+            .create_step(task.id, &test_step(2, "Run tests"))
+            .await
+            .unwrap();
+
+        let failed = TaskResult::Failed {
+            reason: "Agent crashed".to_string(),
+            attempts: 1,
+            cost_usd: 0.05,
+        };
+        runner.finalize_steps(task.id, &failed, "/tmp").await;
+
+        let context = runner
+            .context_builder
+            .build_context(task.id, plan.id)
+            .await
+            .unwrap();
+        let plain = runner.context_builder.generate_prompt(&context);
+        let enriched = runner
+            .context_builder
+            .build_prompt_builder(&context)
+            .build();
+        for prompt in [&plain, &enriched] {
+            assert!(
+                !prompt.to_lowercase().contains("do not do it"),
+                "work a failed run did not reach is not forbidden: {prompt}"
+            );
+            assert!(prompt.contains("Write code") && prompt.contains("Run tests"));
+            // The agent is told what the mark means, and when the step is still due.
+            assert!(
+                prompt.contains("not reached by a run that stopped early"),
+                "{prompt}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_finalize_steps_on_error_marks_skipped() {
         use crate::neo4j::models::{StepStatus, TaskStatus};

@@ -973,6 +973,40 @@ pub mod conformance {
         store.delete_project(p.id, &p.name).await.unwrap();
     }
 
+    /// The prompt `task enrich` caches on a task is cleared by writing an
+    /// empty string: it reads back as "no cache" (what `PlanManager` relies on
+    /// to drop a stale prompt, issue #1189), and the other enrichment fields
+    /// are left alone.
+    pub async fn check_empty_prompt_cache_reads_as_none(store: &dyn GraphStore) {
+        let p = a_project("prompt-cache");
+        store.create_project(&p).await.unwrap();
+        let plan = a_plan(p.id, "prompt cache plan", 1, Utc::now());
+        store.create_plan(&plan).await.unwrap();
+        let task = a_task(Some("cached"));
+        store.create_task(plan.id, &task).await.unwrap();
+
+        store
+            .update_task_enrichment(task.id, Some("{\"ctx\":1}"), None, Some("CACHED PROMPT"))
+            .await
+            .unwrap();
+        let cached = store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(cached.prompt_cache.as_deref(), Some("CACHED PROMPT"));
+
+        store
+            .update_task_enrichment(task.id, None, None, Some(""))
+            .await
+            .unwrap();
+        let cleared = store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(cleared.prompt_cache, None, "an empty cache is no cache");
+        assert_eq!(
+            cleared.execution_context.as_deref(),
+            Some("{\"ctx\":1}"),
+            "the other enrichment fields are untouched"
+        );
+
+        store.delete_project(p.id, &p.name).await.unwrap();
+    }
+
     // ------------------------------------------------------------------
     // 7. Sorting of a filtered list.
     // ------------------------------------------------------------------
@@ -2259,6 +2293,7 @@ macro_rules! all_checks {
                 check_absent_entity_matrix,
                 check_cascade_delete_project,
                 check_task_delete_reports_its_cascade,
+                check_empty_prompt_cache_reads_as_none,
                 check_sorting,
                 check_sorting_tie_break_paging,
                 check_pagination,

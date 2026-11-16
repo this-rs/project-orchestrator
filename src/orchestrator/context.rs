@@ -435,11 +435,7 @@ impl ContextBuilder {
 
         // Steps
         if !context.steps.is_empty() {
-            let mut s = String::new();
-            for step in &context.steps {
-                s.push_str(&render_step(step));
-            }
-            builder = builder.with_steps(s);
+            builder = builder.with_steps(render_steps(&context.steps));
         }
 
         // Knowledge Notes
@@ -643,9 +639,7 @@ impl ContextBuilder {
         // Steps
         if !context.steps.is_empty() {
             prompt.push_str("## Steps\n");
-            for step in &context.steps {
-                prompt.push_str(&render_step(step));
-            }
+            prompt.push_str(&render_steps(&context.steps));
             prompt.push('\n');
         }
 
@@ -952,30 +946,49 @@ pub struct PlanEnrichmentResult {
 // Standalone utilities
 // ============================================================================
 
-/// One step of the task, as both prompt paths list it.
+/// What the prompt says once when a step is listed as skipped.
+///
+/// `skipped` has two origins the store does not tell apart: a step left out on
+/// purpose (`step update status: skipped`), and a step the runner closed
+/// because the run stopped before reaching it (`finalize_steps` on an error, a
+/// cancellation, an exceeded budget, a timeout). An order such as "do not do
+/// it" would be right for the first and would forbid the remaining work of a
+/// retried task for the second. So the mark is explained and the agent is
+/// given the rule that holds for both.
+const SKIPPED_STEPS_LEGEND: &str =
+    "`[-]` = skipped: left out on purpose, or not reached by a run that stopped early. \
+Do such a step only if an acceptance criterion cannot hold without it.\n";
+
+/// The steps of the task, as both prompt paths list them.
 ///
 /// A skipped step used to be rendered `[ ]`, exactly like a pending one: the
-/// executing agent read it as work left to do and redid what had been ruled
-/// out (issue #1189). It keeps its line — the numbering and the `step_id` stay
-/// stable — with a mark of its own and the instruction spelled out.
-pub(crate) fn render_step(step: &crate::neo4j::models::StepNode) -> String {
-    let (mark, note) = match step.status {
-        StepStatus::Completed => ("[x]", ""),
-        StepStatus::Skipped => ("[-]", " — SKIPPED: ruled out, do not do it"),
-        StepStatus::Pending | StepStatus::InProgress => ("[ ]", ""),
-    };
-    let mut line = format!(
-        "{} {}. {}{} `[step_id: {}]`\n",
-        mark,
-        step.order + 1,
-        step.description,
-        note,
-        step.id
-    );
-    if let Some(ref verification) = step.verification {
-        line.push_str(&format!("   Verification: {}\n", verification));
+/// executing agent read it as work left to do (issue #1189). It keeps its line
+/// — the numbering and the `step_id` stay stable — with a mark of its own, and
+/// [`SKIPPED_STEPS_LEGEND`] follows the list when at least one step carries it.
+pub(crate) fn render_steps(steps: &[crate::neo4j::models::StepNode]) -> String {
+    let mut out = String::new();
+    for step in steps {
+        let (mark, note) = match step.status {
+            StepStatus::Completed => ("[x]", ""),
+            StepStatus::Skipped => ("[-]", " — skipped, not done"),
+            StepStatus::Pending | StepStatus::InProgress => ("[ ]", ""),
+        };
+        out.push_str(&format!(
+            "{} {}. {}{} `[step_id: {}]`\n",
+            mark,
+            step.order + 1,
+            step.description,
+            note,
+            step.id
+        ));
+        if let Some(ref verification) = step.verification {
+            out.push_str(&format!("   Verification: {}\n", verification));
+        }
     }
-    line
+    if steps.iter().any(|s| s.status == StepStatus::Skipped) {
+        out.push_str(SKIPPED_STEPS_LEGEND);
+    }
+    out
 }
 
 /// Pre-read affected files and format them as markdown code blocks.
@@ -1800,8 +1813,18 @@ mod tests {
                 "a skipped step must not read as unchecked work: {skipped}"
             );
             assert!(
-                skipped.starts_with("[-]") && skipped.contains("SKIPPED"),
+                skipped.starts_with("[-]") && skipped.contains("skipped"),
                 "a skipped step says so: {skipped}"
+            );
+            // "Skipped" is also what the runner writes on steps a failed run
+            // did not reach: the mark is explained, the work is not forbidden.
+            assert!(!prompt.to_lowercase().contains("do not do it"), "{prompt}");
+            assert_eq!(
+                prompt
+                    .matches("not reached by a run that stopped early")
+                    .count(),
+                1,
+                "the legend appears once: {prompt}"
             );
         }
     }

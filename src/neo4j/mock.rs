@@ -10197,7 +10197,8 @@ impl PlanStore for MockGraphStore {
                 task.persona = Some(p.to_string());
             }
             if let Some(pc) = prompt_cache {
-                task.prompt_cache = Some(pc.to_string());
+                // As Neo4j reads it back: an empty string is "no cache".
+                task.prompt_cache = Some(pc.to_string()).filter(|s| !s.is_empty());
             }
         }
         Ok(())
