@@ -4907,9 +4907,12 @@ impl PlanRunner {
     /// Finalize steps for a task on ALL exit paths (success, timeout, error, cancelled).
     ///
     /// - `Success`: pending/in_progress → completed
-    /// - `Timeout` with commits: in_progress → completed, pending → skipped
-    /// - `Timeout` without commits: all → skipped
-    /// - `Error`/`Cancelled`/`BudgetExceeded`: all → skipped
+    /// - `Timeout` with commits: in_progress → completed; the rest stays to do
+    /// - `Timeout` without commits, `Error`/`Cancelled`/`BudgetExceeded`: the
+    ///   steps are NOT touched: a run that stopped before a step was done leaves
+    ///   it to do. Closing it as `skipped` told the next run of the task not to
+    ///   do the work (issue #1189: the store has no way to tell that from a step
+    ///   skipped on purpose).
     async fn finalize_steps(
         &self,
         task_id: Uuid,
@@ -4993,14 +4996,14 @@ impl PlanRunner {
         for step in &remaining {
             let new_status = match outcome {
                 TaskResult::Success { .. } => crate::neo4j::models::StepStatus::Completed,
-                TaskResult::Timeout { .. } => {
-                    if has_commits && step.status == crate::neo4j::models::StepStatus::InProgress {
-                        crate::neo4j::models::StepStatus::Completed
-                    } else {
-                        crate::neo4j::models::StepStatus::Skipped
-                    }
+                TaskResult::Timeout { .. }
+                    if has_commits
+                        && step.status == crate::neo4j::models::StepStatus::InProgress =>
+                {
+                    crate::neo4j::models::StepStatus::Completed
                 }
-                _ => crate::neo4j::models::StepStatus::Skipped,
+                // Not reached by a run that stopped: still to do, for the next run.
+                _ => continue,
             };
 
             // Update breakdown to reflect finalized statuses
@@ -7021,12 +7024,12 @@ mod tests {
         }
     }
 
-    /// The runner closes the steps a failed run did not reach as `skipped`
-    /// (the store has one status for "left out on purpose" and "not reached").
-    /// The next run's prompt must not forbid that remaining work.
+    /// A failed run leaves its unreached steps to do, and the retry of the task
+    /// goes through `prepare_task_retry` (the path `retry_plan_task` takes): the
+    /// prompt of the retried task lists them as to-do, with no order to skip them.
     #[tokio::test]
-    async fn steps_closed_by_a_failed_run_are_not_forbidden_in_the_next_prompt() {
-        use crate::neo4j::models::TaskStatus;
+    async fn a_retried_task_is_told_its_unreached_steps_are_still_to_do() {
+        use crate::neo4j::models::{StepStatus, TaskStatus};
         use crate::test_helpers::{test_plan, test_step, test_task};
 
         let (runner, graph) = test_plan_runner_with_graph();
@@ -7036,20 +7039,37 @@ mod tests {
         task.status = TaskStatus::InProgress;
         graph.create_task(plan.id, &task).await.unwrap();
         graph
-            .create_step(task.id, &test_step(1, "Write code"))
+            .create_step(task.id, &test_step(0, "Write code"))
             .await
             .unwrap();
         graph
-            .create_step(task.id, &test_step(2, "Run tests"))
+            .create_step(task.id, &test_step(1, "Run tests"))
             .await
             .unwrap();
 
+        // The run fails: the task is failed, its steps are not finalized as skipped.
         let failed = TaskResult::Failed {
             reason: "Agent crashed".to_string(),
             attempts: 1,
             cost_usd: 0.05,
         };
         runner.finalize_steps(task.id, &failed, "/tmp").await;
+        graph
+            .update_task_status(task.id, TaskStatus::Failed)
+            .await
+            .unwrap();
+        for step in graph.get_task_steps(task.id).await.unwrap() {
+            assert_eq!(step.status, StepStatus::Pending, "{}", step.description);
+        }
+
+        // The retry: the same path as `retry_plan_task`.
+        crate::api::handlers::prepare_task_retry(graph.as_ref(), plan.id, task.id)
+            .await
+            .expect("a failed task with no active run is retried");
+        assert_eq!(
+            graph.get_task(task.id).await.unwrap().unwrap().status,
+            TaskStatus::Pending
+        );
 
         let context = runner
             .context_builder
@@ -7062,21 +7082,15 @@ mod tests {
             .build_prompt_builder(&context)
             .build();
         for prompt in [&plain, &enriched] {
-            assert!(
-                !prompt.to_lowercase().contains("do not do it"),
-                "work a failed run did not reach is not forbidden: {prompt}"
-            );
-            assert!(prompt.contains("Write code") && prompt.contains("Run tests"));
-            // The agent is told what the mark means, and when the step is still due.
-            assert!(
-                prompt.contains("not reached by a run that stopped early"),
-                "{prompt}"
-            );
+            assert!(prompt.contains("[ ] 1. Write code"), "{prompt}");
+            assert!(prompt.contains("[ ] 2. Run tests"), "{prompt}");
+            assert!(!prompt.contains("[-]"), "{prompt}");
+            assert!(!prompt.to_lowercase().contains("do not do"), "{prompt}");
         }
     }
 
     #[tokio::test]
-    async fn test_finalize_steps_on_error_marks_skipped() {
+    async fn test_finalize_steps_on_error_leaves_unreached_steps_to_do() {
         use crate::neo4j::models::{StepStatus, TaskStatus};
         use crate::test_helpers::{test_plan, test_step, test_task};
 
@@ -7105,13 +7119,13 @@ mod tests {
         };
         runner.finalize_steps(task_id, &result, "/tmp").await;
 
-        // Verify: all pending → skipped
+        // Verify: a run that stopped leaves the unreached steps to do (issue #1189)
         let steps = graph.get_task_steps(task_id).await.unwrap();
         for step in &steps {
             assert_eq!(
                 step.status,
-                StepStatus::Skipped,
-                "Step '{}' should be Skipped on error, got {:?}",
+                StepStatus::Pending,
+                "Step '{}' should stay Pending (to do) when the run stops, got {:?}",
                 step.description,
                 step.status
             );
@@ -7119,7 +7133,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_finalize_steps_on_budget_exceeded_marks_skipped() {
+    async fn test_finalize_steps_on_budget_exceeded_leaves_unreached_steps_to_do() {
         use crate::neo4j::models::{StepStatus, TaskStatus};
         use crate::test_helpers::{test_plan, test_step, test_task};
 
@@ -7146,7 +7160,7 @@ mod tests {
         runner.finalize_steps(task_id, &result, "/tmp").await;
 
         let steps = graph.get_task_steps(task_id).await.unwrap();
-        assert_eq!(steps[0].status, StepStatus::Skipped);
+        assert_eq!(steps[0].status, StepStatus::Pending);
     }
 
     #[tokio::test]
@@ -7826,7 +7840,7 @@ mod tests {
     // === T5 skipped step: test step lifecycle (in_progress → completed on success, → failed on failure) ===
 
     #[tokio::test]
-    async fn test_finalize_steps_on_failure_marks_remaining_as_skipped() {
+    async fn test_finalize_steps_on_failure_leaves_remaining_steps_to_do() {
         use crate::neo4j::models::{StepStatus, TaskStatus};
         use crate::test_helpers::{test_plan, test_step, test_task};
 
@@ -7856,7 +7870,7 @@ mod tests {
         step3.status = StepStatus::Completed;
         graph.create_step(task_id, &step3).await.unwrap();
 
-        // finalize_steps with Failed outcome — remaining steps become Skipped
+        // finalize_steps with Failed outcome — remaining steps stay Pending
         let result = TaskResult::Failed {
             reason: "compilation error".to_string(),
             attempts: 1,
@@ -7867,7 +7881,7 @@ mod tests {
         // Verify breakdown
         assert_eq!(breakdown.total, 3);
         assert_eq!(breakdown.completed, 1); // step3 was already completed
-        assert_eq!(breakdown.skipped, 2); // step1 (in_progress) + step2 (pending) → skipped
+        assert_eq!(breakdown.pending, 2); // step1 (in_progress) + step2 (pending) stays to do
 
         // Verify step statuses:
         let steps = graph.get_task_steps(task_id).await.unwrap();
@@ -7878,17 +7892,17 @@ mod tests {
         let step2_updated = steps.iter().find(|s| s.description == "Run tests").unwrap();
         let step3_updated = steps.iter().find(|s| s.description == "Setup").unwrap();
 
-        // in_progress → skipped (on failure, remaining steps are skipped)
+        // in_progress stays to do (a run that fails leaves them to do)
         assert_eq!(
             step1_updated.status,
-            StepStatus::Skipped,
-            "in_progress step should become skipped on task failure"
+            StepStatus::InProgress,
+            "in_progress step should stay to do when the run fails"
         );
-        // pending → skipped
+        // pending stays to do
         assert_eq!(
             step2_updated.status,
-            StepStatus::Skipped,
-            "pending step should become skipped on task failure"
+            StepStatus::Pending,
+            "pending step should stay to do when the run fails"
         );
         // completed stays completed
         assert_eq!(
@@ -8549,7 +8563,7 @@ mod tests {
     // === Coverage: finalize_steps with BudgetExceeded (all → skipped) ===
 
     #[tokio::test]
-    async fn test_finalize_steps_budget_exceeded_marks_skipped() {
+    async fn test_finalize_steps_budget_exceeded_leaves_unreached_steps_to_do() {
         use crate::neo4j::models::{StepStatus, TaskStatus};
         use crate::test_helpers::{test_plan, test_step, test_task};
 
@@ -8583,7 +8597,7 @@ mod tests {
         let cwd = env!("CARGO_MANIFEST_DIR");
         let breakdown = runner.finalize_steps(task_id, &outcome, cwd).await;
 
-        assert_eq!(breakdown.skipped, 2, "Both steps should be marked skipped");
+        assert_eq!(breakdown.pending, 2, "Both steps should stay to do");
         assert_eq!(breakdown.completed, 0);
         assert_eq!(breakdown.total, 2);
     }
@@ -8591,7 +8605,7 @@ mod tests {
     // === Coverage: finalize_steps with Failed outcome ===
 
     #[tokio::test]
-    async fn test_finalize_steps_failed_marks_skipped() {
+    async fn test_finalize_steps_failed_leaves_unreached_steps_to_do() {
         use crate::neo4j::models::{StepStatus, TaskStatus};
         use crate::test_helpers::{test_plan, test_step, test_task};
 
@@ -8628,16 +8642,16 @@ mod tests {
         let cwd = env!("CARGO_MANIFEST_DIR");
         let breakdown = runner.finalize_steps(task_id, &outcome, cwd).await;
 
-        // 1 already completed + 2 pending → skipped
+        // 1 already completed + 2 pending stays to do
         assert_eq!(breakdown.completed, 1);
-        assert_eq!(breakdown.skipped, 2);
+        assert_eq!(breakdown.pending, 2);
         assert_eq!(breakdown.total, 3);
     }
 
     // === Coverage: finalize_steps with Timeout (no commits) ===
 
     #[tokio::test]
-    async fn test_finalize_steps_timeout_no_commits_marks_skipped() {
+    async fn test_finalize_steps_timeout_no_commits_leaves_steps_to_do() {
         use crate::neo4j::models::{StepStatus, TaskStatus};
         use crate::test_helpers::{test_plan, test_step, test_task};
 
@@ -8670,8 +8684,8 @@ mod tests {
         let cwd = tmp.to_str().unwrap();
         let breakdown = runner.finalize_steps(task_id, &outcome, cwd).await;
 
-        // Without commits, timeout marks everything as skipped
-        assert_eq!(breakdown.skipped, 2);
+        // Without commits, timeout leaves everything to do (issue #1189)
+        assert_eq!(breakdown.pending, 2);
         assert_eq!(breakdown.completed, 0);
         assert_eq!(breakdown.total, 2);
     }

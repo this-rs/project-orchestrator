@@ -177,18 +177,18 @@ fn take_malformed_string_lists(
 ) -> serde_json::Map<String, Value> {
     let mut rejected = serde_json::Map::new();
     for key in keys {
-        let well_formed = match body.get(*key) {
+        // `[]` is refused here too: clearing a list is a contract change
+        // (#1223), not part of this PR. It is named, not silently dropped.
+        let reason = match body.get(*key) {
             None => continue,
-            Some(Value::Array(items)) => items.iter().all(Value::is_string),
-            Some(_) => false,
+            Some(Value::Array(items)) if items.is_empty() => {
+                "not written: [] is not sent by this version (clearing a list is a contract change)"
+            }
+            Some(Value::Array(items)) if items.iter().all(Value::is_string) => continue,
+            Some(_) => "not written: must be an array of strings",
         };
-        if !well_formed {
-            body.remove(*key);
-            rejected.insert(
-                (*key).to_string(),
-                json!("not written: must be an array of strings ([] clears the list)"),
-            );
-        }
+        body.remove(*key);
+        rejected.insert((*key).to_string(), json!(reason));
     }
     rejected
 }
@@ -7915,9 +7915,10 @@ mod tests {
         }
     }
 
-    /// An empty list is a value: it clears the criteria and the files.
+    /// `[]` is named in `rejected_fields` and clears nothing in this PR: the
+    /// clearing is a contract change, kept for the contract PR (#1223).
     #[tokio::test]
-    async fn an_empty_list_clears_the_criteria_and_the_files() {
+    async fn an_empty_list_is_refused_by_name_and_clears_nothing() {
         use crate::neo4j::traits::*;
         let (handler, graph, task_id) = real_handler_with_task().await;
         let result = handler
@@ -7933,13 +7934,17 @@ mod tests {
             .await
             .unwrap();
         let stored = graph.get_task(task_id).await.unwrap().unwrap();
-        assert!(stored.acceptance_criteria.is_empty());
-        assert!(stored.affected_files.is_empty());
-        assert_eq!(
-            result["updated_fields"],
-            json!(["acceptance_criteria", "affected_files"])
-        );
-        assert!(result.get("rejected_fields").is_none(), "{result}");
+        assert_eq!(stored.acceptance_criteria, vec!["old criterion"]);
+        assert_eq!(stored.affected_files, vec!["src/old.rs"]);
+        assert_eq!(result["updated_fields"], json!([]));
+        for key in ["acceptance_criteria", "affected_files"] {
+            assert!(
+                result["rejected_fields"][key]
+                    .as_str()
+                    .is_some_and(|why| why.contains("[]")),
+                "{key}: {result}"
+            );
+        }
     }
 
     /// `updated_fields` names what was written, and only that: a `null` writes

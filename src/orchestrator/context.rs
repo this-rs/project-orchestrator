@@ -948,16 +948,11 @@ pub struct PlanEnrichmentResult {
 
 /// What the prompt says once when a step is listed as skipped.
 ///
-/// `skipped` has two origins the store does not tell apart: a step left out on
-/// purpose (`step update status: skipped`), and a step the runner closed
-/// because the run stopped before reaching it (`finalize_steps` on an error, a
-/// cancellation, an exceeded budget, a timeout). An order such as "do not do
-/// it" would be right for the first and would forbid the remaining work of a
-/// retried task for the second. So the mark is explained and the agent is
-/// given the rule that holds for both.
+/// A step is `skipped` only when someone ruled it out: the runner no longer
+/// closes the steps a run did not reach (they stay `pending`, a to-do), so the
+/// mark always means "left out on purpose", and the rule can say so.
 const SKIPPED_STEPS_LEGEND: &str =
-    "`[-]` = skipped: left out on purpose, or not reached by a run that stopped early. \
-Do such a step only if an acceptance criterion cannot hold without it.\n";
+    "`[-]` = skipped on purpose: the step was ruled out, do not do such a step.\n";
 
 /// The steps of the task, as both prompt paths list them.
 ///
@@ -1820,9 +1815,7 @@ mod tests {
             // did not reach: the mark is explained, the work is not forbidden.
             assert!(!prompt.to_lowercase().contains("do not do it"), "{prompt}");
             assert_eq!(
-                prompt
-                    .matches("not reached by a run that stopped early")
-                    .count(),
+                prompt.matches("skipped on purpose").count(),
                 1,
                 "the legend appears once: {prompt}"
             );
