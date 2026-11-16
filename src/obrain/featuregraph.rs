@@ -202,7 +202,9 @@ impl EntreeGraphe {
             graphe: lire_graphe(&get)?,
             entites,
             inconnues: 0,
-            tri_maj: super::date::en_texte(get("updated_at").as_ref()).unwrap_or_default(),
+            tri_maj: super::date::en_texte(get("updated_at").as_ref()).ok_or_else(|| {
+                anyhow!("nœud FeatureGraph {noeud:?} : `updated_at` sans clé de tri lisible")
+            })?,
         })
     }
 
@@ -296,7 +298,14 @@ impl IndexGraphes {
                     None => inconnues += 1,
                 }
             }
-            let tri_maj = super::date::en_texte(get("updated_at").as_ref()).unwrap_or_default();
+            // A valid graph has its sort key (the lookup above read `updated_at`); a value
+            // without one is quarantined, never sorted as the empty string.
+            let Some(tri_maj) = super::date::en_texte(get("updated_at").as_ref()) else {
+                rapport.en_quarantaine.push(format!(
+                    "nœud FeatureGraph {noeud:?} : `updated_at` sans clé de tri lisible"
+                ));
+                continue;
+            };
             index.par_id.insert(
                 graphe.id,
                 EntreeGraphe {

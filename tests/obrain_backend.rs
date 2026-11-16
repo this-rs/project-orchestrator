@@ -137,6 +137,8 @@ mod with_the_feature {
     }
 
     async fn open(path: &Path) -> ObrainGraphStore {
+        // Installed before the first open: the warnings of an opening are captured.
+        let _ = avertissements();
         let path = path.to_path_buf();
         tokio::task::spawn_blocking(move || ObrainGraphStore::open(path, Creation::Permise))
             .await
@@ -7900,6 +7902,157 @@ mod with_the_feature {
         assert_eq!(
             projet.analytics_computed_at.map(|d| d.timestamp_micros()),
             Some(instant)
+        );
+    }
+
+    /// The warnings of this test binary, as text. One subscriber is installed for the
+    /// whole binary (a global default can be set once), and each test looks for its
+    /// own marker (an entity id) in what it captured.
+    fn avertissements() -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+        static TAMPON: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<u8>>>> =
+            std::sync::OnceLock::new();
+        TAMPON
+            .get_or_init(|| {
+                #[derive(Clone)]
+                struct Ecrivain(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+                impl std::io::Write for Ecrivain {
+                    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                        self.0.lock().unwrap().extend_from_slice(b);
+                        Ok(b.len())
+                    }
+                    fn flush(&mut self) -> std::io::Result<()> {
+                        Ok(())
+                    }
+                }
+                let tampon = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let ecrivain = Ecrivain(tampon.clone());
+                let abonne = tracing_subscriber::fmt()
+                    .with_writer(move || ecrivain.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::WARN)
+                    .finish();
+                let _ = tracing::subscriber::set_global_default(abonne);
+                tampon
+            })
+            .clone()
+    }
+
+    fn texte_des_avertissements() -> String {
+        String::from_utf8_lossy(&avertissements().lock().unwrap()).into_owned()
+    }
+
+    /// A signed tombstone WITHOUT its `issued_at` (absent, not unreadable) is still a
+    /// revocation: the hash answers `is_tombstoned = true`, with a warning naming the
+    /// tombstone. A revocation is never lost to a damaged date (fail-closed).
+    #[tokio::test]
+    async fn une_tombe_sans_issued_at_reste_une_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let hash = format!("h-sans-date-{}", Uuid::new_v4());
+        let store = open(&base).await;
+        store.close().await.unwrap();
+        drop(store);
+
+        let h = hash.clone();
+        write_foreign(&base, move |db| {
+            db.create_node_with_props(
+                &["Tombstone"],
+                vec![
+                    ("content_hash", Value::from(h.clone())),
+                    ("issuer_did", Value::from("did:local:issuer")),
+                    ("signature_hex", Value::from("ab12cd34")),
+                    ("reason", Value::from("rgpd")),
+                ],
+            );
+        })
+        .await;
+
+        let store = open(&base).await;
+        let rapport = store.rapport_d_ouverture().clone();
+        assert!(rapport.en_quarantaine.is_empty(), "{rapport:?}");
+        assert!(
+            store.is_tombstoned(&hash).await.unwrap(),
+            "a tombstone without issued_at must still revoke its hash"
+        );
+        assert_eq!(store.list_tombstones().await.unwrap().len(), 1);
+        assert!(
+            texte_des_avertissements().contains(&hash),
+            "the tombstone is kept with a warning that names it"
+        );
+    }
+
+    /// A present `decided_at` that is the empty string is a value present and not a
+    /// date: the decision is quarantined and named, never read as "now". (An ABSENT
+    /// `decided_at` keeps the adapter's default.)
+    #[tokio::test]
+    async fn une_date_maintenant_presente_et_vide_met_en_quarantaine() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        store.close().await.unwrap();
+        drop(store);
+
+        let did = Uuid::new_v4();
+        write_foreign(&base, move |db| {
+            db.create_node_with_props(
+                &["Decision"],
+                vec![
+                    ("id", Value::from(did.to_string())),
+                    ("description", Value::from("d")),
+                    ("rationale", Value::from("r")),
+                    ("status", Value::from("accepted")),
+                    ("decided_at", Value::from("")),
+                ],
+            );
+        })
+        .await;
+
+        let store = open(&base).await;
+        let quarantaine = store.rapport_d_ouverture().en_quarantaine.clone();
+        assert!(
+            quarantaine
+                .iter()
+                .any(|m| m.contains("Decision") && m.contains("`decided_at`")),
+            "{quarantaine:#?}"
+        );
+        assert!(!matches!(store.get_decision(did).await, Ok(Some(_))));
+    }
+
+    /// An OPTIONAL date that is present but unreadable is read absent, and a warning
+    /// names the property and the entity (here a project's `last_synced`).
+    #[tokio::test]
+    async fn une_date_optionnelle_illisible_avertit_en_nommant_propriete_et_entite() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let store = open(&base).await;
+        let p = a_project("avertissement");
+        store.create_project(&p).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+
+        let pid = p.id.to_string();
+        let marqueur = pid.clone();
+        write_foreign(&base, move |db| {
+            db.set_node_property(
+                noeud_d_id(db, "Project", &pid),
+                "last_synced",
+                Value::from("pas une date"),
+            );
+        })
+        .await;
+
+        let store = open(&base).await;
+        assert!(store.rapport_d_ouverture().en_quarantaine.is_empty());
+        assert_eq!(
+            store.get_project(p.id).await.unwrap().unwrap().last_synced,
+            None
+        );
+        let texte = texte_des_avertissements();
+        assert!(
+            texte.contains("last_synced")
+                && texte.contains(&marqueur)
+                && texte.contains("pas une date"),
+            "the warning must name the property, the entity and the value: {texte}"
         );
     }
 }

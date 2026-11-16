@@ -91,8 +91,9 @@ pub(super) fn facultative(get: Lire<'_>, cle: &str, quoi: &str) -> Result<Option
 
 /// A REQUIRED date that the Neo4j adapter reads as "now" when the property is
 /// ABSENT (`node_to_decision`, the chat sessions and events). That default is
-/// kept, for an absent property ONLY: a stored value is read under its three
-/// forms, and one that is not a date is an error, never replaced by "now".
+/// kept, for an absent property ONLY: a value that is PRESENT is read under its
+/// three forms, and one that is not a date, the empty string included, is an
+/// error, never replaced by "now".
 pub(super) fn ou_maintenant_si_absente(
     get: Lire<'_>,
     cle: &str,
@@ -100,18 +101,16 @@ pub(super) fn ou_maintenant_si_absente(
 ) -> Result<DateTime<Utc>> {
     match get(cle) {
         None | Some(Value::Null) => Ok(Utc::now()),
-        Some(Value::String(s)) if s.is_empty() => Ok(Utc::now()),
         Some(v) => decoder(&v).map_err(|pourquoi| illisible(quoi, cle, pourquoi)),
     }
 }
 
 /// A date already looked up on an EDGE, for a field that is required (the edge's
-/// `last_verified`): absent, null or empty is `None`; a value present that is not
-/// a date is an error, naming the property and the variant.
+/// `last_verified`): absent or null is `None`; a value present that is not a date,
+/// the empty string included, is an error, naming the property and the variant.
 pub(super) fn de_valeur(v: Option<&Value>, cle: &str, quoi: &str) -> Result<Option<DateTime<Utc>>> {
     match v {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) if s.is_empty() => Ok(None),
         Some(v) => decoder(v)
             .map(Some)
             .map_err(|pourquoi| illisible(quoi, cle, pourquoi)),
@@ -240,13 +239,18 @@ mod tests {
         let avant = Utc::now();
         let absente = ou_maintenant_si_absente(&get, "absente", "décision X").unwrap();
         assert!(absente >= avant);
-        assert!(ou_maintenant_si_absente(&get, "vide", "décision X").unwrap() >= avant);
-        // Present and not a date: an error, never "now".
+        // Present and not a date, the empty string included: an error naming it, never
+        // "now" (a stored value is never replaced).
         let e = format!(
             "{:#}",
             ou_maintenant_si_absente(&get, "texte", "décision X").unwrap_err()
         );
         assert!(e.contains("`texte`") && e.contains("pas une date"), "{e}");
+        let e = format!(
+            "{:#}",
+            ou_maintenant_si_absente(&get, "vide", "décision X").unwrap_err()
+        );
+        assert!(e.contains("`vide`"), "{e}");
     }
 
     #[test]

@@ -57,9 +57,10 @@
 //! `delete_project` refuse by name (`ProjectStore::delete_project (cascade)`), as any
 //! node outside the projects and plans already does.
 //!
-//! Kept from Neo4j, because they are its stated contract: a tombstone whose
-//! `issued_at` does not parse reads as the Unix epoch, deterministic and
-//! unverifiable (`tombstone_from_stored`), so that a revocation is never lost;
+//! Kept, because a revocation is never lost: a tombstone whose `issued_at` is
+//! absent or does not read is still served and answers « revoked » (fail-closed),
+//! with a warning naming it. Its date is the Unix epoch, which fails any
+//! verification (as Neo4j's `tombstone_from_stored` reads it, deterministic);
 //! `get_sharing_consent` of an unknown note is `NotSet`.
 //!
 //! # Atomicity
@@ -78,7 +79,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use chrono::SecondsFormat;
+use chrono::{DateTime, SecondsFormat};
 use obrain_common::types::{NodeId, Value};
 use obrain_core::graph::Direction;
 use obrain_engine::ObrainDB;
@@ -206,9 +207,22 @@ fn lire_tombe(get: &dyn Fn(&str) -> Option<Value>) -> Result<SignedTombstone> {
     Ok(SignedTombstone {
         issuer_did: texte("issuer_did")?,
         signature_hex: texte("signature_hex")?,
-        // Required: written with every tombstone. Absent, or not a date, is an error
-        // naming it, never the epoch (a signed value invented from nothing).
-        issued_at: super::date::requise(get, "issued_at", &quoi)?,
+        // Required, but a revocation must never be lost: an absent or unreadable
+        // `issued_at` keeps the record, which still answers « revoked » (`tombe_effective`
+        // does not read the date). The date is the epoch, a placeholder that fails any
+        // verification, and a warning names the tombstone.
+        issued_at: match super::date::facultative(get, "issued_at", &quoi)? {
+            Some(d) => d,
+            None => {
+                tracing::warn!(
+                    propriete = "issued_at",
+                    entite = quoi.as_str(),
+                    "tombe sans `issued_at` lisible : gardée et tenue pour révoquée \
+                     (fail-closed) ; sa date vaut l'époque et sa vérification échoue"
+                );
+                DateTime::UNIX_EPOCH
+            }
+        },
         reason: Some(texte("reason")?).filter(|r| !r.is_empty()),
         content_hash: hash,
     })
@@ -691,11 +705,14 @@ mod tests {
         inconnue.issuer_did = "did:local:unknown".into();
         assert!(!tombe_effective(&inconnue));
 
-        // An unreadable `issued_at` is an error naming it: never the epoch.
+        // An unreadable `issued_at` keeps the revocation: the record is served, its date
+        // is the epoch, and it is still effective (never lost, never "not revoked").
         let mut p = proprietes_tombe(&t);
         p.retain(|(k, _)| *k != "issued_at");
         p.push(("issued_at", Value::from("jamais")));
-        let e = format!("{:#}", lire_tombe(&depuis(p)).unwrap_err());
-        assert!(e.contains("issued_at") && e.contains("jamais"), "{e}");
+        let gardee = lire_tombe(&depuis(p)).unwrap();
+        assert_eq!(gardee.issued_at, DateTime::UNIX_EPOCH);
+        assert!(tombe_effective(&gardee));
+        assert!(!crate::sharing::tombstone::verify_tombstone(&gardee));
     }
 }

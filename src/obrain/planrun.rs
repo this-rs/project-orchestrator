@@ -557,6 +557,11 @@ impl IndexExecutions {
                 Ok(d) => Marque::Lue(entree.noeud, d),
                 Err(pourquoi) => {
                     let raison = format!("plan {id} : `{MARQUE}` illisible : {pourquoi}");
+                    tracing::warn!(
+                        propriete = MARQUE,
+                        plan = %id,
+                        "marque tierce illisible : le plan est servi, sa marque refusée ({pourquoi})"
+                    );
                     rapport
                         .en_quarantaine
                         .push(format!("{raison} — le plan est servi, sa marque refusée"));
