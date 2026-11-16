@@ -475,6 +475,10 @@ impl CodeStore for Neo4jClient {
             .await
     }
 
+    async fn project_contains_file(&self, project_id: Uuid, path: &str) -> anyhow::Result<bool> {
+        self.project_contains_file(project_id, path).await
+    }
+
     async fn list_project_files(&self, project_id: Uuid) -> anyhow::Result<Vec<FileNode>> {
         self.list_project_files(project_id).await
     }

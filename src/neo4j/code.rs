@@ -435,8 +435,8 @@ impl Neo4jClient {
     ) -> Result<Vec<String>> {
         let q = query(
             r#"
-            MATCH (f:File)
-            WHERE f.path ENDS WITH $suffix AND f.project_id = $project_id
+            MATCH (:Project {id: $project_id})-[:CONTAINS]->(f:File)
+            WHERE f.path ENDS WITH $suffix
             RETURN f.path AS path
             ORDER BY f.path
             LIMIT $limit
@@ -452,6 +452,25 @@ impl Neo4jClient {
             out.push(row.get::<String>("path")?);
         }
         Ok(out)
+    }
+
+    /// Does the project contain the file at this exact path? The `CONTAINS`
+    /// relation, as in [`Self::list_project_files`].
+    pub async fn project_contains_file(&self, project_id: Uuid, path: &str) -> Result<bool> {
+        let q = query(
+            r#"
+            MATCH (:Project {id: $project_id})-[:CONTAINS]->(f:File {path: $path})
+            RETURN count(f) AS n
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("path", path.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        match result.next().await? {
+            Some(row) => Ok(row.get::<i64>("n")? > 0),
+            None => Ok(false),
+        }
     }
 
     /// List files for a project

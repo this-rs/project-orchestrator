@@ -589,8 +589,9 @@ pub struct ImpactAnalysis {
     pub confidence: Option<crate::graph::confidence::ConfidenceScore>,
 }
 
-/// Upper bound of the files listed when a relative target is ambiguous: the
-/// query fetches at most this many, so the answer lists at most this many.
+/// Upper bound of the files listed when a relative target is ambiguous. One more
+/// is fetched, only to know whether the list is cut: the answer then says
+/// "(and others)".
 const IMPACT_TARGET_MAX_LISTED: usize = 6;
 
 /// The file of the code graph an impact analysis is about.
@@ -605,6 +606,12 @@ const IMPACT_TARGET_MAX_LISTED: usize = 6;
 /// 3. for a relative target, the one file of the graph (of the project, when
 ///    given) whose path ends with `/<target>`.
 ///
+/// With a project, a file found at step 1 or 2 must be CONTAINED by that
+/// project: the lookup by path is global, and with nested roots (`/r` and
+/// `/r/b`) the outer project's `<root>/b/src/lib.rs` is the inner project's file.
+/// Taking it would analyse another project's file with this project's scope and
+/// answer "no impact".
+///
 /// Several files at step 3 is a 400 that lists them; none is a 404. A path
 /// that has dependents is accepted even without a `File` node of its own, so a
 /// graph that answered before still answers.
@@ -614,6 +621,7 @@ async fn resolve_impact_file(
     project: Option<(uuid::Uuid, &str)>,
 ) -> Result<String, AppError> {
     let relative = !raw.starts_with('/');
+    let project_id = project.map(|(id, _)| id);
     let mut candidates: Vec<String> = Vec::new();
     if let (true, Some((_, root))) = (relative, project) {
         let expanded = crate::expand_tilde(root);
@@ -622,12 +630,18 @@ async fn resolve_impact_file(
     candidates.push(raw.to_string());
 
     for candidate in &candidates {
-        if neo4j.get_file(candidate).await?.is_some() {
+        if neo4j.get_file(candidate).await?.is_none() {
+            continue;
+        }
+        let owned = match project_id {
+            Some(pid) => neo4j.project_contains_file(pid, candidate).await?,
+            None => true,
+        };
+        if owned {
             return Ok(candidate.clone());
         }
     }
 
-    let project_id = project.map(|(id, _)| id);
     if relative {
         let suffix = format!("/{}", raw.trim_start_matches("./"));
         // With a project, the filter is in the query: a LIMIT applied first would
@@ -637,11 +651,11 @@ async fn resolve_impact_file(
         let mut matches: Vec<String> = match project_id {
             Some(pid) => {
                 neo4j
-                    .find_project_files_by_path_suffix(pid, &suffix, IMPACT_TARGET_MAX_LISTED)
+                    .find_project_files_by_path_suffix(pid, &suffix, IMPACT_TARGET_MAX_LISTED + 1)
                     .await?
             }
             None => neo4j
-                .find_files_by_path_suffix(&suffix, IMPACT_TARGET_MAX_LISTED)
+                .find_files_by_path_suffix(&suffix, IMPACT_TARGET_MAX_LISTED + 1)
                 .await?
                 .into_iter()
                 .map(|(path, _)| path)
@@ -653,11 +667,14 @@ async fn resolve_impact_file(
             0 => {}
             1 => return Ok(matches.remove(0)),
             _ => {
+                let cut = matches.len() > IMPACT_TARGET_MAX_LISTED;
+                matches.truncate(IMPACT_TARGET_MAX_LISTED);
                 return Err(AppError::BadRequest(format!(
-                    "ambiguous target '{raw}': it names several files of the graph ({}). \
+                    "ambiguous target '{raw}': it names several files of the graph ({}{}). \
                      Pass an absolute path, or project_slug with a path relative to the project root.",
-                    matches.join(", ")
-                )))
+                    matches.join(", "),
+                    if cut { " (and others)" } else { "" }
+                )));
             }
         }
     }
@@ -6572,6 +6589,162 @@ mod tests {
             "{error}"
         );
         assert!(!error.contains("/repo/a0/"), "{error}");
+    }
+
+    /// Two projects with nested roots: `outer` at `/r`, `inner` at `/r/b`. The file
+    /// `/r/b/src/lib.rs` is the inner project's; with `shared` the outer project
+    /// contains it too (one node, two `CONTAINS`, as the sync of nested roots
+    /// leaves it).
+    async fn impact_app_with_nested_projects(shared: bool) -> axum::Router {
+        use crate::meilisearch::mock::MockSearchStore;
+        use crate::neo4j::mock::MockGraphStore;
+        use crate::neo4j::models::ProjectNode;
+        use crate::test_helpers::mock_app_state_with;
+
+        let project = |slug: &str, root: &str| ProjectNode {
+            id: uuid::Uuid::new_v4(),
+            name: slug.to_string(),
+            slug: slug.to_string(),
+            description: None,
+            root_path: root.to_string(),
+            created_at: chrono::Utc::now(),
+            last_synced: None,
+            analytics_computed_at: None,
+            last_co_change_computed_at: None,
+            default_note_energy: None,
+            scaffolding_override: None,
+            sharing_policy: None,
+            watch_enabled: false,
+            profile: Default::default(),
+        };
+        let graph = MockGraphStore::new();
+        let (outer, inner) = (project("outer", "/r"), project("inner", "/r/b"));
+        graph.create_project(&outer).await.unwrap();
+        graph.create_project(&inner).await.unwrap();
+        graph
+            .upsert_file(&FileNode {
+                path: "/r/b/src/lib.rs".to_string(),
+                language: "rust".to_string(),
+                hash: "h".to_string(),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(inner.id),
+            })
+            .await
+            .unwrap();
+        if shared {
+            graph
+                .project_files
+                .write()
+                .await
+                .entry(outer.id)
+                .or_default()
+                .push("/r/b/src/lib.rs".to_string());
+        }
+        test_app_on(mock_app_state_with(graph, MockSearchStore::new())).await
+    }
+
+    /// `get_file` is global: with nested roots the outer project's
+    /// `<root>/b/src/lib.rs` is a file of the INNER project. It is not the outer
+    /// project's, so the outer project answers 404 instead of analysing another
+    /// project's file with its own scope (a false "no impact").
+    #[tokio::test]
+    async fn a_nested_projects_file_is_not_found_for_the_outer_project() {
+        let app = impact_app_with_nested_projects(false).await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact?target=b/src/lib.rs&project_slug=outer",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = json_of(resp).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("file not found in graph"),
+            "{json}"
+        );
+    }
+
+    /// The inner project still resolves its own file, and the absolute path
+    /// written as is under the outer project's scope is refused the same way.
+    #[tokio::test]
+    async fn a_nested_projects_file_is_found_by_its_own_project_only() {
+        let app = impact_app_with_nested_projects(false).await;
+        let resp = app
+            .clone()
+            .oneshot(auth_get(
+                "/api/code/impact?target=src/lib.rs&project_slug=inner",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_of(resp).await["target"], "/r/b/src/lib.rs");
+
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/impact?target=/r/b/src/lib.rs&project_slug=outer",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A node that both nested projects contain is found by either.
+    #[tokio::test]
+    async fn a_file_contained_by_both_nested_projects_is_found_by_either() {
+        let app = impact_app_with_nested_projects(true).await;
+        for slug in ["outer", "inner"] {
+            let target = if slug == "outer" {
+                "b/src/lib.rs"
+            } else {
+                "src/lib.rs"
+            };
+            let resp = app
+                .clone()
+                .oneshot(auth_get(&format!(
+                    "/api/code/impact?target={target}&project_slug={slug}"
+                )))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{slug}");
+            assert_eq!(json_of(resp).await["target"], "/r/b/src/lib.rs", "{slug}");
+        }
+    }
+
+    /// More candidates than the list holds: the answer says the list is cut.
+    #[tokio::test]
+    async fn an_ambiguity_list_cut_at_six_says_there_are_others() {
+        let app = impact_app_with_a_project_among_others(&[], 7).await;
+        let resp = app
+            .oneshot(auth_get("/api/code/impact?target=src/lib.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = json_of(resp).await;
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("(and others)"), "{error}");
+        assert!(error.contains("/repo/a5/src/lib.rs"), "{error}");
+        assert!(!error.contains("/repo/a6/src/lib.rs"), "{error}");
+    }
+
+    /// Exactly six candidates are all listed: nothing is hidden, nothing is said.
+    #[tokio::test]
+    async fn an_ambiguity_list_of_exactly_six_is_complete() {
+        let app = impact_app_with_a_project_among_others(&[], 6).await;
+        let resp = app
+            .oneshot(auth_get("/api/code/impact?target=src/lib.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = json_of(resp).await;
+        let error = json["error"].as_str().unwrap();
+        assert!(!error.contains("(and others)"), "{error}");
+        assert!(error.contains("/repo/a5/src/lib.rs"), "{error}");
     }
 
     /// A suffix is matched on a path boundary: `lib.rs` is not `mylib.rs`.

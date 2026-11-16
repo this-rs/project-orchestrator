@@ -7525,17 +7525,43 @@ impl CodeStore for MockGraphStore {
         suffix: &str,
         limit: usize,
     ) -> Result<Vec<String>> {
+        let listed = self
+            .project_files
+            .read()
+            .await
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_default();
         let mut out: Vec<String> = self
             .files
             .read()
             .await
             .values()
-            .filter(|f| f.path.ends_with(suffix) && f.project_id == Some(project_id))
+            .filter(|f| {
+                f.path.ends_with(suffix)
+                    && (f.project_id == Some(project_id) || listed.contains(&f.path))
+            })
             .map(|f| f.path.clone())
             .collect();
         out.sort();
         out.truncate(limit);
         Ok(out)
+    }
+
+    async fn project_contains_file(&self, project_id: Uuid, path: &str) -> Result<bool> {
+        let listed = self
+            .project_files
+            .read()
+            .await
+            .get(&project_id)
+            .is_some_and(|paths| paths.iter().any(|p| p == path));
+        let owned = self
+            .files
+            .read()
+            .await
+            .get(path)
+            .is_some_and(|f| f.project_id == Some(project_id));
+        Ok(listed || owned)
     }
 
     async fn list_project_files(&self, project_id: Uuid) -> Result<Vec<FileNode>> {

@@ -1052,6 +1052,17 @@ pub mod conformance {
             .unwrap();
         assert_eq!(seen_by_another, vec![format!("conformance/a0{suffix}")]);
 
+        // Membership is the `CONTAINS` relation: the wanted project contains its
+        // file, another project does not.
+        assert!(store
+            .project_contains_file(wanted.id, &wanted_path)
+            .await
+            .unwrap());
+        assert!(!store
+            .project_contains_file(projects[1].id, &wanted_path)
+            .await
+            .unwrap());
+
         for p in &projects {
             store.delete_project(p.id, &p.name).await.unwrap();
         }
