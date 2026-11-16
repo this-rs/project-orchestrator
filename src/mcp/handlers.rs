@@ -150,10 +150,20 @@ const STEP_UPDATE_KEYS: &[&str] = &["status", "description", "verification"];
 /// A `null` value and a `_`-prefixed key (client metadata) are not fields.
 fn refuse_unwritable_fields(
     args: &Value,
+    tool: &str,
     writable: &[&str],
     what: &str,
     id_key: &str,
 ) -> Result<()> {
+    // Only the parameters the tool publishes are refused. A key the API writes
+    // but the tool does not publish (`due_date`, `model_alias`, …) keeps being
+    // ignored, as on main: refusing it would be a contract change of its own.
+    let published: Vec<String> = super::tools::all_tools()
+        .into_iter()
+        .find(|t| t.name == tool)
+        .and_then(|t| t.input_schema.properties)
+        .and_then(|p| p.as_object().map(|o| o.keys().cloned().collect()))
+        .unwrap_or_default();
     let given: Vec<&str> = args
         .as_object()
         .into_iter()
@@ -167,7 +177,7 @@ fn refuse_unwritable_fields(
     let mut unsupported: Vec<&str> = given
         .iter()
         .copied()
-        .filter(|key| !writable.contains(key))
+        .filter(|key| !writable.contains(key) && published.iter().any(|p| p == key))
         .collect();
     unsupported.sort_unstable();
     if !unsupported.is_empty() {
@@ -1752,7 +1762,7 @@ impl ToolHandler {
 
             "update_task" => {
                 let task_id = extract_id(args, "task_id")?;
-                refuse_unwritable_fields(args, TASK_UPDATE_KEYS, "task update", "task_id")?;
+                refuse_unwritable_fields(args, "task", TASK_UPDATE_KEYS, "task update", "task_id")?;
                 let (mut body, mut fields) = written_update_body(args, TASK_UPDATE_KEYS);
                 let rejected = take_malformed_string_lists(
                     &mut body,
@@ -2034,7 +2044,7 @@ impl ToolHandler {
 
             "update_step" => {
                 let step_id = extract_id(args, "step_id")?;
-                refuse_unwritable_fields(args, STEP_UPDATE_KEYS, "step update", "step_id")?;
+                refuse_unwritable_fields(args, "step", STEP_UPDATE_KEYS, "step update", "step_id")?;
                 let (body, fields) = written_update_body(args, STEP_UPDATE_KEYS);
                 let result = http
                     .patch(&format!("/api/steps/{}", step_id), &Value::Object(body))
@@ -2226,8 +2236,11 @@ impl ToolHandler {
                 // B": A is the OLD decision, B the one that replaces it. The two
                 // were bound the other way round, so B — the new decision — was
                 // the one marked `superseded` (issue #1189).
-                let old_id = extract_id(args, "decision_id")?;
-                let new_id = extract_id(args, "superseded_by_id")?;
+                // Compared as UUIDs: `extract_id` validates the format and returns the
+                // text, so `…ABC` and `…abc` are one decision, and the REST path
+                // (which normalises the id) would supersede it by itself.
+                let old_id = uuid::Uuid::parse_str(&extract_id(args, "decision_id")?)?;
+                let new_id = uuid::Uuid::parse_str(&extract_id(args, "superseded_by_id")?)?;
                 if old_id == new_id {
                     return Err(anyhow!(
                         "supersede_self: decision_id and superseded_by_id are the same \
@@ -8116,6 +8129,51 @@ mod tests {
         }
     }
 
+    /// The same decision written in two cases is still the same decision: the
+    /// guard compares UUIDs, not text. Without it the request reached REST, which
+    /// normalises the id, and the decision was marked superseded by itself.
+    #[tokio::test]
+    async fn supersede_refuses_the_same_decision_whatever_the_case_of_its_uuid() {
+        let (handler, _) = make_http_handler().await;
+        let err = handler
+            .handle(
+                "decision",
+                Some(json!({
+                    "action": "supersede",
+                    "decision_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "superseded_by_id": "550E8400-E29B-41D4-A716-446655440000",
+                })),
+            )
+            .await
+            .expect_err("the same decision in two cases");
+        assert!(err.to_string().contains("supersede_self"), "{err}");
+    }
+
+    /// A key the API writes but the tool does not publish (`due_date`) keeps
+    /// being ignored, as on main: the update goes through, the key is not
+    /// refused and not written.
+    #[tokio::test]
+    async fn an_unpublished_key_the_api_writes_is_still_ignored_not_refused() {
+        use crate::neo4j::traits::*;
+        let (handler, graph, task_id) = real_handler_with_task().await;
+        let result = handler
+            .handle(
+                "task",
+                Some(json!({
+                    "action": "update",
+                    "task_id": task_id.to_string(),
+                    "title": "new title",
+                    "due_date": "2026-12-01",
+                })),
+            )
+            .await
+            .expect("an unpublished key is not a refusal");
+        assert_eq!(result["updated_fields"], json!(["title"]), "{result}");
+        let stored = graph.get_task(task_id).await.unwrap().unwrap();
+        assert_eq!(stored.title.as_deref(), Some("new title"));
+        assert_eq!(stored.due_date, None, "ignored, as before");
+    }
+
     /// A list refused by name and nothing else: nothing was written, so the
     /// answer says `updated: false` (in #1221 it said `true`, as on main).
     #[tokio::test]
@@ -8216,14 +8274,14 @@ mod tests {
                     "action": "update",
                     "step_id": UUID1,
                     "description": "d",
-                    "order": 3,
+                    "task_id": UUID2,
                 })),
             )
             .await
-            .expect_err("order is not written by update");
+            .expect_err("task_id is a published parameter that step update does not write");
         let msg = err.to_string();
         assert!(msg.contains("unsupported_fields"), "{msg}");
-        assert!(msg.contains("order"), "{msg}");
+        assert!(msg.contains("task_id"), "{msg}");
     }
 
     /// `decision_id: A, superseded_by_id: B` reads "A is superseded by B". The

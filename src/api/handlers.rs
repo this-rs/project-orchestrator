@@ -665,6 +665,12 @@ pub async fn delete_task(
         .plan_manager()
         .delete_task(task_id)
         .await?;
+    tracing::info!(
+        %task_id,
+        steps_deleted = report.steps_deleted,
+        decisions_deleted = report.deleted_decision_ids.len(),
+        "task deleted with its steps and decisions"
+    );
     state
         .event_bus
         .emit_deleted(crate::events::EntityType::Task, &task_id.to_string(), None);
@@ -14292,6 +14298,91 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// The log keeps what the cascade removed: the line an operator greps for
+    /// after a task disappeared, with the counts (issue #1189, review U5).
+    #[derive(Clone, Default)]
+    struct EventText(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventText {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={:?} ", field.name(), value));
+                }
+            }
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", event.metadata().target(), fields.0));
+        }
+    }
+
+    /// The capture of every event of this test binary. It is the process-wide
+    /// subscriber: a thread-local one is not seen reliably by a callsite that the
+    /// other tests, running in parallel, have already registered.
+    fn captured_events() -> &'static EventText {
+        static CAPTURE: std::sync::OnceLock<EventText> = std::sync::OnceLock::new();
+        CAPTURE.get_or_init(|| {
+            use tracing_subscriber::layer::SubscriberExt;
+            let capture = EventText::default();
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(capture.clone()),
+            );
+            capture
+        })
+    }
+
+    #[tokio::test]
+    async fn deleting_a_task_logs_what_went_with_it() {
+        let capture = captured_events();
+
+        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let task_id = seeded_task(&graph).await;
+        let (app, _bus) = test_app_parts(graph.clone()).await;
+        for _ in 0..2 {
+            posted_id(
+                &app,
+                &format!("/api/tasks/{task_id}/decisions"),
+                serde_json::json!({ "description": "d", "rationale": "r" }),
+            )
+            .await;
+        }
+        posted_id(
+            &app,
+            &format!("/api/tasks/{task_id}/steps"),
+            serde_json::json!({ "description": "a step" }),
+        )
+        .await;
+        let resp = app
+            .oneshot(auth_delete(&format!("/api/tasks/{task_id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The line of THIS task: other tests delete tasks in parallel.
+        let events = capture.0.lock().unwrap().clone();
+        let line = events
+            .iter()
+            .find(|l| {
+                l.contains("task deleted with its steps and decisions")
+                    && l.contains(&task_id.to_string())
+            })
+            .unwrap_or_else(|| panic!("no deletion line for {task_id} in {events:?}"));
+        assert!(line.contains("decisions_deleted=2"), "{line}");
+        assert!(line.contains("steps_deleted=1"), "{line}");
     }
 
     /// POST /api/decisions/{new}/supersedes/{old} with an id that names no
