@@ -6439,6 +6439,42 @@ mod tests {
         assert_eq!(json["caller_count"], 1);
     }
 
+    /// Without `project_slug`, a relative target is looked up in EVERY project: a
+    /// single file of another project is accepted, and the answer names its
+    /// absolute path. This is the declared effect of the contract PR (section 5).
+    #[tokio::test]
+    async fn a_relative_target_without_a_slug_resolves_to_another_projects_unique_file() {
+        let app = impact_app_with_a_project_among_others(&[], 1).await;
+        let resp = app
+            .oneshot(auth_get("/api/code/impact?target=src/lib.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = json_of(resp).await;
+        assert_eq!(json["target"], "/repo/a0/src/lib.rs");
+    }
+
+    /// Two projects own a `src/lib.rs`, and no slug says which one is meant: the
+    /// answer is a 400 that lists both paths, not a pick.
+    #[tokio::test]
+    async fn two_projects_with_the_same_suffix_without_a_slug_is_ambiguous_and_lists_both() {
+        let app = impact_app_with_a_project_among_others(&[], 2).await;
+        let resp = app
+            .oneshot(auth_get("/api/code/impact?target=src/lib.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = json_of(resp).await;
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(
+            error.contains("/repo/a0/src/lib.rs") && error.contains("/repo/a1/src/lib.rs"),
+            "{error}"
+        );
+    }
+
     /// A project and files named `src/lib.rs` in `others` other projects. The
     /// project's own files sort AFTER the others'.
     async fn impact_app_with_a_project_among_others(
